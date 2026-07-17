@@ -16,34 +16,30 @@ The parent (`/Users/joaoh82/projects/flotta_parent`) is a **planning-only worksp
 
 ## Current state
 
-The repo currently contains only `LICENSE` (AGPL-3.0). It has **not been bootstrapped yet**. The paths in *Architecture* below describe the **target** layout, not existing files. The immediate next steps, per the kickoff guide, are:
-
-1. **Bootstrap** (parent `docs/claude-code-kickoff.md` §1): create `src/flotta/`, `dashboard/`, `skills/`, `docs/`, `vendor/`; `git init` is already done; copy `development-plan.md` + `fleet-runtime-product.md` into `docs/`; clone Hermes read-only into `vendor/hermes`; add `vendor/` to `.gitignore`.
-2. **M1 seam validation** (Session 1 prompt in the kickoff guide) — read-only investigation of vendored Hermes, no implementation code.
-
-Milestone state is **M0** (namespace & environment). Follow the milestones in order — do not skip ahead or exceed v0.1 scope.
+The repo is scaffolded: `pyproject.toml` (Python 3.11, hatchling, src layout, pytest + ruff dev group via uv), `uv.lock`, `src/flotta/` with `store.py` + `test_store.py`, and `vendor/hermes` (read-only reference clone, gitignored). Milestones done: **M1** (seam validation — **GO**, findings in the parent's `docs/SEAM_NOTES.md`, decision D7) and **M3.1** (fleet-state store). Next up: **M2** (worker image), then the rest of M3. M0 namespace tasks (PyPI/npm placeholders, Modal auth) may still be open — check the plan. Follow the milestones in order — do not skip ahead or exceed v0.1 scope.
 
 ## Source of truth
 
-The living planning docs are in the **parent** repo (`/Users/joaoh82/projects/flotta_parent/docs/`) until bootstrap copies them into this repo's `docs/`:
+The living planning docs live in the **parent** repo (`/Users/joaoh82/projects/flotta_parent/docs/`):
 
 - **`development-plan.md`** — milestones M0–M7 with acceptance criteria, open questions, decision log (D1–D6), changelog. **Read it at session start.** Before finishing a session: tick task statuses (`[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked-with-note), add a changelog line, and record any choice in the decision log.
 - **`fleet-runtime-product.md`** — product scope. Do **not** exceed v0.1 scope.
-- **`claude-code-kickoff.md`** — bootstrap steps + the eight paste-ready per-milestone session prompts (one per session). Reality diverging from this guide? The plan file wins.
-- **`vendor/hermes/`** (after bootstrap) — read-only reference clone of Hermes Agent. **Never modify it.**
+- **`claude-code-kickoff.md`** — bootstrap steps + the eight paste-ready per-milestone session prompts (one per session). Reality diverging from this guide? The plan file wins. Known divergence: its §1 starter text and M2 prompt still say the worker "starts `mcp_serve`" — superseded by D7/SEAM_NOTES.
+- **`SEAM_NOTES.md`** — M1 findings with file:line refs into the Hermes clone (headless boot recipe, `mcp_serve` correction, storage layout, terminal backends). Read before M2/M3 work.
+- **`vendor/hermes/`** (in this repo, gitignored) — read-only reference clone of Hermes Agent (@ `594308d4bbe9`). **Never modify it.**
 
 ## Architecture (v0.1 target layout)
 
 The runtime is built around one durable store that is the single source of truth for fleet state; everything else reads from or writes to it.
 
-- **`src/flotta/store.py`** — fleet-state store on SQLite, designed so the connection string could later point at **Turso** (thin SQL, no ORM). Two tables: `workers` (id, task, status `provisioning|running|done|failed|torn_down`, endpoint, spawned_at, finished_at, cost_estimate) and `events` (id, worker_id, ts, type, payload_json). Status transitions are **validated** (e.g. no `done → running`).
+- **`src/flotta/store.py`** — ✅ built (M3.1). Fleet-state store on SQLite via stdlib `sqlite3`, designed so the connection factory could later point at **Turso** (thin SQL, no ORM — D8). Two tables: `workers` (id, task, status `provisioning|running|done|failed|torn_down`, endpoint, spawned_at, finished_at, cost_estimate) and `events` (id, worker_id, ts, type, payload_json). Status transitions are **validated** by an explicit transition table (e.g. no `done → running`; `torn_down` is terminal).
 - **`src/flotta/provision.py`** — Modal app: `spawn_worker(task) -> {worker_id, endpoint}` and `teardown(worker_id)` (idempotent). Both write lifecycle events to the store.
-- **`src/flotta/worker/`** — Modal image definition (Hermes installed, pinned) + container entrypoint: reads `FLOTTA_TASK` / `FLOTTA_TIMEOUT_S` from env, boots Hermes **headless** (no messaging gateway, single provider, fixed toolset — per `docs/SEAM_NOTES.md`), starts `mcp_serve`, and exits on completion or a hard timeout (default 900s).
+- **`src/flotta/worker/`** — Modal image definition (Hermes installed, pinned) + container entrypoint: reads `FLOTTA_TASK` / `FLOTTA_TIMEOUT_S` from env, sets `HERMES_HOME` to a writable ephemeral path, boots Hermes **headless** via `AIAgent` (no messaging gateway, single pinned provider, fixed toolset, `skip_context_files`/`skip_memory` — per SEAM_NOTES Q1), and exits on completion or a hard timeout (default 900s). **Not `hermes mcp serve`** — that is a stdio messaging bridge, not a task endpoint (D7, SEAM_NOTES Q2). The MCP surface, if used over the one-shot form, is a thin Flotta-owned streamable-http server exposing a `run_task` tool; Hermes's MCP client can already dial it by URL.
 - **`src/flotta/cli.py`** — Typer CLI: `flotta ps | logs <id> | kill <id> | spawn "<task>"`, all against the store and provisioning functions. Human-readable tables with a `--json` flag.
 - **`dashboard/`** — Next.js (TypeScript, App Router, Tailwind). API routes read the store file directly via `FLOTTA_STORE`; polling UI (2–5s). Localhost only, no auth in v0.1.
 - **`skills/orchestrator/`** — the Hermes skill teaching the orchestrator when/how to delegate to a worker and to always tear down (including on failure).
 
-Data flow: orchestrator → `spawn_worker` (Modal) → worker boots headless Hermes + `mcp_serve` → events land in the store → CLI/dashboard read the store → `teardown` closes the row.
+Data flow: orchestrator → `spawn_worker` (Modal) → worker boots headless Hermes (`AIAgent`), runs the task, reports the result → events land in the store → CLI/dashboard read the store → `teardown` closes the row.
 
 ## Conventions
 
@@ -56,12 +52,12 @@ Data flow: orchestrator → `spawn_worker` (Modal) → worker boots headless Her
 
 ## Commands
 
-Nothing is wired yet (no `pyproject.toml`/`package.json` until bootstrap). Target commands once the milestones land:
+Python tooling runs through **uv** (`pyproject.toml` + `uv.lock` are wired; dashboard `package.json` arrives with M5):
 
 ```bash
-pytest                                   # run tests (add -k <name> for a single test)
-ruff check .                             # lint
-ruff format .                            # format
+uv run pytest                            # run tests (add -k <name> for a single test)
+uv run ruff check src                    # lint
+uv run ruff format src                   # format
 modal deploy src/flotta/provision.py     # deploy provisioning functions (M3+)
 modal run src/flotta/worker/...          # smoke-test the worker image (M2+)
 flotta ps | logs <id> | kill <id> | spawn "<task>"   # CLI (M4+)
