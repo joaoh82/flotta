@@ -52,7 +52,7 @@ Data flow: orchestrator → `spawn_worker` (Modal) → worker boots headless Her
 
 ## Commands
 
-Python tooling runs through **uv** (`pyproject.toml` + `uv.lock` are wired; dashboard `package.json` arrives with M5):
+Common commands live in the **`justfile`** (`just` lists them; `just check` = lint + tests). **Convention: whenever a milestone lands a new runnable command (M2 modal smoke test, M3 deploy, M4 CLI, M5 dashboard), add a recipe to the justfile in the same PR.** Python tooling runs through **uv** (`pyproject.toml` + `uv.lock` are wired; dashboard `package.json` arrives with M5):
 
 ```bash
 uv run pytest                            # run tests (add -k <name> for a single test)
