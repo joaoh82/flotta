@@ -25,6 +25,11 @@ fmt:
 # lint + tests — run before committing
 check: lint test
 
+# M2 worker smoke test: build the image on Modal, boot the worker, confirm the
+# MCP endpoint answers (hermetic — no LLM provider or API key needed).
+smoke:
+    modal run src/flotta/worker/modal_app.py
+
 # show the development plan (lives in the parent workspace)
 plan:
     @sed -n '1,60p' ../docs/development-plan.md
