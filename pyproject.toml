@@ -2,6 +2,7 @@
 name = "flotta"
 version = "0.0.1"
 description = "Open-source fleet runtime for self-improving agents"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
 dependencies = []
