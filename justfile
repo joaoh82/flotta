@@ -70,6 +70,11 @@ e2e *ARGS: modal-whoami
 # same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
 e2e-live: (e2e "--live")
 
+# M4 CLI — e.g. `just flotta ps`, `just flotta spawn "task" --wait`, `just flotta logs <id>`.
+# Installing the package puts a bare `flotta` on PATH; this recipe just saves the `uv run`.
+flotta *ARGS:
+    MODAL_PROFILE={{modal_profile}} uv run flotta {{ARGS}}
+
 # show the development plan (lives in the parent workspace)
 plan:
     @sed -n '1,60p' ../docs/development-plan.md
