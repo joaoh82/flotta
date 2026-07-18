@@ -5,7 +5,13 @@ description = "Open-source fleet runtime for self-improving agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
-dependencies = []
+# `modal` is the client for the runtime itself — provisioning, the CLI (M4) and
+# the e2e script cannot work without it, so it is a real runtime dependency.
+# The heavy worker stack (Hermes, the MCP SDK, uvicorn) stays image-only and
+# lazily imported, which is the part D9 actually protects.
+dependencies = [
+    "modal>=1.0",
+]
 
 [dependency-groups]
 dev = [
