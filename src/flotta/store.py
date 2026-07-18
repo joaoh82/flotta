@@ -202,9 +202,7 @@ class FleetStore:
 
     # -- events ------------------------------------------------------------
 
-    def add_event(
-        self, worker_id: str, type: str, payload: dict[str, Any] | None = None
-    ) -> Event:
+    def add_event(self, worker_id: str, type: str, payload: dict[str, Any] | None = None) -> Event:
         payload_json = json.dumps(payload) if payload is not None else None
         try:
             cur = self._conn.execute(

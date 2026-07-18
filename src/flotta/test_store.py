@@ -70,12 +70,7 @@ def test_every_declared_transition_is_accepted(store):
 
 @pytest.mark.parametrize(
     ("src", "dst"),
-    sorted(
-        (src, dst)
-        for src in STATUSES
-        for dst in STATUSES
-        if dst not in TRANSITIONS[src]
-    ),
+    sorted((src, dst) for src in STATUSES for dst in STATUSES if dst not in TRANSITIONS[src]),
 )
 def test_every_undeclared_transition_is_rejected(store, src, dst):
     w = store.create_worker("t")
