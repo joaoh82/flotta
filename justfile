@@ -58,6 +58,18 @@ check: lint test
 smoke: modal-whoami
     MODAL_PROFILE={{modal_profile}} modal run src/flotta/worker/modal_app.py
 
+# M3 — deploy the provisioning app (run_worker). Required before `just e2e`.
+deploy: modal-whoami
+    MODAL_PROFILE={{modal_profile}} modal deploy src/flotta/provision.py
+
+# M3 end-to-end lifecycle against real Modal: spawn -> watch -> teardown, asserting
+# the store at each step. Dry-run by default (no LLM, no provider key needed).
+e2e *ARGS: modal-whoami
+    MODAL_PROFILE={{modal_profile}} uv run python scripts/e2e_lifecycle.py {{ARGS}}
+
+# same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
+e2e-live: (e2e "--live")
+
 # show the development plan (lives in the parent workspace)
 plan:
     @sed -n '1,60p' ../docs/development-plan.md

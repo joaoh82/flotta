@@ -27,26 +27,14 @@ import modal
 # sys.path). This must be defensive: inside the container Modal copies this
 # file to /root/modal_app.py, where those parent directories do not exist —
 # there the package arrives via add_local_python_source instead, so skip it.
+# Must run *before* the `flotta.*` import below. (Same block in provision.py;
+# it cannot be factored out because factoring it out needs the import it fixes.)
 _HERE = pathlib.Path(__file__).resolve()
 _SRC = _HERE.parents[2] if len(_HERE.parents) > 2 else None
 if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-# Hermes Agent pin — matches the vendored clone validated in SEAM_NOTES
-# (commit 594308d4bbe9). Bump here to move to a newer Hermes.
-HERMES_REF = "594308d4bbe95548c9fe418bb10c449099426f93"
-HERMES_PKG = f"hermes-agent[mcp] @ git+https://github.com/NousResearch/Hermes-Agent@{HERMES_REF}"
-
-# The `[mcp]` extra pulls in the MCP SDK (mcp==1.26.0) + starlette; uvicorn
-# serves the streamable-http app. Hermes's own deps are exact-pinned upstream.
-worker_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git")
-    .pip_install(HERMES_PKG, "uvicorn==0.34.0")
-    # Ship the local Flotta package into the container, importable as `flotta`.
-    # (sys.path was primed above so this module name resolves at build time.)
-    .add_local_python_source("flotta")
-)
+from flotta.worker.image import worker_image  # noqa: E402  (needs the sys.path prime above)
 
 app = modal.App("flotta-worker")
 

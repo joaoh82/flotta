@@ -16,7 +16,9 @@ The parent (`/Users/joaoh82/projects/flotta_parent`) is a **planning-only worksp
 
 ## Current state
 
-The repo is scaffolded: `pyproject.toml` (Python 3.11, hatchling, src layout, pytest + ruff dev group via uv), `uv.lock`, `src/flotta/` with `store.py` + `test_store.py`, and `vendor/hermes` (read-only reference clone, gitignored). Milestones done: **M1** (seam validation — **GO**, findings in the parent's `docs/SEAM_NOTES.md`, decision D7) and **M3.1** (fleet-state store). Next up: **M2** (worker image), then the rest of M3. M0 namespace tasks (PyPI/npm placeholders, Modal auth) may still be open — check the plan. Follow the milestones in order — do not skip ahead or exceed v0.1 scope.
+Milestones done: **M1** (seam validation — **GO**, findings in the parent's `docs/SEAM_NOTES.md`, decision D7), **M2** (worker image + Flotta-owned MCP server, D9), and **M3** (provisioning + fleet-state store, D10). The lifecycle is proven end-to-end on real Modal: `just deploy && just e2e`. Next up: **M4** (CLI). M0 namespace tasks (PyPI/npm placeholders) may still be open — check the plan. Follow the milestones in order — do not skip ahead or exceed v0.1 scope.
+
+Local config lives in `.env` (gitignored; copy from `.env.example`). Note that `just` only auto-loads a file named exactly `.env` — a `.env.local` is *not* read.
 
 ## Source of truth
 
@@ -33,7 +35,7 @@ The living planning docs live in the **parent** repo (`/Users/joaoh82/projects/f
 The runtime is built around one durable store that is the single source of truth for fleet state; everything else reads from or writes to it.
 
 - **`src/flotta/store.py`** — ✅ built (M3.1). Fleet-state store on SQLite via stdlib `sqlite3`, designed so the connection factory could later point at **Turso** (thin SQL, no ORM — D8). Two tables: `workers` (id, task, status `provisioning|running|done|failed|torn_down`, endpoint, spawned_at, finished_at, cost_estimate) and `events` (id, worker_id, ts, type, payload_json). Status transitions are **validated** by an explicit transition table (e.g. no `done → running`; `torn_down` is terminal).
-- **`src/flotta/provision.py`** — Modal app: `spawn_worker(task) -> {worker_id, endpoint}` and `teardown(worker_id)` (idempotent). Both write lifecycle events to the store.
+- **`src/flotta/provision.py`** — ✅ built (M3). Split by *where code runs* (D10): `run_worker` is the deployed Modal function (does the work, never touches the store); `spawn_worker(task) -> {worker_id, endpoint}`, `watch_worker(id)` and `teardown(id)` (idempotent) run **locally** beside the store file and are its only writers. The store is a local SQLite file, unreachable from a container — hence a watcher, not entrypoint self-reporting. The stored `endpoint` is the Modal call handle `modal://flotta-provision/run_worker/<fc_id>`.
 - **`src/flotta/worker/`** — Modal image definition (Hermes installed, pinned) + container entrypoint: reads `FLOTTA_TASK` / `FLOTTA_TIMEOUT_S` from env, sets `HERMES_HOME` to a writable ephemeral path, boots Hermes **headless** via `AIAgent` (no messaging gateway, single pinned provider, fixed toolset, `skip_context_files`/`skip_memory` — per SEAM_NOTES Q1), and exits on completion or a hard timeout (default 900s). **Not `hermes mcp serve`** — that is a stdio messaging bridge, not a task endpoint (D7, SEAM_NOTES Q2). The MCP surface, if used over the one-shot form, is a thin Flotta-owned streamable-http server exposing a `run_task` tool; Hermes's MCP client can already dial it by URL.
 - **`src/flotta/cli.py`** — Typer CLI: `flotta ps | logs <id> | kill <id> | spawn "<task>"`, all against the store and provisioning functions. Human-readable tables with a `--json` flag.
 - **`dashboard/`** — Next.js (TypeScript, App Router, Tailwind). API routes read the store file directly via `FLOTTA_STORE`; polling UI (2–5s). Localhost only, no auth in v0.1.
