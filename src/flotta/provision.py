@@ -1,9 +1,18 @@
 """Provisioning — spawn workers, watch them finish, tear them down.
 
-**Where each half runs (OQ2 / decision D10).** The fleet-state store is a plain
-local SQLite file (D8), so a Modal container cannot reach it. That settles the
-"entrypoint reports vs. a watcher" question in favour of a watcher, and splits
-this module in two:
+**Where each half runs (OQ2 / decision D10).** Two reasons pick a watcher over
+worker self-reporting, and the second is the one that lasts:
+
+1. Under D8 the v0.1 store is a plain local SQLite file, which a container
+   cannot reach. This is a consequence of that deferral, *not* of the design —
+   D3 still points at Turso, and a Turso Cloud store would be reachable from a
+   container, so this reason expires when Turso lands.
+2. A worker that dies mid-task — OOM, preemption, container kill — writes
+   nothing at all. A worker that owned its own status would strand in
+   ``running`` forever. The watcher owns the verdict precisely because it
+   outlives the worker, and that stays true under Turso.
+
+So the module splits in two:
 
 - ``run_worker`` runs **inside Modal**. It does the work and touches no store.
   This is the only piece `modal deploy` publishes.
