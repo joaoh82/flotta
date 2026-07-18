@@ -23,9 +23,13 @@ import sys
 import modal
 
 # Make the local `flotta` package importable when this file is run via
-# `modal run` from the repo root (src/ is not otherwise on sys.path).
-_SRC = pathlib.Path(__file__).resolve().parents[2]
-if str(_SRC) not in sys.path:
+# `modal run src/flotta/worker/modal_app.py` (src/ is not otherwise on
+# sys.path). This must be defensive: inside the container Modal copies this
+# file to /root/modal_app.py, where those parent directories do not exist —
+# there the package arrives via add_local_python_source instead, so skip it.
+_HERE = pathlib.Path(__file__).resolve()
+_SRC = _HERE.parents[2] if len(_HERE.parents) > 2 else None
+if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 # Hermes Agent pin — matches the vendored clone validated in SEAM_NOTES
