@@ -1,6 +1,10 @@
 # Flotta dev commands — https://just.systems
 # Keep this file updated as milestones land (M2: modal smoke test, M4: CLI, M5: dashboard).
 
+# Local settings come from .env (gitignored) — copy .env.example to start.
+# That file is the single place to look for machine-local config.
+set dotenv-load := true
+
 # Modal profile for THIS project. Every modal recipe pins it explicitly so no
 # Flotta command ever inherits whatever `modal profile activate` left global —
 # a wrong active profile would otherwise build/deploy into an unrelated
