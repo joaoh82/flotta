@@ -15,13 +15,16 @@ from flotta.cli import (
     DEFAULT_STORE,
     STORE_ENV_VAR,
     TERMINAL,
+    apply_modal_profile,
     event_row,
     fmt_age,
     fmt_duration,
     parse_ts,
+    read_dotenv_value,
     render_events,
     render_table,
     render_workers,
+    resolve_modal_profile,
     resolve_store_path,
     truncate,
     worker_duration,
@@ -237,6 +240,100 @@ def test_store_path_falls_back_to_the_env_var(monkeypatch):
 def test_store_path_defaults_to_the_working_directory(monkeypatch):
     monkeypatch.delenv(STORE_ENV_VAR, raising=False)
     assert str(resolve_store_path(None)) == DEFAULT_STORE
+
+
+# -- dotenv reader ----------------------------------------------------------
+
+
+def write_env(tmp_path, body):
+    path = tmp_path / ".env"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_dotenv_reads_a_plain_value(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=flotta\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+def test_dotenv_ignores_comments_and_blanks(tmp_path):
+    path = write_env(tmp_path, "# a comment\n\n  \nFLOTTA_MODAL_PROFILE=flotta\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+def test_dotenv_handles_export_prefix(tmp_path):
+    path = write_env(tmp_path, "export FLOTTA_MODAL_PROFILE=flotta\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+@pytest.mark.parametrize("quoted", ['"flotta"', "'flotta'"])
+def test_dotenv_strips_matching_quotes(tmp_path, quoted):
+    path = write_env(tmp_path, f"FLOTTA_MODAL_PROFILE={quoted}\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+def test_dotenv_strips_a_trailing_comment(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=flotta # the workspace\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+def test_dotenv_returns_none_for_a_missing_key(tmp_path):
+    path = write_env(tmp_path, "SOMETHING_ELSE=1\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) is None
+
+
+def test_dotenv_returns_none_for_an_empty_value(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) is None
+
+
+def test_dotenv_missing_file_is_not_an_error(tmp_path):
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", tmp_path / "nope.env") is None
+
+
+def test_dotenv_survives_malformed_lines(tmp_path):
+    path = write_env(tmp_path, "garbage line\n=novalue\nFLOTTA_MODAL_PROFILE=flotta\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+def test_dotenv_does_not_match_a_key_that_merely_shares_a_prefix(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE_EXTRA=nope\nFLOTTA_MODAL_PROFILE=flotta\n")
+    assert read_dotenv_value("FLOTTA_MODAL_PROFILE", path) == "flotta"
+
+
+# -- modal profile resolution -----------------------------------------------
+
+
+def test_explicit_modal_profile_is_never_overridden(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=flotta\n")
+    env = {"MODAL_PROFILE": "chosen-by-the-caller"}
+    assert resolve_modal_profile(env, path) is None
+    apply_modal_profile(env, path)
+    assert env["MODAL_PROFILE"] == "chosen-by-the-caller"
+
+
+def test_flotta_profile_env_var_wins_over_dotenv(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=from-dotenv\n")
+    assert resolve_modal_profile({"FLOTTA_MODAL_PROFILE": "from-env"}, path) == "from-env"
+
+
+def test_profile_falls_back_to_dotenv(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=flotta\n")
+    assert resolve_modal_profile({}, path) == "flotta"
+
+
+def test_apply_sets_modal_profile_from_dotenv(tmp_path):
+    path = write_env(tmp_path, "FLOTTA_MODAL_PROFILE=flotta\n")
+    env: dict[str, str] = {}
+    assert apply_modal_profile(env, path) == "flotta"
+    assert env["MODAL_PROFILE"] == "flotta"
+
+
+def test_no_config_leaves_modal_to_its_own_active_profile(tmp_path):
+    """A single-workspace user has neither var set; do not interfere."""
+    env: dict[str, str] = {}
+    assert apply_modal_profile(env, tmp_path / "absent.env") is None
+    assert "MODAL_PROFILE" not in env
 
 
 # -- the one piece of view logic in ps --------------------------------------

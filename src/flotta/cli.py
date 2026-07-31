@@ -17,6 +17,15 @@ to unit-test, which is where this module's tests live.
 in the working directory. The dashboard (M5) reads the same ``FLOTTA_STORE``
 variable, so pointing both at one file is the default experience.
 
+**Modal workspace resolution**, in order: ``$MODAL_PROFILE`` (left untouched if
+already set) → ``$FLOTTA_MODAL_PROFILE`` → ``FLOTTA_MODAL_PROFILE`` in a local
+``.env`` → Modal's own active profile. This matters because the installed
+``flotta`` binary runs with no justfile around it, so nothing else is pinning
+the workspace: without this, a `modal profile activate` for an unrelated
+project would silently redirect `spawn` into the wrong workspace. The
+resolution must happen *before* `provision` is imported, since that module
+imports `modal`, which reads its config at import time — hence `_provision()`.
+
 Note that `ps` and `logs` are pure store reads — they need no Modal
 credentials at all. Only `spawn`, `watch` and `kill` reach the cloud.
 """
@@ -36,6 +45,9 @@ from .store import Event, FleetStore, UnknownWorkerError, Worker
 
 DEFAULT_STORE = "fleet.db"
 STORE_ENV_VAR = "FLOTTA_STORE"
+DEFAULT_DOTENV = ".env"
+PROFILE_ENV_VAR = "FLOTTA_MODAL_PROFILE"
+MODAL_PROFILE_ENV_VAR = "MODAL_PROFILE"
 
 # Terminal states, mirroring provision._TERMINAL — a worker here is finished.
 TERMINAL = frozenset({"done", "failed", "torn_down"})
@@ -163,6 +175,73 @@ def resolve_store_path(explicit: str | None = None) -> Path:
     return Path(explicit or os.environ.get(STORE_ENV_VAR) or DEFAULT_STORE)
 
 
+def read_dotenv_value(key: str, path: str | Path = DEFAULT_DOTENV) -> str | None:
+    """Read one key from a dotenv file, or None if absent/unreadable.
+
+    Deliberately minimal — Flotta needs exactly one value out of `.env` at CLI
+    startup, which is not worth a dependency. Handles comments, blank lines, an
+    `export ` prefix and quoted values; ignores anything malformed rather than
+    failing a command over a stray line.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.removeprefix("export ").strip()
+        if name != key:
+            continue
+        value = value.strip().split(" #", 1)[0].strip()  # strip trailing comment
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value or None
+    return None
+
+
+def resolve_modal_profile(
+    env: dict[str, str] | None = None, dotenv: str | Path = DEFAULT_DOTENV
+) -> str | None:
+    """Which Modal profile this invocation should target, or None to not interfere.
+
+    Returns None when `MODAL_PROFILE` is already set — an explicit choice by the
+    caller always wins — and when nothing names a profile, in which case Modal's
+    own active profile applies, as a single-workspace user would expect.
+    """
+    env = os.environ if env is None else env
+    if env.get(MODAL_PROFILE_ENV_VAR):
+        return None
+    return env.get(PROFILE_ENV_VAR) or read_dotenv_value(PROFILE_ENV_VAR, dotenv)
+
+
+def apply_modal_profile(
+    env: dict[str, str] | None = None, dotenv: str | Path = DEFAULT_DOTENV
+) -> str | None:
+    """Pin `MODAL_PROFILE` from Flotta's config. Returns the profile applied, if any."""
+    env = os.environ if env is None else env
+    profile = resolve_modal_profile(env, dotenv)
+    if profile:
+        env[MODAL_PROFILE_ENV_VAR] = profile
+    return profile
+
+
+def _provision():
+    """Import the provisioning module with the Modal workspace pinned first.
+
+    Ordering is load-bearing: `provision` imports `modal` at module level, and
+    `modal` reads its configuration (including `MODAL_PROFILE`) at import time.
+    Pinning after the import would be silently ignored.
+    """
+    apply_modal_profile()
+    from . import provision
+
+    return provision
+
+
 def emit(payload: Any, table: str, *, as_json: bool) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str) if as_json else table)
 
@@ -248,12 +327,12 @@ def spawn(
     wait: bool = typer.Option(False, "--wait", help="Block until the worker finishes"),
 ) -> None:
     """Launch a worker for TASK (manual spawn — no orchestrator involved)."""
-    from .provision import ProvisionError, spawn_worker, watch_worker
+    provision = _provision()
 
     with _open_store(store) as fleet:
         try:
-            result = spawn_worker(task, store=fleet, timeout_s=timeout_s, dry_run=dry_run)
-        except (ProvisionError, ValueError) as exc:
+            result = provision.spawn_worker(task, store=fleet, timeout_s=timeout_s, dry_run=dry_run)
+        except (provision.ProvisionError, ValueError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
 
@@ -264,7 +343,7 @@ def spawn(
 
         if not as_json:
             typer.echo(f"{worker_id}  running — waiting…", err=True)
-        outcome = watch_worker(worker_id, store=fleet, timeout_s=timeout_s)
+        outcome = provision.watch_worker(worker_id, store=fleet, timeout_s=timeout_s)
         worker = fleet.get_worker(worker_id)
         if as_json:
             emit({**result, **outcome, "worker": worker_dict(worker)}, "", as_json=True)
@@ -287,11 +366,11 @@ def watch(
     timeout_s: int = typer.Option(900, "--timeout-s", help="How long to wait"),
 ) -> None:
     """Block until a worker reaches a terminal state, then report it."""
-    from .provision import watch_worker
+    provision = _provision()
 
     with _open_store(store) as fleet:
         _require(fleet, worker_id)
-        outcome = watch_worker(worker_id, store=fleet, timeout_s=timeout_s)
+        outcome = provision.watch_worker(worker_id, store=fleet, timeout_s=timeout_s)
         worker = fleet.get_worker(worker_id)
         emit(
             {**outcome, "worker": worker_dict(worker)},
@@ -310,12 +389,12 @@ def kill(
     reason: str = typer.Option("cli", "--reason", help="Recorded on the torn_down event"),
 ) -> None:
     """Tear down a worker. Idempotent — killing a dead worker is not an error."""
-    from .provision import teardown
+    provision = _provision()
 
     with _open_store(store) as fleet:
         _require(fleet, worker_id)
         try:
-            result = teardown(worker_id, store=fleet, reason=reason)
+            result = provision.teardown(worker_id, store=fleet, reason=reason)
         except UnknownWorkerError as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc

@@ -70,10 +70,16 @@ e2e *ARGS: modal-whoami
 # same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
 e2e-live: (e2e "--live")
 
-# M4 CLI — e.g. `just flotta ps`, `just flotta spawn "task" --wait`, `just flotta logs <id>`.
-# Installing the package puts a bare `flotta` on PATH; this recipe just saves the `uv run`.
-flotta *ARGS:
-    MODAL_PROFILE={{modal_profile}} uv run flotta {{ARGS}}
+# M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
+# arguments are re-split by the shell, so `just flotta spawn "a b c"` breaks on
+# exactly the case the CLI exists for. Run it directly instead:
+#
+#   uv run flotta ps
+#   uv run flotta spawn "summarize the logs" --wait
+#
+# The workspace no longer needs pinning at the call site: the CLI resolves
+# FLOTTA_MODAL_PROFILE itself (env, then .env) before touching Modal, so an
+# installed bare `flotta` targets the right workspace on its own.
 
 # show the development plan (lives in the parent workspace)
 plan:
