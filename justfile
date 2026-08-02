@@ -62,13 +62,35 @@ smoke: modal-whoami
 deploy: modal-whoami
     MODAL_PROFILE={{modal_profile}} modal deploy src/flotta/provision.py
 
-# M3 end-to-end lifecycle against real Modal: spawn -> watch -> teardown, asserting
-# the store at each step. Dry-run by default (no LLM, no provider key needed).
+# `just --list` shows only the LAST comment line, so keep that line a complete
+# summary — earlier lines are detail for anyone reading the file.
+# Spawn -> watch -> teardown against real Modal, asserting the store at each step.
+# M3 end-to-end lifecycle, dry-run by default (no LLM, no provider key needed)
 e2e *ARGS: modal-whoami
     MODAL_PROFILE={{modal_profile}} uv run python scripts/e2e_lifecycle.py {{ARGS}}
 
 # same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
 e2e-live: (e2e "--live")
+
+# Port 3001 is baked into dashboard/package.json rather than passed here: 3000
+# is reserved for another local service and a flag is too easy to forget.
+# Reads $FLOTTA_STORE, else ../fleet.db — the same store the CLI writes.
+# M5 dashboard — local fleet view on http://localhost:3001
+dashboard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd dashboard
+    [ -d node_modules ] || npm install
+    npm run dev
+
+# type-check + lint the dashboard (the Python `check` recipe does not cover it)
+check-dashboard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd dashboard
+    [ -d node_modules ] || npm install
+    npx tsc --noEmit
+    npx eslint .
 
 # M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
 # arguments are re-split by the shell, so `just flotta spawn "a b c"` breaks on

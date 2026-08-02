@@ -232,8 +232,20 @@ def _modal_waiter(call_id: str, timeout_s: float | None) -> Any:
 
 
 def _modal_canceller(call_id: str) -> None:
-    """Cancel a function call and kill the container running it."""
-    modal.FunctionCall.from_id(call_id).cancel(terminate_containers=True)
+    """Cancel a function call, stopping the container running it.
+
+    Deliberately *not* ``terminate_containers=True``. The SDK accepts that
+    argument, but the Modal server rejects the request outright::
+
+        InvalidError: FunctionCallCancel request must have a function_call_id
+        and terminate_containers must be false
+
+    Because `teardown` records a cancel failure without raising, that rejection
+    was silent: the worker's row closed while its container kept running and
+    billing. A plain `cancel()` already stops execution and marks the inputs
+    terminated, which is the whole requirement.
+    """
+    modal.FunctionCall.from_id(call_id).cancel()
 
 
 # -- local orchestration (the only writers to the store) --------------------

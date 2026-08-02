@@ -142,6 +142,15 @@ def run(store_path: pathlib.Path, *, live: bool, timeout_s: int, watch_timeout_s
             str(event_types(store, worker_id)),
         )
         check("teardown reported previous status", torn.get("already_torn_down") is False)
+        # The regression guard for the bug M5 surfaced: `teardown` records a
+        # cancel failure instead of raising, so a rejected cancel closed the
+        # row while the container kept running and billing. Asserting only the
+        # store state cannot see that — the cancel outcome has to be checked.
+        check(
+            "modal cancel did not error",
+            torn.get("cancel_error") is None,
+            f"cancel_error={torn.get('cancel_error')!r}",
+        )
 
         # -- 4. teardown again (idempotence) -------------------------------
         print("\n[4/4] teardown again (idempotence)")

@@ -344,3 +344,34 @@ def test_terminal_set_matches_provision():
     from flotta.provision import _TERMINAL
 
     assert TERMINAL == _TERMINAL
+
+
+# -- store must exist for reads ---------------------------------------------
+
+
+def test_open_store_refuses_a_missing_path_for_reads(tmp_path, monkeypatch):
+    """A mistyped --store must not render as an empty fleet.
+
+    `_open_store` carried a comment promising exactly this while the code
+    created the file regardless — so `flotta ps --store typo.db` printed
+    "(none)", which reads as "no workers" when it means "wrong file".
+    """
+    import typer
+
+    from flotta.cli import _open_store
+
+    missing = tmp_path / "definitely-not-here.db"
+    with pytest.raises(typer.Exit) as excinfo:
+        _open_store(str(missing))
+    assert excinfo.value.exit_code == 2
+    assert not missing.exists(), "a read must never create the store"
+
+
+def test_open_store_allows_creation_for_spawn(tmp_path):
+    """`spawn` is the one command that may start a fleet from nothing."""
+    from flotta.cli import _open_store
+
+    fresh = tmp_path / "new.db"
+    with _open_store(str(fresh), must_exist=False):
+        pass
+    assert fresh.exists()
