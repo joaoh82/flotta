@@ -344,3 +344,38 @@ def test_full_lifecycle_event_sequence(store):
     assert worker.status == "torn_down"
     assert worker.finished_at is not None
     assert event_types(store, wid) == ["spawned", "running", "completed", "torn_down"]
+
+
+# -- the real Modal canceller -----------------------------------------------
+
+
+def test_modal_canceller_does_not_pass_terminate_containers(monkeypatch):
+    """Regression guard for the bug M5 surfaced.
+
+    `_modal_canceller` used to call `cancel(terminate_containers=True)`. The SDK
+    accepts that argument but the Modal *server* rejects the request, and since
+    `teardown` records a cancel failure rather than raising, the worker's row
+    closed while its container kept running and billing.
+
+    Every other test injects a fake `canceller`, so the real one had no
+    coverage at all — which is exactly why this survived to M5.
+    """
+    from flotta import provision
+
+    seen = {}
+
+    class FakeCall:
+        def cancel(self, *args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        provision.modal.FunctionCall, "from_id", staticmethod(lambda call_id: FakeCall())
+    )
+    provision._modal_canceller("fc-123")
+
+    assert seen["args"] == ()
+    assert seen["kwargs"] == {}, (
+        "cancel() must take no arguments; the Modal server rejects "
+        "terminate_containers and the failure is silent"
+    )

@@ -246,10 +246,27 @@ def emit(payload: Any, table: str, *, as_json: bool) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str) if as_json else table)
 
 
-def _open_store(store: str | None) -> FleetStore:
+def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
+    """Open the fleet-state store.
+
+    Reads must not conjure an empty store at a mistyped path and then cheerfully
+    report "(none)" — that reads as "no workers" when it means "wrong file". Only
+    `spawn`, which legitimately starts a fleet from nothing, passes
+    ``must_exist=False``.
+
+    (The comment above used to sit here on its own while `FleetStore(path)`
+    happily created the file anyway; the dashboard, which reports a missing
+    store explicitly, is what made the discrepancy visible.)
+    """
     path = resolve_store_path(store)
-    # Reads must not conjure an empty store at a mistyped path and then cheerfully
-    # report "(none)" — that reads as "no workers" when it means "wrong file".
+    if must_exist and not path.exists():
+        typer.secho(f"no fleet-state store at {path}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            'Spawn a worker first (flotta spawn "..."), or point at an existing '
+            "store with --store / $FLOTTA_STORE.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     return FleetStore(path)
 
 
@@ -329,7 +346,8 @@ def spawn(
     """Launch a worker for TASK (manual spawn — no orchestrator involved)."""
     provision = _provision()
 
-    with _open_store(store) as fleet:
+    # The one command that may create the store: spawning is how a fleet starts.
+    with _open_store(store, must_exist=False) as fleet:
         try:
             result = provision.spawn_worker(task, store=fleet, timeout_s=timeout_s, dry_run=dry_run)
         except (provision.ProvisionError, ValueError) as exc:
