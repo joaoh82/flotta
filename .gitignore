@@ -7,4 +7,10 @@ __pycache__/
 *.py[co]
 .pytest_cache/
 .ruff_cache/
+# Fleet-state stores. The -wal/-shm sidecars need their own patterns: `*.db`
+# does not match `fleet.db-wal`, so running the CLI or the dashboard left two
+# committable binary files behind. The WAL in particular can hold transaction
+# data that never belongs in a commit.
 *.db
+*.db-wal
+*.db-shm
