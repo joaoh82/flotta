@@ -72,6 +72,35 @@ e2e *ARGS: modal-whoami
 # same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
 e2e-live: (e2e "--live")
 
+# Symlinked rather than copied, so edits to the skill take effect immediately
+# without a reinstall. Remove with `just uninstall-skill`.
+# M6 — install the orchestrator skill into the local Hermes (~/.hermes/skills)
+install-skill:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="${HERMES_HOME:-$HOME/.hermes}/skills/flotta-orchestrator"
+    if [ ! -d "$(dirname "$dest")" ]; then
+      echo "ERROR: no Hermes skills directory at $(dirname "$dest")." >&2
+      echo "Is Hermes installed? Set HERMES_HOME if it lives elsewhere." >&2
+      exit 1
+    fi
+    # Refuse to clobber a real directory — only ever replace our own symlink.
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+      echo "ERROR: $dest exists and is not a symlink; refusing to overwrite." >&2
+      exit 1
+    fi
+    ln -sfn "$(pwd)/skills/orchestrator" "$dest"
+    echo "linked $dest -> $(pwd)/skills/orchestrator"
+
+# M6 — remove the orchestrator skill from the local Hermes
+uninstall-skill:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="${HERMES_HOME:-$HOME/.hermes}/skills/flotta-orchestrator"
+    if [ -L "$dest" ]; then rm "$dest" && echo "removed $dest"
+    elif [ -e "$dest" ]; then echo "$dest is not a symlink; leaving it alone." >&2; exit 1
+    else echo "nothing installed at $dest"; fi
+
 # Port 3001 is baked into dashboard/package.json rather than passed here: 3000
 # is reserved for another local service and a flag is too easy to forget.
 # Reads $FLOTTA_STORE, else ../fleet.db — the same store the CLI writes.
