@@ -64,7 +64,8 @@ _SRC = _HERE.parents[1] if len(_HERE.parents) > 1 else None
 if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from flotta.store import FleetStore, UnknownWorkerError  # noqa: E402  (needs the prime above)
+from flotta.store import TERMINAL as _TERMINAL  # noqa: E402  the canonical set
+from flotta.store import FleetStore, UnknownWorkerError  # noqa: E402  (needs the prime)
 from flotta.worker.config import DEFAULT_TIMEOUT_S  # noqa: E402
 from flotta.worker.image import worker_image  # noqa: E402
 
@@ -76,8 +77,42 @@ FUNCTION_NAME = "run_worker"
 # per-task deadline is enforced inside the container by `_run_task_core`.
 MAX_TIMEOUT_S = 3600
 
-# Terminal states — nothing left to watch.
-_TERMINAL = frozenset({"done", "failed", "torn_down"})
+# Live-worker cap. v0.1 is a one-worker-at-a-time system and, until now, that
+# was documentation rather than behaviour: nothing counted before launching, so
+# a loop or an orchestrator ignoring the skill spent money instead of erroring.
+# Default 1 makes the documented scope true; raising it is an explicit opt-in to
+# territory nothing has tested. 0 means unlimited, for anyone who means it.
+DEFAULT_MAX_CONCURRENT = 1
+MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
+
+
+def resolve_max_concurrent(
+    explicit: int | None = None, env: dict[str, str] | None = None
+) -> int | None:
+    """How many workers may be live at once: explicit -> env -> default.
+
+    Returns ``None`` for *unlimited*, which is what ``0`` requests. Anyone
+    setting that has said so deliberately; the default of 1 is what protects
+    everyone who has not thought about it.
+    """
+    import os
+
+    env = os.environ if env is None else env
+
+    if explicit is None:
+        raw = (env.get(MAX_CONCURRENT_ENV) or "").strip()
+        if raw:
+            try:
+                explicit = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{MAX_CONCURRENT_ENV} must be an integer, got {raw!r}") from exc
+        else:
+            explicit = DEFAULT_MAX_CONCURRENT
+
+    if explicit < 0:
+        raise ValueError(f"{MAX_CONCURRENT_ENV} must be >= 0, got {explicit}")
+    return None if explicit == 0 else explicit
+
 
 # Provider config forwarded from the local environment into the container as a
 # Modal Secret (never as a plain function argument, which would land in call
@@ -266,6 +301,7 @@ def spawn_worker(
     dry_run: bool = False,
     worker_id: str | None = None,
     launcher: Launcher | None = None,
+    max_concurrent: int | None = None,
 ) -> dict[str, str]:
     """Launch a worker for `task` and record it. Returns ``{worker_id, endpoint}``.
 
@@ -277,7 +313,11 @@ def spawn_worker(
         raise ValueError(f"timeout_s {timeout_s} exceeds the container cap of {MAX_TIMEOUT_S}s")
 
     launch = launcher or _modal_launcher
-    worker = store.create_worker(task, worker_id=worker_id)
+    # The cap is enforced by the store so the count and the insert share one
+    # transaction — checking here and inserting after would race.
+    worker = store.create_worker(
+        task, worker_id=worker_id, max_live=resolve_max_concurrent(max_concurrent)
+    )
     store.add_event(
         worker.id, "spawned", {"task": task, "timeout_s": timeout_s, "dry_run": dry_run}
     )

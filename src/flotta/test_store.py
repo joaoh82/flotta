@@ -5,6 +5,7 @@ import pytest
 from flotta.store import (
     STATUSES,
     TRANSITIONS,
+    ConcurrencyLimitError,
     FleetStore,
     InvalidStatusError,
     InvalidTransitionError,
@@ -215,3 +216,73 @@ def test_state_survives_reopen(tmp_path):
         assert w is not None
         assert (w.status, w.endpoint) == ("running", "https://e")
         assert [e.type for e in s.get_events(wid)] == ["spawned"]
+
+
+# -- concurrency cap (M7.1c) ------------------------------------------------
+
+
+def test_create_worker_without_a_cap_is_unchanged(store):
+    """The cap is opt-in; omitting max_live must not start refusing spawns."""
+    for i in range(5):
+        store.create_worker(f"task {i}")
+    assert len(store.list_workers()) == 5
+
+
+def test_cap_refuses_once_the_limit_is_reached(store):
+    store.create_worker("first", max_live=1)
+    with pytest.raises(ConcurrencyLimitError) as excinfo:
+        store.create_worker("second", max_live=1)
+    assert excinfo.value.limit == 1
+    assert len(excinfo.value.live_ids) == 1
+
+
+def test_cap_names_the_live_workers_so_there_is_something_to_act_on(store):
+    a = store.create_worker("a", max_live=2)
+    b = store.create_worker("b", max_live=2)
+    with pytest.raises(ConcurrencyLimitError) as excinfo:
+        store.create_worker("c", max_live=2)
+    assert set(excinfo.value.live_ids) == {a.id, b.id}
+    assert a.id in str(excinfo.value)
+
+
+def test_cap_allows_a_spawn_below_the_limit(store):
+    store.create_worker("first", max_live=3)
+    store.create_worker("second", max_live=3)
+    assert len(store.list_workers()) == 2
+
+
+@pytest.mark.parametrize("terminal", ["done", "failed", "torn_down"])
+def test_terminal_workers_do_not_count_toward_the_cap(store, terminal):
+    """A finished worker holds no slot — otherwise the fleet jams after one task."""
+    first = store.create_worker("first", max_live=1)
+    store.update_status(first.id, "running")
+    store.update_status(first.id, terminal)
+
+    second = store.create_worker("second", max_live=1)
+    assert second.id != first.id
+
+
+def test_provisioning_counts_as_live(store):
+    """A worker mid-launch holds a slot; otherwise two spawns race past the cap."""
+    first = store.create_worker("first", max_live=1)
+    assert first.status == "provisioning"
+    with pytest.raises(ConcurrencyLimitError):
+        store.create_worker("second", max_live=1)
+
+
+def test_a_refused_spawn_leaves_no_row_behind(store):
+    """The rollback must be real — a phantom row would hold a slot forever."""
+    store.create_worker("first", max_live=1)
+    with pytest.raises(ConcurrencyLimitError):
+        store.create_worker("second", max_live=1)
+    assert [w.task for w in store.list_workers()] == ["first"]
+    assert store.count_live() == 1
+
+
+def test_count_live_ignores_terminal_workers(store):
+    a = store.create_worker("a")
+    store.create_worker("b")
+    assert store.count_live() == 2
+    store.update_status(a.id, "running")
+    store.update_status(a.id, "done")
+    assert store.count_live() == 1

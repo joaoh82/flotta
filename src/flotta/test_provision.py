@@ -15,11 +15,12 @@ from flotta.provision import (
     classify_result,
     endpoint_for,
     function_call_id,
+    resolve_max_concurrent,
     spawn_worker,
     teardown,
     watch_worker,
 )
-from flotta.store import FleetStore, UnknownWorkerError
+from flotta.store import ConcurrencyLimitError, FleetStore, UnknownWorkerError
 
 
 @pytest.fixture
@@ -379,3 +380,79 @@ def test_modal_canceller_does_not_pass_terminate_containers(monkeypatch):
         "cancel() must take no arguments; the Modal server rejects "
         "terminate_containers and the failure is silent"
     )
+
+
+# -- concurrency cap policy (M7.1c) -----------------------------------------
+
+
+def test_max_concurrent_defaults_to_one():
+    """The documented v0.1 scope should be the behaviour, not just the docs."""
+    assert resolve_max_concurrent(None, {}) == 1
+
+
+def test_max_concurrent_reads_the_env():
+    assert resolve_max_concurrent(None, {"FLOTTA_MAX_CONCURRENT": "4"}) == 4
+
+
+def test_explicit_max_concurrent_beats_the_env():
+    assert resolve_max_concurrent(7, {"FLOTTA_MAX_CONCURRENT": "4"}) == 7
+
+
+def test_zero_means_unlimited():
+    """None is the store's 'no cap' sentinel; 0 is how a human asks for it."""
+    assert resolve_max_concurrent(0, {}) is None
+    assert resolve_max_concurrent(None, {"FLOTTA_MAX_CONCURRENT": "0"}) is None
+
+
+@pytest.mark.parametrize("bad", ["abc", "1.5", ""])
+def test_bad_env_values(bad):
+    if bad == "":
+        assert resolve_max_concurrent(None, {"FLOTTA_MAX_CONCURRENT": bad}) == 1
+    else:
+        with pytest.raises(ValueError, match="FLOTTA_MAX_CONCURRENT"):
+            resolve_max_concurrent(None, {"FLOTTA_MAX_CONCURRENT": bad})
+
+
+def test_negative_is_rejected():
+    with pytest.raises(ValueError, match=">= 0"):
+        resolve_max_concurrent(-1, {})
+
+
+def test_spawn_worker_refuses_past_the_cap(store, monkeypatch):
+    """The whole point: a second spawn must error rather than spend money."""
+    monkeypatch.delenv("FLOTTA_MAX_CONCURRENT", raising=False)
+    spawn_worker("first", store=store, dry_run=True, launcher=fake_launcher("fc-1"))
+
+    launched = []
+    with pytest.raises(ConcurrencyLimitError):
+        spawn_worker(
+            "second",
+            store=store,
+            dry_run=True,
+            launcher=lambda **kw: launched.append(kw) or "fc-2",
+        )
+    assert launched == [], "the launcher must not be reached once the cap refuses"
+    assert len(store.list_workers()) == 1
+
+
+def test_spawn_worker_allows_a_second_once_the_first_is_terminal(store, monkeypatch):
+    monkeypatch.delenv("FLOTTA_MAX_CONCURRENT", raising=False)
+    first = spawn_worker("first", store=store, dry_run=True, launcher=fake_launcher("fc-1"))
+    watch_worker(
+        first["worker_id"], store=store, waiter=lambda c, t: {"completed": True, "dry_run": True}
+    )
+    second = spawn_worker("second", store=store, dry_run=True, launcher=fake_launcher("fc-2"))
+    assert second["worker_id"] != first["worker_id"]
+
+
+def test_spawn_worker_honours_an_explicit_higher_cap(store, monkeypatch):
+    monkeypatch.delenv("FLOTTA_MAX_CONCURRENT", raising=False)
+    for i in range(3):
+        spawn_worker(
+            f"task {i}",
+            store=store,
+            dry_run=True,
+            max_concurrent=3,
+            launcher=fake_launcher(f"fc-{i}"),
+        )
+    assert store.count_live() == 3

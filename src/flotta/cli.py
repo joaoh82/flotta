@@ -41,7 +41,8 @@ from typing import Any
 
 import typer
 
-from .store import Event, FleetStore, UnknownWorkerError, Worker
+from .store import TERMINAL as STORE_TERMINAL
+from .store import ConcurrencyLimitError, Event, FleetStore, UnknownWorkerError, Worker
 
 DEFAULT_STORE = "fleet.db"
 STORE_ENV_VAR = "FLOTTA_STORE"
@@ -49,8 +50,8 @@ DEFAULT_DOTENV = ".env"
 PROFILE_ENV_VAR = "FLOTTA_MODAL_PROFILE"
 MODAL_PROFILE_ENV_VAR = "MODAL_PROFILE"
 
-# Terminal states, mirroring provision._TERMINAL — a worker here is finished.
-TERMINAL = frozenset({"done", "failed", "torn_down"})
+# Terminal states — imported, not re-declared, so it cannot drift from the store.
+TERMINAL = STORE_TERMINAL
 
 app = typer.Typer(
     name="flotta",
@@ -342,6 +343,11 @@ def spawn(
         False, "--dry-run", help="Boot the container but skip the LLM call"
     ),
     wait: bool = typer.Option(False, "--wait", help="Block until the worker finishes"),
+    max_concurrent: int | None = typer.Option(
+        None,
+        "--max-concurrent",
+        help="Live-worker cap; 0 disables it [$FLOTTA_MAX_CONCURRENT, default 1]",
+    ),
 ) -> None:
     """Launch a worker for TASK (manual spawn — no orchestrator involved)."""
     provision = _provision()
@@ -349,7 +355,24 @@ def spawn(
     # The one command that may create the store: spawning is how a fleet starts.
     with _open_store(store, must_exist=False) as fleet:
         try:
-            result = provision.spawn_worker(task, store=fleet, timeout_s=timeout_s, dry_run=dry_run)
+            result = provision.spawn_worker(
+                task,
+                store=fleet,
+                timeout_s=timeout_s,
+                dry_run=dry_run,
+                max_concurrent=max_concurrent,
+            )
+        except ConcurrencyLimitError as exc:
+            # Refusing to spawn is a policy decision, not a worker failure — exit 2
+            # so a script can tell "the fleet is busy" from "the task failed", and
+            # name the live workers so there is something to act on.
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            typer.secho(
+                "Inspect with `flotta ps`, free a slot with `flotta kill <id>`, "
+                "or raise the cap with --max-concurrent / $FLOTTA_MAX_CONCURRENT.",
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
         except (provision.ProvisionError, ValueError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
