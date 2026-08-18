@@ -1,12 +1,13 @@
 """`flotta` — see and control the fleet from the terminal (M4).
 
-Five commands over the store and the provisioning functions:
+Six commands over the store and the provisioning functions:
 
     flotta ps                    active + recent workers
     flotta spawn "<task>"        launch one (--wait to follow it)
     flotta watch <id>            block until a worker reaches a terminal state
     flotta logs <id>             the worker's event timeline
     flotta kill <id>             tear it down (idempotent)
+    flotta reconcile             resolve workers stranded past their deadline
 
 Every command takes ``--json`` for scripting; the default is a plain aligned
 table. Tables are hand-rolled rather than pulled from a rendering library —
@@ -27,7 +28,13 @@ resolution must happen *before* `provision` is imported, since that module
 imports `modal`, which reads its config at import time — hence `_provision()`.
 
 Note that `ps` and `logs` are pure store reads — they need no Modal
-credentials at all. Only `spawn`, `watch` and `kill` reach the cloud.
+credentials at all. Only `spawn`, `watch`, `kill` and `reconcile` reach the
+cloud.
+
+`reconcile` is deliberately its own command rather than something `ps` does
+automatically, which is what the plan first suggested. Auto-reconciling would
+turn the cheapest read in the CLI into a command that writes to the store and
+requires Modal credentials — losing a property worth keeping.
 """
 
 from __future__ import annotations
@@ -420,6 +427,40 @@ def watch(
         )
         if worker.status != "done":
             raise typer.Exit(code=1)
+
+
+@app.command()
+def reconcile(
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+    grace_s: int = typer.Option(
+        60, "--grace-s", help="Seconds past a worker's own timeout before it counts as stranded"
+    ),
+) -> None:
+    """Resolve workers stranded in a live state past their deadline.
+
+    A worker spawned without `--wait` and never watched sits at `running`
+    forever once its container dies, because only local code writes the store.
+    This re-attaches to each overdue call, records the real outcome when the
+    result is still available, and marks the rest `failed` with a reason.
+    """
+    provision = _provision()
+
+    with _open_store(store) as fleet:
+        outcomes = provision.reconcile(fleet, grace_s=grace_s)
+
+        if as_json:
+            emit(outcomes, "", as_json=True)
+            return
+        if not outcomes:
+            typer.echo("nothing to reconcile — no worker is past its deadline")
+            return
+        recovered = sum(1 for o in outcomes if o.get("recovered"))
+        for o in outcomes:
+            mark = "recovered" if o.get("recovered") else "closed"
+            typer.echo(f"{o['worker_id']}  {o['status']:10} {mark}")
+        typer.echo("")
+        typer.echo(f"{len(outcomes)} reconciled, {recovered} with a recovered result")
 
 
 @app.command()

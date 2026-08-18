@@ -6,21 +6,28 @@ whole file is hermetic: no Modal account, no network, no spend. The real
 adapters are covered by `scripts/e2e_lifecycle.py` against live Modal.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from flotta.provision import (
+    DEFAULT_GRACE_S,
     MAX_TIMEOUT_S,
     ProvisionError,
     WorkerTimeout,
     classify_result,
     endpoint_for,
     function_call_id,
+    overdue_workers,
+    reconcile,
     resolve_max_concurrent,
     spawn_worker,
     teardown,
     watch_worker,
+    worker_deadline_s,
 )
 from flotta.store import ConcurrencyLimitError, FleetStore, UnknownWorkerError
+from flotta.worker.config import DEFAULT_TIMEOUT_S
 
 
 @pytest.fixture
@@ -456,3 +463,121 @@ def test_spawn_worker_honours_an_explicit_higher_cap(store, monkeypatch):
             launcher=fake_launcher(f"fc-{i}"),
         )
     assert store.count_live() == 3
+
+
+# -- stranded-worker reconciler (M7.1b) -------------------------------------
+
+
+def _age(store, worker_id, seconds):
+    """Backdate a worker's spawned_at so it reads as `seconds` old."""
+    old = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    store._conn.execute("UPDATE workers SET spawned_at = ? WHERE id = ?", (old, worker_id))
+
+
+def test_worker_deadline_comes_from_the_spawned_event(store):
+    r = spawn_worker("t", store=store, timeout_s=300, dry_run=True, launcher=fake_launcher("fc-1"))
+    assert worker_deadline_s(store, r["worker_id"]) == 300
+
+
+def test_worker_deadline_falls_back_when_the_event_is_unusable(store):
+    worker = store.create_worker("no spawned event")
+    assert worker_deadline_s(store, worker.id) == DEFAULT_TIMEOUT_S
+
+
+def test_a_worker_inside_its_deadline_is_not_overdue(store):
+    spawn_worker("t", store=store, timeout_s=900, dry_run=True, launcher=fake_launcher("fc-1"))
+    assert overdue_workers(store) == []
+
+
+def test_a_worker_past_its_deadline_is_overdue(store):
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    _age(store, r["worker_id"], 60 + DEFAULT_GRACE_S + 30)
+    overdue = overdue_workers(store)
+    assert [w.id for w, _ in overdue] == [r["worker_id"]]
+
+
+def test_terminal_workers_are_never_overdue(store):
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    watch_worker(r["worker_id"], store=store, waiter=lambda c, t: {"completed": True})
+    _age(store, r["worker_id"], 10_000)
+    assert overdue_workers(store) == []
+
+
+def test_reconcile_recovers_a_result_that_is_still_available(store):
+    """The happy path: the container died, but Modal still has the answer."""
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    wid = r["worker_id"]
+    _age(store, wid, 60 + DEFAULT_GRACE_S + 30)
+
+    out = reconcile(
+        store,
+        waiter=lambda c, t: {"completed": True, "final_response": "recovered answer"},
+    )
+    assert out[0]["recovered"] is True
+    assert store.get_worker(wid).status == "done"
+    assert event_types(store, wid) == ["spawned", "running", "completed"]
+    payload = store.get_events(wid)[-1].payload
+    assert payload["final_response"] == "recovered answer"
+    assert payload["reconciled"] is True
+
+
+def test_reconcile_marks_failed_when_the_result_is_gone(store):
+    """The result expired or the call vanished — close the row, invent nothing."""
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    wid = r["worker_id"]
+    _age(store, wid, 60 + DEFAULT_GRACE_S + 30)
+
+    def gone(call_id, timeout):
+        raise RuntimeError("function call not found")
+
+    out = reconcile(store, waiter=gone)
+    assert out[0]["recovered"] is False
+    assert store.get_worker(wid).status == "failed"
+    assert event_types(store, wid)[-1] == "failed"
+    assert "could not be fetched" in store.get_events(wid)[-1].payload["error"]
+
+
+def test_reconcile_never_invents_a_completed_event(store):
+    """The load-bearing guarantee: no success is recorded for unobserved work."""
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    wid = r["worker_id"]
+    _age(store, wid, 10_000)
+
+    def gone(call_id, timeout):
+        raise RuntimeError("expired")
+
+    reconcile(store, waiter=gone)
+    assert "completed" not in event_types(store, wid)
+    assert store.get_worker(wid).status == "failed"
+
+
+def test_reconcile_handles_a_worker_that_never_got_an_endpoint(store):
+    """Launch crashed before recording a call id — nothing to re-attach to."""
+    worker = store.create_worker("never launched")
+    _age(store, worker.id, 10_000)
+    out = reconcile(store, waiter=lambda c, t: {"completed": True})
+    assert out[0]["status"] == "failed"
+    assert "no modal endpoint" in store.get_events(worker.id)[-1].payload["error"]
+
+
+def test_reconcile_leaves_healthy_workers_alone(store):
+    """A worker still inside its deadline must not be touched."""
+    r = spawn_worker("t", store=store, timeout_s=900, dry_run=True, launcher=fake_launcher("fc-1"))
+    called = []
+    assert reconcile(store, waiter=lambda c, t: called.append(c)) == []
+    assert called == []
+    assert store.get_worker(r["worker_id"]).status == "running"
+
+
+def test_reconcile_frees_a_slot_for_the_concurrency_cap(store, monkeypatch):
+    """The two M7.1 items compose: reconciling a stranded worker unblocks spawning."""
+    monkeypatch.delenv("FLOTTA_MAX_CONCURRENT", raising=False)
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    _age(store, r["worker_id"], 10_000)
+
+    with pytest.raises(ConcurrencyLimitError):
+        spawn_worker("blocked", store=store, dry_run=True, launcher=fake_launcher("fc-2"))
+
+    reconcile(store, waiter=lambda c, t: {"completed": True, "final_response": "x"})
+    second = spawn_worker("now ok", store=store, dry_run=True, launcher=fake_launcher("fc-3"))
+    assert second["worker_id"] != r["worker_id"]

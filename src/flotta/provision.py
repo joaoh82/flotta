@@ -49,6 +49,7 @@ from __future__ import annotations
 import pathlib
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import modal
@@ -65,7 +66,7 @@ if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not 
     sys.path.insert(0, str(_SRC))
 
 from flotta.store import TERMINAL as _TERMINAL  # noqa: E402  the canonical set
-from flotta.store import FleetStore, UnknownWorkerError  # noqa: E402  (needs the prime)
+from flotta.store import FleetStore, UnknownWorkerError, Worker  # noqa: E402  (needs prime)
 from flotta.worker.config import DEFAULT_TIMEOUT_S  # noqa: E402
 from flotta.worker.image import worker_image  # noqa: E402
 
@@ -84,6 +85,11 @@ MAX_TIMEOUT_S = 3600
 # territory nothing has tested. 0 means unlimited, for anyone who means it.
 DEFAULT_MAX_CONCURRENT = 1
 MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
+
+# Grace beyond a worker's own timeout before `reconcile` calls it stranded.
+# The container hard-exits at its timeout, so this only has to cover the lag
+# between that exit and the local process noticing.
+DEFAULT_GRACE_S = 60
 
 
 def resolve_max_concurrent(
@@ -118,18 +124,19 @@ def resolve_max_concurrent(
 # function argument (that would land in call logs).
 PROVIDER_KEYS = ("FLOTTA_MODEL", "FLOTTA_MODEL_BASE_URL", "FLOTTA_API_KEY")
 
-# The secret is referenced **by name**, and that is the whole point (M7.1a).
-# `Secret.from_name` hydrates lazily — at call time, not at decoration time —
-# so rotating a key takes effect on the next spawn with no redeploy.
+# Referenced **by name** rather than snapshotted (M7.1a). The old
+# `Secret.from_local_environ` baked in whatever environment ran `modal deploy`,
+# so editing `.env` without redeploying silently kept serving stale values.
 #
-# It previously used `Secret.from_local_environ`, which snapshots the local
-# environment when `modal deploy` runs. That made key rotation require a
-# redeploy, and worse, editing `.env` without one silently kept serving the old
-# (or empty) values, which is a genuinely confusing failure to debug.
+# Measured behaviour, since the docs invite over-reading: a secret becomes
+# environment variables when a container **starts**, not per call. Rotating it
+# therefore needs no code change and no redeploy — new containers pick it up on
+# their own — but a container Modal is keeping warm serves the old value until
+# it scales down. `modal app stop flotta-provision -y` forces the turnover.
 #
-# The secret must exist for the function to start, even for `dry_run` which
-# needs no provider at all — so `just deploy` creates an empty one when absent,
-# and `just secret-sync` is how you push local values into it.
+# The secret must exist for the function to start at all, even for `dry_run`
+# which needs no provider — so `just deploy` creates an empty one when absent,
+# and `just secret-sync` pushes local values into it.
 SECRET_NAME = "flotta-provider"
 
 
@@ -201,6 +208,17 @@ def run_worker(
 
 
 # -- endpoint encoding ------------------------------------------------------
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    """Parse a store timestamp, tolerating anything unexpected."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def endpoint_for(call_id: str) -> str:
@@ -387,6 +405,116 @@ def watch_worker(
     store.add_event(worker_id, event_type, payload)
     store.update_status(worker_id, status)
     return {"worker_id": worker_id, "status": status, "event": event_type, "result": result}
+
+
+def worker_deadline_s(store: FleetStore, worker_id: str) -> int:
+    """The `timeout_s` a worker was spawned with, from its `spawned` event.
+
+    Falls back to the default when the event is missing or malformed — an
+    unreadable payload should not make a stranded worker un-reconcilable.
+    """
+    for event in store.get_events(worker_id):
+        if event.type == "spawned" and isinstance(event.payload, dict):
+            value = event.payload.get("timeout_s")
+            if isinstance(value, int) and value > 0:
+                return value
+    return DEFAULT_TIMEOUT_S
+
+
+def overdue_workers(
+    store: FleetStore, *, now: datetime | None = None, grace_s: int = DEFAULT_GRACE_S
+) -> list[tuple[Worker, float]]:
+    """Live workers past their own deadline, with how far past, oldest first.
+
+    "Past its deadline" is the worker's own `timeout_s` plus a grace period —
+    the container hard-exits at that timeout, so anything still `running` well
+    beyond it has stopped without anyone recording the outcome.
+    """
+    now = now or datetime.now(UTC)
+    overdue: list[tuple[Worker, float]] = []
+    for worker in store.list_workers():
+        if worker.status in _TERMINAL:
+            continue
+        started = _parse_ts(worker.spawned_at)
+        if started is None:
+            continue
+        age = (now - started).total_seconds()
+        limit = worker_deadline_s(store, worker.id) + grace_s
+        if age > limit:
+            overdue.append((worker, age - limit))
+    return sorted(overdue, key=lambda pair: pair[1], reverse=True)
+
+
+def reconcile(
+    store: FleetStore,
+    *,
+    waiter: Waiter | None = None,
+    now: datetime | None = None,
+    grace_s: int = DEFAULT_GRACE_S,
+    fetch_timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Resolve workers stranded in a live state past their deadline.
+
+    Why this exists: under D10 the store is written only by local code, so a
+    worker spawned without `--wait` and never watched sits at `running` forever
+    once its container dies. One was found in the wild at 138 hours.
+
+    Recovery is attempted first, and it is usually possible — a Modal call's
+    result outlives the container by a long way (measured: a 9-hour-old result
+    was still retrievable). So a stranded worker's *answer* is normally
+    recoverable, not merely losable, and this records it properly.
+
+    When the result cannot be fetched the worker is marked `failed` with an
+    explicit reason. It is never marked `completed` — inventing a success for
+    work nobody observed is exactly the lie the watcher design exists to avoid.
+    """
+    wait = waiter or _modal_waiter
+    outcomes: list[dict[str, Any]] = []
+
+    for worker, over_by in overdue_workers(store, now=now, grace_s=grace_s):
+        call_id = function_call_id(worker.endpoint)
+        if call_id is None:
+            payload = {
+                "error": "stranded with no modal endpoint; never reported a result",
+                "overdue_by_s": round(over_by, 1),
+                "reconciled": True,
+            }
+            store.add_event(worker.id, "failed", payload)
+            store.update_status(worker.id, "failed")
+            outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
+            continue
+
+        try:
+            result: Any = wait(call_id, fetch_timeout_s)
+        except Exception as exc:
+            payload = {
+                "error": (
+                    f"stranded past its deadline and the result could not be fetched: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "overdue_by_s": round(over_by, 1),
+                "reconciled": True,
+            }
+            store.add_event(worker.id, "failed", payload)
+            store.update_status(worker.id, "failed")
+            outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
+            continue
+
+        status, event_type, payload = classify_result(result)
+        payload = {**payload, "reconciled": True, "overdue_by_s": round(over_by, 1)}
+        store.add_event(worker.id, event_type, payload)
+        store.update_status(worker.id, status)
+        outcomes.append(
+            {
+                "worker_id": worker.id,
+                "status": status,
+                "event": event_type,
+                "recovered": status == "done",
+                "result": result,
+            }
+        )
+
+    return outcomes
 
 
 def teardown(
