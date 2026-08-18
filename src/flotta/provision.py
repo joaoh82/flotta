@@ -114,12 +114,23 @@ def resolve_max_concurrent(
     return None if explicit == 0 else explicit
 
 
-# Provider config forwarded from the local environment into the container as a
-# Modal Secret (never as a plain function argument, which would land in call
-# logs). Absent keys are simply not forwarded — the worker then reports
-# "missing provider config" rather than failing to launch, and `dry_run` still
-# exercises the whole lifecycle with no provider at all.
+# Provider config reaches the container as a Modal Secret, never as a plain
+# function argument (that would land in call logs).
 PROVIDER_KEYS = ("FLOTTA_MODEL", "FLOTTA_MODEL_BASE_URL", "FLOTTA_API_KEY")
+
+# The secret is referenced **by name**, and that is the whole point (M7.1a).
+# `Secret.from_name` hydrates lazily — at call time, not at decoration time —
+# so rotating a key takes effect on the next spawn with no redeploy.
+#
+# It previously used `Secret.from_local_environ`, which snapshots the local
+# environment when `modal deploy` runs. That made key rotation require a
+# redeploy, and worse, editing `.env` without one silently kept serving the old
+# (or empty) values, which is a genuinely confusing failure to debug.
+#
+# The secret must exist for the function to start, even for `dry_run` which
+# needs no provider at all — so `just deploy` creates an empty one when absent,
+# and `just secret-sync` is how you push local values into it.
+SECRET_NAME = "flotta-provider"
 
 
 class ProvisionError(Exception):
@@ -135,11 +146,8 @@ class WorkerTimeout(ProvisionError):
 
 
 def _provider_secret() -> modal.Secret:
-    """Forward whichever provider vars exist locally; never fail on absence."""
-    import os
-
-    present = [key for key in PROVIDER_KEYS if os.environ.get(key)]
-    return modal.Secret.from_local_environ(present) if present else modal.Secret.from_dict({})
+    """Reference the named provider secret; resolved at call time, not deploy time."""
+    return modal.Secret.from_name(SECRET_NAME)
 
 
 app = modal.App(APP_NAME)
