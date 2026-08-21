@@ -139,10 +139,18 @@ Two separate bills, and conflating them is how people get surprised:
 A typical short task is cents. The first run is the expensive one, because Hermes is installed
 from source into the image; after that the image is cached.
 
-**Flotta does not estimate cost for you yet.** The dashboard's "Est. cost" column renders `—`
-because nothing populates it. Deriving a figure from duration × a guessed rate was rejected — a
-fabricated dollar amount that looks authoritative is worse than an honest blank. Watch your Modal
-and provider dashboards.
+**Cost estimation is opt-in, and deliberately so.** Set a rate and Flotta fills the "Est. cost"
+column; leave it unset and every surface shows `—`:
+
+```bash
+FLOTTA_COST_PER_SECOND=0.0000131   # your rate, from Modal's pricing for the worker's CPU/memory
+```
+
+It has to be *your* number because Modal's billing API cannot attribute cost to a single worker:
+line items are keyed by **App** id at daily or hourly resolution, every worker shares one app, and
+function calls cannot be tagged. Rather than derive a dollar figure from a rate nobody chose —
+which would look authoritative and be wrong — Flotta shows a blank until you supply one. It covers
+**container time only**; model tokens are a separate bill Flotta never sees.
 
 ## Command reference
 
@@ -174,7 +182,7 @@ Stated plainly, because finding these yourself is worse.
   conversation, and it cannot ask a question. Under-specified tasks come back as confident nonsense.
 - **`--wait`, or the row strands** until `flotta watch` / `flotta reconcile`.
 - **The dashboard has no authentication and can kill workers.** Localhost only. Do not expose it.
-- **No cost estimation.** See above.
+- **Cost estimation is opt-in and container-time only.** Set `FLOTTA_COST_PER_SECOND` or the column stays blank; token spend is never included. See [What it costs](#what-it-costs).
 - **Rotating a provider key is not instant.** `just secret-sync` needs no redeploy, but a secret
   becomes environment variables when a container *starts*, so a warm container serves the old value
   until it scales down. `modal app stop flotta-provision -y` forces it.

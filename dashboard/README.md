@@ -73,9 +73,10 @@ may still be running instead of reporting a clean kill.
   `running`. The dashboard is a pure reader and cannot advance the state
   machine — it is showing you the truth about the store, which is stale. Use
   `flotta spawn --wait`, or `flotta watch <id>` afterwards.
-- **Est. cost is always `—`.** Nothing populates `cost_estimate` yet (OQ3 in the
-  development plan is still open). The column renders whatever the store holds
-  rather than inventing a number from duration.
+- **Est. cost is `—` unless you set a rate.** Modal cannot attribute cost to a
+  single worker, so the column shows `wall-clock seconds × $FLOTTA_COST_PER_SECOND` when
+  that is configured and a blank when it is not. It covers container time only —
+  model tokens are a separate bill.
 - No auth, no multi-user, no history beyond what the store keeps.
 - `node:sqlite` is still marked experimental in Node 24, so the dev server
   prints one `ExperimentalWarning` on first query. It is cosmetic.
