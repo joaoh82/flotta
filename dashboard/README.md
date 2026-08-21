@@ -74,7 +74,7 @@ may still be running instead of reporting a clean kill.
   machine — it is showing you the truth about the store, which is stale. Use
   `flotta spawn --wait`, or `flotta watch <id>` afterwards.
 - **Est. cost is `—` unless you set a rate.** Modal cannot attribute cost to a
-  single worker, so the column shows `duration × $FLOTTA_COST_PER_SECOND` when
+  single worker, so the column shows `wall-clock seconds × $FLOTTA_COST_PER_SECOND` when
   that is configured and a blank when it is not. It covers container time only —
   model tokens are a separate bill.
 - No auth, no multi-user, no history beyond what the store keeps.

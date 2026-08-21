@@ -722,3 +722,81 @@ def test_billable_seconds_without_a_start(store):
 
     w = Worker("w-1", "t", "done", None, "junk", None, None)
     assert billable_seconds(w) is None
+
+
+# -- review follow-ups on M7.3 ----------------------------------------------
+
+
+def test_a_bad_rate_cannot_strand_a_worker(store, monkeypatch):
+    """Regression: pricing must never abort the status write.
+
+    `resolve_cost_rate` raises on a typo. When it was resolved *after* the
+    waiter returned, a bad `FLOTTA_COST_PER_SECOND` left a `completed` event
+    recorded against a row still marked `running` — an internally inconsistent
+    store that `reconcile` could not fix, because it raised in the same place.
+    """
+    monkeypatch.setenv("FLOTTA_COST_PER_SECOND", "abc")
+    r = spawn_worker("t", store=store, dry_run=True, launcher=fake_launcher("fc-1"))
+    wid = r["worker_id"]
+
+    with pytest.raises(ValueError, match="FLOTTA_COST_PER_SECOND"):
+        watch_worker(wid, store=store, waiter=lambda c, t: {"completed": True})
+
+    # It failed before touching anything: no verdict event, status untouched.
+    assert store.get_worker(wid).status == "running"
+    assert event_types(store, wid) == ["spawned", "running"]
+
+
+def test_a_bad_rate_does_not_block_reconcile_midway(store, monkeypatch):
+    monkeypatch.setenv("FLOTTA_COST_PER_SECOND", "abc")
+    r = spawn_worker("t", store=store, timeout_s=60, dry_run=True, launcher=fake_launcher("fc-1"))
+    _age(store, r["worker_id"], 10_000)
+    with pytest.raises(ValueError, match="FLOTTA_COST_PER_SECOND"):
+        reconcile(store, waiter=lambda c, t: {"completed": True})
+    # Nothing half-written.
+    assert event_types(store, r["worker_id"]) == ["spawned", "running"]
+
+
+def test_a_timed_out_worker_is_priced(store, monkeypatch):
+    """The most expensive outcome there is — it ran to its full deadline."""
+    monkeypatch.delenv("FLOTTA_COST_PER_SECOND", raising=False)
+    r = spawn_worker("t", store=store, dry_run=True, launcher=fake_launcher("fc-1"))
+    _age(store, r["worker_id"], 900)
+
+    def times_out(call_id, timeout):
+        raise WorkerTimeout("deadline exceeded")
+
+    watch_worker(r["worker_id"], store=store, waiter=times_out, cost_per_second=0.001)
+    worker = store.get_worker(r["worker_id"])
+    assert worker.status == "failed"
+    assert worker.cost_estimate == pytest.approx(0.9, rel=0.05)
+
+
+def test_a_waiter_exception_is_priced(store, monkeypatch):
+    monkeypatch.delenv("FLOTTA_COST_PER_SECOND", raising=False)
+    r = spawn_worker("t", store=store, dry_run=True, launcher=fake_launcher("fc-1"))
+    _age(store, r["worker_id"], 40)
+
+    def boom(call_id, timeout):
+        raise RuntimeError("connection reset")
+
+    watch_worker(r["worker_id"], store=store, waiter=boom, cost_per_second=0.001)
+    assert store.get_worker(r["worker_id"]).cost_estimate == pytest.approx(0.04, rel=0.05)
+
+
+def test_a_worker_that_never_launched_is_not_priced(store, monkeypatch):
+    """The other direction of the same error: no container ran, so charge nothing."""
+    monkeypatch.delenv("FLOTTA_COST_PER_SECOND", raising=False)
+    worker = store.create_worker("never launched")
+    _age(store, worker.id, 10_000)
+    reconcile(store, waiter=lambda c, t: {"completed": True}, cost_per_second=0.001)
+    priced = store.get_worker(worker.id)
+    assert priced.status == "failed"
+    assert priced.cost_estimate is None
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "NaN", "Infinity"])
+def test_non_finite_rates_are_rejected(bad):
+    """`float('nan') < 0` is False, so a bare sign check let NaN through."""
+    with pytest.raises(ValueError, match="FLOTTA_COST_PER_SECOND"):
+        resolve_cost_rate(None, {"FLOTTA_COST_PER_SECOND": bad})

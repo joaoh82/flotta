@@ -46,6 +46,7 @@ with fakes and the base `flotta` package keeps no hard Modal dependency.
 
 from __future__ import annotations
 
+import math
 import pathlib
 import sys
 from collections.abc import Callable
@@ -93,7 +94,9 @@ MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
 # nor `with_options` accepts a per-call tag. A 12-second worker is simply not
 # separable from that.
 #
-# So the estimate is `duration_s × a rate the operator sets themselves`. Unset
+# So the estimate is `wall-clock seconds × a rate the operator sets themselves`
+# (see `billable_seconds` — *not* the task's `duration_s`, which omits image
+# pull and container boot and prices a dry run at zero). Unset
 # by default, in which case `cost_estimate` stays NULL and every surface renders
 # an em dash — a blank is better than a number derived from a rate nobody chose.
 # It covers **container time only**; model tokens are a separate bill Flotta
@@ -118,6 +121,8 @@ def resolve_cost_rate(
         except ValueError as exc:
             raise ValueError(f"{COST_PER_SECOND_ENV} must be a number, got {raw!r}") from exc
 
+    if not math.isfinite(explicit):
+        raise ValueError(f"{COST_PER_SECOND_ENV} must be a finite number, got {explicit}")
     if explicit < 0:
         raise ValueError(f"{COST_PER_SECOND_ENV} must be >= 0, got {explicit}")
     return explicit or None
@@ -421,6 +426,9 @@ def spawn_worker(
     except Exception as exc:
         detail = f"spawn failed: {type(exc).__name__}: {exc}"
         store.add_event(worker.id, "failed", {"error": detail})
+        # Deliberately unpriced: the launch never happened, so no container
+        # ran. Charging for compute that did not occur overstates just as
+        # surely as the dry-run zero understated.
         store.update_status(worker.id, "failed")
         raise ProvisionError(detail) from exc
 
@@ -444,6 +452,13 @@ def watch_worker(
     passes, or Modal reports the call gone; every one of those outcomes writes
     a terminal state, so no worker is left stranded in `running`.
     """
+    # Resolved up front, deliberately. A bad rate must never surface *after* a
+    # result is in hand: raising there would leave a `completed` event recorded
+    # against a row still marked `running`, and `reconcile` — which resolves the
+    # same way — could not rescue it either. Failing here costs nothing and says
+    # exactly what is wrong.
+    rate = resolve_cost_rate(cost_per_second)
+
     wait = waiter or _modal_waiter
     worker = _require_worker(store, worker_id)
 
@@ -454,6 +469,7 @@ def watch_worker(
     if call_id is None:
         payload = {"error": f"worker has no modal endpoint to watch (endpoint={worker.endpoint!r})"}
         store.add_event(worker_id, "failed", payload)
+        # Unpriced on purpose — no endpoint means nothing was ever launched.
         store.update_status(worker_id, "failed")
         return {"worker_id": worker_id, "status": "failed", "error": payload["error"]}
 
@@ -462,12 +478,19 @@ def watch_worker(
     except WorkerTimeout as exc:
         payload = {"error": f"watch deadline exceeded: {exc}"}
         store.add_event(worker_id, "timed_out", payload)
-        store.update_status(worker_id, "failed")
+        # The most expensive outcome there is — the container ran to its full
+        # deadline — so this is the last branch that should go unpriced.
+        store.update_status(
+            worker_id, "failed", cost_estimate=estimate_cost(billable_seconds(worker), rate)
+        )
         return {"worker_id": worker_id, "status": "failed", "timed_out": True, **payload}
     except Exception as exc:
         payload = {"error": f"worker call failed: {type(exc).__name__}: {exc}"}
         store.add_event(worker_id, "failed", payload)
-        store.update_status(worker_id, "failed")
+        # The call existed, so a container almost certainly ran; price it.
+        store.update_status(
+            worker_id, "failed", cost_estimate=estimate_cost(billable_seconds(worker), rate)
+        )
         return {"worker_id": worker_id, "status": "failed", **payload}
 
     status, event_type, payload = classify_result(result)
@@ -476,7 +499,7 @@ def watch_worker(
     # `finished_at` yet, so `billable_seconds` measures to now — the same
     # instant `update_status` is about to stamp. One write, no second
     # transition (and `done -> done` would rightly be rejected anyway).
-    cost = estimate_cost(billable_seconds(worker), resolve_cost_rate(cost_per_second))
+    cost = estimate_cost(billable_seconds(worker), rate)
     store.update_status(worker_id, status, cost_estimate=cost)
     return {
         "worker_id": worker_id,
@@ -549,6 +572,10 @@ def reconcile(
     explicit reason. It is never marked `completed` — inventing a success for
     work nobody observed is exactly the lie the watcher design exists to avoid.
     """
+    # Same reason as `watch_worker`: resolved before any work, so a typo'd rate
+    # cannot block the very recovery this function exists to perform.
+    rate = resolve_cost_rate(cost_per_second)
+
     wait = waiter or _modal_waiter
     outcomes: list[dict[str, Any]] = []
 
@@ -561,6 +588,7 @@ def reconcile(
                 "reconciled": True,
             }
             store.add_event(worker.id, "failed", payload)
+            # Unpriced on purpose — no endpoint means no container ran.
             store.update_status(worker.id, "failed")
             outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
             continue
@@ -577,14 +605,18 @@ def reconcile(
                 "reconciled": True,
             }
             store.add_event(worker.id, "failed", payload)
-            store.update_status(worker.id, "failed")
+            # The call existed and ran past its deadline — the container was
+            # billed even though its result is unreachable.
+            store.update_status(
+                worker.id, "failed", cost_estimate=estimate_cost(billable_seconds(worker), rate)
+            )
             outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
             continue
 
         status, event_type, payload = classify_result(result)
         payload = {**payload, "reconciled": True, "overdue_by_s": round(over_by, 1)}
         store.add_event(worker.id, event_type, payload)
-        cost = estimate_cost(billable_seconds(worker), resolve_cost_rate(cost_per_second))
+        cost = estimate_cost(billable_seconds(worker), rate)
         store.update_status(worker.id, status, cost_estimate=cost)
         outcomes.append(
             {
