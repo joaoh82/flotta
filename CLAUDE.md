@@ -16,37 +16,45 @@ The parent (`/Users/joaoh82/projects/flotta_parent`) is a **planning-only worksp
 
 ## Current state
 
-Milestones done: **M1** (seam validation — **GO**, findings in the parent's `docs/SEAM_NOTES.md`, decision D7), **M2** (worker image + Flotta-owned MCP server, D9), **M3** (provisioning + fleet-state store, D10), and **M4** (the Typer CLI). The full thesis has run for real: `just e2e-live` passes **21/21** — a headless Hermes agent booted in a disposable Modal container, made a genuine model call, returned its result, and was torn down, with every transition recorded in the local store. Next up: **M5** (local dashboard). M0.3 (PyPI/npm placeholders) and part of M0.4 (Node 20+, Hermes locally) are still open — check the plan. Follow the milestones in order — do not skip ahead or exceed v0.1 scope.
+**M1–M6 are done and M7.1 has landed.** The full thesis runs for real: a chat message to the local Hermes spawns a headless worker in a disposable Modal container, gets a genuine model answer back, and tears the worker down — 41s end to end, with every transition recorded in the local store (M6). `just e2e` passes 21/21 and `just e2e-live` 22/22 against real Modal.
 
-Local config lives in `.env` (gitignored; copy from `.env.example`). Note that `just` only auto-loads a file named exactly `.env` — a `.env.local` is *not* read. **Sharp edge:** provider credentials reach the worker via `Secret.from_local_environ`, which snapshots them at `modal deploy` time rather than resolving per call — editing `.env` without re-deploying silently keeps serving the old (or empty) secret. A named Modal Secret is the proper fix, parked for M7.1.
+**Next: M7.2 (README + quickstart).** Then OQ3 cost estimation (M7.3), the `HERMES_REF` drift (M7.4), a clean-machine test, the demo GIF, and going public. `M0.3` (PyPI/npm placeholders) is still open and blocks M7.7 — the bare `flotta` name should be reserved before the repo is public. Follow the plan's order; do not exceed v0.1 scope.
+
+**Local config** lives in `.env` (gitignored; copy `.env.example`). `just` only auto-loads a file named exactly `.env` — a `.env.local` is *not* read.
+
+**Provider credentials** come from a **named Modal secret**, `flotta-provider`, not from the deploying shell. `just secret-sync` pushes the three `FLOTTA_*` provider vars from `.env` into it; `just secret-ensure` (a `deploy` dependency) creates it empty so the provider-free dry-run path works, and never overwrites. Rotation needs **no redeploy** — but it is not instant: a secret becomes environment variables when a container *starts*, so a warm container serves the old value until it scales down. `modal app stop flotta-provision -y` forces the turnover. (Measured, because the docs invite over-reading it as per-call.)
 
 ## Source of truth
 
 The living planning docs live in the **parent** repo (`/Users/joaoh82/projects/flotta_parent/docs/`):
 
-- **`development-plan.md`** — milestones M0–M7 with acceptance criteria, open questions (OQ1–OQ6), decision log (D1–D10), changelog. **Read it at session start.** Before finishing a session: tick task statuses (`[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked-with-note), add a changelog line, and record any choice in the decision log.
+- **`development-plan.md`** — milestones M0–M7 with acceptance criteria, open questions (OQ1–OQ6), decision log (D1–D12), changelog. **Read it at session start.** Before finishing a session: tick task statuses (`[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked-with-note), add a changelog line, and record any choice in the decision log.
 - **`fleet-runtime-product.md`** — product scope. Do **not** exceed v0.1 scope.
 - **`claude-code-kickoff.md`** — bootstrap steps + the eight paste-ready per-milestone session prompts (one per session). Reality diverging from this guide? The plan file wins. Known divergence: its §1 starter text and M2 prompt still say the worker "starts `mcp_serve`" — superseded by D7/SEAM_NOTES.
-- **`SEAM_NOTES.md`** — M1 findings with file:line refs into the Hermes clone (headless boot recipe, `mcp_serve` correction, storage layout, terminal backends). Read before M2/M3 work.
+- **`SEAM_NOTES.md`** — M1 findings with file:line refs into the Hermes clone (headless boot recipe, `mcp_serve` correction, storage layout, terminal backends). **Caveat:** `vendor/` is pinned at `594308d4bbe9` while the *installed* Hermes is newer (v0.16.0 / `d62979a6`), so it is no longer a reliable guide to the local agent's behaviour — reading it for skill conventions already caused a wrong turn in M6. Reconciling the pin is M7.4.
 - **`vendor/hermes/`** (in this repo, gitignored) — read-only reference clone of Hermes Agent (@ `594308d4bbe9`). **Never modify it.**
 
 ## Architecture (v0.1 target layout)
 
 The runtime is built around one durable store that is the single source of truth for fleet state; everything else reads from or writes to it.
 
-- **`src/flotta/store.py`** — ✅ built (M3.1). Fleet-state store on SQLite via stdlib `sqlite3`, designed so the connection factory could later point at **Turso** (thin SQL, no ORM — D8). Two tables: `workers` (id, task, status `provisioning|running|done|failed|torn_down`, endpoint, spawned_at, finished_at, cost_estimate) and `events` (id, worker_id, ts, type, payload_json). Status transitions are **validated** by an explicit transition table (e.g. no `done → running`; `torn_down` is terminal).
-- **`src/flotta/provision.py`** — ✅ built (M3). Split by *where code runs* (D10): `run_worker` is the deployed Modal function (does the work, never touches the store); `spawn_worker(task) -> {worker_id, endpoint}`, `watch_worker(id)` and `teardown(id)` (idempotent) run **locally** beside the store file and are its only writers. The store is a local SQLite file, unreachable from a container — hence a watcher, not entrypoint self-reporting. The stored `endpoint` is the Modal call handle `modal://flotta-provision/run_worker/<fc_id>`.
+- **`src/flotta/store.py`** — ✅ built (M3.1). Fleet-state store on SQLite via stdlib `sqlite3`, designed so the connection factory could later point at **Turso** (thin SQL, no ORM — D8). Two tables: `workers` (id, task, status `provisioning|running|done|failed|torn_down`, endpoint, spawned_at, finished_at, cost_estimate) and `events` (id, worker_id, ts, type, payload_json). Status transitions are **validated** by an explicit transition table (e.g. no `done → running`; `torn_down` is terminal). `TERMINAL` is defined **here and only here** — `provision` and `cli` import it, after all three had drifting copies. `create_worker(max_live=N)` enforces the live-worker cap by counting and inserting inside one `BEGIN IMMEDIATE`; a check-then-insert would race and let two simultaneous spawns both through (M7.1c).
+- **`src/flotta/provision.py`** — ✅ built (M3). Split by *where code runs* (D10): `run_worker` is the deployed Modal function (does the work, never touches the store); `spawn_worker(task) -> {worker_id, endpoint}`, `watch_worker(id)` and `teardown(id)` (idempotent) run **locally** beside the store file and are its only writers. The store is a local SQLite file, unreachable from a container — hence a watcher, not entrypoint self-reporting. The stored `endpoint` is the Modal call handle `modal://flotta-provision/run_worker/<fc_id>` — **not a URL**: v0.1 workers are one-shot, so nothing is listening, which is why the M6 skill drives the CLI rather than registering an MCP tool (D12). **M7.1 added:** `reconcile()` resolves workers stranded past their own `timeout_s` — it re-attaches and *recovers the real result* where possible (a 9-hour-old call result was still retrievable) and marks the rest `failed`, **never `completed`**; `resolve_max_concurrent()` is the cap policy (explicit → `$FLOTTA_MAX_CONCURRENT` → **1**, `0` = unlimited); and credentials come from the named secret rather than the deploying shell.
 - **`src/flotta/worker/`** — ✅ built (M2). `image.py` holds the one shared `modal.Image` (Hermes pinned via the `HERMES_REF` constant — the single bump point) so `flotta-worker` and `flotta-provision` can share it without importing each other's `modal.App`. `modal_app.py` is the smoke-test app, `config.py` the `WorkerConfig.from_env` contract, `server.py` the Flotta MCP server (`health` + `run_task`) behind **pure-ASGI** bearer auth — a Starlette `BaseHTTPMiddleware` would buffer and break MCP's SSE stream (D9). The container entrypoint reads `FLOTTA_TASK` / `FLOTTA_TIMEOUT_S` from env, sets `HERMES_HOME` to a writable ephemeral path, boots Hermes **headless** via `AIAgent` (no messaging gateway, single pinned provider, fixed toolset, `skip_context_files`/`skip_memory` — per SEAM_NOTES Q1), and exits on completion or a hard timeout (default 900s). **Not `hermes mcp serve`** — that is a stdio messaging bridge, not a task endpoint (D7, SEAM_NOTES Q2). The MCP surface, if used over the one-shot form, is a thin Flotta-owned streamable-http server exposing a `run_task` tool; Hermes's MCP client can already dial it by URL.
-- **`src/flotta/cli.py`** — ✅ built (M4). Typer CLI, wired as a console entry point so a bare `flotta` lands on PATH. **Five** commands, not four: `ps`, `spawn "<task>"` (`--wait`, `--dry-run`, `--timeout-s`), `watch <id>`, `logs <id>`, `kill <id>` (idempotent). `watch` was added beyond the plan's list because `spawn` returns immediately by design — without it the CLI can start and kill a worker but never observe one *succeed*. Every command takes `--json`; the tested surface is a pure `str`-in/`str`-out formatting layer, so tables are hand-rolled rather than pulled from a rendering library. **Store resolution:** `--store` → `$FLOTTA_STORE` → `./fleet.db` (the same variable M5's dashboard reads). **Modal workspace resolution:** `$MODAL_PROFILE` → `$FLOTTA_MODAL_PROFILE` → `.env` → Modal's active profile, applied *before* `provision` is imported (`modal` reads its config at import time) — the installed binary has no justfile pinning it, so without this an unrelated `modal profile activate` would silently redirect `spawn`. `ps` and `logs` are pure store reads needing no Modal credentials; a non-`done` outcome exits 1 so scripts can branch on it.
-- **`dashboard/`** — ⏳ next (M5). Next.js (TypeScript, App Router, Tailwind). API routes read the store file directly via `FLOTTA_STORE`; polling UI (2–5s). Localhost only, no auth in v0.1.
-- **`skills/orchestrator/`** — ⏳ planned (M6). The Hermes skill teaching the orchestrator when/how to delegate to a worker and to always tear down (including on failure).
+- **`src/flotta/cli.py`** — ✅ built (M4, extended in M7.1). Typer CLI wired as a console entry point, so `uv tool install .` puts a bare `flotta` on PATH — `uv run` is the contributor path, not the user path. **Six** commands: `ps`, `spawn "<task>"` (`--wait`, `--dry-run`, `--timeout-s`, `--max-concurrent`), `watch <id>`, `logs <id>`, `kill <id>` (idempotent), and `reconcile`. `watch` exists because `spawn` returns immediately by design — without it the CLI could start and kill a worker but never observe one *succeed*. Every command takes `--json`; the tested surface is a pure `str`-in/`str`-out formatting layer, so tables are hand-rolled rather than pulled from a rendering library. **Store resolution:** `--store` → `$FLOTTA_STORE` → `./fleet.db` (the same variable the dashboard reads); reads require the store to exist, and only `spawn` may create it. **Modal workspace resolution:** `$MODAL_PROFILE` → `$FLOTTA_MODAL_PROFILE` → `.env` → Modal's active profile, applied *before* `provision` is imported (`modal` reads its config at import time) — the installed binary has no justfile pinning it, so without this an unrelated `modal profile activate` would silently redirect `spawn`. `ps` and `logs` are pure store reads needing no Modal credentials; **`reconcile` is deliberately not folded into `ps`** so that stays true. Exit codes carry meaning: `1` a failed worker, `2` a refusal (cap reached, or a missing store).
+
+
+- **`dashboard/`** — ✅ built (M5). Next.js 16 (App Router, TypeScript, Tailwind 4) reading the same store through Node's built-in **`node:sqlite`** — no native module and no database dependency. Connections are `readOnly` and opened **per request**: under WAL a long-lived reader pins an old snapshot and would quietly serve stale rows to a polling UI. A missing store is a **503 naming the path**, never an empty fleet. Localhost only, no auth, port **3001**. Read-only except the kill button, which shells out to the CLI (D11) and checks the *cancel outcome*, not just the HTTP status.
+
+
+- **`skills/orchestrator/`** — ✅ built (M6). A Hermes skill teaching the orchestrator to delegate, installed with `just install-skill` (symlink, so repo edits take effect without a reinstall). Written to the installed Hermes's own conventions — `description` ≤ 60 chars is a hardline with an enforcement test in its repo. **It competes with Hermes's built-in `delegate_task` in the always-on skill index**, so it leads with the property that actually distinguishes Flotta: **isolation**, not durability. (Durability was the first draft's claim; a live routing test showed a one-shot `cronjob` covers that too, and the model correctly chose `cronjob` over Flotta — D12.)
 
 Data flow: orchestrator → `spawn_worker` (Modal) → worker boots headless Hermes (`AIAgent`), runs the task, reports the result → events land in the store → CLI/dashboard read the store → `teardown` closes the row.
 
 ## Conventions
 
 - **Python 3.11**, type hints everywhere, **ruff** for lint + format.
-- Tests with **pytest** next to the code (`test_*.py`). Every `store`/`provision` change needs a test; validate status transitions and listing filters explicitly. **Keep the suite hermetic and $0** — every Modal touchpoint is injected, never called for real (177 tests green as of the M4 follow-up).
+- Tests with **pytest** next to the code (`test_*.py`). Every `store`/`provision` change needs a test; validate status transitions and listing filters explicitly. **Keep the suite hermetic and $0** — every Modal touchpoint is injected, never called for real (**212 tests** green as of M7.1).
 - **One commit per completed task**, message prefixed with the task ID — e.g. `M3.2: spawn_worker writes lifecycle events`.
 - Dashboard: TypeScript, **no UI library beyond Tailwind**, keep it boring.
 - Secrets only via Modal secrets / `.env` (gitignored) — never hardcode.
@@ -58,13 +66,17 @@ Common commands live in the **`justfile`** (`just` lists them; `just check` = li
 
 ```bash
 just check                  # lint + tests — run before committing
+just check-dashboard        # tsc + eslint (the Python `check` does not cover the dashboard)
 just test-one <keyword>     # a single test (uv run pytest -k <keyword>)
 just fmt                    # ruff format + --fix
 just modal-whoami           # which Modal workspace the recipes target (gates every modal recipe)
-just smoke                  # M2: build the image on Modal, verify the MCP endpoint — hermetic, $0, no LLM
-just deploy                 # M3: deploy the provisioning app — required before e2e
+just smoke                  # M2: build the image, verify the MCP endpoint — no LLM, but a REAL billed container
+just secret-sync            # M7: push .env's provider vars into the named Modal secret (this is how you rotate)
+just deploy                 # M3: deploy the provisioning app — required before e2e; ensures the secret exists
 just e2e                    # M3: full lifecycle against real Modal, dry-run (no LLM, no provider key)
-just e2e-live               # same with a real model call — needs FLOTTA_MODEL / FLOTTA_MODEL_BASE_URL / FLOTTA_API_KEY
+just e2e-live               # same with a real model call — needs the provider vars synced
+just dashboard              # M5: local fleet view on http://localhost:3001
+just install-skill          # M6: symlink the orchestrator skill into ~/.hermes/skills
 ```
 
 Every Modal recipe pins the workspace profile (`FLOTTA_MODAL_PROFILE`, default `flotta`) through `just modal-whoami`, which authenticates for real — `modal profile current` only echoes the env var back and never validates. This exists because the globally-active profile was once found pointing at an unrelated workspace.
@@ -73,40 +85,20 @@ Every Modal recipe pins the workspace profile (`FLOTTA_MODAL_PROFILE`, default `
 
 ```bash
 uv run flotta ps
-uv run flotta spawn "summarize the logs" --wait
+uv run flotta spawn "summarize the logs" --wait   # --wait, or the row strands
+uv run flotta reconcile                          # rescue workers stranded past their deadline
 ```
 
-The dashboard arrives with M5: `cd dashboard && npm run dev -- -p 3001` — **not** port 3000 (reserved; see parent `CLAUDE.md`).
+The dashboard runs with `just dashboard` on **port 3001** — never 3000 (reserved; see parent `CLAUDE.md`). The port is baked into `dashboard/package.json` rather than passed as a flag, because a flag is too easy to forget.
 
 ## Knowledge Base
 
-This project shares its knowledge base with its parent (flotta). Do **not** create a separate `projects/<child>/` folder — entries about this repo go in the parent's folder.
+This project shares its knowledge base with its parent. Do **not** create a separate folder for this repo — entries about it go in the parent's.
 
-Project knowledge lives in the private repo **`joaoh82/projects-knowledge`**, cloned at `~/projects/projects-knowledge` (clone to the same path in cloud environments). Follow the repo workflow in the parent `CLAUDE.md`: pull before writing, work only in the repo working tree (never via the Obsidian vault path), read only this project's folder, and commit + push at session end if anything changed (this notes repo is exempt from the never-touch-`main` rule).
+Knowledge lives in the **`projects-knowledge` Obsidian vault** at `~/Documents/projects-knowledge/Projects/flotta/`. It is a plain synced folder: no git, nothing to clone, pull, commit or push — just read and write the files. *(Older references to a `joaoh82/projects-knowledge` git repo at `~/projects/projects-knowledge` are retired; that path no longer exists.)*
 
-### Project-specific — `~/projects/projects-knowledge/projects/flotta/`
+- **Context (read first):** `~/Documents/projects-knowledge/Projects/flotta/context.md` — stable background: product goals, domain, stakeholders. Update only when the underlying facts change.
+- **Notes (running journal):** `.../notes.md` — append-only, dated `## YYYY-MM-DD` headings, for decisions, blockers, incidents.
+- **Wiki:** `.../wiki/` — reference sub-docs (architecture, local dev setup, credential locations). Create files as topics emerge.
 
-- **Code (this repo):** `/Users/joaoh82/projects/flotta_parent/flotta`
-- **Code (parent meta-repo):** `/Users/joaoh82/projects/flotta_parent`
-- **Context (read first):** `~/projects/projects-knowledge/projects/flotta/context.md`
-- **Notes (running journal):** `~/projects/projects-knowledge/projects/flotta/notes.md`
-- **Project wiki:** `~/projects/projects-knowledge/projects/flotta/wiki/`
-
-**How to use each:**
-
-- `context.md` — stable background (product goals, stakeholders, domain). Read before non-trivial work. Update only when underlying facts change.
-- `notes.md` — append-only dated journal (`## YYYY-MM-DD` headings) for decisions, blockers, TODOs, incidents. Notes about *this repo* still go here, in the parent's `notes.md`.
-- `wiki/` — reference sub-docs (`Architecture.md`, `Local Dev Setup.md`, `Tech Services.md`). Create files as topics emerge.
-
-**When to save:**
-
-- New stable fact about the product/domain → update the parent's `context.md`.
-- A decision, incident, or working note → append a dated entry to the parent's `notes.md`.
-- Reusable reference material (setup steps, credential locations, architecture) → new/updated file in the parent's `wiki/`.
-
-### Cross-project knowledge — `~/Documents/josh-obsidian-synced/vault/` (Obsidian machines only)
-
-- **General wiki:** `~/Documents/josh-obsidian-synced/vault/wiki/` — start at `_master-index.md`, then drill into the relevant topic's `_index.md`.
-- **Raw dumps:** `~/Documents/josh-obsidian-synced/vault/raw/` — drop unprocessed research here as `YYYY-MM-DD-{slug}.md`.
-
-Read the general wiki when the question isn't specific to this project. This vault has not moved to the knowledge repo — it only exists on machines with the Obsidian vault; if the path doesn't exist, skip it.
+If `~/Documents/projects-knowledge/` does not exist (cloud sandbox, CI), there is no knowledge base in that environment — skip it silently rather than reconstructing it from a git remote.
