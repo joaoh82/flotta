@@ -69,7 +69,7 @@ if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not 
 from flotta.store import TERMINAL as _TERMINAL  # noqa: E402  the canonical set
 from flotta.store import FleetStore, UnknownWorkerError, Worker  # noqa: E402  (needs prime)
 from flotta.worker.config import DEFAULT_TIMEOUT_S  # noqa: E402
-from flotta.worker.image import worker_image  # noqa: E402
+from flotta.worker.image import HERMES_REF, worker_image  # noqa: E402
 
 APP_NAME = "flotta-provision"
 FUNCTION_NAME = "run_worker"
@@ -417,8 +417,18 @@ def spawn_worker(
     worker = store.create_worker(
         task, worker_id=worker_id, max_live=resolve_max_concurrent(max_concurrent)
     )
+    # `hermes_ref` is recorded per worker, not just configured globally: the pin
+    # moves over time, so "which Hermes ran this task?" is a fact about the
+    # worker, answerable months later, not a fact about today's config.
     store.add_event(
-        worker.id, "spawned", {"task": task, "timeout_s": timeout_s, "dry_run": dry_run}
+        worker.id,
+        "spawned",
+        {
+            "task": task,
+            "timeout_s": timeout_s,
+            "dry_run": dry_run,
+            "hermes_ref": HERMES_REF,
+        },
     )
 
     try:

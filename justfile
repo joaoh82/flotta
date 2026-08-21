@@ -54,6 +54,44 @@ fmt:
 # lint + tests — run before committing
 check: lint test
 
+# Compares three numbers that drift apart silently: the Hermes your workers run,
+# the latest upstream release, and the Hermes running locally as orchestrator.
+# The pin went two months stale before anyone noticed, which is why this exists.
+# M7 — report Hermes version drift (pinned vs. latest vs. local)
+hermes-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pinned=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+    latest=$(gh api repos/NousResearch/Hermes-Agent/releases/latest --jq .tag_name 2>/dev/null || echo "?")
+    local_v=$(hermes --version 2>/dev/null | head -1 || echo "not installed")
+    printf "  workers run   : %s\n" "$pinned"
+    printf "  latest release: %s\n" "$latest"
+    printf "  your local    : %s\n" "$local_v"
+    if [ "$pinned" = "$latest" ]; then
+      echo "  -> up to date"
+    elif [ "$latest" = "?" ]; then
+      echo "  -> could not reach GitHub; pin unchanged" >&2
+    else
+      echo "  -> BEHIND. 'just hermes-bump $latest' to move, which re-verifies live."
+    fi
+
+# Bumping is not mechanical: SEAM_NOTES' headless boot recipe was validated
+# against one version, so this rebuilds the image and re-runs the live checks.
+# Leaves the edit in place on failure so you can inspect, then revert.
+# M7 — bump the pinned Hermes and re-verify against real Modal
+hermes-bump REF:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file=src/flotta/worker/image.py
+    current=$(grep -oE 'DEFAULT_HERMES_REF = "[^"]+"' "$file")
+    sed -i.bak -E 's|DEFAULT_HERMES_REF = "[^"]+"|DEFAULT_HERMES_REF = "{{REF}}"|' "$file" && rm -f "$file.bak"
+    echo "  $current -> DEFAULT_HERMES_REF = \"{{REF}}\""
+    echo "  rebuilding and re-verifying (smoke, then a live task)..."
+    just smoke
+    just deploy
+    just e2e-live
+    echo "  {{REF}} verified: image builds, MCP answers, a real task round-trips."
+
 # M2 worker smoke test — build image on Modal, confirm the MCP endpoint answers (hermetic, no API key)
 smoke: modal-whoami
     MODAL_PROFILE={{modal_profile}} modal run src/flotta/worker/modal_app.py

@@ -6,17 +6,50 @@ image definition without either importing the other's `modal.App`:
 - `worker/modal_app.py`  — app ``flotta-worker``, the hermetic M2 smoke test
 - `provision.py`         — app ``flotta-provision``, the deployed `run_worker`
 
-Bumping Hermes is a one-line change here (`HERMES_REF`), and both apps follow.
+## Why Hermes is pinned rather than floating (M7.4)
+
+Tracking the latest Hermes automatically is the obvious wish, and `@main`
+is the obvious way to get it. It does not work, and it fails *silently*:
+
+Modal caches image layers by the build definition string. With `@main` that
+string never changes, so after the first build every later build is a cache
+hit — you keep running whatever Hermes was current the day you first built,
+while believing you are on latest. (`pip_install` carries a `force_build`
+flag precisely because layers are cached this way.) The alternative, busting
+the cache on every build, means a multi-minute Hermes-from-source rebuild
+before every smoke test.
+
+So the ref is pinned, and **kept current deliberately** instead:
+
+    just hermes-check     # what we pin vs. latest upstream vs. your local install
+    just hermes-bump      # move the pin, then re-verify with smoke + e2e-live
+
+Pinned to a **release tag**, not a commit SHA. Upstream ships dated calver
+tags (`v2026.8.19`), which are comparable at a glance — a SHA tells you
+nothing about how far behind you are, which is how this pin quietly drifted
+two months while nobody noticed.
+
+Override per-environment with `$FLOTTA_HERMES_REF`: any tag, branch or SHA.
+That is the escape hatch for anyone who needs an older Hermes, or who wants
+to test an unreleased one. Note the caching caveat above still applies to a
+branch name.
 """
 
 from __future__ import annotations
 
+import os
+
 import modal
 
-# Hermes Agent pin — matches the vendored clone validated in SEAM_NOTES
-# (commit 594308d4bbe9). Bump here to move to a newer Hermes.
-HERMES_REF = "594308d4bbe95548c9fe418bb10c449099426f93"
-HERMES_PKG = f"hermes-agent[mcp] @ git+https://github.com/NousResearch/Hermes-Agent@{HERMES_REF}"
+# The Hermes release Flotta's workers run. Bump with `just hermes-bump`, which
+# also re-runs the live checks — the headless boot recipe in SEAM_NOTES was
+# validated against a specific version, so a bump is not purely mechanical.
+DEFAULT_HERMES_REF = "v2026.7.20"
+HERMES_REF_ENV = "FLOTTA_HERMES_REF"
+
+HERMES_REF = os.environ.get(HERMES_REF_ENV, "").strip() or DEFAULT_HERMES_REF
+HERMES_REPO = "https://github.com/NousResearch/Hermes-Agent"
+HERMES_PKG = f"hermes-agent[mcp] @ git+{HERMES_REPO}@{HERMES_REF}"
 
 # The `[mcp]` extra pulls in the MCP SDK (mcp==1.26.0) + starlette; uvicorn
 # serves the streamable-http app. Hermes's own deps are exact-pinned upstream.

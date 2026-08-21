@@ -800,3 +800,13 @@ def test_non_finite_rates_are_rejected(bad):
     """`float('nan') < 0` is False, so a bare sign check let NaN through."""
     with pytest.raises(ValueError, match="FLOTTA_COST_PER_SECOND"):
         resolve_cost_rate(None, {"FLOTTA_COST_PER_SECOND": bad})
+
+
+def test_spawn_records_which_hermes_ran(store):
+    """The pin moves; "which Hermes ran this worker" must stay answerable later."""
+    from flotta.worker.image import HERMES_REF
+
+    r = spawn_worker("t", store=store, dry_run=True, launcher=fake_launcher("fc-1"))
+    spawned = store.get_events(r["worker_id"])[0]
+    assert spawned.type == "spawned"
+    assert spawned.payload["hermes_ref"] == HERMES_REF
