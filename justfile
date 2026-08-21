@@ -54,42 +54,82 @@ fmt:
 # lint + tests — run before committing
 check: lint test
 
-# Compares three numbers that drift apart silently: the Hermes your workers run,
-# the latest upstream release, and the Hermes running locally as orchestrator.
-# The pin went two months stale before anyone noticed, which is why this exists.
-# M7 — report Hermes version drift (pinned vs. latest vs. local)
+# Compares the Hermes your workers run, the newest version they *can* run, and
+# the Hermes running locally as orchestrator.
+#
+# "latest installable" is not "latest": upstream stopped supporting wheel/sdist
+# builds after v2026.7.20, so `pip install git+...` fails on anything newer and
+# the worker image cannot reach it (OQ7). An earlier version of this recipe
+# happily recommended bumping to the newest release, which could not build —
+# a check that tells you to do the impossible is worse than no check.
+# M7 — report Hermes version drift (pinned vs. installable ceiling vs. local)
 hermes-check:
     #!/usr/bin/env bash
     set -euo pipefail
     pinned=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+    ceiling=$(uv run python -c "from flotta.worker.image import LAST_INSTALLABLE_REF; print(LAST_INSTALLABLE_REF)")
     latest=$(gh api repos/NousResearch/Hermes-Agent/releases/latest --jq .tag_name 2>/dev/null || echo "?")
     local_v=$(hermes --version 2>/dev/null | head -1 || echo "not installed")
-    printf "  workers run   : %s\n" "$pinned"
-    printf "  latest release: %s\n" "$latest"
-    printf "  your local    : %s\n" "$local_v"
-    if [ "$pinned" = "$latest" ]; then
-      echo "  -> up to date"
-    elif [ "$latest" = "?" ]; then
-      echo "  -> could not reach GitHub; pin unchanged" >&2
+    printf "  workers run       : %s\n" "$pinned"
+    printf "  installable ceiling: %s\n" "$ceiling"
+    printf "  latest release    : %s\n" "$latest"
+    printf "  your local        : %s\n" "$local_v"
+    echo
+    if [ "$pinned" = "$ceiling" ]; then
+      echo "  Workers are at the ceiling — the newest Hermes the image can install."
     else
-      echo "  -> BEHIND. 'just hermes-bump $latest' to move, which re-verifies live."
+      echo "  BEHIND the ceiling. 'just hermes-bump $ceiling' to move (re-verifies live)."
+    fi
+    if [ "$latest" != "?" ] && [ "$latest" != "$ceiling" ]; then
+      echo "  $latest exists but CANNOT be installed: upstream dropped wheel/sdist"
+      echo "  builds, so 'pip install git+...' fails. Reaching it needs a different"
+      echo "  install mechanism (shell installer / Dockerfile / Nix) — see OQ7."
     fi
 
 # Bumping is not mechanical: SEAM_NOTES' headless boot recipe was validated
 # against one version, so this rebuilds the image and re-runs the live checks.
-# Leaves the edit in place on failure so you can inspect, then revert.
+#
+# On failure it **restores the previous pin**. An earlier version left the
+# broken edit in place "so you can inspect it", which in practice meant a
+# working tree pinned to a Hermes that cannot build — on `main`, where the
+# next commit would have shipped it.
 # M7 — bump the pinned Hermes and re-verify against real Modal
 hermes-bump REF:
     #!/usr/bin/env bash
     set -euo pipefail
     file=src/flotta/worker/image.py
-    current=$(grep -oE 'DEFAULT_HERMES_REF = "[^"]+"' "$file")
+
+    branch=$(git branch --show-current)
+    if [ "$branch" = "main" ]; then
+      echo "ERROR: refusing to edit the pin on 'main'." >&2
+      echo "  git switch -c chore/hermes-$(echo '{{REF}}' | tr -d 'v.')" >&2
+      exit 1
+    fi
+    if ! git diff --quiet -- "$file"; then
+      echo "ERROR: $file has uncommitted changes; commit or revert first." >&2
+      exit 1
+    fi
+
+    ceiling=$(uv run python -c "from flotta.worker.image import LAST_INSTALLABLE_REF; print(LAST_INSTALLABLE_REF)")
+    previous=$(grep -oE 'DEFAULT_HERMES_REF = "[^"]+"' "$file" | cut -d'"' -f2)
+
+    restore() {
+      git checkout -- "$file"
+      echo "  restored the previous pin ($previous) — nothing was left broken." >&2
+    }
+    trap 'restore' ERR
+
     sed -i.bak -E 's|DEFAULT_HERMES_REF = "[^"]+"|DEFAULT_HERMES_REF = "{{REF}}"|' "$file" && rm -f "$file.bak"
-    echo "  $current -> DEFAULT_HERMES_REF = \"{{REF}}\""
+    echo "  $previous -> {{REF}}"
+    if [ "{{REF}}" != "$ceiling" ]; then
+      echo "  NOTE: the installable ceiling is $ceiling. Anything above it cannot be"
+      echo "  built by the current image mechanism (OQ7) and will fail below."
+    fi
     echo "  rebuilding and re-verifying (smoke, then a live task)..."
     just smoke
     just deploy
     just e2e-live
+    trap - ERR
     echo "  {{REF}} verified: image builds, MCP answers, a real task round-trips."
 
 # M2 worker smoke test — build image on Modal, confirm the MCP endpoint answers (hermetic, no API key)
