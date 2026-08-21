@@ -130,11 +130,33 @@ def _run_task_core(
     }
 
 
-def build_server(cfg: WorkerConfig) -> Any:
-    """Construct the FastMCP server with the two Flotta tools registered."""
-    from mcp.server.fastmcp import FastMCP  # lazy: image-only
+def _new_mcp_server(cfg: WorkerConfig) -> Any:
+    """Construct the MCP server object, across both major SDK versions.
 
-    mcp = FastMCP("flotta-worker", host=cfg.host, port=cfg.port)
+    The SDK renamed its high-level server between 1.x and 2.x — `FastMCP`
+    became `MCPServer` — and moved `host` from the constructor onto
+    `streamable_http_app()`. Both are supported here because the Hermes pin
+    decides which SDK lands in the image: v1 for older Hermes, v2 for
+    `v2026.7.30`+. Without this, moving the pin forward breaks the worker with
+    a bare `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`, which
+    is how this was found.
+
+    `.tool()` and `.streamable_http_app()` keep their names in both, so only
+    construction differs.
+    """
+    try:
+        from mcp.server import MCPServer  # mcp >= 2
+
+        return MCPServer("flotta-worker")
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP  # mcp 1.x
+
+        return FastMCP("flotta-worker", host=cfg.host, port=cfg.port)
+
+
+def build_server(cfg: WorkerConfig) -> Any:
+    """Construct the MCP server with the two Flotta tools registered."""
+    mcp = _new_mcp_server(cfg)
 
     @mcp.tool()
     def health() -> dict[str, Any]:
@@ -181,7 +203,13 @@ def _bearer_auth_asgi(app: Any, token: str) -> Any:
 
 def build_asgi_app(cfg: WorkerConfig) -> Any:
     """Return the streamable-http ASGI app, gated by bearer auth when configured."""
-    app = build_server(cfg).streamable_http_app()
+    server = build_server(cfg)
+    try:
+        # mcp >= 2 takes the bind host here (it drives DNS-rebinding checks);
+        # uvicorn still does the actual binding in `serve`.
+        app = server.streamable_http_app(host=cfg.host)
+    except TypeError:
+        app = server.streamable_http_app()  # mcp 1.x
     if cfg.auth_token:
         app = _bearer_auth_asgi(app, cfg.auth_token)
     return app

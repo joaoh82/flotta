@@ -16,6 +16,7 @@ end-to-end lifecycle script, where a real provider secret is attached.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import pathlib
 import sys
@@ -76,16 +77,41 @@ def _result_to_obj(result) -> dict:
         return {"text": text}
 
 
+@contextlib.asynccontextmanager
+async def _mcp_streams(url: str, headers: dict):
+    """Open MCP streamable-http transport, across both SDK generations.
+
+    The two differ in more than a name. In 1.x the function took `headers=`
+    and yielded three values (read, write, get_session_id); in 2.x it takes a
+    pre-configured `httpx2.AsyncClient` — headers go on the client — and
+    yields two. Both shapes are normalised to `(read, write)` here so the
+    probe below reads the same either way.
+    """
+    try:
+        import httpx2
+        from mcp.client.streamable_http import streamable_http_client  # mcp >= 2
+
+        async with (
+            httpx2.AsyncClient(headers=headers) as http_client,
+            streamable_http_client(url, http_client=http_client) as streams,
+        ):
+            yield streams[0], streams[1]
+    except ImportError:  # mcp 1.x
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async with streamablehttp_client(url, headers=headers) as (read, write, _):
+            yield read, write
+
+
 async def _probe(cfg) -> dict:
     """Connect over MCP: list tools, call health, and verify auth is enforced."""
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
 
     url = cfg.mcp_url
     good_headers = {"Authorization": f"Bearer {cfg.auth_token}"}
 
     async with (
-        streamablehttp_client(url, headers=good_headers) as (read, write, _),
+        _mcp_streams(url, good_headers) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -97,11 +123,7 @@ async def _probe(cfg) -> dict:
     auth_enforced = False
     try:
         async with (
-            streamablehttp_client(url, headers={"Authorization": "Bearer WRONG"}) as (
-                read,
-                write,
-                _,
-            ),
+            _mcp_streams(url, {"Authorization": "Bearer WRONG"}) as (read, write),
             ClientSession(read, write) as session,
         ):
             await session.initialize()
