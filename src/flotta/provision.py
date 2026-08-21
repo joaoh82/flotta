@@ -49,6 +49,7 @@ from __future__ import annotations
 import pathlib
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import modal
@@ -64,7 +65,8 @@ _SRC = _HERE.parents[1] if len(_HERE.parents) > 1 else None
 if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from flotta.store import FleetStore, UnknownWorkerError  # noqa: E402  (needs the prime above)
+from flotta.store import TERMINAL as _TERMINAL  # noqa: E402  the canonical set
+from flotta.store import FleetStore, UnknownWorkerError, Worker  # noqa: E402  (needs prime)
 from flotta.worker.config import DEFAULT_TIMEOUT_S  # noqa: E402
 from flotta.worker.image import worker_image  # noqa: E402
 
@@ -76,15 +78,66 @@ FUNCTION_NAME = "run_worker"
 # per-task deadline is enforced inside the container by `_run_task_core`.
 MAX_TIMEOUT_S = 3600
 
-# Terminal states — nothing left to watch.
-_TERMINAL = frozenset({"done", "failed", "torn_down"})
+# Live-worker cap. v0.1 is a one-worker-at-a-time system and, until now, that
+# was documentation rather than behaviour: nothing counted before launching, so
+# a loop or an orchestrator ignoring the skill spent money instead of erroring.
+# Default 1 makes the documented scope true; raising it is an explicit opt-in to
+# territory nothing has tested. 0 means unlimited, for anyone who means it.
+DEFAULT_MAX_CONCURRENT = 1
+MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
 
-# Provider config forwarded from the local environment into the container as a
-# Modal Secret (never as a plain function argument, which would land in call
-# logs). Absent keys are simply not forwarded — the worker then reports
-# "missing provider config" rather than failing to launch, and `dry_run` still
-# exercises the whole lifecycle with no provider at all.
+# Grace beyond a worker's own timeout before `reconcile` calls it stranded.
+# The container hard-exits at its timeout, so this only has to cover the lag
+# between that exit and the local process noticing.
+DEFAULT_GRACE_S = 60
+
+
+def resolve_max_concurrent(
+    explicit: int | None = None, env: dict[str, str] | None = None
+) -> int | None:
+    """How many workers may be live at once: explicit -> env -> default.
+
+    Returns ``None`` for *unlimited*, which is what ``0`` requests. Anyone
+    setting that has said so deliberately; the default of 1 is what protects
+    everyone who has not thought about it.
+    """
+    import os
+
+    env = os.environ if env is None else env
+
+    if explicit is None:
+        raw = (env.get(MAX_CONCURRENT_ENV) or "").strip()
+        if raw:
+            try:
+                explicit = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{MAX_CONCURRENT_ENV} must be an integer, got {raw!r}") from exc
+        else:
+            explicit = DEFAULT_MAX_CONCURRENT
+
+    if explicit < 0:
+        raise ValueError(f"{MAX_CONCURRENT_ENV} must be >= 0, got {explicit}")
+    return None if explicit == 0 else explicit
+
+
+# Provider config reaches the container as a Modal Secret, never as a plain
+# function argument (that would land in call logs).
 PROVIDER_KEYS = ("FLOTTA_MODEL", "FLOTTA_MODEL_BASE_URL", "FLOTTA_API_KEY")
+
+# Referenced **by name** rather than snapshotted (M7.1a). The old
+# `Secret.from_local_environ` baked in whatever environment ran `modal deploy`,
+# so editing `.env` without redeploying silently kept serving stale values.
+#
+# Measured behaviour, since the docs invite over-reading: a secret becomes
+# environment variables when a container **starts**, not per call. Rotating it
+# therefore needs no code change and no redeploy — new containers pick it up on
+# their own — but a container Modal is keeping warm serves the old value until
+# it scales down. `modal app stop flotta-provision -y` forces the turnover.
+#
+# The secret must exist for the function to start at all, even for `dry_run`
+# which needs no provider — so `just deploy` creates an empty one when absent,
+# and `just secret-sync` pushes local values into it.
+SECRET_NAME = "flotta-provider"
 
 
 class ProvisionError(Exception):
@@ -100,11 +153,8 @@ class WorkerTimeout(ProvisionError):
 
 
 def _provider_secret() -> modal.Secret:
-    """Forward whichever provider vars exist locally; never fail on absence."""
-    import os
-
-    present = [key for key in PROVIDER_KEYS if os.environ.get(key)]
-    return modal.Secret.from_local_environ(present) if present else modal.Secret.from_dict({})
+    """Reference the named provider secret; resolved at call time, not deploy time."""
+    return modal.Secret.from_name(SECRET_NAME)
 
 
 app = modal.App(APP_NAME)
@@ -158,6 +208,17 @@ def run_worker(
 
 
 # -- endpoint encoding ------------------------------------------------------
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    """Parse a store timestamp, tolerating anything unexpected."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def endpoint_for(call_id: str) -> str:
@@ -266,6 +327,7 @@ def spawn_worker(
     dry_run: bool = False,
     worker_id: str | None = None,
     launcher: Launcher | None = None,
+    max_concurrent: int | None = None,
 ) -> dict[str, str]:
     """Launch a worker for `task` and record it. Returns ``{worker_id, endpoint}``.
 
@@ -277,7 +339,11 @@ def spawn_worker(
         raise ValueError(f"timeout_s {timeout_s} exceeds the container cap of {MAX_TIMEOUT_S}s")
 
     launch = launcher or _modal_launcher
-    worker = store.create_worker(task, worker_id=worker_id)
+    # The cap is enforced by the store so the count and the insert share one
+    # transaction — checking here and inserting after would race.
+    worker = store.create_worker(
+        task, worker_id=worker_id, max_live=resolve_max_concurrent(max_concurrent)
+    )
     store.add_event(
         worker.id, "spawned", {"task": task, "timeout_s": timeout_s, "dry_run": dry_run}
     )
@@ -339,6 +405,116 @@ def watch_worker(
     store.add_event(worker_id, event_type, payload)
     store.update_status(worker_id, status)
     return {"worker_id": worker_id, "status": status, "event": event_type, "result": result}
+
+
+def worker_deadline_s(store: FleetStore, worker_id: str) -> int:
+    """The `timeout_s` a worker was spawned with, from its `spawned` event.
+
+    Falls back to the default when the event is missing or malformed — an
+    unreadable payload should not make a stranded worker un-reconcilable.
+    """
+    for event in store.get_events(worker_id):
+        if event.type == "spawned" and isinstance(event.payload, dict):
+            value = event.payload.get("timeout_s")
+            if isinstance(value, int) and value > 0:
+                return value
+    return DEFAULT_TIMEOUT_S
+
+
+def overdue_workers(
+    store: FleetStore, *, now: datetime | None = None, grace_s: int = DEFAULT_GRACE_S
+) -> list[tuple[Worker, float]]:
+    """Live workers past their own deadline, with how far past, oldest first.
+
+    "Past its deadline" is the worker's own `timeout_s` plus a grace period —
+    the container hard-exits at that timeout, so anything still `running` well
+    beyond it has stopped without anyone recording the outcome.
+    """
+    now = now or datetime.now(UTC)
+    overdue: list[tuple[Worker, float]] = []
+    for worker in store.list_workers():
+        if worker.status in _TERMINAL:
+            continue
+        started = _parse_ts(worker.spawned_at)
+        if started is None:
+            continue
+        age = (now - started).total_seconds()
+        limit = worker_deadline_s(store, worker.id) + grace_s
+        if age > limit:
+            overdue.append((worker, age - limit))
+    return sorted(overdue, key=lambda pair: pair[1], reverse=True)
+
+
+def reconcile(
+    store: FleetStore,
+    *,
+    waiter: Waiter | None = None,
+    now: datetime | None = None,
+    grace_s: int = DEFAULT_GRACE_S,
+    fetch_timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Resolve workers stranded in a live state past their deadline.
+
+    Why this exists: under D10 the store is written only by local code, so a
+    worker spawned without `--wait` and never watched sits at `running` forever
+    once its container dies. One was found in the wild at 138 hours.
+
+    Recovery is attempted first, and it is usually possible — a Modal call's
+    result outlives the container by a long way (measured: a 9-hour-old result
+    was still retrievable). So a stranded worker's *answer* is normally
+    recoverable, not merely losable, and this records it properly.
+
+    When the result cannot be fetched the worker is marked `failed` with an
+    explicit reason. It is never marked `completed` — inventing a success for
+    work nobody observed is exactly the lie the watcher design exists to avoid.
+    """
+    wait = waiter or _modal_waiter
+    outcomes: list[dict[str, Any]] = []
+
+    for worker, over_by in overdue_workers(store, now=now, grace_s=grace_s):
+        call_id = function_call_id(worker.endpoint)
+        if call_id is None:
+            payload = {
+                "error": "stranded with no modal endpoint; never reported a result",
+                "overdue_by_s": round(over_by, 1),
+                "reconciled": True,
+            }
+            store.add_event(worker.id, "failed", payload)
+            store.update_status(worker.id, "failed")
+            outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
+            continue
+
+        try:
+            result: Any = wait(call_id, fetch_timeout_s)
+        except Exception as exc:
+            payload = {
+                "error": (
+                    f"stranded past its deadline and the result could not be fetched: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "overdue_by_s": round(over_by, 1),
+                "reconciled": True,
+            }
+            store.add_event(worker.id, "failed", payload)
+            store.update_status(worker.id, "failed")
+            outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
+            continue
+
+        status, event_type, payload = classify_result(result)
+        payload = {**payload, "reconciled": True, "overdue_by_s": round(over_by, 1)}
+        store.add_event(worker.id, event_type, payload)
+        store.update_status(worker.id, status)
+        outcomes.append(
+            {
+                "worker_id": worker.id,
+                "status": status,
+                "event": event_type,
+                "recovered": status == "done",
+                "result": result,
+            }
+        )
+
+    return outcomes
 
 
 def teardown(

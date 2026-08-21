@@ -22,6 +22,13 @@ from typing import Any
 
 STATUSES: frozenset[str] = frozenset({"provisioning", "running", "done", "failed", "torn_down"})
 
+# The canonical terminal set. `provision` and `cli` import this rather than
+# each declaring their own — three copies of the same truth is how they drift.
+TERMINAL: frozenset[str] = frozenset({"done", "failed", "torn_down"})
+
+# Everything else is a worker that may still be burning money.
+LIVE: frozenset[str] = STATUSES - TERMINAL
+
 # Allowed status transitions. Terminal results (done/failed) can only be
 # reached from running; torn_down is reachable from every live state so a
 # kill is always possible; nothing leaves torn_down.
@@ -71,6 +78,22 @@ class InvalidTransitionError(StoreError):
 
 class InvalidStatusError(StoreError):
     """Raised when a status value is not one of STATUSES."""
+
+
+class ConcurrencyLimitError(StoreError):
+    """Raised when creating a worker would exceed the live-worker cap.
+
+    Carries the ids that are already live so the caller can name them — a bare
+    "limit reached" leaves the user with nothing to act on.
+    """
+
+    def __init__(self, limit: int, live_ids: list[str]) -> None:
+        self.limit = limit
+        self.live_ids = live_ids
+        super().__init__(
+            f"refusing to spawn: {len(live_ids)} worker(s) already live "
+            f"and the limit is {limit} ({', '.join(live_ids)})"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,14 +151,54 @@ class FleetStore:
 
     # -- workers -----------------------------------------------------------
 
-    def create_worker(self, task: str, *, worker_id: str | None = None) -> Worker:
-        """Insert a new worker in status ``provisioning`` and return it."""
+    def create_worker(
+        self, task: str, *, worker_id: str | None = None, max_live: int | None = None
+    ) -> Worker:
+        """Insert a new worker in status ``provisioning`` and return it.
+
+        When ``max_live`` is given, the insert is refused if that many workers
+        are already in a non-terminal state, raising `ConcurrencyLimitError`.
+
+        The count and the insert share one ``BEGIN IMMEDIATE`` transaction on
+        purpose. Counting first and inserting after would race: two spawns
+        starting together would both see room and both proceed, which is
+        exactly the runaway the cap exists to prevent.
+        """
         wid = worker_id or f"w-{uuid.uuid4().hex[:12]}"
-        self._conn.execute(
-            "INSERT INTO workers (id, task, status, spawned_at) VALUES (?, ?, ?, ?)",
-            (wid, task, "provisioning", _utcnow()),
-        )
+        row = (wid, task, "provisioning", _utcnow())
+        insert = "INSERT INTO workers (id, task, status, spawned_at) VALUES (?, ?, ?, ?)"
+
+        if max_live is None:
+            self._conn.execute(insert, row)
+            return self._get_worker_or_raise(wid)
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            placeholders = ",".join("?" * len(LIVE))
+            live = [
+                r["id"]
+                for r in self._conn.execute(
+                    f"SELECT id FROM workers WHERE status IN ({placeholders}) ORDER BY spawned_at",
+                    tuple(sorted(LIVE)),
+                ).fetchall()
+            ]
+            if len(live) >= max_live:
+                raise ConcurrencyLimitError(max_live, live)
+            self._conn.execute(insert, row)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
         return self._get_worker_or_raise(wid)
+
+    def count_live(self) -> int:
+        """How many workers are in a non-terminal state."""
+        placeholders = ",".join("?" * len(LIVE))
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS n FROM workers WHERE status IN ({placeholders})",
+            tuple(sorted(LIVE)),
+        ).fetchone()
+        return int(row["n"])
 
     def update_status(
         self,

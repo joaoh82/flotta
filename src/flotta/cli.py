@@ -1,12 +1,13 @@
 """`flotta` — see and control the fleet from the terminal (M4).
 
-Five commands over the store and the provisioning functions:
+Six commands over the store and the provisioning functions:
 
     flotta ps                    active + recent workers
     flotta spawn "<task>"        launch one (--wait to follow it)
     flotta watch <id>            block until a worker reaches a terminal state
     flotta logs <id>             the worker's event timeline
     flotta kill <id>             tear it down (idempotent)
+    flotta reconcile             resolve workers stranded past their deadline
 
 Every command takes ``--json`` for scripting; the default is a plain aligned
 table. Tables are hand-rolled rather than pulled from a rendering library —
@@ -27,7 +28,13 @@ resolution must happen *before* `provision` is imported, since that module
 imports `modal`, which reads its config at import time — hence `_provision()`.
 
 Note that `ps` and `logs` are pure store reads — they need no Modal
-credentials at all. Only `spawn`, `watch` and `kill` reach the cloud.
+credentials at all. Only `spawn`, `watch`, `kill` and `reconcile` reach the
+cloud.
+
+`reconcile` is deliberately its own command rather than something `ps` does
+automatically, which is what the plan first suggested. Auto-reconciling would
+turn the cheapest read in the CLI into a command that writes to the store and
+requires Modal credentials — losing a property worth keeping.
 """
 
 from __future__ import annotations
@@ -41,7 +48,8 @@ from typing import Any
 
 import typer
 
-from .store import Event, FleetStore, UnknownWorkerError, Worker
+from .store import TERMINAL as STORE_TERMINAL
+from .store import ConcurrencyLimitError, Event, FleetStore, UnknownWorkerError, Worker
 
 DEFAULT_STORE = "fleet.db"
 STORE_ENV_VAR = "FLOTTA_STORE"
@@ -49,8 +57,8 @@ DEFAULT_DOTENV = ".env"
 PROFILE_ENV_VAR = "FLOTTA_MODAL_PROFILE"
 MODAL_PROFILE_ENV_VAR = "MODAL_PROFILE"
 
-# Terminal states, mirroring provision._TERMINAL — a worker here is finished.
-TERMINAL = frozenset({"done", "failed", "torn_down"})
+# Terminal states — imported, not re-declared, so it cannot drift from the store.
+TERMINAL = STORE_TERMINAL
 
 app = typer.Typer(
     name="flotta",
@@ -342,6 +350,11 @@ def spawn(
         False, "--dry-run", help="Boot the container but skip the LLM call"
     ),
     wait: bool = typer.Option(False, "--wait", help="Block until the worker finishes"),
+    max_concurrent: int | None = typer.Option(
+        None,
+        "--max-concurrent",
+        help="Live-worker cap; 0 disables it [$FLOTTA_MAX_CONCURRENT, default 1]",
+    ),
 ) -> None:
     """Launch a worker for TASK (manual spawn — no orchestrator involved)."""
     provision = _provision()
@@ -349,7 +362,24 @@ def spawn(
     # The one command that may create the store: spawning is how a fleet starts.
     with _open_store(store, must_exist=False) as fleet:
         try:
-            result = provision.spawn_worker(task, store=fleet, timeout_s=timeout_s, dry_run=dry_run)
+            result = provision.spawn_worker(
+                task,
+                store=fleet,
+                timeout_s=timeout_s,
+                dry_run=dry_run,
+                max_concurrent=max_concurrent,
+            )
+        except ConcurrencyLimitError as exc:
+            # Refusing to spawn is a policy decision, not a worker failure — exit 2
+            # so a script can tell "the fleet is busy" from "the task failed", and
+            # name the live workers so there is something to act on.
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            typer.secho(
+                "Inspect with `flotta ps`, free a slot with `flotta kill <id>`, "
+                "or raise the cap with --max-concurrent / $FLOTTA_MAX_CONCURRENT.",
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
         except (provision.ProvisionError, ValueError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
@@ -397,6 +427,40 @@ def watch(
         )
         if worker.status != "done":
             raise typer.Exit(code=1)
+
+
+@app.command()
+def reconcile(
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+    grace_s: int = typer.Option(
+        60, "--grace-s", help="Seconds past a worker's own timeout before it counts as stranded"
+    ),
+) -> None:
+    """Resolve workers stranded in a live state past their deadline.
+
+    A worker spawned without `--wait` and never watched sits at `running`
+    forever once its container dies, because only local code writes the store.
+    This re-attaches to each overdue call, records the real outcome when the
+    result is still available, and marks the rest `failed` with a reason.
+    """
+    provision = _provision()
+
+    with _open_store(store) as fleet:
+        outcomes = provision.reconcile(fleet, grace_s=grace_s)
+
+        if as_json:
+            emit(outcomes, "", as_json=True)
+            return
+        if not outcomes:
+            typer.echo("nothing to reconcile — no worker is past its deadline")
+            return
+        recovered = sum(1 for o in outcomes if o.get("recovered"))
+        for o in outcomes:
+            mark = "recovered" if o.get("recovered") else "closed"
+            typer.echo(f"{o['worker_id']}  {o['status']:10} {mark}")
+        typer.echo("")
+        typer.echo(f"{len(outcomes)} reconciled, {recovered} with a recovered result")
 
 
 @app.command()

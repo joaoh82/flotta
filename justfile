@@ -58,8 +58,50 @@ check: lint test
 smoke: modal-whoami
     MODAL_PROFILE={{modal_profile}} modal run src/flotta/worker/modal_app.py
 
+# Creates the named provider secret only if it is absent — never overwrites, so a
+# deploy cannot clobber a key you rotated in the Modal dashboard or via secret-sync.
+# M3 — ensure the provider secret exists (empty is fine; dry-run needs no provider)
+secret-ensure: modal-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if MODAL_PROFILE={{modal_profile}} modal secret list 2>/dev/null | grep -q ' flotta-provider '; then
+      echo "secret 'flotta-provider' exists — leaving it alone"
+    else
+      echo "creating empty secret 'flotta-provider' (use 'just secret-sync' to fill it)"
+      MODAL_PROFILE={{modal_profile}} modal secret create flotta-provider FLOTTA_PLACEHOLDER=unset
+    fi
+
+# Rotate a key: edit .env, run this. No code change and no redeploy — the named
+# secret is the container's source of truth (M7.1a).
+#
+# It is NOT instant, and the reason is worth knowing: a secret is injected as
+# environment variables when a container *starts*, so any container Modal is
+# still keeping warm goes on serving the old value until it scales down. New
+# containers get the new value immediately. To force it, stop the app:
+#   modal app stop flotta-provision -y
+# M7 — push local provider credentials into the named Modal secret
+secret-sync: modal-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    for k in FLOTTA_MODEL FLOTTA_MODEL_BASE_URL FLOTTA_API_KEY; do
+      [ -n "${!k:-}" ] || missing+=("$k")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+      echo "ERROR: not set in .env: ${missing[*]}" >&2
+      echo "Fill them in .env (see .env.example), then re-run." >&2
+      exit 1
+    fi
+    MODAL_PROFILE={{modal_profile}} modal secret create flotta-provider --force \
+      FLOTTA_MODEL="$FLOTTA_MODEL" \
+      FLOTTA_MODEL_BASE_URL="$FLOTTA_MODEL_BASE_URL" \
+      FLOTTA_API_KEY="$FLOTTA_API_KEY"
+    echo "secret updated — no redeploy needed."
+    echo "New containers use it immediately; a warm one may serve the old value"
+    echo "until it scales down. To force it now: modal app stop flotta-provision -y"
+
 # M3 — deploy the provisioning app (run_worker). Required before `just e2e`.
-deploy: modal-whoami
+deploy: modal-whoami secret-ensure
     MODAL_PROFILE={{modal_profile}} modal deploy src/flotta/provision.py
 
 # `just --list` shows only the LAST comment line, so keep that line a complete

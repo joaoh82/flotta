@@ -171,6 +171,15 @@ the user to check their Modal dashboard. Do not quietly move on.
    the store; read commands deliberately do not.
 7. **Modal auth or workspace errors.** Ask the user to run `just modal-whoami`
    in the repo.
+8. **`refusing to spawn: N worker(s) already live`** (exit code 2). Flotta caps
+   live workers at **1** by default. This is a refusal, not a crash — no worker
+   was created and nothing was billed. Either an earlier worker is still
+   running, or one stranded because it was spawned without `--wait`. Run
+   `flotta ps`, then `flotta watch <id>` to collect it or `flotta kill <id>` to
+   free the slot. Do **not** reach for `--max-concurrent` to get around this
+   unless the user has explicitly asked for concurrent workers: v0.1 is
+   untested above one, and the cap is what stops a loop from spending real
+   money.
 
 ## Verification
 
@@ -188,5 +197,6 @@ Before telling the user you are done:
 One string in — the worker knows nothing else.
 Always --wait, or the result is never collected.
 Always tear down, even on failure.
+One worker at a time — a second spawn is refused, not queued.
 The store is the truth; the worker's summary is a claim.
 ```
