@@ -86,6 +86,74 @@ MAX_TIMEOUT_S = 3600
 DEFAULT_MAX_CONCURRENT = 1
 MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
 
+# Cost estimation (OQ3, decided in M7.3). Modal's billing API was investigated
+# and **cannot** attribute cost to a single worker: `Workspace.billing.report()`
+# returns line items keyed by *App* id at daily or hourly resolution, every
+# worker shares the one `flotta-provision` app, and neither `Function.spawn`
+# nor `with_options` accepts a per-call tag. A 12-second worker is simply not
+# separable from that.
+#
+# So the estimate is `duration_s × a rate the operator sets themselves`. Unset
+# by default, in which case `cost_estimate` stays NULL and every surface renders
+# an em dash — a blank is better than a number derived from a rate nobody chose.
+# It covers **container time only**; model tokens are a separate bill Flotta
+# never sees.
+COST_PER_SECOND_ENV = "FLOTTA_COST_PER_SECOND"
+
+
+def resolve_cost_rate(
+    explicit: float | None = None, env: dict[str, str] | None = None
+) -> float | None:
+    """Dollars per container-second, or None when the operator has not set one."""
+    import os
+
+    env = os.environ if env is None else env
+
+    if explicit is None:
+        raw = (env.get(COST_PER_SECOND_ENV) or "").strip()
+        if not raw:
+            return None
+        try:
+            explicit = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{COST_PER_SECOND_ENV} must be a number, got {raw!r}") from exc
+
+    if explicit < 0:
+        raise ValueError(f"{COST_PER_SECOND_ENV} must be >= 0, got {explicit}")
+    return explicit or None
+
+
+def billable_seconds(worker: Worker, now: datetime | None = None) -> float | None:
+    """How long the worker existed, as observed from here.
+
+    **Not** the task's `duration_s`. That measures time *inside* `run_worker`
+    and excludes image pull and container boot, so it understates what Modal
+    bills — a dry run reports `0.0` while its container demonstrably ran. Wall
+    time from `spawned_at` is the better proxy: it spans launch to verdict.
+
+    It errs slightly high, because it also includes the local round-trip, and
+    that is the direction to err in for a cost estimate.
+    """
+    started = _parse_ts(worker.spawned_at)
+    if started is None:
+        return None
+    end = _parse_ts(worker.finished_at) or now or datetime.now(UTC)
+    return max(0.0, (end - started).total_seconds())
+
+
+def estimate_cost(seconds: Any, rate: float | None) -> float | None:
+    """`seconds × rate`, or None when either is missing or unusable.
+
+    Total by design: an unusable duration yields no estimate rather than an
+    exception, because failing to price a worker must never fail recording it.
+    """
+    if rate is None or not isinstance(seconds, int | float) or isinstance(seconds, bool):
+        return None
+    if seconds < 0:
+        return None
+    return round(float(seconds) * rate, 6)
+
+
 # Grace beyond a worker's own timeout before `reconcile` calls it stranded.
 # The container hard-exits at its timeout, so this only has to cover the lag
 # between that exit and the local process noticing.
@@ -368,6 +436,7 @@ def watch_worker(
     store: FleetStore,
     timeout_s: float | None = None,
     waiter: Waiter | None = None,
+    cost_per_second: float | None = None,
 ) -> dict[str, Any]:
     """Await a worker's result and record the terminal status it implies.
 
@@ -403,8 +472,19 @@ def watch_worker(
 
     status, event_type, payload = classify_result(result)
     store.add_event(worker_id, event_type, payload)
-    store.update_status(worker_id, status)
-    return {"worker_id": worker_id, "status": status, "event": event_type, "result": result}
+    # Priced from the row as it stands *before* the write: it has no
+    # `finished_at` yet, so `billable_seconds` measures to now — the same
+    # instant `update_status` is about to stamp. One write, no second
+    # transition (and `done -> done` would rightly be rejected anyway).
+    cost = estimate_cost(billable_seconds(worker), resolve_cost_rate(cost_per_second))
+    store.update_status(worker_id, status, cost_estimate=cost)
+    return {
+        "worker_id": worker_id,
+        "status": status,
+        "event": event_type,
+        "result": result,
+        "cost_estimate": cost,
+    }
 
 
 def worker_deadline_s(store: FleetStore, worker_id: str) -> int:
@@ -452,6 +532,7 @@ def reconcile(
     now: datetime | None = None,
     grace_s: int = DEFAULT_GRACE_S,
     fetch_timeout_s: float = 10.0,
+    cost_per_second: float | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve workers stranded in a live state past their deadline.
 
@@ -503,7 +584,8 @@ def reconcile(
         status, event_type, payload = classify_result(result)
         payload = {**payload, "reconciled": True, "overdue_by_s": round(over_by, 1)}
         store.add_event(worker.id, event_type, payload)
-        store.update_status(worker.id, status)
+        cost = estimate_cost(billable_seconds(worker), resolve_cost_rate(cost_per_second))
+        store.update_status(worker.id, status, cost_estimate=cost)
         outcomes.append(
             {
                 "worker_id": worker.id,

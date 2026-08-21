@@ -65,10 +65,12 @@ export function workerDuration(
 /**
  * Cost, when the store has one.
  *
- * Nothing populates `cost_estimate` yet — OQ3 (Modal usage API vs.
- * duration x rate) is unresolved — so in practice this renders an em dash. It
- * deliberately does not invent a number from duration: a fabricated dollar
- * figure that looks authoritative is worse than an honest blank.
+ * Populated only when the operator sets `FLOTTA_COST_PER_SECOND`; otherwise
+ * this renders an em dash. Modal's billing API cannot attribute cost to one
+ * worker — it is keyed by App id at daily/hourly resolution and calls cannot be
+ * tagged — so the figure is duration x a rate the operator chose. It is never
+ * derived from a rate nobody picked: a fabricated dollar figure that looks
+ * authoritative is worse than an honest blank.
  */
 export function fmtCost(cost: number | null | undefined): string {
   if (cost === null || cost === undefined) return "—";
