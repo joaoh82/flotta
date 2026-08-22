@@ -25,6 +25,17 @@ worker. That one rule shapes most of the design.
 > delegation round-trip in about 40 seconds. What is left before 1.0 is polish, not architecture —
 > see [Limitations](#limitations), which is deliberately specific.
 
+> [!WARNING]
+> **Flotta is a local tool. Nothing in it is authenticated.**
+>
+> The dashboard has no login and its kill button tears down real workers; anyone who can reach
+> the port can stop any worker and read every task and result the fleet has produced. The CLI
+> and the fleet store assume the same — a single trusted operator on one machine.
+>
+> Everything binds localhost by design. Do not put the dashboard on a shared host, a public
+> interface, or a tunnel without putting authentication in front of it first. Multi-user is not
+> a v0.1 feature and there is no permission model to fall back on.
+
 ## What it does today
 
 - **Disposable cloud workers.** A pinned Modal image boots Hermes *headless* — no messaging
