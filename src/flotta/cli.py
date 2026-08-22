@@ -268,7 +268,11 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
     """
     path = resolve_store_path(store)
     if must_exist and not path.exists():
-        typer.secho(f"no fleet-state store at {path}", fg=typer.colors.RED, err=True)
+        # Absolute, always. A relative "fleet.db" does not tell you *which*
+        # directory was searched, and since `spawn` creates the store in the
+        # working directory, stores genuinely do end up scattered — a stranger
+        # can spawn in one directory and be told "no store" in another.
+        typer.secho(f"no fleet-state store at {path.resolve()}", fg=typer.colors.RED, err=True)
         typer.secho(
             'Spawn a worker first (flotta spawn "..."), or point at an existing '
             "store with --store / $FLOTTA_STORE.",
@@ -313,7 +317,16 @@ def ps(
         if status is None and not all_:
             workers = [w for w in workers if w.status not in TERMINAL]
         workers = workers[:limit]
-        emit([worker_dict(w) for w in workers], render_workers(workers), as_json=as_json)
+        if as_json:
+            emit([worker_dict(w) for w in workers], "", as_json=True)
+            return
+        typer.echo(render_workers(workers))
+        if not workers:
+            # Naming the file matters most when there is nothing to show: an
+            # empty fleet and the wrong store look identical otherwise.
+            typer.secho(
+                f"(store: {resolve_store_path(store).resolve()})", fg=typer.colors.BRIGHT_BLACK
+            )
 
 
 @app.command()
@@ -360,7 +373,16 @@ def spawn(
     provision = _provision()
 
     # The one command that may create the store: spawning is how a fleet starts.
+    store_path = resolve_store_path(store)
+    created_store = not store_path.exists()
     with _open_store(store, must_exist=False) as fleet:
+        if created_store and not as_json:
+            # Say so once, so the file's location is known rather than inferred
+            # later from a confusing empty `ps`.
+            typer.secho(
+                f"created fleet store at {store_path.resolve()}",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
         try:
             result = provision.spawn_worker(
                 task,

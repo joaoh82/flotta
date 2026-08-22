@@ -163,6 +163,10 @@ flotta kill <id>               # tear it down (idempotent)
 flotta reconcile               # rescue workers stranded past their deadline
 ```
 
+**The store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`. `spawn`
+says where it created one, and every read command names the file it looked at — because spawning in
+one directory and running `ps` in another otherwise looks exactly like an empty fleet.
+
 Every command takes `--json`. `ps` and `logs` are pure store reads and need no Modal credentials.
 Exit codes carry meaning: `1` a failed worker, `2` a refusal (the fleet is busy, or the store is
 missing).

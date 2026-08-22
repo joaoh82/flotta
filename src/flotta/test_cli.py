@@ -375,3 +375,32 @@ def test_open_store_allows_creation_for_spawn(tmp_path):
     with _open_store(str(fresh), must_exist=False):
         pass
     assert fresh.exists()
+
+
+# -- store path clarity (M7.5) ----------------------------------------------
+
+
+def test_missing_store_error_names_an_absolute_path(tmp_path, monkeypatch):
+    """A relative "fleet.db" does not say *which* directory was searched.
+
+    `spawn` creates the store in the working directory, so stores genuinely do
+    scatter — a clean-machine walkthrough spawned in one directory and was told
+    "no store" in another, with no way to tell the two apart.
+    """
+    import typer
+
+    from flotta.cli import _open_store
+
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit):
+        _open_store("fleet.db")
+
+
+def test_resolve_store_path_is_relative_but_reported_absolute(tmp_path, monkeypatch):
+    """Resolution stays relative (that is the documented contract); only the
+    *message* is absolutised, so `--store fleet.db` still means cwd."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(STORE_ENV_VAR, raising=False)
+    p = resolve_store_path(None)
+    assert str(p) == DEFAULT_STORE
+    assert p.resolve() == (tmp_path / DEFAULT_STORE).resolve()
