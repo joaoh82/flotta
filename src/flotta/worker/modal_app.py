@@ -35,7 +35,10 @@ _SRC = _HERE.parents[2] if len(_HERE.parents) > 2 else None
 if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from flotta.worker.image import worker_image  # noqa: E402  (needs the sys.path prime above)
+from flotta.worker.image import (  # noqa: E402  (needs the sys.path prime above)
+    HERMES_REF,
+    worker_image,
+)
 
 app = modal.App("flotta-worker")
 
@@ -138,6 +141,38 @@ async def _probe(cfg) -> dict:
     return {"ok": ok, "tools": tools, "health": health, "auth_enforced": auth_enforced}
 
 
+def _installed_hermes() -> dict:
+    """What Hermes the container is *actually* running.
+
+    The pin says what we asked for; this says what arrived. Those can differ —
+    a stale image layer, a moved tag, a hand-edited ref — and without checking,
+    a smoke test that passes proves the image works, not that it works on the
+    version you think. `git describe` reads the checkout the editable install
+    points at, so it reflects the real source tree.
+    """
+    import importlib.metadata as md
+    import subprocess
+
+    from flotta.worker.image import HERMES_SRC
+
+    info: dict[str, str] = {}
+    try:
+        info["version"] = md.version("hermes-agent")
+    except Exception as exc:  # never fail the smoke test over reporting
+        info["version"] = f"unknown ({type(exc).__name__})"
+    try:
+        info["ref"] = subprocess.run(
+            ["git", "describe", "--tags", "--always"],
+            cwd=HERMES_SRC,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
+    except Exception as exc:
+        info["ref"] = f"unknown ({type(exc).__name__})"
+    return info
+
+
 @app.function(image=worker_image, timeout=300)
 def smoke_check() -> dict:
     """In-container: boot the MCP endpoint and confirm it answers."""
@@ -155,7 +190,9 @@ def smoke_check() -> dict:
         }
     )
     _serve_in_thread(cfg)
-    return asyncio.run(_probe(cfg))
+    result = asyncio.run(_probe(cfg))
+    result["hermes"] = _installed_hermes()
+    return result
 
 
 @app.local_entrypoint()
@@ -164,4 +201,12 @@ def smoke() -> None:
     print(json.dumps(result, indent=2))
     if not result.get("ok"):
         raise SystemExit("SMOKE FAILED — MCP endpoint did not answer as expected")
+    hermes = result.get("hermes") or {}
+    expected = HERMES_REF
+    actual = hermes.get("ref", "?")
+    print(f"hermes in container: {hermes.get('version', '?')} @ {actual}  (pinned: {expected})")
+    if actual != expected and not expected.startswith(actual.rstrip("-dirty")):
+        # A warning, not a failure: a SHA pin or a branch will not equal the
+        # `git describe` output, and that is legitimate.
+        print(f"NOTE: container ref {actual!r} does not match the pin {expected!r}")
     print(f"SMOKE OK — MCP endpoint answered (tools={result.get('tools')})")
