@@ -29,6 +29,11 @@ The port is **3001**, not Next's default 3000, which is reserved for another
 local service. That is baked into `package.json` rather than left to a flag, so
 it cannot be forgotten.
 
+The dev server prints this warning on every start, along with the store it is
+about to read — wired as npm's `predev` hook, so it fires for `npm run dev` and
+`just dashboard` alike rather than only the path that happens to go through
+`just`. Set `NO_COLOR` if the highlighting is unwelcome.
+
 ## Where the data comes from
 
 | | |
@@ -90,6 +95,8 @@ app/
   api/workers/route.ts      GET  list
   api/workers/[id]/route.ts GET  detail + events · DELETE kill
   components/               client components (polling, table, timeline)
+scripts/
+  banner.mjs                startup warning (npm `predev` hook)
 lib/
   store.ts                  read-only node:sqlite access  (server-only)
   teardown.ts               shells out to the CLI          (server-only)
