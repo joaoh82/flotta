@@ -156,3 +156,32 @@ def test_doctor_survives_a_corrupt_database(tmp_path):
     report = doctor.collect(hermes_home=str(home), port=1)
     assert "error" in report["state_db"]
     assert doctor.render(report)  # still renders rather than raising
+
+
+def test_doctor_finds_an_ipv6_only_listener(tmp_path):
+    """Fly's private network is IPv6-only, so a box binds `::`.
+
+    An IPv4-only probe reported that healthy box as down — a false FAIL, which
+    is worse than no check because it sends you debugging the wrong thing.
+    """
+    import socket
+    import threading
+
+    from flotta.box import doctor
+
+    server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("::1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    threading.Thread(target=lambda: server.accept(), daemon=True).start()
+    try:
+        assert doctor._is_listening(port) is True
+    finally:
+        server.close()
+
+
+def test_doctor_reports_nothing_listening_on_a_free_port():
+    from flotta.box import doctor
+
+    assert doctor._is_listening(1) is False

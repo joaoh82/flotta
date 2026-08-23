@@ -122,6 +122,13 @@ between milestones — architecture, conventions, and the sharp edges below.
   once, create many boxes — so `BoxSpec.image` names an existing one and
   `just fly-up` owns producing it. The same split will hold for a Firecracker
   rootfs.
+- **Fly's private network is IPv6-only — bind `::`, never `0.0.0.0`.** An
+  IPv4-only bind is invisible to `flyctl proxy`, which dials the machine's
+  `fdaa:` address: the connection resets and nothing in the logs explains it.
+  Diagnosed by reading `/proc/net/tcp6` on the box, where the only IPv6
+  listener was port 22. `::` binds IPv6 and, with Linux dual-stack, accepts
+  IPv4 too. The same trap catches health checks: probe **both** address
+  families or a perfectly healthy box reports as down.
 - **Do not build shell incantations for `fly ssh` — ship a command.** Checking
   a box's state through `flyctl ssh console -C "..."` wrapping `/bin/sh -c
   '...'` wrapping `python3 -c "..."` is three layers of quoting, and one

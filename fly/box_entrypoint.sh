@@ -29,7 +29,17 @@
 # bypass Hermes's auth gate rather than satisfy it, and that gate exists
 # because of a real campaign (`hermes-0day`) against open dashboards.
 #
-# So the box binds all interfaces and *satisfies* the gate with the bundled
+# ## Why `::` and not `0.0.0.0`
+#
+# **Fly's private network is IPv6-only.** `0.0.0.0` binds IPv4 only, so a box
+# serving on it is invisible to `flyctl proxy`, which dials the machine's
+# `fdaa:` address — the connection is reset and nothing in the logs says why.
+# Diagnosed by reading `/proc/net/tcp6` on the box: the sole IPv6 listener was
+# port 22. `::` binds IPv6 and, with Linux dual-stack, accepts IPv4 too.
+#
+# ## Why binding all interfaces is not a hole
+#
+# The box binds all interfaces and *satisfies* the gate with the bundled
 # basic-auth provider. Two independent layers protect it:
 #
 #   1. There is no public route. fly.toml declares no service and the app has
@@ -43,7 +53,7 @@ set -euo pipefail
 
 : "${HERMES_HOME:=/data/hermes}"
 : "${FLOTTA_SERVE_PORT:=9119}"
-: "${FLOTTA_SERVE_HOST:=0.0.0.0}"
+: "${FLOTTA_SERVE_HOST:=::}"
 
 # Created on every boot, not in an image layer: the volume mounts over /data at
 # container start, so anything the build wrote there is invisible afterwards.

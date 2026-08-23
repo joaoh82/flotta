@@ -12,6 +12,10 @@ Reports what actually matters about a box, in the order you would ask:
     does state.db have sessions?    (M3: it remembers *conversations*)
     what has it learned?            (memories and skills on disk)
     is Hermes listening?            (M3: it is an agent you can talk to)
+
+Checks both address families for that last one. Fly's private network is
+IPv6-only, so a box binds `::` — and an IPv4-only probe reports a healthy box
+as down, which is a worse failure than not checking at all.
 """
 
 from __future__ import annotations
@@ -85,10 +89,23 @@ def _list_dir(path: Path) -> dict:
 
 
 def _is_listening(port: int) -> bool:
-    """Whether anything answers on the serve port, from inside the box."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(2)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
+    """Whether anything answers on the serve port, from inside the box.
+
+    Both address families, because the answer differs and the difference is the
+    whole point: the box binds `::` so Fly's IPv6-only private network can
+    reach it, and an IPv4-only probe then reports a perfectly healthy box as
+    down. This function was IPv4-only and did exactly that — a false FAIL on a
+    box that was serving fine.
+    """
+    for family, host in ((socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2)
+                if sock.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:
+            continue  # family unavailable on this host
+    return False
 
 
 def render(report: dict) -> str:
