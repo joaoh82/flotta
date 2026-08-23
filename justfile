@@ -404,5 +404,30 @@ fly-doctor: fly-whoami
     #!/usr/bin/env bash
     set -euo pipefail
     APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
-    flyctl machines start --app "$APP" >/dev/null 2>&1 || true
-    flyctl ssh console --app "$APP" -C "python3 -m flotta.box.doctor"
+
+    # Machines are started BY ID. `flyctl machines start --app X` with no id
+    # fails with "a machine ID must be specified when not running
+    # interactively" — and an earlier version of this recipe swallowed that
+    # with `|| true`, so a stopped box surfaced as `fly ssh`'s far less helpful
+    # "app has no started VMs. It may be unhealthy or not have been deployed
+    # yet", which sends you looking at deploys and health checks instead of at
+    # a box that is simply asleep.
+    IDS=$(flyctl machines list --app "$APP" --json \
+      | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin)))")
+    if [ -z "$IDS" ]; then
+      echo "no machines in $APP — run \`just fly-up\` first" >&2
+      exit 1
+    fi
+    for MID in $IDS; do
+      flyctl machines start "$MID" --app "$APP" >/dev/null 2>&1 || true
+    done
+    # Started is not the same as ready: hermes serve takes a few seconds to
+    # come up, and the doctor's own listener check is what distinguishes them.
+    flyctl machines list --app "$APP" --json \
+      | uv run python -c "
+    import json,sys
+    stuck=[m['id'] for m in json.load(sys.stdin) if m['state']!='started']
+    sys.exit(f'still not started: {stuck}' if stuck else 0)"
+
+    # --wait-s: a box that just started is still importing Hermes.
+    flyctl ssh console --app "$APP" -C "python3 -m flotta.box.doctor --wait-s 45"

@@ -25,6 +25,7 @@ import json
 import os
 import socket
 import sqlite3
+import time
 from pathlib import Path
 
 DEFAULT_HERMES_HOME = "/data/hermes"
@@ -36,7 +37,7 @@ DEFAULT_PORT = 9119
 SESSION_TABLES = ("sessions", "messages", "messages_fts")
 
 
-def collect(hermes_home: str | None = None, port: int | None = None) -> dict:
+def collect(hermes_home: str | None = None, port: int | None = None, wait_s: float = 0.0) -> dict:
     home = Path(hermes_home or os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME)
     port = port or int(os.environ.get("FLOTTA_SERVE_PORT") or DEFAULT_PORT)
 
@@ -64,7 +65,12 @@ def collect(hermes_home: str | None = None, port: int | None = None) -> dict:
 
     report["memories"] = _list_dir(home / "memories")
     report["skills"] = _list_dir(home / "skills")
-    report["serving"] = _is_listening(port)
+    # `wait_s` because a machine reaching `started` is not the same as Hermes
+    # being up — it imports the agent first, which takes seconds. Running the
+    # doctor straight after `fly machines start` otherwise reports FAIL on a box
+    # that is merely still booting, which is a false alarm about the one thing
+    # this milestone added.
+    report["serving"] = _is_listening(port, wait_s=wait_s)
     report["port"] = port
     return report
 
@@ -88,7 +94,7 @@ def _list_dir(path: Path) -> dict:
     }
 
 
-def _is_listening(port: int) -> bool:
+def _is_listening(port: int, wait_s: float = 0.0) -> bool:
     """Whether anything answers on the serve port, from inside the box.
 
     Both address families, because the answer differs and the difference is the
@@ -97,15 +103,19 @@ def _is_listening(port: int) -> bool:
     down. This function was IPv4-only and did exactly that — a false FAIL on a
     box that was serving fine.
     """
-    for family, host in ((socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")):
-        try:
-            with socket.socket(family, socket.SOCK_STREAM) as sock:
-                sock.settimeout(2)
-                if sock.connect_ex((host, port)) == 0:
-                    return True
-        except OSError:
-            continue  # family unavailable on this host
-    return False
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while True:
+        for family, host in ((socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")):
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2)
+                    if sock.connect_ex((host, port)) == 0:
+                        return True
+            except OSError:
+                continue  # family unavailable on this host
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def render(report: dict) -> str:
@@ -131,9 +141,15 @@ def render(report: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report what is true about this box.")
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument(
+        "--wait-s",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for hermes serve to come up (a just-started box is still booting)",
+    )
     args = parser.parse_args(argv)
 
-    report = collect()
+    report = collect(wait_s=args.wait_s)
     print(json.dumps(report, indent=2) if args.as_json else render(report))
     # Non-zero when the box cannot do its job, so this is usable as a check.
     healthy = report["exists"] and report["on_volume"] and report["serving"]

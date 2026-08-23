@@ -136,6 +136,14 @@ between milestones — architecture, conventions, and the sharp edges below.
   `python3 -m flotta.box.doctor` (`just fly-doctor`) has no quoting problem and
   reports the things worth asking: HERMES_HOME on the volume, the session
   schema, memories, skills, whether Hermes is listening.
+- **`flyctl machines start` needs an id.** A bare `--app X` fails with "a
+  machine ID must be specified when not running interactively". Swallowing that
+  with `|| true` is worse than not trying: the failure resurfaces as `fly ssh`'s
+  "app has no started VMs. It may be unhealthy or not have been deployed yet",
+  which sends you to check deploys and health for a box that is merely asleep.
+- **`started` is not `ready`.** A machine reaching `started` says nothing about
+  Hermes, which imports the agent first (~6s). Any check run straight after a
+  start needs a bounded wait — `flotta.box.doctor --wait-s`.
 - **`fly ssh` needs a running machine.** A stopped box gives a connection
   error, not "the box is stopped" — `just fly-doctor` starts it first.
 - **`flyctl ssh console -C` does not run a shell.** It execs the string as
