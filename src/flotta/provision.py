@@ -163,6 +163,10 @@ def billable_seconds(task: Task, now: datetime | None = None) -> float | None:
     """
     started = _parse_ts(task.started_at)
     if started is None:
+        # Never ran — either still `pending`, or failed straight out of it.
+        # Time spent waiting on a stopped box is not billable: nothing was
+        # running to bill. Returning None keeps the estimate blank rather than
+        # charging for the wait.
         return None
     end = _parse_ts(task.finished_at) or now or datetime.now(UTC)
     return max(0.0, (end - started).total_seconds())
@@ -523,6 +527,16 @@ def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[st
     if box.status == "stopped":
         return {"box_id": box_id, "status": "stopped", "already_stopped": True}
 
+    # Legality is checked *before* the event is written. `add_event` then
+    # `update_box_status` looks harmless but is not: `provisioning -> stopped`
+    # and `torn_down -> stopped` are both illegal, so the naive order leaves a
+    # `stopped` event on a box that never stopped and *then* raises. Events are
+    # the audit trail; a lie in them outlives the traceback.
+    if box.status != "running":
+        raise ProvisionError(
+            f"box {box_id} is {box.status!r}; only a running box can be stopped"
+        )
+
     store.add_event("box", box_id, "stopped", {"reason": reason, "previous_status": box.status})
     store.update_box_status(box_id, "stopped")
     return {"box_id": box_id, "status": "stopped", "already_stopped": False}
@@ -538,6 +552,19 @@ def start_box(box_id: str, *, store: FleetStore, reason: str = "requested") -> d
     box = _require_box(store, box_id)
     if box.status == "running":
         return {"box_id": box_id, "status": "running", "already_running": True}
+
+    # Only a *stopped* box may start. `provisioning -> running` is legal in the
+    # store — it is how `spawn_box` records a successful launch — so without
+    # this guard `flotta start` on a box mid-spawn marks it running with no
+    # endpoint, which is precisely the wake/create collapse this function is
+    # named to avoid. Worse, it then makes `spawn_box`'s own
+    # `provisioning -> running` illegal, so a launched container is left
+    # billing with its call id never recorded.
+    if box.status != "stopped":
+        raise ProvisionError(
+            f"box {box_id} is {box.status!r}; only a stopped box can be started. "
+            "Starting is waking an existing box, never creating one."
+        )
 
     store.add_event("box", box_id, "running", {"reason": reason, "previous_status": box.status})
     store.update_box_status(box_id, "running")
@@ -646,6 +673,10 @@ def overdue_tasks(
     for task in store.list_tasks():
         if is_terminal("task", task.status):
             continue
+        # A task with no `started_at` is `pending` — waiting for its box, not
+        # stranded. Measuring its age from `created_at` would reconcile it to
+        # `failed` after `timeout_s + grace` purely for having waited, which is
+        # the opposite of what a sleeping fleet is meant to allow.
         started = _parse_ts(task.started_at)
         if started is None:
             continue

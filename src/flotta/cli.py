@@ -130,7 +130,11 @@ def fmt_age(ts: str | None, *, now: datetime | None = None) -> str:
 
 
 def task_duration(task: Task, *, now: datetime | None = None) -> float | None:
-    """Elapsed time for a task: to `finished_at`, or to now if still live."""
+    """How long a task has been *running*: to `finished_at`, or to now if live.
+
+    None while `pending`, because nothing has run yet. Rendering the wait as a
+    duration would say a task on a sleeping box had been working for a week.
+    """
     start = parse_ts(task.started_at)
     if start is None:
         return None
@@ -194,12 +198,14 @@ def task_row(task: Task, *, now: datetime | None = None) -> list[str]:
         task.status,
         truncate(task.prompt, 40),
         fmt_duration(task_duration(task, now=now)),
-        fmt_age(task.started_at, now=now),
+        # `created`, not `started`: a pending task has no start, and the column
+        # that is always populated is the one worth showing.
+        fmt_age(task.created_at, now=now),
     ]
 
 
 def render_tasks(tasks: list[Task], *, now: datetime | None = None) -> str:
-    headers = ["id", "box", "status", "task", "duration", "started"]
+    headers = ["id", "box", "status", "task", "duration", "created"]
     return render_table(headers, [task_row(t, now=now) for t in tasks])
 
 
@@ -578,6 +584,10 @@ def stop(
         except UnknownEntityError as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
+        except provision.ProvisionError as exc:
+            # A refusal, not a failure — exit 2, same as a busy fleet.
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=2) from exc
         note = " (already stopped)" if result.get("already_stopped") else ""
         emit(result, f"{box.id}  stopped{note}", as_json=as_json)
 
@@ -599,6 +609,9 @@ def start(
         except UnknownEntityError as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
+        except provision.ProvisionError as exc:
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=2) from exc
         note = " (already running)" if result.get("already_running") else ""
         emit(result, f"{box.id}  running{note}", as_json=as_json)
 

@@ -95,6 +95,21 @@ cd flotta
 uv tool install .        # puts a bare `flotta` on your PATH
 ```
 
+> **Upgrading an existing checkout?** The store schema changed — `workers`
+> became `boxes` / `workspaces` / `tasks` — and there is **no migration**.
+> Delete your old store first:
+>
+> ```bash
+> rm -f fleet.db fleet.db-wal fleet.db-shm e2e_fleet.db e2e_fleet.db-wal e2e_fleet.db-shm
+> ```
+>
+> This matters because the schema is created with `CREATE TABLE IF NOT EXISTS`:
+> an old file is not rejected, it quietly gains empty new tables beside the
+> stale `workers` one and renders as an empty fleet. Old rows are dropped
+> rather than migrated on purpose — they describe one-shot task runs, and there
+> is no box for them to become. Inventing a synthetic box per historical worker
+> would be a lie in the data.
+
 Working on Flotta itself? Use `uv run flotta …` from the repo instead and skip the install.
 
 *(`pip install flotta` will work once the package is published; it is not on PyPI yet.)*
@@ -211,8 +226,10 @@ says where it created one, and every read command names the file it looked at �
 one directory and running `ps` in another otherwise looks exactly like an empty fleet.
 
 Every command takes `--json`. `ps` and `logs` are pure store reads and need no Modal credentials;
-so are `stop` and `start`, for now. Exit codes carry meaning: `1` a failed task, `2` a refusal
-(the fleet is busy, or the store is missing).
+so are `stop` and `start`, for now. Exit codes carry meaning: `1` a failed task or a missing id,
+`2` a refusal — the fleet is busy, the store is missing, or the box is in the wrong state
+(**only a running box can be stopped, and only a stopped box can be started**; starting is waking
+an existing box, never creating one).
 
 **Always pass `--wait`** — or note the ids. Flotta's *local* process records the outcome, not the
 container, so a task nobody waits on finishes in the cloud while its row sits at `running`.

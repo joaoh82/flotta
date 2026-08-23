@@ -14,7 +14,10 @@ the connection factory at Turso (libsql) later is a one-function change
   No memory of their own; the box remembers and drives them remotely.
 - ``tasks`` — the unit of work. ``done``/``failed`` live **here**, not on
   the machine. A task points at its box and, when it needed somewhere to
-  run code, at a workspace.
+  run code, at a workspace. It carries two clocks: ``created_at`` (when the
+  work was asked for) and a nullable ``started_at`` (when something began
+  doing it). They differ whenever a task waits on a stopped box, which is
+  exactly what ``pending`` exists to name.
 
 Shards deliberately get no table. They are Modal function calls owned by a
 workspace; the aggregate lands on ``tasks.result_json`` and Modal owns the
@@ -129,7 +132,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_id  TEXT REFERENCES workspaces(id),
     prompt        TEXT NOT NULL,
     status        TEXT NOT NULL,
-    started_at    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    started_at    TEXT,
     finished_at   TEXT,
     result_json   TEXT,
     cost_estimate REAL
@@ -226,7 +230,13 @@ class Task:
     workspace_id: str | None
     prompt: str
     status: str
-    started_at: str
+    created_at: str
+    # None until the task actually starts running. `created_at` is when the
+    # work was asked for; `started_at` is when something began doing it. Those
+    # are the same instant only when the box is already awake — the whole point
+    # of `pending` is that they need not be, and anything measuring runtime or
+    # deadlines must use this one, not `created_at`.
+    started_at: str | None
     finished_at: str | None
     result: dict[str, Any] | None
     cost_estimate: float | None
@@ -519,7 +529,7 @@ class FleetStore:
                     raise ConcurrencyLimitError(max_live, live, noun="task")
             self._conn.execute(
                 """
-                INSERT INTO tasks (id, box_id, workspace_id, prompt, status, started_at)
+                INSERT INTO tasks (id, box_id, workspace_id, prompt, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (tid, box_id, workspace_id, prompt, "pending", _utcnow()),
@@ -556,6 +566,13 @@ class FleetStore:
             finished_at = current.finished_at
             if finished_at is None and status in TASK_TERMINAL:
                 finished_at = _utcnow()
+            # Stamped when the work actually begins, not when it was asked for.
+            # A task that fails straight out of `pending` never started, and
+            # leaving this NULL is what tells the cost and deadline code that
+            # nothing ran and nothing is stranded.
+            started_at = current.started_at
+            if started_at is None and status == "running":
+                started_at = _utcnow()
             self._conn.execute(
                 """
                 UPDATE tasks
@@ -563,6 +580,7 @@ class FleetStore:
                     result_json = COALESCE(?, result_json),
                     cost_estimate = COALESCE(?, cost_estimate),
                     workspace_id = COALESCE(?, workspace_id),
+                    started_at = ?,
                     finished_at = ?
                 WHERE id = ?
                 """,
@@ -571,6 +589,7 @@ class FleetStore:
                     json.dumps(result) if result is not None else None,
                     cost_estimate,
                     workspace_id,
+                    started_at,
                     finished_at,
                     task_id,
                 ),
@@ -598,7 +617,7 @@ class FleetStore:
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
-            f"SELECT * FROM tasks {where} ORDER BY started_at DESC, id DESC", tuple(params)
+            f"SELECT * FROM tasks {where} ORDER BY created_at DESC, id DESC", tuple(params)
         ).fetchall()
         return [_task_from_row(r) for r in rows]
 
@@ -612,7 +631,7 @@ class FleetStore:
         return [
             r["id"]
             for r in self._conn.execute(
-                f"SELECT id FROM tasks WHERE status IN ({placeholders}) ORDER BY started_at",
+                f"SELECT id FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at",
                 tuple(sorted(live)),
             ).fetchall()
         ]
@@ -738,6 +757,7 @@ def _task_from_row(row: sqlite3.Row) -> Task:
         workspace_id=row["workspace_id"],
         prompt=row["prompt"],
         status=row["status"],
+        created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         result=json.loads(row["result_json"]) if row["result_json"] is not None else None,

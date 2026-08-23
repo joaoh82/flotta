@@ -876,6 +876,7 @@ def test_billable_seconds_uses_finished_at_when_present(store):
         workspace_id=None,
         prompt="t",
         status="done",
+        created_at="2026-08-18T11:59:00+00:00",
         started_at="2026-08-18T12:00:00+00:00",
         finished_at="2026-08-18T12:00:45+00:00",
         result=None,
@@ -887,7 +888,7 @@ def test_billable_seconds_uses_finished_at_when_present(store):
 def test_billable_seconds_without_a_start(store):
     from flotta.store import Task
 
-    t = Task("t-1", "b-1", None, "t", "done", "junk", None, None, None)
+    t = Task("t-1", "b-1", None, "t", "done", "2026-08-18T12:00:00+00:00", "junk", None, None, None)
     assert billable_seconds(t) is None
 
 
@@ -989,3 +990,140 @@ def test_spawn_records_which_hermes_ran(store):
     spawned = store.get_events("task", r["task_id"])[0]
     assert spawned.type == "spawned"
     assert spawned.payload["hermes_ref"] == HERMES_REF
+
+
+# -- PR #28 review findings -------------------------------------------------
+
+
+def test_start_refuses_a_box_that_never_launched(store):
+    """Wake is not create.
+
+    `provisioning -> running` is legal in the store — it is how `spawn_box`
+    records a successful launch — so without a guard `flotta start` on a box
+    mid-spawn marks it running with no endpoint.
+    """
+    box = store.create_box("eng-b")
+    with pytest.raises(ProvisionError, match="only a stopped box can be started"):
+        start_box(box.id, store=store)
+    assert store.get_box(box.id).status == "provisioning"
+    assert box_events(store, box.id) == []  # nothing written on the way out
+
+
+def test_start_refuses_a_torn_down_box_cleanly(store):
+    """A clean refusal, not an InvalidTransitionError traceback."""
+    bid = box_of(store, spawned(store))
+    teardown_box(bid, store=store, canceller=lambda c: None)
+    with pytest.raises(ProvisionError, match="only a stopped box can be started"):
+        start_box(bid, store=store)
+
+
+def test_start_on_a_provisioning_box_cannot_strand_a_billed_container(store):
+    """The race the guard closes.
+
+    If `start_box` marked a mid-spawn box `running`, `spawn_box`'s own
+    `provisioning -> running` would then be `running -> running` — illegal — so
+    the launch would raise *after* Modal had been paid, with the call id never
+    recorded and nothing left to cancel.
+    """
+    box = store.create_box("eng-b")
+    with pytest.raises(ProvisionError):
+        start_box(box.id, store=store)
+    # The spawn path is still able to complete, which is the property at stake.
+    store.update_box_status(box.id, "running", endpoint=endpoint_for("fc-1"))
+    assert store.get_box(box.id).endpoint == endpoint_for("fc-1")
+
+
+def test_stop_refuses_a_box_that_never_ran_without_writing_an_event(store):
+    """Events are the audit trail; a lie in them outlives the traceback.
+
+    `add_event` then `update_box_status` leaves a `stopped` event on a box that
+    never stopped, because `provisioning -> stopped` is illegal and raises only
+    after the event is committed.
+    """
+    box = store.create_box("eng-b")
+    with pytest.raises(ProvisionError, match="only a running box can be stopped"):
+        stop_box(box.id, store=store)
+    assert store.get_box(box.id).status == "provisioning"
+    assert box_events(store, box.id) == []
+
+
+def test_stop_refuses_a_torn_down_box_without_writing_an_event(store):
+    bid = box_of(store, spawned(store))
+    teardown_box(bid, store=store, canceller=lambda c: None)
+    before = box_events(store, bid)
+    with pytest.raises(ProvisionError, match="only a running box can be stopped"):
+        stop_box(bid, store=store)
+    assert box_events(store, bid) == before
+    assert "stopped" not in box_events(store, bid)
+
+
+def test_a_pending_task_is_not_stranded_however_long_it_waits(store):
+    """Waiting on a stopped box is the product working, not a fault.
+
+    `created_at` is the insert clock; measuring the deadline from it would
+    reconcile a patiently-waiting task to `failed` purely for having waited.
+    """
+    box = store.create_box("eng-b")
+    task = store.create_task(box.id, "waits for a sleeping box")
+    store._conn.execute(
+        "UPDATE tasks SET created_at = ? WHERE id = ?",
+        ("2026-01-01T00:00:00+00:00", task.id),
+    )
+    assert overdue_tasks(store) == []
+    assert reconcile(store, waiter=lambda c, t: {"completed": True}) == []
+    assert store.get_task(task.id).status == "pending"  # untouched
+
+
+def test_a_pending_task_is_not_billed_for_waiting(store):
+    box = store.create_box("eng-b")
+    task = store.create_task(box.id, "waits")
+    store._conn.execute(
+        "UPDATE tasks SET created_at = ? WHERE id = ?",
+        ("2026-01-01T00:00:00+00:00", task.id),
+    )
+    assert billable_seconds(store.get_task(task.id)) is None
+    assert estimate_cost(billable_seconds(store.get_task(task.id)), 0.001) is None
+
+
+def test_started_at_is_stamped_on_pending_to_running(store):
+    box = store.create_box("eng-b")
+    task = store.create_task(box.id, "t")
+    assert task.started_at is None
+    assert task.created_at  # always set
+    running = store.update_task_status(task.id, "running")
+    assert running.started_at is not None
+    assert running.created_at == task.created_at  # the ask-time never moves
+
+
+def test_started_at_is_not_stamped_when_a_pending_task_fails(store):
+    """Failed straight out of pending: it never ran, so it has no run-start."""
+    box = store.create_box("eng-b")
+    task = store.create_task(box.id, "t")
+    failed = store.update_task_status(task.id, "failed")
+    assert failed.started_at is None
+    assert failed.finished_at is not None
+    assert billable_seconds(failed) is None
+
+
+def test_billing_measures_the_run_not_the_wait(store):
+    """The two clocks, side by side: a long wait then a short run."""
+    box = store.create_box("eng-b")
+    task = store.create_task(box.id, "t")
+    store._conn.execute(
+        "UPDATE tasks SET created_at = ? WHERE id = ?",
+        ("2026-01-01T00:00:00+00:00", task.id),
+    )
+    store.update_task_status(task.id, "running")
+    _age(store, task.id, 30)  # ran for 30s, after waiting since January
+    assert billable_seconds(store.get_task(task.id)) == pytest.approx(30, rel=0.1)
+
+
+def test_teardown_of_a_box_with_a_pending_task_fails_it(store):
+    """Killing a sleeping box resolves the work waiting on it."""
+    box = store.create_box("eng-b")
+    task = store.create_task(box.id, "never got to run")
+    out = teardown_box(box.id, store=store, canceller=lambda c: None)
+    assert out["failed_tasks"] == [task.id]
+    resolved = store.get_task(task.id)
+    assert resolved.status == "failed"
+    assert resolved.started_at is None  # honest: it never ran

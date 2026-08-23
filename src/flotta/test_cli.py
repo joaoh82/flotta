@@ -61,6 +61,7 @@ def make_task(**overrides) -> Task:
         "workspace_id": None,
         "prompt": "summarize the logs",
         "status": "running",
+        "created_at": (NOW - timedelta(seconds=30)).isoformat(),
         "started_at": (NOW - timedelta(seconds=30)).isoformat(),
         "finished_at": None,
         "result": None,
@@ -254,6 +255,23 @@ def test_task_row_shape():
     assert row[3] == "summarize the logs"
     assert row[4] == "30s"
     assert row[5] == "30s ago"
+
+
+def test_task_row_of_a_pending_task_shows_no_duration():
+    """A task waiting on a sleeping box has not run for any length of time.
+
+    Rendering the wait as a duration would say a task on a box stopped last
+    week had been working for a week.
+    """
+    pending = make_task(status="pending", started_at=None)
+    row = task_row(pending, now=NOW)
+    assert row[2] == "pending"
+    assert row[4] == "-"  # duration
+    assert row[5] == "30s ago"  # created — always populated
+
+
+def test_task_duration_is_none_while_pending():
+    assert task_duration(make_task(status="pending", started_at=None), now=NOW) is None
 
 
 def test_task_row_truncates_a_long_prompt():

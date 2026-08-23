@@ -78,6 +78,30 @@ between milestones — architecture, conventions, and the sharp edges below.
   arithmetic assumes tens. A live task is what burns CPU, so that is what is
   rationed. `create_workspace(max_live=...)` is the same guard, wired and tested
   ahead of the tier that will use it.
+- **No store migration; delete the old file.** The schema is created with
+  `CREATE TABLE IF NOT EXISTS`, so a pre-M0 `fleet.db` is not rejected — it
+  quietly gains empty new tables beside the stale `workers` one and renders as
+  an empty fleet. `rm -f fleet.db fleet.db-wal fleet.db-shm e2e_fleet.db
+  e2e_fleet.db-wal e2e_fleet.db-shm`. Old rows are dropped rather than migrated
+  on purpose: they describe one-shot task runs and there is no box for them to
+  become.
+- **Only `running` can stop; only `stopped` can start.** `provisioning ->
+  running` is legal in the store (it is how `spawn_box` records a launch), so
+  an unguarded `start_box` would wake a box mid-spawn into `running` with no
+  endpoint — the wake/create collapse the pivot doc warns about — and then make
+  `spawn_box`'s own transition illegal, stranding a billed container. Both
+  functions refuse with `ProvisionError` (CLI exit 2).
+- **Check transition legality *before* writing the event.** `add_event` then
+  `update_*_status` looks harmless and is not: an illegal transition leaves a
+  committed event describing something that never happened, then raises. Events
+  are the audit trail; a lie in them outlives the traceback.
+- **Tasks have two clocks.** `created_at` (insert, NOT NULL) is when the work
+  was asked for; `started_at` (nullable, stamped on `pending -> running`) is
+  when something began doing it. Anything measuring runtime or deadlines —
+  `billable_seconds`, `overdue_tasks`, the CLI's duration column — must use
+  `started_at`, and must treat NULL as "never ran". Using the insert clock
+  bills a task for waiting on a sleeping box and reconciles it to `failed` for
+  having waited, which is the opposite of what a sleeping fleet is for.
 - **`run_worker` is deliberately not renamed.** It is the Tier 3 stateless
   one-shot living in `provision.py`; calling it a box would be wrong in the
   other direction. Its successor name is `run_shard`, and that belongs to the
