@@ -172,13 +172,20 @@ which would look authoritative and be wrong — Flotta shows a blank until you s
 ## Command reference
 
 ```bash
-flotta ps [--all]              # live workers (finished hidden by default)
-flotta spawn "<task>" --wait   # launch one and block for the result
-flotta watch <id>              # re-attach to a worker spawned earlier
-flotta logs <id>               # that worker's event timeline
-flotta kill <id>               # tear it down (idempotent)
-flotta reconcile               # rescue workers stranded past their deadline
+flotta ps [--all] [--tasks]    # boxes in the fleet; --tasks lists the work
+flotta spawn "<task>" --wait   # create a box, put a task on it, block for the result
+flotta watch <id>              # re-attach to a task (or a box's live task)
+flotta logs <box>              # that box's timeline, across all three tiers
+flotta stop <box>              # disk retained, no CPU
+flotta start <box>             # wake it again
+flotta kill <box>              # destroy it (idempotent)
+flotta reconcile               # rescue tasks stranded past their deadline
 ```
+
+A **box** is a machine that is an agent, a **task** is one piece of work that
+visits it, and a box outlives every task on it. `ps` shows boxes because the
+fleet *is* the boxes — and a `stopped` box stays in that list, because an idle
+fleet is the system working, not rows to tidy away.
 
 **The store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`. `spawn`
 says where it created one, and every read command names the file it looked at — because spawning in

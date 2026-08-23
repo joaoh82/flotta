@@ -1,13 +1,20 @@
 """`flotta` — see and control the fleet from the terminal (M4).
 
-Six commands over the store and the provisioning functions:
+Commands over the store and the provisioning functions:
 
-    flotta ps                    active + recent workers
-    flotta spawn "<task>"        launch one (--wait to follow it)
-    flotta watch <id>            block until a worker reaches a terminal state
-    flotta logs <id>             the worker's event timeline
-    flotta kill <id>             tear it down (idempotent)
-    flotta reconcile             resolve workers stranded past their deadline
+    flotta ps                    boxes in the fleet (--tasks for the work)
+    flotta spawn "<task>"        create a box and put one task on it (--wait to follow)
+    flotta watch <id>            block until a task reaches a terminal state
+    flotta logs <box>            the box's timeline, across all three tiers
+    flotta stop <box>            stop a box — disk retained, no CPU
+    flotta start <box>           wake a stopped box
+    flotta kill <box>            destroy it (idempotent)
+    flotta reconcile             resolve tasks stranded past their deadline
+
+**What `ps` lists changed with the pivot.** v0.1 listed workers, which were
+task runs wearing a machine's clothes. The fleet is now the *boxes*, so that is
+the default view; `--tasks` lists the work instead. `spawn` prints both ids
+because it creates both rows.
 
 Every command takes ``--json`` for scripting; the default is a plain aligned
 table. Tables are hand-rolled rather than pulled from a rendering library —
@@ -28,8 +35,9 @@ resolution must happen *before* `provision` is imported, since that module
 imports `modal`, which reads its config at import time — hence `_provision()`.
 
 Note that `ps` and `logs` are pure store reads — they need no Modal
-credentials at all. Only `spawn`, `watch`, `kill` and `reconcile` reach the
-cloud.
+credentials at all. `stop` and `start` are store-only too in M0, since no
+backend can suspend a machine until M1. Only `spawn`, `watch`, `kill` and
+`reconcile` reach the cloud.
 
 `reconcile` is deliberately its own command rather than something `ps` does
 automatically, which is what the plan first suggested. Auto-reconciling would
@@ -48,8 +56,15 @@ from typing import Any
 
 import typer
 
-from .store import TERMINAL as STORE_TERMINAL
-from .store import ConcurrencyLimitError, Event, FleetStore, UnknownWorkerError, Worker
+from .store import (
+    Box,
+    ConcurrencyLimitError,
+    Event,
+    FleetStore,
+    Task,
+    UnknownEntityError,
+    is_terminal,
+)
 
 DEFAULT_STORE = "fleet.db"
 STORE_ENV_VAR = "FLOTTA_STORE"
@@ -57,12 +72,9 @@ DEFAULT_DOTENV = ".env"
 PROFILE_ENV_VAR = "FLOTTA_MODAL_PROFILE"
 MODAL_PROFILE_ENV_VAR = "MODAL_PROFILE"
 
-# Terminal states — imported, not re-declared, so it cannot drift from the store.
-TERMINAL = STORE_TERMINAL
-
 app = typer.Typer(
     name="flotta",
-    help="Fleet runtime for self-improving agents — see and control your workers.",
+    help="Fleet runtime for self-improving agents — see and control your boxes.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -117,12 +129,26 @@ def fmt_age(ts: str | None, *, now: datetime | None = None) -> str:
     return f"{fmt_duration((now - parsed).total_seconds())} ago"
 
 
-def worker_duration(worker: Worker, *, now: datetime | None = None) -> float | None:
-    """Elapsed time for a worker: to `finished_at`, or to now if still live."""
-    start = parse_ts(worker.spawned_at)
+def task_duration(task: Task, *, now: datetime | None = None) -> float | None:
+    """Elapsed time for a task: to `finished_at`, or to now if still live."""
+    start = parse_ts(task.started_at)
     if start is None:
         return None
-    end = parse_ts(worker.finished_at) or now or datetime.now(UTC)
+    end = parse_ts(task.finished_at) or now or datetime.now(UTC)
+    return max(0.0, (end - start).total_seconds())
+
+
+def box_age(box: Box, *, now: datetime | None = None) -> float | None:
+    """How long a box has existed: to `destroyed_at`, or to now if still alive.
+
+    Age, not duration. A box that has been stopped for a month is a month old
+    and has run for none of it — conflating the two is the task-shaped thinking
+    the pivot is getting rid of.
+    """
+    start = parse_ts(box.created_at)
+    if start is None:
+        return None
+    end = parse_ts(box.destroyed_at) or now or datetime.now(UTC)
     return max(0.0, (end - start).total_seconds())
 
 
@@ -140,35 +166,62 @@ def render_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def worker_row(worker: Worker, *, now: datetime | None = None) -> list[str]:
+def box_row(box: Box, latest: Task | None = None, *, now: datetime | None = None) -> list[str]:
     return [
-        worker.id,
-        worker.status,
-        truncate(worker.task, 40),
-        fmt_duration(worker_duration(worker, now=now)),
-        fmt_age(worker.spawned_at, now=now),
+        box.id,
+        box.name,
+        box.status,
+        truncate(latest.prompt if latest else None, 40),
+        fmt_age(box.created_at, now=now),
     ]
 
 
-def render_workers(workers: list[Worker], *, now: datetime | None = None) -> str:
-    headers = ["id", "status", "task", "duration", "spawned"]
-    return render_table(headers, [worker_row(w, now=now) for w in workers])
+def render_boxes(
+    boxes: list[Box],
+    latest: dict[str, Task] | None = None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    latest = latest or {}
+    headers = ["id", "name", "status", "latest task", "created"]
+    return render_table(headers, [box_row(b, latest.get(b.id), now=now) for b in boxes])
+
+
+def task_row(task: Task, *, now: datetime | None = None) -> list[str]:
+    return [
+        task.id,
+        task.box_id,
+        task.status,
+        truncate(task.prompt, 40),
+        fmt_duration(task_duration(task, now=now)),
+        fmt_age(task.started_at, now=now),
+    ]
+
+
+def render_tasks(tasks: list[Task], *, now: datetime | None = None) -> str:
+    headers = ["id", "box", "status", "task", "duration", "started"]
+    return render_table(headers, [task_row(t, now=now) for t in tasks])
 
 
 def event_row(event: Event) -> list[str]:
     return [
         parse_ts(event.ts).strftime("%H:%M:%S") if parse_ts(event.ts) else "-",
+        event.entity_kind,
         event.type,
-        truncate(json.dumps(event.payload) if event.payload else "", 70),
+        truncate(json.dumps(event.payload) if event.payload else "", 60),
     ]
 
 
 def render_events(events: list[Event]) -> str:
-    return render_table(["time", "event", "detail"], [event_row(e) for e in events])
+    return render_table(["time", "tier", "event", "detail"], [event_row(e) for e in events])
 
 
-def worker_dict(worker: Worker) -> dict[str, Any]:
-    return asdict(worker)
+def box_dict(box: Box) -> dict[str, Any]:
+    return asdict(box)
+
+
+def task_dict(task: Task) -> dict[str, Any]:
+    return asdict(task)
 
 
 def event_dict(event: Event) -> dict[str, Any]:
@@ -258,13 +311,9 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
     """Open the fleet-state store.
 
     Reads must not conjure an empty store at a mistyped path and then cheerfully
-    report "(none)" — that reads as "no workers" when it means "wrong file". Only
+    report "(none)" — that reads as "no boxes" when it means "wrong file". Only
     `spawn`, which legitimately starts a fleet from nothing, passes
     ``must_exist=False``.
-
-    (The comment above used to sit here on its own while `FleetStore(path)`
-    happily created the file anyway; the dashboard, which reports a missing
-    store explicitly, is what made the discrepancy visible.)
     """
     path = resolve_store_path(store)
     if must_exist and not path.exists():
@@ -274,7 +323,7 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
         # can spawn in one directory and be told "no store" in another.
         typer.secho(f"no fleet-state store at {path.resolve()}", fg=typer.colors.RED, err=True)
         typer.secho(
-            'Spawn a worker first (flotta spawn "..."), or point at an existing '
+            'Spawn a box first (flotta spawn "..."), or point at an existing '
             "store with --store / $FLOTTA_STORE.",
             err=True,
         )
@@ -282,12 +331,36 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
     return FleetStore(path)
 
 
-def _require(store: FleetStore, worker_id: str) -> Worker:
-    worker = store.get_worker(worker_id)
-    if worker is None:
-        typer.secho(f"no worker with id {worker_id!r}", fg=typer.colors.RED, err=True)
+def _require_box(store: FleetStore, box_id: str) -> Box:
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is None:
+        typer.secho(f"no box with id or name {box_id!r}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
-    return worker
+    return box
+
+
+def _resolve_task(store: FleetStore, ident: str) -> Task:
+    """Accept a task id, a box id, or a box name and land on one task.
+
+    Given a box, the newest live task on it — that is what "watch this" means
+    when you have just spawned something. Without this, `ps` (which lists
+    boxes) and `watch` (which needs a task) would name different things and
+    there would be no command bridging them.
+    """
+    task = store.get_task(ident)
+    if task is not None:
+        return task
+
+    box = store.get_box(ident) or store.get_box_by_name(ident)
+    if box is not None:
+        live = [t for t in store.list_tasks(box_id=box.id) if not is_terminal("task", t.status)]
+        if live:
+            return live[0]
+        typer.secho(f"box {box.id} has no live task to watch", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    typer.secho(f"no task or box matching {ident!r}", fg=typer.colors.RED, err=True)
+    raise typer.Exit(code=1)
 
 
 StoreOpt = typer.Option(None, "--store", help="Path to the fleet-state store [$FLOTTA_STORE]")
@@ -302,26 +375,48 @@ def ps(
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
     status: str | None = typer.Option(None, "--status", help="Filter by status"),
-    all_: bool = typer.Option(False, "--all", "-a", help="Include finished workers"),
+    all_: bool = typer.Option(
+        False, "--all", "-a", help="Include torn-down boxes / finished tasks"
+    ),
+    tasks: bool = typer.Option(False, "--tasks", help="List tasks instead of boxes"),
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum rows"),
 ) -> None:
-    """List active and recent workers."""
+    """List the fleet: boxes by default, tasks with --tasks."""
     with _open_store(store) as fleet:
         try:
-            workers = fleet.list_workers(status)
+            rows = fleet.list_tasks(status=status) if tasks else fleet.list_boxes(status)
         except Exception as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
-        # Default view is "what is live" — finished workers pile up fast and
-        # are rarely what you opened `ps` to see. --all restores the full list.
+
+        kind = "task" if tasks else "box"
+        # Default view is "what is live" — finished work piles up fast and is
+        # rarely what you opened `ps` to see. --all restores the full list.
+        # Note a *stopped* box survives this filter: it is not terminal, and
+        # hiding your idle fleet would hide the point of the fleet.
         if status is None and not all_:
-            workers = [w for w in workers if w.status not in TERMINAL]
-        workers = workers[:limit]
+            rows = [r for r in rows if not is_terminal(kind, r.status)]
+        rows = rows[:limit]
+
         if as_json:
-            emit([worker_dict(w) for w in workers], "", as_json=True)
+            emit(
+                [task_dict(r) for r in rows] if tasks else [box_dict(r) for r in rows],
+                "",
+                as_json=True,
+            )
             return
-        typer.echo(render_workers(workers))
-        if not workers:
+
+        if tasks:
+            typer.echo(render_tasks(rows))
+        else:
+            latest: dict[str, Task] = {}
+            for box in rows:
+                box_tasks = fleet.list_tasks(box_id=box.id)
+                if box_tasks:
+                    latest[box.id] = box_tasks[0]
+            typer.echo(render_boxes(rows, latest))
+
+        if not rows:
             # Naming the file matters most when there is nothing to show: an
             # empty fleet and the wrong store look identical otherwise.
             typer.secho(
@@ -331,45 +426,51 @@ def ps(
 
 @app.command()
 def logs(
-    worker_id: str = typer.Argument(..., help="Worker id"),
+    box_id: str = typer.Argument(..., help="Box id or name"),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
-    """Show a worker's event timeline."""
+    """Show a box's timeline — its own events plus its tasks' and workspaces'."""
     with _open_store(store) as fleet:
-        worker = _require(fleet, worker_id)
-        events = fleet.get_events(worker_id)
+        box = _require_box(fleet, box_id)
+        events = fleet.get_box_timeline(box.id)
+        box_tasks = fleet.list_tasks(box_id=box.id)
         if as_json:
             emit(
-                {"worker": worker_dict(worker), "events": [event_dict(e) for e in events]},
+                {
+                    "box": box_dict(box),
+                    "tasks": [task_dict(t) for t in box_tasks],
+                    "events": [event_dict(e) for e in events],
+                },
                 "",
                 as_json=True,
             )
             return
-        typer.echo(f"{worker.id}  {worker.status}  {truncate(worker.task, 60)}")
-        if worker.endpoint:
-            typer.echo(f"endpoint: {worker.endpoint}")
+        typer.echo(f"{box.id}  {box.name}  {box.status}")
+        if box.endpoint:
+            typer.echo(f"endpoint: {box.endpoint}")
         typer.echo("")
         typer.echo(render_events(events))
 
 
 @app.command()
 def spawn(
-    task: str = typer.Argument(..., help="The task to hand to the worker"),
+    task: str = typer.Argument(..., help="The task to put on the box"),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
+    name: str | None = typer.Option(None, "--name", help="Box name (default: generated)"),
     timeout_s: int = typer.Option(900, "--timeout-s", help="Hard task timeout"),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Boot the container but skip the LLM call"
     ),
-    wait: bool = typer.Option(False, "--wait", help="Block until the worker finishes"),
+    wait: bool = typer.Option(False, "--wait", help="Block until the task finishes"),
     max_concurrent: int | None = typer.Option(
         None,
         "--max-concurrent",
-        help="Live-worker cap; 0 disables it [$FLOTTA_MAX_CONCURRENT, default 1]",
+        help="Live-task cap; 0 disables it [$FLOTTA_MAX_CONCURRENT, default 1]",
     ),
 ) -> None:
-    """Launch a worker for TASK (manual spawn — no orchestrator involved)."""
+    """Create a box and put TASK on it (manual spawn — no orchestrator involved)."""
     provision = _provision()
 
     # The one command that may create the store: spawning is how a fleet starts.
@@ -384,20 +485,21 @@ def spawn(
                 fg=typer.colors.BRIGHT_BLACK,
             )
         try:
-            result = provision.spawn_worker(
+            result = provision.spawn_box(
                 task,
                 store=fleet,
+                name=name,
                 timeout_s=timeout_s,
                 dry_run=dry_run,
                 max_concurrent=max_concurrent,
             )
         except ConcurrencyLimitError as exc:
-            # Refusing to spawn is a policy decision, not a worker failure — exit 2
+            # Refusing to spawn is a policy decision, not a task failure — exit 2
             # so a script can tell "the fleet is busy" from "the task failed", and
-            # name the live workers so there is something to act on.
+            # name the live tasks so there is something to act on.
             typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
             typer.secho(
-                "Inspect with `flotta ps`, free a slot with `flotta kill <id>`, "
+                "Inspect with `flotta ps --tasks`, free a slot with `flotta kill <box>`, "
                 "or raise the cap with --max-concurrent / $FLOTTA_MAX_CONCURRENT.",
                 err=True,
             )
@@ -406,49 +508,99 @@ def spawn(
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
 
-        worker_id = result["worker_id"]
+        box_id, task_id = result["box_id"], result["task_id"]
         if not wait:
-            emit(result, f"{worker_id}  running\nendpoint: {result['endpoint']}", as_json=as_json)
+            emit(
+                result,
+                f"{box_id}  running\ntask: {task_id}\nendpoint: {result['endpoint']}",
+                as_json=as_json,
+            )
             return
 
         if not as_json:
-            typer.echo(f"{worker_id}  running — waiting…", err=True)
-        outcome = provision.watch_worker(worker_id, store=fleet, timeout_s=timeout_s)
-        worker = fleet.get_worker(worker_id)
+            typer.echo(f"{task_id}  running — waiting…", err=True)
+        outcome = provision.watch_task(task_id, store=fleet, timeout_s=timeout_s)
+        finished = fleet.get_task(task_id)
         if as_json:
-            emit({**result, **outcome, "worker": worker_dict(worker)}, "", as_json=True)
+            emit({**result, **outcome, "task": task_dict(finished)}, "", as_json=True)
         else:
-            typer.echo(f"{worker_id}  {worker.status}  in {fmt_duration(worker_duration(worker))}")
+            typer.echo(f"{task_id}  {finished.status}  in {fmt_duration(task_duration(finished))}")
             response = (outcome.get("result") or {}).get("final_response")
             if response:
                 typer.echo("")
                 typer.echo(response)
-        # A failed worker is a failed command — scripts should be able to tell.
-        if worker.status != "done":
+        # A failed task is a failed command — scripts should be able to tell.
+        if finished.status != "done":
             raise typer.Exit(code=1)
 
 
 @app.command()
 def watch(
-    worker_id: str = typer.Argument(..., help="Worker id"),
+    ident: str = typer.Argument(..., help="Task id, or a box id/name to watch its live task"),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
     timeout_s: int = typer.Option(900, "--timeout-s", help="How long to wait"),
 ) -> None:
-    """Block until a worker reaches a terminal state, then report it."""
+    """Block until a task reaches a terminal state, then report it."""
     provision = _provision()
 
     with _open_store(store) as fleet:
-        _require(fleet, worker_id)
-        outcome = provision.watch_worker(worker_id, store=fleet, timeout_s=timeout_s)
-        worker = fleet.get_worker(worker_id)
+        task = _resolve_task(fleet, ident)
+        outcome = provision.watch_task(task.id, store=fleet, timeout_s=timeout_s)
+        finished = fleet.get_task(task.id)
         emit(
-            {**outcome, "worker": worker_dict(worker)},
-            f"{worker.id}  {worker.status}  in {fmt_duration(worker_duration(worker))}",
+            {**outcome, "task": task_dict(finished)},
+            f"{finished.id}  {finished.status}  in {fmt_duration(task_duration(finished))}",
             as_json=as_json,
         )
-        if worker.status != "done":
+        if finished.status != "done":
             raise typer.Exit(code=1)
+
+
+@app.command()
+def stop(
+    box_id: str = typer.Argument(..., help="Box id or name"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+    reason: str = typer.Option("cli", "--reason", help="Recorded on the stopped event"),
+) -> None:
+    """Stop a box — disk retained, no CPU. Idempotent.
+
+    Store-side only until M1: no backend can suspend a machine yet, so this
+    records the transition without an infrastructure call behind it.
+    """
+    provision = _provision()
+
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        try:
+            result = provision.stop_box(box.id, store=fleet, reason=reason)
+        except UnknownEntityError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        note = " (already stopped)" if result.get("already_stopped") else ""
+        emit(result, f"{box.id}  stopped{note}", as_json=as_json)
+
+
+@app.command()
+def start(
+    box_id: str = typer.Argument(..., help="Box id or name"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+    reason: str = typer.Option("cli", "--reason", help="Recorded on the running event"),
+) -> None:
+    """Wake a stopped box. Idempotent."""
+    provision = _provision()
+
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        try:
+            result = provision.start_box(box.id, store=fleet, reason=reason)
+        except UnknownEntityError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        note = " (already running)" if result.get("already_running") else ""
+        emit(result, f"{box.id}  running{note}", as_json=as_json)
 
 
 @app.command()
@@ -456,12 +608,12 @@ def reconcile(
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
     grace_s: int = typer.Option(
-        60, "--grace-s", help="Seconds past a worker's own timeout before it counts as stranded"
+        60, "--grace-s", help="Seconds past a task's own timeout before it counts as stranded"
     ),
 ) -> None:
-    """Resolve workers stranded in a live state past their deadline.
+    """Resolve tasks stranded in a live state past their deadline.
 
-    A worker spawned without `--wait` and never watched sits at `running`
+    A task spawned without `--wait` and never watched sits at `running`
     forever once its container dies, because only local code writes the store.
     This re-attaches to each overdue call, records the real outcome when the
     result is still available, and marks the rest `failed` with a reason.
@@ -475,35 +627,35 @@ def reconcile(
             emit(outcomes, "", as_json=True)
             return
         if not outcomes:
-            typer.echo("nothing to reconcile — no worker is past its deadline")
+            typer.echo("nothing to reconcile — no task is past its deadline")
             return
         recovered = sum(1 for o in outcomes if o.get("recovered"))
         for o in outcomes:
             mark = "recovered" if o.get("recovered") else "closed"
-            typer.echo(f"{o['worker_id']}  {o['status']:10} {mark}")
+            typer.echo(f"{o['task_id']}  {o['status']:10} {mark}")
         typer.echo("")
         typer.echo(f"{len(outcomes)} reconciled, {recovered} with a recovered result")
 
 
 @app.command()
 def kill(
-    worker_id: str = typer.Argument(..., help="Worker id"),
+    box_id: str = typer.Argument(..., help="Box id or name"),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
     reason: str = typer.Option("cli", "--reason", help="Recorded on the torn_down event"),
 ) -> None:
-    """Tear down a worker. Idempotent — killing a dead worker is not an error."""
+    """Destroy a box, failing anything still running on it. Idempotent."""
     provision = _provision()
 
     with _open_store(store) as fleet:
-        _require(fleet, worker_id)
+        box = _require_box(fleet, box_id)
         try:
-            result = provision.teardown(worker_id, store=fleet, reason=reason)
-        except UnknownWorkerError as exc:
+            result = provision.teardown_box(box.id, store=fleet, reason=reason)
+        except UnknownEntityError as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
         note = " (already torn down)" if result.get("already_torn_down") else ""
-        emit(result, f"{worker_id}  torn_down{note}", as_json=as_json)
+        emit(result, f"{box.id}  torn_down{note}", as_json=as_json)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,43 +1,52 @@
-"""Provisioning — spawn workers, watch them finish, tear them down.
+"""Provisioning — create boxes, watch their tasks, tear them down.
 
 **Where each half runs (OQ2 / decision D10).** Two reasons pick a watcher over
-worker self-reporting, and the second is the one that lasts:
+self-reporting, and the second is the one that lasts:
 
 1. Under D8 the v0.1 store is a plain local SQLite file, which a container
    cannot reach. This is a consequence of that deferral, *not* of the design —
    D3 still points at Turso, and a Turso Cloud store would be reachable from a
    container, so this reason expires when Turso lands.
-2. A worker that dies mid-task — OOM, preemption, container kill — writes
-   nothing at all. A worker that owned its own status would strand in
+2. A machine that dies mid-task — OOM, preemption, container kill — writes
+   nothing at all. A task that owned its own status would strand in
    ``running`` forever. The watcher owns the verdict precisely because it
-   outlives the worker, and that stays true under Turso.
+   outlives the machine, and that stays true under Turso.
 
 So the module splits in two:
 
 - ``run_worker`` runs **inside Modal**. It does the work and touches no store.
-  This is the only piece `modal deploy` publishes.
-- ``spawn_worker`` / ``watch_worker`` / ``teardown`` run **locally**, next to
-  the store file, and are its only writers. The CLI (M4), the dashboard (M5)
-  and the orchestrator skill (M6) all call these.
+  This is the only piece `modal deploy` publishes, and it is deliberately
+  **not** renamed: it is Tier 3, the stateless one-shot, and calling it a box
+  would be wrong in the other direction. Its successor name is `run_shard`,
+  which belongs to M8, not here.
+- ``spawn_box`` / ``watch_task`` / ``stop_box`` / ``start_box`` /
+  ``teardown_box`` run **locally**, next to the store file, and are its only
+  writers. The CLI (M4) and the dashboard (M5) call these.
 
-So the worker never writes fleet state; it only ever *returns* a result, which
-the local watcher translates into a status change. A worker that dies without
-returning still resolves, because the watcher — not the worker — owns the
-verdict.
+**The pivot, as it lands here.** v0.1's `spawn_worker` created one row that was
+simultaneously a machine and a task. It is now two: a **box** that owns the
+endpoint and the machine lifecycle, and a **task** that owns the verdict. Under
+Modal the box is still disposable — Modal cannot stop and resume a container —
+so `stop_box`/`start_box` are store-side only until M1's `Backend` protocol
+gives them something real to call. That asymmetry is the point: it documents in
+code why Modal cannot be the primary substrate.
 
 **Lifecycle and the events it writes.**
 
-    spawn_worker()   provisioning ──spawned──> running   (+ endpoint)
-    watch_worker()   running ──completed──> done
-                     running ──failed/timed_out──> failed
-    teardown()       any ──torn_down──> torn_down        (idempotent)
+    spawn_box()      box:  provisioning ──running──> running   (+ endpoint)
+                     task: pending ──spawned──> running
+    watch_task()     task: running ──completed──> done
+                     task: running ──failed/timed_out──> failed
+    stop_box()       box:  running ──stopped──> stopped        (idempotent)
+    start_box()      box:  stopped ──running──> running        (idempotent)
+    teardown_box()   box:  any ──torn_down──> torn_down        (idempotent)
+                     its live tasks ──> failed
 
 The recorded ``endpoint`` is the Modal function-call handle
-(``modal://flotta-provision/run_worker/<fc_id>``), not an HTTP URL: v0.1
-workers are one-shot, so the call id *is* the address you can later re-attach
-to, cancel, or fetch results from. When M6 needs the orchestrator to dial a
-*live* worker over MCP, serve-mode plus a `modal.forward` tunnel turns this
-column into a real URL without changing the schema.
+(``modal://flotta-provision/run_worker/<fc_id>``), not an HTTP URL: under this
+backend a box is one-shot, so the call id *is* the address you can later
+re-attach to, cancel, or fetch results from. When M1 lands a persistent
+backend, this column becomes a real hostname without changing the schema.
 
 Import discipline matches `worker/server.py`: `modal` is imported lazily inside
 the adapter functions, so the pure store-writing logic here is unit-testable
@@ -49,6 +58,7 @@ from __future__ import annotations
 import math
 import pathlib
 import sys
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -66,8 +76,14 @@ _SRC = _HERE.parents[1] if len(_HERE.parents) > 1 else None
 if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from flotta.store import TERMINAL as _TERMINAL  # noqa: E402  the canonical set
-from flotta.store import FleetStore, UnknownWorkerError, Worker  # noqa: E402  (needs prime)
+from flotta.store import (  # noqa: E402  (needs the sys.path prime above)
+    Box,
+    ConcurrencyLimitError,
+    FleetStore,
+    Task,
+    UnknownEntityError,
+    is_terminal,
+)
 from flotta.worker.config import DEFAULT_TIMEOUT_S  # noqa: E402
 from flotta.worker.image import HERMES_REF, worker_image  # noqa: E402
 
@@ -79,19 +95,20 @@ FUNCTION_NAME = "run_worker"
 # per-task deadline is enforced inside the container by `_run_task_core`.
 MAX_TIMEOUT_S = 3600
 
-# Live-worker cap. v0.1 is a one-worker-at-a-time system and, until now, that
-# was documentation rather than behaviour: nothing counted before launching, so
-# a loop or an orchestrator ignoring the skill spent money instead of erroring.
-# Default 1 makes the documented scope true; raising it is an explicit opt-in to
-# territory nothing has tested. 0 means unlimited, for anyone who means it.
+# Live-task cap. v0.1 capped *workers*, when a worker was both the machine and
+# the work. Box existence is uncapped now — the whole fleet arithmetic assumes
+# tens of them — so the guard moved to the thing that actually burns CPU: a
+# task in a live state. Default 1 keeps the money behaviour v0.1 had; raising
+# it is an explicit opt-in to territory nothing has tested. 0 means unlimited,
+# for anyone who means it.
 DEFAULT_MAX_CONCURRENT = 1
 MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
 
 # Cost estimation (OQ3, decided in M7.3). Modal's billing API was investigated
-# and **cannot** attribute cost to a single worker: `Workspace.billing.report()`
+# and **cannot** attribute cost to a single task: `Workspace.billing.report()`
 # returns line items keyed by *App* id at daily or hourly resolution, every
-# worker shares the one `flotta-provision` app, and neither `Function.spawn`
-# nor `with_options` accepts a per-call tag. A 12-second worker is simply not
+# task shares the one `flotta-provision` app, and neither `Function.spawn`
+# nor `with_options` accepts a per-call tag. A 12-second task is simply not
 # separable from that.
 #
 # So the estimate is `wall-clock seconds × a rate the operator sets themselves`
@@ -128,21 +145,26 @@ def resolve_cost_rate(
     return explicit or None
 
 
-def billable_seconds(worker: Worker, now: datetime | None = None) -> float | None:
-    """How long the worker existed, as observed from here.
+def billable_seconds(task: Task, now: datetime | None = None) -> float | None:
+    """How long the task ran, as observed from here.
+
+    Measured on the **task**, not the box: a box spans months across many
+    tasks, so wall time from its `created_at` would price a machine's whole
+    life against one piece of work. This is also why `cost_estimate` lives on
+    `tasks` — the formula and the column have to agree about what they mean.
 
     **Not** the task's `duration_s`. That measures time *inside* `run_worker`
     and excludes image pull and container boot, so it understates what Modal
     bills — a dry run reports `0.0` while its container demonstrably ran. Wall
-    time from `spawned_at` is the better proxy: it spans launch to verdict.
+    time from `started_at` is the better proxy: it spans launch to verdict.
 
     It errs slightly high, because it also includes the local round-trip, and
     that is the direction to err in for a cost estimate.
     """
-    started = _parse_ts(worker.spawned_at)
+    started = _parse_ts(task.started_at)
     if started is None:
         return None
-    end = _parse_ts(worker.finished_at) or now or datetime.now(UTC)
+    end = _parse_ts(task.finished_at) or now or datetime.now(UTC)
     return max(0.0, (end - started).total_seconds())
 
 
@@ -150,7 +172,7 @@ def estimate_cost(seconds: Any, rate: float | None) -> float | None:
     """`seconds × rate`, or None when either is missing or unusable.
 
     Total by design: an unusable duration yields no estimate rather than an
-    exception, because failing to price a worker must never fail recording it.
+    exception, because failing to price a task must never fail recording it.
     """
     if rate is None or not isinstance(seconds, int | float) or isinstance(seconds, bool):
         return None
@@ -159,7 +181,7 @@ def estimate_cost(seconds: Any, rate: float | None) -> float | None:
     return round(float(seconds) * rate, 6)
 
 
-# Grace beyond a worker's own timeout before `reconcile` calls it stranded.
+# Grace beyond a task's own timeout before `reconcile` calls it stranded.
 # The container hard-exits at its timeout, so this only has to cover the lag
 # between that exit and the local process noticing.
 DEFAULT_GRACE_S = 60
@@ -168,7 +190,7 @@ DEFAULT_GRACE_S = 60
 def resolve_max_concurrent(
     explicit: int | None = None, env: dict[str, str] | None = None
 ) -> int | None:
-    """How many workers may be live at once: explicit -> env -> default.
+    """How many tasks may be live at once: explicit -> env -> default.
 
     Returns ``None`` for *unlimited*, which is what ``0`` requests. Anyone
     setting that has said so deliberately; the default of 1 is what protects
@@ -217,10 +239,10 @@ class ProvisionError(Exception):
     """Base error for provisioning operations."""
 
 
-class WorkerTimeout(ProvisionError):
-    """The worker did not produce a result before the watch deadline.
+class TaskTimeout(ProvisionError):
+    """The task did not produce a result before the watch deadline.
 
-    Adapters translate Modal's own timeout errors into this, so `watch_worker`
+    Adapters translate Modal's own timeout errors into this, so `watch_task`
     never has to import or catch a Modal exception type.
     """
 
@@ -295,7 +317,7 @@ def _parse_ts(value: str | None) -> datetime | None:
 
 
 def endpoint_for(call_id: str) -> str:
-    """Encode a Modal function-call id as the worker's stored endpoint."""
+    """Encode a Modal function-call id as the box's stored endpoint."""
     return f"modal://{APP_NAME}/{FUNCTION_NAME}/{call_id}"
 
 
@@ -315,14 +337,14 @@ def function_call_id(endpoint: str | None) -> str | None:
 
 
 def classify_result(result: Any) -> tuple[str, str, dict[str, Any]]:
-    """Map a worker result onto ``(status, event_type, payload)``.
+    """Map a task result onto ``(status, event_type, payload)``.
 
     Pure and total: any shape of input yields a verdict, because leaving a
-    worker stuck in `running` because its result was malformed is strictly
+    task stuck in `running` because its result was malformed is strictly
     worse than recording a failure.
     """
     if not isinstance(result, dict):
-        return "failed", "failed", {"error": f"malformed worker result: {result!r}"}
+        return "failed", "failed", {"error": f"malformed task result: {result!r}"}
 
     if result.get("completed"):
         payload = {
@@ -334,7 +356,7 @@ def classify_result(result: Any) -> tuple[str, str, dict[str, Any]]:
         }
         return "done", "completed", payload
 
-    error = result.get("error") or "worker reported failure without an error message"
+    error = result.get("error") or "task reported failure without an error message"
     if result.get("timed_out"):
         return "failed", "timed_out", {"error": error, "duration_s": result.get("duration_s")}
     return "failed", "failed", {"error": error, "duration_s": result.get("duration_s")}
@@ -362,7 +384,7 @@ def _modal_waiter(call_id: str, timeout_s: float | None) -> Any:
     try:
         return call.get(timeout=timeout_s)
     except ModalTimeoutError as exc:
-        raise WorkerTimeout(str(exc)) from exc
+        raise TaskTimeout(str(exc)) from exc
 
 
 def _modal_canceller(call_id: str) -> None:
@@ -375,7 +397,7 @@ def _modal_canceller(call_id: str) -> None:
         and terminate_containers must be false
 
     Because `teardown` records a cancel failure without raising, that rejection
-    was silent: the worker's row closed while its container kept running and
+    was silent: the box's row closed while its container kept running and
     billing. A plain `cancel()` already stops execution and marks the inputs
     terminated, which is the whole requirement.
     """
@@ -385,82 +407,157 @@ def _modal_canceller(call_id: str) -> None:
 # -- local orchestration (the only writers to the store) --------------------
 
 
-def _require_worker(store: FleetStore, worker_id: str):
-    worker = store.get_worker(worker_id)
-    if worker is None:
-        raise UnknownWorkerError(f"no worker with id {worker_id!r}")
-    return worker
+def _require_box(store: FleetStore, box_id: str) -> Box:
+    box = store.get_box(box_id)
+    if box is None:
+        raise UnknownEntityError(f"no box with id {box_id!r}")
+    return box
 
 
-def spawn_worker(
+def _require_task(store: FleetStore, task_id: str) -> Task:
+    task = store.get_task(task_id)
+    if task is None:
+        raise UnknownEntityError(f"no task with id {task_id!r}")
+    return task
+
+
+def spawn_box(
     task: str,
     *,
     store: FleetStore,
+    name: str | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     dry_run: bool = False,
-    worker_id: str | None = None,
+    box_id: str | None = None,
+    task_id: str | None = None,
     launcher: Launcher | None = None,
     max_concurrent: int | None = None,
 ) -> dict[str, str]:
-    """Launch a worker for `task` and record it. Returns ``{worker_id, endpoint}``.
+    """Create a box, put one task on it, launch it. Returns ids + endpoint.
 
-    The row is created *before* the launch so a launch that fails still leaves
-    a worker to explain it — the failure is recorded and re-raised rather than
-    vanishing.
+    The successor to v0.1's `spawn_worker`, and the place the pivot is most
+    visible: what used to be one row is now two. The **box** is the machine and
+    owns the endpoint; the **task** is the work and owns the verdict.
+
+    Under the Modal backend a box is still disposable — Modal cannot stop and
+    resume a container, so every spawn mints a fresh one. That is not the
+    target shape; it is the honest shape *for this backend*, and it is exactly
+    the asymmetry M1's `Backend` protocol exists to make explicit.
+
+    Both rows are created *before* the launch so a launch that fails still
+    leaves something to explain it — the failure is recorded and re-raised
+    rather than vanishing.
     """
     if timeout_s > MAX_TIMEOUT_S:
         raise ValueError(f"timeout_s {timeout_s} exceeds the container cap of {MAX_TIMEOUT_S}s")
 
     launch = launcher or _modal_launcher
-    # The cap is enforced by the store so the count and the insert share one
-    # transaction — checking here and inserting after would race.
-    worker = store.create_worker(
-        task, worker_id=worker_id, max_live=resolve_max_concurrent(max_concurrent)
-    )
-    # `hermes_ref` is recorded per worker, not just configured globally: the pin
+    cap = resolve_max_concurrent(max_concurrent)
+
+    # Pre-check before creating anything, so the common refusal leaves no rows
+    # behind. The cap is *also* passed to `create_task`, where it shares a
+    # transaction with the insert — that is the backstop against two spawns
+    # racing, which this check alone cannot close.
+    if cap is not None:
+        live = store.list_tasks()
+        live_ids = [t.id for t in live if not is_terminal("task", t.status)]
+        if len(live_ids) >= cap:
+            raise ConcurrencyLimitError(cap, live_ids, noun="task")
+
+    box = store.create_box(name or f"box-{uuid.uuid4().hex[:8]}", box_id=box_id)
+    try:
+        work = store.create_task(box.id, task, task_id=task_id, max_live=cap)
+    except ConcurrencyLimitError:
+        # Lost the race between the pre-check and here. Close the orphan box
+        # rather than leaving a machine row nothing will ever claim.
+        store.add_event("box", box.id, "torn_down", {"reason": "concurrency limit"})
+        store.update_box_status(box.id, "torn_down")
+        raise
+
+    # `hermes_ref` is recorded per task, not just configured globally: the pin
     # moves over time, so "which Hermes ran this task?" is a fact about the
-    # worker, answerable months later, not a fact about today's config.
+    # task, answerable months later, not a fact about today's config.
     store.add_event(
-        worker.id,
+        "task",
+        work.id,
         "spawned",
         {
             "task": task,
             "timeout_s": timeout_s,
             "dry_run": dry_run,
             "hermes_ref": HERMES_REF,
+            "box_id": box.id,
         },
     )
 
     try:
-        call_id = launch(task=task, worker_id=worker.id, timeout_s=timeout_s, dry_run=dry_run)
+        call_id = launch(task=task, worker_id=work.id, timeout_s=timeout_s, dry_run=dry_run)
     except Exception as exc:
         detail = f"spawn failed: {type(exc).__name__}: {exc}"
-        store.add_event(worker.id, "failed", {"error": detail})
+        store.add_event("task", work.id, "failed", {"error": detail})
         # Deliberately unpriced: the launch never happened, so no container
         # ran. Charging for compute that did not occur overstates just as
         # surely as the dry-run zero understated.
-        store.update_status(worker.id, "failed")
+        store.update_task_status(work.id, "failed")
+        store.add_event("box", box.id, "torn_down", {"reason": "spawn failed"})
+        store.update_box_status(box.id, "torn_down")
         raise ProvisionError(detail) from exc
 
     endpoint = endpoint_for(call_id)
-    store.update_status(worker.id, "running", endpoint=endpoint)
-    store.add_event(worker.id, "running", {"endpoint": endpoint, "function_call_id": call_id})
-    return {"worker_id": worker.id, "endpoint": endpoint}
+    store.update_box_status(box.id, "running", endpoint=endpoint)
+    store.add_event("box", box.id, "running", {"endpoint": endpoint, "function_call_id": call_id})
+    store.update_task_status(work.id, "running")
+    return {"box_id": box.id, "task_id": work.id, "endpoint": endpoint}
 
 
-def watch_worker(
-    worker_id: str,
+def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[str, Any]:
+    """Record a box as ``stopped`` — disk retained, no CPU. Idempotent.
+
+    Store-side only in M0. There is no backend that can actually suspend a
+    machine yet: `ModalBackend` will raise `NotSupported` on `stop` (M1), and
+    `FlyBackend` is what makes this real. Writing the transition now means the
+    state machine the rest of the system reasons about is already correct when
+    a backend arrives to drive it.
+    """
+    box = _require_box(store, box_id)
+    if box.status == "stopped":
+        return {"box_id": box_id, "status": "stopped", "already_stopped": True}
+
+    store.add_event("box", box_id, "stopped", {"reason": reason, "previous_status": box.status})
+    store.update_box_status(box_id, "stopped")
+    return {"box_id": box_id, "status": "stopped", "already_stopped": False}
+
+
+def start_box(box_id: str, *, store: FleetStore, reason: str = "requested") -> dict[str, Any]:
+    """Wake a stopped box back to ``running``. Idempotent.
+
+    The other half of the pivot's central transition. `wake` and `create` stay
+    distinct on purpose (M7): conflating them is how you end up with forty
+    half-remembered agents instead of forty agents.
+    """
+    box = _require_box(store, box_id)
+    if box.status == "running":
+        return {"box_id": box_id, "status": "running", "already_running": True}
+
+    store.add_event("box", box_id, "running", {"reason": reason, "previous_status": box.status})
+    store.update_box_status(box_id, "running")
+    return {"box_id": box_id, "status": "running", "already_running": False}
+
+
+def watch_task(
+    task_id: str,
     *,
     store: FleetStore,
     timeout_s: float | None = None,
     waiter: Waiter | None = None,
     cost_per_second: float | None = None,
 ) -> dict[str, Any]:
-    """Await a worker's result and record the terminal status it implies.
+    """Await a task's result and record the terminal status it implies.
 
-    This is the M3.4 watcher. Blocks until the container returns, the deadline
-    passes, or Modal reports the call gone; every one of those outcomes writes
-    a terminal state, so no worker is left stranded in `running`.
+    The watcher, unchanged in spirit from v0.1 and moved down a tier: it now
+    resolves a **task**, not a machine. Blocks until the container returns, the
+    deadline passes, or Modal reports the call gone; every one of those
+    outcomes writes a terminal state, so no task is left stranded in `running`.
     """
     # Resolved up front, deliberately. A bad rate must never surface *after* a
     # result is in hand: raising there would leave a `completed` event recorded
@@ -470,49 +567,50 @@ def watch_worker(
     rate = resolve_cost_rate(cost_per_second)
 
     wait = waiter or _modal_waiter
-    worker = _require_worker(store, worker_id)
+    task = _require_task(store, task_id)
 
-    if worker.status in _TERMINAL:
-        return {"worker_id": worker_id, "status": worker.status, "already_terminal": True}
+    if is_terminal("task", task.status):
+        return {"task_id": task_id, "status": task.status, "already_terminal": True}
 
-    call_id = function_call_id(worker.endpoint)
+    box = _require_box(store, task.box_id)
+    call_id = function_call_id(box.endpoint)
     if call_id is None:
-        payload = {"error": f"worker has no modal endpoint to watch (endpoint={worker.endpoint!r})"}
-        store.add_event(worker_id, "failed", payload)
+        payload = {"error": f"box has no modal endpoint to watch (endpoint={box.endpoint!r})"}
+        store.add_event("task", task_id, "failed", payload)
         # Unpriced on purpose — no endpoint means nothing was ever launched.
-        store.update_status(worker_id, "failed")
-        return {"worker_id": worker_id, "status": "failed", "error": payload["error"]}
+        store.update_task_status(task_id, "failed")
+        return {"task_id": task_id, "status": "failed", "error": payload["error"]}
 
     try:
         result: Any = wait(call_id, timeout_s)
-    except WorkerTimeout as exc:
+    except TaskTimeout as exc:
         payload = {"error": f"watch deadline exceeded: {exc}"}
-        store.add_event(worker_id, "timed_out", payload)
+        store.add_event("task", task_id, "timed_out", payload)
         # The most expensive outcome there is — the container ran to its full
         # deadline — so this is the last branch that should go unpriced.
-        store.update_status(
-            worker_id, "failed", cost_estimate=estimate_cost(billable_seconds(worker), rate)
+        store.update_task_status(
+            task_id, "failed", cost_estimate=estimate_cost(billable_seconds(task), rate)
         )
-        return {"worker_id": worker_id, "status": "failed", "timed_out": True, **payload}
+        return {"task_id": task_id, "status": "failed", "timed_out": True, **payload}
     except Exception as exc:
-        payload = {"error": f"worker call failed: {type(exc).__name__}: {exc}"}
-        store.add_event(worker_id, "failed", payload)
+        payload = {"error": f"task call failed: {type(exc).__name__}: {exc}"}
+        store.add_event("task", task_id, "failed", payload)
         # The call existed, so a container almost certainly ran; price it.
-        store.update_status(
-            worker_id, "failed", cost_estimate=estimate_cost(billable_seconds(worker), rate)
+        store.update_task_status(
+            task_id, "failed", cost_estimate=estimate_cost(billable_seconds(task), rate)
         )
-        return {"worker_id": worker_id, "status": "failed", **payload}
+        return {"task_id": task_id, "status": "failed", **payload}
 
     status, event_type, payload = classify_result(result)
-    store.add_event(worker_id, event_type, payload)
+    store.add_event("task", task_id, event_type, payload)
     # Priced from the row as it stands *before* the write: it has no
     # `finished_at` yet, so `billable_seconds` measures to now — the same
-    # instant `update_status` is about to stamp. One write, no second
+    # instant `update_task_status` is about to stamp. One write, no second
     # transition (and `done -> done` would rightly be rejected anyway).
-    cost = estimate_cost(billable_seconds(worker), rate)
-    store.update_status(worker_id, status, cost_estimate=cost)
+    cost = estimate_cost(billable_seconds(task), rate)
+    store.update_task_status(task_id, status, result=payload, cost_estimate=cost)
     return {
-        "worker_id": worker_id,
+        "task_id": task_id,
         "status": status,
         "event": event_type,
         "result": result,
@@ -520,13 +618,13 @@ def watch_worker(
     }
 
 
-def worker_deadline_s(store: FleetStore, worker_id: str) -> int:
-    """The `timeout_s` a worker was spawned with, from its `spawned` event.
+def task_deadline_s(store: FleetStore, task_id: str) -> int:
+    """The `timeout_s` a task was spawned with, from its `spawned` event.
 
     Falls back to the default when the event is missing or malformed — an
-    unreadable payload should not make a stranded worker un-reconcilable.
+    unreadable payload should not make a stranded task un-reconcilable.
     """
-    for event in store.get_events(worker_id):
+    for event in store.get_events("task", task_id):
         if event.type == "spawned" and isinstance(event.payload, dict):
             value = event.payload.get("timeout_s")
             if isinstance(value, int) and value > 0:
@@ -534,27 +632,27 @@ def worker_deadline_s(store: FleetStore, worker_id: str) -> int:
     return DEFAULT_TIMEOUT_S
 
 
-def overdue_workers(
+def overdue_tasks(
     store: FleetStore, *, now: datetime | None = None, grace_s: int = DEFAULT_GRACE_S
-) -> list[tuple[Worker, float]]:
-    """Live workers past their own deadline, with how far past, oldest first.
+) -> list[tuple[Task, float]]:
+    """Live tasks past their own deadline, with how far past, oldest first.
 
-    "Past its deadline" is the worker's own `timeout_s` plus a grace period —
+    "Past its deadline" is the task's own `timeout_s` plus a grace period —
     the container hard-exits at that timeout, so anything still `running` well
     beyond it has stopped without anyone recording the outcome.
     """
     now = now or datetime.now(UTC)
-    overdue: list[tuple[Worker, float]] = []
-    for worker in store.list_workers():
-        if worker.status in _TERMINAL:
+    overdue: list[tuple[Task, float]] = []
+    for task in store.list_tasks():
+        if is_terminal("task", task.status):
             continue
-        started = _parse_ts(worker.spawned_at)
+        started = _parse_ts(task.started_at)
         if started is None:
             continue
         age = (now - started).total_seconds()
-        limit = worker_deadline_s(store, worker.id) + grace_s
+        limit = task_deadline_s(store, task.id) + grace_s
         if age > limit:
-            overdue.append((worker, age - limit))
+            overdue.append((task, age - limit))
     return sorted(overdue, key=lambda pair: pair[1], reverse=True)
 
 
@@ -567,40 +665,46 @@ def reconcile(
     fetch_timeout_s: float = 10.0,
     cost_per_second: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Resolve workers stranded in a live state past their deadline.
+    """Resolve tasks stranded in a live state past their deadline.
 
     Why this exists: under D10 the store is written only by local code, so a
-    worker spawned without `--wait` and never watched sits at `running` forever
+    task spawned without `--wait` and never watched sits at `running` forever
     once its container dies. One was found in the wild at 138 hours.
 
     Recovery is attempted first, and it is usually possible — a Modal call's
     result outlives the container by a long way (measured: a 9-hour-old result
-    was still retrievable). So a stranded worker's *answer* is normally
+    was still retrievable). So a stranded task's *answer* is normally
     recoverable, not merely losable, and this records it properly.
 
-    When the result cannot be fetched the worker is marked `failed` with an
+    When the result cannot be fetched the task is marked `failed` with an
     explicit reason. It is never marked `completed` — inventing a success for
     work nobody observed is exactly the lie the watcher design exists to avoid.
+
+    Note this reconciles **tasks**, not boxes. A stranded task is a verdict
+    nobody recorded; a box outliving its tasks is not a fault, it is the
+    product. Box-level reconciliation against real backend state is M4's
+    control-plane loop.
     """
-    # Same reason as `watch_worker`: resolved before any work, so a typo'd rate
+    # Same reason as `watch_task`: resolved before any work, so a typo'd rate
     # cannot block the very recovery this function exists to perform.
     rate = resolve_cost_rate(cost_per_second)
 
     wait = waiter or _modal_waiter
     outcomes: list[dict[str, Any]] = []
 
-    for worker, over_by in overdue_workers(store, now=now, grace_s=grace_s):
-        call_id = function_call_id(worker.endpoint)
+    for task, over_by in overdue_tasks(store, now=now, grace_s=grace_s):
+        box = store.get_box(task.box_id)
+        call_id = function_call_id(box.endpoint) if box else None
         if call_id is None:
             payload = {
                 "error": "stranded with no modal endpoint; never reported a result",
                 "overdue_by_s": round(over_by, 1),
                 "reconciled": True,
             }
-            store.add_event(worker.id, "failed", payload)
+            store.add_event("task", task.id, "failed", payload)
             # Unpriced on purpose — no endpoint means no container ran.
-            store.update_status(worker.id, "failed")
-            outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
+            store.update_task_status(task.id, "failed")
+            outcomes.append({"task_id": task.id, "status": "failed", "recovered": False})
             continue
 
         try:
@@ -614,23 +718,23 @@ def reconcile(
                 "overdue_by_s": round(over_by, 1),
                 "reconciled": True,
             }
-            store.add_event(worker.id, "failed", payload)
+            store.add_event("task", task.id, "failed", payload)
             # The call existed and ran past its deadline — the container was
             # billed even though its result is unreachable.
-            store.update_status(
-                worker.id, "failed", cost_estimate=estimate_cost(billable_seconds(worker), rate)
+            store.update_task_status(
+                task.id, "failed", cost_estimate=estimate_cost(billable_seconds(task), rate)
             )
-            outcomes.append({"worker_id": worker.id, "status": "failed", "recovered": False})
+            outcomes.append({"task_id": task.id, "status": "failed", "recovered": False})
             continue
 
         status, event_type, payload = classify_result(result)
         payload = {**payload, "reconciled": True, "overdue_by_s": round(over_by, 1)}
-        store.add_event(worker.id, event_type, payload)
-        cost = estimate_cost(billable_seconds(worker), rate)
-        store.update_status(worker.id, status, cost_estimate=cost)
+        store.add_event("task", task.id, event_type, payload)
+        cost = estimate_cost(billable_seconds(task), rate)
+        store.update_task_status(task.id, status, result=payload, cost_estimate=cost)
         outcomes.append(
             {
-                "worker_id": worker.id,
+                "task_id": task.id,
                 "status": status,
                 "event": event_type,
                 "recovered": status == "done",
@@ -641,28 +745,32 @@ def reconcile(
     return outcomes
 
 
-def teardown(
-    worker_id: str,
+def teardown_box(
+    box_id: str,
     *,
     store: FleetStore,
     reason: str = "requested",
     canceller: Canceller | None = None,
 ) -> dict[str, Any]:
-    """Stop a worker's container and close its row. Idempotent.
+    """Destroy a box, resolving anything still running on it. Idempotent.
 
-    Calling this on an already torn-down worker is a no-op that returns
-    cleanly — the store's transition table makes `torn_down` terminal, so a
-    second attempt would otherwise raise. Cancellation is best-effort: a
-    container that already exited cannot be cancelled, and that must not stop
-    the row from closing.
+    Calling this on an already torn-down box is a no-op that returns cleanly —
+    the store's transition table makes `torn_down` terminal, so a second
+    attempt would otherwise raise. Cancellation is best-effort: a container
+    that already exited cannot be cancelled, and that must not stop the row
+    from closing.
+
+    Its live tasks are marked **failed**, not torn down. Tasks have no
+    `torn_down` state by design: work that was interrupted did not happen, and
+    a verdict that says so is worth more than one that shrugs.
     """
     cancel = canceller or _modal_canceller
-    worker = _require_worker(store, worker_id)
+    box = _require_box(store, box_id)
 
-    if worker.status == "torn_down":
-        return {"worker_id": worker_id, "status": "torn_down", "already_torn_down": True}
+    if box.status == "torn_down":
+        return {"box_id": box_id, "status": "torn_down", "already_torn_down": True}
 
-    call_id = function_call_id(worker.endpoint)
+    call_id = function_call_id(box.endpoint)
     cancelled = False
     cancel_error: str | None = None
     if call_id is not None:
@@ -672,21 +780,40 @@ def teardown(
         except Exception as exc:
             cancel_error = f"{type(exc).__name__}: {exc}"
 
+    failed_tasks: list[str] = []
+    for task in store.list_tasks(box_id=box_id):
+        if is_terminal("task", task.status):
+            continue
+        store.add_event(
+            "task", task.id, "failed", {"error": f"box torn down ({reason})", "reconciled": False}
+        )
+        store.update_task_status(task.id, "failed")
+        failed_tasks.append(task.id)
+
+    for workspace in store.list_workspaces(box_id=box_id):
+        if workspace.status == "torn_down":
+            continue
+        store.add_event("workspace", workspace.id, "torn_down", {"reason": f"box {reason}"})
+        store.update_workspace_status(workspace.id, "torn_down")
+
     store.add_event(
-        worker_id,
+        "box",
+        box_id,
         "torn_down",
         {
             "reason": reason,
             "cancelled": cancelled,
             "cancel_error": cancel_error,
-            "previous_status": worker.status,
+            "previous_status": box.status,
+            "failed_tasks": failed_tasks,
         },
     )
-    store.update_status(worker_id, "torn_down")
+    store.update_box_status(box_id, "torn_down")
     return {
-        "worker_id": worker_id,
+        "box_id": box_id,
         "status": "torn_down",
         "already_torn_down": False,
         "cancelled": cancelled,
         "cancel_error": cancel_error,
+        "failed_tasks": failed_tasks,
     }
