@@ -165,17 +165,21 @@ def test_doctor_finds_an_ipv6_only_listener(tmp_path):
     is worse than no check because it sends you debugging the wrong thing.
     """
     import socket
-    import threading
 
     from flotta.box import doctor
 
+    # No accept() thread: `connect_ex` succeeds as soon as the connection lands
+    # in the listen backlog. An earlier version spawned a daemon thread blocked
+    # in accept(), which raised ConnectionAbortedError when the socket closed —
+    # and pytest attributed that warning to whichever *unrelated* test happened
+    # to be running at the time, sending anyone who investigated to the wrong
+    # file entirely.
     server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("::1", 0))
-    server.listen(1)
-    port = server.getsockname()[1]
-    threading.Thread(target=lambda: server.accept(), daemon=True).start()
     try:
+        server.bind(("::1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
         assert doctor._is_listening(port) is True
     finally:
         server.close()
