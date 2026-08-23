@@ -14,7 +14,9 @@ from flotta.fly import (
     DEFAULT_MOUNT_PATH,
     DEFAULT_ORG,
     DURABLE_PATHS,
+    FALLBACK_REGION,
     FlyConfig,
+    detect_region,
     durable_paths,
 )
 
@@ -146,11 +148,56 @@ def test_describe_names_the_target_before_anything_acts_on_it():
     assert "/data/hermes" in out
 
 
-def test_describe_is_explicit_when_fly_picks_the_region():
-    """A blank region field would read as a bug rather than a choice."""
-    assert "nearest" in cfg().describe()
-
-
 def test_config_carries_its_own_durable_paths():
     c = cfg({"FLOTTA_FLY_VOLUME_GB": "2"})
     assert c.durable_paths == durable_paths(c.hermes_home)
+
+
+# -- region detection -------------------------------------------------------
+
+# Every Fly edge echoes the region that served a request in a `Fly-Region`
+# header, so one unauthenticated request answers "where is nearest?".
+_EDGE_RESPONSE = """=== Headers ===
+Host: debug.fly.dev
+Fly-Region: ams
+Fly-Request-Id: 01ABC-ams
+"""
+
+
+def test_region_is_read_from_the_fly_edge_header():
+    assert detect_region(lambda: _EDGE_RESPONSE) == "ams"
+
+
+def test_region_detection_is_case_insensitive():
+    assert detect_region(lambda: "fly-region: gru\n") == "gru"
+
+
+def test_region_detection_returns_none_when_the_header_is_absent():
+    assert detect_region(lambda: "Host: example.com\n") is None
+
+
+def test_region_detection_never_raises():
+    """A slow DNS lookup must not kill a provisioning run."""
+
+    def boom():
+        raise OSError("network unreachable")
+
+    assert detect_region(boom) is None
+
+
+def test_resolved_region_is_always_concrete():
+    """`fly volumes create` refuses to run without a region when not on a TTY,
+    so "unset" cannot mean "decide later" — something must name one."""
+    assert cfg().resolved_region(lambda: "") == FALLBACK_REGION
+    assert cfg().resolved_region(lambda: _EDGE_RESPONSE) == "ams"
+
+
+def test_configured_region_beats_detection():
+    """An explicit choice is never second-guessed by a network probe."""
+    c = cfg({"FLOTTA_FLY_REGION": "gru"})
+    assert c.resolved_region(lambda: _EDGE_RESPONSE) == "gru"
+
+
+def test_describe_says_the_region_is_detected_not_chosen_by_fly():
+    """The old wording claimed Fly would pick one, which is false for volumes."""
+    assert "detected at provision time" in cfg().describe()

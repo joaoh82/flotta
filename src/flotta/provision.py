@@ -537,9 +537,7 @@ def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[st
     # `stopped` event on a box that never stopped and *then* raises. Events are
     # the audit trail; a lie in them outlives the traceback.
     if box.status != "running":
-        raise ProvisionError(
-            f"box {box_id} is {box.status!r}; only a running box can be stopped"
-        )
+        raise ProvisionError(f"box {box_id} is {box.status!r}; only a running box can be stopped")
 
     # Refuse while work is in flight. Under a real backend this would suspend
     # the machine; under Modal it changes a row and nothing else, so the

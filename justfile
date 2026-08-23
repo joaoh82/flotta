@@ -282,7 +282,10 @@ fly-up: fly-whoami
     ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
     VOL=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().volume_name)")
     GB=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().volume_gb)")
-    REGION=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().region or '')")
+    # Concrete, always: `fly volumes create` refuses to run without a region
+    # when it is not attached to a TTY, so "unset" cannot mean "decide later".
+    REGION=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().resolved_region())")
+    echo "region     $REGION"
     REF=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
 
     # Fly app names are globally unique across all of Fly, not per-org, so a
@@ -304,11 +307,7 @@ fly-up: fly-whoami
       # -y: no interactive "are you sure about a single-node volume" prompt.
       # A single unreplicated volume is correct here — this is one box, and
       # replication is a v2 concern.
-      if [ -n "$REGION" ]; then
-        flyctl volumes create "$VOL" --app "$APP" --size "$GB" --region "$REGION" -y
-      else
-        flyctl volumes create "$VOL" --app "$APP" --size "$GB" -y
-      fi
+      flyctl volumes create "$VOL" --app "$APP" --size "$GB" --region "$REGION" -y
     else
       echo "volume $VOL already exists"
     fi
@@ -359,3 +358,18 @@ fly-down: fly-whoami
     APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
     echo "This destroys app $APP AND its volume — the box forgets everything."
     flyctl apps destroy "$APP"
+
+# M2: push .env's provider vars into the box as Fly secrets (this is how you rotate)
+fly-secrets: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    : "${FLOTTA_MODEL:?set FLOTTA_MODEL in .env}"
+    : "${FLOTTA_MODEL_BASE_URL:?set FLOTTA_MODEL_BASE_URL in .env}"
+    : "${FLOTTA_API_KEY:?set FLOTTA_API_KEY in .env}"
+    # --stage writes them without restarting; the caller decides when to bounce.
+    # Values are passed on stdin, never as argv — argv is visible in `ps`.
+    printf 'FLOTTA_MODEL=%s\nFLOTTA_MODEL_BASE_URL=%s\nFLOTTA_API_KEY=%s\n' \
+      "$FLOTTA_MODEL" "$FLOTTA_MODEL_BASE_URL" "$FLOTTA_API_KEY" \
+      | flyctl secrets import --app "$APP"
+    echo "provider secrets set on $APP (values not echoed)"

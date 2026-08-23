@@ -8,25 +8,35 @@ container.
     just fly-up          # provision the box (once)
     just fly-proof       # this script
 
-## What it actually proves, and what it deliberately does not
+## What it proves
 
-The proof is **file-level and deterministic**. It writes to Hermes's durable
-store, records a SHA-256 of every path in the contract, stops the machine,
-starts it, and re-hashes. It does not ask the model to recall anything as its
-*primary* assertion, because that would make the milestone's verdict depend on
-whether a model chose to call the memory tool on a given run — a flaky proof of
-a claim that is not actually about the model.
+Two claims, in increasing order of interest:
 
-What is claimed is narrower and checkable: **Hermes's entire store survives the
-machine being stopped.** Conversation history, memories, learned skills and
-session transcripts are byte-identical afterwards, and the text of a
-conversation held before the stop is still queryable out of `state.db` after
-it. That is the property every later milestone builds on.
+1. **File-level, deterministic.** Every file under `HERMES_HOME` is SHA-256'd,
+   the machine is stopped, started, and re-hashed. Nothing may disappear and
+   nothing may change.
+2. **Agent-level.** A box is told to commit a fact to memory, the machine is
+   *killed*, restarted, and a **fresh process** is asked for the fact back. It
+   answers correctly, out of a disk that outlived the container.
 
-The agent-level recall check runs too, and is reported — but as evidence, not
-as the gate. A model declining to use its memory is a prompting problem; the
-disk losing the memory is an architecture problem, and only the second one is
-M2's business.
+The second is the whole pitch, and it is a real gate here rather than a
+courtesy check — the seed turn instructs the memory tool explicitly, so the
+model is not being asked to guess that it should persist something.
+
+## What `state.db` does and does not hold — a correction
+
+SEAM_NOTES Q3 describes a rich `state.db` (sessions, messages, FTS). **A
+headless `AIAgent.run_conversation` does not populate it.** Measured on a live
+box: after a completed turn, `state.db` contains exactly one table,
+`async_delegations`, with zero rows — the session schema is created by the
+gateway/CLI path, not this one.
+
+So conversation *history* is not what survives here, and this script does not
+pretend otherwise. What survives is the surface that actually matters for the
+pivot's claim — `memories/`, `skills/`, `SOUL.md`, and the rest of the store —
+because "self-improving" is about what the agent learned, not about a chat
+transcript. Session persistence arrives with M3, when the messaging gateway is
+turned back on; that is the code path that writes those tables.
 """
 
 from __future__ import annotations
@@ -150,9 +160,21 @@ def fingerprint(cfg: FlyConfig) -> dict[str, str]:
 
 def run(*, keep_running: bool, skip_recall: bool) -> int:
     cfg = FlyConfig.from_env()
+    # Two ids, not one. The run label is how the recall question addresses
+    # *this* run's fact; the nonce is the secret it must produce.
+    #
+    # An earlier version keyed on "the M2 passphrase" alone and failed in the
+    # most instructive way available: the box answered with a passphrase from a
+    # previous cycle entirely. Memory accumulating across runs is the product
+    # working, so the fix is a question only this run can answer — not wiping
+    # the store between runs, which would quietly weaken the proof.
+    run_label = uuid.uuid4().hex[:6].upper()
     nonce = f"FLOTTA-{uuid.uuid4().hex[:10].upper()}"
 
-    print(f"\nFlotta M2 — durable HERMES_HOME\n{cfg.describe()}\n  nonce      {nonce}\n")
+    print(
+        f"\nFlotta M2 — durable HERMES_HOME\n{cfg.describe()}"
+        f"\n  run        {run_label}\n  nonce      {nonce}\n"
+    )
 
     mid = machine_id(cfg)
     print(f"[1/6] box {mid}")
@@ -178,14 +200,22 @@ echo seeded
 """
     check("sentinels written", "seeded" in on_box(cfg, seed))
 
-    # A real Hermes turn, so `state.db` and a session transcript are written by
-    # the agent itself rather than by this script. This is the part that proves
-    # Hermes's *own* store is on the volume, not just that the volume works.
+    # A real Hermes turn that writes through the *memory tool*, so the durable
+    # artefact is produced by the agent rather than by this script. The
+    # instruction names the tool explicitly: an earlier version said only
+    # "remember this", and the model treated it as conversational — it wrote
+    # nothing, then honestly reported an empty memory store on recall. That is a
+    # prompting failure wearing the costume of a durability failure, and telling
+    # those two apart is the whole job of this script.
     print("       running a Hermes turn (one model call)…")
     turn = on_box(
         cfg,
         "cd /app && python -m flotta.box.run --task "
-        + shlex.quote(f"Remember this passphrase exactly: {nonce}. Reply with only the word OK."),
+        + shlex.quote(
+            f"Use your memory tool to save this fact permanently: "
+            f"the passphrase for M2 run {run_label} is {nonce}. "
+            "Then reply with only the word OK."
+        ),
         timeout=900,
     )
     turn_line = turn.splitlines()[-1] if turn.strip() else "{}"
@@ -202,28 +232,21 @@ echo seeded
     before = fingerprint(cfg)
     check("HERMES_HOME is non-empty", bool(before), f"{len(before)} files")
     check(
-        "state.db was written by Hermes",
-        any(p == "state.db" or p.startswith("state.db") for p in before),
+        "Hermes made the volume its own store",
+        any(p.startswith("memories/") for p in before) and "SOUL.md" in before,
         ", ".join(sorted(before)[:8]),
     )
     print(f"       {len(before)} files fingerprinted")
 
-    # -- 3. the conversation is queryable out of the durable store ----------
-    print("\n[3/6] nonce is in Hermes's own store")
-    # `grep -r` finds the nonce inside state.db because SQLite stores short
-    # text inline — a deliberately dumb check that needs no sqlite3 binary on
-    # the box and no knowledge of Hermes's schema version.
-    found_before = on_box(cfg, f'grep -rl {shlex.quote(nonce)} "$HERMES_HOME" 2>/dev/null || true')
-    check(
-        "nonce present under HERMES_HOME before the stop",
-        bool(found_before.strip()),
-        found_before.strip()[:120] or "(nothing)",
+    # -- 3. the agent actually committed it to memory -----------------------
+    print("\n[3/6] the agent wrote it to its own memory")
+    found_before = on_box(
+        cfg, f'grep -rl {shlex.quote(nonce)} "$HERMES_HOME/memories" 2>/dev/null || true'
     )
-    in_state_db_before = "state.db" in found_before
     check(
-        "nonce is in state.db (Hermes wrote its history to the volume)",
-        in_state_db_before,
-        f"found in: {found_before.strip()[:200] or '(nothing)'}",
+        "nonce is in memories/ (the memory tool ran, not just the disk)",
+        bool(found_before.strip()),
+        found_before.strip()[:200] or "(nothing — did the model skip the tool?)",
     )
 
     # -- 4. stop / start ----------------------------------------------------
@@ -254,27 +277,28 @@ echo seeded
         f"changed: {', '.join(changed[:8])}",
     )
 
-    found_after = on_box(cfg, f'grep -rl {shlex.quote(nonce)} "$HERMES_HOME" 2>/dev/null || true')
+    found_after = on_box(
+        cfg, f'grep -rl {shlex.quote(nonce)} "$HERMES_HOME/memories" 2>/dev/null || true'
+    )
     check(
-        "the conversation is still in state.db after the restart",
-        "state.db" in found_after,
-        f"found in: {found_after.strip()[:200] or '(nothing)'}",
+        "the memory is still on disk after the restart",
+        bool(found_after.strip()),
+        found_after.strip()[:200] or "(nothing)",
     )
 
     for path in DURABLE_PATHS:
         present = on_box(cfg, f'test -e "$HERMES_HOME/{path.relative}" && echo yes || echo no')
         check(f"{path.relative} survived — {path.what}", "yes" in present)
 
-    # -- recall: evidence, not the gate ------------------------------------
+    # -- the thesis, end to end --------------------------------------------
     if not skip_recall:
-        print("\n[bonus] does the agent itself recall it?")
-        print("       (evidence, not the gate — see the module docstring)")
+        print("\n[thesis] a fresh process, after the machine was killed")
         recall = on_box(
             cfg,
             "cd /app && python -m flotta.box.run --task "
             + shlex.quote(
-                "What passphrase were you asked to remember? "
-                "Search your memory and reply with only the passphrase."
+                f"What is the passphrase for M2 run {run_label}? "
+                "Check your memory and reply with only the passphrase."
             ),
             timeout=900,
         )
@@ -283,10 +307,11 @@ echo seeded
             answer = str(json.loads(recall_line).get("final_response") or "")
         except json.JSONDecodeError:
             answer = recall_line
-        if nonce in answer:
-            print(f"  ok   agent recalled the passphrase: {answer.strip()[:80]}")
-        else:
-            print(f"  --   agent did not recall it (not a failure): {answer.strip()[:120]}")
+        check(
+            "the box recalled what it learned before it was stopped",
+            nonce in answer,
+            f"answered: {answer.strip()[:160] or '(nothing)'}",
+        )
 
     if not keep_running:
         print("\nstopping the box again (it costs disk either way, CPU only while up)")
@@ -299,7 +324,7 @@ echo seeded
             print(f"  - {failure}")
         return 1
     print(f"M2 OK — {_checks}/{_checks} checks passed.")
-    print("A box stopped, started, and still had its entire Hermes store.")
+    print("A box learned something, was killed, came back, and still knew it.")
     return 0
 
 

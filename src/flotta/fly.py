@@ -27,7 +27,7 @@ is pinned explicitly (`$FLOTTA_FLY_ORG`, then `.env`, then `personal`) and
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +40,15 @@ DEFAULT_APP = "flotta-box"
 """Fly app names are **globally unique across all of Fly**, not per-org, so
 this default will collide for anyone who is not first. `$FLOTTA_FLY_APP`
 overrides it, and `just fly-up` says so when creation fails."""
+
+FALLBACK_REGION = "ams"
+"""Used only when the nearest region cannot be detected.
+
+Not "let Fly choose": `fly volumes create` **requires** an explicit region when
+it is not attached to a TTY, so an unresolved region is a hard failure at
+provision time rather than a convenient default. Detection is attempted first
+(`detect_region`); this is the last resort so a recipe never dies on a
+network hiccup."""
 
 DEFAULT_VOLUME_NAME = "flotta_data"
 """Volume names are per-app and must be a valid identifier — no dashes."""
@@ -90,6 +99,40 @@ DURABLE_PATHS: tuple[DurablePath, ...] = (
 def durable_paths(hermes_home: str = DEFAULT_HERMES_HOME) -> tuple[str, ...]:
     """Absolute paths that must survive a stop/start cycle."""
     return tuple(f"{hermes_home.rstrip('/')}/{p.relative}" for p in DURABLE_PATHS)
+
+
+# --- region detection ------------------------------------------------------
+
+
+def detect_region(fetch: Callable[[], str] | None = None) -> str | None:
+    """The Fly edge region nearest this machine, or None if it cannot be found.
+
+    Every Fly edge echoes the region that served a request in a ``Fly-Region``
+    header, so one request to a Fly-hosted host answers "where is nearest?"
+    without a token, an API client, or a hardcoded guess.
+
+    Total by design: a box that cannot be placed optimally is a much smaller
+    problem than a provisioning recipe that dies because DNS was slow, so every
+    failure yields None and the caller falls back.
+    """
+    if fetch is None:  # pragma: no cover - exercised live, not in tests
+
+        def fetch() -> str:
+            import urllib.request
+
+            with urllib.request.urlopen("https://debug.fly.dev", timeout=10) as response:
+                return response.read().decode("utf-8", "replace")
+
+    try:
+        body = fetch()
+    except Exception:
+        return None
+
+    for line in body.splitlines():
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "fly-region":
+            return _clean(value) or None
+    return None
 
 
 # --- configuration ---------------------------------------------------------
@@ -148,6 +191,15 @@ class FlyConfig:
     def durable_paths(self) -> tuple[str, ...]:
         return durable_paths(self.hermes_home)
 
+    def resolved_region(self, fetch: Callable[[], str] | None = None) -> str:
+        """A concrete region, always. Configured, else detected, else fallback.
+
+        `fly volumes create` refuses to run without one when it is not
+        attached to a TTY, so "unset" cannot mean "decide later" — something
+        has to name a region before the volume exists.
+        """
+        return self.region or detect_region(fetch) or FALLBACK_REGION
+
     def describe(self) -> str:
         """One block naming exactly what the next Fly command will act on.
 
@@ -155,7 +207,7 @@ class FlyConfig:
         reason `just modal-whoami` gates the Modal ones: `flyctl` acts on
         whatever org is current, and finding out afterwards is expensive.
         """
-        region = self.region or "(nearest to you — Fly chooses)"
+        region = self.region or "(unset — detected at provision time)"
         return "\n".join(
             (
                 "Fly target for flotta recipes:",
