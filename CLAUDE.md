@@ -22,8 +22,15 @@ This is the **implementation repo** for **Flotta** — an open-source fleet runt
 >
 > **M0 has landed** (the rename + the three-table split). Everything below the store is still v0.1
 > Modal one-shots: `stop`/`start` write transitions with no infrastructure behind them, and
-> `HERMES_HOME` is still ephemeral, so **a box does not yet remember anything**. Durable memory
-> across a stop/start cycle is the next milestone and the project's whole thesis.
+> `HERMES_HOME` is still ephemeral, so **a box does not yet remember anything**.
+>
+> **Next is M2, not M1 — this ordering is deliberate and counterintuitive, so do not "fix" it.**
+> M2 is durable `HERMES_HOME`: mount a persistent volume at `/data`, point `HERMES_HOME` at
+> `/data/hermes`, and prove across a stop/start cycle that memory, learned skills and history all
+> survive. That is the project's thesis reduced to one assertion, and it can be demonstrated on a
+> single **hand-provisioned Fly machine** before any of M1's `Backend` abstraction exists.
+> Building the abstraction first would mean designing an interface for a capability nobody has
+> demonstrated yet. See §7 and §5 of the pivot doc.
 
 ## Parent project
 
