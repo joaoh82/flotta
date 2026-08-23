@@ -264,3 +264,52 @@ def test_existing_endpoint_is_none_when_there_is_no_machine():
         runner=lambda cmd, *, timeout, check: subprocess.CompletedProcess(cmd, 0, "[]", ""),
     )
     assert backend.existing_endpoint() is None
+
+
+def test_create_refuses_before_provisioning_anything_billable():
+    """The orphan-app bug, found in the Fly dashboard rather than by a test.
+
+    `create` used to make the app and a 1GB volume and *then* discover it had
+    no image to boot — leaving an app with zero machines and a volume quietly
+    costing $0.15/month. Provisioning cannot be made atomic across three API
+    calls, so the cheap refusal has to come first.
+    """
+    import subprocess
+
+    from flotta.backend import BackendError
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check):
+        issued.append(cmd)
+        # No apps, no machines, no releases: a completely fresh account.
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+    with pytest.raises(BackendError, match="Nothing was created"):
+        backend.create(BoxSpec(name="eng-a"))
+
+    mutating = [c for c in issued if "create" in c or "run" in c]
+    assert mutating == [], f"refused, but still issued: {mutating}"
+
+
+def test_create_boots_from_an_explicit_image_on_a_fresh_app():
+    """`spec.image` is the escape hatch: a brand-new app has no releases."""
+    import json as _json
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check):
+        issued.append(cmd)
+        if "machines" in cmd and "list" in cmd:
+            # empty until the machine is run, then one
+            ran = any("run" in c for c in issued)
+            body = _json.dumps([{"id": "m9", "state": "started"}] if ran else [])
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+    handle = backend.create(BoxSpec(name="eng-a", image="registry.fly.io/x:v1"))
+    assert handle.id == "m9"
+    assert any("run" in c for c in issued), "should have booted a machine"

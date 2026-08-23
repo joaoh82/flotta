@@ -102,6 +102,26 @@ class FlyBackend:
         app = self.config.app
         region = spec.region or self.config.resolved_region()
 
+        # Adopt first: a machine that already exists is the box.
+        existing = self._machines(app) if self._app_exists(app) else []
+        if existing:
+            machine_id = existing[0]["id"]
+            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+
+        # THEN decide whether a boot is even possible, BEFORE creating anything
+        # billable. An earlier version created the app and a 1GB volume and only
+        # then discovered it had no image to run, leaving an orphan app with a
+        # volume quietly costing $0.15/month — found in the Fly dashboard, not
+        # by any test. Provisioning is not atomic and cannot be made so across
+        # three API calls, so the order has to put the cheap refusal first.
+        image = spec.image or (self._current_image(app) if self._app_exists(app) else None)
+        if not image:
+            raise BackendError(
+                f"no image to boot a box from: app {app!r} has no completed release "
+                "and BoxSpec.image was not set. Build and release one first "
+                "(`just fly-up`), or pass BoxSpec(image=...). Nothing was created."
+            )
+
         if not self._app_exists(app):
             self._flyctl("apps", "create", app, "--org", self.config.org, app=None)
         if not self._volume_exists(app, self.config.volume_name):
@@ -115,19 +135,6 @@ class FlyBackend:
                 region,
                 "-y",
                 app=app,
-            )
-
-        existing = self._machines(app)
-        if existing:
-            machine_id = existing[0]["id"]
-            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
-
-        image = spec.image or self._current_image(app)
-        if not image:
-            raise BackendError(
-                f"app {app!r} has no machine and no image to boot one from. "
-                "Build and release one first (`just fly-build`), or pass "
-                "BoxSpec(image=...)."
             )
 
         args = [
