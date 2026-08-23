@@ -237,6 +237,21 @@ check-dashboard:
 # FLOTTA_MODAL_PROFILE itself (env, then .env) before touching Modal, so an
 # installed bare `flotta` targets the right workspace on its own.
 
+# Regenerates assets/demo.gif from assets/demo.tape. `just --list` shows only
+# the last comment line, so the cost lives there rather than here.
+# M7.6: re-record the README demo GIF — costs a real spawn (container + model call)
+demo: modal-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v vhs >/dev/null || { echo "vhs not installed: brew install vhs"; exit 1; }
+    # The tape drives the installed `flotta`, not `uv run flotta`, so the GIF
+    # shows what the README tells a user to type. Keep the two in step.
+    uv tool install --force . >/dev/null
+    # Must run from the repo root: the CLI reads `.env` from the current
+    # directory to resolve the Modal profile.
+    vhs assets/demo.tape
+    ls -lh assets/demo.gif
+
 # show the development plan (lives in the parent workspace)
 plan:
     @sed -n '1,60p' ../docs/development-plan.md
