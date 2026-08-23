@@ -109,6 +109,34 @@ between milestones — architecture, conventions, and the sharp edges below.
   M2 proof once passed by answering with a passphrase from a *previous* cycle.
   That is the product working correctly and the test being wrong — the fix is a
   question only this run can answer, never wiping the store between runs.
+- **A box's memory outlives its machine.** Verified: the machine was destroyed
+  outright, `create_box` provisioned a new one, and `/data/hermes` came back
+  byte-identical (same SHA-256 on `memories/MEMORY.md`). The volume is the box;
+  the machine is replaceable. That is also the "fork a box" primitive §M2
+  gestures at, already working.
+- **`fly image show` returns `null` when an app has no machines.** It derives
+  the image *from a machine*, which is exactly the moment `create` needs one.
+  Read `flyctl releases` (`ImageRef`, newest complete release) instead — an
+  image belongs to the app's release history, not to any machine.
+- **`create` never builds an image.** Building is a fleet operation — build
+  once, create many boxes — so `BoxSpec.image` names an existing one and
+  `just fly-up` owns producing it. The same split will hold for a Firecracker
+  rootfs.
+- **`flyctl ssh console -C` does not run a shell.** It execs the string as
+  argv, so `echo a; cat b` runs `echo` with the literal arguments `a;`, `cat`,
+  `b` — no error, just quietly wrong output. `FlyBackend.exec` wraps commands
+  in `/bin/sh -c` for this reason. Heredocs are still mangled in transit
+  (base64 them), and a backgrounded process does not survive the session.
+- **Suspend is not faster than stop — it keeps memory.** Measured, 3 runs
+  each: cold stop reaches `started` in ~0.31s, suspend in ~0.43s. What suspend
+  buys is the VM's RAM (uptime 44.4s -> 53.5s, versus 72.1s -> 6.7s cold).
+  §8.4 argues for suspend on latency grounds and that part is wrong; the
+  state-preservation reason is right and is why `prefer_suspend` is the
+  default. It is worth nothing while PID 1 is `sleep infinity`, and everything
+  once a box runs Hermes as a service.
+- **The Fly app name belongs in the main checkout's `.env`, not a worktree's.**
+  It is gitignored, so a worktree copy dies with the branch — and the fleet's
+  address goes with it. `just fly-whoami` shows what is resolved.
 - **`stop` is refused while a box has live tasks.** Until a backend can really
   suspend, stopping changes a row and nothing else — the container keeps
   running and keeps billing while `count_active_boxes()` reports zero. A

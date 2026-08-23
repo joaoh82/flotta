@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from flotta.backend import BackendError, NotSupported
 from flotta.provision import (
     DEFAULT_GRACE_S,
     MAX_TIMEOUT_S,
@@ -21,6 +22,7 @@ from flotta.provision import (
     TaskTimeout,
     billable_seconds,
     classify_result,
+    create_box,
     endpoint_for,
     estimate_cost,
     function_call_id,
@@ -73,6 +75,52 @@ def spawned(store, task="do the thing", **kwargs):
 
 def box_of(store, task_id):
     return store.get_task(task_id).box_id
+
+
+class FakeBackend:
+    """A substrate that can do everything, for testing the wiring not the vendor.
+
+    Records the verbs it was asked for, so a test can assert that `stop_box`
+    reached the infrastructure at all — the M0 bug was a row that moved while
+    nothing else did, and only an observed call rules that out.
+    """
+
+    scheme = "fake"
+
+    def __init__(self, *, can_suspend=True):
+        self.calls: list[str] = []
+        self.can_suspend = can_suspend
+        self.machine_state = "started"
+
+    def suspend(self, box_id):
+        self.calls.append("suspend")
+        if not self.can_suspend:
+            raise NotSupported("this fake cannot suspend")
+        self.machine_state = "suspended"
+
+    def stop(self, box_id):
+        self.calls.append("stop")
+        self.machine_state = "stopped"
+
+    def start(self, box_id):
+        self.calls.append("start")
+        self.machine_state = "started"
+
+    def destroy(self, box_id):
+        self.calls.append("destroy")
+        self.machine_state = "gone"
+
+    def state(self, box_id):
+        return self.machine_state
+
+    def endpoint(self, box_id):
+        return f"fake://{box_id}"
+
+    def create(self, spec):
+        raise NotSupported("not used in these tests")
+
+    def exec(self, box_id, command, *, timeout_s=300):
+        raise NotSupported("not used in these tests")
 
 
 def idle_box(store, **kwargs):
@@ -434,7 +482,7 @@ def test_teardown_unknown_box_raises(store):
 def test_a_stopped_box_can_still_be_torn_down(store):
     """You must be able to destroy a sleeping agent without waking it first."""
     bid = idle_box(store)
-    stop_box(bid, store=store)
+    stop_box(bid, store=store, backend=FakeBackend())
     out = teardown_box(bid, store=store, canceller=lambda c: None)
     assert out["status"] == "torn_down"
     assert store.get_box(bid).destroyed_at is not None
@@ -445,33 +493,33 @@ def test_stop_then_start_round_trips(store):
     """The pivot's central transition, through the provisioning layer."""
     bid = idle_box(store)
 
-    assert stop_box(bid, store=store)["status"] == "stopped"
+    assert stop_box(bid, store=store, backend=FakeBackend())["status"] == "stopped"
     assert store.get_box(bid).status == "stopped"
     # Stopping is not finishing: the machine is still there tomorrow.
     assert store.get_box(bid).destroyed_at is None
 
-    assert start_box(bid, store=store)["status"] == "running"
+    assert start_box(bid, store=store, backend=FakeBackend())["status"] == "running"
     assert store.get_box(bid).status == "running"
     assert box_events(store, bid) == ["running", "stopped", "running"]
 
 
 def test_stop_is_idempotent(store):
     bid = idle_box(store)
-    stop_box(bid, store=store)
-    second = stop_box(bid, store=store)
+    stop_box(bid, store=store, backend=FakeBackend())
+    second = stop_box(bid, store=store, backend=FakeBackend())
     assert second["already_stopped"] is True
     assert box_events(store, bid).count("stopped") == 1
 
 
 def test_start_is_idempotent(store):
     bid = box_of(store, spawned(store))
-    second = start_box(bid, store=store)  # already running
+    second = start_box(bid, store=store, backend=FakeBackend())  # already running
     assert second["already_running"] is True
 
 
 def test_stop_records_a_reason(store):
     bid = idle_box(store)
-    stop_box(bid, store=store, reason="idle 30m")
+    stop_box(bid, store=store, reason="idle 30m", backend=FakeBackend())
     payload = store.get_events("box", bid)[-1].payload
     assert payload["reason"] == "idle 30m"
     assert payload["previous_status"] == "running"
@@ -479,9 +527,9 @@ def test_stop_records_a_reason(store):
 
 def test_stop_and_start_reject_an_unknown_box(store):
     with pytest.raises(UnknownEntityError):
-        stop_box("b-nope", store=store)
+        stop_box("b-nope", store=store, backend=FakeBackend())
     with pytest.raises(UnknownEntityError):
-        start_box("b-nope", store=store)
+        start_box("b-nope", store=store, backend=FakeBackend())
 
 
 def test_a_stopped_box_does_not_count_as_active(store):
@@ -497,7 +545,7 @@ def test_a_stopped_box_does_not_count_as_active(store):
     watch_task(tid, store=store, waiter=lambda c, t: {"completed": True})
 
     assert store.count_active_boxes() == 1
-    stop_box(bid, store=store)
+    stop_box(bid, store=store, backend=FakeBackend())
     assert store.count_active_boxes() == 0
     assert len(store.list_boxes()) == 1  # still there, still yours
 
@@ -515,8 +563,8 @@ def test_full_lifecycle_event_sequence(store):
     watch_task(tid, store=store, waiter=lambda c, t: {"completed": True, "dry_run": True})
     assert store.get_task(tid).status == "done"
 
-    stop_box(bid, store=store)
-    start_box(bid, store=store)
+    stop_box(bid, store=store, backend=FakeBackend())
+    start_box(bid, store=store, backend=FakeBackend())
     teardown_box(bid, store=store, canceller=lambda c: None)
 
     box = store.get_box(bid)
@@ -1023,7 +1071,7 @@ def test_start_refuses_a_box_that_never_launched(store):
     """
     box = store.create_box("eng-b")
     with pytest.raises(ProvisionError, match="only a stopped box can be started"):
-        start_box(box.id, store=store)
+        start_box(box.id, store=store, backend=FakeBackend())
     assert store.get_box(box.id).status == "provisioning"
     assert box_events(store, box.id) == []  # nothing written on the way out
 
@@ -1033,7 +1081,7 @@ def test_start_refuses_a_torn_down_box_cleanly(store):
     bid = box_of(store, spawned(store))
     teardown_box(bid, store=store, canceller=lambda c: None)
     with pytest.raises(ProvisionError, match="only a stopped box can be started"):
-        start_box(bid, store=store)
+        start_box(bid, store=store, backend=FakeBackend())
 
 
 def test_start_on_a_provisioning_box_cannot_strand_a_billed_container(store):
@@ -1046,22 +1094,24 @@ def test_start_on_a_provisioning_box_cannot_strand_a_billed_container(store):
     """
     box = store.create_box("eng-b")
     with pytest.raises(ProvisionError):
-        start_box(box.id, store=store)
+        start_box(box.id, store=store, backend=FakeBackend())
     # The spawn path is still able to complete, which is the property at stake.
     store.update_box_status(box.id, "running", endpoint=endpoint_for("fc-1"))
     assert store.get_box(box.id).endpoint == endpoint_for("fc-1")
 
 
 def test_stop_refuses_a_box_that_never_ran_without_writing_an_event(store):
-    """Events are the audit trail; a lie in them outlives the traceback.
+    """The operator-facing half of the rule, after M1 split it in two.
 
-    `add_event` then `update_box_status` leaves a `stopped` event on a box that
-    never stopped, because `provisioning -> stopped` is illegal and raises only
-    after the event is committed.
+    The *store* now permits `provisioning -> stopped`, because `create_box`
+    legitimately needs somewhere honest to put a machine that exists but is not
+    up. Asking to *stop* a box that never ran is a different act, and this verb
+    still refuses it — and refuses before writing anything, so no `stopped`
+    event describes something that never happened.
     """
     box = store.create_box("eng-b")
     with pytest.raises(ProvisionError, match="only a running box can be stopped"):
-        stop_box(box.id, store=store)
+        stop_box(box.id, store=store, backend=FakeBackend())
     assert store.get_box(box.id).status == "provisioning"
     assert box_events(store, box.id) == []
 
@@ -1071,7 +1121,7 @@ def test_stop_refuses_a_torn_down_box_without_writing_an_event(store):
     teardown_box(bid, store=store, canceller=lambda c: None)
     before = box_events(store, bid)
     with pytest.raises(ProvisionError, match="only a running box can be stopped"):
-        stop_box(bid, store=store)
+        stop_box(bid, store=store, backend=FakeBackend())
     assert box_events(store, bid) == before
     assert "stopped" not in box_events(store, bid)
 
@@ -1158,7 +1208,7 @@ def test_stop_refuses_while_a_task_is_still_running(store):
     tid = spawned(store)
     bid = box_of(store, tid)
     with pytest.raises(ProvisionError, match="still running"):
-        stop_box(bid, store=store)
+        stop_box(bid, store=store, backend=FakeBackend())
     assert store.get_box(bid).status == "running"
     assert "stopped" not in box_events(store, bid)
     assert store.count_active_boxes() == 1  # the accounting stays honest
@@ -1170,7 +1220,7 @@ def test_stop_refuses_while_a_task_is_merely_pending(store):
     store.update_box_status(box.id, "running")
     store.create_task(box.id, "queued")
     with pytest.raises(ProvisionError, match="still running"):
-        stop_box(box.id, store=store)
+        stop_box(box.id, store=store, backend=FakeBackend())
 
 
 def test_stop_is_allowed_once_the_work_resolves(store):
@@ -1178,7 +1228,7 @@ def test_stop_is_allowed_once_the_work_resolves(store):
     tid = spawned(store)
     bid = box_of(store, tid)
     watch_task(tid, store=store, waiter=lambda c, t: {"completed": True})
-    assert stop_box(bid, store=store)["status"] == "stopped"
+    assert stop_box(bid, store=store, backend=FakeBackend())["status"] == "stopped"
 
 
 def test_kill_is_the_escape_hatch_the_refusal_points_at(store):
@@ -1236,3 +1286,358 @@ def test_a_duplicate_id_is_not_reported_as_a_duplicate_name(store):
         store.create_box("a-different-name", box_id="b-fixed")
     with pytest.raises(DuplicateBoxError, match="named 'eng-a'"):
         store.create_box("eng-a")
+
+
+# -- M1: the backend actually gets called -----------------------------------
+
+
+def test_stop_reaches_the_infrastructure_not_just_the_row(store):
+    """The M0 bug, now impossible.
+
+    Under M0 `stop_box` moved a row and nothing else: the container kept
+    running and kept billing while `count_active_boxes()` reported zero. Only
+    an observed backend call rules that out.
+    """
+    bid = idle_box(store)
+    fake = FakeBackend()
+    out = stop_box(bid, store=store, backend=fake)
+    assert fake.calls == ["suspend"]
+    assert fake.machine_state == "suspended"
+    assert out["method"] == "suspend"
+
+
+def test_stop_prefers_suspend_and_falls_back_to_cold_stop(store):
+    """Measured, not assumed: suspend is not faster (0.43s vs 0.31s to
+    `started`) — it keeps the VM's memory, which is what a box running Hermes
+    will need. Where a substrate refuses, a cold stop is still better than
+    staying up."""
+    bid = idle_box(store)
+    fake = FakeBackend(can_suspend=False)
+    out = stop_box(bid, store=store, backend=fake)
+    assert fake.calls == ["suspend", "stop"]
+    assert out["method"] == "stop"
+
+
+def test_the_method_is_recorded_on_the_event_not_the_status(store):
+    """`stopped` is the fleet's word; *how* is a substrate detail.
+
+    Promoting `suspended` to a box status would leak Fly's vocabulary into a
+    state machine that also has to describe Modal and, later, Hetzner — but
+    "did this box keep its memory?" is worth answering months later.
+    """
+    bid = idle_box(store)
+    stop_box(bid, store=store, backend=FakeBackend())
+    assert store.get_box(bid).status == "stopped"
+    assert store.get_events("box", bid)[-1].payload["method"] == "suspend"
+
+
+def test_a_failed_stop_leaves_the_box_running(store):
+    """The row must not claim a box is asleep when the machine refused.
+
+    This is the same ordering rule M0's review established for events, one
+    layer out: nothing is recorded until the side effect has actually happened.
+    """
+    bid = idle_box(store)
+
+    class Broken(FakeBackend):
+        def suspend(self, box_id):
+            raise BackendError("fly is down")
+
+        def stop(self, box_id):
+            raise BackendError("fly is down")
+
+    with pytest.raises(ProvisionError, match="could not stop"):
+        stop_box(bid, store=store, backend=Broken())
+
+    assert store.get_box(bid).status == "running"
+    assert "stopped" not in box_events(store, bid)
+
+
+def test_a_failed_start_leaves_the_box_stopped(store):
+    bid = idle_box(store)
+    stop_box(bid, store=store, backend=FakeBackend())
+
+    class Broken(FakeBackend):
+        def start(self, box_id):
+            raise BackendError("no capacity in this region")
+
+    with pytest.raises(ProvisionError, match="could not start"):
+        start_box(bid, store=store, backend=Broken())
+
+    assert store.get_box(bid).status == "stopped"
+
+
+def test_start_resumes_through_the_backend(store):
+    bid = idle_box(store)
+    stop_box(bid, store=store, backend=FakeBackend())
+    fake = FakeBackend()
+    start_box(bid, store=store, backend=fake)
+    assert fake.calls == ["start"]
+    assert store.get_box(bid).status == "running"
+
+
+def test_a_modal_box_cannot_be_stopped(store):
+    """The asymmetry the pivot doc calls "the point", enforced end to end.
+
+    `spawn_box` mints a `modal://` endpoint, so this resolves the real
+    ModalBackend with no fake in sight — a Modal container genuinely cannot be
+    stopped and resumed, and saying so is more useful than a row that lies.
+    """
+    bid = idle_box(store)  # endpoint is modal://...
+    assert store.get_box(bid).endpoint.startswith("modal://")
+    with pytest.raises(ProvisionError, match="could not stop"):
+        stop_box(bid, store=store)  # no backend injected: routes on the scheme
+    assert store.get_box(bid).status == "running"
+
+
+def test_a_box_with_no_endpoint_says_so_rather_than_guessing(store):
+    """A box that was never launched has no substrate to act on."""
+    box = store.create_box("never-launched")
+    store.update_box_status(box.id, "running")
+    with pytest.raises(ProvisionError, match="no endpoint"):
+        stop_box(box.id, store=store)
+
+
+def test_backend_is_routed_from_the_endpoint_scheme(store):
+    """One fact in one place: the address already says where the box lives, so
+    a `boxes.backend` column would be a second copy that could disagree."""
+    from flotta.backend import scheme_of
+
+    bid = idle_box(store)
+    assert scheme_of(store.get_box(bid).endpoint) == "modal"
+
+
+# -- M1: create_box tells the truth about what it made ----------------------
+
+
+def test_create_box_records_running_only_when_the_machine_is_up(store):
+    class Creating(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.calls.append("create")
+            self.machine_state = "stopped"  # created, not started — per the protocol
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    impl = Creating()
+    out = create_box("eng-a", store=store, backend=impl)
+
+    assert impl.calls == ["create", "start"], "create must start before claiming running"
+    assert out["status"] == "running"
+    box = store.get_box(out["box_id"])
+    assert box.status == "running"
+    assert box.endpoint == "fake://app/m1"
+
+
+def test_create_box_does_not_claim_running_when_the_machine_is_not(store):
+    """The M0 lie, one layer up.
+
+    `Backend.create` may return before the box is running. Writing `running`
+    on the strength of the plan rather than the substrate is exactly the
+    store/invoice disagreement this milestone closed for `stop_box`.
+    """
+
+    class WontStart(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.machine_state = "stopped"
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def start(self, box_id):
+            raise BackendError("no capacity in ams")
+
+    with pytest.raises(ProvisionError, match="not running"):
+        create_box("eng-a", store=store, backend=WontStart())
+
+    box = store.list_boxes()[0]
+    assert box.status == "stopped", "a created-but-down machine is stopped, not running"
+    assert box.endpoint == "fake://app/m1", "the endpoint is kept so it can be recovered"
+    assert box.destroyed_at is None
+
+
+def test_a_box_that_failed_to_start_can_be_started_later(store):
+    """`stopped` was chosen over `torn_down` precisely so this works."""
+
+    class WontStartOnce(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.fail = True
+
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.machine_state = "stopped"
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def start(self, box_id):
+            if self.fail:
+                self.fail = False
+                raise BackendError("transient")
+            self.machine_state = "started"
+
+    impl = WontStartOnce()
+    with pytest.raises(ProvisionError):
+        create_box("eng-a", store=store, backend=impl)
+
+    bid = store.list_boxes()[0].id
+    assert start_box(bid, store=store, backend=impl)["status"] == "running"
+
+
+def test_create_box_closes_the_row_when_provisioning_fails(store):
+    """No machine exists, so there is nothing to recover — close it."""
+
+    class Broken(FakeBackend):
+        def create(self, spec):
+            raise BackendError("fly quota exceeded")
+
+    with pytest.raises(ProvisionError, match="create failed"):
+        create_box("eng-a", store=store, backend=Broken())
+
+    box = store.list_boxes()[0]
+    assert box.status == "torn_down"
+    assert box.endpoint is None
+
+
+def test_create_box_names_the_box(store):
+    class Creating(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            assert spec.name == "eng-b"
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    out = create_box("eng-b", store=store, backend=Creating())
+    assert store.get_box_by_name("eng-b").id == out["box_id"]
+
+
+# -- PR #30 re-review follow-ups --------------------------------------------
+
+
+def test_a_flaky_state_call_cannot_unsay_a_successful_start(store):
+    """The lie this milestone closed, pointing the other way.
+
+    `_observed_state` used to catch bare `Exception` and return "unknown", so a
+    `state()` blip *after* a clean `start()` recorded the box as `stopped` while
+    the machine was up. A start that returned is evidence; an unreadable
+    substrate must not overturn it.
+    """
+
+    class FlakyState(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def state(self, box_id):
+            raise BackendError("fly api timeout")
+
+    out = create_box("eng-a", store=store, backend=FlakyState())
+    assert out["status"] == "running"
+    assert store.get_box(out["box_id"]).status == "running"
+
+
+def test_an_unreadable_state_after_a_failed_start_still_records_stopped(store):
+    """The conservative direction is kept: no evidence of a start, no `running`."""
+
+    class Broken(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def start(self, box_id):
+            raise BackendError("no capacity")
+
+        def state(self, box_id):
+            raise BackendError("also down")
+
+    with pytest.raises(ProvisionError, match="not running"):
+        create_box("eng-a", store=store, backend=Broken())
+    assert store.list_boxes()[0].status == "stopped"
+
+
+def test_a_non_backend_error_from_state_is_not_swallowed(store):
+    """Only a substrate that cannot answer is tolerated; a bug here surfaces."""
+
+    class Buggy(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def state(self, box_id):
+            raise TypeError("programming error in the adapter")
+
+    with pytest.raises(TypeError):
+        create_box("eng-a", store=store, backend=Buggy())
+
+
+def test_two_boxes_cannot_claim_the_same_machine(store):
+    """`create` is idempotent over the machine; the store is not.
+
+    A second `create_box` under a different name would otherwise mint a second
+    row on the same endpoint — two rows, one machine — and `stop_box` on either
+    would then lie about the other. Unreachable through today's CLI, which is
+    why it is worth closing before `flotta create` exists to reach it.
+    """
+
+    class Adopting(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.made = False
+
+        def existing_endpoint(self):
+            return "fake://app/m1" if self.made else None
+
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.made = True
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    impl = Adopting()
+    first = create_box("eng-a", store=store, backend=impl)
+
+    with pytest.raises(ProvisionError, match="already occupies"):
+        create_box("eng-b", store=store, backend=impl)
+
+    assert [b.id for b in store.list_boxes()] == [first["box_id"]]
+
+
+def test_a_destroyed_box_frees_its_machine_for_a_new_one(store):
+    """The guard is about *live* rows — a torn-down box holds nothing."""
+
+    class Adopting(FakeBackend):
+        def existing_endpoint(self):
+            return "fake://app/m1"
+
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    impl = Adopting()
+    box = store.create_box("old")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    store.update_box_status(box.id, "torn_down")
+
+    assert create_box("new", store=store, backend=impl)["status"] == "running"
+
+
+def test_start_box_verifies_rather_than_assuming(store):
+    """`create_box` believes the substrate; `start_box` must not be laxer."""
+    bid = idle_box(store)
+    stop_box(bid, store=store, backend=FakeBackend())
+
+    class LiesAboutStarting(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.machine_state = "stopped"
+
+        def start(self, box_id):
+            self.calls.append("start")  # returns cleanly, machine stays down
+
+    with pytest.raises(ProvisionError, match="did not come up"):
+        start_box(bid, store=store, backend=LiesAboutStarting())
+    assert store.get_box(bid).status == "stopped", "the row is unchanged"

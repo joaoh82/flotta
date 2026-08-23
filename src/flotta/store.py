@@ -55,7 +55,13 @@ EntityKind = Literal["box", "workspace", "task"]
 BOX_STATUSES: frozenset[str] = frozenset({"provisioning", "running", "stopped", "torn_down"})
 BOX_TERMINAL: frozenset[str] = frozenset({"torn_down"})
 BOX_TRANSITIONS: dict[str, frozenset[str]] = {
-    "provisioning": frozenset({"running", "torn_down"}),
+    # `provisioning -> stopped` exists because `create` can legitimately return
+    # a machine that is not running yet: the protocol says so, and a
+    # Firecracker pool will make that the common case. Without it a box whose
+    # create succeeded but whose start failed had nowhere honest to sit —
+    # `running` would be a lie and `torn_down` would throw away a machine that
+    # exists. `stopped` is exactly true, and `start_box` can recover from it.
+    "provisioning": frozenset({"running", "stopped", "torn_down"}),
     "running": frozenset({"stopped", "torn_down"}),
     "stopped": frozenset({"running", "torn_down"}),
     "torn_down": frozenset(),

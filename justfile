@@ -400,3 +400,7 @@ fly-secrets: fly-whoami
       flyctl machines stop "$MID" --app "$APP" >/dev/null
     done
     echo "provider secrets set on $APP (values not echoed)"
+
+# M1: drive a real box through the Backend protocol (REAL infra, no model call)
+fly-cycle: fly-whoami
+    uv run python scripts/m1_backend_cycle.py
