@@ -20,8 +20,11 @@ primary_region = ""
   HERMES_REF = "v2026.8.19"
 
 [env]
-  # The reason this milestone exists. Must stay inside the mount below.
+  # The reason M2 exists. Must stay inside the mount below.
   HERMES_HOME = "/data/hermes"
+  # `hermes serve` binds this. Loopback only — see box_entrypoint.sh for why
+  # public exposure waits for M5's front door and auth.
+  FLOTTA_SERVE_PORT = "9119"
 
 # The disk that makes a box a box. Volumes bill whether the machine runs, is
 # stopped, or is suspended ($0.15/GB/month) — a stopped box is cheap, not free.

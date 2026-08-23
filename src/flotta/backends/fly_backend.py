@@ -145,6 +145,15 @@ class FlyBackend:
             spec.name,
             "--region",
             region,
+            # Tag it the way `fly deploy` tags its own machines. Without this,
+            # `machine run` produces a box that Fly Launch does not recognise
+            # as belonging to the app, so a later `fly deploy` decides the app
+            # "doesn't have any Fly Launch machines" and creates a SECOND one —
+            # with a second volume, since Fly volume names are a *group*, not a
+            # unique key. Observed live: two machines, two 1GB volumes, and the
+            # memory on the one `fly deploy` was no longer managing.
+            "--metadata",
+            "fly_platform_version=v2",
             "--volume",
             f"{self.config.volume_name}:{spec.mount_path}",
             "--vm-size",

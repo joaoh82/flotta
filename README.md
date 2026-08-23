@@ -162,17 +162,23 @@ Any OpenAI-compatible endpoint works — swap the base URL for OpenAI, Nous Port
 just dashboard           # http://localhost:3001
 ```
 
-### 6. Let the agent decide
+### 6. Talk to a box
 
-This is the point of the whole thing. Install the skill into your local Hermes, then just ask:
+The point of the whole thing, and the shape it now has: **the agent lives in
+the cloud and you are a client.** A box runs `hermes serve` as PID 1 with its
+memory on a durable volume, so it is still there tomorrow and still knows what
+you told it.
 
 ```bash
-just install-skill
-hermes chat -q "Delegate this to a Flotta cloud worker and summarize: '<your task>'.
-                Flotta repo: /path/to/flotta. Tear it down when done."
+just fly-up          # build and deploy the box image
+just fly-auth        # mint its dashboard credentials
 ```
 
-The orchestrator decides delegation is warranted, spawns, collects, summarizes, and cleans up.
+v0.1 did this the other way round — an orchestrator on your laptop shipping
+tasks to disposable containers — which is the inversion the pivot exists to
+correct. The local orchestrator skill that taught your laptop's Hermes to
+delegate is gone: a cloud box's Hermes *is* the orchestrator and does not need
+a skill to delegate to itself.
 
 ## What it costs
 
@@ -276,7 +282,6 @@ Stated plainly, because finding these yourself is worse.
 | `src/flotta/worker/` | the Modal image and the container entrypoint — **runs in the cloud** |
 | `src/flotta/cli.py` | the Typer CLI |
 | `dashboard/` | Next.js over the same store, via Node's built-in SQLite |
-| `skills/orchestrator/` | the Hermes skill that teaches delegation |
 
 Storage is deliberately plain SQLite behind a thin SQL interface, so pointing it at
 [Turso](https://turso.tech) later is a change to one connection factory rather than a rewrite.

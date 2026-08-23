@@ -177,35 +177,6 @@ e2e *ARGS: modal-whoami
 # same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
 e2e-live: (e2e "--live")
 
-# Symlinked rather than copied, so edits to the skill take effect immediately
-# without a reinstall. Remove with `just uninstall-skill`.
-# M6 — install the orchestrator skill into the local Hermes (~/.hermes/skills)
-install-skill:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    dest="${HERMES_HOME:-$HOME/.hermes}/skills/flotta-orchestrator"
-    if [ ! -d "$(dirname "$dest")" ]; then
-      echo "ERROR: no Hermes skills directory at $(dirname "$dest")." >&2
-      echo "Is Hermes installed? Set HERMES_HOME if it lives elsewhere." >&2
-      exit 1
-    fi
-    # Refuse to clobber a real directory — only ever replace our own symlink.
-    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
-      echo "ERROR: $dest exists and is not a symlink; refusing to overwrite." >&2
-      exit 1
-    fi
-    ln -sfn "$(pwd)/skills/orchestrator" "$dest"
-    echo "linked $dest -> $(pwd)/skills/orchestrator"
-
-# M6 — remove the orchestrator skill from the local Hermes
-uninstall-skill:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    dest="${HERMES_HOME:-$HOME/.hermes}/skills/flotta-orchestrator"
-    if [ -L "$dest" ]; then rm "$dest" && echo "removed $dest"
-    elif [ -e "$dest" ]; then echo "$dest is not a symlink; leaving it alone." >&2; exit 1
-    else echo "nothing installed at $dest"; fi
-
 # Port 3001 is baked into dashboard/package.json rather than passed here: 3000
 # is reserved for another local service and a flag is too easy to forget.
 # Reads $FLOTTA_STORE, else ../fleet.db — the same store the CLI writes.
@@ -404,3 +375,26 @@ fly-secrets: fly-whoami
 # M1: drive a real box through the Backend protocol (REAL infra, no model call)
 fly-cycle: fly-whoami
     uv run python scripts/m1_backend_cycle.py
+
+# M3: mint and push the box's dashboard credentials (this is how you rotate)
+fly-auth: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    # Generated here, never committed: the box is reachable only over Fly's
+    # private network, but "private network" is one layer and Hermes's own auth
+    # gate is the other. Neither is meant to hold alone.
+    PASS=$(uv run python -c "import secrets; print(secrets.token_urlsafe(32))")
+    SECRET=$(uv run python -c "import secrets; print(secrets.token_urlsafe(48))")
+    printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD=%s\nHERMES_DASHBOARD_BASIC_AUTH_SECRET=%s\n' \
+      flotta "$PASS" "$SECRET" | flyctl secrets import --app "$APP"
+    # Written locally so `flotta chat` can log in. Gitignored with the rest of .env.
+    uv run python - "$PASS" <<'PY'
+    import pathlib, sys
+    env = pathlib.Path(".env")
+    text = env.read_text() if env.exists() else ""
+    lines = [ln for ln in text.splitlines() if not ln.startswith("FLOTTA_BOX_PASSWORD=")]
+    lines.append(f"FLOTTA_BOX_PASSWORD={sys.argv[1]}")
+    env.write_text("\n".join(lines) + "\n")
+    PY
+    echo "credentials set on $APP and recorded in .env (values not echoed)"

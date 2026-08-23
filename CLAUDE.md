@@ -204,7 +204,9 @@ The runtime is built around one durable store that is the single source of truth
 - **`dashboard/`** — Next.js 16 (App Router, TypeScript, Tailwind 4) reading the same store through Node's built-in **`node:sqlite`** — no native module and no database dependency. Connections are `readOnly` and opened **per request**: under WAL a long-lived reader pins an old snapshot and would quietly serve stale rows to a polling UI. A missing store is a **503 naming the path**, never an empty fleet. Localhost only, no auth, port **3001**. Read-only except the kill button, which shells out to the CLI (D11) and checks the *cancel outcome*, not just the HTTP status.
 
 
-- **`skills/orchestrator/`** — A Hermes skill teaching the orchestrator to delegate, installed with `just install-skill` (symlink, so repo edits take effect without a reinstall). Written to the installed Hermes's own conventions — `description` ≤ 60 chars is a hardline with an enforcement test in its repo. **It competes with Hermes's built-in `delegate_task` in the always-on skill index**, so it leads with the property that actually distinguishes Flotta: **isolation**, not durability. (Durability was the first draft's claim; a live routing test showed a one-shot `cronjob` covers that too, and the model correctly chose `cronjob` over Flotta — D12.)
+- **`skills/orchestrator/` — deleted (M3).** A cloud box's Hermes *is* the
+  orchestrator; a skill teaching it to delegate to itself is dead weight. It had
+  also been broken since M0, when `spawn --json` stopped returning `worker_id`.
 
 Data flow: orchestrator → `spawn_box` (Modal) → the container boots headless Hermes (`AIAgent`), runs the task, reports the result → events land in the store against the box and the task → CLI/dashboard read the store → `teardown_box` closes the machine and fails anything still running on it.
 
@@ -235,7 +237,6 @@ just deploy                 # M3: deploy the provisioning app — required befor
 just e2e                    # M3: full lifecycle against real Modal, dry-run (no LLM, no provider key)
 just e2e-live               # same with a real model call — needs the provider vars synced
 just dashboard              # M5: local fleet view on http://localhost:3001
-just install-skill          # M6: symlink the orchestrator skill into ~/.hermes/skills
 ```
 
 Every Modal recipe pins the workspace profile (`FLOTTA_MODAL_PROFILE`, default `flotta`) through `just modal-whoami`, which authenticates for real — `modal profile current` only echoes the env var back and never validates. This exists because the globally-active profile was once found pointing at an unrelated workspace.
