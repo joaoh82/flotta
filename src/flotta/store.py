@@ -172,6 +172,10 @@ class InvalidStatusError(StoreError):
     """Raised when a status value is not legal for that entity kind."""
 
 
+class LegacyStoreError(StoreError):
+    """Raised when opening a pre-M0 store that has a ``workers`` table."""
+
+
 class DuplicateBoxError(StoreError):
     """Raised when creating a box whose name is already taken.
 
@@ -288,7 +292,32 @@ class FleetStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
+        self._check_not_legacy(db_path)
         self._conn.executescript(_SCHEMA)
+
+    def _check_not_legacy(self, db_path: str | Path) -> None:
+        """Refuse a pre-M0 store instead of rendering it as an empty fleet.
+
+        The schema is created with ``CREATE TABLE IF NOT EXISTS``, so an old
+        file is not rejected by SQLite — it quietly gains empty ``boxes`` /
+        ``tasks`` tables beside the stale ``workers`` one and every surface
+        reports "no boxes". "Wrong file" and "empty fleet" looking identical is
+        the exact failure `_open_store` already exists to prevent; this closes
+        the same hole one level down. A check is cheaper than the surprise.
+        """
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workers'"
+        ).fetchone()
+        if row is None:
+            return
+        self._conn.close()
+        raise LegacyStoreError(
+            f"{db_path} is a pre-M0 fleet store (it has a `workers` table).\n"
+            "There is no migration: v0.1 rows describe one-shot task runs and there is "
+            "no box for them to become.\n"
+            "Delete it and start fresh:\n"
+            f"  rm -f {db_path} {db_path}-wal {db_path}-shm"
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -321,6 +350,11 @@ class FleetStore:
                 (bid, name, "provisioning", _utcnow()),
             )
         except sqlite3.IntegrityError as exc:
+            # Two different collisions land here. Reporting a duplicate *id* as
+            # a duplicate *name* sends the caller looking for the wrong thing —
+            # they would rename and hit the same wall.
+            if self.get_box(bid) is not None:
+                raise DuplicateBoxError(f"a box with id {bid!r} already exists") from exc
             raise DuplicateBoxError(f"a box named {name!r} already exists") from exc
         return self._get_box_or_raise(bid)
 
@@ -522,7 +556,7 @@ class FleetStore:
         try:
             self._get_box_or_raise(box_id)
             if workspace_id is not None:
-                self._get_workspace_or_raise(workspace_id)
+                self._require_workspace_of(box_id, workspace_id)
             if max_live is not None:
                 live = self._live_task_ids()
                 if len(live) >= max_live:
@@ -562,7 +596,7 @@ class FleetStore:
             current = self._get_task_or_raise(task_id)
             _check_transition("task", task_id, current.status, status)
             if workspace_id is not None:
-                self._get_workspace_or_raise(workspace_id)
+                self._require_workspace_of(current.box_id, workspace_id)
             finished_at = current.finished_at
             if finished_at is None and status in TASK_TERMINAL:
                 finished_at = _utcnow()
@@ -707,6 +741,22 @@ class FleetStore:
             "task": self._get_task_or_raise,
         }[kind]
         getter(entity_id)
+
+    def _require_workspace_of(self, box_id: str, workspace_id: str) -> Workspace:
+        """The workspace must exist *and* belong to this box.
+
+        Checking only existence would let a task attach to another box's
+        workspace — harmless while nothing creates workspaces, and a
+        cross-box credential leak the moment the tier is real: a workspace
+        carries a scoped token issued for *its* box.
+        """
+        workspace = self._get_workspace_or_raise(workspace_id)
+        if workspace.box_id != box_id:
+            raise UnknownEntityError(
+                f"workspace {workspace_id!r} belongs to box {workspace.box_id!r}, "
+                f"not {box_id!r}"
+            )
+        return workspace
 
     def _get_box_or_raise(self, box_id: str) -> Box:
         box = self.get_box(box_id)

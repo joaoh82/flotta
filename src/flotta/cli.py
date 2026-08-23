@@ -61,6 +61,7 @@ from .store import (
     ConcurrencyLimitError,
     Event,
     FleetStore,
+    LegacyStoreError,
     Task,
     UnknownEntityError,
     is_terminal,
@@ -334,7 +335,13 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
             err=True,
         )
         raise typer.Exit(code=2)
-    return FleetStore(path)
+    try:
+        return FleetStore(path)
+    except LegacyStoreError as exc:
+        # A pre-M0 store. Same class of confusion as a missing one — say which
+        # file and what to do, rather than raising from the SQLite layer.
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=2) from exc
 
 
 def _require_box(store: FleetStore, box_id: str) -> Box:

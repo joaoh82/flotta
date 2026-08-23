@@ -75,6 +75,18 @@ def box_of(store, task_id):
     return store.get_task(task_id).box_id
 
 
+def idle_box(store, **kwargs):
+    """A box whose task has finished — the only state `stop_box` accepts.
+
+    Stopping is refused while work is in flight, because under Modal that would
+    change a row while the container kept billing. Tests that want to exercise
+    the stop/start cycle have to earn "idle" the same way an operator does.
+    """
+    tid = spawned(store, **kwargs)
+    watch_task(tid, store=store, waiter=lambda c, t: {"completed": True})
+    return box_of(store, tid)
+
+
 def orphan_task(store, prompt="orphan", name="orphan-box"):
     """A task on a box that was never launched, so there is no endpoint."""
     box = store.create_box(name)
@@ -421,8 +433,7 @@ def test_teardown_unknown_box_raises(store):
 
 def test_a_stopped_box_can_still_be_torn_down(store):
     """You must be able to destroy a sleeping agent without waking it first."""
-    tid = spawned(store)
-    bid = box_of(store, tid)
+    bid = idle_box(store)
     stop_box(bid, store=store)
     out = teardown_box(bid, store=store, canceller=lambda c: None)
     assert out["status"] == "torn_down"
@@ -432,8 +443,7 @@ def test_a_stopped_box_can_still_be_torn_down(store):
 
 def test_stop_then_start_round_trips(store):
     """The pivot's central transition, through the provisioning layer."""
-    tid = spawned(store)
-    bid = box_of(store, tid)
+    bid = idle_box(store)
 
     assert stop_box(bid, store=store)["status"] == "stopped"
     assert store.get_box(bid).status == "stopped"
@@ -446,7 +456,7 @@ def test_stop_then_start_round_trips(store):
 
 
 def test_stop_is_idempotent(store):
-    bid = box_of(store, spawned(store))
+    bid = idle_box(store)
     stop_box(bid, store=store)
     second = stop_box(bid, store=store)
     assert second["already_stopped"] is True
@@ -460,7 +470,7 @@ def test_start_is_idempotent(store):
 
 
 def test_stop_records_a_reason(store):
-    bid = box_of(store, spawned(store))
+    bid = idle_box(store)
     stop_box(bid, store=store, reason="idle 30m")
     payload = store.get_events("box", bid)[-1].payload
     assert payload["reason"] == "idle 30m"
@@ -475,8 +485,17 @@ def test_stop_and_start_reject_an_unknown_box(store):
 
 
 def test_a_stopped_box_does_not_count_as_active(store):
-    """The cost claim, as an assertion: an idle fleet burns no CPU."""
-    bid = box_of(store, spawned(store))
+    """The cost claim, as an assertion: an idle fleet burns no CPU.
+
+    "Idle" has to be earned — the task is resolved first. An earlier version of
+    this test stopped a box with its container still running and still
+    asserted zero active boxes, which made the test agree with the accounting
+    and disagree with the invoice.
+    """
+    tid = spawned(store)
+    bid = box_of(store, tid)
+    watch_task(tid, store=store, waiter=lambda c, t: {"completed": True})
+
     assert store.count_active_boxes() == 1
     stop_box(bid, store=store)
     assert store.count_active_boxes() == 0
@@ -1127,3 +1146,93 @@ def test_teardown_of_a_box_with_a_pending_task_fails_it(store):
     resolved = store.get_task(task.id)
     assert resolved.status == "failed"
     assert resolved.started_at is None  # honest: it never ran
+
+
+def test_stop_refuses_while_a_task_is_still_running(store):
+    """A `stop` that does not stop spend is a money footgun with a nice name.
+
+    Under Modal nothing suspends: the row would say `stopped`,
+    `count_active_boxes()` would say zero, and the container would keep
+    billing. Refuse until a backend can actually suspend.
+    """
+    tid = spawned(store)
+    bid = box_of(store, tid)
+    with pytest.raises(ProvisionError, match="still running"):
+        stop_box(bid, store=store)
+    assert store.get_box(bid).status == "running"
+    assert "stopped" not in box_events(store, bid)
+    assert store.count_active_boxes() == 1  # the accounting stays honest
+
+
+def test_stop_refuses_while_a_task_is_merely_pending(store):
+    """Pending work is still work — the box has something to do."""
+    box = store.create_box("eng-b")
+    store.update_box_status(box.id, "running")
+    store.create_task(box.id, "queued")
+    with pytest.raises(ProvisionError, match="still running"):
+        stop_box(box.id, store=store)
+
+
+def test_stop_is_allowed_once_the_work_resolves(store):
+    """The refusal is about live work, not a permanent block."""
+    tid = spawned(store)
+    bid = box_of(store, tid)
+    watch_task(tid, store=store, waiter=lambda c, t: {"completed": True})
+    assert stop_box(bid, store=store)["status"] == "stopped"
+
+
+def test_kill_is_the_escape_hatch_the_refusal_points_at(store):
+    """`stop` refuses; the message names `kill`, so `kill` had better work."""
+    tid = spawned(store)
+    bid = box_of(store, tid)
+    cancelled = []
+    out = teardown_box(bid, store=store, canceller=cancelled.append)
+    assert cancelled == ["fc-test"]  # the Modal call really was cancelled
+    assert out["failed_tasks"] == [tid]
+    assert store.count_active_boxes() == 0
+
+
+def test_a_task_cannot_borrow_another_boxs_workspace(store):
+    """A workspace carries a scoped token issued for *its* box."""
+    mine = store.create_box("eng-a")
+    theirs = store.create_box("eng-b")
+    their_ws = store.create_workspace(theirs.id)
+    with pytest.raises(UnknownEntityError, match="belongs to box"):
+        store.create_task(mine.id, "t", workspace_id=their_ws.id)
+
+
+def test_a_task_cannot_be_moved_onto_another_boxs_workspace(store):
+    mine = store.create_box("eng-a")
+    theirs = store.create_box("eng-b")
+    their_ws = store.create_workspace(theirs.id)
+    task = store.create_task(mine.id, "t")
+    with pytest.raises(UnknownEntityError, match="belongs to box"):
+        store.update_task_status(task.id, "running", workspace_id=their_ws.id)
+
+
+def test_a_legacy_store_is_refused_not_rendered_as_empty(store, tmp_path):
+    """ "Wrong file" and "empty fleet" must not look identical."""
+    import sqlite3
+
+    from flotta.store import LegacyStoreError
+
+    legacy = tmp_path / "old_fleet.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE workers (id TEXT PRIMARY KEY, task TEXT, status TEXT)")
+    conn.execute("INSERT INTO workers VALUES ('w-1', 'old task', 'done')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(LegacyStoreError, match="pre-M0 fleet store"):
+        FleetStore(legacy)
+
+
+def test_a_duplicate_id_is_not_reported_as_a_duplicate_name(store):
+    """Renaming would not have helped; say which collision it was."""
+    from flotta.store import DuplicateBoxError
+
+    store.create_box("eng-a", box_id="b-fixed")
+    with pytest.raises(DuplicateBoxError, match="id 'b-fixed'"):
+        store.create_box("a-different-name", box_id="b-fixed")
+    with pytest.raises(DuplicateBoxError, match="named 'eng-a'"):
+        store.create_box("eng-a")

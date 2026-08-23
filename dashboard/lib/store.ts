@@ -98,7 +98,10 @@ const BOX_SELECT = `
          COALESCE(
            (SELECT t.prompt FROM tasks t
              WHERE t.box_id = b.id
-             ORDER BY t.started_at DESC, t.id DESC LIMIT 1),
+             -- created_at, not started_at: a pending task has started_at NULL,
+             -- and SQLite sorts NULLs last under DESC, so the newest task
+             -- would lose to an older one that happened to have run.
+             ORDER BY t.created_at DESC, t.id DESC LIMIT 1),
            ''
          )                                                AS task,
          b.status                                         AS status,

@@ -92,6 +92,12 @@ between milestones — architecture, conventions, and the sharp edges below.
   e2e_fleet.db-wal e2e_fleet.db-shm`. Old rows are dropped rather than migrated
   on purpose: they describe one-shot task runs and there is no box for them to
   become.
+- **`stop` is refused while a box has live tasks.** Until a backend can really
+  suspend, stopping changes a row and nothing else — the container keeps
+  running and keeps billing while `count_active_boxes()` reports zero. A
+  `stop` that does not stop spend is a money footgun with a reassuring name.
+  When M2 lands real suspend this becomes a decision (snapshot mid-task)
+  rather than a refusal.
 - **Only `running` can stop; only `stopped` can start.** `provisioning ->
   running` is legal in the store (it is how `spawn_box` records a launch), so
   an unguarded `start_box` would wake a box mid-spawn into `running` with no

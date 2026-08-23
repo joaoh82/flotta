@@ -210,7 +210,7 @@ flotta ps [--all] [--tasks]    # boxes in the fleet; --tasks lists the work
 flotta spawn "<task>" --wait   # create a box, put a task on it, block for the result
 flotta watch <id>              # re-attach to a task (or a box's live task)
 flotta logs <box>              # that box's timeline, across all three tiers
-flotta stop <box>              # disk retained, no CPU
+flotta stop <box>              # mark it idle (refused while work is in flight)
 flotta start <box>             # wake it again
 flotta kill <box>              # destroy it (idempotent)
 flotta reconcile               # rescue tasks stranded past their deadline
@@ -245,7 +245,9 @@ Stated plainly, because finding these yourself is worse.
   Fixing it — a persistent volume at `/data` — is the next milestone.
 - **`stop` and `start` do not suspend anything.** They record the transition; Modal cannot stop and
   resume a container, so nothing is actually suspended and nothing is actually saved. They become
-  real when a persistent backend lands.
+  real when a persistent backend lands. Because of that, **`stop` is refused while the box has a
+  live task** — a "stopped" box whose container is still running would report zero CPU while the
+  invoice disagreed. Use `flotta kill` to cancel and destroy, or wait for the task.
 - **One task at a time.** Enforced, not merely advised — a second concurrent spawn is refused with
   exit 2. Boxes themselves are uncapped. Raise the task cap with `--max-concurrent` only if you
   mean it; nothing above one is tested.

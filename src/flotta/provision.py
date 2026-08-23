@@ -522,6 +522,10 @@ def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[st
     `FlyBackend` is what makes this real. Writing the transition now means the
     state machine the rest of the system reasons about is already correct when
     a backend arrives to drive it.
+
+    **Refuses while the box has live tasks**, because until suspend is real a
+    "stopped" box with a running container is still being billed — the row
+    would say idle and the invoice would disagree.
     """
     box = _require_box(store, box_id)
     if box.status == "stopped":
@@ -535,6 +539,21 @@ def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[st
     if box.status != "running":
         raise ProvisionError(
             f"box {box_id} is {box.status!r}; only a running box can be stopped"
+        )
+
+    # Refuse while work is in flight. Under a real backend this would suspend
+    # the machine; under Modal it changes a row and nothing else, so the
+    # container keeps running and keeps billing while `count_active_boxes()`
+    # reports zero. A `stop` that does not stop spend is a money footgun with a
+    # reassuring name — worse than not having the command. When M2 lands real
+    # suspend, this becomes a decision (snapshot mid-task) rather than a
+    # refusal.
+    live = [t.id for t in store.list_tasks(box_id=box_id) if not is_terminal("task", t.status)]
+    if live:
+        raise ProvisionError(
+            f"box {box_id} has {len(live)} task(s) still running ({', '.join(live)}); "
+            "stopping would not stop the spend, only the bookkeeping. "
+            "Wait for them, or use `flotta kill` to cancel and destroy the box."
         )
 
     store.add_event("box", box_id, "stopped", {"reason": reason, "previous_status": box.status})
