@@ -230,8 +230,10 @@ check-dashboard:
 # arguments are re-split by the shell, so `just flotta spawn "a b c"` breaks on
 # exactly the case the CLI exists for. Run it directly instead:
 #
-#   uv run flotta ps
+#   uv run flotta ps                 # boxes; --tasks for the work
 #   uv run flotta spawn "summarize the logs" --wait
+#   uv run flotta stop <box>         # M0: disk retained, no CPU
+#   uv run flotta start <box>        # M0: wake it again
 #
 # The workspace no longer needs pinning at the call site: the CLI resolves
 # FLOTTA_MODAL_PROFILE itself (env, then .env) before touching Modal, so an

@@ -3,8 +3,12 @@
 The commands themselves are thin wrappers over `store` and `provision`, both
 already covered; what is worth testing here is the pure `str`-in/`str`-out
 layer — column sizing, truncation, duration rendering — plus the small amount
-of real logic in the CLI: which store file it picks, and which workers `ps`
+of real logic in the CLI: which store file it picks, and which rows `ps`
 hides by default.
+
+`ps` lists **boxes** now, so the row helpers come in two flavours and the
+default-hidden set is per-tier: a torn-down box and a finished task, but *not*
+a stopped box — hiding your idle fleet would hide the point of the fleet.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -14,45 +18,64 @@ import pytest
 from flotta.cli import (
     DEFAULT_STORE,
     STORE_ENV_VAR,
-    TERMINAL,
     apply_modal_profile,
+    box_age,
+    box_row,
     event_row,
     fmt_age,
     fmt_duration,
     parse_ts,
     read_dotenv_value,
+    render_boxes,
     render_events,
     render_table,
-    render_workers,
+    render_tasks,
     resolve_modal_profile,
     resolve_store_path,
+    task_duration,
+    task_row,
     truncate,
-    worker_duration,
-    worker_row,
 )
-from flotta.store import Event, Worker
+from flotta.store import Box, Event, Task, is_terminal
 
 NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
 
 
-def make_worker(**overrides) -> Worker:
+def make_box(**overrides) -> Box:
     base = {
-        "id": "w-abc123",
-        "task": "summarize the logs",
+        "id": "b-abc123",
+        "name": "eng-b",
         "status": "running",
         "endpoint": "modal://flotta-provision/run_worker/fc-1",
-        "spawned_at": (NOW - timedelta(seconds=30)).isoformat(),
+        "created_at": (NOW - timedelta(seconds=30)).isoformat(),
+        "destroyed_at": None,
+    }
+    base.update(overrides)
+    return Box(**base)
+
+
+def make_task(**overrides) -> Task:
+    base = {
+        "id": "t-abc123",
+        "box_id": "b-abc123",
+        "workspace_id": None,
+        "prompt": "summarize the logs",
+        "status": "running",
+        "created_at": (NOW - timedelta(seconds=30)).isoformat(),
+        "started_at": (NOW - timedelta(seconds=30)).isoformat(),
         "finished_at": None,
+        "result": None,
         "cost_estimate": None,
     }
     base.update(overrides)
-    return Worker(**base)
+    return Task(**base)
 
 
 def make_event(**overrides) -> Event:
     base = {
         "id": 1,
-        "worker_id": "w-abc123",
+        "entity_kind": "task",
+        "entity_id": "t-abc123",
         "ts": NOW.isoformat(),
         "type": "spawned",
         "payload": {"task": "t"},
@@ -133,29 +156,49 @@ def test_fmt_age_on_junk():
     assert fmt_age("garbage", now=NOW) == "-"
 
 
-# -- worker_duration --------------------------------------------------------
+# -- task_duration / box_age ------------------------------------------------
 
 
-def test_worker_duration_uses_finished_at_when_present():
-    worker = make_worker(
-        spawned_at=NOW.isoformat(),
+def test_task_duration_uses_finished_at_when_present():
+    task = make_task(
+        started_at=NOW.isoformat(),
         finished_at=(NOW + timedelta(seconds=12)).isoformat(),
     )
-    assert worker_duration(worker, now=NOW + timedelta(hours=5)) == 12
+    assert task_duration(task, now=NOW + timedelta(hours=5)) == 12
 
 
-def test_worker_duration_runs_to_now_while_live():
-    worker = make_worker(spawned_at=(NOW - timedelta(seconds=7)).isoformat(), finished_at=None)
-    assert worker_duration(worker, now=NOW) == 7
+def test_task_duration_runs_to_now_while_live():
+    task = make_task(started_at=(NOW - timedelta(seconds=7)).isoformat(), finished_at=None)
+    assert task_duration(task, now=NOW) == 7
 
 
-def test_worker_duration_never_negative():
-    worker = make_worker(spawned_at=(NOW + timedelta(seconds=5)).isoformat())
-    assert worker_duration(worker, now=NOW) == 0.0
+def test_task_duration_never_negative():
+    task = make_task(started_at=(NOW + timedelta(seconds=5)).isoformat())
+    assert task_duration(task, now=NOW) == 0.0
 
 
-def test_worker_duration_without_a_start():
-    assert worker_duration(make_worker(spawned_at="junk"), now=NOW) is None
+def test_task_duration_without_a_start():
+    assert task_duration(make_task(started_at="junk"), now=NOW) is None
+
+
+def test_box_age_runs_to_now_while_alive():
+    box = make_box(created_at=(NOW - timedelta(days=30)).isoformat())
+    assert box_age(box, now=NOW) == 30 * 86400
+
+
+def test_box_age_stops_at_destroyed_at():
+    box = make_box(
+        created_at=NOW.isoformat(),
+        destroyed_at=(NOW + timedelta(seconds=42)).isoformat(),
+    )
+    assert box_age(box, now=NOW + timedelta(days=1)) == 42
+
+
+def test_a_stopped_box_keeps_ageing():
+    """Age is not runtime. A box asleep for a month is a month old."""
+    box = make_box(status="stopped", created_at=(NOW - timedelta(days=30)).isoformat())
+    assert box_age(box, now=NOW) == 30 * 86400
+    assert box.destroyed_at is None
 
 
 # -- render_table -----------------------------------------------------------
@@ -185,39 +228,83 @@ def test_render_table_headers_are_uppercased():
 # -- rows -------------------------------------------------------------------
 
 
-def test_worker_row_shape():
-    row = worker_row(make_worker(), now=NOW)
-    assert row[0] == "w-abc123"
-    assert row[1] == "running"
-    assert row[2] == "summarize the logs"
-    assert row[3] == "30s"
+def test_box_row_shape():
+    row = box_row(make_box(), make_task(), now=NOW)
+    assert row[0] == "b-abc123"
+    assert row[1] == "eng-b"
+    assert row[2] == "running"
+    assert row[3] == "summarize the logs"
     assert row[4] == "30s ago"
 
 
-def test_worker_row_truncates_a_long_task():
-    row = worker_row(make_worker(task="x" * 200), now=NOW)
-    assert len(row[2]) == 40
+def test_box_row_without_a_task_yet():
+    """A box you have created and not yet given work to is normal, not broken."""
+    assert box_row(make_box(), None, now=NOW)[3] == "-"
 
 
-def test_render_workers_includes_a_header_and_one_row_each():
-    out = render_workers([make_worker(), make_worker(id="w-2")], now=NOW)
+def test_box_row_truncates_a_long_task():
+    row = box_row(make_box(), make_task(prompt="x" * 200), now=NOW)
+    assert len(row[3]) == 40
+
+
+def test_task_row_shape():
+    row = task_row(make_task(), now=NOW)
+    assert row[0] == "t-abc123"
+    assert row[1] == "b-abc123"
+    assert row[2] == "running"
+    assert row[3] == "summarize the logs"
+    assert row[4] == "30s"
+    assert row[5] == "30s ago"
+
+
+def test_task_row_of_a_pending_task_shows_no_duration():
+    """A task waiting on a sleeping box has not run for any length of time.
+
+    Rendering the wait as a duration would say a task on a box stopped last
+    week had been working for a week.
+    """
+    pending = make_task(status="pending", started_at=None)
+    row = task_row(pending, now=NOW)
+    assert row[2] == "pending"
+    assert row[4] == "-"  # duration
+    assert row[5] == "30s ago"  # created — always populated
+
+
+def test_task_duration_is_none_while_pending():
+    assert task_duration(make_task(status="pending", started_at=None), now=NOW) is None
+
+
+def test_task_row_truncates_a_long_prompt():
+    assert len(task_row(make_task(prompt="x" * 200), now=NOW)[3]) == 40
+
+
+def test_render_boxes_includes_a_header_and_one_row_each():
+    out = render_boxes([make_box(), make_box(id="b-2", name="eng-c")], now=NOW)
     assert len(out.splitlines()) == 3
     assert "ID" in out.splitlines()[0]
 
 
-def test_render_workers_empty():
-    assert render_workers([], now=NOW) == "(none)"
+def test_render_boxes_empty():
+    assert render_boxes([], now=NOW) == "(none)"
 
 
-def test_event_row_renders_time_and_payload():
+def test_render_tasks_empty():
+    assert render_tasks([], now=NOW) == "(none)"
+
+
+def test_event_row_names_the_tier_it_came_from():
+    """A box timeline mixes all three tiers; without the column it is unreadable."""
     row = event_row(make_event())
     assert row[0] == "12:00:00"
-    assert row[1] == "spawned"
-    assert "task" in row[2]
+    assert row[1] == "task"
+    assert row[2] == "spawned"
+    assert "task" in row[3]
+
+    assert event_row(make_event(entity_kind="box", type="stopped"))[1] == "box"
 
 
 def test_event_row_without_payload():
-    assert event_row(make_event(payload=None))[2] == "-"
+    assert event_row(make_event(payload=None))[3] == "-"
 
 
 def test_render_events_empty():
@@ -339,11 +426,19 @@ def test_no_config_leaves_modal_to_its_own_active_profile(tmp_path):
 # -- the one piece of view logic in ps --------------------------------------
 
 
-def test_terminal_set_matches_provision():
-    """`ps` hides these by default; drift here would silently change the view."""
-    from flotta.provision import _TERMINAL
+def test_ps_hides_finished_work_but_not_a_sleeping_fleet():
+    """What `ps` hides by default, stated as the rule the command applies.
 
-    assert TERMINAL == _TERMINAL
+    v0.1 had one TERMINAL set for everything. Now it is per-tier, and the case
+    that matters is `stopped`: a box asleep is the product working, not a row
+    to tidy away.
+    """
+    assert is_terminal("box", "torn_down")
+    assert not is_terminal("box", "stopped")  # the one that would break the pitch
+    assert not is_terminal("box", "running")
+    assert is_terminal("task", "done")
+    assert is_terminal("task", "failed")
+    assert not is_terminal("task", "pending")
 
 
 # -- store must exist for reads ---------------------------------------------
@@ -354,7 +449,7 @@ def test_open_store_refuses_a_missing_path_for_reads(tmp_path, monkeypatch):
 
     `_open_store` carried a comment promising exactly this while the code
     created the file regardless — so `flotta ps --store typo.db` printed
-    "(none)", which reads as "no workers" when it means "wrong file".
+    "(none)", which reads as "no boxes" when it means "wrong file".
     """
     import typer
 

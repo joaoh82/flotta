@@ -11,9 +11,15 @@
  * browser devtools read identically.
  */
 
+/**
+ * A row is a box (see `lib/store.ts`), so `stopped` is reachable. `done` and
+ * `failed` are kept because they still describe tasks, which the timeline
+ * renders — the union spans what the UI can be handed, not one table.
+ */
 export type WorkerStatus =
   | "provisioning"
   | "running"
+  | "stopped"
   | "done"
   | "failed"
   | "torn_down";
@@ -36,7 +42,10 @@ export interface FleetEvent {
   payload: Record<string, unknown> | null;
 }
 
-/** Terminal states — mirrors `provision._TERMINAL` / `cli.TERMINAL`. */
+/**
+ * Terminal states. `stopped` is deliberately absent: a stopped box is idle,
+ * not finished, and it must keep showing up in the fleet view.
+ */
 export const TERMINAL: ReadonlySet<string> = new Set([
   "done",
   "failed",
