@@ -76,6 +76,15 @@ _SRC = _HERE.parents[1] if len(_HERE.parents) > 1 else None
 if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from flotta.backend import (  # noqa: E402
+    Backend,
+    BackendError,
+    BoxSpec,
+    UnknownBackendError,
+    scheme_of,
+)
+from flotta.backend import backend_for as _backend_for  # noqa: E402
+from flotta.backend import pause as _pause  # noqa: E402
 from flotta.store import (  # noqa: E402  (needs the sys.path prime above)
     Box,
     ConcurrencyLimitError,
@@ -411,6 +420,29 @@ def _modal_canceller(call_id: str) -> None:
 # -- local orchestration (the only writers to the store) --------------------
 
 
+def _resolve_backend(box: Box, backend: Backend | None) -> Backend:
+    """The backend that owns this box, from its stored endpoint.
+
+    Routing on the endpoint scheme rather than a `boxes.backend` column keeps
+    one fact in one place — see `flotta.backend.backend_for`. An explicit
+    `backend` argument overrides it, which is how the tests stay hermetic.
+    """
+    if backend is not None:
+        return backend
+    try:
+        return _backend_for(box.endpoint)
+    except UnknownBackendError as exc:
+        if not box.endpoint:
+            raise ProvisionError(
+                f"box {box.id} has no endpoint, so there is no substrate to act on. "
+                "A box that was never launched can only be torn down."
+            ) from exc
+        raise ProvisionError(
+            f"box {box.id} lives on a substrate this build does not know how to "
+            f"drive ({box.endpoint!r}): {exc}"
+        ) from exc
+
+
 def _require_box(store: FleetStore, box_id: str) -> Box:
     box = store.get_box(box_id)
     if box is None:
@@ -514,38 +546,88 @@ def spawn_box(
     return {"box_id": box.id, "task_id": work.id, "endpoint": endpoint}
 
 
-def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[str, Any]:
-    """Record a box as ``stopped`` — disk retained, no CPU. Idempotent.
+def create_box(
+    name: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    spec: BoxSpec | None = None,
+) -> dict[str, Any]:
+    """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
 
-    Store-side only in M0. There is no backend that can actually suspend a
-    machine yet: `ModalBackend` will raise `NotSupported` on `stop` (M1), and
-    `FlyBackend` is what makes this real. Writing the transition now means the
-    state machine the rest of the system reasons about is already correct when
-    a backend arrives to drive it.
+    The verb v0.1 had no use for. `spawn_box` creates a machine *for a task* and
+    throws it away; this creates a machine you **have**, which tasks then visit.
+    Under Modal the distinction was meaningless — every container was disposable
+    — which is why `create_box` arrives with the first substrate that can keep a
+    disk.
 
-    **Refuses while the box has live tasks**, because until suspend is real a
-    "stopped" box with a running container is still being billed — the row
-    would say idle and the invoice would disagree.
+    The row is written before the provision so a failed create still leaves
+    something that explains itself, exactly as `spawn_box` does. A box whose
+    provision failed is closed rather than left in `provisioning` forever: there
+    is no machine behind it, so nothing can ever move it forward.
+    """
+    impl = backend or _backend_for("fly://")  # default substrate for persistent boxes
+    box = store.create_box(name)
+    store.add_event("box", box.id, "provisioning", {"name": name, "backend": impl.scheme})
+
+    try:
+        handle = impl.create(spec or BoxSpec(name=name))
+    except BackendError as exc:
+        detail = f"create failed: {type(exc).__name__}: {exc}"
+        store.add_event("box", box.id, "torn_down", {"reason": detail})
+        store.update_box_status(box.id, "torn_down")
+        raise ProvisionError(detail) from exc
+
+    store.update_box_status(box.id, "running", endpoint=handle.endpoint)
+    store.add_event(
+        "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
+    )
+    return {"box_id": box.id, "endpoint": handle.endpoint, "machine_id": handle.id}
+
+
+def stop_box(
+    box_id: str,
+    *,
+    store: FleetStore,
+    reason: str = "idle",
+    backend: Backend | None = None,
+    prefer_suspend: bool = True,
+) -> dict[str, Any]:
+    """Put a box to sleep — disk retained, CPU released. Idempotent.
+
+    **Real infrastructure since M1.** Under M0 this only wrote a row; the
+    container kept running and kept billing while `count_active_boxes()`
+    reported zero. It now asks the backend to actually release the CPU, and
+    the row is written *after* that succeeds.
+
+    Prefers `suspend` (a Firecracker memory snapshot) and falls back to a cold
+    `stop` where the substrate refuses. Measured on a real box, suspend is not
+    the *faster* of the two — cold stop reaches `started` in ~0.31s against
+    suspend's ~0.43s. What suspend buys is what the VM's uptime counter shows:
+    it keeps its memory (44.4s -> 53.5s) where a cold stop resets it (72.1s ->
+    6.7s). That is worth nothing today, when a box runs `sleep infinity`, and
+    is worth everything once a box runs Hermes as a service — a cold start
+    means re-importing the agent before it can think.
+
+    The store still records only ``stopped``. How the CPU was released is a
+    substrate detail and lands in the event payload as ``method``; promoting it
+    to a fleet status would leak Fly's vocabulary into a state machine that has
+    to describe Hetzner and Modal too.
     """
     box = _require_box(store, box_id)
     if box.status == "stopped":
         return {"box_id": box_id, "status": "stopped", "already_stopped": True}
 
-    # Legality is checked *before* the event is written. `add_event` then
-    # `update_box_status` looks harmless but is not: `provisioning -> stopped`
-    # and `torn_down -> stopped` are both illegal, so the naive order leaves a
-    # `stopped` event on a box that never stopped and *then* raises. Events are
-    # the audit trail; a lie in them outlives the traceback.
+    # Legality before any side effect — an illegal transition must not leave a
+    # `stopped` event describing something that never happened.
     if box.status != "running":
         raise ProvisionError(f"box {box_id} is {box.status!r}; only a running box can be stopped")
 
-    # Refuse while work is in flight. Under a real backend this would suspend
-    # the machine; under Modal it changes a row and nothing else, so the
-    # container keeps running and keeps billing while `count_active_boxes()`
-    # reports zero. A `stop` that does not stop spend is a money footgun with a
-    # reassuring name — worse than not having the command. When M2 lands real
-    # suspend, this becomes a decision (snapshot mid-task) rather than a
-    # refusal.
+    # Refuse while work is in flight. Suspending mid-task is a coherent thing to
+    # want and is not this milestone: the task's watcher is a *local* process
+    # holding a Modal call handle, and freezing the box underneath it would
+    # strand that watcher. M6's workspace tier is where mid-task suspend
+    # becomes meaningful.
     live = [t.id for t in store.list_tasks(box_id=box_id) if not is_terminal("task", t.status)]
     if live:
         raise ProvisionError(
@@ -554,34 +636,59 @@ def stop_box(box_id: str, *, store: FleetStore, reason: str = "idle") -> dict[st
             "Wait for them, or use `flotta kill` to cancel and destroy the box."
         )
 
-    store.add_event("box", box_id, "stopped", {"reason": reason, "previous_status": box.status})
+    impl = _resolve_backend(box, backend)
+    try:
+        method = _pause(impl, box.endpoint or box_id, prefer_suspend=prefer_suspend)
+    except BackendError as exc:
+        raise ProvisionError(f"could not stop box {box_id}: {exc}") from exc
+
+    store.add_event(
+        "box",
+        box_id,
+        "stopped",
+        {"reason": reason, "previous_status": box.status, "method": method},
+    )
     store.update_box_status(box_id, "stopped")
-    return {"box_id": box_id, "status": "stopped", "already_stopped": False}
+    return {
+        "box_id": box_id,
+        "status": "stopped",
+        "already_stopped": False,
+        "method": method,
+    }
 
 
-def start_box(box_id: str, *, store: FleetStore, reason: str = "requested") -> dict[str, Any]:
+def start_box(
+    box_id: str,
+    *,
+    store: FleetStore,
+    reason: str = "requested",
+    backend: Backend | None = None,
+) -> dict[str, Any]:
     """Wake a stopped box back to ``running``. Idempotent.
 
-    The other half of the pivot's central transition. `wake` and `create` stay
-    distinct on purpose (M7): conflating them is how you end up with forty
-    half-remembered agents instead of forty agents.
+    The other half of the pivot's central transition, and real infrastructure
+    since M1. `wake` and `create` stay distinct on purpose (§M7): conflating
+    them is how you end up with forty half-remembered agents instead of forty
+    agents — which is also why only a `stopped` box may start.
+
+    Resumes from a memory snapshot when `stop_box` took one, so a box that was
+    suspended comes back with its working state rather than cold.
     """
     box = _require_box(store, box_id)
     if box.status == "running":
         return {"box_id": box_id, "status": "running", "already_running": True}
 
-    # Only a *stopped* box may start. `provisioning -> running` is legal in the
-    # store — it is how `spawn_box` records a successful launch — so without
-    # this guard `flotta start` on a box mid-spawn marks it running with no
-    # endpoint, which is precisely the wake/create collapse this function is
-    # named to avoid. Worse, it then makes `spawn_box`'s own
-    # `provisioning -> running` illegal, so a launched container is left
-    # billing with its call id never recorded.
     if box.status != "stopped":
         raise ProvisionError(
             f"box {box_id} is {box.status!r}; only a stopped box can be started. "
             "Starting is waking an existing box, never creating one."
         )
+
+    impl = _resolve_backend(box, backend)
+    try:
+        impl.start(box.endpoint or box_id)
+    except BackendError as exc:
+        raise ProvisionError(f"could not start box {box_id}: {exc}") from exc
 
     store.add_event("box", box_id, "running", {"reason": reason, "previous_status": box.status})
     store.update_box_status(box_id, "running")
@@ -799,6 +906,7 @@ def teardown_box(
     store: FleetStore,
     reason: str = "requested",
     canceller: Canceller | None = None,
+    backend: Backend | None = None,
 ) -> dict[str, Any]:
     """Destroy a box, resolving anything still running on it. Idempotent.
 
@@ -818,14 +926,27 @@ def teardown_box(
     if box.status == "torn_down":
         return {"box_id": box_id, "status": "torn_down", "already_torn_down": True}
 
-    call_id = function_call_id(box.endpoint)
+    # Destruction goes through the backend that owns the box, so a Fly box
+    # loses its machine *and* its volume while a Modal box has its call
+    # cancelled. The injected `canceller` stays the Modal path's seam — it
+    # predates the protocol and every existing test drives it.
     cancelled = False
     cancel_error: str | None = None
-    if call_id is not None:
+    if canceller is not None or scheme_of(box.endpoint) == "modal":
+        call_id = function_call_id(box.endpoint)
+        if call_id is not None:
+            try:
+                cancel(call_id)
+                cancelled = True
+            except Exception as exc:
+                cancel_error = f"{type(exc).__name__}: {exc}"
+    elif box.endpoint:
         try:
-            cancel(call_id)
+            _resolve_backend(box, backend).destroy(box.endpoint)
             cancelled = True
-        except Exception as exc:
+        except (BackendError, ProvisionError) as exc:
+            # Best effort, same as a Modal cancel: a machine that is already
+            # gone must not stop the row from closing.
             cancel_error = f"{type(exc).__name__}: {exc}"
 
     failed_tasks: list[str] = []
