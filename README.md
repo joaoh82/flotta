@@ -2,6 +2,12 @@
 
 **Hand a task to a disposable agent in the cloud. Get the answer back. Destroy it.**
 
+![Flotta spawning a worker, collecting its answer, and showing an empty fleet afterwards](assets/demo.gif)
+
+*Real run, not a mockup — `just demo` re-records it. The worker answers `4.19.0-gvisor`, which is
+Modal's sandbox kernel and not the laptop that asked; by the time `flotta ps` runs, the container
+is gone and only the store remembers it.*
+
 Flotta (Italian for *fleet*) is an open-source fleet runtime for self-improving agents. One
 always-on orchestrator — [Hermes Agent](https://github.com/NousResearch/Hermes-Agent) first —
 spawns headless worker agents in throwaway [Modal](https://modal.com) containers, collects their
