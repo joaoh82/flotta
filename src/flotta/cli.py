@@ -34,10 +34,11 @@ project would silently redirect `spawn` into the wrong workspace. The
 resolution must happen *before* `provision` is imported, since that module
 imports `modal`, which reads its config at import time — hence `_provision()`.
 
-Note that `ps` and `logs` are pure store reads — they need no Modal
-credentials at all. `stop` and `start` are store-only too in M0, since no
-backend can suspend a machine until M1. Only `spawn`, `watch`, `kill` and
-`reconcile` reach the cloud.
+Note that `ps` and `logs` are pure store reads — they need no credentials at
+all. Everything else reaches a substrate: `stop`/`start` drive the box's
+backend (M1), and `spawn`/`watch`/`kill`/`reconcile` reach Modal. A box on a
+substrate that cannot do what was asked refuses rather than pretending — a
+Modal box cannot be stopped and resumed, and `flotta stop` says so with exit 2.
 
 `reconcile` is deliberately its own command rather than something `ps` does
 automatically, which is what the plan first suggested. Auto-reconciling would
@@ -579,8 +580,15 @@ def stop(
 ) -> None:
     """Stop a box — disk retained, no CPU. Idempotent.
 
-    Store-side only until M1: no backend can suspend a machine yet, so this
-    records the transition without an infrastructure call behind it.
+    Real infrastructure since M1. Prefers `suspend` — a memory snapshot, so the
+    box comes back with its working state — and falls back to a cold stop where
+    the substrate refuses. Measured, suspend is not the *faster* of the two;
+    what it buys is that the VM keeps its RAM, which matters once a box runs
+    Hermes rather than sleeping.
+
+    Refused while the box has a live task, and refused outright on a substrate
+    that cannot stop-and-resume (Modal): a row saying `stopped` while the
+    container keeps billing is worse than an error.
     """
     provision = _provision()
 

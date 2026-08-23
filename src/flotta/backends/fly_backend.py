@@ -80,13 +80,24 @@ class FlyBackend:
     # -- lifecycle ---------------------------------------------------------
 
     def create(self, spec: BoxSpec) -> BoxHandle:
-        """Provision app + volume + machine, and return before it is useful.
+        """Provision app + volume + machine. May return before it is running.
 
-        Returns a handle rather than a running box on purpose. On Fly this is
-        nearly instant; on a Hetzner/Firecracker pool it would mean "a microVM
-        is booting on a server I rent", which can take a while. Modelling
-        create as necessarily-synchronous now would make that backend a special
-        case later.
+        Idempotent over an existing machine: if the app already has one, that
+        one is adopted rather than a second being created. M1 is a
+        one-box-per-app fleet (see `destroy`), so a second machine here would
+        be a mistake, not a feature.
+
+        Returns a handle rather than a *running* box on purpose. On Fly the
+        machine starts almost immediately; on a Firecracker pool `create` means
+        "a microVM is booting on a server I rent", which can take a while.
+        Callers that need it running must say so — `provision.create_box` does
+        exactly that, and writes `running` only once the substrate agrees.
+
+        **Does not build the image.** Building is a fleet operation — you build
+        once and create many boxes from the result — so `spec.image` names an
+        existing image and `just fly-build` owns producing one. When it is
+        None, the app's current release image is used, which is what makes
+        `create` work straight after a deploy.
         """
         app = self.config.app
         region = spec.region or self.config.resolved_region()
@@ -106,14 +117,75 @@ class FlyBackend:
                 app=app,
             )
 
+        existing = self._machines(app)
+        if existing:
+            machine_id = existing[0]["id"]
+            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+
+        image = spec.image or self._current_image(app)
+        if not image:
+            raise BackendError(
+                f"app {app!r} has no machine and no image to boot one from. "
+                "Build and release one first (`just fly-build`), or pass "
+                "BoxSpec(image=...)."
+            )
+
+        args = [
+            "machine",
+            "run",
+            image,
+            "--name",
+            spec.name,
+            "--region",
+            region,
+            "--volume",
+            f"{self.config.volume_name}:{spec.mount_path}",
+            "--vm-size",
+            self.config.vm_size,
+            "--vm-memory",
+            str(self.config.vm_memory_mb),
+        ]
+        for key, value in {"HERMES_HOME": self.config.hermes_home, **spec.env}.items():
+            args += ["--env", f"{key}={value}"]
+
+        self._flyctl(*args, app=app)
+
         machines = self._machines(app)
         if not machines:
-            raise BackendError(
-                f"app {app!r} has no machine. M1 drives an existing box; "
-                "run `just fly-up` to build and deploy the image first."
-            )
+            raise BackendError(f"`machine run` reported success but app {app!r} has no machine")
         machine_id = machines[0]["id"]
         return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+
+    def _current_image(self, app: str) -> str | None:
+        """The image this app last released, if any.
+
+        Read from `flyctl releases`, not `flyctl image show`. The latter
+        derives the image *from a running machine* and returns bare `null` once
+        there are none — which is exactly the moment `create` needs it, since
+        that is when there is a box to create. An image belongs to the app's
+        release history, not to any particular machine.
+        """
+        result = self._flyctl("releases", "--json", app=app, check=False)
+        if result.returncode != 0:
+            return None
+        try:
+            releases = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(releases, list):
+            return None
+        # Newest first, and skip anything that never completed — booting a box
+        # from a half-finished release is a worse failure than refusing.
+        for release in releases:
+            if not isinstance(release, dict):
+                continue
+            status = str(release.get("Status") or release.get("status") or "").lower()
+            if status and status != "complete":
+                continue
+            ref = release.get("ImageRef") or release.get("imageRef")
+            if ref:
+                return str(ref)
+        return None
 
     def start(self, box_id: str) -> None:
         app, mid = self._addr(box_id)
@@ -151,6 +223,12 @@ class FlyBackend:
         Destroying the *app* rather than just the machine, because a machine
         without its volume is a box that has forgotten everything while still
         costing $0.15/GB/month — the worst of both. Destroy means destroy.
+
+        **This is fleet-wide within the app.** M1 is deliberately one box per
+        app — `create` adopts `machines[0]` rather than adding a second — so
+        app and box are the same thing here. A multi-box app would need this to
+        destroy the machine and detach its volume instead, and `create` would
+        need to stop adopting. Both change together or not at all.
         """
         app, mid = self._addr(box_id)
         if not self._app_exists(app):
@@ -275,6 +353,13 @@ class FlyBackend:
             if self._state(app, machine_id) in STABLE_STATES:
                 return
             time.sleep(0.5)
+        # Raising, not returning. Falling through would hand the next flyctl
+        # call the exact `failed_precondition: machine still active` this
+        # method exists to prevent — and the error would name the wrong verb.
+        raise BackendError(
+            f"machine {machine_id} did not settle within {timeout_s}s "
+            f"(still {self._state(app, machine_id)!r})"
+        )
 
     def _wait_for(
         self, app: str, machine_id: str, want: str, timeout_s: int = DEFAULT_WAIT_TIMEOUT_S

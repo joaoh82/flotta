@@ -56,6 +56,11 @@ DEFAULT_VOLUME_NAME = "flotta_data"
 DEFAULT_VOLUME_GB = 1
 DEFAULT_MOUNT_PATH = "/data"
 
+# Matches fly/fly.toml. `create` boots a machine directly rather than through a
+# deploy, so the size has to be named somewhere other than that file.
+DEFAULT_VM_SIZE = "shared-cpu-1x"
+DEFAULT_VM_MEMORY_MB = 1024
+
 # The whole point of the milestone. `HERMES_HOME` relocates Hermes's *entire*
 # store atomically — db, sessions, memories, skills (SEAM_NOTES Q3) — so
 # putting it inside the mounted volume is the one change that makes a box able
@@ -67,6 +72,8 @@ APP_ENV = "FLOTTA_FLY_APP"
 REGION_ENV = "FLOTTA_FLY_REGION"
 VOLUME_NAME_ENV = "FLOTTA_FLY_VOLUME_NAME"
 VOLUME_GB_ENV = "FLOTTA_FLY_VOLUME_GB"
+VM_SIZE_ENV = "FLOTTA_FLY_VM_SIZE"
+VM_MEMORY_ENV = "FLOTTA_FLY_VM_MEMORY_MB"
 
 DEFAULT_DOTENV = ".env"
 
@@ -154,6 +161,8 @@ class FlyConfig:
     volume_gb: int
     mount_path: str
     hermes_home: str
+    vm_size: str
+    vm_memory_mb: int
 
     @classmethod
     def from_env(
@@ -179,6 +188,9 @@ class FlyConfig:
             if volume_gb < 1:
                 raise ValueError(f"{VOLUME_GB_ENV} must be >= 1, got {volume_gb}")
 
+        vm_memory_raw = pick(VM_MEMORY_ENV)
+        vm_memory_mb = int(vm_memory_raw) if vm_memory_raw else DEFAULT_VM_MEMORY_MB
+
         mount_path = DEFAULT_MOUNT_PATH
         return cls(
             org=pick(ORG_ENV) or DEFAULT_ORG,
@@ -192,6 +204,8 @@ class FlyConfig:
             volume_gb=volume_gb,
             mount_path=mount_path,
             hermes_home=f"{mount_path}/hermes",
+            vm_size=pick(VM_SIZE_ENV) or DEFAULT_VM_SIZE,
+            vm_memory_mb=vm_memory_mb,
         )
 
     @property

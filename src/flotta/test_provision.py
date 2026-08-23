@@ -22,6 +22,7 @@ from flotta.provision import (
     TaskTimeout,
     billable_seconds,
     classify_result,
+    create_box,
     endpoint_for,
     estimate_cost,
     function_call_id,
@@ -1402,3 +1403,107 @@ def test_backend_is_routed_from_the_endpoint_scheme(store):
 
     bid = idle_box(store)
     assert scheme_of(store.get_box(bid).endpoint) == "modal"
+
+
+# -- M1: create_box tells the truth about what it made ----------------------
+
+
+def test_create_box_records_running_only_when_the_machine_is_up(store):
+    class Creating(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.calls.append("create")
+            self.machine_state = "stopped"  # created, not started — per the protocol
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    impl = Creating()
+    out = create_box("eng-a", store=store, backend=impl)
+
+    assert impl.calls == ["create", "start"], "create must start before claiming running"
+    assert out["status"] == "running"
+    box = store.get_box(out["box_id"])
+    assert box.status == "running"
+    assert box.endpoint == "fake://app/m1"
+
+
+def test_create_box_does_not_claim_running_when_the_machine_is_not(store):
+    """The M0 lie, one layer up.
+
+    `Backend.create` may return before the box is running. Writing `running`
+    on the strength of the plan rather than the substrate is exactly the
+    store/invoice disagreement this milestone closed for `stop_box`.
+    """
+
+    class WontStart(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.machine_state = "stopped"
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def start(self, box_id):
+            raise BackendError("no capacity in ams")
+
+    with pytest.raises(ProvisionError, match="not running"):
+        create_box("eng-a", store=store, backend=WontStart())
+
+    box = store.list_boxes()[0]
+    assert box.status == "stopped", "a created-but-down machine is stopped, not running"
+    assert box.endpoint == "fake://app/m1", "the endpoint is kept so it can be recovered"
+    assert box.destroyed_at is None
+
+
+def test_a_box_that_failed_to_start_can_be_started_later(store):
+    """`stopped` was chosen over `torn_down` precisely so this works."""
+
+    class WontStartOnce(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.fail = True
+
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.machine_state = "stopped"
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def start(self, box_id):
+            if self.fail:
+                self.fail = False
+                raise BackendError("transient")
+            self.machine_state = "started"
+
+    impl = WontStartOnce()
+    with pytest.raises(ProvisionError):
+        create_box("eng-a", store=store, backend=impl)
+
+    bid = store.list_boxes()[0].id
+    assert start_box(bid, store=store, backend=impl)["status"] == "running"
+
+
+def test_create_box_closes_the_row_when_provisioning_fails(store):
+    """No machine exists, so there is nothing to recover — close it."""
+
+    class Broken(FakeBackend):
+        def create(self, spec):
+            raise BackendError("fly quota exceeded")
+
+    with pytest.raises(ProvisionError, match="create failed"):
+        create_box("eng-a", store=store, backend=Broken())
+
+    box = store.list_boxes()[0]
+    assert box.status == "torn_down"
+    assert box.endpoint is None
+
+
+def test_create_box_names_the_box(store):
+    class Creating(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            assert spec.name == "eng-b"
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    out = create_box("eng-b", store=store, backend=Creating())
+    assert store.get_box_by_name("eng-b").id == out["box_id"]

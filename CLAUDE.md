@@ -109,6 +109,19 @@ between milestones — architecture, conventions, and the sharp edges below.
   M2 proof once passed by answering with a passphrase from a *previous* cycle.
   That is the product working correctly and the test being wrong — the fix is a
   question only this run can answer, never wiping the store between runs.
+- **A box's memory outlives its machine.** Verified: the machine was destroyed
+  outright, `create_box` provisioned a new one, and `/data/hermes` came back
+  byte-identical (same SHA-256 on `memories/MEMORY.md`). The volume is the box;
+  the machine is replaceable. That is also the "fork a box" primitive §M2
+  gestures at, already working.
+- **`fly image show` returns `null` when an app has no machines.** It derives
+  the image *from a machine*, which is exactly the moment `create` needs one.
+  Read `flyctl releases` (`ImageRef`, newest complete release) instead — an
+  image belongs to the app's release history, not to any machine.
+- **`create` never builds an image.** Building is a fleet operation — build
+  once, create many boxes — so `BoxSpec.image` names an existing one and
+  `just fly-up` owns producing it. The same split will hold for a Firecracker
+  rootfs.
 - **`flyctl ssh console -C` does not run a shell.** It execs the string as
   argv, so `echo a; cat b` runs `echo` with the literal arguments `a;`, `cat`,
   `b` — no error, just quietly wrong output. `FlyBackend.exec` wraps commands

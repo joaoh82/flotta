@@ -218,10 +218,27 @@ def test_a_stopped_box_can_be_torn_down(store):
     assert b.destroyed_at is not None
 
 
-def test_a_box_cannot_be_stopped_before_it_runs(store):
+def test_a_created_box_may_land_stopped_without_ever_running(store):
+    """`provisioning -> stopped` is legal, and only `create_box` should use it.
+
+    `Backend.create` may return a machine that is not running — the protocol
+    says so, and on a Firecracker pool that is the normal case. Such a box has
+    to sit somewhere true: `running` would be a lie and `torn_down` would
+    discard a machine that exists and is costing disk.
+
+    The operator-facing refusal did not go away, it moved to the right layer:
+    `provision.stop_box` still rejects stopping a box that never ran, because
+    *asking to stop* something mid-provision is a different act from *recording*
+    that a freshly created machine is not up. See
+    `test_stop_refuses_a_box_that_never_ran_without_writing_an_event`.
+    """
     b = store.create_box("eng-b")
-    with pytest.raises(InvalidTransitionError):
-        store.update_box_status(b.id, "stopped")
+    b = store.update_box_status(b.id, "stopped")
+    assert b.status == "stopped"
+    assert b.destroyed_at is None  # created, idle, recoverable
+
+    # and it can then be woken normally
+    assert store.update_box_status(b.id, "running").status == "running"
 
 
 def test_a_task_cannot_be_stopped(store, box):

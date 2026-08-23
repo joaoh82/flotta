@@ -87,6 +87,13 @@ class BoxSpec:
     """
 
     name: str
+    #: The image a box boots from. Building it is a **fleet** operation, not a
+    #: per-box one — you build once and create many boxes from the result, and
+    #: the same is true of a rootfs on a Firecracker pool. So `create` consumes
+    #: an image reference and never builds; `just fly-build` owns that.
+    #: None means "whatever this app last released", which is what makes
+    #: `create` usable straight after a deploy.
+    image: str | None = None
     region: str | None = None
     volume_gb: int = 1
     #: Where the durable volume is mounted. `HERMES_HOME` lives inside it —

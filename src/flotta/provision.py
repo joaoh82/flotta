@@ -578,11 +578,53 @@ def create_box(
         store.update_box_status(box.id, "torn_down")
         raise ProvisionError(detail) from exc
 
-    store.update_box_status(box.id, "running", endpoint=handle.endpoint)
+    # `Backend.create` may return before the box is running — the protocol says
+    # so, and on a Firecracker pool that will be the normal case. Writing
+    # `running` here without asking would reintroduce exactly the lie this
+    # milestone closed for `stop_box`: a row claiming a machine is up while it
+    # is asleep. So start it, then believe the substrate rather than the plan.
+    started_error: str | None = None
+    try:
+        impl.start(handle.endpoint)
+    except BackendError as exc:
+        started_error = f"{type(exc).__name__}: {exc}"
+
+    observed = _observed_state(impl, handle.endpoint)
+    if observed == "started":
+        store.update_box_status(box.id, "running", endpoint=handle.endpoint)
+        store.add_event(
+            "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
+        )
+        return {
+            "box_id": box.id,
+            "endpoint": handle.endpoint,
+            "machine_id": handle.id,
+            "status": "running",
+        }
+
+    # The machine exists but is not up. `stopped` is the true statement, and it
+    # is recoverable — `flotta start` retries — where `torn_down` would discard
+    # a machine that is sitting there costing disk.
+    detail = started_error or f"machine is {observed!r} after create"
+    store.update_box_status(box.id, "stopped", endpoint=handle.endpoint)
     store.add_event(
-        "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
+        "box",
+        box.id,
+        "stopped",
+        {"endpoint": handle.endpoint, "machine_id": handle.id, "reason": detail},
     )
-    return {"box_id": box.id, "endpoint": handle.endpoint, "machine_id": handle.id}
+    raise ProvisionError(
+        f"box {box.id} was created ({handle.endpoint}) but is not running: {detail}. "
+        f"It is recorded as stopped; `flotta start {box.id}` will retry."
+    )
+
+
+def _observed_state(impl: Backend, endpoint: str) -> str:
+    """What the substrate says, tolerating a backend that cannot answer."""
+    try:
+        return impl.state(endpoint)
+    except Exception:
+        return "unknown"
 
 
 def stop_box(

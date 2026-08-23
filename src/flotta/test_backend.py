@@ -22,6 +22,17 @@ from flotta.backends.fly_backend import FlyBackend, endpoint_for, parse_endpoint
 from flotta.backends.modal_backend import ModalBackend
 
 
+def _offline_config():
+    """A FlyConfig that never reads the environment or a dotenv."""
+    from flotta.fly import FlyConfig
+
+    return FlyConfig.from_env({}, dotenv="/nonexistent/.env")
+
+
+def _never_runs(cmd, *, timeout, check):
+    raise AssertionError(f"the hermetic suite must not shell out: {cmd}")
+
+
 class Recorder:
     """Minimal backend that records the verbs it was asked for."""
 
@@ -157,10 +168,28 @@ def test_modal_can_still_be_destroyed():
 
 
 def test_both_backends_satisfy_the_protocol():
-    """`runtime_checkable` only checks method names, which is exactly the
-    drift worth catching: a backend that forgets `suspend` should fail here
-    rather than at the first stop on a live box."""
-    assert isinstance(FlyBackend(config=None) if False else ModalBackend(), Backend)
+    """`runtime_checkable` only checks method names, which is exactly the drift
+    worth catching: a backend that forgets `suspend` should fail here rather
+    than at the first stop on a live box.
+
+    An earlier version of this test read `FlyBackend(...) if False else
+    ModalBackend()` — it claimed to check both and checked one, which is worse
+    than not having the test. FlyBackend is constructed with an explicit config
+    and a stub runner so nothing reaches flyctl or the environment.
+    """
+    fly = FlyBackend(config=_offline_config(), runner=_never_runs)
+    assert isinstance(fly, Backend)
+    assert isinstance(ModalBackend(), Backend)
+
+
+@pytest.mark.parametrize(
+    "verb", ["create", "start", "suspend", "stop", "destroy", "exec", "state", "endpoint"]
+)
+def test_every_protocol_verb_exists_on_both(verb):
+    """Named individually so a missing one fails by name, not as a bare
+    isinstance False."""
+    assert callable(getattr(FlyBackend(config=_offline_config(), runner=_never_runs), verb))
+    assert callable(getattr(ModalBackend(), verb))
 
 
 def test_exec_result_ok():
