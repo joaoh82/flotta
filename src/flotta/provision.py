@@ -567,6 +567,23 @@ def create_box(
     is no machine behind it, so nothing can ever move it forward.
     """
     impl = backend or _backend_for("fly://")  # default substrate for persistent boxes
+
+    # `create` is idempotent over the *machine* — it adopts `machines[0]` rather
+    # than adding a second — but the store is not, so a second `create_box`
+    # under a different name would mint a second row pointing at the same
+    # endpoint. Two rows, one machine: `stop_box` on either would then lie
+    # about the other. Unreachable through today's CLI, which is exactly why it
+    # is worth closing before `flotta create` exists to reach it.
+    probe = _peek_endpoint(impl)
+    if probe:
+        for existing in store.list_boxes():
+            if existing.endpoint == probe and not is_terminal("box", existing.status):
+                raise ProvisionError(
+                    f"box {existing.id} ({existing.name}) already occupies {probe}. "
+                    "One machine hosts one box; destroy it with `flotta kill` "
+                    "before creating another, or point FLOTTA_FLY_APP elsewhere."
+                )
+
     box = store.create_box(name)
     store.add_event("box", box.id, "provisioning", {"name": name, "backend": impl.scheme})
 
@@ -589,7 +606,11 @@ def create_box(
     except BackendError as exc:
         started_error = f"{type(exc).__name__}: {exc}"
 
-    observed = _observed_state(impl, handle.endpoint)
+    # If `start` returned cleanly, that is evidence the box is up; an
+    # unreadable `state()` must not overturn it.
+    observed = _observed_state(
+        impl, handle.endpoint, assume="stopped" if started_error else "started"
+    )
     if observed == "started":
         store.update_box_status(box.id, "running", endpoint=handle.endpoint)
         store.add_event(
@@ -619,12 +640,40 @@ def create_box(
     )
 
 
-def _observed_state(impl: Backend, endpoint: str) -> str:
-    """What the substrate says, tolerating a backend that cannot answer."""
+def _peek_endpoint(impl: Backend) -> str | None:
+    """The endpoint `create` would adopt, without creating anything.
+
+    Best-effort and side-effect-free: used only to notice that a machine is
+    already spoken for. A backend that cannot answer simply yields None and the
+    duplicate check is skipped, because refusing to create on the strength of a
+    failed probe would be worse than the duplicate it guards against.
+    """
+    peek = getattr(impl, "existing_endpoint", None)
+    if peek is None:
+        return None
+    try:
+        return peek()
+    except BackendError:
+        return None
+
+
+def _observed_state(impl: Backend, endpoint: str, *, assume: str) -> str:
+    """What the substrate says, falling back to what we already know.
+
+    `assume` is what the caller has independent evidence for — a `start()` that
+    returned without raising is real evidence the box is up. An earlier version
+    caught bare `Exception` and returned `"unknown"`, which meant a flaky
+    `state()` *after a successful start* recorded the box as `stopped` while
+    the machine was running: the same row-disagrees-with-reality bug this
+    milestone exists to remove, pointing the other way.
+
+    Only `BackendError` is tolerated — a substrate that cannot answer. Anything
+    else is a bug here and should surface.
+    """
     try:
         return impl.state(endpoint)
-    except Exception:
-        return "unknown"
+    except BackendError:
+        return assume
 
 
 def stop_box(
@@ -727,10 +776,22 @@ def start_box(
         )
 
     impl = _resolve_backend(box, backend)
+    target = box.endpoint or box_id
     try:
-        impl.start(box.endpoint or box_id)
+        impl.start(target)
     except BackendError as exc:
         raise ProvisionError(f"could not start box {box_id}: {exc}") from exc
+
+    # Verified, not assumed — `create_box` believes the substrate rather than
+    # the plan and this must not be laxer than its sibling. A `start` that
+    # returns while the machine is still down would otherwise leave a row
+    # claiming `running`, which is the bug this milestone closed for `stop`.
+    observed = _observed_state(impl, target, assume="started")
+    if observed not in ("started", "unknown"):
+        raise ProvisionError(
+            f"box {box_id} did not come up: the substrate reports {observed!r}. "
+            "The row is unchanged; try again."
+        )
 
     store.add_event("box", box_id, "running", {"reason": reason, "previous_status": box.status})
     store.update_box_status(box_id, "running")

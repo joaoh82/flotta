@@ -1101,11 +1101,13 @@ def test_start_on_a_provisioning_box_cannot_strand_a_billed_container(store):
 
 
 def test_stop_refuses_a_box_that_never_ran_without_writing_an_event(store):
-    """Events are the audit trail; a lie in them outlives the traceback.
+    """The operator-facing half of the rule, after M1 split it in two.
 
-    `add_event` then `update_box_status` leaves a `stopped` event on a box that
-    never stopped, because `provisioning -> stopped` is illegal and raises only
-    after the event is committed.
+    The *store* now permits `provisioning -> stopped`, because `create_box`
+    legitimately needs somewhere honest to put a machine that exists but is not
+    up. Asking to *stop* a box that never ran is a different act, and this verb
+    still refuses it — and refuses before writing anything, so no `stopped`
+    event describes something that never happened.
     """
     box = store.create_box("eng-b")
     with pytest.raises(ProvisionError, match="only a running box can be stopped"):
@@ -1507,3 +1509,135 @@ def test_create_box_names_the_box(store):
 
     out = create_box("eng-b", store=store, backend=Creating())
     assert store.get_box_by_name("eng-b").id == out["box_id"]
+
+
+# -- PR #30 re-review follow-ups --------------------------------------------
+
+
+def test_a_flaky_state_call_cannot_unsay_a_successful_start(store):
+    """The lie this milestone closed, pointing the other way.
+
+    `_observed_state` used to catch bare `Exception` and return "unknown", so a
+    `state()` blip *after* a clean `start()` recorded the box as `stopped` while
+    the machine was up. A start that returned is evidence; an unreadable
+    substrate must not overturn it.
+    """
+
+    class FlakyState(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def state(self, box_id):
+            raise BackendError("fly api timeout")
+
+    out = create_box("eng-a", store=store, backend=FlakyState())
+    assert out["status"] == "running"
+    assert store.get_box(out["box_id"]).status == "running"
+
+
+def test_an_unreadable_state_after_a_failed_start_still_records_stopped(store):
+    """The conservative direction is kept: no evidence of a start, no `running`."""
+
+    class Broken(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def start(self, box_id):
+            raise BackendError("no capacity")
+
+        def state(self, box_id):
+            raise BackendError("also down")
+
+    with pytest.raises(ProvisionError, match="not running"):
+        create_box("eng-a", store=store, backend=Broken())
+    assert store.list_boxes()[0].status == "stopped"
+
+
+def test_a_non_backend_error_from_state_is_not_swallowed(store):
+    """Only a substrate that cannot answer is tolerated; a bug here surfaces."""
+
+    class Buggy(FakeBackend):
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+        def state(self, box_id):
+            raise TypeError("programming error in the adapter")
+
+    with pytest.raises(TypeError):
+        create_box("eng-a", store=store, backend=Buggy())
+
+
+def test_two_boxes_cannot_claim_the_same_machine(store):
+    """`create` is idempotent over the machine; the store is not.
+
+    A second `create_box` under a different name would otherwise mint a second
+    row on the same endpoint — two rows, one machine — and `stop_box` on either
+    would then lie about the other. Unreachable through today's CLI, which is
+    why it is worth closing before `flotta create` exists to reach it.
+    """
+
+    class Adopting(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.made = False
+
+        def existing_endpoint(self):
+            return "fake://app/m1" if self.made else None
+
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            self.made = True
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    impl = Adopting()
+    first = create_box("eng-a", store=store, backend=impl)
+
+    with pytest.raises(ProvisionError, match="already occupies"):
+        create_box("eng-b", store=store, backend=impl)
+
+    assert [b.id for b in store.list_boxes()] == [first["box_id"]]
+
+
+def test_a_destroyed_box_frees_its_machine_for_a_new_one(store):
+    """The guard is about *live* rows — a torn-down box holds nothing."""
+
+    class Adopting(FakeBackend):
+        def existing_endpoint(self):
+            return "fake://app/m1"
+
+        def create(self, spec):
+            from flotta.backend import BoxHandle
+
+            return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+    impl = Adopting()
+    box = store.create_box("old")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    store.update_box_status(box.id, "torn_down")
+
+    assert create_box("new", store=store, backend=impl)["status"] == "running"
+
+
+def test_start_box_verifies_rather_than_assuming(store):
+    """`create_box` believes the substrate; `start_box` must not be laxer."""
+    bid = idle_box(store)
+    stop_box(bid, store=store, backend=FakeBackend())
+
+    class LiesAboutStarting(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.machine_state = "stopped"
+
+        def start(self, box_id):
+            self.calls.append("start")  # returns cleanly, machine stays down
+
+    with pytest.raises(ProvisionError, match="did not come up"):
+        start_box(bid, store=store, backend=LiesAboutStarting())
+    assert store.get_box(bid).status == "stopped", "the row is unchanged"

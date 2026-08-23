@@ -195,3 +195,72 @@ def test_every_protocol_verb_exists_on_both(verb):
 def test_exec_result_ok():
     assert ExecResult(0, "hi", "").ok
     assert not ExecResult(1, "", "boom").ok
+
+
+# -- re-review follow-ups ---------------------------------------------------
+
+
+def test_a_flyctl_timeout_becomes_a_backend_error():
+    """`BackendError` is the only exception `create_box`/`stop_box` catch.
+
+    A `TimeoutExpired` escaping past them leaves a row stranded in
+    `provisioning` with a real machine attached — the row never closes because
+    the cleanup path was never entered.
+    """
+    import subprocess
+
+    from flotta.backend import BackendError
+    from flotta.backends.fly_backend import _run_flyctl
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="flyctl machines start", timeout=5)
+
+    real = subprocess.run
+    subprocess.run = boom
+    try:
+        with pytest.raises(BackendError, match="timed out"):
+            _run_flyctl(["flyctl", "machines", "start"], timeout=5, check=True)
+    finally:
+        subprocess.run = real
+
+
+@pytest.mark.parametrize(
+    ("releases", "expected"),
+    [
+        ([{"Status": "complete", "ImageRef": "reg/app:v3"}], "reg/app:v3"),
+        # A blank status is not a complete one. The earlier check was
+        # `if status and status != "complete"`, which let this through — the
+        # half-written release you least want to boot a box from.
+        ([{"Status": "", "ImageRef": "reg/app:half"}], None),
+        ([{"ImageRef": "reg/app:nostatus"}], None),
+        ([{"Status": "failed", "ImageRef": "reg/app:bad"}], None),
+        (
+            [
+                {"Status": "failed", "ImageRef": "reg/app:bad"},
+                {"Status": "complete", "ImageRef": "reg/app:good"},
+            ],
+            "reg/app:good",
+        ),
+    ],
+)
+def test_only_a_complete_release_is_bootable(releases, expected):
+    import json as _json
+    import subprocess
+
+    backend = FlyBackend(
+        config=_offline_config(),
+        runner=lambda cmd, *, timeout, check: subprocess.CompletedProcess(
+            cmd, 0, _json.dumps(releases), ""
+        ),
+    )
+    assert backend._current_image("app") == expected
+
+
+def test_existing_endpoint_is_none_when_there_is_no_machine():
+    import subprocess
+
+    backend = FlyBackend(
+        config=_offline_config(),
+        runner=lambda cmd, *, timeout, check: subprocess.CompletedProcess(cmd, 0, "[]", ""),
+    )
+    assert backend.existing_endpoint() is None

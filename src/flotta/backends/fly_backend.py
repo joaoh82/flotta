@@ -156,6 +156,19 @@ class FlyBackend:
         machine_id = machines[0]["id"]
         return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
 
+    def existing_endpoint(self) -> str | None:
+        """The endpoint `create` would adopt, without creating anything.
+
+        Lets `provision.create_box` notice that a machine is already spoken for
+        before it mints a second row against it. Read-only by construction — it
+        lists machines and nothing else.
+        """
+        app = self.config.app
+        machines = self._machines(app)
+        if not machines:
+            return None
+        return endpoint_for(app, machines[0]["id"])
+
     def _current_image(self, app: str) -> str | None:
         """The image this app last released, if any.
 
@@ -179,8 +192,12 @@ class FlyBackend:
         for release in releases:
             if not isinstance(release, dict):
                 continue
+            # Explicitly complete, not merely "not obviously incomplete". The
+            # earlier `if status and status != "complete"` let a release with a
+            # blank Status through, which is exactly the half-written one you
+            # do not want to boot a box from.
             status = str(release.get("Status") or release.get("status") or "").lower()
-            if status and status != "complete":
+            if status != "complete":
                 continue
             ref = release.get("ImageRef") or release.get("imageRef")
             if ref:
@@ -381,7 +398,13 @@ def _run_flyctl(cmd: list[str], *, timeout: int, check: bool) -> subprocess.Comp
             "flyctl is not on PATH. Install it (`brew install flyctl`) and "
             "`fly auth login`; see `just fly-whoami`."
         )
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        # Must surface as BackendError: that is the only exception `create_box`
+        # and `stop_box` catch, and anything else escapes past their cleanup —
+        # leaving a row in `provisioning` with a real machine attached to it.
+        raise BackendError(f"{' '.join(cmd)} timed out after {timeout}s") from exc
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         # Fly refuses suspend on some configurations. Surfacing that as
