@@ -257,3 +257,105 @@ demo: modal-whoami
 # show the development plan (lives in the parent workspace)
 plan:
     @sed -n '1,60p' ../docs/development-plan.md
+
+# --- M2: the box tier on Fly.io -------------------------------------------
+#
+# `fly-whoami` gates every Fly recipe for the same reason `modal-whoami` gates
+# the Modal ones: flyctl acts on whichever org is current, and this repo already
+# found its globally-active Modal profile pointing at an unrelated workspace
+# once. Pin it in .env (FLOTTA_FLY_ORG / FLOTTA_FLY_APP), never rely on ambient.
+
+# which Fly org/app/volume every fly recipe will act on
+fly-whoami:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().describe())"
+    echo
+    echo -n "  logged in as  "
+    flyctl auth whoami
+
+# M2: provision the box — app + volume + first deploy (REAL infra, costs money)
+fly-up: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
+    VOL=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().volume_name)")
+    GB=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().volume_gb)")
+    REGION=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().region or '')")
+    REF=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+
+    # Fly app names are globally unique across all of Fly, not per-org, so a
+    # collision here is the single most likely first failure. Say so plainly.
+    if ! flyctl apps list --json | grep -q "\"Name\": *\"$APP\""; then
+      echo "creating app $APP in org $ORG"
+      flyctl apps create "$APP" --org "$ORG" || {
+        echo "" >&2
+        echo "If that failed with a name conflict: Fly app names are GLOBALLY unique." >&2
+        echo "Pick another and set FLOTTA_FLY_APP in .env." >&2
+        exit 1
+      }
+    else
+      echo "app $APP already exists"
+    fi
+
+    if ! flyctl volumes list --app "$APP" --json | grep -q "\"name\": *\"$VOL\""; then
+      echo "creating ${GB}GB volume $VOL"
+      # -y: no interactive "are you sure about a single-node volume" prompt.
+      # A single unreplicated volume is correct here — this is one box, and
+      # replication is a v2 concern.
+      if [ -n "$REGION" ]; then
+        flyctl volumes create "$VOL" --app "$APP" --size "$GB" --region "$REGION" -y
+      else
+        flyctl volumes create "$VOL" --app "$APP" --size "$GB" -y
+      fi
+    else
+      echo "volume $VOL already exists"
+    fi
+
+    # fly.toml carries defaults; the resolved config wins. Rewritten into a
+    # temp copy so the committed file stays the documented default.
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    cp fly/Dockerfile fly/box_entrypoint.sh fly/fly.toml "$TMP/"
+    uv run python - "$TMP/fly.toml" "$APP" "$REGION" "$REF" <<'PY'
+    import pathlib, sys
+    path, app, region, ref = pathlib.Path(sys.argv[1]), *sys.argv[2:5]
+    text = path.read_text()
+    text = text.replace('app = "flotta-box"', f'app = "{app}"')
+    text = text.replace('primary_region = ""', f'primary_region = "{region}"')
+    text = text.replace('HERMES_REF = "v2026.8.19"', f'HERMES_REF = "{ref}"')
+    path.write_text(text)
+    PY
+
+    echo "deploying (Hermes pinned at $REF)"
+    flyctl deploy --config "$TMP/fly.toml" --dockerfile "$TMP/Dockerfile" \
+      --app "$APP" --ha=false --yes .
+
+# M2: prove HERMES_HOME survives a stop/start (REAL infra + one model call)
+fly-proof *ARGS: fly-whoami
+    uv run python scripts/m2_memory_proof.py {{ARGS}}
+
+# open a shell on the box
+fly-ssh: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    flyctl ssh console --app "$APP"
+
+# M2: stop the box — keeps the disk, stops paying for CPU
+fly-stop: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    flyctl machines list --app "$APP" --json \
+      | uv run python -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)]" \
+      | xargs -r -I{} flyctl machines stop {} --app "$APP"
+
+# DESTROY the box and its volume — the disk and everything it remembered
+fly-down: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    echo "This destroys app $APP AND its volume — the box forgets everything."
+    flyctl apps destroy "$APP"
