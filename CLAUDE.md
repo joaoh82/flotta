@@ -92,6 +92,23 @@ between milestones — architecture, conventions, and the sharp edges below.
   e2e_fleet.db-wal e2e_fleet.db-shm`. Old rows are dropped rather than migrated
   on purpose: they describe one-shot task runs and there is no box for them to
   become.
+- **A headless `run_conversation` does NOT populate `state.db`.** SEAM_NOTES Q3
+  describes a rich schema (sessions, messages, FTS); measured on a live box,
+  after a completed turn `state.db` holds exactly one table
+  (`async_delegations`, zero rows). Those tables are written by the
+  gateway/CLI path, not by `AIAgent.run_conversation`. So conversation
+  *history* does not survive a restart today — **memories and skills do**, and
+  that is the surface the pivot's claim actually rests on. Session persistence
+  arrives with M3, when the gateway is turned back on.
+- **The memory tool must be named in the prompt.** "Remember X" is treated as
+  conversational and writes nothing; the box then honestly reports an empty
+  memory store on recall, which looks exactly like a durability failure and is
+  not one. "Use your memory tool to save this fact permanently: X" writes
+  `$HERMES_HOME/memories/MEMORY.md`.
+- **Memory accumulates across runs, so test questions must be run-scoped.** The
+  M2 proof once passed by answering with a passphrase from a *previous* cycle.
+  That is the product working correctly and the test being wrong — the fix is a
+  question only this run can answer, never wiping the store between runs.
 - **`stop` is refused while a box has live tasks.** Until a backend can really
   suspend, stopping changes a row and nothing else — the container keeps
   running and keeps billing while `count_active_boxes()` reports zero. A

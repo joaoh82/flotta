@@ -1,0 +1,39 @@
+# What NOT to ship to Fly's builder.
+#
+# `flyctl deploy .` tars the working tree and uploads it. The Dockerfile does
+# not COPY .env, but the tarball still carries it — the secret transits
+# regardless of whether a layer ever references it. Same class of mistake as
+# passing a key in argv where `ps` can read it: the leak is in the transport,
+# not the destination.
+#
+# Deny-by-default would be safer still, but the build genuinely needs
+# pyproject.toml, README.md, src/ and fly/, and an allowlist that drifts out of
+# sync with the Dockerfile fails closed in a confusing way. So: an explicit
+# deny list, with the secret-bearing entries first.
+
+# --- secrets and local credentials (the reason this file exists) -----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- local state that is never part of a build -----------------------------
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-wal
+*.db-shm
+
+# --- vcs, tooling, and things with their own build ------------------------
+.git/
+.github/
+.gitignore
+vendor/
+dashboard/
+skills/
+assets/
+node_modules/

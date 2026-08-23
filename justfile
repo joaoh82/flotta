@@ -257,3 +257,146 @@ demo: modal-whoami
 # show the development plan (lives in the parent workspace)
 plan:
     @sed -n '1,60p' ../docs/development-plan.md
+
+# --- M2: the box tier on Fly.io -------------------------------------------
+#
+# `fly-whoami` gates every Fly recipe for the same reason `modal-whoami` gates
+# the Modal ones: flyctl acts on whichever org is current, and this repo already
+# found its globally-active Modal profile pointing at an unrelated workspace
+# once. Pin it in .env (FLOTTA_FLY_ORG / FLOTTA_FLY_APP), never rely on ambient.
+
+# which Fly org/app/volume every fly recipe will act on
+fly-whoami:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().describe())"
+    echo
+    echo -n "  logged in as  "
+    flyctl auth whoami
+
+# M2: provision the box — app + volume + first deploy (REAL infra, costs money)
+fly-up: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
+    VOL=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().volume_name)")
+    GB=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().volume_gb)")
+    # Concrete, always: `fly volumes create` refuses to run without a region
+    # when it is not attached to a TTY, so "unset" cannot mean "decide later".
+    REGION=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().resolved_region())")
+    echo "region     $REGION"
+    REF=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+
+    # Fly app names are globally unique across all of Fly, not per-org, so a
+    # collision here is the single most likely first failure. Say so plainly.
+    # Exact match on the parsed JSON, not a grep. Two reasons: the field is
+    # `Name` for apps and `name` for volumes (already inconsistent), and a
+    # substring grep for "flotta-box" matches an existing "flotta-box-2" — so
+    # the recipe would decide the app exists and skip creating it.
+    if ! flyctl apps list --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any(a.get('Name')=='$APP' for a in json.load(sys.stdin)) else 1)"; then
+      echo "creating app $APP in org $ORG"
+      flyctl apps create "$APP" --org "$ORG" || {
+        echo "" >&2
+        echo "If that failed with a name conflict: Fly app names are GLOBALLY unique." >&2
+        echo "Pick another and set FLOTTA_FLY_APP in .env." >&2
+        exit 1
+      }
+    else
+      echo "app $APP already exists"
+    fi
+
+    if ! flyctl volumes list --app "$APP" --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any(v.get('name')=='$VOL' for v in json.load(sys.stdin)) else 1)"; then
+      echo "creating ${GB}GB volume $VOL"
+      # -y: no interactive "are you sure about a single-node volume" prompt.
+      # A single unreplicated volume is correct here — this is one box, and
+      # replication is a v2 concern.
+      flyctl volumes create "$VOL" --app "$APP" --size "$GB" --region "$REGION" -y
+    else
+      echo "volume $VOL already exists"
+    fi
+
+    # fly.toml carries defaults; the resolved config wins. Rewritten into a
+    # temp copy so the committed file stays the documented default.
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    cp fly/Dockerfile fly/box_entrypoint.sh fly/fly.toml "$TMP/"
+    uv run python - "$TMP/fly.toml" "$APP" "$REGION" "$REF" "$VOL" <<'PY'
+    import pathlib, sys
+    path = pathlib.Path(sys.argv[1])
+    app, region, ref, vol = sys.argv[2:6]
+    text = path.read_text()
+    for old, new in (
+        ('app = "flotta-box"', f'app = "{app}"'),
+        ('primary_region = ""', f'primary_region = "{region}"'),
+        ('HERMES_REF = "v2026.8.19"', f'HERMES_REF = "{ref}"'),
+        # The mount source has to move with the volume name. Creating
+        # `$VOL` while fly.toml still mounts `flotta_data` deploys a machine
+        # with no disk where HERMES_HOME should be — and the proof then reads
+        # as a durability failure rather than a config mistake.
+        ('source = "flotta_data"', f'source = "{vol}"'),
+    ):
+        assert old in text, f"fly.toml no longer contains {old!r}"
+        text = text.replace(old, new)
+    path.write_text(text)
+    PY
+
+    echo "deploying (Hermes pinned at $REF)"
+    flyctl deploy --config "$TMP/fly.toml" --dockerfile "$TMP/Dockerfile" \
+      --app "$APP" --ha=false --yes .
+
+# M2: prove HERMES_HOME survives a stop/start (REAL infra + one model call)
+fly-proof *ARGS: fly-whoami
+    uv run python scripts/m2_memory_proof.py {{ARGS}}
+
+# open a shell on the box
+fly-ssh: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    flyctl ssh console --app "$APP"
+
+# M2: stop the box — keeps the disk, stops paying for CPU
+fly-stop: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    flyctl machines list --app "$APP" --json \
+      | uv run python -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)]" \
+      | xargs -r -I{} flyctl machines stop {} --app "$APP"
+
+# DESTROY the box and its volume — the disk and everything it remembered
+fly-down: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    echo "This destroys app $APP AND its volume — the box forgets everything."
+    flyctl apps destroy "$APP"
+
+# M2: push .env's provider vars into the box as Fly secrets (this is how you rotate)
+fly-secrets: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    : "${FLOTTA_MODEL:?set FLOTTA_MODEL in .env}"
+    : "${FLOTTA_MODEL_BASE_URL:?set FLOTTA_MODEL_BASE_URL in .env}"
+    : "${FLOTTA_API_KEY:?set FLOTTA_API_KEY in .env}"
+
+    # `secrets import` issues a release, which STARTS stopped machines. That is
+    # the surprise-agent footgun the missing service block exists to avoid, so
+    # remember what was asleep and put it back.
+    WERE_STOPPED=$(flyctl machines list --app "$APP" --json \
+      | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin) if m['state'] != 'started'))")
+
+    # Values on stdin, never argv — argv is visible in `ps`.
+    printf 'FLOTTA_MODEL=%s\nFLOTTA_MODEL_BASE_URL=%s\nFLOTTA_API_KEY=%s\n' \
+      "$FLOTTA_MODEL" "$FLOTTA_MODEL_BASE_URL" "$FLOTTA_API_KEY" \
+      | flyctl secrets import --app "$APP"
+
+    for MID in $WERE_STOPPED; do
+      echo "re-stopping $MID (it was asleep before this rotation)"
+      flyctl machines stop "$MID" --app "$APP" >/dev/null
+    done
+    echo "provider secrets set on $APP (values not echoed)"

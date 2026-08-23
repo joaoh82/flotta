@@ -753,8 +753,7 @@ class FleetStore:
         workspace = self._get_workspace_or_raise(workspace_id)
         if workspace.box_id != box_id:
             raise UnknownEntityError(
-                f"workspace {workspace_id!r} belongs to box {workspace.box_id!r}, "
-                f"not {box_id!r}"
+                f"workspace {workspace_id!r} belongs to box {workspace.box_id!r}, not {box_id!r}"
             )
         return workspace
 

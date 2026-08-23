@@ -1,0 +1,45 @@
+# Flotta box — one persistent agent on one Fly Machine (M2).
+#
+# Generated-by-hand on purpose. M2 is the hand-provisioned proof; M1's
+# `FlyBackend` will create machines through the Machines API and this file
+# stops being the source of truth. Until then it is, and `just fly-up` reads
+# the app/volume names from it via `src/flotta/fly.py`.
+#
+# `app` and `primary_region` are rewritten by `just fly-up` from
+# $FLOTTA_FLY_APP / $FLOTTA_FLY_REGION — the values here are only the defaults.
+
+app = "flotta-box"
+primary_region = ""
+
+[build]
+  dockerfile = "Dockerfile"
+
+[build.args]
+  # Overwritten by `just fly-up` with HERMES_REF from
+  # src/flotta/worker/image.py, so the box and the shard tier cannot drift.
+  HERMES_REF = "v2026.8.19"
+
+[env]
+  # The reason this milestone exists. Must stay inside the mount below.
+  HERMES_HOME = "/data/hermes"
+
+# The disk that makes a box a box. Volumes bill whether the machine runs, is
+# stopped, or is suspended ($0.15/GB/month) — a stopped box is cheap, not free.
+[mounts]
+  source = "flotta_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+# NO [http_service] / [[services]] block, deliberately.
+#
+# Fly Proxy's `auto_start_machines` defaults to true for any service, which
+# means *any* inbound packet wakes a stopped box: a surprise bill and, worse, a
+# surprise agent that starts thinking because someone scanned a port. The pivot
+# doc calls this out (§8.4) as one of two Fly-specific footguns.
+#
+# The box has nothing to serve yet anyway — `fly ssh console` is the only way
+# in, and that does not go through the proxy. When M3 exposes the messaging
+# gateway, add the service block *with* `auto_start_machines = false`.
