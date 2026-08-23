@@ -122,6 +122,15 @@ between milestones — architecture, conventions, and the sharp edges below.
   once, create many boxes — so `BoxSpec.image` names an existing one and
   `just fly-up` owns producing it. The same split will hold for a Firecracker
   rootfs.
+- **Do not build shell incantations for `fly ssh` — ship a command.** Checking
+  a box's state through `flyctl ssh console -C "..."` wrapping `/bin/sh -c
+  '...'` wrapping `python3 -c "..."` is three layers of quoting, and one
+  attempt ended up spelling a path as `chr(47)+chr(100)+...` to escape them.
+  `python3 -m flotta.box.doctor` (`just fly-doctor`) has no quoting problem and
+  reports the things worth asking: HERMES_HOME on the volume, the session
+  schema, memories, skills, whether Hermes is listening.
+- **`fly ssh` needs a running machine.** A stopped box gives a connection
+  error, not "the box is stopped" — `just fly-doctor` starts it first.
 - **`flyctl ssh console -C` does not run a shell.** It execs the string as
   argv, so `echo a; cat b` runs `echo` with the literal arguments `a;`, `cat`,
   `b` — no error, just quietly wrong output. `FlyBackend.exec` wraps commands

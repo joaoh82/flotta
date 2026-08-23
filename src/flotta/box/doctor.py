@@ -1,0 +1,127 @@
+"""`python -m flotta.box.doctor` — what is true about this box, from inside it.
+
+Exists because the alternative was a shell incantation. Checking the box's
+state used to mean nesting `python3 -c "..."` inside `/bin/sh -c '...'` inside
+`flyctl ssh console -C "..."`, and three layers of quoting mangles literals —
+one attempt ended up spelling a file path with `chr(47)+chr(100)+...` to dodge
+the quotes. A command that ships with the image has no quoting problem at all.
+
+Reports what actually matters about a box, in the order you would ask:
+
+    is HERMES_HOME on the volume?   (M2: the box can remember)
+    does state.db have sessions?    (M3: it remembers *conversations*)
+    what has it learned?            (memories and skills on disk)
+    is Hermes listening?            (M3: it is an agent you can talk to)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sqlite3
+from pathlib import Path
+
+DEFAULT_HERMES_HOME = "/data/hermes"
+DEFAULT_PORT = 9119
+
+#: Tables that only exist once `hermes serve` has run. Under M2 the box had
+#: exactly one table (`async_delegations`) because a headless
+#: `run_conversation` never creates the session schema — the gateway path does.
+SESSION_TABLES = ("sessions", "messages", "messages_fts")
+
+
+def collect(hermes_home: str | None = None, port: int | None = None) -> dict:
+    home = Path(hermes_home or os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME)
+    port = port or int(os.environ.get("FLOTTA_SERVE_PORT") or DEFAULT_PORT)
+
+    report: dict = {"hermes_home": str(home), "exists": home.is_dir()}
+
+    # On the volume, not in the container's writable layer. If this is False the
+    # box forgets everything on the next stop, which is the whole M2 failure.
+    report["on_volume"] = _same_device(home, Path("/data"))
+
+    db = home / "state.db"
+    report["state_db"] = {"exists": db.is_file(), "tables": 0, "has_sessions": False}
+    if db.is_file():
+        try:
+            # read-only: a doctor must never be the thing that corrupts the
+            # database it was asked to inspect.
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            names = {
+                t for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            conn.close()
+            report["state_db"]["tables"] = len(names)
+            report["state_db"]["has_sessions"] = all(t in names for t in SESSION_TABLES)
+        except sqlite3.Error as exc:
+            report["state_db"]["error"] = str(exc)
+
+    report["memories"] = _list_dir(home / "memories")
+    report["skills"] = _list_dir(home / "skills")
+    report["serving"] = _is_listening(port)
+    report["port"] = port
+    return report
+
+
+def _same_device(path: Path, mount: Path) -> bool:
+    """True when `path` sits on the same filesystem as the mounted volume."""
+    try:
+        return path.stat().st_dev == mount.stat().st_dev
+    except OSError:
+        return False
+
+
+def _list_dir(path: Path) -> dict:
+    if not path.is_dir():
+        return {"exists": False, "files": []}
+    files = sorted(p.name for p in path.iterdir() if p.is_file())
+    return {
+        "exists": True,
+        "files": files,
+        "bytes": sum(p.stat().st_size for p in path.iterdir() if p.is_file()),
+    }
+
+
+def _is_listening(port: int) -> bool:
+    """Whether anything answers on the serve port, from inside the box."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def render(report: dict) -> str:
+    def mark(ok: bool) -> str:
+        return "ok  " if ok else "FAIL"
+
+    db = report["state_db"]
+    lines = [
+        f"{mark(report['exists'])} HERMES_HOME exists       {report['hermes_home']}",
+        f"{mark(report['on_volume'])} on the durable volume   (survives a stop)",
+        f"{mark(db['exists'])} state.db present",
+        f"{mark(db['has_sessions'])} session schema          {db['tables']} tables"
+        + ("" if db["has_sessions"] else "  <- hermes serve has not run"),
+        f"{mark(report['memories']['exists'])} memories/               "
+        f"{len(report['memories']['files'])} file(s)",
+        f"{mark(report['skills']['exists'])} skills/                 "
+        f"{len(report['skills']['files'])} file(s)",
+        f"{mark(report['serving'])} hermes serve listening  127.0.0.1:{report['port']}",
+    ]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Report what is true about this box.")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    args = parser.parse_args(argv)
+
+    report = collect()
+    print(json.dumps(report, indent=2) if args.as_json else render(report))
+    # Non-zero when the box cannot do its job, so this is usable as a check.
+    healthy = report["exists"] and report["on_volume"] and report["serving"]
+    return 0 if healthy else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

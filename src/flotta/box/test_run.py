@@ -82,3 +82,77 @@ def test_the_turn_is_bounded():
     — still holding the provider key, still burning CPU unwatched."""
     assert box_run.DEFAULT_TIMEOUT_S == 900
     assert box_run.TIMEOUT_EXIT_CODE == 75
+
+
+# -- box doctor -------------------------------------------------------------
+
+
+def test_doctor_detects_a_box_that_cannot_remember(tmp_path):
+    """The M2 failure, as a check: HERMES_HOME off the volume.
+
+    A box whose store is in the container's writable layer looks perfectly
+    healthy until it stops, and then it has forgotten everything.
+    """
+    from flotta.box import doctor
+
+    report = doctor.collect(hermes_home=str(tmp_path / "ephemeral"), port=1)
+    assert report["exists"] is False
+    assert report["on_volume"] is False
+
+
+def test_doctor_reports_a_missing_session_schema(tmp_path):
+    """The M2 debt, as a check.
+
+    A headless `run_conversation` leaves state.db with one table
+    (`async_delegations`); only `hermes serve` creates the session schema. A
+    box with memories but no sessions remembers facts and not conversations.
+    """
+    import sqlite3
+
+    from flotta.box import doctor
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    conn = sqlite3.connect(home / "state.db")
+    conn.execute("CREATE TABLE async_delegations (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    report = doctor.collect(hermes_home=str(home), port=1)
+    assert report["state_db"]["exists"] is True
+    assert report["state_db"]["tables"] == 1
+    assert report["state_db"]["has_sessions"] is False
+    assert "hermes serve has not run" in doctor.render(report)
+
+
+def test_doctor_opens_the_database_read_only(tmp_path):
+    """A doctor must never be the thing that corrupts what it inspects."""
+    import sqlite3
+
+    from flotta.box import doctor
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    conn = sqlite3.connect(home / "state.db")
+    for table in ("sessions", "messages", "messages_fts"):
+        conn.execute(f"CREATE TABLE {table} (id TEXT)")
+    conn.commit()
+    conn.close()
+    before = (home / "state.db").stat().st_mtime_ns
+
+    report = doctor.collect(hermes_home=str(home), port=1)
+    assert report["state_db"]["has_sessions"] is True
+    assert (home / "state.db").stat().st_mtime_ns == before, "doctor wrote to the database"
+
+
+def test_doctor_survives_a_corrupt_database(tmp_path):
+    """Reporting has to work on exactly the box you were called out to debug."""
+    from flotta.box import doctor
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "state.db").write_text("this is not a database")
+
+    report = doctor.collect(hermes_home=str(home), port=1)
+    assert "error" in report["state_db"]
+    assert doctor.render(report)  # still renders rather than raising

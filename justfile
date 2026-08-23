@@ -398,3 +398,11 @@ fly-auth: fly-whoami
     env.write_text("\n".join(lines) + "\n")
     PY
     echo "credentials set on $APP and recorded in .env (values not echoed)"
+
+# M3: what is true about the box — HERMES_HOME, sessions, memory, serving
+fly-doctor: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    flyctl machines start --app "$APP" >/dev/null 2>&1 || true
+    flyctl ssh console --app "$APP" -C "python3 -m flotta.box.doctor"
