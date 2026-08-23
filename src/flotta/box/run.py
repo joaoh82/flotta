@@ -30,10 +30,16 @@ import argparse
 import json
 import os
 import sys
+import threading
 import uuid
 from typing import Any
 
 DEFAULT_HERMES_HOME = "/data/hermes"
+
+# Matches the worker's default so a box and a shard time out alike.
+DEFAULT_TIMEOUT_S = 900
+# Distinct from success/failure, same code the worker's watchdog uses.
+TIMEOUT_EXIT_CODE = 75
 
 
 def build_agent(
@@ -85,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Stable id for this turn (defaults to a fresh one)",
     )
+    parser.add_argument(
+        "--timeout-s",
+        type=int,
+        default=int(os.environ.get("FLOTTA_TIMEOUT_S") or DEFAULT_TIMEOUT_S),
+        help="Hard deadline for the turn [$FLOTTA_TIMEOUT_S, default 900]",
+    )
     args = parser.parse_args(argv)
 
     hermes_home = (os.environ.get("HERMES_HOME") or "").strip() or DEFAULT_HERMES_HOME
@@ -114,21 +126,57 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     task_id = args.task_id or f"box-{uuid.uuid4().hex[:12]}"
-    try:
-        agent = build_agent(base_url=base_url, api_key=api_key, model=model)
-        result = agent.run_conversation(args.task, task_id=task_id)
-    except Exception as exc:  # reported, never a traceback into the ssh session
+
+    # Bounded like the worker's `_run_task_core`, and for a sharper reason here:
+    # this runs under `fly ssh console`, so when the SSH client gives up the
+    # Python child is orphaned under `sleep infinity` — still holding the
+    # provider key, still burning CPU on a box nobody is watching. A daemon
+    # thread plus a join deadline means the process exits even if the turn
+    # never returns.
+    outcome: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            agent = build_agent(base_url=base_url, api_key=api_key, model=model)
+            outcome["result"] = agent.run_conversation(args.task, task_id=task_id)
+        except Exception as exc:  # reported, never a traceback into the ssh session
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+
+    thread = threading.Thread(target=_run, name=f"flotta-box-{task_id}", daemon=True)
+    thread.start()
+    thread.join(args.timeout_s)
+
+    if thread.is_alive():
         print(
             json.dumps(
                 {
                     "completed": False,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "timed_out": True,
+                    "error": f"turn exceeded {args.timeout_s}s",
+                    "task_id": task_id,
+                    "hermes_home": hermes_home,
+                }
+            )
+        )
+        # os._exit, not sys.exit: the worker thread is still running inside
+        # Hermes and a clean shutdown would block on it, which is the hang this
+        # timeout exists to end.
+        sys.stdout.flush()
+        os._exit(TIMEOUT_EXIT_CODE)
+
+    if "error" in outcome:
+        print(
+            json.dumps(
+                {
+                    "completed": False,
+                    "error": outcome["error"],
                     "task_id": task_id,
                     "hermes_home": hermes_home,
                 }
             )
         )
         return 1
+    result = outcome["result"]
 
     print(
         json.dumps(

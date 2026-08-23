@@ -290,7 +290,12 @@ fly-up: fly-whoami
 
     # Fly app names are globally unique across all of Fly, not per-org, so a
     # collision here is the single most likely first failure. Say so plainly.
-    if ! flyctl apps list --json | grep -q "\"Name\": *\"$APP\""; then
+    # Exact match on the parsed JSON, not a grep. Two reasons: the field is
+    # `Name` for apps and `name` for volumes (already inconsistent), and a
+    # substring grep for "flotta-box" matches an existing "flotta-box-2" — so
+    # the recipe would decide the app exists and skip creating it.
+    if ! flyctl apps list --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any(a.get('Name')=='$APP' for a in json.load(sys.stdin)) else 1)"; then
       echo "creating app $APP in org $ORG"
       flyctl apps create "$APP" --org "$ORG" || {
         echo "" >&2
@@ -302,7 +307,8 @@ fly-up: fly-whoami
       echo "app $APP already exists"
     fi
 
-    if ! flyctl volumes list --app "$APP" --json | grep -q "\"name\": *\"$VOL\""; then
+    if ! flyctl volumes list --app "$APP" --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any(v.get('name')=='$VOL' for v in json.load(sys.stdin)) else 1)"; then
       echo "creating ${GB}GB volume $VOL"
       # -y: no interactive "are you sure about a single-node volume" prompt.
       # A single unreplicated volume is correct here — this is one box, and
@@ -317,13 +323,23 @@ fly-up: fly-whoami
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
     cp fly/Dockerfile fly/box_entrypoint.sh fly/fly.toml "$TMP/"
-    uv run python - "$TMP/fly.toml" "$APP" "$REGION" "$REF" <<'PY'
+    uv run python - "$TMP/fly.toml" "$APP" "$REGION" "$REF" "$VOL" <<'PY'
     import pathlib, sys
-    path, app, region, ref = pathlib.Path(sys.argv[1]), *sys.argv[2:5]
+    path = pathlib.Path(sys.argv[1])
+    app, region, ref, vol = sys.argv[2:6]
     text = path.read_text()
-    text = text.replace('app = "flotta-box"', f'app = "{app}"')
-    text = text.replace('primary_region = ""', f'primary_region = "{region}"')
-    text = text.replace('HERMES_REF = "v2026.8.19"', f'HERMES_REF = "{ref}"')
+    for old, new in (
+        ('app = "flotta-box"', f'app = "{app}"'),
+        ('primary_region = ""', f'primary_region = "{region}"'),
+        ('HERMES_REF = "v2026.8.19"', f'HERMES_REF = "{ref}"'),
+        # The mount source has to move with the volume name. Creating
+        # `$VOL` while fly.toml still mounts `flotta_data` deploys a machine
+        # with no disk where HERMES_HOME should be — and the proof then reads
+        # as a durability failure rather than a config mistake.
+        ('source = "flotta_data"', f'source = "{vol}"'),
+    ):
+        assert old in text, f"fly.toml no longer contains {old!r}"
+        text = text.replace(old, new)
     path.write_text(text)
     PY
 
@@ -367,9 +383,20 @@ fly-secrets: fly-whoami
     : "${FLOTTA_MODEL:?set FLOTTA_MODEL in .env}"
     : "${FLOTTA_MODEL_BASE_URL:?set FLOTTA_MODEL_BASE_URL in .env}"
     : "${FLOTTA_API_KEY:?set FLOTTA_API_KEY in .env}"
-    # --stage writes them without restarting; the caller decides when to bounce.
-    # Values are passed on stdin, never as argv — argv is visible in `ps`.
+
+    # `secrets import` issues a release, which STARTS stopped machines. That is
+    # the surprise-agent footgun the missing service block exists to avoid, so
+    # remember what was asleep and put it back.
+    WERE_STOPPED=$(flyctl machines list --app "$APP" --json \
+      | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin) if m['state'] != 'started'))")
+
+    # Values on stdin, never argv — argv is visible in `ps`.
     printf 'FLOTTA_MODEL=%s\nFLOTTA_MODEL_BASE_URL=%s\nFLOTTA_API_KEY=%s\n' \
       "$FLOTTA_MODEL" "$FLOTTA_MODEL_BASE_URL" "$FLOTTA_API_KEY" \
       | flyctl secrets import --app "$APP"
+
+    for MID in $WERE_STOPPED; do
+      echo "re-stopping $MID (it was asleep before this rotation)"
+      flyctl machines stop "$MID" --app "$APP" >/dev/null
+    done
     echo "provider secrets set on $APP (values not echoed)"

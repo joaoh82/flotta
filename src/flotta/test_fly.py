@@ -59,6 +59,20 @@ def test_the_four_things_that_must_survive():
     }
 
 
+def test_state_db_is_not_labelled_as_conversation_history():
+    """Measured, not assumed.
+
+    After a completed headless turn on a live box, `state.db` holds one table
+    (`async_delegations`, zero rows) — SEAM_NOTES Q3's sessions/messages/FTS
+    schema is written by the gateway/CLI path. Labelling the file "conversation
+    history" would promise something M2 does not deliver, and the promise would
+    outlive anyone's memory of measuring it.
+    """
+    state_db = next(p for p in DURABLE_PATHS if p.relative == "state.db")
+    assert "conversation history" not in state_db.what
+    assert not state_db.is_dir
+
+
 def test_skills_is_in_the_contract():
     """Named explicitly: `skills/` surviving is what "self-improving" means.
 

@@ -31,6 +31,11 @@ ARG HERMES_REF
 ARG HERMES_REPO=https://github.com/NousResearch/Hermes-Agent
 RUN test -n "$HERMES_REF" || (echo "HERMES_REF build-arg is required" >&2; exit 1)
 
+# `/opt/hermes`, and a plain `-e .` rather than the worker image's
+# `/opt/hermes-agent` and `[mcp]` extra. The extra exists so a Tier 3 worker can
+# serve an MCP endpoint; a box has nothing to serve yet (M3 turns the messaging
+# gateway on and that changes). Noted so the difference reads as a decision
+# rather than drift the next time someone diffs the two images.
 ENV HERMES_SRC=/opt/hermes
 RUN git clone --depth 1 --branch "$HERMES_REF" "$HERMES_REPO" "$HERMES_SRC" \
     && pip install --no-cache-dir -e "$HERMES_SRC"

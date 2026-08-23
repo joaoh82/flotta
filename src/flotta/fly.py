@@ -89,7 +89,12 @@ class DurablePath:
 # This is the acceptance surface for M2: "memory survives" is four distinct
 # claims, and asserting only the first would let the interesting ones rot.
 DURABLE_PATHS: tuple[DurablePath, ...] = (
-    DurablePath("state.db", "conversation history (sessions, messages, FTS)", is_dir=False),
+    # Measured, not assumed: after a completed headless turn on a live box,
+    # state.db holds one table (`async_delegations`, zero rows). SEAM_NOTES Q3
+    # describes the full sessions/messages/FTS schema, but that is written by
+    # the gateway/CLI path — so this file surviving is a *file* claim today,
+    # not a "your chat history is safe" claim. It becomes the latter in M3.
+    DurablePath("state.db", "Hermes's state database (see note above)", is_dir=False),
     DurablePath("memories", "markdown memory written by the memory tool", is_dir=True),
     DurablePath("skills", "learned skills — the self-improvement surface", is_dir=True),
     DurablePath("sessions", "per-session transcripts", is_dir=True),
@@ -178,8 +183,10 @@ class FlyConfig:
         return cls(
             org=pick(ORG_ENV) or DEFAULT_ORG,
             app=pick(APP_ENV) or DEFAULT_APP,
-            # None means "let Fly choose the region nearest you", which is the
-            # right default for a single hand-provisioned box.
+            # None here means "not configured", NOT "let Fly decide" — Fly
+            # does not get a say, because `fly volumes create` refuses to run
+            # without an explicit region off a TTY. `resolved_region()` turns
+            # this into a concrete one.
             region=pick(REGION_ENV),
             volume_name=pick(VOLUME_NAME_ENV) or DEFAULT_VOLUME_NAME,
             volume_gb=volume_gb,
