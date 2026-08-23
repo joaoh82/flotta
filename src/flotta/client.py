@@ -29,7 +29,6 @@ this module's interface, not its transport.
 from __future__ import annotations
 
 import contextlib
-import json
 import socket
 import subprocess
 import time
@@ -170,16 +169,86 @@ def health(endpoint: str, *, timeout_s: float = DEFAULT_READY_TIMEOUT_S) -> dict
         raise ChatError(f"could not reach {endpoint}: {exc}") from exc
 
 
-def _post(base_url: str, path: str, payload: dict, *, timeout_s: float) -> dict:
-    request = urllib.request.Request(
-        f"{base_url}{path}",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout_s) as response:
-        body = response.read().decode("utf-8", "replace")
+# --- authenticating against a box -----------------------------------------
+#
+# The flow, discovered by reading the routes and confirmed against a live box:
+#
+#   POST /auth/password-login   {provider, username, password}  -> session cookies
+#   POST /api/auth/ws-ticket                                    -> single-use ticket (30s)
+#   WS   /api/ws?ticket=...                                     -> the agent
+#
+# The ticket exists because a browser cannot set headers on a WebSocket; it is
+# single-use with a short TTL, so mint one per connection rather than caching.
+
+PROVIDER = "basic"
+USERNAME = "flotta"
+
+
+def credentials(dotenv: str = ".env") -> tuple[str, str]:
+    """(username, password) for the box, from the local dotenv.
+
+    Written there by `just fly-auth`, which also pushes them to the box as Fly
+    secrets. Never committed — the box is reachable only over Fly's private
+    network, but that is one layer and Hermes's auth gate is the other.
+    """
+    from pathlib import Path
+
     try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise ChatError(f"{path} did not return JSON: {body[:200]!r}") from exc
+        text = Path(dotenv).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ChatError(f"no {dotenv} to read box credentials from — run `just fly-auth`") from exc
+    for line in text.splitlines():
+        if line.startswith("FLOTTA_BOX_PASSWORD="):
+            return USERNAME, line.split("=", 1)[1].strip()
+    raise ChatError(f"FLOTTA_BOX_PASSWORD is not in {dotenv} — run `just fly-auth`")
+
+
+def new_session(*, unsafe_cookies: bool = True):
+    """An aiohttp session that will actually keep the box's cookies.
+
+    `unsafe=True` is load-bearing, not laziness: aiohttp refuses to store
+    cookies for IP-address hosts, and a tunnel is always `127.0.0.1`. Without
+    it the login returns 200, no cookie is retained, and the very next request
+    is anonymous — which surfaces as a bare 401 from `/api/auth/ws-ticket` and
+    looks like a credentials problem rather than a cookie-jar policy.
+    """
+    import aiohttp
+
+    return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=unsafe_cookies))
+
+
+async def login(session, base_url: str, username: str, password: str) -> None:
+    """Exchange credentials for session cookies on `session`."""
+    response = await session.post(
+        f"{base_url}/auth/password-login",
+        json={"provider": PROVIDER, "username": username, "password": password, "next": ""},
+    )
+    if response.status != 200:
+        body = (await response.text())[:200]
+        raise ChatError(
+            f"login refused ({response.status}): {body}. "
+            "Credentials are minted by `just fly-auth`; rotating them there "
+            "updates both the box and .env."
+        )
+
+
+async def ws_ticket(session, base_url: str) -> str:
+    """Mint a single-use WebSocket ticket for the logged-in session."""
+    response = await session.post(f"{base_url}/api/auth/ws-ticket")
+    if response.status != 200:
+        body = (await response.text())[:200]
+        raise ChatError(
+            f"could not mint a ws ticket ({response.status}): {body}. "
+            "A 401 here after a successful login usually means the cookie jar "
+            "dropped the session — see `new_session`."
+        )
+    payload = await response.json()
+    ticket = payload.get("ticket")
+    if not ticket:
+        raise ChatError(f"ws-ticket returned no ticket: {payload}")
+    return str(ticket)
+
+
+async def open_agent_socket(session, base_url: str, ticket: str):
+    """Connect to the box's agent socket. Caller owns the returned WS."""
+    return await session.ws_connect(f"{base_url}/api/ws?ticket={ticket}")

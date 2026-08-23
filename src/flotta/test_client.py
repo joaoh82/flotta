@@ -71,3 +71,50 @@ def test_the_client_holds_no_agent_logic():
     source = (__import__("pathlib").Path(__file__).parent / "client.py").read_text()
     for forbidden in ("run_agent", "AIAgent", "openai", "anthropic", "run_conversation"):
         assert forbidden not in source, f"the thin client must not reference {forbidden!r}"
+
+
+# -- authenticating against a box -------------------------------------------
+
+
+def test_credentials_come_from_the_dotenv(tmp_path):
+    from flotta.client import USERNAME, credentials
+
+    env = tmp_path / ".env"
+    env.write_text("FLOTTA_MODEL=x\nFLOTTA_BOX_PASSWORD=s3cret\n")
+    assert credentials(str(env)) == (USERNAME, "s3cret")
+
+
+def test_missing_credentials_point_at_the_command_that_mints_them(tmp_path):
+    from flotta.client import credentials
+
+    env = tmp_path / ".env"
+    env.write_text("FLOTTA_MODEL=x\n")
+    with pytest.raises(ChatError, match="just fly-auth"):
+        credentials(str(env))
+
+    with pytest.raises(ChatError, match="just fly-auth"):
+        credentials(str(tmp_path / "nope.env"))
+
+
+def test_the_cookie_jar_must_be_unsafe_for_ip_hosts():
+    """A tunnel is always 127.0.0.1, and aiohttp will not store cookies for an
+    IP host by default.
+
+    Without this the login returns 200, the cookie is silently dropped, and the
+    next request is anonymous — which surfaces as a bare 401 from
+    `/api/auth/ws-ticket` and reads as a credentials problem rather than a
+    cookie-jar policy. Cost an entire debugging pass; pinned so it cannot
+    regress quietly.
+    """
+    import asyncio
+
+    from flotta.client import new_session
+
+    async def check():
+        session = new_session()
+        try:
+            assert session.cookie_jar._unsafe is True
+        finally:
+            await session.close()
+
+    asyncio.run(check())

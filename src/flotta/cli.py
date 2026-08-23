@@ -439,6 +439,69 @@ def ps(
 
 
 @app.command()
+def chat(
+    box_id: str = typer.Argument(..., help="Box id or name"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+    status: bool = typer.Option(
+        True, "--status/--no-status", help="Prove the authenticated round trip and exit"
+    ),
+) -> None:
+    """Open an authenticated connection to a box's agent.
+
+    The inversion, as a command: this does **not** run an agent. It tunnels to
+    the box over Fly's private network, authenticates against the Hermes
+    running there, and opens its agent socket. All the thinking happens on the
+    box, where the memory is.
+    """
+    import asyncio
+
+    from . import client as chat_client
+
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        if not box.endpoint:
+            typer.secho(
+                f"box {box.id} has no endpoint — it was never launched",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        async def run() -> dict:
+            with chat_client.tunnel(box.endpoint) as base_url:
+                chat_client.wait_until_ready(base_url)
+                username, password = chat_client.credentials()
+                session = chat_client.new_session()
+                try:
+                    await chat_client.login(session, base_url, username, password)
+                    ticket = await chat_client.ws_ticket(session, base_url)
+                    socket = await chat_client.open_agent_socket(session, base_url, ticket)
+                    await socket.close()
+                    return {
+                        "box_id": box.id,
+                        "name": box.name,
+                        "endpoint": box.endpoint,
+                        "authenticated": True,
+                        "agent_socket": "open",
+                    }
+                finally:
+                    await session.close()
+
+        try:
+            result = asyncio.run(run())
+        except chat_client.ChatError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+
+        emit(
+            result,
+            f"{box.name} ({box.id})\n  {box.endpoint}\n  authenticated, agent socket open",
+            as_json=as_json,
+        )
+
+
+@app.command()
 def logs(
     box_id: str = typer.Argument(..., help="Box id or name"),
     store: str | None = StoreOpt,

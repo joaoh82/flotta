@@ -122,6 +122,16 @@ between milestones — architecture, conventions, and the sharp edges below.
   once, create many boxes — so `BoxSpec.image` names an existing one and
   `just fly-up` owns producing it. The same split will hold for a Firecracker
   rootfs.
+- **aiohttp will not store cookies for an IP host** unless the jar is built
+  with `unsafe=True`. A tunnel is always `127.0.0.1`, so without it the login
+  returns 200, the cookie is dropped, and the next call is anonymous — which
+  surfaces as a bare 401 from `/api/auth/ws-ticket` and reads as bad
+  credentials rather than a cookie-jar policy.
+- **The box's auth flow** is `POST /auth/password-login` ({provider, username,
+  password}) for session cookies, then `POST /api/auth/ws-ticket` for a
+  single-use 30s ticket, then `WS /api/ws?ticket=...`. The ticket exists
+  because a browser cannot set headers on a WebSocket — mint one per
+  connection rather than caching it.
 - **Fly's private network is IPv6-only — bind `::`, never `0.0.0.0`.** An
   IPv4-only bind is invisible to `flyctl proxy`, which dials the machine's
   `fdaa:` address: the connection resets and nothing in the logs explains it.
