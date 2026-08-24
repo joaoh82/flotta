@@ -282,7 +282,7 @@ Data flow: orchestrator → `spawn_box` (Modal) → the container boots headless
 - **Python 3.11**, type hints everywhere, **ruff** for lint + format.
 - Tests with **pytest** next to the code (`test_*.py`). Every `store`/`provision` change needs a test; validate status transitions and listing filters explicitly. **Keep the suite hermetic and $0** — every Modal touchpoint is injected, never called for real. `just check` is the gate; it must be green before committing — and since `.github/workflows/ci.yml` runs it on every pull request and every push to `main`, a green suite is now verified on the commit rather than asserted in the PR description. Keep the workflow free of secrets and of any recipe that touches real Modal or Fly.
 - **One commit per completed task**, message prefixed with the task ID — e.g. `M3.2: spawn_box writes lifecycle events`.
-- Dashboard: TypeScript, **no UI library beyond Tailwind**, keep it boring.
+- Dashboard: TypeScript, **no UI library beyond Tailwind**, keep it boring. Node version is `dashboard/.nvmrc` (24) and it is not incidental: `package-lock.json` is maintained under npm 11, and the npm 10 that ships with Node 20/22 rejects it (`npm ci` reports `@emnapi/core`/`@emnapi/runtime` missing). Regenerate the lockfile with the same Node.
 - Secrets only via Modal secrets / `.env` (gitignored) — never hardcode.
 - Use **plan mode first** for anything non-trivial; keep session scopes small (≈ one milestone task cluster).
 
