@@ -441,11 +441,10 @@ def ps(
 @app.command()
 def chat(
     box_id: str = typer.Argument(..., help="Box id or name"),
+    message: str | None = typer.Argument(None, help="What to say. Omit to just check the box."),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
-    status: bool = typer.Option(
-        True, "--status/--no-status", help="Prove the authenticated round trip and exit"
-    ),
+    timeout_s: float = typer.Option(300.0, "--timeout-s", help="How long to wait for a reply"),
 ) -> None:
     """Open an authenticated connection to a box's agent.
 
@@ -490,15 +489,43 @@ def chat(
                     await chat_client.login(session, base_url, username, password)
                     ticket = await chat_client.ws_ticket(session, base_url)
                     socket = await chat_client.open_agent_socket(session, base_url, ticket)
-                    await socket.close()
-                    return {
-                        "box_id": box.id,
-                        "name": box.name,
-                        "endpoint": box.endpoint,
-                        "authenticated": True,
-                        "agent_socket": "open",
-                        "was_asleep": woken["was_asleep"],
-                    }
+                    try:
+                        await chat_client.await_ready(socket)
+                        result = {
+                            "box_id": box.id,
+                            "name": box.name,
+                            "endpoint": box.endpoint,
+                            "authenticated": True,
+                            "agent_socket": "open",
+                            "was_asleep": woken["was_asleep"],
+                        }
+                        if message is None:
+                            # No message: prove the round trip and stop. Useful
+                            # as a health check, and the behaviour before the
+                            # turn protocol was decoded.
+                            return result
+
+                        created = await chat_client.create_session(socket)
+                        session_id = created.get("session_id") or ""
+                        if not session_id:
+                            # Fail closed. Sending a turn with an empty session
+                            # id is rejected by the gateway as a JSON-RPC error,
+                            # which used to mean waiting out the whole turn
+                            # deadline for a refusal that arrived immediately.
+                            raise chat_client.ChatError(
+                                f"the box opened no session: {created or '(empty result)'}"
+                            )
+                        turn = await chat_client.send_turn(
+                            socket, session_id, message, timeout_s=timeout_s
+                        )
+                        return {
+                            **result,
+                            "session_id": turn.session_id,
+                            "model": (created.get("info") or {}).get("model"),
+                            "response": turn.response,
+                        }
+                    finally:
+                        await socket.close()
                 finally:
                     await session.close()
 
@@ -508,11 +535,14 @@ def chat(
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
 
-        emit(
-            result,
-            f"{box.name} ({box.id})\n  {box.endpoint}\n  authenticated, agent socket open",
-            as_json=as_json,
-        )
+        if message is None:
+            emit(
+                result,
+                f"{box.name} ({box.id})\n  {box.endpoint}\n  authenticated, agent socket open",
+                as_json=as_json,
+            )
+            return
+        emit(result, result["response"], as_json=as_json)
 
 
 @app.command()
