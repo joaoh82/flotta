@@ -798,6 +798,60 @@ def start_box(
     return {"box_id": box_id, "status": "running", "already_running": False}
 
 
+def wake_box(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    reason: str = "addressed",
+) -> dict[str, Any]:
+    """Ensure a box is up, whatever state it was in. Idempotent.
+
+    **A box is meant to be asleep most of the time** — that is the entire cost
+    argument (§8.4: an idle fleet costs about what a fleet of disks costs). So
+    anything that addresses a box has to be willing to wake it. §M7 says the
+    same thing from the other end: "delegation wakes a stopped box; it does not
+    create one".
+
+    Distinct from `start_box`, which is the *operator's* verb and deliberately
+    refuses anything that is not `stopped` — asking to start a mid-provision
+    box is a mistake worth reporting. This is the *addressing* path: the caller
+    does not care what state the box was in, only that it is up now.
+
+    It also reconciles a row that disagrees with the substrate. That happens
+    for real: Fly can stop a machine on its own (a host drain, a platform
+    restart), leaving the store saying `running` while nothing is listening.
+    """
+    box = _require_box(store, box_id)
+    impl = _resolve_backend(box, backend)
+
+    observed = _observed_state(impl, box.endpoint or box_id, assume="unknown")
+    already_up = observed == "started"
+
+    if not already_up:
+        try:
+            impl.start(box.endpoint or box_id)
+        except BackendError as exc:
+            raise ProvisionError(f"could not wake box {box_id}: {exc}") from exc
+
+    # Bring the row back in line. `stopped -> running` is the ordinary wake;
+    # a row already claiming `running` needs nothing.
+    if box.status == "stopped":
+        store.add_event("box", box_id, "running", {"reason": reason, "previous_status": "stopped"})
+        store.update_box_status(box_id, "running")
+    elif box.status != "running":
+        raise ProvisionError(
+            f"box {box_id} is {box.status!r}; only a running or stopped box can be addressed"
+        )
+
+    return {
+        "box_id": box_id,
+        "status": "running",
+        "was_asleep": not already_up,
+        "observed_before": observed,
+    }
+
+
 def watch_task(
     task_id: str,
     *,

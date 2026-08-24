@@ -110,7 +110,20 @@ def tunnel(
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 stderr = (proc.stderr.read() if proc.stderr else "") or ""
-                raise ChatError(f"flyctl proxy exited immediately: {stderr.strip()[:300]}")
+                detail = stderr.strip()[:300]
+                if "not found in DNS" in detail:
+                    # Fly's internal DNS only resolves *running* machines, so
+                    # this is almost always a sleeping box rather than a bad
+                    # address — and the raw flyctl message reads like the
+                    # latter.
+                    raise ChatError(
+                        f"{endpoint} is not in Fly's internal DNS, which usually means "
+                        "the machine is stopped — Fly only resolves running machines. "
+                        "Wake it first (`flotta chat` does this for you; "
+                        "`flyctl machines start <id>` by hand).\n"
+                        f"  flyctl said: {detail}"
+                    )
+                raise ChatError(f"flyctl proxy exited immediately: {detail}")
             with (
                 contextlib.suppress(OSError),
                 socket.create_connection(("127.0.0.1", port), timeout=0.5),

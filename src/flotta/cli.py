@@ -468,6 +468,19 @@ def chat(
             )
             raise typer.Exit(code=1)
 
+        # Wake it first. A box is meant to be asleep most of the time, and Fly's
+        # internal DNS only resolves *running* machines — so without this the
+        # tunnel fails with a bare "host was not found in DNS", which reads as a
+        # broken address rather than a sleeping agent.
+        provision = _provision()
+        try:
+            woken = provision.wake_box(box.id, store=fleet)
+        except provision.ProvisionError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        if woken["was_asleep"] and not as_json:
+            typer.secho(f"woke {box.name} (it was asleep)", fg=typer.colors.BRIGHT_BLACK, err=True)
+
         async def run() -> dict:
             with chat_client.tunnel(box.endpoint) as base_url:
                 chat_client.wait_until_ready(base_url)
@@ -484,6 +497,7 @@ def chat(
                         "endpoint": box.endpoint,
                         "authenticated": True,
                         "agent_socket": "open",
+                        "was_asleep": woken["was_asleep"],
                     }
                 finally:
                     await session.close()

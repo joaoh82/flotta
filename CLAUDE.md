@@ -132,6 +132,21 @@ between milestones — architecture, conventions, and the sharp edges below.
   single-use 30s ticket, then `WS /api/ws?ticket=...`. The ticket exists
   because a browser cannot set headers on a WebSocket — mint one per
   connection rather than caching it.
+- **Fly's internal DNS only resolves *running* machines.** Addressing a
+  stopped box fails with "host was not found in DNS", which reads as a bad
+  address rather than a sleeping agent. Anything that addresses a box must wake
+  it first — `provision.wake_box`, which `flotta chat` calls.
+- **`wake_box` is not `start_box`.** `start_box` is the operator's verb and
+  refuses anything that is not `stopped`, because asking to start a
+  mid-provision box is a mistake worth reporting. `wake_box` is the
+  *addressing* path: it does not care what state the box was in, and it
+  reconciles a row that disagrees with the substrate (Fly can stop a machine on
+  its own during a host drain). §M7: "delegation wakes a stopped box; it does
+  not create one".
+- **Credentials and the app name live in the MAIN checkout's `.env`.** It is
+  gitignored, so a worktree copy dies with the branch — the Fly app name was
+  lost that way once, and `FLOTTA_BOX_PASSWORD` a second time. `just fly-auth`
+  re-mints.
 - **Fly's private network is IPv6-only — bind `::`, never `0.0.0.0`.** An
   IPv4-only bind is invisible to `flyctl proxy`, which dials the machine's
   `fdaa:` address: the connection resets and nothing in the logs explains it.
