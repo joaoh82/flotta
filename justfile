@@ -197,6 +197,12 @@ check-dashboard:
     npx tsc --noEmit
     npx eslint .
 
+# Exactly what .github/workflows/ci.yml runs, in one command — so "will CI go
+# green?" is answerable before pushing. The workflow's two jobs are separate so
+# a dashboard-only failure is obvious there; here they run in sequence.
+# Everything CI checks (python + dashboard) — no Modal, no Fly, no cost
+ci: check check-dashboard
+
 # M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
 # arguments are re-split by the shell, so `just flotta spawn "a b c"` breaks on
 # exactly the case the CLI exists for. Run it directly instead:
