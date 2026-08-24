@@ -506,7 +506,15 @@ def chat(
                             return result
 
                         created = await chat_client.create_session(socket)
-                        session_id = created.get("session_id", "")
+                        session_id = created.get("session_id") or ""
+                        if not session_id:
+                            # Fail closed. Sending a turn with an empty session
+                            # id is rejected by the gateway as a JSON-RPC error,
+                            # which used to mean waiting out the whole turn
+                            # deadline for a refusal that arrived immediately.
+                            raise chat_client.ChatError(
+                                f"the box opened no session: {created or '(empty result)'}"
+                            )
                         turn = await chat_client.send_turn(
                             socket, session_id, message, timeout_s=timeout_s
                         )

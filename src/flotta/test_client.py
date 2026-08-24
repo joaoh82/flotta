@@ -125,6 +125,12 @@ def test_the_cookie_jar_must_be_unsafe_for_ip_hosts():
 # -- the agent protocol -----------------------------------------------------
 
 
+#: Stand-in for "whatever id the client actually allocated". RPC ids come from
+#: a monotonic counter now, so a fixture that hardcodes 1 or 2 would pass only
+#: while it happened to run first.
+ECHO_ID = "<rid>"
+
+
 class FakeWS:
     """A scripted agent socket. Records what the client sent."""
 
@@ -141,6 +147,8 @@ class FakeWS:
         if not self._frames:
             return _Msg(aiohttp.WSMsgType.CLOSED, None)
         payload = self._frames.pop(0)
+        if payload.get("id") == ECHO_ID:
+            payload = {**payload, "id": self.sent[-1]["id"] if self.sent else None}
         return _Msg(aiohttp.WSMsgType.TEXT, json.dumps(payload))
 
 
@@ -188,7 +196,7 @@ def test_a_turn_waits_for_complete_and_ignores_interleaved_events():
 
     ws = FakeWS(
         [
-            {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},  # the ack
+            {"jsonrpc": "2.0", "id": ECHO_ID, "result": {"ok": True}},  # the ack
             _event("sessions.changed"),
             _event("message.delta", {"text": "FLOT"}),
             _event("message.complete", {"text": "FLOTTA-OK", "status": "complete"}),
@@ -233,7 +241,11 @@ def test_session_create_skips_events_until_its_response():
     ws = FakeWS(
         [
             _event("sessions.changed"),
-            {"jsonrpc": "2.0", "id": 1, "result": {"session_id": "abc", "info": {"model": "m"}}},
+            {
+                "jsonrpc": "2.0",
+                "id": ECHO_ID,
+                "result": {"session_id": "abc", "info": {"model": "m"}},
+            },
         ]
     )
     assert asyncio.run(create_session(ws))["session_id"] == "abc"
@@ -246,3 +258,84 @@ def test_a_closed_socket_is_reported_not_hung():
 
     with pytest.raises(ChatError, match="closed"):
         asyncio.run(create_session(FakeWS([])))
+
+
+def test_a_rejected_submit_fails_immediately_not_after_the_turn_deadline():
+    """A refused `prompt.submit` comes back as a JSON-RPC error against our id,
+    never as a `message.complete`.
+
+    Treating it as noise meant waiting out the entire 300s turn deadline for a
+    refusal that arrived in milliseconds — the worst way to surface a bad
+    session id.
+    """
+    import asyncio
+
+    from flotta.client import send_turn
+
+    ws = FakeWS(
+        [{"jsonrpc": "2.0", "id": ECHO_ID, "error": {"code": -32602, "message": "no such session"}}]
+    )
+    with pytest.raises(ChatError, match="rejected"):
+        asyncio.run(send_turn(ws, "gone", "hello", timeout_s=300))
+
+
+def test_an_empty_session_id_is_refused_before_anything_is_sent():
+    import asyncio
+
+    from flotta.client import send_turn
+
+    ws = FakeWS([])
+    with pytest.raises(ChatError, match="without a session id"):
+        asyncio.run(send_turn(ws, "", "hello"))
+    assert ws.sent == [], "nothing should reach the agent"
+
+
+def test_a_timeout_is_a_chat_error_not_a_traceback():
+    """`asyncio.wait_for` raises TimeoutError, which the CLI does not catch —
+    so an unwrapped one dumps a traceback at the operator instead of a line."""
+    import asyncio
+
+    from flotta.client import await_ready
+
+    class Silent(FakeWS):
+        async def receive(self):
+            await asyncio.sleep(5)
+
+    with pytest.raises(ChatError, match="did not respond"):
+        asyncio.run(await_ready(Silent([]), timeout_s=0.2))
+
+
+def test_session_create_has_an_overall_deadline():
+    """Per-frame timeouts let a chatty gateway reset the clock forever."""
+    import asyncio
+
+    from flotta.client import create_session
+
+    class Chatty(FakeWS):
+        async def receive(self):
+            import aiohttp
+
+            await asyncio.sleep(0.05)
+            return _Msg(aiohttp.WSMsgType.TEXT, json.dumps(_event("sessions.changed")))
+
+    with pytest.raises(ChatError, match="not answered within"):
+        asyncio.run(create_session(Chatty([]), timeout_s=0.4))
+
+
+def test_rpc_ids_do_not_collide_on_a_reused_socket():
+    """Ids only need to be unique per connection; a monotonic counter gives
+    that for free. Hardcoded 1/2 collided the moment a socket carried two
+    turns."""
+    import asyncio
+
+    from flotta.client import send_turn
+
+    ws = FakeWS(
+        [
+            _event("message.complete", {"text": "one", "status": "complete"}),
+            _event("message.complete", {"text": "two", "status": "complete"}),
+        ]
+    )
+    asyncio.run(send_turn(ws, "s1", "first"))
+    asyncio.run(send_turn(ws, "s1", "second"))
+    assert ws.sent[0]["id"] != ws.sent[1]["id"]

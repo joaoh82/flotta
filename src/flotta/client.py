@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import socket
 import subprocess
@@ -307,22 +308,38 @@ async def open_agent_socket(session, base_url: str, ticket: str):
 
 READY_EVENT = "gateway.ready"
 COMPLETE_EVENT = "message.complete"
-DELTA_EVENT = "message.delta"
+
+#: JSON-RPC ids only have to be unique per connection, and a global monotonic
+#: counter guarantees that for free. Hardcoding 1 and 2 worked while every
+#: socket carried exactly one turn — a second `send_turn` on the same socket
+#: would have collided with the first.
+_rpc_ids = itertools.count(1)
 
 #: Generous, because it bounds a model call rather than a network round trip —
 #: and on a cold box the agent may still be loading when the turn arrives.
 DEFAULT_TURN_TIMEOUT_S = 300.0
 
 
-async def _rpc(ws, rid: int, method: str, params: dict) -> None:
+async def _rpc(ws, method: str, params: dict) -> int:
+    """Send one JSON-RPC request and return the id its reply will carry."""
+    rid = next(_rpc_ids)
     await ws.send_str(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+    return rid
 
 
-async def _next_json(ws, *, timeout_s: float) -> dict:
-    """One decoded text frame, or a ChatError explaining what arrived instead."""
+async def _next_json(ws, *, timeout_s: float, what: str = "the agent") -> dict:
+    """One decoded text frame, or a ChatError explaining what arrived instead.
+
+    `asyncio.wait_for` raises `TimeoutError`, which the CLI does not catch —
+    so an unwrapped timeout in the handshake dumps a traceback at the operator
+    instead of one line telling them the box did not answer.
+    """
     import aiohttp
 
-    message = await asyncio.wait_for(ws.receive(), timeout=timeout_s)
+    try:
+        message = await asyncio.wait_for(ws.receive(), timeout=timeout_s)
+    except TimeoutError as exc:
+        raise ChatError(f"{what} did not respond within {timeout_s:.0f}s") from exc
     if message.type is not aiohttp.WSMsgType.TEXT:
         raise ChatError(f"the agent socket closed ({message.type.name})")
     try:
@@ -333,7 +350,7 @@ async def _next_json(ws, *, timeout_s: float) -> dict:
 
 async def await_ready(ws, *, timeout_s: float = 30.0) -> dict:
     """Consume the `gateway.ready` the server sends on connect."""
-    frame = await _next_json(ws, timeout_s=timeout_s)
+    frame = await _next_json(ws, timeout_s=timeout_s, what="the agent handshake")
     event = (frame.get("params") or {}).get("type")
     if event != READY_EVENT:
         raise ChatError(f"expected {READY_EVENT}, got {event or frame}")
@@ -342,10 +359,28 @@ async def await_ready(ws, *, timeout_s: float = 30.0) -> dict:
 
 async def create_session(ws, *, title: str = "", timeout_s: float = 60.0) -> dict:
     """Open a conversation on the box and return its `result` block."""
-    await _rpc(ws, 1, "session.create", {"title": title} if title else {})
+    rid = await _rpc(ws, "session.create", {"title": title} if title else {})
+
+    # A wall-clock deadline, not a per-frame one. Waiting `timeout_s` per
+    # *ignored* event means a chatty gateway that never answers this id keeps
+    # resetting the clock and the handshake never ends.
+    deadline = asyncio.get_running_loop().time() + timeout_s
     while True:
-        frame = await _next_json(ws, timeout_s=timeout_s)
-        if frame.get("id") != 1:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise ChatError(f"session.create was not answered within {timeout_s:.0f}s")
+        try:
+            frame = await _next_json(ws, timeout_s=remaining, what="session.create")
+        except ChatError:
+            # The per-frame wait and the wall-clock deadline race as `remaining`
+            # shrinks. Report the deadline that actually matters rather than
+            # "did not respond within 0s".
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ChatError(
+                    f"session.create was not answered within {timeout_s:.0f}s"
+                ) from None
+            raise
+        if frame.get("id") != rid:
             continue  # events interleave with responses; ignore until ours lands
         if "error" in frame:
             raise ChatError(f"session.create failed: {frame['error']}")
@@ -363,14 +398,30 @@ async def send_turn(
     deltas would make this client responsible for a rendering concern it has
     no business holding.
     """
-    await _rpc(ws, 2, "prompt.submit", {"session_id": session_id, "text": text})
+    if not session_id:
+        raise ChatError("cannot send a turn without a session id")
+
+    rid = await _rpc(ws, "prompt.submit", {"session_id": session_id, "text": text})
 
     deadline = asyncio.get_running_loop().time() + timeout_s
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise ChatError(f"the agent did not reply within {timeout_s:.0f}s")
-        frame = await _next_json(ws, timeout_s=remaining)
+        try:
+            frame = await _next_json(ws, timeout_s=remaining, what="the agent")
+        except ChatError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ChatError(f"the agent did not reply within {timeout_s:.0f}s") from None
+            raise
+
+        # A rejected submit — unknown session, malformed params — comes back as
+        # a JSON-RPC error against our id, never as a `message.complete`.
+        # Treating it as noise means waiting out the whole turn deadline for an
+        # answer that was refused in milliseconds.
+        if frame.get("id") == rid and "error" in frame:
+            raise ChatError(f"prompt.submit was rejected: {frame['error']}")
+
         params = frame.get("params") or {}
         if params.get("type") != COMPLETE_EVENT:
             continue
