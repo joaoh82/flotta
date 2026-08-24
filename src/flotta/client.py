@@ -72,28 +72,13 @@ def free_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-@contextlib.contextmanager
-def tunnel(
-    endpoint: str,
-    *,
-    remote_port: int = DEFAULT_REMOTE_PORT,
-    local_port: int | None = None,
-    ready_timeout_s: float = 20.0,
-) -> Iterator[str]:
-    """Open a WireGuard tunnel to a box's loopback port; yield the local base URL.
-
-    Always closed on exit, including on error: a leaked `flyctl proxy` holds a
-    port and keeps a WireGuard session alive long after the command that made
-    it is gone, and the next run then fails with a confusing bind error.
-    """
-    app, machine_id = parse_endpoint(endpoint)
-    port = local_port or free_local_port()
-
-    proc = subprocess.Popen(
+def _spawn_proxy(app: str, machine_id: str, local_port: int, remote_port: int):
+    """Start `flyctl proxy` against one specific machine."""
+    return subprocess.Popen(
         [
             "flyctl",
             "proxy",
-            f"{port}:{remote_port}",
+            f"{local_port}:{remote_port}",
             "--app",
             app,
             # Address the machine directly rather than letting Fly's internal
@@ -105,20 +90,69 @@ def tunnel(
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+@contextlib.contextmanager
+def tunnel(
+    endpoint: str,
+    *,
+    remote_port: int = DEFAULT_REMOTE_PORT,
+    local_port: int | None = None,
+    ready_timeout_s: float = 20.0,
+    dns_retry_s: float = 30.0,
+) -> Iterator[str]:
+    """Open a WireGuard tunnel to a box's loopback port; yield the local base URL.
+
+    Always closed on exit, including on error: a leaked `flyctl proxy` holds a
+    port and keeps a WireGuard session alive long after the command that made
+    it is gone, and the next run then fails with a confusing bind error.
+    """
+    app, machine_id = parse_endpoint(endpoint)
+    port = local_port or free_local_port()
+
+    # Fly's internal DNS lags a machine reaching `started` by a beat, so a
+    # proxy opened the instant after a wake can still be told the host does not
+    # exist. Retrying is the difference between "run it again" and "it works" —
+    # the caller has already done everything right by waking the box first.
+    proc = _spawn_proxy(app, machine_id, port, remote_port)
+    dns_deadline = time.monotonic() + dns_retry_s
     try:
-        deadline = time.monotonic() + ready_timeout_s
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                stderr = (proc.stderr.read() if proc.stderr else "") or ""
-                raise ChatError(f"flyctl proxy exited immediately: {stderr.strip()[:300]}")
-            with (
-                contextlib.suppress(OSError),
-                socket.create_connection(("127.0.0.1", port), timeout=0.5),
-            ):
+        while True:
+            deadline = time.monotonic() + ready_timeout_s
+            failure: str | None = None
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    stderr = (proc.stderr.read() if proc.stderr else "") or ""
+                    failure = stderr.strip()[:300]
+                    break
+                with (
+                    contextlib.suppress(OSError),
+                    socket.create_connection(("127.0.0.1", port), timeout=0.5),
+                ):
+                    failure = None
+                    break
+                time.sleep(0.2)
+            else:
+                raise ChatError(f"tunnel to {endpoint} never came up within {ready_timeout_s}s")
+
+            if failure is None:
                 break
-            time.sleep(0.2)
-        else:
-            raise ChatError(f"tunnel to {endpoint} never came up within {ready_timeout_s}s")
+
+            if "not found in DNS" in failure and time.monotonic() < dns_deadline:
+                # Almost certainly propagation, not a wrong address — the box
+                # was just woken. Try again on a fresh proxy.
+                time.sleep(1.0)
+                proc = _spawn_proxy(app, machine_id, port, remote_port)
+                continue
+
+            if "not found in DNS" in failure:
+                raise ChatError(
+                    f"{endpoint} is not in Fly's internal DNS after {dns_retry_s:.0f}s. "
+                    "Fly only resolves running machines, so this usually means the "
+                    "machine is stopped or failed to start — check `just fly-doctor`.\n"
+                    f"  flyctl said: {failure}"
+                )
+            raise ChatError(f"flyctl proxy exited immediately: {failure}")
 
         yield f"http://127.0.0.1:{port}"
     finally:
