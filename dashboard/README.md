@@ -43,6 +43,21 @@ about to read — wired as npm's `predev` hook, so it fires for `npm run dev` an
 `just dashboard` alike rather than only the path that happens to go through
 `just`. Set `NO_COLOR` if the highlighting is unwelcome.
 
+## It cannot read a Postgres fleet (yet)
+
+The fleet store can live on Postgres (`$FLOTTA_DATABASE_URL`, M4). **This
+dashboard cannot read that** — it opens a local SQLite file directly. With a
+Postgres URL configured, every API route answers **501 `store_on_postgres`**
+with an explanation, rather than rendering an empty fleet.
+
+Refusing matters more than it might look: the fallback would be a UI showing
+zero boxes while the fleet is alive and healthy, which is the same "wrong file
+looks like no boxes" confusion the CLI spends real effort killing. Use
+`flotta ps` in the meantime.
+
+The fix is not "teach the dashboard Postgres" — it is §8.3's control-plane API,
+which retires direct-SQLite reads entirely.
+
 ## Where the data comes from
 
 | | |
