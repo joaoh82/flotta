@@ -75,13 +75,8 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          # From dashboard/.nvmrc, so nvm/fnm and CI cannot disagree — and the
-          # version is not incidental. package-lock.json is maintained under
-          # npm 11 (Node 24), and npm 10 (which ships with Node 20 and 22)
-          # rejects it: it wants @emnapi/core and @emnapi/runtime as top-level
-          # entries, which npm 11 leaves bundled under
-          # @tailwindcss/oxide-wasm32-wasi. Node 22 here failed `npm ci` for
-          # exactly that reason. next 16 needs >=20.9; the lockfile needs 24.
+          # From dashboard/.nvmrc, so nvm/fnm and CI cannot disagree about the
+          # version the lockfile is maintained under. next 16 needs >=20.9.
           node-version-file: dashboard/.nvmrc
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
