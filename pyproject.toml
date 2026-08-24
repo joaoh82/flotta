@@ -18,6 +18,13 @@ dependencies = [
     "aiohttp>=3.9",
 ]
 
+[project.optional-dependencies]
+# Postgres is opt-in. The fleet store defaults to a SQLite file so local work
+# and the whole test suite need no server — installing a database driver to run
+# 455 hermetic tests would be a poor trade. `uv sync --extra postgres` adds it
+# for anyone pointing $FLOTTA_DATABASE_URL at a real server.
+postgres = ["psycopg[binary]>=3.1"]
+
 [project.scripts]
 flotta = "flotta.cli:app"
 

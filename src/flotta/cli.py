@@ -315,6 +315,39 @@ def emit(payload: Any, table: str, *, as_json: bool) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str) if as_json else table)
 
 
+def store_target(explicit: str | None = None) -> str:
+    """What the CLI will open: a `postgres://` URL, or a SQLite path.
+
+    `$FLOTTA_DATABASE_URL` wins when set — the same variable §8.3's Railway
+    template wires by reference — otherwise the historical `--store` /
+    `$FLOTTA_STORE` / `./fleet.db` chain applies. One value, so there is no way
+    to configure two contradictory stores.
+    """
+    from flotta import db
+
+    url = db.resolve_url(explicit)
+    if db.is_postgres_url(url):
+        return url  # type: ignore[return-value]
+    return str(resolve_store_path(explicit))
+
+
+def describe_store(target: str) -> str:
+    """How the store is named in errors and footers.
+
+    A Postgres URL carries a password, so it is never echoed — the host and
+    database are enough to tell two deployments apart, which is the only
+    reason the store is named at all.
+    """
+    from flotta import db
+
+    if not db.is_postgres_url(target):
+        return str(Path(target).resolve())
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(target)
+    return f"postgres://{parts.hostname or '?'}{parts.path or ''}"
+
+
 def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
     """Open the fleet-state store.
 
@@ -323,6 +356,19 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
     `spawn`, which legitimately starts a fleet from nothing, passes
     ``must_exist=False``.
     """
+    from flotta import db as _db
+
+    target = store_target(store)
+    if _db.is_postgres_url(target):
+        # A server has no "does the file exist" question — it either connects
+        # or it does not, and a connection failure says so far better than a
+        # guess about whether someone has spawned yet.
+        try:
+            return FleetStore(target)
+        except _db.DatabaseError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+
     path = resolve_store_path(store)
     if must_exist and not path.exists():
         # Absolute, always. A relative "fleet.db" does not tell you *which*
@@ -337,7 +383,7 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
         )
         raise typer.Exit(code=2)
     try:
-        return FleetStore(path)
+        return FleetStore(str(path))
     except LegacyStoreError as exc:
         # A pre-M0 store. Same class of confusion as a missing one — say which
         # file and what to do, rather than raising from the SQLite layer.
@@ -434,7 +480,7 @@ def ps(
             # Naming the file matters most when there is nothing to show: an
             # empty fleet and the wrong store look identical otherwise.
             typer.secho(
-                f"(store: {resolve_store_path(store).resolve()})", fg=typer.colors.BRIGHT_BLACK
+                f"(store: {describe_store(store_target(store))})", fg=typer.colors.BRIGHT_BLACK
             )
 
 
