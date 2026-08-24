@@ -5,6 +5,8 @@ module stays *thin*. If it ever grows agent logic the inversion has quietly
 reversed, and a test is a cheaper reminder than a code review.
 """
 
+import json
+
 import pytest
 
 from flotta.client import ChatError, free_local_port, wait_until_ready
@@ -118,3 +120,129 @@ def test_the_cookie_jar_must_be_unsafe_for_ip_hosts():
             await session.close()
 
     asyncio.run(check())
+
+
+# -- the agent protocol -----------------------------------------------------
+
+
+class FakeWS:
+    """A scripted agent socket. Records what the client sent."""
+
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self.sent: list[dict] = []
+
+    async def send_str(self, data):
+        self.sent.append(json.loads(data))
+
+    async def receive(self):
+        import aiohttp
+
+        if not self._frames:
+            return _Msg(aiohttp.WSMsgType.CLOSED, None)
+        payload = self._frames.pop(0)
+        return _Msg(aiohttp.WSMsgType.TEXT, json.dumps(payload))
+
+
+class _Msg:
+    def __init__(self, type_, data):
+        self.type = type_
+        self.data = data
+
+
+def _event(type_, payload=None):
+    return {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": type_, "payload": payload or {}},
+    }
+
+
+def test_the_server_speaks_first():
+    """`gateway.ready` arrives unprompted; a client that sends before reading
+    it is talking over the handshake."""
+    import asyncio
+
+    from flotta.client import await_ready
+
+    ws = FakeWS([_event("gateway.ready", {"skin": {"name": "default"}})])
+    assert asyncio.run(await_ready(ws)) == {"skin": {"name": "default"}}
+
+
+def test_a_wrong_first_frame_is_reported():
+    import asyncio
+
+    from flotta.client import await_ready
+
+    ws = FakeWS([_event("something.else")])
+    with pytest.raises(ChatError, match="gateway.ready"):
+        asyncio.run(await_ready(ws))
+
+
+def test_a_turn_waits_for_complete_and_ignores_interleaved_events():
+    """Replies arrive as *events*, not as the RPC result — `prompt.submit`'s
+    response only acknowledges the submit — and other events interleave."""
+    import asyncio
+
+    from flotta.client import send_turn
+
+    ws = FakeWS(
+        [
+            {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},  # the ack
+            _event("sessions.changed"),
+            _event("message.delta", {"text": "FLOT"}),
+            _event("message.complete", {"text": "FLOTTA-OK", "status": "complete"}),
+        ]
+    )
+    turn = asyncio.run(send_turn(ws, "s1", "hello"))
+    assert turn.response == "FLOTTA-OK"
+    assert turn.session_id == "s1"
+    assert ws.sent[0]["method"] == "prompt.submit"
+    assert ws.sent[0]["params"] == {"session_id": "s1", "text": "hello"}
+
+
+def test_a_provider_failure_is_not_printed_as_the_agent_speaking():
+    """Found live: a box with no provider configured answers a normal
+    `message.complete` whose text is an error string.
+
+    Returning it as `response` would print "No inference provider configured"
+    as though the agent had said it — a broken box would look like a confused
+    one.
+    """
+    import asyncio
+
+    from flotta.client import send_turn
+
+    ws = FakeWS(
+        [
+            _event(
+                "message.complete",
+                {"text": "Error: No inference provider configured.", "status": "error"},
+            )
+        ]
+    )
+    with pytest.raises(ChatError, match="could not answer"):
+        asyncio.run(send_turn(ws, "s1", "hello"))
+
+
+def test_session_create_skips_events_until_its_response():
+    import asyncio
+
+    from flotta.client import create_session
+
+    ws = FakeWS(
+        [
+            _event("sessions.changed"),
+            {"jsonrpc": "2.0", "id": 1, "result": {"session_id": "abc", "info": {"model": "m"}}},
+        ]
+    )
+    assert asyncio.run(create_session(ws))["session_id"] == "abc"
+
+
+def test_a_closed_socket_is_reported_not_hung():
+    import asyncio
+
+    from flotta.client import create_session
+
+    with pytest.raises(ChatError, match="closed"):
+        asyncio.run(create_session(FakeWS([])))

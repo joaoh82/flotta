@@ -28,7 +28,9 @@ this module's interface, not its transport.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import socket
 import subprocess
 import time
@@ -286,3 +288,98 @@ async def ws_ticket(session, base_url: str) -> str:
 async def open_agent_socket(session, base_url: str, ticket: str):
     """Connect to the box's agent socket. Caller owns the returned WS."""
     return await session.ws_connect(f"{base_url}/api/ws?ticket={ticket}")
+
+
+# --- talking to the agent --------------------------------------------------
+#
+# The box's agent surface is **JSON-RPC 2.0 over the WebSocket**, decoded by
+# reading `tui_gateway/ws.py` and confirmed against a live box:
+#
+#   <-  {"method": "event", "params": {"type": "gateway.ready", ...}}
+#   ->  {"id": 1, "method": "session.create", "params": {}}
+#   <-  {"id": 1, "result": {"session_id": "...", "info": {"model": ...}}}
+#   ->  {"id": 2, "method": "prompt.submit", "params": {"session_id", "text"}}
+#   <-  {"method": "event", "params": {"type": "message.complete",
+#                                      "payload": {"text", "status", "usage"}}}
+#
+# The server speaks first (`gateway.ready`) and every reply is an *event*, not
+# an RPC result — the `prompt.submit` response only acknowledges the submit.
+
+READY_EVENT = "gateway.ready"
+COMPLETE_EVENT = "message.complete"
+DELTA_EVENT = "message.delta"
+
+#: Generous, because it bounds a model call rather than a network round trip —
+#: and on a cold box the agent may still be loading when the turn arrives.
+DEFAULT_TURN_TIMEOUT_S = 300.0
+
+
+async def _rpc(ws, rid: int, method: str, params: dict) -> None:
+    await ws.send_str(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+
+
+async def _next_json(ws, *, timeout_s: float) -> dict:
+    """One decoded text frame, or a ChatError explaining what arrived instead."""
+    import aiohttp
+
+    message = await asyncio.wait_for(ws.receive(), timeout=timeout_s)
+    if message.type is not aiohttp.WSMsgType.TEXT:
+        raise ChatError(f"the agent socket closed ({message.type.name})")
+    try:
+        return json.loads(message.data)
+    except json.JSONDecodeError as exc:
+        raise ChatError(f"agent sent non-JSON: {message.data[:200]!r}") from exc
+
+
+async def await_ready(ws, *, timeout_s: float = 30.0) -> dict:
+    """Consume the `gateway.ready` the server sends on connect."""
+    frame = await _next_json(ws, timeout_s=timeout_s)
+    event = (frame.get("params") or {}).get("type")
+    if event != READY_EVENT:
+        raise ChatError(f"expected {READY_EVENT}, got {event or frame}")
+    return (frame.get("params") or {}).get("payload") or {}
+
+
+async def create_session(ws, *, title: str = "", timeout_s: float = 60.0) -> dict:
+    """Open a conversation on the box and return its `result` block."""
+    await _rpc(ws, 1, "session.create", {"title": title} if title else {})
+    while True:
+        frame = await _next_json(ws, timeout_s=timeout_s)
+        if frame.get("id") != 1:
+            continue  # events interleave with responses; ignore until ours lands
+        if "error" in frame:
+            raise ChatError(f"session.create failed: {frame['error']}")
+        return frame.get("result") or {}
+
+
+async def send_turn(
+    ws, session_id: str, text: str, *, timeout_s: float = DEFAULT_TURN_TIMEOUT_S
+) -> Turn:
+    """Send one message and wait for the agent's reply.
+
+    Waits for `message.complete` rather than accumulating `message.delta`.
+    The complete frame carries the whole text, so streaming is an option for a
+    UI rather than a requirement for a correct answer — and reassembling
+    deltas would make this client responsible for a rendering concern it has
+    no business holding.
+    """
+    await _rpc(ws, 2, "prompt.submit", {"session_id": session_id, "text": text})
+
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise ChatError(f"the agent did not reply within {timeout_s:.0f}s")
+        frame = await _next_json(ws, timeout_s=remaining)
+        params = frame.get("params") or {}
+        if params.get("type") != COMPLETE_EVENT:
+            continue
+        payload = params.get("payload") or {}
+        status = payload.get("status")
+        reply = payload.get("text") or ""
+        if status and status != "complete":
+            # A provider failure comes back as a normal completion carrying an
+            # error string — surfacing it as a reply would print an error
+            # message as if the agent had said it.
+            raise ChatError(f"the agent could not answer ({status}): {reply[:300]}")
+        return Turn(session_id=session_id, response=reply, raw=payload)

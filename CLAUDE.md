@@ -127,6 +127,22 @@ between milestones — architecture, conventions, and the sharp edges below.
   returns 200, the cookie is dropped, and the next call is anonymous — which
   surfaces as a bare 401 from `/api/auth/ws-ticket` and reads as bad
   credentials rather than a cookie-jar policy.
+- **The box's agent protocol is JSON-RPC 2.0 over `/api/ws`.** The server
+  speaks first (`gateway.ready`), then `session.create` -> `{session_id, info}`
+  and `prompt.submit` `{session_id, text}`. **The reply is an *event*
+  (`message.complete`), not the RPC result** — the `prompt.submit` response only
+  acknowledges the submit. `message.complete` carries the whole text, so
+  reassembling `message.delta` is a rendering choice, not a requirement.
+- **`hermes serve` does not read the `FLOTTA_*` provider vars.** The Tier 3
+  one-shot path passes base_url/api_key straight to `AIAgent`; the gateway
+  resolves a provider through Hermes's own config instead, so a box with only
+  `FLOTTA_*` set answers every turn with "No inference provider configured".
+  `just fly-secrets` sets both vocabularies — `OPENROUTER_API_KEY` for
+  OpenRouter, `OPENAI_*` otherwise. Found by sending a real turn; no test
+  could have caught it.
+- **A provider failure arrives as a normal `message.complete`** whose text is
+  an error string, with `status != "complete"`. Returning it as the reply would
+  print "No inference provider configured" as though the agent had said it.
 - **The box's auth flow** is `POST /auth/password-login` ({provider, username,
   password}) for session cookies, then `POST /api/auth/ws-ticket` for a
   single-use 30s ticket, then `WS /api/ws?ticket=...`. The ticket exists

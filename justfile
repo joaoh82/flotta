@@ -361,10 +361,29 @@ fly-secrets: fly-whoami
     WERE_STOPPED=$(flyctl machines list --app "$APP" --json \
       | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin) if m['state'] != 'started'))")
 
+    # Two consumers, two vocabularies — both have to be set.
+    #
+    # `flotta.box.run` (the Tier 3 one-shot path) takes base_url/api_key as
+    # explicit AIAgent arguments and reads the FLOTTA_* names. `hermes serve`
+    # (the box's agent surface, M3) does NOT: it resolves a provider through
+    # Hermes's own config, so a box with only FLOTTA_* set answers every turn
+    # with "No inference provider configured" — found by sending a real turn,
+    # not by any test.
+    #
+    # The native name depends on the endpoint, so it is derived rather than
+    # guessed: OpenRouter has its own variable, everything OpenAI-compatible
+    # shares OPENAI_*.
+    if printf '%s' "$FLOTTA_MODEL_BASE_URL" | grep -qi openrouter; then
+      NATIVE=$(printf 'OPENROUTER_API_KEY=%s\n' "$FLOTTA_API_KEY")
+    else
+      NATIVE=$(printf 'OPENAI_API_KEY=%s\nOPENAI_BASE_URL=%s\n' "$FLOTTA_API_KEY" "$FLOTTA_MODEL_BASE_URL")
+    fi
+
     # Values on stdin, never argv — argv is visible in `ps`.
-    printf 'FLOTTA_MODEL=%s\nFLOTTA_MODEL_BASE_URL=%s\nFLOTTA_API_KEY=%s\n' \
-      "$FLOTTA_MODEL" "$FLOTTA_MODEL_BASE_URL" "$FLOTTA_API_KEY" \
-      | flyctl secrets import --app "$APP"
+    { printf 'FLOTTA_MODEL=%s\nFLOTTA_MODEL_BASE_URL=%s\nFLOTTA_API_KEY=%s\n' \
+        "$FLOTTA_MODEL" "$FLOTTA_MODEL_BASE_URL" "$FLOTTA_API_KEY"
+      printf '%s\n' "$NATIVE"
+    } | flyctl secrets import --app "$APP"
 
     for MID in $WERE_STOPPED; do
       echo "re-stopping $MID (it was asleep before this rotation)"
