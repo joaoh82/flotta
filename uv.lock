@@ -260,6 +260,7 @@ name = "flotta"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "modal" },
     { name = "typer" },
 ]
@@ -272,6 +273,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.9" },
     { name = "modal", specifier = ">=1.0" },
     { name = "typer", specifier = ">=0.12" },
 ]

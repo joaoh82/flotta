@@ -122,6 +122,40 @@ between milestones — architecture, conventions, and the sharp edges below.
   once, create many boxes — so `BoxSpec.image` names an existing one and
   `just fly-up` owns producing it. The same split will hold for a Firecracker
   rootfs.
+- **aiohttp will not store cookies for an IP host** unless the jar is built
+  with `unsafe=True`. A tunnel is always `127.0.0.1`, so without it the login
+  returns 200, the cookie is dropped, and the next call is anonymous — which
+  surfaces as a bare 401 from `/api/auth/ws-ticket` and reads as bad
+  credentials rather than a cookie-jar policy.
+- **The box's auth flow** is `POST /auth/password-login` ({provider, username,
+  password}) for session cookies, then `POST /api/auth/ws-ticket` for a
+  single-use 30s ticket, then `WS /api/ws?ticket=...`. The ticket exists
+  because a browser cannot set headers on a WebSocket — mint one per
+  connection rather than caching it.
+- **Fly's private network is IPv6-only — bind `::`, never `0.0.0.0`.** An
+  IPv4-only bind is invisible to `flyctl proxy`, which dials the machine's
+  `fdaa:` address: the connection resets and nothing in the logs explains it.
+  Diagnosed by reading `/proc/net/tcp6` on the box, where the only IPv6
+  listener was port 22. `::` binds IPv6 and, with Linux dual-stack, accepts
+  IPv4 too. The same trap catches health checks: probe **both** address
+  families or a perfectly healthy box reports as down.
+- **Do not build shell incantations for `fly ssh` — ship a command.** Checking
+  a box's state through `flyctl ssh console -C "..."` wrapping `/bin/sh -c
+  '...'` wrapping `python3 -c "..."` is three layers of quoting, and one
+  attempt ended up spelling a path as `chr(47)+chr(100)+...` to escape them.
+  `python3 -m flotta.box.doctor` (`just fly-doctor`) has no quoting problem and
+  reports the things worth asking: HERMES_HOME on the volume, the session
+  schema, memories, skills, whether Hermes is listening.
+- **`flyctl machines start` needs an id.** A bare `--app X` fails with "a
+  machine ID must be specified when not running interactively". Swallowing that
+  with `|| true` is worse than not trying: the failure resurfaces as `fly ssh`'s
+  "app has no started VMs. It may be unhealthy or not have been deployed yet",
+  which sends you to check deploys and health for a box that is merely asleep.
+- **`started` is not `ready`.** A machine reaching `started` says nothing about
+  Hermes, which imports the agent first (~6s). Any check run straight after a
+  start needs a bounded wait — `flotta.box.doctor --wait-s`.
+- **`fly ssh` needs a running machine.** A stopped box gives a connection
+  error, not "the box is stopped" — `just fly-doctor` starts it first.
 - **`flyctl ssh console -C` does not run a shell.** It execs the string as
   argv, so `echo a; cat b` runs `echo` with the literal arguments `a;`, `cat`,
   `b` — no error, just quietly wrong output. `FlyBackend.exec` wraps commands
@@ -204,7 +238,9 @@ The runtime is built around one durable store that is the single source of truth
 - **`dashboard/`** — Next.js 16 (App Router, TypeScript, Tailwind 4) reading the same store through Node's built-in **`node:sqlite`** — no native module and no database dependency. Connections are `readOnly` and opened **per request**: under WAL a long-lived reader pins an old snapshot and would quietly serve stale rows to a polling UI. A missing store is a **503 naming the path**, never an empty fleet. Localhost only, no auth, port **3001**. Read-only except the kill button, which shells out to the CLI (D11) and checks the *cancel outcome*, not just the HTTP status.
 
 
-- **`skills/orchestrator/`** — A Hermes skill teaching the orchestrator to delegate, installed with `just install-skill` (symlink, so repo edits take effect without a reinstall). Written to the installed Hermes's own conventions — `description` ≤ 60 chars is a hardline with an enforcement test in its repo. **It competes with Hermes's built-in `delegate_task` in the always-on skill index**, so it leads with the property that actually distinguishes Flotta: **isolation**, not durability. (Durability was the first draft's claim; a live routing test showed a one-shot `cronjob` covers that too, and the model correctly chose `cronjob` over Flotta — D12.)
+- **`skills/orchestrator/` — deleted (M3).** A cloud box's Hermes *is* the
+  orchestrator; a skill teaching it to delegate to itself is dead weight. It had
+  also been broken since M0, when `spawn --json` stopped returning `worker_id`.
 
 Data flow: orchestrator → `spawn_box` (Modal) → the container boots headless Hermes (`AIAgent`), runs the task, reports the result → events land in the store against the box and the task → CLI/dashboard read the store → `teardown_box` closes the machine and fails anything still running on it.
 
@@ -235,7 +271,6 @@ just deploy                 # M3: deploy the provisioning app — required befor
 just e2e                    # M3: full lifecycle against real Modal, dry-run (no LLM, no provider key)
 just e2e-live               # same with a real model call — needs the provider vars synced
 just dashboard              # M5: local fleet view on http://localhost:3001
-just install-skill          # M6: symlink the orchestrator skill into ~/.hermes/skills
 ```
 
 Every Modal recipe pins the workspace profile (`FLOTTA_MODAL_PROFILE`, default `flotta`) through `just modal-whoami`, which authenticates for real — `modal profile current` only echoes the env var back and never validates. This exists because the globally-active profile was once found pointing at an unrelated workspace.
