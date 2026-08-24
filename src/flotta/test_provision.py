@@ -1714,3 +1714,79 @@ def test_wake_refuses_a_torn_down_box(store):
     teardown_box(bid, store=store, canceller=lambda c: None)
     with pytest.raises(ProvisionError, match="can be addressed"):
         wake_box(bid, store=store, backend=FakeBackend())
+
+
+def test_wake_refuses_an_illegal_status_without_touching_the_machine(store):
+    """Legality before any side effect — and the version of this test that
+    used a default `FakeBackend` passed for the wrong reason.
+
+    `FakeBackend` starts out `started`, so the start branch never ran and the
+    ordering bug was invisible: a torn-down box whose machine was *stopped*
+    got started first and refused second, leaving a machine up with the row
+    still saying `torn_down`. Both PR reviewers caught the gap.
+    """
+    bid = box_of(store, spawned(store))
+    teardown_box(bid, store=store, canceller=lambda c: None)
+
+    impl = FakeBackend()
+    impl.machine_state = "stopped"  # the case the old test could not reach
+    with pytest.raises(ProvisionError, match="can be addressed"):
+        wake_box(bid, store=store, backend=impl)
+
+    assert impl.calls == [], "an illegal status must not start the machine"
+    assert impl.machine_state == "stopped"
+    assert store.get_box(bid).status == "torn_down"
+
+
+def test_wake_refuses_a_provisioning_box_without_starting_it(store):
+    box = store.create_box("mid-provision")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    store._conn.execute("UPDATE boxes SET status = 'provisioning' WHERE id = ?", (box.id,))
+
+    impl = FakeBackend()
+    impl.machine_state = "stopped"
+    with pytest.raises(ProvisionError, match="can be addressed"):
+        wake_box(box.id, store=store, backend=impl)
+    assert impl.calls == []
+
+
+def test_wake_does_not_write_running_when_the_machine_stays_down(store):
+    """`start_box` verifies the box came up; `wake_box` must not be laxer.
+
+    Writing `running` on a start that returned early hands the caller straight
+    into the "host was not found in DNS" failure this function exists to
+    prevent — the bookkeeping lie and the user-visible bug are the same event.
+    """
+    bid = idle_box(store)
+    stop_box(bid, store=store, backend=FakeBackend())
+
+    class StartReturnsButStaysDown(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.machine_state = "stopped"
+
+        def start(self, box_id):
+            self.calls.append("start")  # returns cleanly, machine stays down
+
+    with pytest.raises(ProvisionError, match="did not come up"):
+        wake_box(bid, store=store, backend=StartReturnsButStaysDown())
+
+    assert store.get_box(bid).status == "stopped", "the row must be unchanged"
+
+
+def test_wake_does_not_claim_to_have_woken_a_box_it_could_not_observe(store):
+    """ "woke it" should be a fact, not a guess.
+
+    When `state()` cannot answer we still start — it is idempotent — but
+    reporting `was_asleep` would put a confident line in front of the operator
+    on no evidence.
+    """
+    bid = box_of(store, spawned(store))
+
+    class Unobservable(FakeBackend):
+        def state(self, box_id):
+            raise BackendError("fly api unavailable")
+
+    out = wake_box(bid, store=store, backend=Unobservable())
+    assert out["was_asleep"] is False
+    assert out["observed_before"] == "unknown"

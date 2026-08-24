@@ -805,7 +805,7 @@ def wake_box(
     backend: Backend | None = None,
     reason: str = "addressed",
 ) -> dict[str, Any]:
-    """Ensure a box is up, whatever state it was in. Idempotent.
+    """Ensure a box is up so it can be addressed. Idempotent.
 
     **A box is meant to be asleep most of the time** — that is the entire cost
     argument (§8.4: an idle fleet costs about what a fleet of disks costs). So
@@ -813,41 +813,63 @@ def wake_box(
     same thing from the other end: "delegation wakes a stopped box; it does not
     create one".
 
-    Distinct from `start_box`, which is the *operator's* verb and deliberately
-    refuses anything that is not `stopped` — asking to start a mid-provision
-    box is a mistake worth reporting. This is the *addressing* path: the caller
-    does not care what state the box was in, only that it is up now.
+    Distinct from `start_box`, which is the *operator's* verb and refuses
+    anything that is not `stopped` — asking to start a mid-provision box is a
+    mistake worth reporting. This is the *addressing* path: it accepts a box
+    that is already `running` as well as one that is `stopped`, and reconciles a
+    row that disagrees with the substrate. That last case happens for real: Fly
+    can stop a machine on its own during a host drain, leaving the store saying
+    `running` while nothing is listening.
 
-    It also reconciles a row that disagrees with the substrate. That happens
-    for real: Fly can stop a machine on its own (a host drain, a platform
-    restart), leaving the store saying `running` while nothing is listening.
+    It is **not** laxer than `start_box` about the two things that matter:
+
+    - Legality is checked **before** any substrate call. Starting a machine and
+      *then* refusing the wake would leave it running with the row still saying
+      `torn_down` — the exact store/reality disagreement this whole milestone
+      exists to remove.
+    - A start is **verified** before the row moves. A `start()` that returns
+      while the machine is still coming up would otherwise write `running` and
+      hand the caller straight into the "host was not found in DNS" failure
+      this function was added to prevent.
     """
     box = _require_box(store, box_id)
-    impl = _resolve_backend(box, backend)
 
-    observed = _observed_state(impl, box.endpoint or box_id, assume="unknown")
-    already_up = observed == "started"
-
-    if not already_up:
-        try:
-            impl.start(box.endpoint or box_id)
-        except BackendError as exc:
-            raise ProvisionError(f"could not wake box {box_id}: {exc}") from exc
-
-    # Bring the row back in line. `stopped -> running` is the ordinary wake;
-    # a row already claiming `running` needs nothing.
-    if box.status == "stopped":
-        store.add_event("box", box_id, "running", {"reason": reason, "previous_status": "stopped"})
-        store.update_box_status(box_id, "running")
-    elif box.status != "running":
+    # Legality first, before anything can happen to the machine.
+    if box.status not in ("running", "stopped"):
         raise ProvisionError(
             f"box {box_id} is {box.status!r}; only a running or stopped box can be addressed"
         )
 
+    impl = _resolve_backend(box, backend)
+    target = box.endpoint or box_id
+    observed = _observed_state(impl, target, assume="unknown")
+
+    # Only an *observed* non-started state counts as asleep. When `state()`
+    # cannot answer we start anyway (it is idempotent) but do not claim to have
+    # woken anything — "woke it" should be a fact, not a guess.
+    was_asleep = observed not in ("started", "unknown")
+
+    if observed != "started":
+        try:
+            impl.start(target)
+        except BackendError as exc:
+            raise ProvisionError(f"could not wake box {box_id}: {exc}") from exc
+
+        after = _observed_state(impl, target, assume="started")
+        if after not in ("started", "unknown"):
+            raise ProvisionError(
+                f"box {box_id} did not come up: the substrate reports {after!r}. "
+                "The row is unchanged; try again."
+            )
+
+    if box.status == "stopped":
+        store.add_event("box", box_id, "running", {"reason": reason, "previous_status": "stopped"})
+        store.update_box_status(box_id, "running")
+
     return {
         "box_id": box_id,
         "status": "running",
-        "was_asleep": not already_up,
+        "was_asleep": was_asleep,
         "observed_before": observed,
     }
 
