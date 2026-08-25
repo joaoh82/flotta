@@ -469,5 +469,12 @@ test-postgres:
       docker exec "$NAME" pg_isready -U postgres >/dev/null 2>&1 && break
       sleep 1
     done
+    # `--extra postgres`: psycopg is optional, so a clean `uv sync` does not have
+    # it and this recipe would fail on the one machine that most needs it to
+    # work — a fresh checkout.
+    #
+    # The whole store suite runs too, not just the concurrency file: test_store
+    # parameterises over both engines when this variable is set, which is where
+    # "behaves identically" is actually proven.
     FLOTTA_TEST_POSTGRES_URL="postgresql://postgres:flotta@127.0.0.1:$PORT/flotta" \
-      uv run pytest src/flotta/test_store_postgres.py -q
+      uv run --extra postgres pytest src/flotta/test_store.py src/flotta/test_store_postgres.py -q

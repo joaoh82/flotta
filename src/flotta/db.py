@@ -148,6 +148,22 @@ def is_postgres_url(url: str | None) -> bool:
     return bool(url) and str(url).startswith(_POSTGRES_SCHEMES)
 
 
+def describe_url(url: str) -> str:
+    """Host and database only — a Postgres URL carries a password.
+
+    Used anywhere the store is named to a human: errors, footers, logs. There
+    is no case where the credential belongs in output, and the host plus
+    database is enough to tell two deployments apart.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # pragma: no cover - urlsplit is forgiving
+        return "postgres://(unparseable url)"
+    return f"postgres://{parts.hostname or '?'}{parts.path or ''}"
+
+
 def resolve_url(explicit: str | None = None, env: dict[str, str] | None = None) -> str | None:
     """`$FLOTTA_DATABASE_URL`, or None to mean "a local SQLite file"."""
     env = os.environ if env is None else env
@@ -262,7 +278,14 @@ class PostgresConnection:
         try:
             self._conn = psycopg.connect(url, autocommit=True, row_factory=psycopg.rows.dict_row)
         except Exception as exc:
-            raise DatabaseError(f"could not connect to postgres: {exc}") from exc
+            # The URL carries a password and this message reaches stderr.
+            # psycopg's own errors do not echo conninfo today, but "today" is
+            # not a guarantee worth resting a credential on — so the URL is
+            # described rather than interpolated, and the driver's text is
+            # scrubbed of it.
+            safe = describe_url(url)
+            detail = str(exc).replace(url, safe)
+            raise DatabaseError(f"could not connect to {safe}: {detail}") from exc
 
     def _run(self, sql: str, params: Sequence[Any]) -> Any:
         cursor = self._conn.cursor()

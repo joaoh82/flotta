@@ -7,6 +7,8 @@ hand-wrote each tier would let one drift without anyone noticing.
 """
 
 import itertools
+import os
+import uuid
 
 import pytest
 
@@ -27,11 +29,51 @@ from flotta.store import (
     is_terminal,
 )
 
+#: Engines this suite runs against. Postgres is included only when
+#: `$FLOTTA_TEST_POSTGRES_URL` names a server, so `just check` stays hermetic,
+#: offline and $0 — and `just test-postgres` runs the *same* ~90 tests against a
+#: real server rather than a separate, smaller file that could drift.
+_ENGINES = ["sqlite"]
+if os.environ.get("FLOTTA_TEST_POSTGRES_URL", "").strip():
+    _ENGINES.append("postgres")
 
-@pytest.fixture
-def store(tmp_path):
-    with FleetStore(tmp_path / "fleet.db") as s:
-        yield s
+
+@pytest.fixture(params=_ENGINES)
+def store(request, tmp_path):
+    """A FleetStore on each configured engine.
+
+    Parameterised rather than duplicated. M4's claim is that the store behaves
+    *identically* on SQLite and Postgres, and the only way to mean that is to
+    hold the behaviour fixed and swap what is underneath — a second, smaller
+    Postgres-only file would drift from this one and quietly stop proving the
+    claim.
+
+    Each Postgres run gets its own schema: the suite asserts on whole-table
+    listings (`list_boxes() == []`), so leakage between tests would surface as
+    impossible failures far from the cause.
+    """
+    if request.param == "sqlite":
+        with FleetStore(tmp_path / "fleet.db") as s:
+            yield s
+        return
+
+    import psycopg
+
+    url = os.environ["FLOTTA_TEST_POSTGRES_URL"].strip()
+    schema = f"t{uuid.uuid4().hex[:12]}"
+    admin = psycopg.connect(url, autocommit=True)
+    admin.execute(f'CREATE SCHEMA "{schema}"')
+    admin.close()
+
+    sep = "&" if "?" in url else "?"
+    fleet = FleetStore(f"{url}{sep}options=-csearch_path%3D{schema}")
+    try:
+        yield fleet
+    finally:
+        fleet.close()
+        admin = psycopg.connect(url, autocommit=True)
+        admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        admin.close()
 
 
 @pytest.fixture

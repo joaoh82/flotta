@@ -1,9 +1,17 @@
 """Fleet-state store — the single source of truth for fleet state.
 
-Thin SQL over the stdlib ``sqlite3`` driver, no ORM. The store is addressed
-by a database path, and every statement is plain portable SQL, so pointing
-the connection factory at Turso (libsql) later is a one-function change
-(decisions D3/D8 in the development plan).
+Thin SQL, no ORM, over **either SQLite or Postgres** — `flotta.db` is the seam
+(M4). A ``postgres://`` URL selects Postgres, anything else is a SQLite path,
+and ``$FLOTTA_DATABASE_URL`` is the switch. SQLite stays the default so local
+work and the whole test suite need no server.
+
+Every statement here is portable SQL with ``?`` placeholders; the seam rewrites
+them per dialect. What is *not* portable — generated ids and the transaction
+guard — goes through `execute_returning_id` and `transaction(guard=...)` rather
+than being written twice.
+
+D3 planned Turso for this. §8.3's Railway recipe names Postgres, so landing
+Turso would have meant migrating the same schema twice.
 
 **Three tables, three tiers** (the pivot expressed as schema):
 

@@ -342,10 +342,7 @@ def describe_store(target: str) -> str:
 
     if not db.is_postgres_url(target):
         return str(Path(target).resolve())
-    from urllib.parse import urlsplit
-
-    parts = urlsplit(target)
-    return f"postgres://{parts.hostname or '?'}{parts.path or ''}"
+    return db.describe_url(target)
 
 
 def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
@@ -641,14 +638,25 @@ def spawn(
     provision = _provision()
 
     # The one command that may create the store: spawning is how a fleet starts.
+    #
+    # Only a *file* can be created by opening it. On Postgres the server either
+    # exists or the connection fails, and announcing "created fleet store at
+    # ./fleet.db" there was a plain lie — the file was never written, and the
+    # banner printed on every spawn, not just the first. That is the same
+    # "wrong store" confusion this milestone is trying to kill, on the write
+    # side.
+    from flotta import db as _db
+
+    target = store_target(store)
+    on_postgres = _db.is_postgres_url(target)
     store_path = resolve_store_path(store)
-    created_store = not store_path.exists()
+    created_store = not on_postgres and not store_path.exists()
     with _open_store(store, must_exist=False) as fleet:
         if created_store and not as_json:
             # Say so once, so the file's location is known rather than inferred
             # later from a confusing empty `ps`.
             typer.secho(
-                f"created fleet store at {store_path.resolve()}",
+                f"created fleet store at {describe_store(target)}",
                 fg=typer.colors.BRIGHT_BLACK,
             )
         try:

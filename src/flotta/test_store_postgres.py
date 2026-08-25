@@ -1,23 +1,25 @@
-"""The whole store suite, re-run against real Postgres.
+"""What the parameterised store suite cannot assert: two connections racing.
 
-Skipped unless `$FLOTTA_TEST_POSTGRES_URL` names a server, so `just check` stays
-hermetic, offline and $0 — the property that has made every milestone cheap to
-verify. Run it with:
+`test_store.py` runs its whole ~90-test body against Postgres as well as
+SQLite when `$FLOTTA_TEST_POSTGRES_URL` is set — that is where "the store
+behaves identically on both engines" is actually proven, by holding the
+behaviour fixed and swapping what is underneath.
 
-    docker run -d --rm --name flotta-pg -e POSTGRES_PASSWORD=flotta \\
-      -e POSTGRES_DB=flotta -p 55432:5432 postgres:16-alpine
-    FLOTTA_TEST_POSTGRES_URL=postgresql://postgres:flotta@127.0.0.1:55432/flotta \\
-      uv run pytest src/flotta/test_store_postgres.py
+This file is only for the claim that needs **concurrency**: the transaction
+guard. Every other test is single-threaded, so a dropped guard is invisible to
+them — demonstrated during the migration, when three transactions lost their
+guard and all 453 tests still passed. `BEGIN IMMEDIATE` on SQLite and
+`LOCK TABLE … IN SHARE ROW EXCLUSIVE MODE` on Postgres are different
+mechanisms for the same guarantee, and only a race can tell whether either is
+doing its job.
 
-Re-running the *existing* tests rather than writing Postgres-specific ones is
-the point: the claim M4 makes is that the store behaves identically on both
-engines, and the only way to mean that is to hold the behaviour fixed and swap
-what is underneath.
+    just test-postgres     # spins up a throwaway server and runs this
 """
 
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 
 import pytest
@@ -26,30 +28,24 @@ POSTGRES_URL = os.environ.get("FLOTTA_TEST_POSTGRES_URL", "").strip()
 
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL,
-    reason="set FLOTTA_TEST_POSTGRES_URL to run the store suite against Postgres",
+    reason="set FLOTTA_TEST_POSTGRES_URL to run the concurrency checks",
 )
 
 
 @pytest.fixture
-def store():
-    """A FleetStore on Postgres, in a schema of its own.
-
-    A fresh schema per test rather than a shared one: the suite asserts on
-    whole-table listings (`list_boxes() == []`), so leakage between tests would
-    surface as impossible failures far from the cause.
-    """
+def pg_store():
+    """A Postgres FleetStore in a schema of its own."""
     import psycopg
 
     from flotta.store import FleetStore
 
-    schema = f"t{uuid.uuid4().hex[:12]}"
+    schema = f"c{uuid.uuid4().hex[:12]}"
     admin = psycopg.connect(POSTGRES_URL, autocommit=True)
     admin.execute(f'CREATE SCHEMA "{schema}"')
     admin.close()
 
     sep = "&" if "?" in POSTGRES_URL else "?"
-    scoped = f"{POSTGRES_URL}{sep}options=-csearch_path%3D{schema}"
-    fleet = FleetStore(scoped)
+    fleet = FleetStore(f"{POSTGRES_URL}{sep}options=-csearch_path%3D{schema}")
     try:
         yield fleet
     finally:
@@ -59,121 +55,72 @@ def store():
         admin.close()
 
 
-def test_the_engine_really_is_postgres(store):
-    assert store.is_postgres is True
+def _race(store, factory, count=2):
+    """Run `factory` on `count` separate connections, released together."""
+    from flotta.store import FleetStore
 
+    outcomes: list[str] = []
+    barrier = threading.Barrier(count)
+    lock = threading.Lock()
 
-def test_a_box_round_trips(store):
-    box = store.create_box("eng-a")
-    assert box.status == "provisioning"
-    assert store.get_box(box.id) == box
-    assert store.get_box_by_name("eng-a") == box
-
-
-def test_the_full_lifecycle(store):
-    box = store.create_box("eng-a")
-    store.update_box_status(box.id, "running", endpoint="fly://app/m1")
-    store.update_box_status(box.id, "stopped")
-    assert store.get_box(box.id).destroyed_at is None  # stopping is not finishing
-
-    task = store.create_task(box.id, "add OAuth")
-    assert task.started_at is None  # pending has no run-start
-    task = store.update_task_status(task.id, "running")
-    assert task.started_at is not None
-    task = store.update_task_status(task.id, "done", result={"ok": True}, cost_estimate=0.04)
-    assert (task.status, task.result, task.cost_estimate) == ("done", {"ok": True}, 0.04)
-
-
-def test_events_get_generated_ids(store):
-    """Postgres has no `lastrowid`; the seam uses `RETURNING id`."""
-    box = store.create_box("eng-a")
-    first = store.add_event("box", box.id, "one")
-    second = store.add_event("box", box.id, "two")
-    assert first.id and second.id and second.id > first.id
-    assert [e.type for e in store.get_events("box", box.id)] == ["one", "two"]
-
-
-def test_json_payloads_survive(store):
-    box = store.create_box("eng-a")
-    store.add_event("box", box.id, "stopped", {"nested": {"why": "idle"}, "n": 3})
-    assert store.get_events("box", box.id)[0].payload == {"nested": {"why": "idle"}, "n": 3}
-
-
-def test_a_duplicate_name_is_a_unique_violation(store):
-    """`sqlite3.IntegrityError` and psycopg's `UniqueViolation` are normalised
-    by the seam so the store catches one exception, not two."""
-    from flotta.store import DuplicateBoxError
-
-    store.create_box("eng-a")
-    with pytest.raises(DuplicateBoxError):
-        store.create_box("eng-a")
-
-
-def test_transitions_are_still_validated(store):
-    """`torn_down` is terminal, on either engine.
-
-    An earlier version of this test used `provisioning -> stopped`, which M1
-    made *legal* — it is the honest parking state for a box that was created
-    but did not come up. Nothing about Postgres was wrong; the test was.
-    """
-    from flotta.store import InvalidTransitionError
-
-    box = store.create_box("eng-a")
-    store.update_box_status(box.id, "torn_down")
-    for target in ("running", "stopped", "provisioning"):
-        with pytest.raises(InvalidTransitionError):
-            store.update_box_status(box.id, target)
-
-
-def test_the_concurrency_cap_holds(store):
-    """The guarded transaction, on the engine where the mechanism differs.
-
-    SQLite gets `BEGIN IMMEDIATE`; Postgres gets an explicit table lock. If the
-    guard were dropped on Postgres this would still pass single-threaded — see
-    `test_concurrent_creates_cannot_both_win` for the one that would not.
-    """
-    from flotta.store import ConcurrencyLimitError
-
-    box = store.create_box("eng-a")
-    store.create_task(box.id, "first", max_live=1)
-    with pytest.raises(ConcurrencyLimitError):
-        store.create_task(box.id, "second", max_live=1)
-
-
-def test_concurrent_creates_cannot_both_win(store):
-    """Two real connections racing the cap.
-
-    This is the assertion the guard exists for, and it is the one a
-    single-threaded test cannot make: without the table lock both sessions read
-    a live count of zero and both insert.
-    """
-    import threading
-
-    from flotta.store import ConcurrencyLimitError, FleetStore
-
-    box = store.create_box("eng-a")
-    url = store._url  # same schema, separate connections
-    results: list[str] = []
-    barrier = threading.Barrier(2)
-
-    def attempt(name: str) -> None:
-        fleet = FleetStore(url)
+    def attempt(index: int) -> None:
+        fleet = FleetStore(store._url)
         try:
-            barrier.wait(timeout=10)
-            fleet.create_task(box.id, name, max_live=1)
-            results.append("created")
-        except ConcurrencyLimitError:
-            results.append("refused")
+            barrier.wait(timeout=15)
+            factory(fleet, index)
+            with lock:
+                outcomes.append("created")
+        except Exception as exc:  # the cap's refusal, or anything else
+            with lock:
+                outcomes.append(type(exc).__name__)
         finally:
             fleet.close()
 
-    threads = [threading.Thread(target=attempt, args=(n,)) for n in ("a", "b")]
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(count)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=45)
+    return outcomes
 
-    assert sorted(results) == ["created", "refused"], (
-        f"expected exactly one winner, got {results} — the cap is racy"
+
+def test_the_task_cap_survives_a_real_race(pg_store):
+    """The assertion the guard exists for, and the one no single-threaded test
+    can make: without the table lock both sessions read a live count of zero
+    and both insert."""
+    box = pg_store.create_box("eng-a")
+    outcomes = _race(pg_store, lambda fleet, i: fleet.create_task(box.id, f"t{i}", max_live=1))
+
+    assert sorted(outcomes) == ["ConcurrencyLimitError", "created"], (
+        f"expected exactly one winner, got {outcomes} — the cap is racy"
     )
-    assert store.count_live_tasks() == 1
+    assert pg_store.count_live_tasks() == 1
+
+
+def test_the_workspace_cap_survives_a_real_race(pg_store):
+    """Same guard, the other table — wired ahead of the tier that uses it."""
+    box = pg_store.create_box("eng-a")
+    outcomes = _race(pg_store, lambda fleet, i: fleet.create_workspace(box.id, max_live=1))
+
+    assert sorted(outcomes) == ["ConcurrencyLimitError", "created"], (
+        f"expected exactly one winner, got {outcomes}"
+    )
+    assert pg_store.count_live_workspaces() == 1
+
+
+def test_concurrent_status_changes_do_not_both_win(pg_store):
+    """`update_box_status` is a read-check-write too.
+
+    Two callers racing `running -> stopped` must not both succeed: the second
+    is transitioning from a status it never observed, which is exactly what the
+    transition table exists to reject.
+    """
+    box = pg_store.create_box("eng-a")
+    pg_store.update_box_status(box.id, "running")
+
+    outcomes = _race(pg_store, lambda fleet, i: fleet.update_box_status(box.id, "stopped"))
+
+    assert outcomes.count("created") == 1, (
+        f"expected one winner and one rejected transition, got {outcomes}"
+    )
+    assert pg_store.get_box(box.id).status == "stopped"
