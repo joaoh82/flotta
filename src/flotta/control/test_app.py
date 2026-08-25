@@ -1,20 +1,19 @@
 """Tests for the control-plane API, against a real store and the real app.
 
-`fastapi` and `httpx` come with the `control` extra, so these skip on a plain
-`uv sync` rather than forcing a web framework on the 460 hermetic tests.
+`fastapi` and `httpx` are in the `dev` dependency group, so these always run.
+They used to be extra-only behind a `pytest.importorskip`, which meant CI —
+a plain `uv sync --frozen` — skipped this entire file and reported green.
+Import them plainly: a missing dependency should break the run, not quietly
+delete sixteen tests from it.
 """
 
 from __future__ import annotations
 
 import pytest
+from fastapi.testclient import TestClient
 
-pytest.importorskip("fastapi", reason="needs `uv sync --extra control`")
-pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from flotta.control.app import InsecureBindError, check_bind, create_app  # noqa: E402
-from flotta.store import FleetStore  # noqa: E402
+from flotta.control.app import InsecureBindError, check_bind, create_app
+from flotta.store import FleetStore
 
 
 @pytest.fixture
