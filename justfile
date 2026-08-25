@@ -177,9 +177,19 @@ e2e *ARGS: modal-whoami
 # same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
 e2e-live: (e2e "--live")
 
+# Loopback only: there is no auth yet and DELETE /api/boxes/<id> destroys a box
+# and its memory, so `serve` refuses a public bind rather than warning about it.
+# Reads $FLOTTA_STORE (or $FLOTTA_DATABASE_URL) exactly as the CLI does.
+# M4.5 control plane — the fleet API + the reconcile loop, on http://127.0.0.1:8080
+serve port="8080":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run flotta serve --port {{port}}
+
 # Port 3001 is baked into dashboard/package.json rather than passed here: 3000
 # is reserved for another local service and a flag is too easy to forget.
-# Reads $FLOTTA_STORE, else ../fleet.db — the same store the CLI writes.
+# Needs `just serve` running: the dashboard reads the control-plane API, not
+# the store. Without it every page answers 503 and says so.
 # M5 dashboard — local fleet view on http://localhost:3001
 dashboard:
     #!/usr/bin/env bash

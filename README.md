@@ -25,6 +25,8 @@ you ──▶ Hermes ──spawn──▶ ┌─ box ─────────
                           └────────────┬───────────┘
         fleet.db ◀── watcher ──────────┘
            ▲
+     control plane
+           ▲
       CLI · dashboard
 ```
 
@@ -160,9 +162,16 @@ Any OpenAI-compatible endpoint works — swap the base URL for OpenAI, Nous Port
 
 ### 5. Watch the fleet
 
+Two processes: the control plane serves the fleet, the dashboard renders it.
+
 ```bash
-just dashboard           # http://localhost:3001
+just serve               # http://127.0.0.1:8080 — the fleet API
+just dashboard           # http://localhost:3001 — in another terminal
 ```
+
+The dashboard reads the API, so it shows a Postgres fleet and a SQLite one
+identically, and its kill button no longer shells out to the CLI. Started on its
+own it answers 503 and tells you to run `just serve`.
 
 ### 6. Talk to a box
 
@@ -222,6 +231,8 @@ flotta stop <box>              # mark it idle (refused while work is in flight)
 flotta start <box>             # wake it again
 flotta kill <box>              # destroy it (idempotent)
 flotta reconcile               # rescue tasks stranded past their deadline
+flotta chat <box>              # talk to the agent on a box
+flotta serve [--port 8080]     # the control plane: fleet API + reconcile on a timer
 ```
 
 A **box** is a machine that is an agent, a **task** is one piece of work that
@@ -233,8 +244,8 @@ fleet is the system working, not rows to tidy away.
 `postgres://` URL and the CLI reads that instead of a local file — the last
 thing tying a fleet to one laptop. `just test-postgres` runs the store suite
 against a throwaway Postgres to prove the two engines behave identically. The
-dashboard cannot read a Postgres fleet yet and says so (501) rather than
-showing an empty one; that waits on the control-plane API.
+dashboard reads whichever engine the control plane is on, because it no longer
+reads the store at all — see [The control plane](#the-control-plane).
 
 **Otherwise the store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`. `spawn`
 says where it created one, and every read command names the file it looked at — because spawning in
@@ -246,9 +257,49 @@ so are `stop` and `start`, for now. Exit codes carry meaning: `1` a failed task 
 (**only a running box can be stopped, and only a stopped box can be started**; starting is waking
 an existing box, never creating one).
 
-**Always pass `--wait`** — or note the ids. Flotta's *local* process records the outcome, not the
-container, so a task nobody waits on finishes in the cloud while its row sits at `running`.
-`flotta watch <id>` collects it afterwards, and `flotta reconcile` sweeps up any you forgot.
+**Pass `--wait`, or run the control plane.** The verdict is recorded by whatever local process
+outlives the container — never the container itself — so a task nobody is watching finishes in the
+cloud while its row sits at `running`. `flotta watch <id>` collects it afterwards and
+`flotta reconcile` sweeps up any you forgot, but both are things you have to remember. `flotta serve`
+runs that sweep on a timer so you do not have to.
+
+## The control plane
+
+`flotta serve` is a small always-on process that owns two things: the fleet API
+the dashboard reads, and the reconcile loop.
+
+The loop is the point. Until now a task's verdict belonged to whichever local
+process happened to be holding `--wait`, which is why "always pass `--wait`" was
+the central caveat — and why one task was found stranded at `running` for 138
+hours. `flotta reconcile` already knew how to rescue those; what it lacked was
+somewhere to run that is not a terminal someone has to remember to open.
+
+```bash
+just serve                       # 127.0.0.1:8080
+curl -s localhost:8080/health    # is the loop actually sweeping?
+```
+
+`/health` answers that question rather than "is the process up", because those
+are not the same question and only one of them is useful. A loop that has been
+slept by a platform's serverless setting looks *identical* to a loop with
+nothing to do — both report a healthy process and zero reconciled tasks. So the
+loop records when each sweep **finished** and whether it raised, and `/health`
+returns 503 when sweeps have stopped landing or keep failing. That distinction
+is not hypothetical: the first live run of this loop failed every single sweep
+while `/health` cheerfully said `ok`.
+
+**It refuses to bind a public interface.** There is no authentication yet —
+scoped tokens are the next milestone — and `DELETE /api/boxes/<id>` destroys a
+box and everything it remembers. Rather than shipping something that *could* be
+deployed publicly, a non-loopback bind fails at startup with the reason.
+`FLOTTA_CONTROL_ALLOW_INSECURE_BIND=1` exists for a network you genuinely own
+(Fly 6PN, Tailscale), because refusing that case would only push people to a
+worse workaround. It is loud in the logs.
+
+A `Dockerfile` at the repo root builds it, so the fleet can outlive the laptop
+entirely. Do not put it behind a serverless/scale-to-zero setting: the reconcile
+loop is continuous background work, and sleeping it reintroduces the exact bug
+it exists to fix, one layer down.
 
 ## Limitations
 
@@ -271,10 +322,13 @@ Stated plainly, because finding these yourself is worse.
 - **A box only knows the string you send it.** It cannot see your files, your repo, or your
   conversation, and it cannot ask a question. Under-specified tasks come back as confident
   nonsense. (This is the failure durable box memory is meant to remove rather than mitigate.)
-- **`--wait`, or the row strands** until `flotta watch` / `flotta reconcile`.
-- **The dashboard has no authentication and can destroy boxes.** Localhost only. Do not expose it.
-  Its UI still says "worker" in places — it reads the new schema correctly, but the vocabulary
-  catches up when it moves off direct SQLite reads and onto an API.
+- **`--wait`, or the row strands** until something sweeps for it — `flotta watch`,
+  `flotta reconcile`, or a running `flotta serve`.
+- **Nothing here has authentication yet**, and the kill button destroys real machines. The control
+  plane refuses a non-loopback bind for that reason; scoped tokens are the next milestone. Localhost
+  only. Do not expose either surface.
+  The dashboard's UI still says "worker" in places — renaming it is cosmetic churn, queued behind
+  the parts that are not.
 - **Cost estimation is opt-in and container-time only.** Set `FLOTTA_COST_PER_SECOND` or the column stays blank; token spend is never included. It is measured per *task*, not per box. See [What it costs](#what-it-costs).
 - **Rotating a provider key is not instant.** `just secret-sync` needs no redeploy, but a secret
   becomes environment variables when a container *starts*, so a warm container serves the old value
@@ -290,10 +344,12 @@ Stated plainly, because finding these yourself is worse.
 | `src/flotta/provision.py` | spawn / watch / stop / start / teardown / reconcile — **runs locally**, the store's only writer. `run_worker`, the one deployed Modal function, lives here too and touches no store |
 | `src/flotta/worker/` | the Modal image and the container entrypoint — **runs in the cloud** |
 | `src/flotta/cli.py` | the Typer CLI |
-| `dashboard/` | Next.js over the same store, via Node's built-in SQLite |
+| `src/flotta/db.py` | the engine seam — one store, SQLite or Postgres |
+| `src/flotta/control/` | the control plane: the fleet API, and the reconcile loop on a timer |
+| `dashboard/` | Next.js over the control-plane API — it does not open the store |
 
-Storage is deliberately plain SQLite behind a thin SQL interface, so pointing it at
-[Turso](https://turso.tech) later is a change to one connection factory rather than a rewrite.
+Storage is plain SQL behind a thin interface, so the engine is a startup decision rather than a
+rewrite: SQLite by default, Postgres when `$FLOTTA_DATABASE_URL` is set.
 
 `run_worker` keeps its v0.1 name deliberately. It is the stateless one-shot — the *shard* tier —
 and renaming it to match the box vocabulary would be wrong in the other direction.
