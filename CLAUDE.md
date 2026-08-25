@@ -320,8 +320,12 @@ just secret-sync            # M7: push .env's provider vars into the named Modal
 just deploy                 # M3: deploy the provisioning app — required before e2e; ensures the secret exists
 just e2e                    # M3: full lifecycle against real Modal, dry-run (no LLM, no provider key)
 just e2e-live               # same with a real model call — needs the provider vars synced
-just dashboard              # M5: local fleet view on http://localhost:3001
+just serve                  # M4.5: the control plane — fleet API + reconcile loop, 127.0.0.1:8080
+just dashboard              # M5: local fleet view on http://localhost:3001 (needs `just serve`)
 ```
+
+The dashboard reads the control-plane API, not the store — `just dashboard`
+alone answers 503 on every page. Run both.
 
 Every Modal recipe pins the workspace profile (`FLOTTA_MODAL_PROFILE`, default `flotta`) through `just modal-whoami`, which authenticates for real — `modal profile current` only echoes the env var back and never validates. This exists because the globally-active profile was once found pointing at an unrelated workspace.
 
