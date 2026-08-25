@@ -456,3 +456,31 @@ fly-doctor: fly-whoami
 
     # --wait-s: a box that just started is still importing Hermes.
     flyctl ssh console --app "$APP" -C "python3 -m flotta.box.doctor --wait-s 45"
+
+# M4: run the store suite against a real Postgres (throwaway container)
+test-postgres:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A container per run, removed on exit. The hermetic suite stays the gate;
+    # this is the "does it behave the same on the other engine" check, and it
+    # needs a server rather than a mock — a mock would agree with whatever the
+    # code does, which is the one thing worth not assuming here.
+    NAME=flotta-pg-$$
+    docker run -d --rm --name "$NAME" \
+      -e POSTGRES_PASSWORD=flotta -e POSTGRES_DB=flotta -P \
+      postgres:16-alpine >/dev/null
+    trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+    PORT=$(docker port "$NAME" 5432/tcp | head -1 | sed 's/.*://')
+    for _ in $(seq 1 30); do
+      docker exec "$NAME" pg_isready -U postgres >/dev/null 2>&1 && break
+      sleep 1
+    done
+    # `--extra postgres`: psycopg is optional, so a clean `uv sync` does not have
+    # it and this recipe would fail on the one machine that most needs it to
+    # work — a fresh checkout.
+    #
+    # The whole store suite runs too, not just the concurrency file: test_store
+    # parameterises over both engines when this variable is set, which is where
+    # "behaves identically" is actually proven.
+    FLOTTA_TEST_POSTGRES_URL="postgresql://postgres:flotta@127.0.0.1:$PORT/flotta" \
+      uv run --extra postgres pytest src/flotta/test_store.py src/flotta/test_store_postgres.py -q

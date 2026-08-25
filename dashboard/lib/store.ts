@@ -39,6 +39,44 @@ export type { FleetEvent, Worker, WorkerStatus } from "./types";
 export { TERMINAL } from "./types";
 
 /** Raised when the store file is absent, so the UI can say so explicitly. */
+/**
+ * Raised when the fleet lives on Postgres and this reader cannot reach it.
+ *
+ * The dashboard opens SQLite directly (see the note at the top of this file),
+ * so a fleet on `$FLOTTA_DATABASE_URL` is somewhere it simply cannot look. The
+ * failure mode without this check is the worst available: `fleet.db` either
+ * does not exist or holds a stale local fleet, so the UI renders **an empty
+ * fleet** and the operator concludes they have no boxes.
+ *
+ * That is the same "wrong file looks like no boxes" confusion the CLI spends
+ * real effort killing, and it deserves the same treatment — say what is
+ * actually true instead of rendering a plausible lie.
+ *
+ * §8.3 retires direct-SQLite reads in favour of the control-plane API; until
+ * then this refuses rather than misleads.
+ */
+export class StoreOnPostgresError extends Error {
+  constructor(public readonly describedUrl: string) {
+    super(
+      `this fleet lives on Postgres (${describedUrl}), which the dashboard ` +
+        `cannot read directly. It reads a local SQLite file, so it would show ` +
+        `an empty fleet rather than your boxes. Use \`flotta ps\` until the ` +
+        `dashboard moves onto the control-plane API.`,
+    );
+    this.name = "StoreOnPostgresError";
+  }
+}
+
+/** Host and database only — a Postgres URL carries a password. */
+export function describeDatabaseUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `postgres://${parsed.hostname}${parsed.pathname}`;
+  } catch {
+    return "postgres://(unparseable url)";
+  }
+}
+
 export class StoreMissingError extends Error {
   constructor(public readonly storePath: string) {
     super(`no fleet-state store at ${storePath}`);
@@ -71,6 +109,14 @@ export function resolveStorePath(): string {
  * a healthy, empty fleet instead of an error.
  */
 function withStore<T>(fn: (db: DatabaseSync) => T): T {
+  // Checked before the file, because a configured Postgres URL means the file
+  // is irrelevant — reporting "no store at ./fleet.db" would send the operator
+  // looking for a file that is not supposed to exist.
+  const databaseUrl = process.env.FLOTTA_DATABASE_URL?.trim();
+  if (databaseUrl && /^postgres(ql)?:\/\//.test(databaseUrl)) {
+    throw new StoreOnPostgresError(describeDatabaseUrl(databaseUrl));
+  }
+
   const storePath = resolveStorePath();
   if (!existsSync(storePath)) throw new StoreMissingError(storePath);
 

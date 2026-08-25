@@ -7,6 +7,8 @@ hand-wrote each tier would let one drift without anyone noticing.
 """
 
 import itertools
+import os
+import uuid
 
 import pytest
 
@@ -27,11 +29,51 @@ from flotta.store import (
     is_terminal,
 )
 
+#: Engines this suite runs against. Postgres is included only when
+#: `$FLOTTA_TEST_POSTGRES_URL` names a server, so `just check` stays hermetic,
+#: offline and $0 — and `just test-postgres` runs the *same* ~90 tests against a
+#: real server rather than a separate, smaller file that could drift.
+_ENGINES = ["sqlite"]
+if os.environ.get("FLOTTA_TEST_POSTGRES_URL", "").strip():
+    _ENGINES.append("postgres")
 
-@pytest.fixture
-def store(tmp_path):
-    with FleetStore(tmp_path / "fleet.db") as s:
-        yield s
+
+@pytest.fixture(params=_ENGINES)
+def store(request, tmp_path):
+    """A FleetStore on each configured engine.
+
+    Parameterised rather than duplicated. M4's claim is that the store behaves
+    *identically* on SQLite and Postgres, and the only way to mean that is to
+    hold the behaviour fixed and swap what is underneath — a second, smaller
+    Postgres-only file would drift from this one and quietly stop proving the
+    claim.
+
+    Each Postgres run gets its own schema: the suite asserts on whole-table
+    listings (`list_boxes() == []`), so leakage between tests would surface as
+    impossible failures far from the cause.
+    """
+    if request.param == "sqlite":
+        with FleetStore(tmp_path / "fleet.db") as s:
+            yield s
+        return
+
+    import psycopg
+
+    url = os.environ["FLOTTA_TEST_POSTGRES_URL"].strip()
+    schema = f"t{uuid.uuid4().hex[:12]}"
+    admin = psycopg.connect(url, autocommit=True)
+    admin.execute(f'CREATE SCHEMA "{schema}"')
+    admin.close()
+
+    sep = "&" if "?" in url else "?"
+    fleet = FleetStore(f"{url}{sep}options=-csearch_path%3D{schema}")
+    try:
+        yield fleet
+    finally:
+        fleet.close()
+        admin = psycopg.connect(url, autocommit=True)
+        admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        admin.close()
 
 
 @pytest.fixture
@@ -637,3 +679,42 @@ def test_is_terminal_is_per_kind(store):
     assert is_terminal("task", "failed")
     assert not is_terminal("task", "pending")
     assert is_terminal("workspace", "torn_down")
+
+
+# -- the guard that makes the caps correct ----------------------------------
+
+
+def test_every_read_check_write_is_guarded():
+    """`BEGIN IMMEDIATE` (or a Postgres table lock) is what makes the store's
+    read-check-write sequences safe, and nothing else in this suite notices if
+    it goes away.
+
+    That was demonstrated the hard way during the Postgres migration: an
+    editing slip left three transactions unguarded and all 453 tests still
+    passed. A concurrency guarantee no test can see is a guarantee waiting to
+    be deleted, so this reads the source and insists.
+    """
+    import inspect
+    import re
+
+    from flotta import store as store_module
+
+    source = inspect.getsource(store_module)
+    unguarded = re.findall(r"with self\._conn\.transaction\(\s*\)", source)
+    assert not unguarded, (
+        f"{len(unguarded)} transaction(s) opened without a guard. Every "
+        "transaction in the store is a read-check-write; an unguarded one "
+        "silently drops to an optimistic BEGIN and the caps become racy."
+    )
+
+
+def test_the_guard_names_a_real_table():
+    import inspect
+    import re
+
+    from flotta import store as store_module
+
+    tables = {"boxes", "workspaces", "tasks", "events"}
+    named = set(re.findall(r'transaction\(guard="(\w+)"\)', inspect.getsource(store_module)))
+    assert named, "expected guarded transactions"
+    assert named <= tables, f"guard names a table that does not exist: {named - tables}"

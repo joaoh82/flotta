@@ -229,7 +229,14 @@ visits it, and a box outlives every task on it. `ps` shows boxes because the
 fleet *is* the boxes — and a `stopped` box stays in that list, because an idle
 fleet is the system working, not rows to tidy away.
 
-**The store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`. `spawn`
+**The fleet store can live on a server.** Set `$FLOTTA_DATABASE_URL` to a
+`postgres://` URL and the CLI reads that instead of a local file — the last
+thing tying a fleet to one laptop. `just test-postgres` runs the store suite
+against a throwaway Postgres to prove the two engines behave identically. The
+dashboard cannot read a Postgres fleet yet and says so (501) rather than
+showing an empty one; that waits on the control-plane API.
+
+**Otherwise the store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`. `spawn`
 says where it created one, and every read command names the file it looked at — because spawning in
 one directory and running `ps` in another otherwise looks exactly like an empty fleet.
 

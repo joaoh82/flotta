@@ -85,6 +85,24 @@ between milestones — architecture, conventions, and the sharp edges below.
   arithmetic assumes tens. A live task is what burns CPU, so that is what is
   rationed. `create_workspace(max_live=...)` is the same guard, wired and tested
   ahead of the tier that will use it.
+- **The fleet store runs on SQLite or Postgres**, chosen by the value it is
+  given: a `postgres://` URL selects Postgres, anything else is a SQLite path.
+  `$FLOTTA_DATABASE_URL` is the switch (the same variable §8.3's Railway
+  template wires). SQLite stays the default so `just check` needs no server.
+- **Every transaction in the store is a read-check-write and must be guarded.**
+  `transaction(guard="tasks")` is `BEGIN IMMEDIATE` on SQLite and
+  `LOCK TABLE … IN SHARE ROW EXCLUSIVE MODE` on Postgres. An unguarded
+  transaction silently drops to an optimistic `BEGIN` and the concurrency caps
+  become racy — and **the hermetic suite cannot see it**: three transactions
+  lost their guard during the migration and all 453 tests still passed.
+  `test_every_read_check_write_is_guarded` reads the source and insists;
+  `test_concurrent_creates_cannot_both_win` (Postgres only) is the one that
+  actually races two connections.
+- **Postgres has no `lastrowid`.** Inserts that need the generated id go
+  through `execute_returning_id` (`RETURNING id`), not `cursor.lastrowid`.
+- **§M4/D3 says "the connection factory is already isolated". It was not** —
+  the store called `sqlite3.connect` directly with inline PRAGMAs. M4 built
+  that seam rather than swapping something behind one.
 - **No store migration; delete the old file.** The schema is created with
   `CREATE TABLE IF NOT EXISTS`, so a pre-M0 `fleet.db` is not rejected — it
   quietly gains empty new tables beside the stale `workers` one and renders as

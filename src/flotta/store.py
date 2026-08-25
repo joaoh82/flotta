@@ -1,9 +1,17 @@
 """Fleet-state store — the single source of truth for fleet state.
 
-Thin SQL over the stdlib ``sqlite3`` driver, no ORM. The store is addressed
-by a database path, and every statement is plain portable SQL, so pointing
-the connection factory at Turso (libsql) later is a one-function change
-(decisions D3/D8 in the development plan).
+Thin SQL, no ORM, over **either SQLite or Postgres** — `flotta.db` is the seam
+(M4). A ``postgres://`` URL selects Postgres, anything else is a SQLite path,
+and ``$FLOTTA_DATABASE_URL`` is the switch. SQLite stays the default so local
+work and the whole test suite need no server.
+
+Every statement here is portable SQL with ``?`` placeholders; the seam rewrites
+them per dialect. What is *not* portable — generated ids and the transaction
+guard — goes through `execute_returning_id` and `transaction(guard=...)` rather
+than being written twice.
+
+D3 planned Turso for this. §8.3's Railway recipe names Postgres, so landing
+Turso would have meant migrating the same schema twice.
 
 **Three tables, three tiers** (the pivot expressed as schema):
 
@@ -37,7 +45,6 @@ Readers: the CLI and the dashboard API routes.
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,7 +52,11 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
+from flotta import db
+
 EntityKind = Literal["box", "workspace", "task"]
+
+DEFAULT_DB_PATH = "fleet.db"
 
 # -- box: a machine that is an agent ----------------------------------------
 #
@@ -112,7 +123,15 @@ _TERMINAL: dict[str, frozenset[str]] = {
     "task": TASK_TERMINAL,
 }
 
-_SCHEMA = """
+# One schema, two dialects. Only the generated-id column differs, so it is a
+# substitution rather than two copies that drift — every other type here
+# (TEXT, REAL) means the same thing on both engines.
+_EVENTS_ID = {
+    "sqlite": "INTEGER PRIMARY KEY AUTOINCREMENT",
+    "postgres": "BIGSERIAL PRIMARY KEY",
+}
+
+_SCHEMA_TEMPLATE = """
 CREATE TABLE IF NOT EXISTS boxes (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,
@@ -146,7 +165,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
     entity_id    TEXT NOT NULL,
     ts           TEXT NOT NULL,
@@ -293,13 +312,27 @@ def is_terminal(kind: EntityKind, status: str) -> bool:
 class FleetStore:
     """Fleet-state store bound to one SQLite database file (or ':memory:')."""
 
-    def __init__(self, db_path: str | Path) -> None:
-        self._conn = sqlite3.connect(str(db_path), isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
-        self._check_not_legacy(db_path)
-        self._conn.executescript(_SCHEMA)
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        """Open the fleet store.
+
+        Takes a SQLite path or a `postgres://` URL — the same value
+        `$FLOTTA_DATABASE_URL` carries, so one variable configures the store and
+        there is no way to say two contradictory things. SQLite stays the
+        default so local work and the whole test suite need no server.
+        """
+        url = db.resolve_url(str(db_path) if db_path is not None else None)
+        self.is_postgres = db.is_postgres_url(url)
+        #: What this store was opened with, so a caller can open a *second*
+        #: connection to the same place — which is the only way to test that
+        #: the concurrency guard actually serialises anything.
+        self._url = url or str(db_path or DEFAULT_DB_PATH)
+        self._conn = db.connect(url or db_path or DEFAULT_DB_PATH)
+        if not self.is_postgres:
+            # A pre-M0 file is refused rather than rendered as an empty fleet.
+            # Postgres cannot be in that state: there is no legacy deployment.
+            self._check_not_legacy(db_path if db_path is not None else DEFAULT_DB_PATH)
+        dialect = "postgres" if self.is_postgres else "sqlite"
+        self._conn.executescript(_SCHEMA_TEMPLATE.format(events_id=_EVENTS_ID[dialect]))
 
     def _check_not_legacy(self, db_path: str | Path) -> None:
         """Refuse a pre-M0 store instead of rendering it as an empty fleet.
@@ -355,7 +388,7 @@ class FleetStore:
                 "INSERT INTO boxes (id, name, status, created_at) VALUES (?, ?, ?, ?)",
                 (bid, name, "provisioning", _utcnow()),
             )
-        except sqlite3.IntegrityError as exc:
+        except db.UniqueViolation as exc:
             # Two different collisions land here. Reporting a duplicate *id* as
             # a duplicate *name* sends the caller looking for the wrong thing —
             # they would rename and hit the same wall.
@@ -373,10 +406,10 @@ class FleetStore:
         leaking into the machine's row.
         """
         _check_status("box", status)
-        # BEGIN IMMEDIATE serializes the read-check-write against concurrent
-        # writers (the same discipline Hermes uses on its own state.db).
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        # `guard` serialises this read-check-write against concurrent writers:
+        # BEGIN IMMEDIATE on SQLite, an explicit table lock on Postgres. Without
+        # it two callers can both read the current status and both act on it.
+        with self._conn.transaction(guard="boxes"):
             current = self._get_box_or_raise(box_id)
             _check_transition("box", box_id, current.status, status)
             destroyed_at = current.destroyed_at
@@ -392,10 +425,6 @@ class FleetStore:
                 """,
                 (status, endpoint, destroyed_at, box_id),
             )
-            self._conn.execute("COMMIT")
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
         return self._get_box_or_raise(box_id)
 
     def get_box(self, box_id: str) -> Box | None:
@@ -446,10 +475,12 @@ class FleetStore:
         workspaces are already in a non-terminal state, raising
         `ConcurrencyLimitError`.
 
-        The count and the insert share one ``BEGIN IMMEDIATE`` transaction on
-        purpose. Counting first and inserting after would race: two creates
-        starting together would both see room and both proceed, which is
-        exactly the runaway the cap exists to prevent.
+        The count and the insert share one **guarded** transaction on purpose.
+        Counting first and inserting after would race: two creates starting
+        together would both see room and both proceed, which is exactly the
+        runaway the cap exists to prevent. The guard is `BEGIN IMMEDIATE` on
+        SQLite and a table lock on Postgres — the mechanisms differ, the
+        guarantee does not.
         """
         wsid = workspace_id or f"ws-{uuid.uuid4().hex[:12]}"
         insert = (
@@ -457,18 +488,13 @@ class FleetStore:
         )
         row = (wsid, box_id, "provisioning", repo, _utcnow())
 
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self._conn.transaction(guard="workspaces"):
             self._get_box_or_raise(box_id)
             if max_live is not None:
                 live = self._live_workspace_ids()
                 if len(live) >= max_live:
                     raise ConcurrencyLimitError(max_live, live, noun="workspace")
             self._conn.execute(insert, row)
-            self._conn.execute("COMMIT")
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
         return self._get_workspace_or_raise(wsid)
 
     def update_workspace_status(
@@ -476,8 +502,7 @@ class FleetStore:
     ) -> Workspace:
         """Move a workspace to ``status``, validating the transition."""
         _check_status("workspace", status)
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self._conn.transaction(guard="workspaces"):
             current = self._get_workspace_or_raise(workspace_id)
             _check_transition("workspace", workspace_id, current.status, status)
             destroyed_at = current.destroyed_at
@@ -493,10 +518,6 @@ class FleetStore:
                 """,
                 (status, endpoint, destroyed_at, workspace_id),
             )
-            self._conn.execute("COMMIT")
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
         return self._get_workspace_or_raise(workspace_id)
 
     def get_workspace(self, workspace_id: str) -> Workspace | None:
@@ -558,8 +579,7 @@ class FleetStore:
         first and inserting after races.
         """
         tid = task_id or f"t-{uuid.uuid4().hex[:12]}"
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self._conn.transaction(guard="tasks"):
             self._get_box_or_raise(box_id)
             if workspace_id is not None:
                 self._require_workspace_of(box_id, workspace_id)
@@ -574,10 +594,6 @@ class FleetStore:
                 """,
                 (tid, box_id, workspace_id, prompt, "pending", _utcnow()),
             )
-            self._conn.execute("COMMIT")
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
         return self._get_task_or_raise(tid)
 
     def update_task_status(
@@ -597,8 +613,7 @@ class FleetStore:
         when there was fan-out — the reason shards need no table of their own.
         """
         _check_status("task", status)
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self._conn.transaction(guard="tasks"):
             current = self._get_task_or_raise(task_id)
             _check_transition("task", task_id, current.status, status)
             if workspace_id is not None:
@@ -634,10 +649,6 @@ class FleetStore:
                     task_id,
                 ),
             )
-            self._conn.execute("COMMIT")
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
         return self._get_task_or_raise(task_id)
 
     def get_task(self, task_id: str) -> Task | None:
@@ -699,12 +710,18 @@ class FleetStore:
             )
         self._require(entity_kind, entity_id)
         payload_json = json.dumps(payload) if payload is not None else None
-        cur = self._conn.execute(
+        # `execute_returning_id`, not `lastrowid`: Postgres has no lastrowid,
+        # and `currval` is per-session state waiting to be wrong. The seam uses
+        # the cheapest correct thing on each engine — SQLite's cursor id, and
+        # `RETURNING id` on Postgres.
+        event_id = self._conn.execute_returning_id(
             "INSERT INTO events (entity_kind, entity_id, ts, type, payload_json) "
             "VALUES (?, ?, ?, ?, ?)",
             (entity_kind, entity_id, _utcnow(), type, payload_json),
         )
-        row = self._conn.execute("SELECT * FROM events WHERE id = ?", (cur.lastrowid,)).fetchone()
+        row = self._conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:  # pragma: no cover - would mean the insert vanished
+            raise StoreError(f"event {event_id} disappeared immediately after insert")
         return _event_from_row(row)
 
     def get_events(self, entity_kind: EntityKind, entity_id: str) -> list[Event]:
@@ -782,7 +799,7 @@ class FleetStore:
         return task
 
 
-def _box_from_row(row: sqlite3.Row) -> Box:
+def _box_from_row(row: db.Row) -> Box:
     return Box(
         id=row["id"],
         name=row["name"],
@@ -793,7 +810,7 @@ def _box_from_row(row: sqlite3.Row) -> Box:
     )
 
 
-def _workspace_from_row(row: sqlite3.Row) -> Workspace:
+def _workspace_from_row(row: db.Row) -> Workspace:
     return Workspace(
         id=row["id"],
         box_id=row["box_id"],
@@ -805,7 +822,7 @@ def _workspace_from_row(row: sqlite3.Row) -> Workspace:
     )
 
 
-def _task_from_row(row: sqlite3.Row) -> Task:
+def _task_from_row(row: db.Row) -> Task:
     return Task(
         id=row["id"],
         box_id=row["box_id"],
@@ -820,7 +837,7 @@ def _task_from_row(row: sqlite3.Row) -> Task:
     )
 
 
-def _event_from_row(row: sqlite3.Row) -> Event:
+def _event_from_row(row: db.Row) -> Event:
     payload = json.loads(row["payload_json"]) if row["payload_json"] is not None else None
     return Event(
         id=row["id"],

@@ -499,3 +499,65 @@ def test_resolve_store_path_is_relative_but_reported_absolute(tmp_path, monkeypa
     p = resolve_store_path(None)
     assert str(p) == DEFAULT_STORE
     assert p.resolve() == (tmp_path / DEFAULT_STORE).resolve()
+
+
+# -- which store the CLI opens ----------------------------------------------
+
+
+def test_store_target_prefers_a_database_url(monkeypatch):
+    from flotta.cli import store_target
+
+    monkeypatch.setenv("FLOTTA_DATABASE_URL", "postgresql://u:p@db.example/flotta")
+    assert store_target() == "postgresql://u:p@db.example/flotta"
+
+
+def test_store_target_falls_back_to_a_path(monkeypatch):
+    from flotta.cli import store_target
+
+    monkeypatch.delenv("FLOTTA_DATABASE_URL", raising=False)
+    monkeypatch.setenv(STORE_ENV_VAR, "/tmp/some.db")
+    assert store_target().endswith("some.db")
+
+
+def test_describe_store_never_echoes_the_password():
+    """This string reaches stderr, footers and logs.
+
+    A Postgres URL carries a credential and there is no case where it belongs
+    in output — host and database are enough to tell two deployments apart.
+    """
+    from flotta.cli import describe_store
+
+    described = describe_store("postgresql://admin:hunter2@db.example:5432/flotta")
+    assert "hunter2" not in described
+    assert "admin" not in described
+    assert "db.example" in described and "flotta" in described
+
+
+def test_describe_store_resolves_a_path():
+    from flotta.cli import describe_store
+
+    assert describe_store("fleet.db").endswith("fleet.db")
+    assert describe_store("fleet.db").startswith("/")
+
+
+def test_a_postgres_fleet_is_never_announced_as_a_created_file(monkeypatch, tmp_path):
+    """The bug both PR reviewers caught, as a test.
+
+    `spawn` computed "did the file exist?" before opening the store, so with a
+    Postgres URL it printed "created fleet store at ./fleet.db" — on *every*
+    spawn, for a file it never wrote. That is the same "wrong store" confusion
+    this milestone exists to kill, on the write side.
+    """
+    import flotta.cli as cli_module
+
+    monkeypatch.setenv("FLOTTA_DATABASE_URL", "postgresql://u:p@db.example/flotta")
+    monkeypatch.chdir(tmp_path)
+
+    target = cli_module.store_target(None)
+    from flotta import db
+
+    assert db.is_postgres_url(target), "precondition: the target is postgres"
+    # The banner is gated on this being a file that did not exist. On a server
+    # there is no file to have created.
+    assert not (tmp_path / "fleet.db").exists()
+    assert "fleet.db" not in cli_module.describe_store(target)

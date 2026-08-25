@@ -7,7 +7,12 @@
  */
 import type { NextRequest } from "next/server";
 
-import { getEvents, getWorker, StoreMissingError } from "@/lib/store";
+import {
+  getEvents,
+  getWorker,
+  StoreMissingError,
+  StoreOnPostgresError,
+} from "@/lib/store";
 import { InvalidWorkerIdError, killWorker } from "@/lib/teardown";
 
 export const runtime = "nodejs";
@@ -15,6 +20,15 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 function storeErrorResponse(error: unknown): Response {
+  if (error instanceof StoreOnPostgresError) {
+    // 501, not 503: the fleet is reachable and healthy — this reader is the
+    // thing that cannot reach it. "Not implemented" is the honest status for a
+    // capability the dashboard has not grown yet (§8.3's API rewrite).
+    return Response.json(
+      { error: "store_on_postgres", message: error.message },
+      { status: 501 },
+    );
+  }
   if (error instanceof StoreMissingError) {
     return Response.json(
       { error: "store_missing", message: error.message, store: error.storePath },
@@ -65,7 +79,9 @@ export async function DELETE(
         { status: 400 },
       );
     }
-    if (error instanceof StoreMissingError) return storeErrorResponse(error);
+    if (error instanceof StoreMissingError || error instanceof StoreOnPostgresError) {
+      return storeErrorResponse(error);
+    }
 
     // The CLI failed. Surface its stderr — a teardown that did not happen must
     // never be reported to the user as success.
