@@ -240,7 +240,11 @@ def event_dict(event: Event) -> dict[str, Any]:
 
 
 def resolve_store_path(explicit: str | None = None) -> Path:
-    """--store → $FLOTTA_STORE → ./fleet.db."""
+    """--store → $FLOTTA_STORE → ./fleet.db.
+
+    `--store` is the CLI's own layer; the rest of the chain is the store's, and
+    is deliberately not re-implemented here.
+    """
     return Path(explicit or os.environ.get(STORE_ENV_VAR) or DEFAULT_STORE)
 
 

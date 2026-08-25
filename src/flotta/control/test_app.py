@@ -216,3 +216,31 @@ def test_the_detail_view_carries_the_tasks_the_list_summarises(client, fleet):
     """
     body = client.get("/api/boxes/eng-a").json()
     assert [t["prompt"] for t in body["tasks"]] == ["add OAuth"]
+
+
+def test_the_service_and_the_cli_resolve_the_same_store(tmp_path, monkeypatch):
+    """One rule for where the fleet lives, not one copy per caller.
+
+    This rule was written out twice — once in the CLI, once here — and the
+    copies disagreed: the service honoured `$FLOTTA_DATABASE_URL` but not
+    `$FLOTTA_STORE`, so `flotta serve` served an empty fleet from `./fleet.db`
+    while `flotta ps` in the same shell listed the real one. It now lives in
+    `FleetStore` itself, and this asserts the two agree.
+    """
+    from flotta.cli import resolve_store_path
+    from flotta.control.app import _store_factory
+
+    path = tmp_path / "elsewhere.db"
+    store = FleetStore(path)
+    store.create_box("eng-a")
+    store.close()
+
+    monkeypatch.chdir(tmp_path)  # so a bad resolution finds ./fleet.db, not the repo's
+    monkeypatch.setenv("FLOTTA_STORE", str(path))
+
+    assert resolve_store_path() == path
+    served = _store_factory()
+    try:
+        assert [b.name for b in served.list_boxes()] == ["eng-a"]
+    finally:
+        served.close()

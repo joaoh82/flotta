@@ -88,15 +88,12 @@ def _store_factory() -> FleetStore:
     UI is stale in the one way a fleet view must never be. Connecting is cheap
     on both engines.
     """
-    # Resolved the same way the CLI resolves it: $FLOTTA_DATABASE_URL, else
-    # $FLOTTA_STORE, else ./fleet.db. `FleetStore()` with no argument only
-    # consults the database URL and silently falls back to ./fleet.db — so a
-    # service started with $FLOTTA_STORE set served an empty fleet from a file
-    # nobody meant. Found by running it against a seeded store.
-    url = db.resolve_url(None)
-    if url:
-        return FleetStore(url)
-    return FleetStore(os.environ.get("FLOTTA_STORE", "").strip() or "fleet.db")
+    # No argument on purpose: FleetStore owns the $FLOTTA_DATABASE_URL /
+    # $FLOTTA_STORE / ./fleet.db chain. This function used to re-implement it
+    # and got it wrong — the service honoured the database URL but not
+    # $FLOTTA_STORE, and served an empty fleet from a file nobody meant while
+    # `flotta ps` in the same shell listed the real one.
+    return FleetStore()
 
 
 def _box_dict(box: Any) -> dict[str, Any]:
