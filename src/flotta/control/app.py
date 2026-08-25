@@ -182,12 +182,23 @@ def create_app(
                 # A stopped box is idle, not finished — hiding it would hide
                 # the point of the fleet.
                 boxes = [b for b in boxes if not is_terminal("box", b.status)]
-            latest = {}
+            # Each box's newest task and its total spend. Cost lives on tasks
+            # (the formula measures start-to-verdict, meaningless across a
+            # machine that spans months), so the list view has to sum it. The
+            # direct-SQL version this replaces did `SUM(cost_estimate)`, and
+            # dropping it silently turned every cost in the UI into a blank.
+            summaries: dict[str, dict[str, Any]] = {}
             for box in boxes:
                 tasks = store.list_tasks(box_id=box.id)
-                if tasks:
-                    latest[box.id] = tasks[0].prompt
-            return {"boxes": [{**_box_dict(b), "latest_task": latest.get(b.id)} for b in boxes]}
+                costs = [t.cost_estimate for t in tasks if t.cost_estimate is not None]
+                summaries[box.id] = {
+                    "latest_task": tasks[0].prompt if tasks else None,
+                    "task_count": len(tasks),
+                    # None rather than 0.0 when nothing is priced: a blank says
+                    # "no rate configured", a zero claims the box ran for free.
+                    "cost_estimate": sum(costs) if costs else None,
+                }
+            return {"boxes": [{**_box_dict(b), **summaries[b.id]} for b in boxes]}
         finally:
             store.close()
 

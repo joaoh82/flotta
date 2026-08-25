@@ -1,17 +1,18 @@
 /**
- * GET /api/workers — every worker, newest first.
+ * GET /api/workers — every box, newest first.
  *
- * `force-dynamic` + `revalidate = 0` are belt and braces: route handlers are
- * already uncached by default in Next 16, but this endpoint reads a live file
- * that changes underneath us, and a cached fleet view would be actively
- * misleading rather than merely stale.
+ * A thin proxy to the control plane since M4.5. It used to open the fleet's
+ * SQLite file directly, which §8.3 required to go: "reads the API, not the DB
+ * directly". The `force-dynamic` pair stays for the same reason it was added —
+ * this endpoint reflects a fleet that changes underneath us, and a cached view
+ * is actively misleading rather than merely stale.
  */
 import {
+  controlPlaneUrl,
+  ControlPlaneError,
+  ControlPlaneUnreachableError,
   listWorkers,
-  resolveStorePath,
-  StoreMissingError,
-  StoreOnPostgresError,
-} from "@/lib/store";
+} from "@/lib/control";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,34 +20,31 @@ export const revalidate = 0;
 
 export async function GET() {
   try {
-    return Response.json({ workers: listWorkers() });
+    return Response.json({ workers: await listWorkers() });
   } catch (error) {
-    if (error instanceof StoreOnPostgresError) {
-      // 501, not 503: the fleet is fine and reachable, this reader just cannot
-      // reach it. "Not implemented" is the honest status for a capability the
-      // dashboard has not grown yet.
-      return Response.json(
-        { error: "store_on_postgres", message: error.message },
-        { status: 501 },
-      );
-    }
-    if (error instanceof StoreMissingError) {
-      // 503, not an empty list: "no store here" and "no workers yet" are very
-      // different facts and the UI must be able to tell them apart.
+    if (error instanceof ControlPlaneUnreachableError) {
+      // 503, not an empty list: "the control plane is down" and "you have no
+      // boxes" are very different facts, and rendering the second for the
+      // first is the confusion this project keeps having to kill.
       return Response.json(
         {
-          error: "store_missing",
+          error: "control_plane_unreachable",
           message: error.message,
-          store: error.storePath,
+          control_plane: controlPlaneUrl(),
         },
         { status: 503 },
       );
     }
+    if (error instanceof ControlPlaneError) {
+      return Response.json(
+        { error: "control_plane_error", message: error.message },
+        { status: 502 },
+      );
+    }
     return Response.json(
       {
-        error: "store_unreadable",
+        error: "unreadable",
         message: error instanceof Error ? error.message : String(error),
-        store: resolveStorePath(),
       },
       { status: 500 },
     );

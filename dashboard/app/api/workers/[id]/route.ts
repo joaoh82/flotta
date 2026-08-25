@@ -1,43 +1,52 @@
 /**
- * GET    /api/workers/:id — worker row + its event timeline
- * DELETE /api/workers/:id — tear the worker down (the kill button)
+ * GET /api/workers/:id — one box, its tasks and its timeline.
+ * DELETE /api/workers/:id — destroy it.
  *
- * Note `params` is a Promise and must be awaited: Next 16 removed the
- * synchronous compatibility shim that Next 15 still allowed.
+ * Both proxy the control plane since M4.5.
+ *
+ * The DELETE used to shell out to `flotta kill` as a subprocess, because
+ * tearing a box down needs Modal or Fly credentials this process does not
+ * have. The control plane has them, so a DELETE is enough — and decision D10
+ * ("only code that can reach the substrate writes to the store") is preserved
+ * by the API boundary rather than by spawning python.
+ *
+ * The id validation goes with it: the value is no longer heading for a command
+ * line, so there is nothing to inject into. It is URL-encoded on the way out
+ * and the control plane 404s an unknown box.
  */
-import type { NextRequest } from "next/server";
-
 import {
+  controlPlaneUrl,
+  ControlPlaneError,
+  ControlPlaneUnreachableError,
   getEvents,
   getWorker,
-  StoreMissingError,
-  StoreOnPostgresError,
-} from "@/lib/store";
-import { InvalidWorkerIdError, killWorker } from "@/lib/teardown";
+  killWorker,
+} from "@/lib/control";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-function storeErrorResponse(error: unknown): Response {
-  if (error instanceof StoreOnPostgresError) {
-    // 501, not 503: the fleet is reachable and healthy — this reader is the
-    // thing that cannot reach it. "Not implemented" is the honest status for a
-    // capability the dashboard has not grown yet (§8.3's API rewrite).
+function errorResponse(error: unknown): Response {
+  if (error instanceof ControlPlaneUnreachableError) {
     return Response.json(
-      { error: "store_on_postgres", message: error.message },
-      { status: 501 },
+      {
+        error: "control_plane_unreachable",
+        message: error.message,
+        control_plane: controlPlaneUrl(),
+      },
+      { status: 503 },
     );
   }
-  if (error instanceof StoreMissingError) {
+  if (error instanceof ControlPlaneError) {
     return Response.json(
-      { error: "store_missing", message: error.message, store: error.storePath },
-      { status: 503 },
+      { error: "control_plane_error", message: error.message },
+      { status: 502 },
     );
   }
   return Response.json(
     {
-      error: "store_unreadable",
+      error: "unreadable",
       message: error instanceof Error ? error.message : String(error),
     },
     { status: 500 },
@@ -45,57 +54,32 @@ function storeErrorResponse(error: unknown): Response {
 }
 
 export async function GET(
-  _request: NextRequest,
+  _request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
   try {
-    const worker = getWorker(id);
+    const worker = await getWorker(id);
     if (!worker) {
       return Response.json({ error: "not_found", id }, { status: 404 });
     }
-    return Response.json({ worker, events: getEvents(id) });
+    return Response.json({ worker, events: await getEvents(id) });
   } catch (error) {
-    return storeErrorResponse(error);
+    return errorResponse(error);
   }
 }
 
 export async function DELETE(
-  _request: NextRequest,
+  _request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
   try {
-    // Confirm the worker exists before shelling out, so a typo comes back as a
-    // clean 404 rather than a CLI stderr dump.
-    if (!getWorker(id)) {
-      return Response.json({ error: "not_found", id }, { status: 404 });
-    }
     return Response.json({ result: await killWorker(id) });
   } catch (error) {
-    if (error instanceof InvalidWorkerIdError) {
-      return Response.json(
-        { error: "invalid_id", message: error.message },
-        { status: 400 },
-      );
+    if (error instanceof ControlPlaneError && error.status === 404) {
+      return Response.json({ error: "not_found", id }, { status: 404 });
     }
-    if (error instanceof StoreMissingError || error instanceof StoreOnPostgresError) {
-      return storeErrorResponse(error);
-    }
-
-    // The CLI failed. Surface its stderr — a teardown that did not happen must
-    // never be reported to the user as success.
-    const stderr =
-      typeof error === "object" && error !== null && "stderr" in error
-        ? String((error as { stderr: unknown }).stderr)
-        : "";
-    return Response.json(
-      {
-        error: "teardown_failed",
-        message: error instanceof Error ? error.message : String(error),
-        detail: stderr.trim(),
-      },
-      { status: 500 },
-    );
+    return errorResponse(error);
   }
 }

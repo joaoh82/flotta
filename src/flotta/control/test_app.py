@@ -176,3 +176,43 @@ def test_a_read_only_replica_is_healthy_without_sweeping(fleet):
         response = c.get("/health")
     assert response.status_code == 200
     assert response.json()["reconcile_loop"]["running"] is False
+
+
+# -- the list view has to do the arithmetic the SQL used to do ---------------
+
+
+def test_a_boxs_cost_is_summed_across_its_tasks(client, fleet):
+    """Cost lives on tasks; the list view is where it gets added up.
+
+    The dashboard's direct-SQL version did `SUM(cost_estimate)`. Proxying to
+    this endpoint dropped the sum without dropping the column, so every cost in
+    the UI silently rendered blank — a fleet that looked free.
+    """
+    store = FleetStore(fleet)
+    box = store.list_boxes()[0]
+    first = store.list_tasks(box_id=box.id)[0]
+    store.update_task_status(first.id, "done", cost_estimate=0.04)
+    second = store.create_task(box.id, "write tests")
+    store.update_task_status(second.id, "running")
+    store.update_task_status(second.id, "done", cost_estimate=0.06)
+    store.close()
+
+    row = client.get("/api/boxes").json()["boxes"][0]
+    assert row["cost_estimate"] == pytest.approx(0.10)
+    assert row["task_count"] == 2
+
+
+def test_an_unpriced_box_costs_none_not_zero(client):
+    """A blank says "no rate configured"; a zero claims the box ran for free."""
+    row = client.get("/api/boxes").json()["boxes"][0]
+    assert row["cost_estimate"] is None
+
+
+def test_the_detail_view_carries_the_tasks_the_list_summarises(client, fleet):
+    """`latest_task` is a list-view convenience; detail returns the tasks.
+
+    Both have to be able to name the box's task. The detail page rendered an
+    empty one, because only the list shape was checked against the UI.
+    """
+    body = client.get("/api/boxes/eng-a").json()
+    assert [t["prompt"] for t in body["tasks"]] == ["add OAuth"]
