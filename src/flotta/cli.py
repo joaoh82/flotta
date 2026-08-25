@@ -793,6 +793,55 @@ def start(
 
 
 @app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address"),
+    port: int = typer.Option(8080, "--port", help="Bind port"),
+    interval_s: float = typer.Option(
+        60.0, "--reconcile-interval-s", help="Seconds between reconcile sweeps"
+    ),
+) -> None:
+    """Run the control plane: the fleet API and the reconcile loop.
+
+    This is the always-on half of the system (§8.1) — the piece that makes
+    `--wait` optional instead of load-bearing, because the watcher lives here
+    rather than in whichever terminal happened to run the spawn.
+
+    Refuses a non-loopback bind: there is no authentication yet (scoped tokens
+    are M5) and `DELETE /api/boxes/<id>` destroys a box and everything it
+    remembers. Bind loopback and tunnel in, or set
+    `FLOTTA_CONTROL_ALLOW_INSECURE_BIND=1` if the port is only reachable on a
+    network you own.
+    """
+    try:
+        from flotta.control import InsecureBindError, check_bind
+    except ImportError as exc:
+        typer.secho(
+            "the control plane needs its extra: `uv sync --extra control`",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2) from exc
+
+    try:
+        check_bind(host)
+    except InsecureBindError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    import uvicorn
+
+    from flotta.control import create_app
+
+    target = store_target(None)
+    typer.secho(
+        f"control plane on http://{host}:{port}  ·  fleet state in {describe_store(target)}",
+        fg=typer.colors.BRIGHT_BLACK,
+        err=True,
+    )
+    uvicorn.run(create_app(interval_s=interval_s), host=host, port=port, log_level="info")
+
+
+@app.command()
 def reconcile(
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,

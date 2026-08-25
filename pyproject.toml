@@ -24,6 +24,16 @@ dependencies = [
 # 455 hermetic tests would be a poor trade. `uv sync --extra postgres` adds it
 # for anyone pointing $FLOTTA_DATABASE_URL at a real server.
 postgres = ["psycopg[binary]>=3.1"]
+# The control plane's HTTP surface. An extra for the same reason as postgres:
+# `just check` runs 460 hermetic tests and should not need a web framework
+# installed to do it. `uv sync --extra control` for anyone running the service.
+control = [
+    "fastapi>=0.115",
+ "httpx>=0.28.1",
+ "uvicorn>=0.34",
+]
+# Everything, for a deployment that runs the control plane against Postgres.
+server = ["flotta[postgres,control]"]
 
 [project.scripts]
 flotta = "flotta.cli:app"
