@@ -1,0 +1,92 @@
+# Independent verification for every pull request and every push to main.
+#
+# It exists because for PRs #28-#33 there was no workflow file at all: the
+# "453 tests passed" line in a PR description was a local run reported by its
+# author, and a reviewer had no way to tell a real green suite from a typo. A
+# check on the commit is the difference.
+#
+# WHAT THIS DELIBERATELY DOES NOT RUN. The suite below is hermetic and $0 —
+# every Modal and Fly touchpoint is injected, nothing reaches the network. The
+# recipes that DO reach real infrastructure must never run here: they cost
+# money and need credentials that do not belong in CI.
+#
+#   just fly-up / fly-cycle / fly-proof / fly-doctor / fly-auth / fly-secrets
+#   just smoke / deploy / e2e            real Modal containers
+#   just e2e-live                        the above, plus real model tokens
+#
+# Nothing here reads `.env` either (gitignored; holds an OpenRouter key and the
+# box's dashboard password). `just check` runs clean in a tree without one —
+# keep it that way, and no secret is ever needed by this workflow.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A force-push supersedes the run it interrupts; don't pay for the old one.
+# main is excluded from cancellation so every commit on it keeps its verdict.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python (ruff + pytest)
+    runs-on: ubuntu-latest
+    env:
+      # Every `uv run` inside the justfile resolves against the committed
+      # lockfile and refuses to silently update it, so a pyproject.toml change
+      # without a matching `uv lock` fails here instead of drifting.
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv (and Python 3.11)
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          # requires-python is >=3.11; test the floor, which is also what the
+          # project's own .venv runs.
+          python-version: "3.11"
+          enable-cache: true
+
+      # CI runs the same recipe a developer runs locally rather than a copy of
+      # its body, so `just check` cannot change without CI following it.
+      - name: Install just
+        uses: extractions/setup-just@v4
+
+      - run: uv sync --frozen
+
+      - name: just check (ruff check src + pytest)
+        run: just check
+
+  dashboard:
+    name: dashboard (tsc + eslint)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # From dashboard/.nvmrc, so nvm/fnm and CI cannot disagree about the
+          # version the lockfile is maintained under. next 16 needs >=20.9.
+          node-version-file: dashboard/.nvmrc
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # `just check-dashboard` runs `npm install` when node_modules is absent,
+      # which is right for a laptop and wrong here: CI must install exactly the
+      # committed lockfile. Hence `npm ci` and the two commands inline rather
+      # than the recipe. Keep the tsc/eslint pair in step with that recipe.
+      - run: npm ci
+
+      - run: npx tsc --noEmit
+
+      - run: npx eslint .

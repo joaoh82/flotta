@@ -2,6 +2,8 @@
 
 **Hand a task to a disposable agent in the cloud. Get the answer back. Destroy it.**
 
+[![CI](https://github.com/joaoh82/flotta/actions/workflows/ci.yml/badge.svg)](https://github.com/joaoh82/flotta/actions/workflows/ci.yml)
+
 ![Flotta spawning a box, collecting its answer, and showing an empty fleet afterwards](assets/demo.gif)
 
 *Real run, not a mockup — `just demo` re-records it. The box answers `4.19.0-gvisor`, which is
@@ -129,7 +131,7 @@ have deployed into someone else's workspace silently.
 ### 3. Prove the plumbing without spending on a model
 
 ```bash
-just check               # 307 tests, offline, free
+just check               # the whole hermetic suite, offline, free
 just deploy              # publishes the run_worker function
 just e2e                 # full lifecycle against real Modal, no LLM
 ```
@@ -295,10 +297,17 @@ and renaming it to match the box vocabulary would be wrong in the other directio
 just                     # list every recipe
 just check               # lint + tests — run before committing
 just check-dashboard     # tsc + eslint
+just ci                  # both of the above — everything CI runs
 just test-one <keyword>  # a single test
 ```
 
 The test suite is hermetic and free: every Modal touchpoint is injected, never called for real.
+
+That is also why it can run on every pull request:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `just check` and the dashboard's
+`tsc`/`eslint` as two separate jobs on each PR and each push to `main`. It needs no secrets and
+touches no billed infrastructure — the recipes that spend money (`smoke`, `deploy`, `e2e`,
+`e2e-live`, anything `fly-*`) are deliberately not part of it and stay a local, deliberate act.
 
 ## License
 

@@ -200,13 +200,20 @@ def test_exec_result_ok():
 # -- re-review follow-ups ---------------------------------------------------
 
 
-def test_a_flyctl_timeout_becomes_a_backend_error():
+def test_a_flyctl_timeout_becomes_a_backend_error(monkeypatch):
     """`BackendError` is the only exception `create_box`/`stop_box` catch.
 
     A `TimeoutExpired` escaping past them leaves a row stranded in
     `provisioning` with a real machine attached — the row never closes because
     the cleanup path was never entered.
+
+    `shutil.which` is stubbed along with `subprocess.run`. Without it this test
+    passes only on a machine that happens to have flyctl installed: `_run_flyctl`
+    checks PATH first, so on a bare machine it raised the "not on PATH" error and
+    the timeout branch under test never ran. That is what it did on CI's first
+    green-suite attempt, on a suite documented as hermetic.
     """
+    import shutil
     import subprocess
 
     from flotta.backend import BackendError
@@ -215,13 +222,10 @@ def test_a_flyctl_timeout_becomes_a_backend_error():
     def boom(*args, **kwargs):
         raise subprocess.TimeoutExpired(cmd="flyctl machines start", timeout=5)
 
-    real = subprocess.run
-    subprocess.run = boom
-    try:
-        with pytest.raises(BackendError, match="timed out"):
-            _run_flyctl(["flyctl", "machines", "start"], timeout=5, check=True)
-    finally:
-        subprocess.run = real
+    monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/flyctl")
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(BackendError, match="timed out"):
+        _run_flyctl(["flyctl", "machines", "start"], timeout=5, check=True)
 
 
 @pytest.mark.parametrize(

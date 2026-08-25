@@ -280,9 +280,9 @@ Data flow: orchestrator → `spawn_box` (Modal) → the container boots headless
 ## Conventions
 
 - **Python 3.11**, type hints everywhere, **ruff** for lint + format.
-- Tests with **pytest** next to the code (`test_*.py`). Every `store`/`provision` change needs a test; validate status transitions and listing filters explicitly. **Keep the suite hermetic and $0** — every Modal touchpoint is injected, never called for real. `just check` is the gate; it must be green before committing.
+- Tests with **pytest** next to the code (`test_*.py`). Every `store`/`provision` change needs a test; validate status transitions and listing filters explicitly. **Keep the suite hermetic and $0** — every Modal touchpoint is injected, never called for real. `just check` is the gate; it must be green before committing — and since `.github/workflows/ci.yml` runs it on every pull request and every push to `main`, a green suite is now verified on the commit rather than asserted in the PR description. Keep the workflow free of secrets and of any recipe that touches real Modal or Fly.
 - **One commit per completed task**, message prefixed with the task ID — e.g. `M3.2: spawn_box writes lifecycle events`.
-- Dashboard: TypeScript, **no UI library beyond Tailwind**, keep it boring.
+- Dashboard: TypeScript, **no UI library beyond Tailwind**, keep it boring. Node version is pinned in `dashboard/.nvmrc` (24) so nvm/fnm and CI agree. **Regenerate `package-lock.json` on Linux**, not on the Mac: npm writes a lockfile for the platform it ran on, and a macOS-generated one omits `@emnapi/core`/`@emnapi/runtime` (optional peers reached through `@tailwindcss/oxide-wasm32-wasi`), which makes `npm ci` fail on CI with "Missing ... from lock file". `docker run --rm -v "$PWD:/w" -w /w node:24-bookworm npm install --package-lock-only` produces one that installs on both.
 - Secrets only via Modal secrets / `.env` (gitignored) — never hardcode.
 - Use **plan mode first** for anything non-trivial; keep session scopes small (≈ one milestone task cluster).
 
@@ -293,6 +293,7 @@ Common commands live in the **`justfile`** (`just` lists them; `just check` = li
 ```bash
 just check                  # lint + tests — run before committing
 just check-dashboard        # tsc + eslint (the Python `check` does not cover the dashboard)
+just ci                     # check + check-dashboard — exactly what GitHub Actions runs
 just test-one <keyword>     # a single test (uv run pytest -k <keyword>)
 just fmt                    # ruff format + --fix
 just modal-whoami           # which Modal workspace the recipes target (gates every modal recipe)
