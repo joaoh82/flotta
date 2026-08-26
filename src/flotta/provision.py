@@ -215,6 +215,32 @@ class ProvisionError(Exception):
     """Base error for provisioning operations."""
 
 
+class BoxOccupied(ProvisionError):
+    """Another live box already claims the machine this one would adopt.
+
+    A distinct type because it is the one create failure that is a *conflict*
+    about fleet state rather than something going wrong — the caller can act on
+    it (pick another app, tear the other box down), and an API needs to say 409
+    here and something else everywhere else. Branching on an exception type
+    rather than parsing a message keeps that from rotting.
+    """
+
+
+class BoxNotRunning(ProvisionError):
+    """The machine was created but is not up. **A box exists.**
+
+    Carries the ids because that is the whole point: the row is recorded as
+    `stopped` and the machine is sitting there costing disk, so a caller that
+    only learns "it failed" cannot start it *or* destroy it. That is how you
+    get an orphan machine billing against an account nobody is looking at.
+    """
+
+    def __init__(self, message: str, *, box_id: str, endpoint: str | None) -> None:
+        super().__init__(message)
+        self.box_id = box_id
+        self.endpoint = endpoint
+
+
 class TaskTimeout(ProvisionError):
     """The task did not produce a result before the watch deadline.
 
@@ -336,7 +362,7 @@ def create_box(
     if probe:
         for existing in store.list_boxes():
             if existing.endpoint == probe and not is_terminal("box", existing.status):
-                raise ProvisionError(
+                raise BoxOccupied(
                     f"box {existing.id} ({existing.name}) already occupies {probe}. "
                     "One machine hosts one box; destroy it with `flotta kill` "
                     "before creating another, or point FLOTTA_FLY_APP elsewhere."
@@ -402,9 +428,11 @@ def create_box(
         "stopped",
         {"endpoint": handle.endpoint, "machine_id": handle.id, "reason": detail},
     )
-    raise ProvisionError(
+    raise BoxNotRunning(
         f"box {box.id} was created ({handle.endpoint}) but is not running: {detail}. "
-        f"It is recorded as stopped; `flotta start {box.id}` will retry."
+        f"It is recorded as stopped; `flotta start {box.id}` will retry.",
+        box_id=box.id,
+        endpoint=handle.endpoint,
     )
 
 

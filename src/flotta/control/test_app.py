@@ -288,22 +288,72 @@ def test_post_without_a_name_is_422_not_a_generated_one(client):
     assert client.post("/api/boxes", json={"name": "   "}).status_code == 422
 
 
-def test_a_refused_creation_is_409_not_500(client, monkeypatch):
-    """`create_box` refuses when a machine is already occupied by another box.
+def test_an_occupied_machine_is_409(client, monkeypatch):
+    """The one create failure that is genuinely a conflict about fleet state.
 
-    That is fleet state, not a malformed request, and the caller can act on it
-    — so it must not arrive as an opaque 500.
+    The caller can act on it — pick another app, tear the other box down — so
+    it must not arrive as an opaque 5xx.
     """
     import flotta.provision as provision
 
     def refuse(name, *, store, **kwargs):
-        raise provision.ProvisionError("box b-1 (eng-a) already occupies fly://app/m1")
+        raise provision.BoxOccupied("box b-1 (eng-a) already occupies fly://app/m1")
 
     monkeypatch.setattr(provision, "create_box", refuse)
 
     response = client.post("/api/boxes", json={"name": "eng-b"})
     assert response.status_code == 409
     assert "already occupies" in response.json()["detail"]
+
+
+def test_a_substrate_failure_is_502_not_409(client, monkeypatch):
+    """A backend that is down or timing out is not the caller's conflict.
+
+    Every `ProvisionError` used to become 409, which told someone whose Fly
+    region was having a bad minute that they had a naming conflict.
+    """
+    import flotta.provision as provision
+
+    def boom(name, *, store, **kwargs):
+        raise provision.ProvisionError("create failed: BackendError: flyctl timed out")
+
+    monkeypatch.setattr(provision, "create_box", boom)
+
+    response = client.post("/api/boxes", json={"name": "eng-b"})
+    assert response.status_code == 502
+    assert "flyctl timed out" in response.json()["detail"]
+
+
+def test_a_created_but_not_running_box_is_201_with_its_id(client, fleet, monkeypatch):
+    """A machine exists. Answering with an error would hide it.
+
+    `create_box` records the row as `stopped` and raises, because the box is
+    not usable yet. But something **was** created and is costing disk, so a
+    response that says "failed" — and does not even carry the id — leaves the
+    caller unable to start it *or* destroy it. That is an orphan machine
+    billing against an account nobody is watching, which this repo has done
+    once already.
+    """
+    import flotta.provision as provision
+
+    def half_made(name, *, store, **kwargs):
+        box = store.create_box(name)
+        store.update_box_status(box.id, "stopped", endpoint="fly://app/m-cold")
+        raise provision.BoxNotRunning(
+            f"box {box.id} was created but is not running",
+            box_id=box.id,
+            endpoint="fly://app/m-cold",
+        )
+
+    monkeypatch.setattr(provision, "create_box", half_made)
+
+    response = client.post("/api/boxes", json={"name": "eng-b"})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["box"]["status"] == "stopped"
+    assert body["box_id"], "the caller must learn the id to start or kill it"
+    assert body["endpoint"] == "fly://app/m-cold"
+    assert "not running" in body["warning"]
 
 
 def test_delete_goes_through_teardown_rather_than_writing_the_row(client, fleet, monkeypatch):

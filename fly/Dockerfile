@@ -7,7 +7,7 @@
 # exists to answer one question — does `/data/hermes` survive a stop/start —
 # and it is kept small enough that the answer is unambiguous.
 #
-# It mirrors `src/flotta/worker/image.py` on purpose, including the editable
+# It mirrors `src/flotta/box/image.py` on purpose, including the editable
 # install: upstream Hermes *blocks* wheel and sdist builds, so
 # `pip install 'hermes-agent @ git+...'` fails for anything after v2026.7.20.
 # Their own setup.py names the way through — `build_editable` does not call
@@ -25,7 +25,7 @@ RUN apt-get update \
 
 # Pinned, never floating. A moving ref means the image silently changes under
 # you between builds and "which Hermes ran this?" stops being answerable.
-# Passed from HERMES_REF in src/flotta/worker/image.py so the box and the
+# Passed from HERMES_REF in src/flotta/box/image.py so the box and the
 # shard tier cannot drift apart.
 ARG HERMES_REF
 ARG HERMES_REPO=https://github.com/NousResearch/Hermes-Agent

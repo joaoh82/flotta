@@ -37,10 +37,10 @@ check: lint test
 hermes-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    pinned=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+    pinned=$(uv run python -c "from flotta.box.image import HERMES_REF; print(HERMES_REF)")
     latest=$(gh api repos/NousResearch/Hermes-Agent/releases/latest --jq .tag_name 2>/dev/null || echo "?")
     local_v=$(hermes --version 2>/dev/null | head -1 || echo "not installed")
-    printf "  workers run   : %s\n" "$pinned"
+    printf "  boxes run     : %s\n" "$pinned"
     printf "  latest release: %s\n" "$latest"
     printf "  your local    : %s\n" "$local_v"
     echo
@@ -63,7 +63,7 @@ hermes-check:
 hermes-bump REF:
     #!/usr/bin/env bash
     set -euo pipefail
-    file=src/flotta/worker/image.py
+    file=src/flotta/box/image.py
 
     branch=$(git branch --show-current)
     if [ "$branch" = "main" ]; then
@@ -187,7 +187,7 @@ fly-up: fly-whoami
     # when it is not attached to a TTY, so "unset" cannot mean "decide later".
     REGION=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().resolved_region())")
     echo "region     $REGION"
-    REF=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+    REF=$(uv run python -c "from flotta.box.image import HERMES_REF; print(HERMES_REF)")
 
     # Fly app names are globally unique across all of Fly, not per-org, so a
     # collision here is the single most likely first failure. Say so plainly.

@@ -1,11 +1,12 @@
 """Run one Hermes turn **on a box**, with memory switched on (M2).
 
-The difference from `flotta.worker.server._run_task_core` is two flags, and
-they are the whole milestone:
+Two flags are the whole milestone. The disposable worker this was contrasted
+with is gone — cut with the shard tier — but the contrast is still the clearest
+statement of what makes a box a box:
 
-    worker (Tier 3, disposable)      box (Tier 1, persistent)
-    skip_memory=True                 skip_memory=False
-    HERMES_HOME=/tmp/hermes          HERMES_HOME=/data/hermes
+    the old disposable worker         a box
+    skip_memory=True                  skip_memory=False
+    HERMES_HOME=/tmp/hermes           HERMES_HOME=/data/hermes
 
 The pivot doc (§2.2) blames the ephemeral `HERMES_HOME` for deleting the value
 proposition, and it is right — but it names only one of the two switches. A box

@@ -16,7 +16,7 @@ primary_region = ""
 
 [build.args]
   # Overwritten by `just fly-up` with HERMES_REF from
-  # src/flotta/worker/image.py, so the box and the shard tier cannot drift.
+  # src/flotta/box/image.py — one pin, so a box always answers "which Hermes?".
   HERMES_REF = "v2026.8.19"
 
 [env]
