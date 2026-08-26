@@ -1,38 +1,14 @@
 # Flotta dev commands — https://just.systems
-# Keep this file updated as milestones land (M2: modal smoke test, M4: CLI, M5: dashboard).
+# Keep this file updated as milestones land.
 
 # Local settings come from .env (gitignored) — copy .env.example to start.
 # That file is the single place to look for machine-local config.
 set dotenv-load := true
 
-# Modal profile for THIS project. Every modal recipe pins it explicitly so no
-# Flotta command ever inherits whatever `modal profile activate` left global —
-# a wrong active profile would otherwise build/deploy into an unrelated
-# workspace. Create it with:
-#   modal token new --profile flotta --no-activate
-# (switch to the Flotta workspace in the Modal dashboard first — the token is
-# minted for the workspace your browser session is in). Override per-shell with
-# FLOTTA_MODAL_PROFILE=<name>.
-modal_profile := env_var_or_default("FLOTTA_MODAL_PROFILE", "flotta")
-
 # list available recipes
 default:
     @just --list
 
-# verify + print which Modal workspace the flotta recipes target (fails if unauthenticated)
-modal-whoami:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # `modal profile current` only echoes $MODAL_PROFILE back and never validates,
-    # so authenticate for real: `modal app list` fails on a missing/bad profile.
-    if ! MODAL_PROFILE={{modal_profile}} modal app list >/dev/null 2>&1; then
-      echo "ERROR: Modal profile '{{modal_profile}}' is missing or not authenticated." >&2
-      echo "Switch to the Flotta workspace in the Modal dashboard, then run:" >&2
-      echo "  modal token new --profile {{modal_profile}} --no-activate" >&2
-      exit 1
-    fi
-    echo "Modal target for flotta recipes:"
-    MODAL_PROFILE={{modal_profile}} modal profile list | grep '•'
 
 # run the test suite
 test *ARGS:
@@ -61,10 +37,10 @@ check: lint test
 hermes-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    pinned=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+    pinned=$(uv run python -c "from flotta.box.image import HERMES_REF; print(HERMES_REF)")
     latest=$(gh api repos/NousResearch/Hermes-Agent/releases/latest --jq .tag_name 2>/dev/null || echo "?")
     local_v=$(hermes --version 2>/dev/null | head -1 || echo "not installed")
-    printf "  workers run   : %s\n" "$pinned"
+    printf "  boxes run     : %s\n" "$pinned"
     printf "  latest release: %s\n" "$latest"
     printf "  your local    : %s\n" "$local_v"
     echo
@@ -83,11 +59,11 @@ hermes-check:
 # broken edit in place "so you can inspect it", which in practice meant a
 # working tree pinned to a Hermes that cannot build — on `main`, where the
 # next commit would have shipped it.
-# M7 — bump the pinned Hermes and re-verify against real Modal
+# M7 — bump the pinned Hermes; verify against a real box
 hermes-bump REF:
     #!/usr/bin/env bash
     set -euo pipefail
-    file=src/flotta/worker/image.py
+    file=src/flotta/box/image.py
 
     branch=$(git branch --show-current)
     if [ "$branch" = "main" ]; then
@@ -110,72 +86,12 @@ hermes-bump REF:
 
     sed -i.bak -E 's|DEFAULT_HERMES_REF = "[^"]+"|DEFAULT_HERMES_REF = "{{REF}}"|' "$file" && rm -f "$file.bak"
     echo "  $previous -> {{REF}}"
-    echo "  rebuilding and re-verifying (smoke, then a live task)..."
-    just smoke
-    just deploy
-    just e2e-live
+    echo "  bump recorded. Verify against a real box:"
+    echo "    just fly-up      # build and boot a box on the new ref"
+    echo "    just fly-proof   # memory survives a stop/start"
+    echo "    just fly-doctor  # it is actually serving"
     trap - ERR
-    echo "  {{REF}} verified: image builds, MCP answers, a real task round-trips."
 
-# M2 worker smoke test — build image on Modal, confirm the MCP endpoint answers (hermetic, no API key)
-smoke: modal-whoami
-    MODAL_PROFILE={{modal_profile}} modal run src/flotta/worker/modal_app.py
-
-# Creates the named provider secret only if it is absent — never overwrites, so a
-# deploy cannot clobber a key you rotated in the Modal dashboard or via secret-sync.
-# M3 — ensure the provider secret exists (empty is fine; dry-run needs no provider)
-secret-ensure: modal-whoami
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if MODAL_PROFILE={{modal_profile}} modal secret list 2>/dev/null | grep -q ' flotta-provider '; then
-      echo "secret 'flotta-provider' exists — leaving it alone"
-    else
-      echo "creating empty secret 'flotta-provider' (use 'just secret-sync' to fill it)"
-      MODAL_PROFILE={{modal_profile}} modal secret create flotta-provider FLOTTA_PLACEHOLDER=unset
-    fi
-
-# Rotate a key: edit .env, run this. No code change and no redeploy — the named
-# secret is the container's source of truth (M7.1a).
-#
-# It is NOT instant, and the reason is worth knowing: a secret is injected as
-# environment variables when a container *starts*, so any container Modal is
-# still keeping warm goes on serving the old value until it scales down. New
-# containers get the new value immediately. To force it, stop the app:
-#   modal app stop flotta-provision -y
-# M7 — push local provider credentials into the named Modal secret
-secret-sync: modal-whoami
-    #!/usr/bin/env bash
-    set -euo pipefail
-    missing=()
-    for k in FLOTTA_MODEL FLOTTA_MODEL_BASE_URL FLOTTA_API_KEY; do
-      [ -n "${!k:-}" ] || missing+=("$k")
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-      echo "ERROR: not set in .env: ${missing[*]}" >&2
-      echo "Fill them in .env (see .env.example), then re-run." >&2
-      exit 1
-    fi
-    MODAL_PROFILE={{modal_profile}} modal secret create flotta-provider --force \
-      FLOTTA_MODEL="$FLOTTA_MODEL" \
-      FLOTTA_MODEL_BASE_URL="$FLOTTA_MODEL_BASE_URL" \
-      FLOTTA_API_KEY="$FLOTTA_API_KEY"
-    echo "secret updated — no redeploy needed."
-    echo "New containers use it immediately; a warm one may serve the old value"
-    echo "until it scales down. To force it now: modal app stop flotta-provision -y"
-
-# M3 — deploy the provisioning app (run_worker). Required before `just e2e`.
-deploy: modal-whoami secret-ensure
-    MODAL_PROFILE={{modal_profile}} modal deploy src/flotta/provision.py
-
-# `just --list` shows only the LAST comment line, so keep that line a complete
-# summary — earlier lines are detail for anyone reading the file.
-# Spawn -> watch -> teardown against real Modal, asserting the store at each step.
-# M3 end-to-end lifecycle, dry-run by default (no LLM, no provider key needed)
-e2e *ARGS: modal-whoami
-    MODAL_PROFILE={{modal_profile}} uv run python scripts/e2e_lifecycle.py {{ARGS}}
-
-# same, but with a real Hermes task — needs FLOTTA_MODEL/FLOTTA_MODEL_BASE_URL/FLOTTA_API_KEY
-e2e-live: (e2e "--live")
 
 # Loopback only: there is no auth yet and DELETE /api/boxes/<id> destroys a box
 # and its memory, so `serve` refuses a public bind rather than warning about it.
@@ -210,7 +126,7 @@ check-dashboard:
 # Exactly what .github/workflows/ci.yml runs, in one command — so "will CI go
 # green?" is answerable before pushing. The workflow's two jobs are separate so
 # a dashboard-only failure is obvious there; here they run in sequence.
-# Everything CI checks (python + dashboard) — no Modal, no Fly, no cost
+# Everything CI checks (python + dashboard) — no Fly, no cost
 ci: check check-dashboard
 
 # M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
@@ -222,22 +138,19 @@ ci: check check-dashboard
 #   uv run flotta stop <box>         # M0: disk retained, no CPU
 #   uv run flotta start <box>        # M0: wake it again
 #
-# The workspace no longer needs pinning at the call site: the CLI resolves
-# FLOTTA_MODAL_PROFILE itself (env, then .env) before touching Modal, so an
-# installed bare `flotta` targets the right workspace on its own.
 
 # Regenerates assets/demo.gif from assets/demo.tape. `just --list` shows only
 # the last comment line, so the cost lives there rather than here.
-# M7.6: re-record the README demo GIF — costs a real spawn (container + model call)
-demo: modal-whoami
+# M7.6: re-record the README demo GIF — STALE, the tape still drives `flotta spawn`
+demo:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v vhs >/dev/null || { echo "vhs not installed: brew install vhs"; exit 1; }
     # The tape drives the installed `flotta`, not `uv run flotta`, so the GIF
     # shows what the README tells a user to type. Keep the two in step.
     uv tool install --force . >/dev/null
-    # Must run from the repo root: the CLI reads `.env` from the current
-    # directory to resolve the Modal profile.
+    # NOTE: assets/demo.tape still drives v0.1's `flotta spawn`, which no
+    # longer exists. Re-record against `flotta create` + `flotta chat`.
     vhs assets/demo.tape
     ls -lh assets/demo.gif
 
@@ -247,10 +160,11 @@ plan:
 
 # --- M2: the box tier on Fly.io -------------------------------------------
 #
-# `fly-whoami` gates every Fly recipe for the same reason `modal-whoami` gates
-# the Modal ones: flyctl acts on whichever org is current, and this repo already
-# found its globally-active Modal profile pointing at an unrelated workspace
-# once. Pin it in .env (FLOTTA_FLY_ORG / FLOTTA_FLY_APP), never rely on ambient.
+# `fly-whoami` gates every Fly recipe: flyctl acts on whichever org is current.
+# The precedent is real — back when this repo used Modal, its globally-active
+# profile was once found pointing at an unrelated workspace, and every recipe
+# had to pin it. Pin Fly in .env (FLOTTA_FLY_ORG / FLOTTA_FLY_APP), never rely
+# on ambient state.
 
 # which Fly org/app/volume every fly recipe will act on
 fly-whoami:
@@ -273,7 +187,7 @@ fly-up: fly-whoami
     # when it is not attached to a TTY, so "unset" cannot mean "decide later".
     REGION=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().resolved_region())")
     echo "region     $REGION"
-    REF=$(uv run python -c "from flotta.worker.image import HERMES_REF; print(HERMES_REF)")
+    REF=$(uv run python -c "from flotta.box.image import HERMES_REF; print(HERMES_REF)")
 
     # Fly app names are globally unique across all of Fly, not per-org, so a
     # collision here is the single most likely first failure. Say so plainly.

@@ -199,6 +199,66 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/boxes", status_code=201)
+    def create_box_endpoint(body: dict[str, Any]) -> Any:
+        """Create a box. The API half of "create Agent B" being a button.
+
+        Goes through `provision.create_box` rather than writing a row, for the
+        same reason `DELETE` goes through `teardown_box`: the store must never
+        claim a machine that was not provisioned. `create_box` also refuses to
+        mint a second row for a machine another box already occupies — a guard
+        that was unreachable until this endpoint existed to reach it.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import (
+            BoxNotRunning,
+            BoxOccupied,
+            ProvisionError,
+            create_box,
+        )
+
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="a box needs a name")
+
+        store = store_factory()
+        try:
+            try:
+                result = create_box(name, store=store)
+            except BoxOccupied as exc:
+                # The only create failure that is genuinely a *conflict*: the
+                # machine is taken, and the caller can act on that.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except BoxNotRunning as exc:
+                # A box **was** created, and the row says `stopped`. Answering
+                # with an error would tell the caller nothing was made while a
+                # machine sits there costing disk — and they would not even
+                # learn its id, so they could neither start it nor destroy it.
+                # That is how an orphan machine bills against an account nobody
+                # is watching, which this repo has done once already.
+                #
+                # 201 with the box, plus a warning saying it is not up.
+                box = store.get_box(exc.box_id)
+                return JSONResponse(
+                    {
+                        "box": _box_dict(box),
+                        "box_id": exc.box_id,
+                        "endpoint": exc.endpoint,
+                        "warning": str(exc),
+                    },
+                    status_code=201,
+                )
+            except ProvisionError as exc:
+                # Everything else is the substrate failing, not the caller
+                # asking for something impossible. 502 matches DELETE, which
+                # already reports a failed teardown that way.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            box = store.get_box(result["box_id"])
+            return {"box": _box_dict(box), **result}
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}")
     def get_box(box_id: str) -> Any:
         store = store_factory()

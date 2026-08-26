@@ -22,11 +22,11 @@ export function ErrorPanel({ error }: { error: ApiError }) {
       )}
       {missing && (
         <p className="mt-3 text-amber-800 dark:text-amber-300">
-          Spawn a worker with{" "}
-          <code className="font-mono">uv run flotta spawn …</code>, or point the
-          dashboard at an existing store by setting{" "}
+          Create an agent with{" "}
+          <code className="font-mono">uv run flotta create &lt;name&gt;</code>, or
+          point the control plane at an existing store by setting{" "}
           <code className="font-mono">FLOTTA_STORE</code> before{" "}
-          <code className="font-mono">npm run dev</code>.
+          <code className="font-mono">just serve</code>.
         </p>
       )}
     </div>

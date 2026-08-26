@@ -49,7 +49,7 @@ export function FleetTable() {
       {shown.length === 0 ? (
         <p className="rounded-lg border border-dashed border-neutral-300 p-8 text-center text-sm text-neutral-500 dark:border-neutral-700">
           {all.length === 0
-            ? "No workers yet. Spawn one with `uv run flotta spawn \"…\"`."
+            ? "No agents yet. Create one with `uv run flotta create <name>`."
             : "No live workers."}
         </p>
       ) : (

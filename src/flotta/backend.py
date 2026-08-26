@@ -130,7 +130,7 @@ class Backend(Protocol):
     anything. That is what keeps `backend_for(endpoint)` cheap.
     """
 
-    #: Scheme used in stored endpoints (`fly`, `modal`, later `hetzner`).
+    #: Scheme used in stored endpoints (`fly`, later `hetzner`).
     scheme: str
 
     def create(self, spec: BoxSpec) -> BoxHandle:
@@ -215,10 +215,10 @@ def _ensure_builtins_registered() -> None:
 
     Called from `backend_for` rather than left to the caller. An earlier
     version relied on someone having imported `flotta.backends` first, and the
-    failure mode was quietly wrong: a perfectly valid `modal://` endpoint
-    resolved to "names no substrate", which reads as a malformed box rather
-    than a missing import. Registration is lazy — the factories are callables —
-    so this never imports `flyctl` or `modal` by itself.
+    failure mode was quietly wrong: a perfectly valid endpoint resolved to
+    "names no substrate", which reads as a malformed box rather than a missing
+    import. Registration is lazy — the factories are callables — so this never
+    imports `flyctl` by itself.
     """
     if _REGISTRY:
         return

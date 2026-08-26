@@ -13,10 +13,13 @@ is gone and only the store remembers it.*
 *(This recording predates the box/task rename, so its `ps` columns are the old ones. Re-recording
 costs a real spawn, so it waits for the next demo pass.)*
 
-Flotta (Italian for *fleet*) is an open-source fleet runtime for self-improving agents. One
-always-on orchestrator — [Hermes Agent](https://github.com/NousResearch/Hermes-Agent) first —
-spawns headless agents in [Modal](https://modal.com) containers, collects their results, and tears
-them down.
+Flotta (Italian for *fleet*) is an open-source fleet runtime for self-improving agents. A **box**
+is a long-lived machine that *is* an agent: it runs [Hermes Agent](https://github.com/NousResearch/Hermes-Agent)
+as PID 1, keeps its memory on a volume at `/data/hermes`, and sleeps between conversations. You
+create one, then talk to it as a client.
+
+Hermes is the engine inside the box — the agent loop, the tooling, the memory — the way
+[exe.dev](https://exe.dev) loads a box with Claude Code and a toolchain. Flotta hosts it.
 
 ```
 you ──▶ Hermes ──spawn──▶ ┌─ box ──────────────────┐
@@ -40,17 +43,14 @@ machine. That one rule shapes most of the design.
 > persistent thing — your agent's memory — on the laptop. That is backwards for what this is
 > meant to be, which is a *host* for persistent cloud agents you talk to from a thin client.
 >
-> The runtime now names three tiers with three lifetimes: a **box** is a machine that *is* an
-> agent (months, durable memory); a **workspace** is where its untrusted code runs (hours, no
-> memory); a **shard** is one stateless fan-out call (seconds). The store, the CLI and the
-> dashboard already speak that vocabulary.
+> The runtime names two tiers with two lifetimes: a **box** is a machine that *is* an agent
+> (months, durable memory on a volume); a **workspace** is where its untrusted code runs (hours,
+> no memory — M6, not built). A third, stateless Modal shards, was cut in 2026-08.
 >
-> **What is not built yet is the persistence.** On Modal — today's only backend — a box is still
-> disposable: `stop` and `start` record the transition but no infrastructure suspends anything,
-> and `HERMES_HOME` is still ephemeral, so a box forgets everything when it dies. Durable memory
-> across a stop/start cycle is the next milestone and the whole point. Until it lands, treat the
-> box vocabulary as the shape the system is growing into, and [Limitations](#limitations) as the
-> honest account of what runs.
+> **The persistence is real now.** A box boots `hermes serve` on a Fly Machine with `/data/hermes`
+> on a volume, and memory survives a stop/start. What is *not* built is the front door: nothing is
+> authenticated, so boxes are reached over a private tunnel and the control plane refuses a public
+> bind. See [Limitations](#limitations) for the honest account.
 
 > [!WARNING]
 > **Flotta is a local tool. Nothing in it is authenticated.**
@@ -65,19 +65,17 @@ machine. That one rule shapes most of the design.
 
 ## What it does today
 
-- **Cloud boxes.** A pinned Modal image boots Hermes *headless* — no messaging gateway, one
-  provider, fixed toolset — and hard-exits on a watchdog timeout, so a stuck box destroys itself.
+- **Persistent cloud boxes.** A pinned image boots `hermes serve` as PID 1 on a Fly Machine with
+  a volume at `/data/hermes`, so an agent's memory survives a stop/start.
 - **Every transition recorded.** A local SQLite store is the single source of truth, split into
   `boxes` / `workspaces` / `tasks`, each with its own validated transition table. A box cannot be
   `done` and a task cannot be `stopped`; the store refuses both.
-- **A CLI.** `ps`, `spawn`, `watch`, `logs`, `stop`, `start`, `kill`, `reconcile` — all with
-  `--json`.
-- **A local dashboard.** A browser view of the fleet with a kill button.
-- **A Hermes skill.** Teaches your orchestrator when to delegate, how to write a task that
-  survives having no context, and to always tear down.
+- **A CLI.** `create`, `chat`, `ps`, `logs`, `stop`, `start`, `kill`, `serve` — all with `--json`.
+- **A control plane.** `flotta serve` — the fleet API plus a reconcile loop on a timer.
+- **A local dashboard.** A browser view of the fleet, reading that API.
 
-Not yet: durable box memory, real suspend/resume, workspaces, shard fan-out, any hosted component.
-`stop` and `start` are store-side only — see the status note above.
+Not yet: the front door and authentication (M5), the Flotta app (M8), shared memory across the
+fleet (M9). Nothing here is authenticated — localhost only.
 
 ## Requirements
 
@@ -85,7 +83,7 @@ Not yet: durable box memory, real suspend/resume, workspaces, shard fan-out, any
 |---|---|
 | Python | 3.11+ |
 | [uv](https://docs.astral.sh/uv/) | for install and dev |
-| [Modal](https://modal.com) account | free tier is plenty to try it |
+| [Fly.io](https://fly.io) account | boxes and volumes bill while they exist |
 | Node 20+ | only for the dashboard |
 | An OpenAI-compatible API key | only to run real tasks; the dry-run path needs none |
 
@@ -118,30 +116,28 @@ Working on Flotta itself? Use `uv run flotta …` from the repo instead and skip
 
 *(`pip install flotta` will work once the package is published; it is not on PyPI yet.)*
 
-### 2. Point at your Modal workspace
+### 2. Point at your Fly org
 
 ```bash
 cp .env.example .env
-modal token new --profile flotta --no-activate
-just modal-whoami        # prints which workspace every command will use
+flyctl auth login
+just fly-whoami          # prints the org, app and volume every recipe will act on
 ```
 
-The profile is pinned in `.env` rather than relying on Modal's globally-active one. That exists
-because the active profile was once found pointing at an unrelated project — a wrong profile would
-have deployed into someone else's workspace silently.
+Pinned in `.env` rather than relying on flyctl's current org. That exists because an ambient,
+globally-active profile was once found pointing at an unrelated project — the wrong one would
+provision into someone else's account silently.
 
-### 3. Prove the plumbing without spending on a model
+### 3. Prove the plumbing without spending anything
 
 ```bash
 just check               # the whole hermetic suite, offline, free
-just deploy              # publishes the run_worker function
-just e2e                 # full lifecycle against real Modal, no LLM
 ```
 
-`just e2e` should end with `E2E OK — 36/36 checks passed against real Modal`. That is a genuine
-container spawning, running, being watched to completion, stopped, started, and destroyed.
+The suite is hermetic: every Fly touchpoint is injected, so this needs no network, no credentials
+and no `flyctl`.
 
-### 4. Add a model and run something real
+### 4. Create an agent and talk to it
 
 Put your provider details in `.env`:
 
@@ -151,14 +147,19 @@ FLOTTA_MODEL_BASE_URL=https://openrouter.ai/api/v1
 FLOTTA_API_KEY=sk-or-...
 ```
 
-Then push them to the box and go:
+Then build the box image, create an agent, and open a session:
 
 ```bash
-just secret-sync         # credentials live in a Modal secret, not in the deploy
-flotta spawn "Explain in 150 words why append-only logs simplify distributed systems." --wait
+just fly-up              # build the image and boot a machine — REAL Fly spend
+just fly-secrets         # provider credentials as Fly secrets, not baked into the image
+flotta create eng-a      # a persistent agent with durable memory
+flotta chat eng-a        # talk to it
 ```
 
 Any OpenAI-compatible endpoint works — swap the base URL for OpenAI, Nous Portal, a local vLLM.
+
+`eng-a` keeps its memory on a volume at `/data/hermes`, so `flotta stop eng-a` and
+`flotta start eng-a` leave it knowing what it knew.
 
 ### 5. Watch the fleet
 
@@ -195,38 +196,38 @@ a skill to delegate to itself.
 
 Two separate bills, and conflating them is how people get surprised:
 
-| Step | Modal compute | Model tokens |
+| Step | Fly | Model tokens |
 |---|---|---|
-| `just check` | — | — |
-| `just modal-whoami` | — | — |
-| `just smoke` | **yes** — a real container; a *cold image build* is the single biggest item here | — |
-| `just deploy && just e2e` | yes, seconds of container time | — |
-| `just e2e-live` | yes | yes, one small call |
-| A real task | yes, for the task's duration | yes, whatever the task needs |
+| `just check` / `just ci` | — | — |
+| `just fly-whoami` | — | — |
+| `just fly-up` | **yes** — builds the image and boots a machine; the cold build is the biggest single item | — |
+| `flotta create <name>` | yes — a machine and a volume | — |
+| A stopped box | **yes, still** — the volume and rootfs bill while they exist | — |
+| `flotta chat` | yes, while the box is awake | yes, whatever the conversation needs |
 
-A typical short task is cents. The first run is the expensive one, because Hermes is installed
-from source into the image; after that the image is cached.
+**A stopped box is cheap, not free.** That is the difference from v0.1's disposable containers and
+it is the trade the whole design makes: you pay storage to keep an agent that remembers.
 
 **Cost estimation is opt-in, and deliberately so.** Set a rate and Flotta fills the "Est. cost"
 column; leave it unset and every surface shows `—`:
 
 ```bash
-FLOTTA_COST_PER_SECOND=0.0000131   # your rate, from Modal's pricing for the box's CPU/memory
+FLOTTA_COST_PER_SECOND=0.0000131   # your rate, from your provider's pricing for the box's CPU/memory
 ```
 
-It has to be *your* number because Modal's billing API cannot attribute cost to a single task:
-line items are keyed by **App** id at daily or hourly resolution, every box shares one app, and
-function calls cannot be tagged. Rather than derive a dollar figure from a rate nobody chose —
-which would look authoritative and be wrong — Flotta shows a blank until you supply one. It covers
-**container time only**; model tokens are a separate bill Flotta never sees.
+It has to be *your* number: a substrate's billing API attributes cost to an app or an org over a
+day, not to one task, and inventing a per-task figure from a rate nobody chose would look
+authoritative and be wrong. Flotta shows a blank until you supply one. It covers **machine time
+only** — model tokens are a separate bill Flotta never sees, and so is volume storage.
 
 ## Command reference
 
 ```bash
+flotta create <name>           # create a box — a persistent agent
+flotta chat <box>              # talk to the agent on a box
 flotta ps [--all] [--tasks]    # boxes in the fleet; --tasks lists the work
-flotta spawn "<task>" --wait   # create a box, put a task on it, block for the result
-flotta watch <id>              # re-attach to a task (or a box's live task)
-flotta logs <box>              # that box's timeline, across all three tiers
+flotta logs <box>              # that box's timeline, across both tiers
+flotta watch <id>              # re-attach to a task  (dormant until M6)
 flotta stop <box>              # mark it idle (refused while work is in flight)
 flotta start <box>             # wake it again
 flotta kill <box>              # destroy it (idempotent)
@@ -247,11 +248,11 @@ against a throwaway Postgres to prove the two engines behave identically. The
 dashboard reads whichever engine the control plane is on, because it no longer
 reads the store at all — see [The control plane](#the-control-plane).
 
-**Otherwise the store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`. `spawn`
-says where it created one, and every read command names the file it looked at — because spawning in
-one directory and running `ps` in another otherwise looks exactly like an empty fleet.
+**Otherwise the store lives in your working directory** (`./fleet.db`) unless you set `$FLOTTA_STORE`.
+`create` says where it made one, and every read command names the file it looked at — because
+creating in one directory and running `ps` in another otherwise looks exactly like an empty fleet.
 
-Every command takes `--json`. `ps` and `logs` are pure store reads and need no Modal credentials;
+Every command takes `--json`. `ps` and `logs` are pure store reads and need no credentials;
 so are `stop` and `start`, for now. Exit codes carry meaning: `1` a failed task or a missing id,
 `2` a refusal — the fleet is busy, the store is missing, or the box is in the wrong state
 (**only a running box can be stopped, and only a stopped box can be started**; starting is waking
@@ -305,14 +306,10 @@ it exists to fix, one layer down.
 
 Stated plainly, because finding these yourself is worse.
 
-- **A box does not remember anything.** `HERMES_HOME` is ephemeral, so memory, learned skills and
-  history die with the container. This is the single most important gap: an agent that cannot
-  remember cannot self-improve, which is the reason to run Hermes rather than a bare model call.
-  Fixing it — a persistent volume at `/data` — is the next milestone.
-- **`stop` and `start` do not suspend anything.** They record the transition; Modal cannot stop and
-  resume a container, so nothing is actually suspended and nothing is actually saved. They become
-  real when a persistent backend lands. Because of that, **`stop` is refused while the box has a
-  live task** — a "stopped" box whose container is still running would report zero CPU while the
+- **Boxes do not share what they learn.** Each keeps its own `/data/hermes`, so a skill one agent
+  acquires is invisible to the others. The original goal was one shared, versioned brain; that is
+  M9 and it is not built.
+- **`stop` is refused while the box has a live task** — a "stopped" box still running would report zero CPU while the
   invoice disagreed. Use `flotta kill` to cancel and destroy, or wait for the task.
 - **One task at a time.** Enforced, not merely advised — a second concurrent spawn is refused with
   exit 2. Boxes themselves are uncapped. Raise the task cap with `--max-concurrent` only if you
@@ -330,9 +327,8 @@ Stated plainly, because finding these yourself is worse.
   The dashboard's UI still says "worker" in places — renaming it is cosmetic churn, queued behind
   the parts that are not.
 - **Cost estimation is opt-in and container-time only.** Set `FLOTTA_COST_PER_SECOND` or the column stays blank; token spend is never included. It is measured per *task*, not per box. See [What it costs](#what-it-costs).
-- **Rotating a provider key is not instant.** `just secret-sync` needs no redeploy, but a secret
-  becomes environment variables when a container *starts*, so a warm container serves the old value
-  until it scales down. `modal app stop flotta-provision -y` forces it.
+- **Rotating a provider key needs a restart.** Fly secrets become environment variables when a
+  machine *starts*, so a running box serves the old value until `flotta stop` + `flotta start`.
 - **Boxes run an older Hermes than your orchestrator** — the image pin has drifted behind the
   released agent, and reconciling it is queued.
 
@@ -341,8 +337,8 @@ Stated plainly, because finding these yourself is worse.
 | | |
 |---|---|
 | `src/flotta/store.py` | the fleet-state store — `boxes` / `workspaces` / `tasks`, SQLite, thin SQL, one validated transition table per tier |
-| `src/flotta/provision.py` | spawn / watch / stop / start / teardown / reconcile — **runs locally**, the store's only writer. `run_worker`, the one deployed Modal function, lives here too and touches no store |
-| `src/flotta/worker/` | the Modal image and the container entrypoint — **runs in the cloud** |
+| `src/flotta/provision.py` | create / stop / start / wake / teardown / reconcile — **runs where it can reach the substrate**, and is the store's only writer |
+| `fly/` | the box image: `hermes serve` as PID 1, `/data/hermes` on a volume |
 | `src/flotta/cli.py` | the Typer CLI |
 | `src/flotta/db.py` | the engine seam — one store, SQLite or Postgres |
 | `src/flotta/control/` | the control plane: the fleet API, and the reconcile loop on a timer |
@@ -364,7 +360,7 @@ just ci                  # both of the above — everything CI runs
 just test-one <keyword>  # a single test
 ```
 
-The test suite is hermetic and free: every Modal touchpoint is injected, never called for real.
+The test suite is hermetic and free: every Fly touchpoint is injected, never called for real.
 
 That is also why it can run on every pull request:
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `just check` and the dashboard's

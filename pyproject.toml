@@ -5,16 +5,15 @@ description = "Open-source fleet runtime for self-improving agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
-# `modal` is the client for the runtime itself — provisioning, the CLI (M4) and
-# the e2e script cannot work without it, so it is a real runtime dependency.
-# The heavy worker stack (Hermes, the MCP SDK, uvicorn) stays image-only and
-# lazily imported, which is the part D9 actually protects.
+# Deliberately small. `modal` was here as the runtime's client and left with
+# the shard tier; Fly is driven through `flyctl` as a subprocess, so it adds no
+# dependency at all. Hermes itself is image-only — it runs *on* a box, never in
+# this package.
 dependencies = [
-    "modal>=1.0",
     "typer>=0.12",
     # The box's agent surface is a WebSocket; this is the client for it.
-    # Declared explicitly rather than relied on transitively (modal pulls it in
-    # today, which is not a promise).
+    # Declared explicitly rather than relied on transitively — it used to
+    # arrive via modal, which was never a promise and is now not even true.
     "aiohttp>=3.9",
 ]
 
