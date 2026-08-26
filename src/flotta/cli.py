@@ -370,6 +370,12 @@ def _resolve_task(store: FleetStore, ident: str) -> Task:
 
 StoreOpt = typer.Option(None, "--store", help="Path to the fleet-state store [$FLOTTA_STORE]")
 JsonOpt = typer.Option(False, "--json", help="Emit JSON instead of a table")
+# Module-level for the same reason as the two above: a `typer.Option(...)` call
+# sitting in an argument default is evaluated at import, which the linter flags
+# and which this file already avoids by naming them here.
+ScopeOpt = typer.Option(
+    None, "--scope", "-s", help="Repeatable. fleet:read | fleet:write | box:destroy"
+)
 
 
 # -- commands ---------------------------------------------------------------
@@ -802,6 +808,122 @@ def kill(
             raise typer.Exit(code=1) from exc
         note = " (already torn down)" if result.get("already_torn_down") else ""
         emit(result, f"{box.id}  torn_down{note}", as_json=as_json)
+
+
+# -- tokens (M5) ------------------------------------------------------------
+
+token_app = typer.Typer(
+    name="token",
+    help="Signing keys and scoped access tokens for the control plane.",
+    no_args_is_help=True,
+)
+app.add_typer(token_app)
+
+
+@token_app.command("key")
+def token_key() -> None:
+    """Generate a signing key. Print it once; it is never stored.
+
+    Not written to `.env` automatically, on purpose. Writing a secret into a
+    file on the user's behalf makes it ambiguous where the real one lives —
+    and the same value has to be set wherever the control plane runs, which is
+    usually somewhere else entirely.
+    """
+    from flotta.auth import SIGNING_KEY_ENV, generate_signing_key
+
+    key = generate_signing_key()
+    typer.echo(f"{SIGNING_KEY_ENV}={key}")
+    typer.secho(
+        "\nPut this in .env, and set the same value wherever the control plane runs.\n"
+        "Rotating it revokes every token that was minted with it — which is how\n"
+        "revocation works here, so keep token lifetimes short.",
+        fg=typer.colors.BRIGHT_BLACK,
+        err=True,
+    )
+
+
+@token_app.command("mint")
+def token_mint(
+    subject: str = typer.Argument(..., help="Who this token is for, e.g. dashboard"),
+    scope: list[str] = ScopeOpt,
+    days: int = typer.Option(30, "--days", help="Lifetime in days"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Mint a scoped token.
+
+    Scopes are named explicitly rather than defaulted: the point of the split
+    is that a dashboard carries `fleet:read` and nothing else, and a default
+    that granted more would quietly undo it.
+    """
+    from flotta.auth import SCOPES, AuthError, mint
+
+    if not scope:
+        typer.secho(
+            f"name at least one --scope. Known: {', '.join(sorted(SCOPES))}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        value = mint(subject=subject, scopes=set(scope), ttl_s=days * 24 * 3600)
+    except AuthError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    if as_json:
+        from flotta.auth import verify
+
+        claims = verify(value)
+        emit(
+            {
+                "token": value,
+                "subject": claims.subject,
+                "scopes": sorted(claims.scopes),
+                "expires_at": claims.expires_at,
+            },
+            "",
+            as_json=True,
+        )
+        return
+    typer.echo(value)
+    typer.secho(
+        f"\n{subject} · {', '.join(sorted(scope))} · expires in {days}d\n"
+        "Shown once. Store it like a password; anyone holding it has these scopes.",
+        fg=typer.colors.BRIGHT_BLACK,
+        err=True,
+    )
+
+
+@token_app.command("inspect")
+def token_inspect(
+    value: str = typer.Argument(..., help="The token to check"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Verify a token and show what it grants.
+
+    Useful for the question that otherwise takes a support thread: *is this
+    thing expired, or is it missing a scope?* — which are a 401 and a 403 and
+    look identical from the outside.
+    """
+    from flotta.auth import AuthError, verify
+
+    try:
+        claims = verify(value)
+    except AuthError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    emit(
+        {
+            "subject": claims.subject,
+            "scopes": sorted(claims.scopes),
+            "issued_at": claims.issued_at,
+            "expires_at": claims.expires_at,
+        },
+        f"{claims.subject}\nscopes:  {', '.join(sorted(claims.scopes)) or '(none)'}\n"
+        f"expires: {datetime.fromtimestamp(claims.expires_at, tz=UTC):%Y-%m-%d %H:%M} UTC",
+        as_json=as_json,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

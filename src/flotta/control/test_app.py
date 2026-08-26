@@ -56,11 +56,31 @@ def test_a_public_bind_is_refused_without_auth():
         check_bind("0.0.0.0", env={})
 
 
-def test_the_insecure_override_exists_for_a_network_you_own():
-    """Refusing outright would push people to a worse workaround — M3 already
-    demonstrated that, when the loopback plan led straight to a socat
-    forwarder that would have bypassed Hermes's gate entirely."""
-    check_bind("0.0.0.0", env={"FLOTTA_CONTROL_ALLOW_INSECURE_BIND": "1"})
+def test_a_public_bind_is_allowed_once_a_signing_key_exists():
+    """The guard's whole purpose was "there is no way to authenticate this".
+
+    There is now, so the refusal lifts — and lifts *only* for that reason. This
+    is the milestone: the bind guard stops being a placeholder and becomes a
+    check on whether auth is configured.
+    """
+    check_bind("0.0.0.0", env={"FLOTTA_SIGNING_KEY": "a-real-key"})
+
+
+def test_the_insecure_override_is_gone():
+    """`FLOTTA_CONTROL_ALLOW_INSECURE_BIND` skipped the guard entirely.
+
+    It existed because the only alternatives were "refuse" and "refuse unless
+    you promise you own the network". Keeping it now would mean shipping a
+    documented way to expose an unauthenticated kill switch, which is precisely
+    the hole M5 closes.
+    """
+    with pytest.raises(InsecureBindError):
+        check_bind("0.0.0.0", env={"FLOTTA_CONTROL_ALLOW_INSECURE_BIND": "1"})
+
+
+def test_the_refusal_says_how_to_fix_it():
+    with pytest.raises(InsecureBindError, match="flotta token key"):
+        check_bind("0.0.0.0", env={})
 
 
 # -- reads ------------------------------------------------------------------
@@ -382,3 +402,143 @@ def test_delete_goes_through_teardown_rather_than_writing_the_row(client, fleet,
     assert called["box_id"] == box_id
     assert called["reason"] == "control-plane"
     assert client.get(f"/api/boxes/{box_id}").json()["box"]["status"] == "torn_down"
+
+
+# -- with authentication switched on ---------------------------------------
+#
+# Every test above runs with no signing key, which is the documented
+# loopback-development state and means they exercise none of this. These are
+# the ones that matter for M5: same app, same routes, a key configured.
+
+AUTH_KEY = "a-signing-key-for-tests"
+
+
+@pytest.fixture
+def secured(fleet):
+    """The control plane as it runs anywhere that is not someone's laptop."""
+    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, signing_key=AUTH_KEY)
+    with TestClient(app) as c:
+        yield c
+
+
+def _token(*scopes, subject="test", ttl_s=300):
+    from flotta.auth import mint
+
+    return mint(subject=subject, scopes=set(scopes), key=AUTH_KEY, ttl_s=ttl_s)
+
+
+def _bearer(*scopes, **kw):
+    return {"Authorization": f"Bearer {_token(*scopes, **kw)}"}
+
+
+def test_an_unauthenticated_request_is_401_with_a_challenge(secured):
+    response = secured.get("/api/boxes")
+    assert response.status_code == 401
+    assert response.headers.get("WWW-Authenticate") == "Bearer"
+
+
+def test_a_valid_token_gets_through(secured):
+    from flotta.auth import SCOPE_FLEET_READ
+
+    response = secured.get("/api/boxes", headers=_bearer(SCOPE_FLEET_READ))
+    assert response.status_code == 200
+    assert [b["name"] for b in response.json()["boxes"]] == ["eng-a"]
+
+
+def test_a_forged_token_is_refused(secured):
+    """The signature is the only thing standing between a reader and destroy."""
+    from flotta.auth import mint
+
+    forged = mint(subject="attacker", scopes={"box:destroy"}, key="not-the-servers-key")
+    response = secured.delete("/api/boxes/eng-a", headers={"Authorization": f"Bearer {forged}"})
+    assert response.status_code == 401
+    assert "signature" in response.json()["detail"]
+
+
+def test_an_expired_token_is_refused(secured):
+    import time
+
+    from flotta.auth import SCOPE_FLEET_READ, mint
+
+    stale = mint(
+        subject="test",
+        scopes={SCOPE_FLEET_READ},
+        key=AUTH_KEY,
+        ttl_s=1,
+        now=int(time.time()) - 3600,
+    )
+    response = secured.get("/api/boxes", headers={"Authorization": f"Bearer {stale}"})
+    assert response.status_code == 401
+    assert "expired" in response.json()["detail"]
+
+
+def test_reading_the_fleet_does_not_let_you_destroy_it(secured):
+    """The reason `box:destroy` is its own scope.
+
+    A dashboard token shows the fleet. If that also tore boxes down, the
+    separation would be decorative — and DELETE is the verb that deletes an
+    agent's entire memory.
+    """
+    from flotta.auth import SCOPE_FLEET_READ
+
+    headers = _bearer(SCOPE_FLEET_READ)
+    assert secured.get("/api/boxes", headers=headers).status_code == 200
+
+    denied = secured.delete("/api/boxes/eng-a", headers=headers)
+    assert denied.status_code == 403, "a read token must not destroy a box"
+    assert "box:destroy" in denied.json()["detail"]
+
+
+def test_creating_does_not_let_you_destroy_either(secured):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    denied = secured.delete("/api/boxes/eng-a", headers=_bearer(SCOPE_FLEET_WRITE))
+    assert denied.status_code == 403
+
+
+def test_a_missing_scope_is_403_not_401(secured):
+    """401 means "authenticate"; 403 means "you did, and it is not enough".
+
+    Answering 401 here would send a caller off to re-authenticate with the same
+    token forever.
+    """
+    from flotta.auth import SCOPE_FLEET_READ
+
+    assert (
+        secured.post(
+            "/api/boxes", json={"name": "eng-b"}, headers=_bearer(SCOPE_FLEET_READ)
+        ).status_code
+        == 403
+    )
+
+
+def test_every_api_route_requires_a_token(secured, fleet):
+    """Guard against a route being added without one.
+
+    The failure this prevents is silent: a new endpoint with no dependency
+    serves the fleet to anybody, and nothing else in the suite would notice
+    because every other test sends a valid token.
+    """
+    box_id = "eng-a"
+    unauthenticated = [
+        secured.get("/api/boxes"),
+        secured.get(f"/api/boxes/{box_id}"),
+        secured.get(f"/api/boxes/{box_id}/events"),
+        secured.post("/api/boxes", json={"name": "x"}),
+        secured.delete(f"/api/boxes/{box_id}"),
+    ]
+    assert [r.status_code for r in unauthenticated] == [401] * 5
+
+
+def test_health_is_not_behind_auth(secured):
+    """A liveness probe cannot hold a credential.
+
+    Deliberate, and worth stating: `/health` reports whether the reconcile loop
+    is sweeping and nothing about the fleet's contents — no box names, no
+    endpoints, no task text. That is what makes it safe to leave open.
+    """
+    response = secured.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert "reconcile_loop" in body
+    assert "boxes" not in body

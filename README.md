@@ -53,15 +53,17 @@ machine. That one rule shapes most of the design.
 > bind. See [Limitations](#limitations) for the honest account.
 
 > [!WARNING]
-> **Flotta is a local tool. Nothing in it is authenticated.**
+> **The control plane is authenticated. A box is not yet publicly routed.**
 >
-> The dashboard has no login and its kill button destroys real machines; anyone who can reach
-> the port can kill any box and read every task and result the fleet has produced. The CLI
-> and the fleet store assume the same — a single trusted operator on one machine.
+> Set `$FLOTTA_SIGNING_KEY` and every fleet-API request needs a scoped token
+> (`flotta token key`, then `flotta token mint`). Leave it unset and the control plane runs
+> unauthenticated — which it will only do on a loopback bind; a public bind with no key is
+> refused at startup.
 >
-> Everything binds localhost by design. Do not put the dashboard on a shared host, a public
-> interface, or a tunnel without putting authentication in front of it first. Multi-user is not
-> a v0.1 feature and there is no permission model to fall back on.
+> Two things are still open, and both are M5's other half: **boxes have no public route**
+> (they are reached over a private Fly tunnel), and **there is no multi-user model** — a token
+> carries scopes, not an identity, so "who did this" is not a question the fleet can answer.
+> Treat a signing key as an admin credential for the whole fleet.
 
 ## What it does today
 
@@ -289,13 +291,48 @@ returns 503 when sweeps have stopped landing or keep failing. That distinction
 is not hypothetical: the first live run of this loop failed every single sweep
 while `/health` cheerfully said `ok`.
 
-**It refuses to bind a public interface.** There is no authentication yet —
-scoped tokens are the next milestone — and `DELETE /api/boxes/<id>` destroys a
-box and everything it remembers. Rather than shipping something that *could* be
-deployed publicly, a non-loopback bind fails at startup with the reason.
-`FLOTTA_CONTROL_ALLOW_INSECURE_BIND=1` exists for a network you genuinely own
-(Fly 6PN, Tailscale), because refusing that case would only push people to a
-worse workaround. It is loud in the logs.
+**It authenticates, and refuses to be exposed without doing so.** Three states,
+each defensible on its own:
+
+| `$FLOTTA_SIGNING_KEY` | bind | result |
+|---|---|---|
+| unset | loopback | runs unauthenticated — local development |
+| unset | public | **refused at startup**, with the fix in the message |
+| set | any | every request needs a scoped token |
+
+`FLOTTA_CONTROL_ALLOW_INSECURE_BIND` is **gone**. It existed because there was
+no way to authenticate a public bind, so the only options were "refuse" and
+"refuse unless you promise you own the network". There is a way now, and
+keeping an override that skips it would ship the hole this closes.
+
+Tokens are signed JSON — permissions travel *in* the token, so verifying one is
+a hash and a clock read rather than a database lookup. Three scopes, flat, no
+hierarchy:
+
+```
+fleet:read     list and inspect boxes, read their events
+fleet:write    create boxes
+box:destroy    tear a box down
+```
+
+`box:destroy` is separate from `fleet:write` deliberately — it is the verb that
+deletes an agent's entire memory, and a dashboard that only *shows* a fleet
+should not carry it. A hierarchy would have granted it automatically.
+
+**Revocation is a key rotation**, which is coarse and stated plainly: an issued
+token cannot be individually revoked before it expires, so mint short ones.
+Rotating `$FLOTTA_SIGNING_KEY` kills every token at once — the operation you
+actually want when something leaks.
+
+```bash
+flotta token key                                       # generate a signing key
+flotta token mint dashboard --scope fleet:read         # a read-only token
+flotta token inspect <token>                           # expired, or missing a scope?
+```
+
+`/health` stays open: it reports whether the reconcile loop is sweeping and
+nothing about the fleet's contents — no box names, no endpoints, no task text.
+A liveness probe cannot hold a credential.
 
 A `Dockerfile` at the repo root builds it, so the fleet can outlive the laptop
 entirely. Do not put it behind a serverless/scale-to-zero setting: the reconcile
@@ -321,9 +358,12 @@ Stated plainly, because finding these yourself is worse.
   nonsense. (This is the failure durable box memory is meant to remove rather than mitigate.)
 - **`--wait`, or the row strands** until something sweeps for it — `flotta watch`,
   `flotta reconcile`, or a running `flotta serve`.
-- **Nothing here has authentication yet**, and the kill button destroys real machines. The control
-  plane refuses a non-loopback bind for that reason; scoped tokens are the next milestone. Localhost
-  only. Do not expose either surface.
+- **Boxes have no public route.** The control plane authenticates, but a box is still reached
+  over a private Fly tunnel — `<box>.flotta.dev` and TLS termination are M5's other half.
+- **A token has scopes, not an identity.** There is no user model, so the fleet cannot answer
+  "who destroyed that box". A signing key is an admin credential for everything.
+- **A token cannot be individually revoked** before it expires. Rotating the signing key revokes
+  all of them; mint short-lived ones.
   The dashboard's UI still says "worker" in places — renaming it is cosmetic churn, queued behind
   the parts that are not.
 - **Cost estimation is opt-in and container-time only.** Set `FLOTTA_COST_PER_SECOND` or the column stays blank; token spend is never included. It is measured per *task*, not per box. See [What it costs](#what-it-costs).

@@ -8,23 +8,23 @@ whatever wants to read it.
 It is §8.1's "boring block" — ~256MB and a public HTTPS endpoint, deployable on
 anything. The interesting requirements all live below the `Backend` line.
 
-## It refuses to serve the world without auth
+## Authentication (M5)
 
-There is no auth here yet — scoped, expiring tokens are §M5, and §8.6 is
-explicit that the Railway template ships *with* that work and never before it.
-So rather than shipping something that could be deployed publicly and would be
-an unauthenticated fleet-control API, this **refuses a non-loopback bind**
-unless auth is configured.
+Every `/api/*` route requires a scoped token signed with `$FLOTTA_SIGNING_KEY`
+— see `flotta.auth` for the token design and why revocation is a key rotation.
+Routes declare the scope they need; `box:destroy` is separate from
+`fleet:write` because `DELETE /api/boxes/{id}` destroys someone's agent *and
+its memory*, and a dashboard that shows a fleet should not carry that.
 
-That is Hermes's own gate, and copying it is deliberate. M3 hit it, tried to
-work around it with a socat forwarder, and the workaround was the wrong answer:
-the gate was right. A `DELETE /api/boxes/{id}` open to the internet destroys
-someone's agent and its memory — the README already calls the unauthenticated
-dashboard "disqualifying for a hosted one", and this has the same reach.
+`/health` is deliberately open. It reports whether the reconcile loop is
+sweeping and nothing about the fleet's contents, and a liveness probe cannot
+hold a credential.
 
-`FLOTTA_CONTROL_ALLOW_INSECURE_BIND=1` exists for a private network where the
-operator genuinely owns the perimeter (Fly's 6PN, Tailscale), because refusing
-*that* would just push people to a worse workaround. It is loud in the logs.
+The bind guard survives, with a smaller job. It used to mean "there is no way
+to authenticate this, so do not expose it"; it now means "auth is not
+configured, so do not expose it". Copying Hermes's own gate was deliberate: M3
+hit that gate, tried to work around it with a socat forwarder, and the
+workaround was the wrong answer — the gate was right.
 """
 
 from __future__ import annotations
@@ -37,13 +37,22 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from flotta import db
+from flotta.auth import (
+    SCOPE_BOX_DESTROY,
+    SCOPE_FLEET_READ,
+    SCOPE_FLEET_WRITE,
+    SIGNING_KEY_ENV,
+    AuthError,
+    Token,
+    resolve_signing_key,
+    verify,
+)
 from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loop
 from flotta.store import FleetStore, UnknownEntityError, is_terminal
 
 _log = logging.getLogger("flotta.control")
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-ALLOW_INSECURE_ENV = "FLOTTA_CONTROL_ALLOW_INSECURE_BIND"
 INTERVAL_ENV = "FLOTTA_RECONCILE_INTERVAL_S"
 
 
@@ -54,29 +63,33 @@ class InsecureBindError(RuntimeError):
 def check_bind(host: str, *, env: dict[str, str] | None = None) -> None:
     """Refuse a non-loopback bind while there is no auth to put in front of it.
 
-    Fails closed at startup rather than warning: a warning in a deploy log is
-    read once, by the person who already knew, and the thing being protected is
-    a kill switch for an agent's whole memory.
+    Three states, and each is defensible on its own:
+
+    - **no key, loopback** — runs unauthenticated. This is local development,
+      where the port is already only reachable by whoever is sitting there, and
+      demanding a token to run `just serve` would buy nothing.
+    - **no key, public** — refused. Fails closed at startup rather than
+      warning: a warning in a deploy log is read once, by the person who
+      already knew, and the thing being protected is a kill switch for an
+      agent's whole memory.
+    - **key set, any bind** — every request needs a scoped token.
+
+    `FLOTTA_CONTROL_ALLOW_INSECURE_BIND` is **gone**. It existed because there
+    was no way to authenticate a public bind, so the only options were "refuse"
+    or "refuse unless you promise you own the network". There is a way now, and
+    keeping an override that skips it would mean shipping the hole this
+    milestone closed.
     """
     env = os.environ if env is None else env
     if host in LOOPBACK_HOSTS:
         return
-    if (env.get(ALLOW_INSECURE_ENV) or "").strip() in ("1", "true", "yes", "on"):
-        _log.warning(
-            "binding %s with no authentication because %s is set. Anyone who can "
-            "reach this port can destroy any box in the fleet, and its memory. "
-            "This is only defensible on a network you own (Fly 6PN, Tailscale). "
-            "Scoped tokens land in M5.",
-            host,
-            ALLOW_INSECURE_ENV,
-        )
+    if resolve_signing_key(env):
         return
     raise InsecureBindError(
-        f"refusing to bind {host!r}: the control plane has no authentication yet "
-        f"(scoped tokens are M5), and DELETE /api/boxes/<id> destroys a box and "
-        f"everything it remembers.\n"
-        f"Bind 127.0.0.1 and reach it over a tunnel, or set {ALLOW_INSECURE_ENV}=1 "
-        f"if this port is only reachable on a network you control."
+        f"refusing to bind {host!r} with no authentication: "
+        f"DELETE /api/boxes/<id> destroys a box and everything it remembers.\n"
+        f"Configure a signing key — `flotta token key` and set ${SIGNING_KEY_ENV} "
+        f"— or bind 127.0.0.1 and reach it over a tunnel."
     )
 
 
@@ -108,6 +121,7 @@ def create_app(
     run_loop: bool = True,
     interval_s: float | None = None,
     loop_runner: Any = None,
+    signing_key: str | None = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -115,8 +129,15 @@ def create_app(
     should serve reads without racing the first one's reconciliation — two
     loops reconciling the same fleet is not harmful (the store's transitions
     are validated) but it is wasted backend calls.
+
+    `signing_key` overrides `$FLOTTA_SIGNING_KEY`. **Resolved once, here, at
+    construction** rather than per request: an app that picks up a key change
+    mid-flight would silently start accepting tokens it was rejecting a moment
+    earlier, and "is this thing authenticated?" would have no stable answer.
+    Rotating the key means restarting the process, which is also what makes
+    rotation a real revocation.
     """
-    from fastapi import FastAPI, HTTPException
+    from fastapi import Depends, FastAPI, Header, HTTPException
 
     resolved_interval = interval_s
     if resolved_interval is None:
@@ -124,6 +145,69 @@ def create_app(
         resolved_interval = float(raw) if raw else DEFAULT_INTERVAL_S
 
     state = LoopState(interval_s=resolved_interval)
+
+    key = signing_key if signing_key is not None else resolve_signing_key()
+    if key is None:
+        _log.warning(
+            "no %s configured: the fleet API is UNAUTHENTICATED. Anyone who can "
+            "reach this port can destroy any box and everything it remembers. "
+            "This is refused on a non-loopback bind; mint a key with "
+            "`flotta token key` before exposing it.",
+            SIGNING_KEY_ENV,
+        )
+
+    def require(*scopes: str):
+        """A dependency that admits a request carrying **all** of `scopes`.
+
+        All rather than any: a route that needs two permissions needs two, and
+        an "any" default is the kind of thing that reads as fine until someone
+        adds a second scope to a route and quietly widens it.
+
+        With no key configured this admits everything, which is the documented
+        loopback-development state — `check_bind` is what stops that reaching a
+        public interface, and it is enforced at startup rather than here so the
+        failure is a refusal to boot rather than a 401 nobody sees.
+        """
+
+        def dependency(authorization: str | None = Header(default=None)) -> Token | None:
+            if key is None:
+                return None
+            if not authorization or not authorization.lower().startswith("bearer "):
+                # 401 with the challenge, not 403: the caller sent nothing, so
+                # the answer is "authenticate", not "you may not".
+                raise HTTPException(
+                    status_code=401,
+                    detail="missing bearer token",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            try:
+                token = verify(authorization.split(" ", 1)[1].strip(), key=key)
+            except AuthError as exc:
+                raise HTTPException(
+                    status_code=401,
+                    detail=str(exc),
+                    headers={"WWW-Authenticate": "Bearer"},
+                ) from exc
+
+            missing = [s for s in scopes if not token.allows(s)]
+            if missing:
+                # 403, not 401: the token is valid and re-authenticating with
+                # it will not help. Name the scope so the fix is obvious.
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"token for {token.subject!r} lacks scope(s): {', '.join(missing)}",
+                )
+            return token
+
+        return dependency
+
+    # Hoisted rather than called inline in each route's default: a call in an
+    # argument default is evaluated once at import, which is fine for Depends
+    # but is a real footgun in general — so the linter flags it, and naming the
+    # three dependencies is clearer than suppressing it five times.
+    needs_read = Depends(require(SCOPE_FLEET_READ))
+    needs_write = Depends(require(SCOPE_FLEET_WRITE))
+    needs_destroy = Depends(require(SCOPE_BOX_DESTROY))
 
     @asynccontextmanager
     async def lifespan(app: Any):
@@ -171,7 +255,7 @@ def create_app(
         )
 
     @app.get("/api/boxes")
-    def list_boxes(all_: bool = False) -> Any:
+    def list_boxes(all_: bool = False, _: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
             boxes = store.list_boxes()
@@ -200,7 +284,7 @@ def create_app(
             store.close()
 
     @app.post("/api/boxes", status_code=201)
-    def create_box_endpoint(body: dict[str, Any]) -> Any:
+    def create_box_endpoint(body: dict[str, Any], _: Token | None = needs_write) -> Any:
         """Create a box. The API half of "create Agent B" being a button.
 
         Goes through `provision.create_box` rather than writing a row, for the
@@ -260,7 +344,7 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}")
-    def get_box(box_id: str) -> Any:
+    def get_box(box_id: str, _: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
             box = store.get_box(box_id) or store.get_box_by_name(box_id)
@@ -274,7 +358,7 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/events")
-    def get_events(box_id: str) -> Any:
+    def get_events(box_id: str, _: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
             box = store.get_box(box_id) or store.get_box_by_name(box_id)
@@ -285,7 +369,7 @@ def create_app(
             store.close()
 
     @app.delete("/api/boxes/{box_id}")
-    def destroy_box(box_id: str) -> Any:
+    def destroy_box(box_id: str, _: Token | None = needs_destroy) -> Any:
         """Destroy a box and everything it remembers. Idempotent.
 
         Goes through `teardown_box`, which cancels the backend's machine and
