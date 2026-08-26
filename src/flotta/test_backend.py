@@ -19,7 +19,6 @@ from flotta.backend import (
     scheme_of,
 )
 from flotta.backends.fly_backend import FlyBackend, endpoint_for, parse_endpoint
-from flotta.backends.modal_backend import ModalBackend
 
 
 def _offline_config():
@@ -106,18 +105,28 @@ def test_scheme_of():
 
 def test_routing_resolves_the_owning_substrate():
     assert isinstance(backend_for("fly://app/m1"), FlyBackend)
-    assert isinstance(backend_for("modal://a/f/c"), ModalBackend)
+
+
+def test_a_cut_substrate_resolves_to_nothing_rather_than_something():
+    """A `modal://` row can still exist in a fleet written before the cut.
+
+    It must fail loudly. Falling back to "the only backend we have left" would
+    point Fly operations at a machine id that is really a Modal call id — the
+    scheme is the address, and guessing at an address is how you stop the
+    wrong thing.
+    """
+    with pytest.raises(UnknownBackendError):
+        backend_for("modal://flotta-provision/run_worker/fc-x")
 
 
 def test_builtins_register_themselves():
     """`backend_for` must not depend on the caller having imported anything.
 
     It did once, and the failure was confusing rather than loud: a valid
-    `modal://` endpoint resolved to "names no substrate", which reads as a
-    malformed box rather than a missing import.
+    endpoint resolved to "names no substrate", which reads as a malformed box
+    rather than a missing import.
     """
     assert "fly" in registered_schemes()
-    assert "modal" in registered_schemes()
 
 
 def test_an_unknown_scheme_is_refused_by_name():
@@ -145,51 +154,52 @@ def test_malformed_fly_endpoints_are_rejected(bad):
 # -- the asymmetry ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("verb", ["suspend", "stop", "start", "create", "exec"])
-def test_modal_refuses_what_it_cannot_do(verb):
-    """The pivot doc calls this "the point" (§M1), and it is load-bearing.
+# -- protocol conformance ---------------------------------------------------
+#
+# `NotSupported` is still exported and still part of the protocol even though
+# nothing raises it today. It is how a future backend that cannot suspend — a
+# container substrate, say — declares that rather than no-op'ing. The Modal
+# backend used to be the proof; §M1 called the asymmetry "the point", and a
+# `stop` that quietly did nothing would mark a box `stopped` while it kept
+# running and billing.
 
-    A `stop` that quietly no-op'd would mark a box `stopped` while its
-    container kept running and billing — the exact bug M0's review found in
-    `stop_box`. Refusing one layer down means it cannot be reintroduced.
+
+def test_the_backend_still_has_a_way_to_refuse():
+    """`NotSupported` must survive the substrate that motivated it.
+
+    Kept as a live assertion rather than a comment: the next backend needs
+    somewhere to put "I cannot do this", and quietly dropping the exception
+    would push the next implementer toward a silent no-op instead.
     """
-    m = ModalBackend()
-    args = {"create": (BoxSpec(name="x"),), "exec": ("id", "ls")}.get(verb, ("id",))
+    assert issubclass(NotSupported, Exception)
+
+    class CannotSuspend:
+        def suspend(self, endpoint):
+            raise NotSupported("this substrate has no snapshot")
+
     with pytest.raises(NotSupported):
-        getattr(m, verb)(*args)
+        CannotSuspend().suspend("x://a/b")
 
 
-def test_modal_can_still_be_destroyed():
-    """Destroy is the one lifecycle verb a one-shot container does support."""
-    calls = []
-    m = ModalBackend()
-    m.destroy("modal://app/fn/")  # no call id -> no-op, not an error
-    assert calls == []
-
-
-def test_both_backends_satisfy_the_protocol():
+def test_the_backend_satisfies_the_protocol():
     """`runtime_checkable` only checks method names, which is exactly the drift
     worth catching: a backend that forgets `suspend` should fail here rather
     than at the first stop on a live box.
 
-    An earlier version of this test read `FlyBackend(...) if False else
-    ModalBackend()` — it claimed to check both and checked one, which is worse
-    than not having the test. FlyBackend is constructed with an explicit config
-    and a stub runner so nothing reaches flyctl or the environment.
+    FlyBackend is constructed with an explicit config and a stub runner so
+    nothing reaches flyctl or the environment.
     """
     fly = FlyBackend(config=_offline_config(), runner=_never_runs)
     assert isinstance(fly, Backend)
-    assert isinstance(ModalBackend(), Backend)
 
 
 @pytest.mark.parametrize(
     "verb", ["create", "start", "suspend", "stop", "destroy", "exec", "state", "endpoint"]
 )
-def test_every_protocol_verb_exists_on_both(verb):
+def test_every_protocol_verb_exists(verb):
     """Named individually so a missing one fails by name, not as a bare
     isinstance False."""
     assert callable(getattr(FlyBackend(config=_offline_config(), runner=_never_runs), verb))
-    assert callable(getattr(ModalBackend(), verb))
 
 
 def test_exec_result_ok():

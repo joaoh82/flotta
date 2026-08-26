@@ -199,6 +199,35 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/boxes", status_code=201)
+    def create_box_endpoint(body: dict[str, Any]) -> Any:
+        """Create a box. The API half of "create Agent B" being a button.
+
+        Goes through `provision.create_box` rather than writing a row, for the
+        same reason `DELETE` goes through `teardown_box`: the store must never
+        claim a machine that was not provisioned. `create_box` also refuses to
+        mint a second row for a machine another box already occupies — a guard
+        that was unreachable until this endpoint existed to reach it.
+        """
+        from flotta.provision import ProvisionError, create_box
+
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="a box needs a name")
+
+        store = store_factory()
+        try:
+            try:
+                result = create_box(name, store=store)
+            except ProvisionError as exc:
+                # 409: the refusal is about fleet state, not a malformed
+                # request, and it is the one a caller can actually act on.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            box = store.get_box(result["box_id"])
+            return {"box": _box_dict(box), **result}
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}")
     def get_box(box_id: str) -> Any:
         store = store_factory()

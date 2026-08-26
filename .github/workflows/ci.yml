@@ -6,12 +6,11 @@
 # check on the commit is the difference.
 #
 # WHAT THIS DELIBERATELY DOES NOT RUN. The suite below is hermetic and $0 —
-# every Modal and Fly touchpoint is injected, nothing reaches the network. The
+# every Fly touchpoint is injected, nothing reaches the network. The
 # recipes that DO reach real infrastructure must never run here: they cost
 # money and need credentials that do not belong in CI.
 #
 #   just fly-up / fly-cycle / fly-proof / fly-doctor / fly-auth / fly-secrets
-#   just smoke / deploy / e2e            real Modal containers
 #   just e2e-live                        the above, plus real model tokens
 #
 # Nothing here reads `.env` either (gitignored; holds an OpenRouter key and the

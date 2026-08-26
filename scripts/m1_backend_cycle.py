@@ -22,7 +22,7 @@ _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from flotta.backend import BoxSpec, NotSupported, backend_for, pause  # noqa: E402
+from flotta.backend import BoxSpec, UnknownBackendError, backend_for, pause  # noqa: E402
 from flotta.backends.fly_backend import endpoint_for  # noqa: E402
 from flotta.fly import FlyConfig  # noqa: E402
 
@@ -94,14 +94,16 @@ def main() -> int:
     )
     print(f"       uptime {_fmt(before_cold)} -> {_fmt(after_cold)}   cycle {stop_resume:.2f}s")
 
-    print("\n[modal] the asymmetry, unmocked")
-    modal = backend_for("modal://flotta-provision/run_worker/fc-x")
-    for verb in ("suspend", "stop"):
-        try:
-            getattr(modal, verb)("modal://flotta-provision/run_worker/fc-x")
-            check(f"modal refuses {verb}", False, "it did not raise")
-        except NotSupported:
-            check(f"modal refuses {verb}", True)
+    # This is where the Modal backend used to be checked for refusing suspend
+    # and stop — the asymmetry M1's protocol existed to make explicit. Modal
+    # left with the shard tier, so the only thing left to assert is that an
+    # endpoint naming no substrate says so rather than resolving to something.
+    print("\n[routing] an unknown scheme is refused, not guessed at")
+    try:
+        backend_for("modal://flotta-provision/run_worker/fc-x")
+        check("a cut substrate no longer resolves", False, "it resolved")
+    except UnknownBackendError:
+        check("a cut substrate no longer resolves", True)
 
     print("\nleaving the box stopped (disk kept, no CPU)")
     pause(backend, endpoint, prefer_suspend=False)

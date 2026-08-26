@@ -243,3 +243,92 @@ def test_the_service_and_the_cli_resolve_the_same_store(tmp_path, monkeypatch):
         assert [b.name for b in served.list_boxes()] == ["eng-a"]
     finally:
         served.close()
+
+
+# -- creating a box over the API (M8 prerequisite) --------------------------
+
+
+def test_post_creates_a_box(client, fleet, monkeypatch):
+    """ "Create Agent B" as a request rather than a shell recipe.
+
+    `FlyBackend.create` shipped in M1 with no caller at all — `provision.
+    create_box` was reachable only from a script and these tests — so a box was
+    hand-provisioned with `just fly-up`. This endpoint is what makes it a verb.
+    """
+    import flotta.provision as provision
+
+    made = {}
+
+    def fake_create(name, *, store, **kwargs):
+        made["name"] = name
+        box = store.create_box(name)
+        store.update_box_status(box.id, "running", endpoint="fly://app/m-new")
+        return {"box_id": box.id, "endpoint": "fly://app/m-new"}
+
+    monkeypatch.setattr(provision, "create_box", fake_create)
+
+    response = client.post("/api/boxes", json={"name": "eng-b"})
+    assert response.status_code == 201
+    body = response.json()
+    assert made["name"] == "eng-b"
+    assert body["box"]["name"] == "eng-b"
+    assert body["endpoint"] == "fly://app/m-new"
+
+    # and it is really in the fleet, not just echoed back
+    assert "eng-b" in [b["name"] for b in client.get("/api/boxes").json()["boxes"]]
+
+
+def test_post_without_a_name_is_422_not_a_generated_one(client):
+    """A box's name is how you address it in `flotta chat` and in the app.
+
+    Generating one silently would leave someone with `box-4f2a91` and no idea
+    which agent it is.
+    """
+    assert client.post("/api/boxes", json={}).status_code == 422
+    assert client.post("/api/boxes", json={"name": "   "}).status_code == 422
+
+
+def test_a_refused_creation_is_409_not_500(client, monkeypatch):
+    """`create_box` refuses when a machine is already occupied by another box.
+
+    That is fleet state, not a malformed request, and the caller can act on it
+    — so it must not arrive as an opaque 500.
+    """
+    import flotta.provision as provision
+
+    def refuse(name, *, store, **kwargs):
+        raise provision.ProvisionError("box b-1 (eng-a) already occupies fly://app/m1")
+
+    monkeypatch.setattr(provision, "create_box", refuse)
+
+    response = client.post("/api/boxes", json={"name": "eng-b"})
+    assert response.status_code == 409
+    assert "already occupies" in response.json()["detail"]
+
+
+def test_delete_goes_through_teardown_rather_than_writing_the_row(client, fleet, monkeypatch):
+    """D10, enforced at the API: only code that reached the substrate may close
+    the row.
+
+    Writing `torn_down` directly here would close the row while the machine
+    kept running and billing — the bug M0's review caught in `stop_box`. This
+    endpoint had no test at all until the Modal cut.
+    """
+    import flotta.provision as provision
+
+    called = {}
+
+    def fake_teardown(box_id, *, store, reason=None, **kwargs):
+        called["box_id"] = box_id
+        called["reason"] = reason
+        store.update_box_status(box_id, "torn_down")
+        return {"box_id": box_id, "status": "torn_down"}
+
+    monkeypatch.setattr(provision, "teardown_box", fake_teardown)
+
+    box_id = client.get("/api/boxes").json()["boxes"][0]["id"]
+    response = client.delete(f"/api/boxes/{box_id}")
+    assert response.status_code == 200
+    assert called["box_id"] == box_id
+    assert called["reason"] == "control-plane"
+    assert client.get(f"/api/boxes/{box_id}").json()["box"]["status"] == "torn_down"

@@ -56,52 +56,33 @@ with fakes and the base `flotta` package keeps no hard Modal dependency.
 from __future__ import annotations
 
 import math
-import pathlib
-import sys
-import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-import modal
-
-# Prime sys.path so `flotta.*` resolves when this file is run as a Modal
-# entrypoint (`modal deploy src/flotta/provision.py` — src/ is not otherwise on
-# sys.path). Defensive: in-container Modal copies this file to /root/provision.py
-# where those parents do not exist, and the package arrives via the image mount.
-# Duplicated in worker/modal_app.py — it cannot be factored into a helper module,
-# because importing that helper is the very thing it exists to make possible.
-_HERE = pathlib.Path(__file__).resolve()
-_SRC = _HERE.parents[1] if len(_HERE.parents) > 1 else None
-if _SRC is not None and (_SRC / "flotta" / "worker").is_dir() and str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-
-from flotta.backend import (  # noqa: E402
+from flotta.backend import (
     Backend,
     BackendError,
     BoxSpec,
     UnknownBackendError,
-    scheme_of,
 )
-from flotta.backend import backend_for as _backend_for  # noqa: E402
-from flotta.backend import pause as _pause  # noqa: E402
-from flotta.store import (  # noqa: E402  (needs the sys.path prime above)
+from flotta.backend import backend_for as _backend_for
+from flotta.backend import pause as _pause
+from flotta.store import (
     Box,
-    ConcurrencyLimitError,
     FleetStore,
     Task,
     UnknownEntityError,
     is_terminal,
 )
-from flotta.worker.config import DEFAULT_TIMEOUT_S  # noqa: E402
-from flotta.worker.image import HERMES_REF, worker_image  # noqa: E402
 
-APP_NAME = "flotta-provision"
-FUNCTION_NAME = "run_worker"
+# How long a task may run before it is considered overdue. Lived in
+# `worker/config.py` — a container's watchdog — until the shard tier was cut.
+# It is a *task* deadline, so it belongs beside the task machinery.
+DEFAULT_TIMEOUT_S = 900
 
-# Modal enforces a per-function hard cap chosen at decoration time, so it cannot
-# track the per-call `timeout_s`. It is set to the ceiling below; the actual
-# per-task deadline is enforced inside the container by `_run_task_core`.
+# The ceiling `timeout_s` may be raised to. Was Modal's per-function hard cap;
+# kept as a sanity bound on a deadline nobody should set to a week.
 MAX_TIMEOUT_S = 3600
 
 # Live-task cap. v0.1 capped *workers*, when a worker was both the machine and
@@ -230,24 +211,6 @@ def resolve_max_concurrent(
 
 # Provider config reaches the container as a Modal Secret, never as a plain
 # function argument (that would land in call logs).
-PROVIDER_KEYS = ("FLOTTA_MODEL", "FLOTTA_MODEL_BASE_URL", "FLOTTA_API_KEY")
-
-# Referenced **by name** rather than snapshotted (M7.1a). The old
-# `Secret.from_local_environ` baked in whatever environment ran `modal deploy`,
-# so editing `.env` without redeploying silently kept serving stale values.
-#
-# Measured behaviour, since the docs invite over-reading: a secret becomes
-# environment variables when a container **starts**, not per call. Rotating it
-# therefore needs no code change and no redeploy — new containers pick it up on
-# their own — but a container Modal is keeping warm serves the old value until
-# it scales down. `modal app stop flotta-provision -y` forces the turnover.
-#
-# The secret must exist for the function to start at all, even for `dry_run`
-# which needs no provider — so `just deploy` creates an empty one when absent,
-# and `just secret-sync` pushes local values into it.
-SECRET_NAME = "flotta-provider"
-
-
 class ProvisionError(Exception):
     """Base error for provisioning operations."""
 
@@ -260,64 +223,6 @@ class TaskTimeout(ProvisionError):
     """
 
 
-def _provider_secret() -> modal.Secret:
-    """Reference the named provider secret; resolved at call time, not deploy time."""
-    return modal.Secret.from_name(SECRET_NAME)
-
-
-app = modal.App(APP_NAME)
-
-
-@app.function(image=worker_image, timeout=MAX_TIMEOUT_S, secrets=[_provider_secret()])
-def run_worker(
-    task: str,
-    worker_id: str,
-    timeout_s: int = DEFAULT_TIMEOUT_S,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    """Run one task to completion inside a disposable container.
-
-    Returns the same structured shape as the worker's `run_task` MCP tool, so
-    the two entry paths stay interchangeable. Never raises for task-level
-    failure — a missing provider, an agent exception and a timeout all come
-    back as ``completed: False`` so the watcher always has a verdict to record.
-
-    ``dry_run`` skips the agent entirely and reports success. It is the
-    provider-free lifecycle path — the same trick as M2's `health` tool (D9) —
-    letting the end-to-end script prove spawn → running → **done** → torn_down
-    without an API key or a cent of spend.
-    """
-    import os
-    import time
-
-    from flotta.worker.config import WorkerConfig
-    from flotta.worker.server import _run_task_core
-
-    started = time.monotonic()
-
-    if dry_run:
-        return {
-            "completed": True,
-            "timed_out": False,
-            "task_id": worker_id,
-            "final_response": f"dry-run ok: {task}",
-            "api_calls": 0,
-            "dry_run": True,
-            "duration_s": round(time.monotonic() - started, 3),
-        }
-
-    cfg = WorkerConfig.from_env(
-        {**os.environ, "FLOTTA_TASK": task, "FLOTTA_TIMEOUT_S": str(timeout_s)}
-    )
-    result = _run_task_core(cfg, task, timeout_s, task_id=worker_id)
-    result["dry_run"] = False
-    result["duration_s"] = round(time.monotonic() - started, 3)
-    return result
-
-
-# -- endpoint encoding ------------------------------------------------------
-
-
 def _parse_ts(value: str | None) -> datetime | None:
     """Parse a store timestamp, tolerating anything unexpected."""
     if not value:
@@ -327,26 +232,6 @@ def _parse_ts(value: str | None) -> datetime | None:
     except (ValueError, TypeError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
-def endpoint_for(call_id: str) -> str:
-    """Encode a Modal function-call id as the box's stored endpoint."""
-    return f"modal://{APP_NAME}/{FUNCTION_NAME}/{call_id}"
-
-
-def function_call_id(endpoint: str | None) -> str | None:
-    """Recover the Modal function-call id from a stored endpoint.
-
-    Returns None for an endpoint that is missing or not a modal:// handle, so
-    callers can treat "nothing to cancel / nothing to await" uniformly.
-    """
-    if not endpoint or not endpoint.startswith("modal://"):
-        return None
-    call_id = endpoint.rsplit("/", 1)[-1]
-    return call_id or None
-
-
-# -- result classification (pure) -------------------------------------------
 
 
 def classify_result(result: Any) -> tuple[str, str, dict[str, Any]]:
@@ -380,44 +265,6 @@ def classify_result(result: Any) -> tuple[str, str, dict[str, Any]]:
 Launcher = Callable[..., str]
 Waiter = Callable[[str, float | None], Any]
 Canceller = Callable[[str], None]
-
-
-def _modal_launcher(*, task: str, worker_id: str, timeout_s: int, dry_run: bool) -> str:
-    """Spawn the deployed `run_worker` and return its function-call id."""
-    fn = modal.Function.from_name(APP_NAME, FUNCTION_NAME)
-    call = fn.spawn(task=task, worker_id=worker_id, timeout_s=timeout_s, dry_run=dry_run)
-    return str(call.object_id)
-
-
-def _modal_waiter(call_id: str, timeout_s: float | None) -> Any:
-    """Block on a function call's result, normalizing timeouts."""
-    from modal.exception import TimeoutError as ModalTimeoutError
-
-    call = modal.FunctionCall.from_id(call_id)
-    try:
-        return call.get(timeout=timeout_s)
-    except ModalTimeoutError as exc:
-        raise TaskTimeout(str(exc)) from exc
-
-
-def _modal_canceller(call_id: str) -> None:
-    """Cancel a function call, stopping the container running it.
-
-    Deliberately *not* ``terminate_containers=True``. The SDK accepts that
-    argument, but the Modal server rejects the request outright::
-
-        InvalidError: FunctionCallCancel request must have a function_call_id
-        and terminate_containers must be false
-
-    Because `teardown` records a cancel failure without raising, that rejection
-    was silent: the box's row closed while its container kept running and
-    billing. A plain `cancel()` already stops execution and marks the inputs
-    terminated, which is the whole requirement.
-    """
-    modal.FunctionCall.from_id(call_id).cancel()
-
-
-# -- local orchestration (the only writers to the store) --------------------
 
 
 def _resolve_backend(box: Box, backend: Backend | None) -> Backend:
@@ -455,95 +302,6 @@ def _require_task(store: FleetStore, task_id: str) -> Task:
     if task is None:
         raise UnknownEntityError(f"no task with id {task_id!r}")
     return task
-
-
-def spawn_box(
-    task: str,
-    *,
-    store: FleetStore,
-    name: str | None = None,
-    timeout_s: int = DEFAULT_TIMEOUT_S,
-    dry_run: bool = False,
-    box_id: str | None = None,
-    task_id: str | None = None,
-    launcher: Launcher | None = None,
-    max_concurrent: int | None = None,
-) -> dict[str, str]:
-    """Create a box, put one task on it, launch it. Returns ids + endpoint.
-
-    The successor to v0.1's `spawn_worker`, and the place the pivot is most
-    visible: what used to be one row is now two. The **box** is the machine and
-    owns the endpoint; the **task** is the work and owns the verdict.
-
-    Under the Modal backend a box is still disposable — Modal cannot stop and
-    resume a container, so every spawn mints a fresh one. That is not the
-    target shape; it is the honest shape *for this backend*, and it is exactly
-    the asymmetry M1's `Backend` protocol exists to make explicit.
-
-    Both rows are created *before* the launch so a launch that fails still
-    leaves something to explain it — the failure is recorded and re-raised
-    rather than vanishing.
-    """
-    if timeout_s > MAX_TIMEOUT_S:
-        raise ValueError(f"timeout_s {timeout_s} exceeds the container cap of {MAX_TIMEOUT_S}s")
-
-    launch = launcher or _modal_launcher
-    cap = resolve_max_concurrent(max_concurrent)
-
-    # Pre-check before creating anything, so the common refusal leaves no rows
-    # behind. The cap is *also* passed to `create_task`, where it shares a
-    # transaction with the insert — that is the backstop against two spawns
-    # racing, which this check alone cannot close.
-    if cap is not None:
-        live = store.list_tasks()
-        live_ids = [t.id for t in live if not is_terminal("task", t.status)]
-        if len(live_ids) >= cap:
-            raise ConcurrencyLimitError(cap, live_ids, noun="task")
-
-    box = store.create_box(name or f"box-{uuid.uuid4().hex[:8]}", box_id=box_id)
-    try:
-        work = store.create_task(box.id, task, task_id=task_id, max_live=cap)
-    except ConcurrencyLimitError:
-        # Lost the race between the pre-check and here. Close the orphan box
-        # rather than leaving a machine row nothing will ever claim.
-        store.add_event("box", box.id, "torn_down", {"reason": "concurrency limit"})
-        store.update_box_status(box.id, "torn_down")
-        raise
-
-    # `hermes_ref` is recorded per task, not just configured globally: the pin
-    # moves over time, so "which Hermes ran this task?" is a fact about the
-    # task, answerable months later, not a fact about today's config.
-    store.add_event(
-        "task",
-        work.id,
-        "spawned",
-        {
-            "task": task,
-            "timeout_s": timeout_s,
-            "dry_run": dry_run,
-            "hermes_ref": HERMES_REF,
-            "box_id": box.id,
-        },
-    )
-
-    try:
-        call_id = launch(task=task, worker_id=work.id, timeout_s=timeout_s, dry_run=dry_run)
-    except Exception as exc:
-        detail = f"spawn failed: {type(exc).__name__}: {exc}"
-        store.add_event("task", work.id, "failed", {"error": detail})
-        # Deliberately unpriced: the launch never happened, so no container
-        # ran. Charging for compute that did not occur overstates just as
-        # surely as the dry-run zero understated.
-        store.update_task_status(work.id, "failed")
-        store.add_event("box", box.id, "torn_down", {"reason": "spawn failed"})
-        store.update_box_status(box.id, "torn_down")
-        raise ProvisionError(detail) from exc
-
-    endpoint = endpoint_for(call_id)
-    store.update_box_status(box.id, "running", endpoint=endpoint)
-    store.add_event("box", box.id, "running", {"endpoint": endpoint, "function_call_id": call_id})
-    store.update_task_status(work.id, "running")
-    return {"box_id": box.id, "task_id": work.id, "endpoint": endpoint}
 
 
 def create_box(
@@ -589,7 +347,17 @@ def create_box(
 
     try:
         handle = impl.create(spec or BoxSpec(name=name))
-    except BackendError as exc:
+    except Exception as exc:
+        # Deliberately broad. This caught only `BackendError`, which is the
+        # failure a backend *means* to raise — but a flyctl timeout, an OSError,
+        # or a plain bug in a backend is not that, and any of them left the row
+        # at `provisioning` forever with a machine possibly already created and
+        # billing. M0's review found the same shape (`subprocess.TimeoutExpired`
+        # escaping) and it matters more now: `POST /api/boxes` puts this behind
+        # a network call, so an unexpected error would strand a row per request.
+        #
+        # `Exception`, not `BaseException`: a Ctrl-C should not be recorded as
+        # a teardown.
         detail = f"create failed: {type(exc).__name__}: {exc}"
         store.add_event("box", box.id, "torn_down", {"reason": detail})
         store.update_box_status(box.id, "torn_down")
@@ -896,16 +664,28 @@ def watch_task(
     # exactly what is wrong.
     rate = resolve_cost_rate(cost_per_second)
 
-    wait = waiter or _modal_waiter
+    # No default waiter. Modal's `FunctionCall.get` used to be one, and cutting
+    # the shard tier removed the only thing that could hand back a verdict.
+    # A task's producer — and therefore its waiter — arrives with the workspace
+    # tier (M6). Until then this is dormant infrastructure, and refusing is the
+    # honest answer: inventing a verdict for work nothing observed is the exact
+    # failure `reconcile` exists to prevent.
+    if waiter is None:
+        raise ProvisionError(
+            "no waiter: nothing produces task results yet. The Modal path was "
+            "cut with the shard tier and the workspace tier (M6) has not landed. "
+            "Pass `waiter=` explicitly to drive a task you are producing yourself."
+        )
+    wait = waiter
     task = _require_task(store, task_id)
 
     if is_terminal("task", task.status):
         return {"task_id": task_id, "status": task.status, "already_terminal": True}
 
     box = _require_box(store, task.box_id)
-    call_id = function_call_id(box.endpoint)
+    call_id = box.endpoint
     if call_id is None:
-        payload = {"error": f"box has no modal endpoint to watch (endpoint={box.endpoint!r})"}
+        payload = {"error": f"box has no endpoint to watch (endpoint={box.endpoint!r})"}
         store.add_event("task", task_id, "failed", payload)
         # Unpriced on purpose — no endpoint means nothing was ever launched.
         store.update_task_status(task_id, "failed")
@@ -1023,15 +803,19 @@ def reconcile(
     # cannot block the very recovery this function exists to perform.
     rate = resolve_cost_rate(cost_per_second)
 
-    wait = waiter or _modal_waiter
+    # Optional here, unlike `watch_task`. Reconciling is mostly *closing* rows
+    # nothing will ever report on, and that works with no waiter at all — which
+    # is the state of the world until M6. A waiter, when passed, lets a result
+    # still be recovered instead of the row merely being closed.
+    wait = waiter
     outcomes: list[dict[str, Any]] = []
 
     for task, over_by in overdue_tasks(store, now=now, grace_s=grace_s):
         box = store.get_box(task.box_id)
-        call_id = function_call_id(box.endpoint) if box else None
-        if call_id is None:
+        call_id = box.endpoint if box else None
+        if call_id is None or wait is None:
             payload = {
-                "error": "stranded with no modal endpoint; never reported a result",
+                "error": "stranded with no way to recover a result; never reported one",
                 "overdue_by_s": round(over_by, 1),
                 "reconciled": True,
             }
@@ -1099,23 +883,21 @@ def teardown_box(
     `torn_down` state by design: work that was interrupted did not happen, and
     a verdict that says so is worth more than one that shrugs.
     """
-    cancel = canceller or _modal_canceller
     box = _require_box(store, box_id)
 
     if box.status == "torn_down":
         return {"box_id": box_id, "status": "torn_down", "already_torn_down": True}
 
-    # Destruction goes through the backend that owns the box, so a Fly box
-    # loses its machine *and* its volume while a Modal box has its call
-    # cancelled. The injected `canceller` stays the Modal path's seam — it
-    # predates the protocol and every existing test drives it.
+    # Destruction goes through the backend that owns the box: a Fly box loses
+    # its machine *and* its volume. `canceller` survives as a pure injection
+    # seam — it was the Modal cancel path, and keeping it lets a caller (and
+    # the tests) drive destruction without a backend.
     cancelled = False
     cancel_error: str | None = None
-    if canceller is not None or scheme_of(box.endpoint) == "modal":
-        call_id = function_call_id(box.endpoint)
-        if call_id is not None:
+    if canceller is not None:
+        if box.endpoint is not None:
             try:
-                cancel(call_id)
+                canceller(box.endpoint)
                 cancelled = True
             except Exception as exc:
                 cancel_error = f"{type(exc).__name__}: {exc}"

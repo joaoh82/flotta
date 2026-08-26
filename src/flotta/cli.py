@@ -2,19 +2,26 @@
 
 Commands over the store and the provisioning functions:
 
+    flotta create <name>         create a box — a persistent agent
+    flotta chat <box>            talk to the agent on a box
     flotta ps                    boxes in the fleet (--tasks for the work)
-    flotta spawn "<task>"        create a box and put one task on it (--wait to follow)
-    flotta watch <id>            block until a task reaches a terminal state
-    flotta logs <box>            the box's timeline, across all three tiers
+    flotta logs <box>            the box's timeline, across both tiers
     flotta stop <box>            stop a box — disk retained, no CPU
     flotta start <box>           wake a stopped box
     flotta kill <box>            destroy it (idempotent)
+    flotta serve                 the control plane: fleet API + reconcile loop
+    flotta watch <id>            block until a task reaches a terminal state
     flotta reconcile             resolve tasks stranded past their deadline
 
 **What `ps` lists changed with the pivot.** v0.1 listed workers, which were
 task runs wearing a machine's clothes. The fleet is now the *boxes*, so that is
-the default view; `--tasks` lists the work instead. `spawn` prints both ids
-because it creates both rows.
+the default view; `--tasks` lists the work instead.
+
+**`create` replaced `spawn`.** `spawn` meant "make a disposable container, run
+one task, tear it down" and routed to Modal; the whole pivot is that a box
+outlives its work. `watch` and `reconcile` are dormant until the workspace tier
+(M6) gives tasks a producer again — kept, because that producer is the next
+milestone.
 
 Every command takes ``--json`` for scripting; the default is a plain aligned
 table. Tables are hand-rolled rather than pulled from a rendering library —
@@ -25,18 +32,9 @@ to unit-test, which is where this module's tests live.
 in the working directory. The dashboard (M5) reads the same ``FLOTTA_STORE``
 variable, so pointing both at one file is the default experience.
 
-**Modal workspace resolution**, in order: ``$MODAL_PROFILE`` (left untouched if
-already set) → ``$FLOTTA_MODAL_PROFILE`` → ``FLOTTA_MODAL_PROFILE`` in a local
-``.env`` → Modal's own active profile. This matters because the installed
-``flotta`` binary runs with no justfile around it, so nothing else is pinning
-the workspace: without this, a `modal profile activate` for an unrelated
-project would silently redirect `spawn` into the wrong workspace. The
-resolution must happen *before* `provision` is imported, since that module
-imports `modal`, which reads its config at import time — hence `_provision()`.
-
 Note that `ps` and `logs` are pure store reads — they need no credentials at
-all. Everything else reaches a substrate: `stop`/`start` drive the box's
-backend (M1), and `spawn`/`watch`/`kill`/`reconcile` reach Modal. A box on a
+all. Everything else reaches a substrate: `create`/`stop`/`start`/`kill` drive
+the box's backend (M1). A box on a
 substrate that cannot do what was asked refuses rather than pretending — a
 Modal box cannot be stopped and resumed, and `flotta stop` says so with exit 2.
 
@@ -59,7 +57,6 @@ import typer
 
 from .store import (
     Box,
-    ConcurrencyLimitError,
     Event,
     FleetStore,
     LegacyStoreError,
@@ -71,8 +68,6 @@ from .store import (
 DEFAULT_STORE = "fleet.db"
 STORE_ENV_VAR = "FLOTTA_STORE"
 DEFAULT_DOTENV = ".env"
-PROFILE_ENV_VAR = "FLOTTA_MODAL_PROFILE"
-MODAL_PROFILE_ENV_VAR = "MODAL_PROFILE"
 
 app = typer.Typer(
     name="flotta",
@@ -248,68 +243,17 @@ def resolve_store_path(explicit: str | None = None) -> Path:
     return Path(explicit or os.environ.get(STORE_ENV_VAR) or DEFAULT_STORE)
 
 
-def read_dotenv_value(key: str, path: str | Path = DEFAULT_DOTENV) -> str | None:
-    """Read one key from a dotenv file, or None if absent/unreadable.
-
-    Deliberately minimal — Flotta needs exactly one value out of `.env` at CLI
-    startup, which is not worth a dependency. Handles comments, blank lines, an
-    `export ` prefix and quoted values; ignores anything malformed rather than
-    failing a command over a stray line.
-    """
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, _, value = line.partition("=")
-        name = name.removeprefix("export ").strip()
-        if name != key:
-            continue
-        value = value.strip().split(" #", 1)[0].strip()  # strip trailing comment
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        return value or None
-    return None
-
-
-def resolve_modal_profile(
-    env: dict[str, str] | None = None, dotenv: str | Path = DEFAULT_DOTENV
-) -> str | None:
-    """Which Modal profile this invocation should target, or None to not interfere.
-
-    Returns None when `MODAL_PROFILE` is already set — an explicit choice by the
-    caller always wins — and when nothing names a profile, in which case Modal's
-    own active profile applies, as a single-workspace user would expect.
-    """
-    env = os.environ if env is None else env
-    if env.get(MODAL_PROFILE_ENV_VAR):
-        return None
-    return env.get(PROFILE_ENV_VAR) or read_dotenv_value(PROFILE_ENV_VAR, dotenv)
-
-
-def apply_modal_profile(
-    env: dict[str, str] | None = None, dotenv: str | Path = DEFAULT_DOTENV
-) -> str | None:
-    """Pin `MODAL_PROFILE` from Flotta's config. Returns the profile applied, if any."""
-    env = os.environ if env is None else env
-    profile = resolve_modal_profile(env, dotenv)
-    if profile:
-        env[MODAL_PROFILE_ENV_VAR] = profile
-    return profile
-
-
 def _provision():
-    """Import the provisioning module with the Modal workspace pinned first.
+    """Import the provisioning module.
 
-    Ordering is load-bearing: `provision` imports `modal` at module level, and
-    `modal` reads its configuration (including `MODAL_PROFILE`) at import time.
-    Pinning after the import would be silently ignored.
+    Still a function rather than a module-level import: `provision` reaches the
+    substrate, and keeping it lazy is what makes `ps` and `logs` — pure store
+    reads — fast and credential-free offline.
+
+    It used to pin a Modal workspace first, because `modal` read its config at
+    import time and pinning afterwards was silently ignored. That went with the
+    shard tier.
     """
-    apply_modal_profile()
     from . import provision
 
     return provision
@@ -373,12 +317,12 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
     path = resolve_store_path(store)
     if must_exist and not path.exists():
         # Absolute, always. A relative "fleet.db" does not tell you *which*
-        # directory was searched, and since `spawn` creates the store in the
+        # directory was searched, and since `create` makes the store in the
         # working directory, stores genuinely do end up scattered — a stranger
-        # can spawn in one directory and be told "no store" in another.
+        # can create in one directory and be told "no store" in another.
         typer.secho(f"no fleet-state store at {path.resolve()}", fg=typer.colors.RED, err=True)
         typer.secho(
-            'Spawn a box first (flotta spawn "..."), or point at an existing '
+            "Create a box first (flotta create <name>), or point at an existing "
             "store with --store / $FLOTTA_STORE.",
             err=True,
         )
@@ -622,33 +566,30 @@ def logs(
 
 
 @app.command()
-def spawn(
-    task: str = typer.Argument(..., help="The task to put on the box"),
+def create(
+    name: str = typer.Argument(..., help="Name for the new agent, e.g. eng-a"),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
-    name: str | None = typer.Option(None, "--name", help="Box name (default: generated)"),
-    timeout_s: int = typer.Option(900, "--timeout-s", help="Hard task timeout"),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Boot the container but skip the LLM call"
-    ),
-    wait: bool = typer.Option(False, "--wait", help="Block until the task finishes"),
-    max_concurrent: int | None = typer.Option(
-        None,
-        "--max-concurrent",
-        help="Live-task cap; 0 disables it [$FLOTTA_MAX_CONCURRENT, default 1]",
-    ),
 ) -> None:
-    """Create a box and put TASK on it (manual spawn — no orchestrator involved)."""
+    """Create a box — a persistent agent with its own durable memory.
+
+    The successor to v0.1's `spawn`, and a different verb on purpose. `spawn`
+    meant "make a disposable container, run one task, tear it down"; the whole
+    pivot is that a box outlives its work. You create an agent, then talk to it
+    with `flotta chat`.
+
+    The machine it lands on keeps `/data/hermes` on a volume, so what the agent
+    learns survives a stop/start.
+    """
     provision = _provision()
 
-    # The one command that may create the store: spawning is how a fleet starts.
+    # The one command that may create the store: creating an agent is how a
+    # fleet starts.
     #
     # Only a *file* can be created by opening it. On Postgres the server either
     # exists or the connection fails, and announcing "created fleet store at
     # ./fleet.db" there was a plain lie — the file was never written, and the
-    # banner printed on every spawn, not just the first. That is the same
-    # "wrong store" confusion this milestone is trying to kill, on the write
-    # side.
+    # banner printed on every run, not just the first.
     from flotta import db as _db
 
     target = store_target(store)
@@ -657,60 +598,23 @@ def spawn(
     created_store = not on_postgres and not store_path.exists()
     with _open_store(store, must_exist=False) as fleet:
         if created_store and not as_json:
-            # Say so once, so the file's location is known rather than inferred
-            # later from a confusing empty `ps`.
             typer.secho(
                 f"created fleet store at {describe_store(target)}",
                 fg=typer.colors.BRIGHT_BLACK,
             )
         try:
-            result = provision.spawn_box(
-                task,
-                store=fleet,
-                name=name,
-                timeout_s=timeout_s,
-                dry_run=dry_run,
-                max_concurrent=max_concurrent,
-            )
-        except ConcurrencyLimitError as exc:
-            # Refusing to spawn is a policy decision, not a task failure — exit 2
-            # so a script can tell "the fleet is busy" from "the task failed", and
-            # name the live tasks so there is something to act on.
-            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
-            typer.secho(
-                "Inspect with `flotta ps --tasks`, free a slot with `flotta kill <box>`, "
-                "or raise the cap with --max-concurrent / $FLOTTA_MAX_CONCURRENT.",
-                err=True,
-            )
-            raise typer.Exit(code=2) from exc
+            result = provision.create_box(name, store=fleet)
         except (provision.ProvisionError, ValueError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
 
-        box_id, task_id = result["box_id"], result["task_id"]
-        if not wait:
-            emit(
-                result,
-                f"{box_id}  running\ntask: {task_id}\nendpoint: {result['endpoint']}",
-                as_json=as_json,
-            )
-            return
-
-        if not as_json:
-            typer.echo(f"{task_id}  running — waiting…", err=True)
-        outcome = provision.watch_task(task_id, store=fleet, timeout_s=timeout_s)
-        finished = fleet.get_task(task_id)
-        if as_json:
-            emit({**result, **outcome, "task": task_dict(finished)}, "", as_json=True)
-        else:
-            typer.echo(f"{task_id}  {finished.status}  in {fmt_duration(task_duration(finished))}")
-            response = (outcome.get("result") or {}).get("final_response")
-            if response:
-                typer.echo("")
-                typer.echo(response)
-        # A failed task is a failed command — scripts should be able to tell.
-        if finished.status != "done":
-            raise typer.Exit(code=1)
+        box = fleet.get_box(result["box_id"])
+        emit(
+            {**result, "box": box_dict(box)},
+            f"{box.id}  {box.name}  {box.status}\nendpoint: {result['endpoint']}\n\n"
+            f"Talk to it with `flotta chat {box.name}`.",
+            as_json=as_json,
+        )
 
 
 @app.command()
