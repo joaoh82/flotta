@@ -32,6 +32,15 @@ control = [
     "httpx>=0.28.1",
     "uvicorn>=0.34",
 ]
+# The front door (M5b). `websockets` is the client half of the agent socket —
+# the door is the only component that has to *speak* WS as a client, since the
+# CLI and the app are both on the other side of it.
+door = [
+    "fastapi>=0.115",
+    "httpx>=0.28.1",
+    "uvicorn>=0.34",
+    "websockets>=13",
+]
 # Everything, for a deployment that runs the control plane against Postgres.
 server = ["flotta[postgres,control]"]
 
@@ -59,6 +68,10 @@ dev = [
     # entrypoint with no test.
     "fastapi>=0.115",
     "httpx>=0.28.1",
+    # The door's WS client, in `dev` for the same reason as the two above:
+    # extra-only test dependencies are how a test file goes quiet without
+    # anyone noticing (see the M4.5 importorskip incident).
+    "websockets>=13",
 ]
 
 [build-system]

@@ -12,6 +12,7 @@ import pytest
 
 from flotta.auth import (
     DEFAULT_TTL_S,
+    SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_FLEET_READ,
     SCOPE_FLEET_WRITE,
@@ -157,9 +158,32 @@ def test_destroy_is_not_implied_by_write():
     assert not claims.allows(SCOPE_BOX_DESTROY)
 
 
-def test_the_known_scopes_are_exactly_these_three():
-    """A new scope should be a deliberate act, visible in a diff."""
-    assert {"fleet:read", "fleet:write", "box:destroy"} == SCOPES
+def test_the_known_scopes_are_exactly_these_four():
+    """A new scope should be a deliberate act, visible in a diff.
+
+    This test earned its keep on the first change: adding `box:chat` for M5b
+    failed here, which is exactly the prompt to ask whether the scope is
+    warranted rather than to notice it in review three PRs later.
+    """
+    assert {"fleet:read", "fleet:write", "box:destroy", "box:chat"} == SCOPES
+
+
+def test_reading_the_fleet_does_not_grant_reading_conversations():
+    """`box:chat` is separate from `fleet:read` deliberately.
+
+    Fleet state is names and statuses. A conversation is everything the agent
+    has ever been told — a different order of sensitivity, and a dashboard
+    token should not carry it.
+    """
+    claims = verify(mint(subject="dashboard", scopes={SCOPE_FLEET_READ}, key=KEY), key=KEY)
+    assert not claims.allows(SCOPE_BOX_CHAT)
+
+
+def test_chatting_does_not_grant_destroying():
+    """The app talks to agents. It has no reason to be able to delete one."""
+    claims = verify(mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY), key=KEY)
+    assert claims.allows(SCOPE_BOX_CHAT)
+    assert not claims.allows(SCOPE_BOX_DESTROY)
 
 
 def test_generated_keys_are_long_and_distinct():

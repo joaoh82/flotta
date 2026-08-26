@@ -810,6 +810,42 @@ def kill(
         emit(result, f"{box.id}  torn_down{note}", as_json=as_json)
 
 
+@app.command()
+def door(
+    host: str = typer.Option("::", "--host", help="Bind address (:: for Fly's IPv6 network)"),
+    port: int = typer.Option(8080, "--port", help="Port to listen on"),
+) -> None:
+    """Run the front door: public, authenticated access to a box (M5b).
+
+    Binds `::` by default, not `127.0.0.1`. The door is *meant* to be reachable
+    — that is what it is for — and Fly's private network is IPv6-only, so an
+    IPv4-only bind is invisible to it. The control plane's loopback default is
+    the opposite case and stays opposite.
+
+    Unlike `flotta serve`, this refuses to start without a signing key at all.
+    There is no local-development state where an unauthenticated front door
+    makes sense: it exists to be exposed.
+    """
+    from flotta.auth import SIGNING_KEY_ENV, resolve_signing_key
+
+    if not resolve_signing_key():
+        typer.secho(
+            f"the front door will not start without ${SIGNING_KEY_ENV}.\n"
+            f"It is a public entrypoint to every agent in the fleet; there is no "
+            f"unauthenticated mode. Generate one with `flotta token key`.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    import uvicorn
+
+    from flotta.door import create_door
+
+    typer.secho(f"front door on {host}:{port}", fg=typer.colors.BRIGHT_BLACK, err=True)
+    uvicorn.run(create_door(), host=host, port=port)
+
+
 # -- tokens (M5) ------------------------------------------------------------
 
 token_app = typer.Typer(

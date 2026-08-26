@@ -60,10 +60,9 @@ machine. That one rule shapes most of the design.
 > unauthenticated — which it will only do on a loopback bind; a public bind with no key is
 > refused at startup.
 >
-> Two things are still open, and both are M5's other half: **boxes have no public route**
-> (they are reached over a private Fly tunnel), and **there is no multi-user model** — a token
-> carries scopes, not an identity, so "who did this" is not a question the fleet can answer.
-> Treat a signing key as an admin credential for the whole fleet.
+> One thing is still open: **there is no multi-user model** — a token carries scopes, not an
+> identity, so "who did this" is not a question the fleet can answer. Treat a signing key as an
+> admin credential for the whole fleet.
 
 ## What it does today
 
@@ -339,6 +338,44 @@ entirely. Do not put it behind a serverless/scale-to-zero setting: the reconcile
 loop is continuous background work, and sleeping it reintroduces the exact bug
 it exists to fix, one layer down.
 
+## The front door
+
+`flotta door` is what makes a box reachable without `flyctl` and a WireGuard
+tunnel: `<box>.flotta.dev` terminates TLS and proxies to that box's
+`hermes serve`.
+
+**It is not a reverse proxy, and could not be.** A request normally arrives
+while the box is *asleep* — that is the cost argument, not an edge case — so the
+door has to resolve the hostname to a box, **wake it**, wait for Hermes to
+finish importing itself, and only then proxy. Caddy and nginx cannot do the
+first three: they need fleet state, substrate credentials, and the knowledge
+that Fly's internal DNS only resolves *running* machines.
+
+```
+client ──TLS──▶ flotta door      1. validate the Flotta token
+                    │            2. ask the control plane to wake the box
+                    │            3. attach the box's own credentials
+                    └──6PN──▶ box:9119
+```
+
+**Auth composes rather than stacks.** A caller presents a scoped Flotta token
+with `box:chat`; the door validates it and attaches the *box's* Hermes
+credentials outbound. The box's password never leaves the server side, and
+Hermes's own gate is satisfied rather than bypassed.
+
+It runs as its own Fly app, deliberately separate from the control plane: the
+door must be on Fly to reach boxes over the private network, and the control
+plane must not be pinned there because it is meant to self-host anywhere.
+
+```bash
+just door                # locally, against a running control plane
+just door-deploy         # a real, billed, always-on Fly machine
+just door-dns            # the exact Cloudflare records to add
+```
+
+**First contact with a sleeping agent takes 10–60s.** That is Hermes booting,
+not a hang — the door holds the connection rather than failing, and says so.
+
 ## Limitations
 
 Stated plainly, because finding these yourself is worse.
@@ -358,8 +395,10 @@ Stated plainly, because finding these yourself is worse.
   nonsense. (This is the failure durable box memory is meant to remove rather than mitigate.)
 - **`--wait`, or the row strands** until something sweeps for it — `flotta watch`,
   `flotta reconcile`, or a running `flotta serve`.
-- **Boxes have no public route.** The control plane authenticates, but a box is still reached
-  over a private Fly tunnel — `<box>.flotta.dev` and TLS termination are M5's other half.
+- **Boxes do not sleep on their own.** Nothing suspends an idle box, so a box you create bills
+  CPU until you `flotta stop` it. The cost argument — an idle fleet costing about what a fleet of
+  disks costs — is not true yet. Idle-sleep needs the door to know a box is in use, so it lands
+  next.
 - **A token has scopes, not an identity.** There is no user model, so the fleet cannot answer
   "who destroyed that box". A signing key is an admin credential for everything.
 - **A token cannot be individually revoked** before it expires. Rotating the signing key revokes
