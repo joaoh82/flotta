@@ -45,6 +45,7 @@ Readers: the CLI and the dashboard API routes.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -57,6 +58,14 @@ from flotta import db
 EntityKind = Literal["box", "workspace", "task"]
 
 DEFAULT_DB_PATH = "fleet.db"
+
+#: Where the fleet lives when nobody says. Read by `FleetStore()` itself rather
+#: than by each caller: this rule was written out twice — once in the CLI, once
+#: in the control plane — and the copies disagreed. The service honoured
+#: `$FLOTTA_DATABASE_URL` but not `$FLOTTA_STORE`, so `flotta serve` beside a
+#: `flotta ps` that listed a fleet served an empty one from a different file.
+#: One rule, in the constructor, so a third caller cannot get it wrong.
+STORE_ENV_VAR = "FLOTTA_STORE"
 
 # -- box: a machine that is an agent ----------------------------------------
 #
@@ -320,6 +329,8 @@ class FleetStore:
         there is no way to say two contradictory things. SQLite stays the
         default so local work and the whole test suite need no server.
         """
+        if db_path is None:
+            db_path = os.environ.get(STORE_ENV_VAR, "").strip() or None
         url = db.resolve_url(str(db_path) if db_path is not None else None)
         self.is_postgres = db.is_postgres_url(url)
         #: What this store was opened with, so a caller can open a *second*

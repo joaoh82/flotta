@@ -24,6 +24,17 @@ dependencies = [
 # 455 hermetic tests would be a poor trade. `uv sync --extra postgres` adds it
 # for anyone pointing $FLOTTA_DATABASE_URL at a real server.
 postgres = ["psycopg[binary]>=3.1"]
+# The control plane's HTTP surface, for anyone *running* the service:
+# `uv sync --extra control`. Its test dependencies are in the `dev` group
+# instead — see the note there; keeping them only here made 16 tests vanish
+# from CI while it still reported green.
+control = [
+    "fastapi>=0.115",
+    "httpx>=0.28.1",
+    "uvicorn>=0.34",
+]
+# Everything, for a deployment that runs the control plane against Postgres.
+server = ["flotta[postgres,control]"]
 
 [project.scripts]
 flotta = "flotta.cli:app"
@@ -32,6 +43,23 @@ flotta = "flotta.cli:app"
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",
+    # The control plane's test dependencies live here, NOT only in the
+    # `control` extra. They were extra-only, `test_app.py` guarded itself with
+    # `pytest.importorskip("fastapi")`, and CI runs a plain `uv sync --frozen`
+    # — so the whole file was skipped, and a skip reports as a pass. Sixteen
+    # tests were invisible on every PR: the bind guard, the health-503 check,
+    # the cost-sum regression, and the store-resolution check. CI was green the
+    # entire time.
+    #
+    # This is the same failure the postgres transaction guards had — a green
+    # signal measuring nothing — so the fix is to make the deps unavoidable
+    # rather than to add the extra to one CI job. A contributor running
+    # `uv sync && just check` gets the same coverage CI does.
+    #
+    # `uvicorn` stays extra-only: only `serve()` needs it, and that is an
+    # entrypoint with no test.
+    "fastapi>=0.115",
+    "httpx>=0.28.1",
 ]
 
 [build-system]

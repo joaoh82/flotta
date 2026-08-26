@@ -1,7 +1,7 @@
 /**
  * Shapes shared by the server and the browser.
  *
- * These live apart from `lib/store.ts` because that module is `server-only`;
+ * These live apart from `lib/control.ts` because that module is `server-only`;
  * a client component importing it is a build error. Types alone are erased at
  * compile time, but keeping them in a neutral module makes the boundary
  * obvious rather than incidental.
@@ -12,7 +12,7 @@
  */
 
 /**
- * A row is a box (see `lib/store.ts`), so `stopped` is reachable. `done` and
+ * A row is a box (see `lib/control.ts`), so `stopped` is reachable. `done` and
  * `failed` are kept because they still describe tasks, which the timeline
  * renders — the union spans what the UI can be handed, not one table.
  */
