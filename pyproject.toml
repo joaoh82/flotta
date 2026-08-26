@@ -80,3 +80,11 @@ extend-exclude = ["vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 flags a function call in an argument default, which is right almost
+# everywhere and wrong for FastAPI: `Depends(...)` in a default *is* the
+# framework's dependency-injection syntax, and the object it builds is
+# immutable. Listing it here rather than scattering `# noqa: B008` over every
+# authenticated route, which would also suppress real B008s on those lines.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header"]

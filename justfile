@@ -5,6 +5,14 @@
 # That file is the single place to look for machine-local config.
 set dotenv-load := true
 
+# M5 — generate a signing key for scoped tokens (print once, never stored)
+token-key:
+    uv run flotta token key
+
+# M5 — mint a scoped token, e.g. `just token-mint dashboard fleet:read`
+token-mint SUBJECT SCOPE:
+    uv run flotta token mint {{SUBJECT}} --scope {{SCOPE}}
+
 # list available recipes
 default:
     @just --list
@@ -93,9 +101,10 @@ hermes-bump REF:
     trap - ERR
 
 
-# Loopback only: there is no auth yet and DELETE /api/boxes/<id> destroys a box
-# and its memory, so `serve` refuses a public bind rather than warning about it.
-# Reads $FLOTTA_STORE (or $FLOTTA_DATABASE_URL) exactly as the CLI does.
+# Unauthenticated unless $FLOTTA_SIGNING_KEY is set — which it will only do on
+# a loopback bind. A public bind with no key is refused at startup, because
+# DELETE /api/boxes/<id> destroys a box and everything it remembers.
+# Mint a key with `just token-key`. Reads $FLOTTA_STORE (or $FLOTTA_DATABASE_URL).
 # M4.5 control plane — the fleet API + the reconcile loop, on http://127.0.0.1:8080
 serve port="8080":
     #!/usr/bin/env bash
@@ -106,6 +115,8 @@ serve port="8080":
 # is reserved for another local service and a flag is too easy to forget.
 # Needs `just serve` running: the dashboard reads the control-plane API, not
 # the store. Without it every page answers 503 and says so.
+# If the control plane has a signing key, set $FLOTTA_CONTROL_TOKEN too —
+# `just token-mint dashboard fleet:read` — or every page answers 401.
 # M5 dashboard — local fleet view on http://localhost:3001
 dashboard:
     #!/usr/bin/env bash

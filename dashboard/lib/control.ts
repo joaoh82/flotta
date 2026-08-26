@@ -61,12 +61,35 @@ export function controlPlaneUrl(): string {
   return (process.env.FLOTTA_CONTROL_URL?.trim() || DEFAULT_CONTROL_URL).replace(/\/$/, "");
 }
 
+/**
+ * The dashboard's own token (M5).
+ *
+ * Read server-side only — this module is `server-only`, so the token never
+ * reaches the browser. That is the whole reason the dashboard proxies the
+ * control plane through its own API routes instead of letting the page call it
+ * directly: a token in client JavaScript is a token in everyone's devtools.
+ *
+ * Mint it with `flotta token mint dashboard --scope fleet:read`. **Read-only
+ * is the right scope**: the fleet view needs to list boxes, and the kill
+ * button is the one thing worth deciding on deliberately — give it
+ * `box:destroy` only if you want anyone with dashboard access to be able to
+ * delete an agent's entire memory.
+ */
+export function controlPlaneToken(): string | null {
+  return process.env.FLOTTA_CONTROL_TOKEN?.trim() || null;
+}
+
 async function call(path: string, init?: RequestInit): Promise<unknown> {
   const base = controlPlaneUrl();
   let response: Response;
   try {
+    const token = controlPlaneToken();
     response = await fetch(`${base}${path}`, {
       ...init,
+      headers: {
+        ...(init?.headers ?? {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       // The fleet changes underneath us; a cached view is actively misleading
       // rather than merely stale. Same reasoning the routes already carry.
       cache: "no-store",
@@ -79,6 +102,18 @@ async function call(path: string, init?: RequestInit): Promise<unknown> {
   }
 
   if (!response.ok) {
+    // 401/403 have one likely cause and a specific fix, and the raw detail
+    // ("missing bearer token") does not say where the token goes.
+    if (response.status === 401 || response.status === 403) {
+      const how = controlPlaneToken()
+        ? "Its token was rejected — expired, or minted with a different signing key, or missing a scope."
+        : "No $FLOTTA_CONTROL_TOKEN is set.";
+      throw new ControlPlaneError(
+        response.status,
+        `${how} Mint one with \`flotta token mint dashboard --scope fleet:read\` ` +
+          `and set FLOTTA_CONTROL_TOKEN before starting the dashboard.`,
+      );
+    }
     let detail = `${response.status} ${response.statusText}`;
     try {
       const body = (await response.json()) as { detail?: string; message?: string };
