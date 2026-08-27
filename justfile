@@ -45,6 +45,12 @@ door-dns:
     echo "  sends a heartbeat, and use Full (Strict) when you do."
 
 
+# Prints a signing key and every token a deployment needs, once. Nothing is
+# written to disk — see docs/DEPLOY.md for where each value goes.
+# M5b: generate all deployment secrets (run this before deploying anything)
+deploy-config domain="flotta.dev":
+    uv run python scripts/deploy_config.py --domain {{domain}}
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key

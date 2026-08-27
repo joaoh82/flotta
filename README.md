@@ -338,6 +338,16 @@ entirely. Do not put it behind a serverless/scale-to-zero setting: the reconcile
 loop is continuous background work, and sleeping it reintroduces the exact bug
 it exists to fix, one layer down.
 
+## Deploying
+
+[`docs/DEPLOY.md`](docs/DEPLOY.md) is the runbook for the first deployment:
+control plane on Railway, front door on Fly, DNS on Cloudflare — **in that
+order**, because each step needs an address the previous one produces.
+
+```bash
+just deploy-config    # every secret, once, with where each value goes
+```
+
 ## The front door
 
 `flotta door` is what makes a box reachable without `flyctl` and a WireGuard
