@@ -56,11 +56,34 @@ Variables:
 ```
 FLOTTA_SIGNING_KEY=<from step 0>
 FLOTTA_DATABASE_URL=${{Postgres.DATABASE_URL}}
+FLY_API_TOKEN=<flyctl tokens create org>
+FLOTTA_FLY_APP=<the app your boxes live in>
+FLOTTA_FLY_ORG=personal
 ```
 
-The second is a **Railway variable reference**, not a literal — it resolves to
-whatever the Postgres service is currently using, so it survives a database
-rotation.
+`FLOTTA_DATABASE_URL` is a **Railway variable reference**, not a literal — it
+resolves to whatever the Postgres service is currently using, so it survives a
+database rotation.
+
+**The last three are why this is not a read-only service.** D10 says fleet
+state is written only by code that can reach the substrate, and the control
+plane *is* that code: `POST /api/boxes` creates a machine, `DELETE` destroys
+one, `POST /api/boxes/{id}/wake` starts one, and the idle sweep suspends one.
+Without a Fly token it serves reads and silently fails every write.
+
+The wake matters most: **the front door depends on it**, and a request for a
+sleeping box is the normal case rather than an edge one. The idle sweep matters
+quietly — its failures are logged rather than raised, so without a token the
+fleet simply never sleeps while the loop keeps reporting healthy.
+
+Mint the token with:
+
+```bash
+flyctl tokens create org --name flotta-control-plane
+```
+
+An **org-scoped** token, because the control plane creates apps and machines
+rather than deploying to one that exists.
 
 Do not set `PORT`. Railway injects it and the image honours it.
 
