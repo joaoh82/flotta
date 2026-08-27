@@ -389,3 +389,58 @@ def test_the_doors_health_says_nothing_about_the_fleet(stub_box):
         body = client.get("/_door/health", headers={"Host": "flotta.dev"}).json()
     assert body["status"] == "ok"
     assert "boxes" not in body and "box" not in body
+
+
+# -- the door's own query parameters never reach the box --------------------
+
+
+def test_the_access_token_is_stripped_before_proxying():
+    """The WS handshake's token must not be forwarded.
+
+    The HTTP path strips `Authorization` so a box never sees a caller's Flotta
+    token. The WS path forwarded the query wholesale — and `access_token` is
+    the *only* way a browser can carry a token on a handshake, so the one route
+    the door exists for leaked exactly what the other was careful to withhold.
+    """
+    from starlette.datastructures import QueryParams
+
+    from flotta.door.app import strip_door_params
+
+    kept = strip_door_params(QueryParams("access_token=flotta_secret&session=abc&ticket=xyz"))
+    assert ("session", "abc") in kept
+    assert ("ticket", "xyz") in kept
+    assert not any(k.lower() == "access_token" for k, _ in kept)
+    assert "flotta_secret" not in str(kept)
+
+
+def test_a_repeated_parameter_is_not_collapsed():
+    """Pairs, not a dict: the box's protocol may care about repeats."""
+    from starlette.datastructures import QueryParams
+
+    from flotta.door.app import strip_door_params
+
+    assert strip_door_params(QueryParams("t=1&t=2")) == [("t", "1"), ("t", "2")]
+
+
+def test_the_box_never_sees_a_flotta_token_in_the_query(stub_box):
+    """The HTTP half of the same leak, asserted at the box.
+
+    A client that sends both a Bearer header and `?access_token=` would have
+    had the query copy forwarded even though admission ignored it.
+    """
+    from fastapi.testclient import TestClient
+
+    port, seen = stub_box
+    app, _ = _door_for(port, box_credentials=("flotta", "pw"))
+    raw = mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY)
+
+    with TestClient(app) as client:
+        client.get(
+            f"/api/x?access_token={raw}&keep=me",
+            headers={"Host": "eng-a.flotta.dev", "Authorization": f"Bearer {raw}"},
+        )
+
+    path = seen[-1]["path"]
+    assert "keep=me" in path, "a caller's own parameters must still be forwarded"
+    assert "access_token" not in path, "the door's token reached the box"
+    assert raw not in path

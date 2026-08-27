@@ -402,7 +402,7 @@ def create_door(
                 upstream = await client.request(
                     request.method,
                     url,
-                    params=dict(request.query_params),
+                    params=strip_door_params(request.query_params),
                     headers=forwarded,
                     content=await request.body(),
                 )
@@ -445,7 +445,11 @@ def create_door(
             return
 
         await websocket.accept()
-        query = str(websocket.url.query or "")
+        # Rebuilt from the filtered pairs rather than passed through: the raw
+        # query carries `access_token`, and the box must not receive it.
+        from urllib.parse import urlencode
+
+        query = urlencode(strip_door_params(websocket.query_params))
         upstream_url = f"ws://{authority(target.host, target.port)}/{path}" + (
             f"?{query}" if query else ""
         )
@@ -511,6 +515,28 @@ _HOP_BY_HOP = frozenset(
         "content-encoding",
     }
 )
+
+
+#: Query parameters the door consumes and must not pass upstream.
+#: `access_token` is the WS handshake's only way to carry a Flotta token — a
+#: browser cannot set headers there — which makes it a *credential in the URL*,
+#: and forwarding it hands the box a token for the fleet it lives in.
+_DOOR_QUERY_PARAMS = frozenset({"access_token"})
+
+
+def strip_door_params(query: Any) -> list[tuple[str, str]]:
+    """Drop the door's own query parameters before proxying.
+
+    The HTTP path strips `Authorization` so a box never sees a caller's Flotta
+    token. This is the same rule for the other channel the token can arrive on,
+    and it was missed: the WS path forwarded the query wholesale, which meant
+    the one route the door exists for leaked exactly what the HTTP route was
+    careful to withhold.
+
+    Returns pairs rather than a dict so a repeated parameter is not silently
+    collapsed — the box's own protocol may care.
+    """
+    return [(k, v) for k, v in query.multi_items() if k.lower() not in _DOOR_QUERY_PARAMS]
 
 
 def _basic(username: str, password: str) -> str:
