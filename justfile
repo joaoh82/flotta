@@ -16,13 +16,47 @@ door port="8081":
 
 # COSTS MONEY: creates/updates an always-on Fly machine. Build context is the
 # REPO ROOT, not fly/door — the image installs the package from pyproject/src.
+# Override the app name with $FLOTTA_DOOR_APP; Fly app names are GLOBALLY
+# unique, so the default is very likely already taken by someone else.
 # M5b: deploy the front door to Fly (real, billed, always-on)
 door-deploy: fly-whoami
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "This creates an always-on machine (~\$2-4/month). Ctrl-C to stop."
+    ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
+    APP="${FLOTTA_DOOR_APP:-flotta-door}"
+
+    # `flyctl deploy` does not create the app — it fails with a bare
+    # "app not found", which reads like a broken config rather than a missing
+    # first step. `fly-up` has created its app since M2; the door recipe
+    # shipped without the equivalent and this is that gap closed.
+    #
+    # Exact match on parsed JSON, not a grep, for the reason fly-up records:
+    # a substring match for "flotta-door" would accept an existing
+    # "flotta-door-2" and skip creating the app that is actually missing.
+    if ! flyctl apps list --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any(a.get('Name')=='$APP' for a in json.load(sys.stdin)) else 1)"; then
+      echo "creating app $APP in org $ORG"
+      flyctl apps create "$APP" --org "$ORG" || {
+        echo "" >&2
+        echo "If that failed with a name conflict: Fly app names are GLOBALLY" >&2
+        echo "unique, not per-org, and 'flotta-door' is an obvious name to have" >&2
+        echo "been taken. Pick another and set FLOTTA_DOOR_APP in .env." >&2
+        exit 1
+      }
+    else
+      echo "app $APP already exists"
+    fi
+
+    echo ""
+    echo "Deploying $APP — an ALWAYS-ON machine (~\$2-4/month). Ctrl-C to stop."
     sleep 3
-    flyctl deploy --config fly/door/fly.toml --dockerfile fly/door/Dockerfile .
+    flyctl deploy --config fly/door/fly.toml --dockerfile fly/door/Dockerfile --app "$APP" .
+
+    echo ""
+    echo "Deployed. It will NOT work until it has secrets — see docs/DEPLOY.md step 4:"
+    echo "  flyctl secrets set --app $APP FLOTTA_SIGNING_KEY=... FLOTTA_CONTROL_URL=... \\"
+    echo "    FLOTTA_CONTROL_TOKEN=... FLOTTA_DOMAIN=... FLOTTA_BOX_PASSWORD=..."
+    echo "Then: just door-dns"
 
 # Prints the exact Cloudflare records to add. Run after `just door-deploy`,
 # because the AAAA target is the door app's address and does not exist before.
@@ -30,7 +64,7 @@ door-deploy: fly-whoami
 door-dns:
     #!/usr/bin/env bash
     set -euo pipefail
-    APP=flotta-door
+    APP="${FLOTTA_DOOR_APP:-flotta-door}"
     DOMAIN="${FLOTTA_DOMAIN:-flotta.dev}"
     echo "Records to add in Cloudflare for ${DOMAIN}:"
     echo

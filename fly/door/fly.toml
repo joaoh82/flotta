@@ -5,6 +5,9 @@
 # to Fly, because §8.3's self-host recipe deploys it to Railway. Two apps, two
 # deployment stories, on purpose.
 
+# Overridden by `--app` in `just door-deploy`, which reads $FLOTTA_DOOR_APP.
+# Fly app names are globally unique rather than per-org, so this default is
+# very likely already taken by somebody else.
 app = "flotta-door"
 primary_region = "iad"
 

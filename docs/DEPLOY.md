@@ -103,6 +103,11 @@ just fly-auth      # mints the box's Hermes credentials into .env
 just door-deploy
 ```
 
+This creates the Fly app if it does not exist, then deploys. **Fly app names
+are globally unique across all of Fly**, not per-org, so `flotta-door` may well
+be taken — if the create fails on a name conflict, pick another and set
+`FLOTTA_DOOR_APP` in `.env`.
+
 Then give it its secrets — the exact command is in step 0's output:
 
 ```bash
