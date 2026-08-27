@@ -37,7 +37,9 @@ ENV FLOTTA_DATABASE_URL=""
 # authenticates in front of this (Railway, Fly) is the operator asserting they
 # own the perimeter.
 ENV FLOTTA_CONTROL_HOST=0.0.0.0
-ENV FLOTTA_CONTROL_PORT=8080
+# Unset by default so $PORT can win; the CMD falls back to 8080 when neither
+# is set. Setting it here would shadow the platform's own variable.
+ENV FLOTTA_CONTROL_PORT=""
 EXPOSE 8080
 
 # `/health` returns 503 when the reconcile loop has stopped sweeping, so a
@@ -45,7 +47,12 @@ EXPOSE 8080
 # being discovered days later from a task stranded at `running`.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,os,sys; \
-url='http://127.0.0.1:'+os.environ.get('FLOTTA_CONTROL_PORT','8080')+'/health'; \
+url='http://127.0.0.1:'+(os.environ.get('FLOTTA_CONTROL_PORT') or os.environ.get('PORT') or '8080')+'/health'; \
 sys.exit(0 if urllib.request.urlopen(url, timeout=4).status == 200 else 1)"
 
-CMD ["sh", "-c", "flotta serve --host \"$FLOTTA_CONTROL_HOST\" --port \"$FLOTTA_CONTROL_PORT\""]
+# `${PORT:-...}` because PaaS platforms inject the port they expect the app to
+# listen on, and Railway — §8.3's self-host target — fails a deploy outright
+# when nothing answers there. Honouring $PORT makes the image work unmodified
+# on Railway, Render and Fly, while FLOTTA_CONTROL_PORT still wins for anyone
+# who sets it deliberately.
+CMD ["sh", "-c", "flotta serve --host \"$FLOTTA_CONTROL_HOST\" --port \"${FLOTTA_CONTROL_PORT:-${PORT:-8080}}\""]
