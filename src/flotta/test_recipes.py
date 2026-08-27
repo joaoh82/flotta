@@ -53,3 +53,17 @@ def test_every_recipe_import_resolves(module, name):
     assert hasattr(mod, name), (
         f"the justfile imports `{name}` from `{module}`, which has no such name"
     )
+
+
+def test_the_suite_is_hermetic_against_a_developers_env():
+    """`FLOTTA_*` must not reach a test from the ambient environment.
+
+    This broke for real: deploying requires `FLOTTA_SIGNING_KEY` in `.env`, the
+    justfile loads `.env`, and fifteen control-plane tests started returning
+    401 — locally only, because CI has no `.env`. A suite that disagrees with
+    itself depending on who runs it is worse than one that simply fails.
+    """
+    import os
+
+    leaked = sorted(k for k in os.environ if k.startswith("FLOTTA_"))
+    assert leaked == [], f"the autouse fixture in conftest.py did not strip: {leaked}"

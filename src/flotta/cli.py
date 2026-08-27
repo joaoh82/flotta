@@ -812,15 +812,20 @@ def kill(
 
 @app.command()
 def door(
-    host: str = typer.Option("::", "--host", help="Bind address (:: for Fly's IPv6 network)"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Bind address"),
     port: int = typer.Option(8080, "--port", help="Port to listen on"),
 ) -> None:
     """Run the front door: public, authenticated access to a box (M5b).
 
-    Binds `::` by default, not `127.0.0.1`. The door is *meant* to be reachable
-    — that is what it is for — and Fly's private network is IPv6-only, so an
-    IPv4-only bind is invisible to it. The control plane's loopback default is
-    the opposite case and stays opposite.
+    Binds `0.0.0.0` by default, not `127.0.0.1`. The door is *meant* to be
+    reachable — that is what it is for — and the control plane's loopback
+    default is the opposite case and stays opposite.
+
+    **Not `::`,** which is what a box binds. A box is reached from other
+    machines over Fly's 6PN and that network is IPv6-only; the door is reached
+    by Fly Proxy, which requires 0.0.0.0. Binding `::` here bound v6-only and
+    every health check came back "connection refused" while the door was
+    serving perfectly over IPv6.
 
     Unlike `flotta serve`, this refuses to start without a signing key at all.
     There is no local-development state where an unauthenticated front door

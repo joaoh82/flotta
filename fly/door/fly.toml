@@ -15,7 +15,15 @@ primary_region = "iad"
   dockerfile = "Dockerfile"
 
 [env]
-  FLOTTA_DOOR_HOST = "::"
+  # 0.0.0.0, NOT `::`. Fly Proxy requires a service to listen on 0.0.0.0 to be
+  # routable; `::` bound v6-only in this image and every health check came back
+  # "connect: connection refused" while the door was serving perfectly on IPv6.
+  #
+  # The box image binds `::` for the opposite and equally correct reason: a box
+  # is reached *from other machines* over Fly's 6PN, which is IPv6-only. The
+  # door is reached *by Fly Proxy*. Same platform, two reachability stories —
+  # and the door's outbound 6PN calls to boxes do not depend on its bind at all.
+  FLOTTA_DOOR_HOST = "0.0.0.0"
   FLOTTA_DOOR_PORT = "8080"
   FLOTTA_DOMAIN = "flotta.dev"
 
