@@ -110,6 +110,38 @@ def _store_factory() -> FleetStore:
     return FleetStore()
 
 
+#: Do not write an `addressed` event more often than this. Without a floor,
+#: every HTTP request through the door would append a row — the event log is
+#: the fleet's history, not a request log, and one row per request would bury
+#: the transitions a human actually reads it for.
+ACTIVITY_FLOOR_S = 60.0
+
+
+def _record_activity(store: Any, box_id: str) -> bool:
+    """Note that a box was addressed, at most once a minute.
+
+    This is the activity signal idle-sleep runs on. It lives in the event log
+    rather than a `boxes.last_active_at` column because the store has no
+    migration machinery — the schema is `CREATE TABLE IF NOT EXISTS` and
+    nothing else, so a new column would silently break every existing fleet.
+
+    Rate-limited by reading the newest event first, which costs one query on a
+    path that is already making an HTTP round trip.
+    """
+    from datetime import UTC, datetime
+
+    from flotta.provision import ADDRESSED_EVENT, last_activity_at
+
+    try:
+        seen = last_activity_at(store, box_id)
+    except Exception:  # pragma: no cover - a box that vanished mid-request
+        return False
+    if seen is not None and (datetime.now(UTC) - seen).total_seconds() < ACTIVITY_FLOOR_S:
+        return False
+    store.add_event("box", box_id, ADDRESSED_EVENT, {"via": "front-door"})
+    return True
+
+
 def _box_dict(box: Any) -> dict[str, Any]:
     from dataclasses import asdict
 
@@ -398,6 +430,7 @@ def create_app(
             box = store.get_box(box_id) or store.get_box_by_name(box_id)
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            _record_activity(store, box.id)
             try:
                 result = wake_box(box.id, store=store, reason="front-door")
             except ProvisionError as exc:

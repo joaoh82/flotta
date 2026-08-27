@@ -56,6 +56,7 @@ with fakes and the base `flotta` package keeps no hard Modal dependency.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -975,3 +976,124 @@ def teardown_box(
         "cancel_error": cancel_error,
         "failed_tasks": failed_tasks,
     }
+
+
+# -- idle sleep -------------------------------------------------------------
+
+#: How long a box may sit with nothing happening before it is suspended.
+#: Thirty minutes is a guess at the shape of a conversation with an agent —
+#: long enough that stepping away for coffee does not cost a cold start, short
+#: enough that a box forgotten on a Friday is not billed all weekend.
+DEFAULT_IDLE_AFTER_S = 30 * 60
+IDLE_AFTER_ENV = "FLOTTA_IDLE_AFTER_S"
+
+#: The event a box's activity is recorded as. Activity lives in the event log
+#: rather than a `boxes.last_active_at` column for one blunt reason: the store
+#: has no migration machinery — the schema is `CREATE TABLE IF NOT EXISTS` and
+#: nothing else — so adding a column would silently break every existing fleet.
+#: M0 could sidestep that by refusing pre-M0 files outright; this cannot.
+ADDRESSED_EVENT = "addressed"
+
+
+def resolve_idle_after(explicit: float | None = None, env: dict[str, str] | None = None) -> float:
+    """`--idle-after` → `$FLOTTA_IDLE_AFTER_S` → 30 minutes. 0 disables."""
+    if explicit is not None:
+        return float(explicit)
+    env = os.environ if env is None else env
+    raw = (env.get(IDLE_AFTER_ENV) or "").strip()
+    if not raw:
+        return float(DEFAULT_IDLE_AFTER_S)
+    try:
+        return max(0.0, float(raw))
+    except ValueError as exc:
+        raise ProvisionError(f"{IDLE_AFTER_ENV}={raw!r} is not a number") from exc
+
+
+def last_activity_at(store: FleetStore, box_id: str) -> datetime | None:
+    """When anything last happened to a box, from its timeline.
+
+    The timeline spans the box *and its tasks*, which is what makes this a
+    usable idleness signal rather than a box-status one: a box quietly driving
+    a task is not idle, and its task's events say so.
+    """
+    newest: datetime | None = None
+    for event in store.get_box_timeline(box_id):
+        stamped = _parse_ts(event.ts)
+        if stamped is not None and (newest is None or stamped > newest):
+            newest = stamped
+    return newest
+
+
+def idle_boxes(
+    store: FleetStore,
+    *,
+    now: datetime | None = None,
+    idle_after_s: float | None = None,
+) -> list[tuple[Box, float]]:
+    """Boxes that are running, unoccupied, and have been quiet long enough.
+
+    Returns `(box, idle_seconds)` so a caller can log *why* rather than just
+    what — an operator asking "why did my agent go to sleep" deserves a number.
+    """
+    threshold = resolve_idle_after(idle_after_s)
+    if threshold <= 0:
+        return []  # explicitly disabled
+    current = now or datetime.now(UTC)
+
+    # One query, not one per box: a live task means occupied, whatever the
+    # event log says, and a box mid-task must never be suspended.
+    occupied = {t.box_id for t in store.list_tasks() if not is_terminal("task", t.status)}
+
+    idle: list[tuple[Box, float]] = []
+    for box in store.list_boxes():
+        if box.status != "running" or box.id in occupied:
+            continue
+        seen = last_activity_at(store, box.id)
+        if seen is None:
+            # No timeline at all is not evidence of idleness — it is evidence
+            # of a box this code does not understand. Leave it alone.
+            continue
+        quiet_for = (current - seen).total_seconds()
+        if quiet_for >= threshold:
+            idle.append((box, quiet_for))
+    return idle
+
+
+def sleep_idle_boxes(
+    store: FleetStore,
+    *,
+    backend: Backend | None = None,
+    now: datetime | None = None,
+    idle_after_s: float | None = None,
+    prefer_suspend: bool = True,
+) -> list[dict[str, Any]]:
+    """Suspend boxes nobody is using. The other half of the cost argument.
+
+    Until this existed, "an idle fleet costs about what a fleet of disks costs"
+    was **theoretical**: nothing suspended anything, `flotta stop` was manual,
+    and a created box billed CPU until someone remembered it.
+
+    Deliberately *not* folded into `reconcile`. That sweep resolves stranded
+    *tasks* and its failure mode is a row that lies; this one spends money and
+    its failure mode is an agent that went to sleep mid-thought. Different
+    concerns, different blast radius, separate functions — and the loop can run
+    one without the other.
+
+    **Suspend, not stop**, where the substrate offers it. M1 measured the
+    difference: suspend restores RAM (uptime 44.4s → 53.5s across a cycle)
+    where a cold stop does not (72.1s → 6.7s). That was worth nothing when PID
+    1 was `sleep infinity`; it is worth a great deal now that it is a Hermes
+    that takes seconds to import itself.
+    """
+    outcomes: list[dict[str, Any]] = []
+    for box, quiet_for in idle_boxes(store, now=now, idle_after_s=idle_after_s):
+        detail = {"idle_s": round(quiet_for, 1), "reason": "idle"}
+        try:
+            result = stop_box(box.id, store=store, backend=backend, prefer_suspend=prefer_suspend)
+        except (ProvisionError, BackendError) as exc:
+            # One box refusing to sleep must not stop the sweep. A machine Fly
+            # is having trouble with is exactly the one still costing money.
+            outcomes.append({**detail, "box_id": box.id, "slept": False, "error": str(exc)})
+            continue
+        outcomes.append({**detail, "box_id": box.id, "slept": True, "method": result.get("method")})
+    return outcomes

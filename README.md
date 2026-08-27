@@ -386,6 +386,24 @@ just door-dns            # the exact Cloudflare records to add
 **First contact with a sleeping agent takes 10–60s.** That is Hermes booting,
 not a hang — the door holds the connection rather than failing, and says so.
 
+### Boxes put themselves to sleep
+
+A box with no live task and nothing happening for 30 minutes is **suspended**,
+and the next request through the door wakes it. `$FLOTTA_IDLE_AFTER_S` changes
+the threshold; `0` switches it off for anyone who would rather pay than wait.
+
+This is what makes the cost argument true rather than aspirational — before it,
+a box you created billed CPU until you remembered to stop it.
+
+Suspend rather than stop, where the substrate offers it: a suspend restores the
+machine's memory, which is worth little when PID 1 is `sleep infinity` and worth
+a great deal when it is a Hermes that takes seconds to import itself.
+
+**A box in a conversation is never suspended.** The sweep skips any box with a
+live task, and the door reports a heartbeat while a WebSocket is open — a long
+conversation writes nothing to the fleet on its own, so without that the agent
+you are mid-sentence with would look idle.
+
 ## Limitations
 
 Stated plainly, because finding these yourself is worse.
@@ -405,10 +423,6 @@ Stated plainly, because finding these yourself is worse.
   nonsense. (This is the failure durable box memory is meant to remove rather than mitigate.)
 - **`--wait`, or the row strands** until something sweeps for it — `flotta watch`,
   `flotta reconcile`, or a running `flotta serve`.
-- **Boxes do not sleep on their own.** Nothing suspends an idle box, so a box you create bills
-  CPU until you `flotta stop` it. The cost argument — an idle fleet costing about what a fleet of
-  disks costs — is not true yet. Idle-sleep needs the door to know a box is in use, so it lands
-  next.
 - **A token has scopes, not an identity.** There is no user model, so the fleet cannot answer
   "who destroyed that box". A signing key is an admin credential for everything.
 - **A token cannot be individually revoked** before it expires. Rotating the signing key revokes

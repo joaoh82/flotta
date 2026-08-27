@@ -1650,3 +1650,142 @@ def test_a_backend_that_fails_unexpectedly_does_not_strand_a_provisioning_row(st
     box = store.get_box_by_name("eng-x")
     assert box.status == "torn_down", "a failed create must not leave a provisioning row"
     assert box_events(store, box.id) == ["provisioning", "torn_down"]
+
+
+# -- idle sleep -------------------------------------------------------------
+#
+# The cost argument, made real. Until this existed nothing suspended anything,
+# so "an idle fleet costs about what a fleet of disks costs" was a claim the
+# code did not support.
+
+
+def _quiet_box(store, *, name="eng-a", ago_s=0, endpoint="fly://app/m1"):
+    """A running box whose whole timeline is `ago_s` seconds old.
+
+    Backdates every event on the box, the same way `_age` backdates a task —
+    `add_event` stamps the clock itself, which is right for production and
+    means a test has to reach past it to describe the past.
+    """
+    box = store.create_box(name)
+    store.update_box_status(box.id, "running", endpoint=endpoint)
+    store.add_event("box", box.id, "running", {"endpoint": endpoint})
+    old = (datetime.now(UTC) - timedelta(seconds=ago_s)).isoformat()
+    store._conn.execute(
+        "UPDATE events SET ts = ? WHERE entity_kind = 'box' AND entity_id = ?", (old, box.id)
+    )
+    return box
+
+
+def test_a_quiet_box_is_suspended(store):
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    backend = FakeBackend()
+    outcomes = sleep_idle_boxes(store, backend=backend, idle_after_s=60)
+
+    assert [o["box_id"] for o in outcomes] == [box.id]
+    assert outcomes[0]["slept"] is True
+    assert store.get_box(box.id).status == "stopped"
+
+
+def test_a_recently_active_box_is_left_alone(store):
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=5)
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=600) == []
+    assert store.get_box(box.id).status == "running"
+
+
+def test_a_box_with_a_live_task_is_never_suspended(store):
+    """The test that matters.
+
+    A box quietly driving a task is *working*, and suspending it would be the
+    worst failure this feature can have: an agent stopped mid-thought, with the
+    task left to strand. The live-task check does not consult the event log at
+    all, precisely so a quiet-but-busy box cannot be misread.
+    """
+    from flotta.provision import sleep_idle_boxes
+
+    task_id = a_box_with_a_task("long job", store=store, endpoint="fly://app/m1")["task_id"]
+    _age(store, task_id, 10_000)
+    # Backdate the *timeline* too, or this passes for the wrong reason: the
+    # task's own `spawned` event is seconds old, so the box reads as active
+    # and the live-task guard is never exercised. Verified by deleting the
+    # guard — without this line the test still passed.
+    old = (datetime.now(UTC) - timedelta(seconds=10_000)).isoformat()
+    store._conn.execute("UPDATE events SET ts = ?", (old,))
+
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=1) == []
+    assert store.get_box(box_of(store, task_id)).status == "running"
+
+
+def test_activity_is_recorded_as_an_event_and_defers_sleep(store):
+    """The whole mechanism, end to end.
+
+    Activity lives in the event log rather than a `last_active_at` column
+    because the store has no migration path — see `ADDRESSED_EVENT`. This
+    asserts the substitute actually works: writing the event moves the box out
+    of reach of the sweep.
+    """
+    from flotta.provision import ADDRESSED_EVENT, sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    store.add_event("box", box.id, ADDRESSED_EVENT, {"via": "front-door"})
+
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60) == []
+    assert store.get_box(box.id).status == "running"
+
+
+def test_a_stopped_box_is_not_stopped_again(store):
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    store.update_box_status(box.id, "stopped")
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60) == []
+
+
+def test_one_box_refusing_to_sleep_does_not_stop_the_sweep(store):
+    """A machine the substrate is struggling with is the one still costing money."""
+    from flotta.backend import BackendError
+    from flotta.provision import sleep_idle_boxes
+
+    first = _quiet_box(store, name="eng-a", ago_s=3600, endpoint="fly://app/m1")
+    second = _quiet_box(store, name="eng-b", ago_s=3600, endpoint="fly://app/m2")
+
+    class Flaky(FakeBackend):
+        def suspend(self, endpoint):
+            if endpoint.endswith("m1"):
+                raise BackendError("fly is having a moment")
+            return super().suspend(endpoint)
+
+    outcomes = sleep_idle_boxes(store, backend=Flaky(), idle_after_s=60)
+    by_id = {o["box_id"]: o for o in outcomes}
+    assert by_id[first.id]["slept"] is False
+    assert by_id[second.id]["slept"] is True, "a failure on one box stopped the sweep"
+
+
+def test_idle_sleep_can_be_switched_off(store):
+    """0 means never, for anyone who would rather pay than wait for a wake."""
+    from flotta.provision import sleep_idle_boxes
+
+    _quiet_box(store, ago_s=99_999)
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=0) == []
+
+
+def test_a_box_with_no_timeline_is_left_alone(store):
+    """No events is not evidence of idleness, it is evidence of confusion."""
+    from flotta.provision import idle_boxes
+
+    box = store.create_box("eng-z")
+    store.update_box_status(box.id, "running", endpoint="fly://app/m9")
+    assert idle_boxes(store, idle_after_s=1) == []
+
+
+def test_the_idle_threshold_comes_from_the_environment(monkeypatch):
+    from flotta.provision import DEFAULT_IDLE_AFTER_S, resolve_idle_after
+
+    monkeypatch.delenv("FLOTTA_IDLE_AFTER_S", raising=False)
+    assert resolve_idle_after() == DEFAULT_IDLE_AFTER_S
+    monkeypatch.setenv("FLOTTA_IDLE_AFTER_S", "120")
+    assert resolve_idle_after() == 120
+    assert resolve_idle_after(45) == 45, "an explicit value wins over the environment"
