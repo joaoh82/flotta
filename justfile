@@ -58,6 +58,43 @@ door-deploy: fly-whoami
     echo "    FLOTTA_CONTROL_TOKEN=... FLOTTA_DOMAIN=... FLOTTA_BOX_PASSWORD=..."
     echo "Then: just door-dns"
 
+# Reads from .env, mints the door's control-plane token from the SAME signing
+# key, and STAGES — so it returns immediately instead of waiting for a machine
+# that cannot start until these exist. Values never touch the command line or
+# your shell history.
+# M5b: push the front door's secrets (run before, or after, door-deploy)
+door-secrets: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP="${FLOTTA_DOOR_APP:-flotta-door}"
+    : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env, e.g. https://<app>.up.railway.app}"
+    : "${FLOTTA_BOX_PASSWORD:?set FLOTTA_BOX_PASSWORD in .env — run just fly-auth}"
+    DOMAIN="${FLOTTA_DOMAIN:-flotta.dev}"
+
+    # Minted here rather than pasted, so the door's token cannot drift from the
+    # key that has to verify it. A mismatch surfaces as `bad signature`, which
+    # reads like a broken token rather than two different keys.
+    TOKEN=$(uv run flotta token mint door --scope fleet:read --scope box:chat)
+
+    # --stage, deliberately. Without it `flyctl secrets set` waits for the app
+    # to become healthy, and the door CANNOT become healthy until it has these
+    # secrets — so the command hangs forever on a deadlock it created. Staging
+    # writes them and returns; the next deploy or restart picks them up.
+    #
+    # Piped rather than passed as arguments: a secret in argv is a secret in
+    # `ps` and in your shell history. Same reason fly-secrets does it.
+    {
+      printf 'FLOTTA_SIGNING_KEY=%s\n' "$FLOTTA_SIGNING_KEY"
+      printf 'FLOTTA_CONTROL_URL=%s\n' "$FLOTTA_CONTROL_URL"
+      printf 'FLOTTA_CONTROL_TOKEN=%s\n' "$TOKEN"
+      printf 'FLOTTA_DOMAIN=%s\n' "$DOMAIN"
+      printf 'FLOTTA_BOX_PASSWORD=%s\n' "$FLOTTA_BOX_PASSWORD"
+    } | flyctl secrets import --stage --app "$APP"
+
+    echo "staged 5 secrets on $APP (values not echoed)"
+    echo "now run: just door-deploy"
+
 # Prints the exact Cloudflare records to add. Run after `just door-deploy`,
 # because the AAAA target is the door app's address and does not exist before.
 # M5b: what to configure in Cloudflare for *.flotta.dev

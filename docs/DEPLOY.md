@@ -99,25 +99,41 @@ just fly-auth      # mints the box's Hermes credentials into .env
 
 ## Step 4 — The front door
 
-```bash
-just door-deploy
+**Secrets first, then deploy.** The order matters and the reverse deadlocks —
+see below.
+
+Put these in `.env`:
+
+```
+FLOTTA_SIGNING_KEY=<the SAME value the control plane has>
+FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
+FLOTTA_DOMAIN=flotta.dev
+# FLOTTA_BOX_PASSWORD is already there, written by `just fly-auth`
 ```
 
-This creates the Fly app if it does not exist, then deploys. **Fly app names
-are globally unique across all of Fly**, not per-org, so `flotta-door` may well
-be taken — if the create fails on a name conflict, pick another and set
-`FLOTTA_DOOR_APP` in `.env`.
-
-Then give it its secrets — the exact command is in step 0's output:
+then:
 
 ```bash
-flyctl secrets set --app flotta-door \
-  FLOTTA_SIGNING_KEY='<the SAME key as Railway>' \
-  FLOTTA_CONTROL_URL='https://<your-app>.up.railway.app' \
-  FLOTTA_CONTROL_TOKEN='<the door token from step 0>' \
-  FLOTTA_DOMAIN='flotta.dev' \
-  FLOTTA_BOX_PASSWORD='<from step 3>'
+just door-secrets    # stages them; mints the door's token from the same key
+just door-deploy     # creates the app if needed, then deploys
 ```
+
+`door-secrets` mints the control-plane token rather than having you paste one,
+so it cannot drift from the key that has to verify it.
+
+> **Why secrets before deploy.** `flyctl secrets set` waits for the app to
+> become healthy — and the door **cannot** become healthy until it has a
+> signing key, because it refuses to run unauthenticated. Run it the other way
+> round and the command hangs on a deadlock it created, while the machine
+> crash-loops until Fly gives up ("exhausted its maximum restart attempts").
+>
+> Neither is broken when that happens: the guard is working and the machine is
+> waiting. `just door-secrets` uses `--stage`, which writes the secrets and
+> returns immediately.
+
+**Fly app names are globally unique across all of Fly**, not per-org, so
+`flotta-door` may well be taken. If the create fails on a name conflict, pick
+another and set `FLOTTA_DOOR_APP` in `.env`.
 
 Verify the door is up before touching DNS:
 
