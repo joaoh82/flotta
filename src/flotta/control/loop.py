@@ -76,6 +76,10 @@ class LoopState:
     last_sweep_at: float | None = None
     sweeps: int = 0
     reconciled: int = 0
+    #: Boxes suspended for being idle. Reported by `/health` because "is
+    #: anything actually going to sleep?" is the question behind the whole
+    #: cost argument, and it was unanswerable before.
+    slept: int = 0
     #: The last sweep's error, if it failed. Kept rather than only logged: a
     #: loop that raises every time still has a recent `last_sweep_at` if the
     #: timestamp were written unconditionally, so the error is the other half
@@ -120,6 +124,7 @@ class LoopState:
             "interval_s": self.interval_s,
             "sweeps": self.sweeps,
             "reconciled": self.reconciled,
+            "slept": self.slept,
             "seconds_since_last_sweep": age,
             "stale": self.is_stale(now),
             "failing": self.is_failing(),
@@ -133,6 +138,7 @@ async def run_reconcile_loop(
     *,
     store_factory: Callable[[], Any],
     reconcile: Callable[..., list[dict[str, Any]]] | None = None,
+    sleeper: Callable[..., list[dict[str, Any]]] | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep,
     max_sweeps: int | None = None,
 ) -> None:
@@ -149,15 +155,19 @@ async def run_reconcile_loop(
     reconciling forever because Fly had a bad minute. The error is recorded so
     `/health` can show it, rather than being swallowed.
     """
-    if reconcile is None:  # imported lazily: `provision` pulls in modal
+    if reconcile is None:
         from flotta.provision import reconcile as reconcile  # noqa: PLW0127
+    if sleeper is None:
+        from flotta.provision import sleep_idle_boxes
+
+        sleeper = sleep_idle_boxes
 
     state.started_at = state._clock()
     _log.info("reconcile loop started, interval=%.0fs", state.interval_s)
 
     while max_sweeps is None or state.sweeps < max_sweeps:
 
-        def sweep() -> list[dict[str, Any]]:
+        def sweep() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             # The store is opened *inside* the worker thread, not handed to it.
             # SQLite connections are bound to their creating thread, so opening
             # on the event loop and reconciling in `to_thread` fails every
@@ -166,14 +176,34 @@ async def run_reconcile_loop(
             # test, because the tests inject a fake store.
             store = store_factory()
             try:
-                return reconcile(store)
+                stranded = reconcile(store)
+                # Separate call, same sweep. Reconciling resolves rows that
+                # lie; sleeping spends money and can interrupt an agent
+                # mid-thought — different blast radius, so a failure in one
+                # must not skip the other, and each is readable on its own.
+                slept: list[dict[str, Any]] = []
+                if sleeper is not None:
+                    try:
+                        slept = sleeper(store)
+                    except Exception as exc:
+                        # Not fatal to the sweep. A fleet that stops
+                        # reconciling because a suspend failed is worse than
+                        # one paying for an extra half hour.
+                        _log.warning("idle sweep failed: %s: %s", type(exc).__name__, exc)
+                return stranded, slept
             finally:
                 store.close()
 
         try:
-            outcomes = await asyncio.to_thread(sweep)
+            outcomes, slept = await asyncio.to_thread(sweep)
             if outcomes:
                 _log.info("reconciled %d stranded task(s)", len(outcomes))
+            for entry in slept:
+                if entry.get("slept"):
+                    _log.info(
+                        "suspended %s after %.0fs idle", entry["box_id"], entry.get("idle_s", 0)
+                    )
+            state.slept += sum(1 for entry in slept if entry.get("slept"))
             state.reconciled += len(outcomes)
             state.last_error = None
             state.consecutive_failures = 0

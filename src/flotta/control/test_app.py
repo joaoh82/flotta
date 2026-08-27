@@ -629,3 +629,70 @@ def test_a_substrate_failure_waking_is_502(secured, monkeypatch):
 
     monkeypatch.setattr(provision, "wake_box", boom)
     assert secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 502
+
+
+# -- activity, for idle sleep -----------------------------------------------
+
+
+def _quieten(fleet, ago_s=3600):
+    """Backdate every event so the box reads as idle.
+
+    Needed because the fixture creates a box *now*: its `running` event is
+    seconds old, so a touch is correctly skipped as redundant. Testing the
+    activity path means testing it on a box that has actually gone quiet.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    store = FleetStore(fleet)
+    try:
+        old = (datetime.now(UTC) - timedelta(seconds=ago_s)).isoformat()
+        store._conn.execute("UPDATE events SET ts = ?", (old,))
+    finally:
+        store.close()
+
+
+def test_waking_records_activity(secured, fleet, monkeypatch):
+    """The signal idle sleep runs on.
+
+    It is an event rather than a `boxes.last_active_at` column because the
+    store has no migration machinery — a new column would break every existing
+    fleet — so this asserts the substitute is actually written.
+    """
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_BOX_CHAT
+    from flotta.provision import ADDRESSED_EVENT
+
+    monkeypatch.setattr(provision, "wake_box", lambda box_id, **kw: {"box_id": box_id})
+    _quieten(fleet)  # the box must actually be quiet, or the touch is redundant
+    secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT))
+
+    store = FleetStore(fleet)
+    try:
+        box = store.get_box_by_name("eng-a")
+        assert ADDRESSED_EVENT in [e.type for e in store.get_events("box", box.id)]
+    finally:
+        store.close()
+
+
+def test_activity_is_rate_limited(secured, fleet, monkeypatch):
+    """The event log is the fleet's history, not a request log.
+
+    One row per request would bury the transitions a human reads it for, and
+    on a busy box would grow without bound.
+    """
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_BOX_CHAT
+    from flotta.provision import ADDRESSED_EVENT
+
+    monkeypatch.setattr(provision, "wake_box", lambda box_id, **kw: {"box_id": box_id})
+    _quieten(fleet)
+    for _ in range(5):
+        secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT))
+
+    store = FleetStore(fleet)
+    try:
+        box = store.get_box_by_name("eng-a")
+        written = [e for e in store.get_events("box", box.id) if e.type == ADDRESSED_EVENT]
+        assert len(written) == 1, f"five requests wrote {len(written)} events"
+    finally:
+        store.close()

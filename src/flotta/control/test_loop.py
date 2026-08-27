@@ -279,3 +279,60 @@ def test_the_store_is_opened_inside_the_worker_thread():
     assert opened_in and used_in
     assert opened_in[0] == used_in[0], "the store must be opened where it is used"
     assert opened_in[0] != threading.get_ident(), "and not on the event loop thread"
+
+
+# -- idle sleep runs in the same sweep --------------------------------------
+
+
+def test_the_loop_sweeps_idle_boxes_too():
+    """Both sweeps, one tick."""
+    state = LoopState(interval_s=0)
+    slept = []
+
+    def fake_sleeper(store):
+        slept.append(store)
+        return [{"box_id": "b-1", "slept": True, "idle_s": 99}]
+
+    asyncio.run(
+        run_reconcile_loop(
+            state,
+            store_factory=FakeStore,
+            reconcile=lambda s: [],
+            sleeper=fake_sleeper,
+            sleep=lambda _: asyncio.sleep(0),
+            max_sweeps=1,
+        )
+    )
+    assert slept, "the idle sweep did not run"
+    assert state.slept == 1
+
+
+def test_a_failing_idle_sweep_does_not_stop_reconciling():
+    """Different blast radius, so a failure in one must not skip the other.
+
+    A fleet that stops resolving stranded tasks because a suspend failed is
+    worse than one paying for an extra half hour of CPU.
+    """
+    state = LoopState(interval_s=0)
+    reconciled = []
+
+    def boom(store):
+        raise RuntimeError("fly is having a moment")
+
+    def fake_reconcile(store):
+        reconciled.append(store)
+        return []
+
+    asyncio.run(
+        run_reconcile_loop(
+            state,
+            store_factory=FakeStore,
+            reconcile=fake_reconcile,
+            sleeper=boom,
+            sleep=lambda _: asyncio.sleep(0),
+            max_sweeps=1,
+        )
+    )
+    assert reconciled, "a failing idle sweep skipped reconciliation"
+    assert state.last_error is None, "an idle failure must not mark the loop unhealthy"
+    assert state.slept == 0

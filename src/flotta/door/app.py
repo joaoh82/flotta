@@ -91,6 +91,10 @@ DEFAULT_BOX_PORT = 9119
 #: How long to wait for `hermes serve` after the machine reports started.
 #: Matches `flotta.client`, which learned the number the hard way.
 DEFAULT_READY_TIMEOUT_S = 90.0
+#: How often to tell the control plane a live conversation is still live.
+#: Comfortably under the default 30-minute idle threshold: this only has to
+#: beat the sweep, and a chattier heartbeat would write more events for no gain.
+HEARTBEAT_S = 120.0
 
 
 class BoxUnavailable(Exception):
@@ -199,6 +203,21 @@ class ControlPlane:
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
+
+    async def touch(self, name: str) -> None:
+        """Tell the control plane this box is still in use. Best effort.
+
+        Waking is idempotent and the control plane rate-limits the event it
+        writes, so calling this on a timer is cheap. It exists because idle
+        sleep runs on the event log, and a *long conversation writes nothing*:
+        the WebSocket is open, the agent is thinking, and without a heartbeat
+        the sweep would read the box as quiet and suspend it mid-thought.
+
+        Failures are swallowed. Losing a heartbeat costs an unnecessary wake
+        later; raising here would drop a live conversation over bookkeeping.
+        """
+        with contextlib.suppress(Exception):
+            await self.wake(name)
 
     async def wake(self, name: str) -> Target:
         """Resolve `name` and ensure it is running. Returns where to proxy.
@@ -445,6 +464,21 @@ def create_door(
             return
 
         await websocket.accept()
+
+        async def keep_awake() -> None:
+            """Hold the box awake for as long as someone is talking to it.
+
+            The conversation itself is invisible to the fleet — the socket is
+            open and nothing is written — so without this the idle sweep would
+            suspend a box someone is mid-sentence with. The interval is well
+            under the idle threshold so a single missed beat is survivable.
+            """
+            while True:
+                await asyncio.sleep(HEARTBEAT_S)
+                await plane.touch(target.name)
+
+        heartbeat = asyncio.create_task(keep_awake())
+
         # Rebuilt from the filtered pairs rather than passed through: the raw
         # query carries `access_token`, and the box must not receive it.
         from urllib.parse import urlencode
@@ -490,6 +524,7 @@ def create_door(
         except Exception as exc:  # pragma: no cover - network faults
             _log.warning("ws proxy to %s failed: %s", target.name, exc)
         finally:
+            heartbeat.cancel()
             with contextlib.suppress(Exception):
                 await websocket.close()
 
