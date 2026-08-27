@@ -22,10 +22,17 @@ RUN uv sync --frozen --extra door --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-# `::` because Fly's private network is IPv6-only and an IPv4-only bind is
-# invisible to it — the same lesson the box image carries. Fly's own proxy
-# reaches the door over that network to serve the public TLS endpoint.
-ENV FLOTTA_DOOR_HOST="::"
+# 0.0.0.0, NOT `::` — and this is the opposite of the box image on purpose.
+#
+# Fly Proxy requires a routable service to listen on 0.0.0.0. A box binds `::`
+# because it is reached *from other machines* over 6PN, which is IPv6-only; the
+# door is reached *by the proxy*. Binding `::` here bound v6-only, so every
+# health check reported "connect: connection refused" while the door was
+# serving fine over IPv6 — the failure looked like a crash and was a bind.
+#
+# The door's outbound calls to boxes are over 6PN regardless; a socket's bind
+# address has nothing to do with what it can dial.
+ENV FLOTTA_DOOR_HOST="0.0.0.0"
 ENV FLOTTA_DOOR_PORT="8080"
 
 # Reports the door's own liveness and nothing about the fleet, so it is safe to
