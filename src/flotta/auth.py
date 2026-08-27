@@ -38,19 +38,30 @@ issuer and one verifier, and they are the same process. Asymmetric signing buys
 "verify without the power to mint", which matters when those are different
 parties — an M10 concern, not a today concern.
 
-## Scopes are flat, and `box:destroy` is its own
+## Scopes are flat, and the dangerous ones are their own
 
-Three, no wildcards, no hierarchy:
+Four, no wildcards, no hierarchy:
 
     fleet:read     list and inspect boxes, read their events
     fleet:write    create boxes
     box:destroy    tear a box down
+    box:chat       talk to the agent on a box — and wake it to do so
 
 `box:destroy` is separated from `fleet:write` on purpose. It is the verb that
 deletes an agent's entire memory, it is the reason the control plane refused to
 bind publicly at all, and a dashboard that only needs to *show* a fleet should
 not carry it. A hierarchy would have made `fleet:write` imply it, which is the
 mistake this shape exists to prevent.
+
+`box:chat` is separate from `fleet:read` for the same reason in the other
+direction: fleet state is *names and statuses*, a conversation is everything
+the agent has ever been told. A token that lists your fleet should not read
+your conversations.
+
+**Waking is folded into `box:chat` rather than given its own scope.** A box is
+asleep most of the time — that is the cost argument — so anything permitted to
+talk to one must be permitted to wake it, or the permission means nothing. A
+separate `box:wake` would be a scope nobody could sensibly withhold.
 """
 
 from __future__ import annotations
@@ -73,7 +84,10 @@ TOKEN_PREFIX = "flotta_"
 SCOPE_FLEET_READ = "fleet:read"
 SCOPE_FLEET_WRITE = "fleet:write"
 SCOPE_BOX_DESTROY = "box:destroy"
-SCOPES: frozenset[str] = frozenset({SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_DESTROY})
+SCOPE_BOX_CHAT = "box:chat"
+SCOPES: frozenset[str] = frozenset(
+    {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_DESTROY, SCOPE_BOX_CHAT}
+)
 
 #: A default that is short because revocation is coarse. Long-lived tokens are
 #: an explicit `--expires` away.

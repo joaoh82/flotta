@@ -38,6 +38,7 @@ from typing import Any
 
 from flotta import db
 from flotta.auth import (
+    SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_FLEET_READ,
     SCOPE_FLEET_WRITE,
@@ -208,6 +209,7 @@ def create_app(
     needs_read = Depends(require(SCOPE_FLEET_READ))
     needs_write = Depends(require(SCOPE_FLEET_WRITE))
     needs_destroy = Depends(require(SCOPE_BOX_DESTROY))
+    needs_chat = Depends(require(SCOPE_BOX_CHAT))
 
     @asynccontextmanager
     async def lifespan(app: Any):
@@ -365,6 +367,46 @@ def create_app(
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
             return {"events": [_event_dict(e) for e in store.get_box_timeline(box.id)]}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/wake")
+    def wake_box_endpoint(box_id: str, _: Token | None = needs_chat) -> Any:
+        """Ensure a box is up so it can be addressed. Idempotent.
+
+        Exists for the front door (M5b), which cannot reach the substrate
+        itself: a request for `<box>.flotta.dev` normally arrives while the box
+        is *asleep* — that is the cost argument, not an edge case — so
+        something has to start it, and D10 says that something must be code
+        that can reach the substrate. The door asks; the control plane acts.
+
+        **Guarded by `box:chat`, not a scope of its own.** A box is asleep most
+        of the time, so anything permitted to talk to one must be permitted to
+        wake it or the permission means nothing. A separate `box:wake` would be
+        a scope nobody could sensibly withhold.
+
+        `wake_box`, not `start_box`: the operator's verb refuses anything that
+        is not `stopped`, which is right when a human asks and wrong here — the
+        addressing path has to accept an already-running box, and reconcile a
+        row that disagrees with the substrate. Fly stops machines on its own
+        during a host drain.
+        """
+        from flotta.provision import ProvisionError, wake_box
+
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            try:
+                result = wake_box(box.id, store=store, reason="front-door")
+            except ProvisionError as exc:
+                # 409 for an illegal state (a torn-down box cannot be woken),
+                # 502 for the substrate failing to start it. The caller can act
+                # on the first and only retry the second.
+                status = 409 if "only a running or stopped box" in str(exc) else 502
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            return {"box": _box_dict(store.get_box(box.id)), **result}
         finally:
             store.close()
 

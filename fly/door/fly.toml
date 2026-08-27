@@ -1,0 +1,49 @@
+# The front door — one always-on machine terminating TLS for *.flotta.dev.
+#
+# Separate app from the boxes, and separate from the control plane. The door
+# must run on Fly to reach boxes over 6PN; the control plane must NOT be pinned
+# to Fly, because §8.3's self-host recipe deploys it to Railway. Two apps, two
+# deployment stories, on purpose.
+
+app = "flotta-door"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  FLOTTA_DOOR_HOST = "::"
+  FLOTTA_DOOR_PORT = "8080"
+  FLOTTA_DOMAIN = "flotta.dev"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # **The door does not sleep.** Everything else in Flotta is designed to,
+  # which is the cost argument — but the thing that wakes a sleeping box cannot
+  # itself be asleep, or the first request pays two cold starts and the second
+  # one has nobody to answer it.
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    # WebSockets are long-lived and mostly idle: an agent conversation holds a
+    # connection open for the length of a conversation while sending almost
+    # nothing. A request-count limit tuned for HTTP would refuse traffic the
+    # door is barely working to serve.
+    soft_limit = 200
+    hard_limit = 400
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/_door/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

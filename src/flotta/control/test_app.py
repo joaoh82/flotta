@@ -542,3 +542,90 @@ def test_health_is_not_behind_auth(secured):
     body = response.json()
     assert "reconcile_loop" in body
     assert "boxes" not in body
+
+
+# -- waking a box for the front door (M5b) ----------------------------------
+
+
+def test_wake_requires_box_chat_not_fleet_write(secured, monkeypatch):
+    """Waking is guarded by `box:chat`, not a scope of its own.
+
+    A box is asleep most of the time, so anything permitted to talk to one must
+    be permitted to wake it — a separate `box:wake` would be a scope nobody
+    could sensibly withhold. But a token that merely *creates* boxes has no
+    business starting someone else's.
+    """
+    from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_WRITE
+
+    denied = secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_FLEET_WRITE))
+    assert denied.status_code == 403
+    assert "box:chat" in denied.json()["detail"]
+
+    import flotta.provision as provision
+
+    monkeypatch.setattr(
+        provision, "wake_box", lambda box_id, **kw: {"box_id": box_id, "woken": True}
+    )
+    assert secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 200
+
+
+def test_wake_goes_through_wake_box_not_start_box(secured, monkeypatch):
+    """`start_box` is the operator's verb and refuses anything not `stopped`.
+
+    That is right when a human asks and wrong here: the addressing path has to
+    accept an already-running box, and reconcile a row that disagrees with the
+    substrate — Fly stops machines on its own during a host drain.
+    """
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    called = {}
+
+    def fake_wake(box_id, *, store, reason=None, **kw):
+        called["box_id"] = box_id
+        called["reason"] = reason
+        return {"box_id": box_id, "woken": True}
+
+    monkeypatch.setattr(provision, "wake_box", fake_wake)
+    monkeypatch.setattr(
+        provision, "start_box", lambda *a, **k: pytest.fail("the addressing path used start_box")
+    )
+
+    response = secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT))
+    assert response.status_code == 200
+    assert called["reason"] == "front-door"
+
+
+def test_waking_an_unknown_box_is_404(secured):
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    assert secured.post("/api/boxes/nope/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 404
+
+
+def test_waking_a_torn_down_box_is_409_not_502(secured, monkeypatch):
+    """An illegal state is the caller's problem; a failing substrate is not.
+
+    Answering 502 for both would tell the door to retry a box that can never
+    come back.
+    """
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    def refuse(box_id, **kw):
+        raise provision.ProvisionError(
+            f"box {box_id} is 'torn_down'; only a running or stopped box can be addressed"
+        )
+
+    monkeypatch.setattr(provision, "wake_box", refuse)
+    assert secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 409
+
+
+def test_a_substrate_failure_waking_is_502(secured, monkeypatch):
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    def boom(box_id, **kw):
+        raise provision.ProvisionError("start failed: BackendError: flyctl timed out")
+
+    monkeypatch.setattr(provision, "wake_box", boom)
+    assert secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 502

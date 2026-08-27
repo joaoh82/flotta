@@ -5,6 +5,46 @@
 # That file is the single place to look for machine-local config.
 set dotenv-load := true
 
+# Binds `::` and refuses to start without $FLOTTA_SIGNING_KEY — a front door has
+# no unauthenticated mode. Needs a running control plane ($FLOTTA_CONTROL_URL)
+# and its own token ($FLOTTA_CONTROL_TOKEN) with fleet:read + box:chat.
+# M5b front door — public access to a box, on http://127.0.0.1:8081
+door port="8081":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run flotta door --host 127.0.0.1 --port {{port}}
+
+# COSTS MONEY: creates/updates an always-on Fly machine. Build context is the
+# REPO ROOT, not fly/door — the image installs the package from pyproject/src.
+# M5b: deploy the front door to Fly (real, billed, always-on)
+door-deploy: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "This creates an always-on machine (~\$2-4/month). Ctrl-C to stop."
+    sleep 3
+    flyctl deploy --config fly/door/fly.toml --dockerfile fly/door/Dockerfile .
+
+# Prints the exact Cloudflare records to add. Run after `just door-deploy`,
+# because the AAAA target is the door app's address and does not exist before.
+# M5b: what to configure in Cloudflare for *.flotta.dev
+door-dns:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=flotta-door
+    DOMAIN="${FLOTTA_DOMAIN:-flotta.dev}"
+    echo "Records to add in Cloudflare for ${DOMAIN}:"
+    echo
+    echo "  1. AAAA   *.${DOMAIN}   ->   <the address below>   [DNS only / grey cloud]"
+    flyctl ips list --app "$APP" 2>/dev/null || echo "     (run `just door-deploy` first)"
+    echo
+    echo "  2. The ACME challenge CNAME, printed by:"
+    echo "       flyctl certs add '*.${DOMAIN}' --app $APP"
+    echo
+    echo "  Grey cloud to start. Cloudflare CAN proxy wildcards on any plan,"
+    echo "  but it closes idle WebSockets — move to orange only once the app"
+    echo "  sends a heartbeat, and use Full (Strict) when you do."
+
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key
