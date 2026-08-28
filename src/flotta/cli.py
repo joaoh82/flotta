@@ -77,6 +77,29 @@ app = typer.Typer(
 )
 
 
+@app.callback()
+def _load_local_config() -> None:
+    """Load `.env` before any command runs.
+
+    Every `just` recipe saw `.env` because the justfile sets `dotenv-load`; a
+    bare `flotta` command saw none of it. That gap was not merely inconvenient
+    — `flotta token mint` reported "no signing key ... Generate one with
+    `flotta token key`" while the key sat in `.env`, and following that advice
+    mints a **new** key, which invalidates every token already deployed. The
+    error led toward breaking a working deployment.
+
+    In a `callback` rather than at import: the test suite imports this module
+    to exercise the formatting layer, and loading a developer's `.env` at
+    import time would undo the hermeticity `conftest` exists to guarantee.
+    Commands are not run under test; importing is.
+
+    An already-set variable always wins — see `dotenv.load_dotenv`.
+    """
+    from flotta.dotenv import load_dotenv
+
+    load_dotenv()
+
+
 # -- formatting layer (pure — this is what the tests exercise) ---------------
 
 
