@@ -225,7 +225,8 @@ only** — model tokens are a separate bill Flotta never sees, and so is volume 
 
 ```bash
 flotta create <name>           # create a box — a persistent agent
-flotta chat <box>              # talk to the agent on a box
+flotta chat <box>              # talk to it, through the front door
+flotta chat <box> --tunnel     # ...or straight at the machine, if the door is broken
 flotta ps [--all] [--tasks]    # boxes in the fleet; --tasks lists the work
 flotta logs <box>              # that box's timeline, across both tiers
 flotta watch <id>              # re-attach to a task  (dormant until M6)
@@ -385,6 +386,24 @@ just door-dns            # the exact Cloudflare records to add
 
 **First contact with a sleeping agent takes 10–60s.** That is Hermes booting,
 not a hang — the door holds the connection rather than failing, and says so.
+
+### What a user needs
+
+`flotta chat eng-a` needs exactly two things:
+
+```bash
+FLOTTA_TOKEN=$(flotta token mint $USER --scope box:chat)
+FLOTTA_DOMAIN=flotta.dev
+```
+
+**No `flyctl`, no Fly account, no fleet database, and no copy of the box's
+password.** The door holds all of those. That is the difference between a tool
+the operator can run and a tool anyone can run — and it is why the door exists
+at all.
+
+`--tunnel` restores the old path, straight at the machine over Fly's private
+network. It needs all four of those things, and exists for the case where the
+door itself is what is broken.
 
 ### Boxes put themselves to sleep
 

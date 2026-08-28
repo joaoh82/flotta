@@ -6,6 +6,7 @@ reversed, and a test is a cheaper reminder than a code review.
 """
 
 import json
+import pathlib
 
 import pytest
 
@@ -339,3 +340,56 @@ def test_rpc_ids_do_not_collide_on_a_reused_socket():
     asyncio.run(send_turn(ws, "s1", "first"))
     asyncio.run(send_turn(ws, "s1", "second"))
     assert ws.sent[0]["id"] != ws.sent[1]["id"]
+
+
+# -- reaching a box through the door ----------------------------------------
+
+
+def test_the_door_url_is_the_box_under_the_domain(monkeypatch):
+    from flotta.client import door_url
+
+    monkeypatch.setenv("FLOTTA_DOMAIN", "flotta.dev")
+    assert door_url("eng-a") == "https://eng-a.flotta.dev"
+
+
+def test_the_domain_is_configurable(monkeypatch):
+    """Self-hosters do not own flotta.dev."""
+    from flotta.client import door_url
+
+    monkeypatch.delenv("FLOTTA_DOMAIN", raising=False)
+    assert door_url("eng-a", domain="boxes.example.org") == "https://eng-a.boxes.example.org"
+
+
+def test_a_trailing_dot_does_not_produce_a_double_dot(monkeypatch):
+    from flotta.client import door_url
+
+    monkeypatch.setenv("FLOTTA_DOMAIN", "flotta.dev.")
+    assert door_url("eng-a") == "https://eng-a.flotta.dev"
+
+
+def test_a_missing_token_says_how_to_mint_one(monkeypatch, tmp_path):
+    """`flotta chat` is the first command a stranger runs.
+
+    Its failure has to name the token and the scope, not leave someone reading
+    source to find out what `box:chat` is.
+    """
+    from flotta.client import ChatError, flotta_token
+
+    monkeypatch.chdir(tmp_path)  # no .env to fall back to
+    with pytest.raises(ChatError) as exc:
+        flotta_token({})
+    assert "box:chat" in str(exc.value)
+    assert "--tunnel" in str(exc.value), "the escape hatch should be discoverable"
+
+
+def test_the_client_still_holds_no_agent_logic():
+    """Unchanged from M3, and re-asserted because this PR touched the client.
+
+    If `flotta.client` ever imports an agent or a model client, the laptop has
+    started thinking again and the whole pivot has reversed.
+    """
+    import flotta.client as mod
+
+    source = pathlib.Path(mod.__file__).read_text(encoding="utf-8")
+    for banned in ("import openai", "from openai", "import anthropic", "AIAgent"):
+        assert banned not in source, f"the client imports {banned!r}"

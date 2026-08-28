@@ -9,6 +9,8 @@ someone's agent.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_READ, mint
@@ -444,3 +446,112 @@ def test_the_box_never_sees_a_flotta_token_in_the_query(stub_box):
     assert "keep=me" in path, "a caller's own parameters must still be forwarded"
     assert "access_token" not in path, "the door's token reached the box"
     assert raw not in path
+
+
+# -- the login rewrite ------------------------------------------------------
+#
+# The correction that made `flotta chat` through the door possible. The door
+# originally attached `Authorization: Basic`, on the assumption that Hermes's
+# "basic" auth provider meant HTTP Basic. It does not — it is a *login form*
+# that exchanges a JSON body for session cookies, so the header was inert and
+# the client still needed the box's password.
+
+
+def test_the_login_body_gets_the_real_credentials():
+    from flotta.door.app import rewrite_login
+
+    sent = json.dumps({"provider": "basic", "username": "", "password": "", "next": ""}).encode()
+    rewritten = json.loads(rewrite_login(sent, "flotta", "the-real-password"))
+
+    assert rewritten["username"] == "flotta"
+    assert rewritten["password"] == "the-real-password"
+    assert rewritten["next"] == "", "the caller's own fields must survive"
+
+
+def test_a_client_supplied_password_is_replaced_not_merged():
+    """A caller cannot smuggle its own credentials past the door.
+
+    If the client's value won, anyone with a `box:chat` token could try
+    passwords against the box through the door — turning a scoped grant into
+    an oracle.
+    """
+    from flotta.door.app import rewrite_login
+
+    sent = json.dumps({"provider": "basic", "username": "root", "password": "guess"}).encode()
+    rewritten = json.loads(rewrite_login(sent, "flotta", "real"))
+
+    assert rewritten["username"] == "flotta"
+    assert rewritten["password"] == "real"
+
+
+@pytest.mark.parametrize("body", [b"", b"not json", b"[1,2,3]", b"null"])
+def test_a_body_the_door_cannot_parse_is_passed_through(body):
+    """This is a proxy. Hermes is entitled to answer its own 400.
+
+    Guessing at what a caller meant is how a proxy starts having opinions about
+    a protocol it does not own.
+    """
+    from flotta.door.app import rewrite_login
+
+    assert rewrite_login(body, "flotta", "real") == body
+
+
+def test_the_box_receives_the_real_password_and_the_client_never_sends_one(stub_box_login):
+    """End to end, asserted at the box.
+
+    The client posts a login with an empty password; the box must receive the
+    real one. That is what lets `FLOTTA_BOX_PASSWORD` stop existing on a user's
+    machine.
+    """
+    from fastapi.testclient import TestClient
+
+    port, seen = stub_box_login
+    app, _ = _door_for(port, box_credentials=("flotta", "the-real-password"))
+
+    with TestClient(app) as client:
+        client.post(
+            "/auth/password-login",
+            headers={"Host": "eng-a.flotta.dev", "Authorization": _bearer(SCOPE_BOX_CHAT)},
+            json={"provider": "basic", "username": "", "password": "", "next": ""},
+        )
+
+    body = json.loads(seen[-1]["body"])
+    assert body["password"] == "the-real-password"
+    assert body["username"] == "flotta"
+
+
+@pytest.fixture
+def stub_box_login():
+    """A stub box that records POST bodies, for the login rewrite."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            seen.append({"path": self.path, "body": self.rfile.read(length).decode()})
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
