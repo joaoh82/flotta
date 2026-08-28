@@ -239,7 +239,10 @@ dashboard:
     #!/usr/bin/env bash
     set -euo pipefail
     cd dashboard
-    [ -d node_modules ] || npm install
+    # `npm ci` for the same reason as check-dashboard: install rewrites the
+    # lockfile for the local platform, and a dev server should not be able to
+    # change what CI installs.
+    [ -d node_modules ] || npm ci
     npm run dev
 
 # type-check + lint the dashboard (the Python `check` recipe does not cover it)
@@ -247,7 +250,15 @@ check-dashboard:
     #!/usr/bin/env bash
     set -euo pipefail
     cd dashboard
-    [ -d node_modules ] || npm install
+    # `npm ci`, not `npm install`. install *rewrites* package-lock.json for the
+    # local platform — pruning the Linux optional deps a CI runner needs — so a
+    # fresh worktree would silently produce a lockfile that fails `npm ci` on
+    # Linux. That happened three times before anyone noticed, because the churn
+    # looks like unrelated noise in a diff and the local check still passes.
+    #
+    # ci installs exactly what the lock says and refuses if it disagrees with
+    # package.json, which is the behaviour a check wants.
+    [ -d node_modules ] || npm ci
     npx tsc --noEmit
     npx eslint .
 
