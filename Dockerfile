@@ -1,8 +1,8 @@
 # The control plane — §8.1's "boring block".
 #
-# Deliberately unremarkable: ~256MB, a public HTTPS endpoint, no volumes, no
-# machines API, nothing that needs a particular provider. That is the whole
-# point of §8.2's split — the interesting requirements live below the `Backend`
+# Deliberately unremarkable: ~345MB (flyctl is 55MB of it), a public HTTPS
+# endpoint, no volumes, nothing that needs a particular provider. That is the
+# whole point of §8.2's split — the interesting requirements live below the `Backend`
 # line, and keeping this block boring is what makes the Railway recipe (M5.5)
 # possible at all.
 #
@@ -26,16 +26,43 @@ COPY src/ ./src/
 # fleet state on a server is the whole reason this process exists.
 RUN pip install --no-cache-dir ".[server]"
 
+# flyctl, because the control plane is the code that reaches the substrate.
+#
+# This image shipped without it and the gap only appeared on a real
+# deployment: D10 says fleet state is written **only** by code that can reach
+# the substrate, and every write endpoint here does exactly that —
+# `POST /api/boxes` creates a machine, `DELETE` destroys one, and
+# `POST /api/boxes/{id}/wake` starts one. Without flyctl the deployed control
+# plane could serve reads and nothing else, and the front door depends on that
+# wake: a request for a sleeping box is the *normal* case, not an edge one.
+#
+# The idle sweep needs it too. `sleep_idle_boxes` suspends through the backend,
+# and its failures are caught and logged rather than raised — so without this
+# the fleet would simply never sleep, quietly, while the loop reported healthy.
+#
+# Authenticate with $FLY_API_TOKEN (`flyctl tokens create org`). flyctl reads
+# it directly; there is no interactive login in a container.
+# Pinned, not latest. `FlyBackend` treats flyctl's JSON as an unstable
+# contract on purpose — `_app_exists` and `_machines` fail *closed* on a parse
+# miss, so a shape change would have this try to create an app that already
+# exists. `flyctl version` at the end turns a bad or misplaced install into a
+# failed build rather than another read-only control plane.
+ARG FLYCTL_VERSION=v0.4.94
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh -s -- "$FLYCTL_VERSION" \
+    && flyctl version \
+    && apt-get purge -y curl && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # Fleet state comes from the environment, never baked in. §8.3 is specific that
 # the Railway template must wire DATABASE_URL *by reference* rather than
 # copy-pasting it, because a hardcoded value breaks on first redeploy.
 ENV FLOTTA_DATABASE_URL=""
 
 # 0.0.0.0 because a container's loopback is reachable by nothing. The bind
-# guard refuses this unless FLOTTA_CONTROL_ALLOW_INSECURE_BIND is set, which is
-# the correct friction until M5 adds tokens: a platform that terminates TLS and
-# authenticates in front of this (Railway, Fly) is the operator asserting they
-# own the perimeter.
+# guard refuses this without a signing key, which is the point: an
+# unauthenticated fleet API is a kill switch for every agent in it.
 ENV FLOTTA_CONTROL_HOST=0.0.0.0
 # Unset by default so $PORT can win; the CMD falls back to 8080 when neither
 # is set. Setting it here would shadow the platform's own variable.
