@@ -529,3 +529,46 @@ def test_a_postgres_fleet_is_never_announced_as_a_created_file(monkeypatch, tmp_
     # there is no file to have created.
     assert not (tmp_path / "fleet.db").exists()
     assert "fleet.db" not in cli_module.describe_store(target)
+
+
+# -- the CLI reads .env -----------------------------------------------------
+
+
+def test_dotenv_loads_without_overriding_an_explicit_variable(tmp_path, monkeypatch):
+    """`just` saw `.env`; a bare `flotta` command did not.
+
+    Worse than inconvenient: `flotta token mint` reported "no signing key ...
+    generate one" while the key sat in `.env`, and generating a new one
+    invalidates every token already deployed.
+
+    An already-set variable wins, matching `just`'s precedence — otherwise
+    `FLOTTA_STORE=x flotta ps` would not mean what it says.
+    """
+    from flotta.dotenv import load_dotenv
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FLOTTA_SIGNING_KEY=from-the-file\nFLOTTA_STORE=file.db\n", encoding="utf-8"
+    )
+    env = {"FLOTTA_STORE": "explicit.db"}
+
+    loaded = load_dotenv(env_file, env)
+
+    assert env["FLOTTA_STORE"] == "explicit.db", "the file overrode an explicit value"
+    assert env["FLOTTA_SIGNING_KEY"] == "from-the-file"
+    assert loaded == ["FLOTTA_SIGNING_KEY"]
+
+
+def test_a_missing_dotenv_is_not_an_error(tmp_path):
+    """CI has no `.env`, and neither does a fresh clone."""
+    from flotta.dotenv import load_dotenv
+
+    assert load_dotenv(tmp_path / "absent.env", {}) == []
+
+
+def test_dotenv_survives_a_malformed_line(tmp_path):
+    """A stray character should not stop a command that does not need it."""
+    from flotta.dotenv import parse_dotenv
+
+    parsed = parse_dotenv("garbage\n=novalue\nexport FLOTTA_A=1\nFLOTTA_B='two' # note\n")
+    assert parsed == {"FLOTTA_A": "1", "FLOTTA_B": "two"}

@@ -125,16 +125,44 @@ def resolve_signing_key(env: dict[str, str] | None = None) -> str | None:
     return (env.get(SIGNING_KEY_ENV) or "").strip() or None
 
 
-def _require_key(key: str | None, env: dict[str, str] | None = None) -> str:
+def _require_key(
+    key: str | None,
+    env: dict[str, str] | None = None,
+    dotenv_path: str | None = None,
+) -> str:
+    """Resolve the signing key, or raise with advice that fits the situation.
+
+    `dotenv_path` is a parameter rather than a constant so a test can say which
+    file it means. Reading the real `.env` unconditionally would make this
+    behave differently on a developer's machine than in CI — the exact bug the
+    `conftest` hermeticity fixture exists to prevent, reintroduced one layer
+    down where that fixture cannot see it.
+    """
     resolved = key if key is not None else resolve_signing_key(env)
-    if not resolved:
+    if resolved:
+        return resolved
+
+    # If a key exists in `.env` but is not in the environment, say *that*.
+    # The previous message said "generate one" unconditionally, and generating
+    # a new key invalidates every token already deployed — so the advice could
+    # break a working fleet while appearing to fix a missing one. Never suggest
+    # minting a key over the top of one that exists.
+    from flotta.dotenv import DEFAULT_DOTENV, read_dotenv_value
+
+    if read_dotenv_value(SIGNING_KEY_ENV, dotenv_path or DEFAULT_DOTENV):
         raise NoSigningKey(
-            f"no signing key: set ${SIGNING_KEY_ENV}. Generate one with "
-            f"`flotta token key` and put it in .env — the same value must be "
-            f"set wherever the control plane runs, or tokens minted here will "
-            f"not verify there."
+            f"${SIGNING_KEY_ENV} is in .env but not in this process's "
+            f"environment. Run the command through `just`, or export it with "
+            f"`set -a; source .env; set +a`.\n"
+            f"Do NOT generate a new key — it would invalidate every token "
+            f"already issued from this one."
         )
-    return resolved
+    raise NoSigningKey(
+        f"no signing key: set ${SIGNING_KEY_ENV}. Generate one with "
+        f"`flotta token key` and put it in .env — the same value must be "
+        f"set wherever the control plane runs, or tokens minted here will "
+        f"not verify there."
+    )
 
 
 def _b64(raw: bytes) -> str:

@@ -251,25 +251,11 @@ def _clean(value: str | None) -> str | None:
 def read_dotenv_value(key: str, path: str | Path = DEFAULT_DOTENV) -> str | None:
     """Read one key from a dotenv file, or None if absent/unreadable.
 
-    Duplicated from `cli.read_dotenv_value` rather than imported: `cli` pulls in
-    typer and (transitively, via `_provision`) modal, and this module is read by
-    the Fly scripts, which must not need either.
+    Delegates to `flotta.dotenv`, which imports nothing but the standard
+    library. This used to be a copy, carrying a comment explaining that `cli`
+    pulls in typer and the Fly scripts must not need it — a good reason to
+    duplicate, and a better reason to extract.
     """
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return None
+    from flotta.dotenv import read_dotenv_value as _read
 
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, _, value = line.partition("=")
-        name = name.removeprefix("export ").strip()
-        if name != key:
-            continue
-        value = value.strip().split(" #", 1)[0].strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        return value or None
-    return None
+    return _read(key, path)

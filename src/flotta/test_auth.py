@@ -141,9 +141,34 @@ def test_a_non_positive_ttl_is_refused():
         mint(subject="s", scopes={SCOPE_FLEET_READ}, key=KEY, ttl_s=0)
 
 
-def test_no_signing_key_says_how_to_make_one():
+def test_no_signing_key_says_how_to_make_one(tmp_path):
+    """No key anywhere: minting one is the right advice."""
+    from flotta.auth import _require_key
+
     with pytest.raises(NoSigningKey, match="flotta token key"):
-        mint(subject="s", scopes={SCOPE_FLEET_READ}, env={})
+        _require_key(None, env={}, dotenv_path=str(tmp_path / "absent.env"))
+
+
+def test_a_key_in_dotenv_is_never_answered_with_generate_a_new_one(tmp_path):
+    """The dangerous case, and the reason this branch exists.
+
+    The old message said "generate one" unconditionally. Generating a new key
+    invalidates every token already issued from the old one — so following the
+    advice would break a working fleet while appearing to fix a missing key.
+    Hit for real: `flotta token mint` said this while the key sat in `.env`,
+    because the CLI did not read `.env` at all.
+    """
+    from flotta.auth import _require_key
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("FLOTTA_SIGNING_KEY=a-real-key\n", encoding="utf-8")
+
+    with pytest.raises(NoSigningKey) as exc:
+        _require_key(None, env={}, dotenv_path=str(env_file))
+
+    assert "in .env but not in this process" in str(exc.value)
+    assert "Do NOT generate a new key" in str(exc.value)
+    assert "flotta token key" not in str(exc.value), "still suggests the dangerous fix"
 
 
 # -- the scope set itself ---------------------------------------------------
