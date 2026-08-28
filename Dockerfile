@@ -1,8 +1,8 @@
 # The control plane — §8.1's "boring block".
 #
-# Deliberately unremarkable: ~256MB, a public HTTPS endpoint, no volumes, no
-# machines API, nothing that needs a particular provider. That is the whole
-# point of §8.2's split — the interesting requirements live below the `Backend`
+# Deliberately unremarkable: ~345MB (flyctl is 55MB of it), a public HTTPS
+# endpoint, no volumes, nothing that needs a particular provider. That is the
+# whole point of §8.2's split — the interesting requirements live below the `Backend`
 # line, and keeping this block boring is what makes the Railway recipe (M5.5)
 # possible at all.
 #
@@ -42,9 +42,16 @@ RUN pip install --no-cache-dir ".[server]"
 #
 # Authenticate with $FLY_API_TOKEN (`flyctl tokens create org`). flyctl reads
 # it directly; there is no interactive login in a container.
+# Pinned, not latest. `FlyBackend` treats flyctl's JSON as an unstable
+# contract on purpose — `_app_exists` and `_machines` fail *closed* on a parse
+# miss, so a shape change would have this try to create an app that already
+# exists. `flyctl version` at the end turns a bad or misplaced install into a
+# failed build rather than another read-only control plane.
+ARG FLYCTL_VERSION=v0.4.94
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh \
+    && curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh -s -- "$FLYCTL_VERSION" \
+    && flyctl version \
     && apt-get purge -y curl && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
