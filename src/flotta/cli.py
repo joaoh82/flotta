@@ -396,6 +396,12 @@ JsonOpt = typer.Option(False, "--json", help="Emit JSON instead of a table")
 # Module-level for the same reason as the two above: a `typer.Option(...)` call
 # sitting in an argument default is evaluated at import, which the linter flags
 # and which this file already avoids by naming them here.
+TunnelOpt = typer.Option(
+    False,
+    "--tunnel",
+    help="Bypass the front door and reach the box over Fly's private network "
+    "(needs flyctl and org membership; for debugging a broken door)",
+)
 ScopeOpt = typer.Option(
     None, "--scope", "-s", help="Repeatable. fleet:read | fleet:write | box:destroy"
 )
@@ -458,6 +464,68 @@ def ps(
             )
 
 
+async def _chat_via_door(
+    chat_client: Any,
+    box_name: str,
+    message: str | None,
+    *,
+    timeout_s: float,
+    quiet: bool,
+) -> dict[str, Any]:
+    """Talk to a box through the front door.
+
+    Needs a hostname and a `box:chat` token. Not the fleet store, not Fly
+    credentials, not the box's password — the door holds all three, which is
+    what makes this runnable by someone who is not the operator.
+    """
+    base_url = chat_client.door_url(box_name)
+    token = chat_client.flotta_token()
+
+    if not quiet:
+        # A cold box is 10-60s while Hermes imports itself. The door holds the
+        # connection rather than failing, so without a word this reads as a hang.
+        typer.secho(
+            f"{base_url} — waking takes 10-60s if the agent is asleep",
+            fg=typer.colors.BRIGHT_BLACK,
+            err=True,
+        )
+
+    session = chat_client.new_session()
+    try:
+        await chat_client.login(session, base_url, token=token)
+        ticket = await chat_client.ws_ticket(session, base_url, token=token)
+        socket = await chat_client.open_agent_socket(session, base_url, ticket, token=token)
+        try:
+            await chat_client.await_ready(socket)
+            result: dict[str, Any] = {
+                "name": box_name,
+                "url": base_url,
+                "via": "door",
+                "authenticated": True,
+                "agent_socket": "open",
+            }
+            if message is None:
+                return result
+
+            created = await chat_client.create_session(socket)
+            session_id = created.get("session_id") or ""
+            if not session_id:
+                raise chat_client.ChatError(
+                    f"the box opened no session: {created or '(empty result)'}"
+                )
+            turn = await chat_client.send_turn(socket, session_id, message, timeout_s=timeout_s)
+            return {
+                **result,
+                "session_id": turn.session_id,
+                "model": (created.get("info") or {}).get("model"),
+                "response": turn.response,
+            }
+        finally:
+            await socket.close()
+    finally:
+        await session.close()
+
+
 @app.command()
 def chat(
     box_id: str = typer.Argument(..., help="Box id or name"),
@@ -465,17 +533,50 @@ def chat(
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
     timeout_s: float = typer.Option(300.0, "--timeout-s", help="How long to wait for a reply"),
+    tunnel: bool = TunnelOpt,
 ) -> None:
     """Open an authenticated connection to a box's agent.
 
-    The inversion, as a command: this does **not** run an agent. It tunnels to
-    the box over Fly's private network, authenticates against the Hermes
-    running there, and opens its agent socket. All the thinking happens on the
-    box, where the memory is.
+    The inversion, as a command: this does **not** run an agent. It connects to
+    the Hermes running on the box and opens its agent socket. All the thinking
+    happens on the box, where the memory is.
+
+    **Goes through the front door** at `https://<box>.$FLOTTA_DOMAIN`, which
+    needs only a `box:chat` token — no `flyctl`, no WireGuard, no membership of
+    the Fly org that hosts the box, and no copy of the box's password. That is
+    the difference between a tool you can run and a tool anyone can run.
+
+    `--tunnel` restores the old path, `flyctl proxy` over Fly's private
+    network. Kept for the case the door itself is the thing that is broken:
+    debugging a box whose DNS, certificate or door deployment is wrong is
+    exactly when you do not want to depend on them.
     """
     import asyncio
 
     from . import client as chat_client
+
+    if not tunnel:
+        # **No store, no Fly credentials, no box password.** The door resolves
+        # the name and wakes the machine, so the only things needed here are a
+        # hostname and a scoped token. Requiring a local fleet database would
+        # mean shipping a copy of the fleet to every user — which is exactly
+        # the "you must be the operator" problem the door removes.
+        try:
+            result = asyncio.run(
+                _chat_via_door(chat_client, box_id, message, timeout_s=timeout_s, quiet=as_json)
+            )
+        except chat_client.ChatError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        if message is None:
+            emit(
+                result,
+                f"{result['name']}\n  {result['url']}\n  authenticated, agent socket open",
+                as_json=as_json,
+            )
+            return
+        emit(result, result["response"], as_json=as_json)
+        return
 
     with _open_store(store) as fleet:
         box = _require_box(fleet, box_id)
@@ -487,67 +588,103 @@ def chat(
             )
             raise typer.Exit(code=1)
 
-        # Wake it first. A box is meant to be asleep most of the time, and Fly's
-        # internal DNS only resolves *running* machines — so without this the
-        # tunnel fails with a bare "host was not found in DNS", which reads as a
-        # broken address rather than a sleeping agent.
-        provision = _provision()
-        try:
-            woken = provision.wake_box(box.id, store=fleet)
-        except provision.ProvisionError as exc:
-            typer.secho(str(exc), fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1) from exc
-        if woken["was_asleep"] and not as_json:
-            typer.secho(f"woke {box.name} (it was asleep)", fg=typer.colors.BRIGHT_BLACK, err=True)
+        # Waking is the *door's* job, and deliberately not done here. A box is
+        # asleep most of the time and Fly's DNS resolves only running machines,
+        # so something must start it — but if this command did, it would need
+        # Fly credentials, which is precisely what the door exists to remove.
+        #
+        # The tunnel path still wakes, because it addresses the machine
+        # directly and there is nothing else in the path to do it.
+        was_asleep: bool | None = None
+        if tunnel:
+            provision = _provision()
+            try:
+                woken = provision.wake_box(box.id, store=fleet)
+            except provision.ProvisionError as exc:
+                typer.secho(str(exc), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1) from exc
+            was_asleep = woken["was_asleep"]
+            if was_asleep and not as_json:
+                typer.secho(
+                    f"woke {box.name} (it was asleep)", fg=typer.colors.BRIGHT_BLACK, err=True
+                )
+        elif not as_json:
+            # The door wakes on demand, and a cold box takes 10-60s while
+            # Hermes imports itself. Say so, or the wait reads as a hang.
+            typer.secho(
+                f"connecting to {box.name} — waking it takes 10-60s if it is asleep",
+                fg=typer.colors.BRIGHT_BLACK,
+                err=True,
+            )
+
+        async def _converse(base_url: str, token: str | None) -> dict:
+            """Everything after "we can reach the box", door or tunnel alike."""
+            if token is None:
+                # Tunnel: nothing in the path can supply credentials, so the
+                # caller must hold them.
+                username, password = chat_client.credentials()
+            else:
+                username = password = None
+            session = chat_client.new_session()
+            try:
+                await chat_client.login(session, base_url, username, password, token=token)
+                ticket = await chat_client.ws_ticket(session, base_url, token=token)
+                socket = await chat_client.open_agent_socket(session, base_url, ticket, token=token)
+                try:
+                    await chat_client.await_ready(socket)
+                    result = {
+                        "box_id": box.id,
+                        "name": box.name,
+                        "endpoint": box.endpoint,
+                        "via": "tunnel" if token is None else "door",
+                        "authenticated": True,
+                        "agent_socket": "open",
+                        "was_asleep": was_asleep,
+                    }
+                    if message is None:
+                        # No message: prove the round trip and stop. Useful as
+                        # a health check, and the behaviour before the turn
+                        # protocol was decoded.
+                        return result
+
+                    created = await chat_client.create_session(socket)
+                    session_id = created.get("session_id") or ""
+                    if not session_id:
+                        # Fail closed. Sending a turn with an empty session id
+                        # is rejected by the gateway as a JSON-RPC error, which
+                        # used to mean waiting out the whole turn deadline for
+                        # a refusal that arrived immediately.
+                        raise chat_client.ChatError(
+                            f"the box opened no session: {created or '(empty result)'}"
+                        )
+                    turn = await chat_client.send_turn(
+                        socket, session_id, message, timeout_s=timeout_s
+                    )
+                    return {
+                        **result,
+                        "session_id": turn.session_id,
+                        "model": (created.get("info") or {}).get("model"),
+                        "response": turn.response,
+                    }
+                finally:
+                    await socket.close()
+            finally:
+                await session.close()
 
         async def run() -> dict:
-            with chat_client.tunnel(box.endpoint) as base_url:
-                chat_client.wait_until_ready(base_url)
-                username, password = chat_client.credentials()
-                session = chat_client.new_session()
-                try:
-                    await chat_client.login(session, base_url, username, password)
-                    ticket = await chat_client.ws_ticket(session, base_url)
-                    socket = await chat_client.open_agent_socket(session, base_url, ticket)
-                    try:
-                        await chat_client.await_ready(socket)
-                        result = {
-                            "box_id": box.id,
-                            "name": box.name,
-                            "endpoint": box.endpoint,
-                            "authenticated": True,
-                            "agent_socket": "open",
-                            "was_asleep": woken["was_asleep"],
-                        }
-                        if message is None:
-                            # No message: prove the round trip and stop. Useful
-                            # as a health check, and the behaviour before the
-                            # turn protocol was decoded.
-                            return result
+            if tunnel:
+                # The escape hatch: straight at the machine over Fly's private
+                # network, bypassing the door entirely. For debugging a box
+                # whose DNS, certificate or door deployment is the problem.
+                with chat_client.tunnel(box.endpoint) as base_url:
+                    chat_client.wait_until_ready(base_url)
+                    return await _converse(base_url, None)
 
-                        created = await chat_client.create_session(socket)
-                        session_id = created.get("session_id") or ""
-                        if not session_id:
-                            # Fail closed. Sending a turn with an empty session
-                            # id is rejected by the gateway as a JSON-RPC error,
-                            # which used to mean waiting out the whole turn
-                            # deadline for a refusal that arrived immediately.
-                            raise chat_client.ChatError(
-                                f"the box opened no session: {created or '(empty result)'}"
-                            )
-                        turn = await chat_client.send_turn(
-                            socket, session_id, message, timeout_s=timeout_s
-                        )
-                        return {
-                            **result,
-                            "session_id": turn.session_id,
-                            "model": (created.get("info") or {}).get("model"),
-                            "response": turn.response,
-                        }
-                    finally:
-                        await socket.close()
-                finally:
-                    await session.close()
+            # The door waits for Hermes itself before proxying, so there is no
+            # `wait_until_ready` here — the client would be waiting twice, and
+            # the second wait would be against a URL the door has already
+            # proven answers.
+            return await _converse(chat_client.door_url(box.name), chat_client.flotta_token())
 
         try:
             result = asyncio.run(run())

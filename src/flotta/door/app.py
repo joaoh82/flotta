@@ -31,7 +31,7 @@ It therefore holds a Flotta token of its own, with `fleet:read` and `box:chat`.
 
 ## Auth composes rather than stacks
 
-A caller presents a **Flotta token**; the door validates it and then attaches
+A caller presents a **Flotta token**; the door validates it and then supplies
 the **box's own Hermes credentials** on the way out. Two consequences, both
 deliberate:
 
@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -412,8 +413,22 @@ def create_door(
             if k.lower() not in _HOP_BY_HOP and k.lower() not in ("host", "authorization")
         }
         forwarded["host"] = authority(target.host, target.port)
+
+        body = await request.body()
         if creds:
+            # Two mechanisms, because Hermes only honours one of them and it is
+            # not the obvious one. Its "basic" provider is a *login form* that
+            # exchanges a JSON body for session cookies, so the header below is
+            # inert — kept because a future provider (or another agent runtime
+            # behind the same door) may want it, and it costs nothing.
+            #
+            # The rewrite is what actually authenticates: the client posts the
+            # shape Hermes expects with no password it could know, and the door
+            # fills in the real one here.
             forwarded["authorization"] = _basic(*creds)
+            if request.method == "POST" and f"/{path}" == LOGIN_PATH:
+                body = rewrite_login(body, *creds)
+                forwarded.pop("content-length", None)
 
         url = f"http://{authority(target.host, target.port)}/{path}"
         try:
@@ -423,7 +438,7 @@ def create_door(
                     url,
                     params=strip_door_params(request.query_params),
                     headers=forwarded,
-                    content=await request.body(),
+                    content=body,
                 )
         except Exception as exc:
             return JSONResponse(
@@ -572,6 +587,45 @@ def strip_door_params(query: Any) -> list[tuple[str, str]]:
     collapsed — the box's own protocol may care.
     """
     return [(k, v) for k, v in query.multi_items() if k.lower() not in _DOOR_QUERY_PARAMS]
+
+
+#: Hermes's login endpoint. The door fills the credentials in here rather than
+#: sending an `Authorization` header, because Hermes's "basic" provider is a
+#: **login form**, not HTTP Basic: it exchanges a JSON body for session
+#: cookies. An `Authorization: Basic` header — which is what this door sent at
+#: first — is simply ignored by it.
+LOGIN_PATH = "/auth/password-login"
+
+
+def rewrite_login(body: bytes, username: str, password: str) -> bytes:
+    """Put the box's real credentials into a login request. Best effort.
+
+    The client sends the shape Hermes expects but with no password it could
+    know; the door substitutes the real one on the way through. So the
+    credential lives only on the server side, and the **session cookies Hermes
+    returns belong to the client** — no session state here, nothing to expire
+    or replicate, and a door restart does not log anyone out.
+
+    Malformed input is passed through untouched rather than rejected: this is a
+    proxy, and Hermes is entitled to answer its own 400 for a body it does not
+    like. Guessing at what a caller meant is how a proxy starts having opinions.
+    """
+    if not body:
+        # An empty body is not a login the door should complete. `or b"{}"`
+        # here would have turned "the client sent nothing" into a *successful*
+        # authentication, which is a surprising thing for a proxy to do on
+        # someone's behalf.
+        return body
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+    payload["username"] = username
+    payload["password"] = password
+    payload.setdefault("provider", "basic")
+    return json.dumps(payload).encode()
 
 
 def _basic(username: str, password: str) -> str:

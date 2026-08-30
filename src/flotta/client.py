@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import itertools
 import json
+import os
 import socket
 import subprocess
 import time
@@ -218,7 +219,53 @@ def health(endpoint: str, *, timeout_s: float = DEFAULT_READY_TIMEOUT_S) -> dict
 # single-use with a short TTL, so mint one per connection rather than caching.
 
 PROVIDER = "basic"
+#: The caller's Flotta token, used against the door. Distinct from the control
+#: plane's own token: this one only needs `box:chat`.
+TOKEN_ENV = "FLOTTA_TOKEN"
 USERNAME = "flotta"
+
+
+DOMAIN_ENV = "FLOTTA_DOMAIN"
+DEFAULT_DOMAIN = "flotta.dev"
+
+
+def door_url(box_name: str, *, domain: str | None = None) -> str:
+    """`https://<box>.<domain>` — the public address of a box.
+
+    The whole point of the front door: reaching an agent stops requiring
+    `flyctl`, a WireGuard tunnel, and membership of the Fly org that happens to
+    host it. A stranger with a scoped token and a hostname can talk to an
+    agent, which is what makes the app (M8) shippable to anyone.
+    """
+    from flotta.dotenv import read_dotenv_value
+
+    resolved = (
+        (domain or os.environ.get(DOMAIN_ENV) or read_dotenv_value(DOMAIN_ENV) or DEFAULT_DOMAIN)
+        .strip()
+        .strip(".")
+    )
+    return f"https://{box_name}.{resolved}"
+
+
+def flotta_token(env: dict[str, str] | None = None) -> str:
+    """The caller's own Flotta token, for the door.
+
+    Minted with `flotta token mint <you> --scope box:chat`. This replaces the
+    box's password on a user's machine: the door holds that, and this holds
+    only a scoped, expiring grant to talk to an agent.
+    """
+    from flotta.dotenv import read_dotenv_value
+
+    env = os.environ if env is None else env
+    token = (env.get(TOKEN_ENV) or "").strip() or read_dotenv_value(TOKEN_ENV)
+    if not token:
+        raise ChatError(
+            f"no ${TOKEN_ENV}. Mint one with:\n"
+            f"  flotta token mint $USER --scope box:chat\n"
+            f"and put it in .env, or pass --tunnel to reach the box directly "
+            f"over Fly's private network instead."
+        )
+    return token
 
 
 def credentials(dotenv: str = ".env") -> tuple[str, str]:
@@ -254,14 +301,50 @@ def new_session(*, unsafe_cookies: bool = True):
     return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=unsafe_cookies))
 
 
-async def login(session, base_url: str, username: str, password: str) -> None:
-    """Exchange credentials for session cookies on `session`."""
+async def login(
+    session,
+    base_url: str,
+    username: str | None = None,
+    password: str | None = None,
+    *,
+    token: str | None = None,
+) -> None:
+    """Exchange credentials for session cookies on `session`.
+
+    Through the **door**, pass `token` and no credentials: the door fills in
+    the box's real username and password on the way through, so they never
+    need to exist on the caller's machine. Hermes's "basic" provider is a login
+    form rather than HTTP Basic, which is why the door rewrites this body
+    instead of attaching a header.
+
+    Through a **tunnel**, pass the credentials — there is nothing in the path
+    to supply them.
+    """
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     response = await session.post(
         f"{base_url}/auth/password-login",
-        json={"provider": PROVIDER, "username": username, "password": password, "next": ""},
+        json={
+            "provider": PROVIDER,
+            "username": username or "",
+            "password": password or "",
+            "next": "",
+        },
+        headers=headers,
     )
     if response.status != 200:
         body = (await response.text())[:200]
+        if token:
+            # Through the door the caller has no credentials to get wrong, so
+            # a 401 is never about them. It is the door's copy — or a door
+            # deployed before it learned to fill them in, which is exactly how
+            # this failed the first time it was tried.
+            raise ChatError(
+                f"the box refused the door's credentials ({response.status}): {body}.\n"
+                f"The door fills these in; the caller never sends them. Check that "
+                f"$FLOTTA_BOX_PASSWORD on the door matches the box "
+                f"(`just door-secrets`), and that the door is running a build "
+                f"that rewrites the login."
+            )
         raise ChatError(
             f"login refused ({response.status}): {body}. "
             "Credentials are minted by `just fly-auth`; rotating them there "
@@ -269,9 +352,10 @@ async def login(session, base_url: str, username: str, password: str) -> None:
         )
 
 
-async def ws_ticket(session, base_url: str) -> str:
+async def ws_ticket(session, base_url: str, *, token: str | None = None) -> str:
     """Mint a single-use WebSocket ticket for the logged-in session."""
-    response = await session.post(f"{base_url}/api/auth/ws-ticket")
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    response = await session.post(f"{base_url}/api/auth/ws-ticket", headers=headers)
     if response.status != 200:
         body = (await response.text())[:200]
         raise ChatError(
@@ -286,9 +370,19 @@ async def ws_ticket(session, base_url: str) -> str:
     return str(ticket)
 
 
-async def open_agent_socket(session, base_url: str, ticket: str):
-    """Connect to the box's agent socket. Caller owns the returned WS."""
-    return await session.ws_connect(f"{base_url}/api/ws?ticket={ticket}")
+async def open_agent_socket(session, base_url: str, ticket: str, *, token: str | None = None):
+    """Connect to the box's agent socket. Caller owns the returned WS.
+
+    Through the door the Flotta token travels as `?access_token=`, not a
+    header — a browser cannot set headers on a WebSocket handshake, so the door
+    accepts it there and strips it before proxying. This client *could* use a
+    header, but sending it the same way the app must keeps one path tested
+    rather than two.
+    """
+    url = f"{base_url}/api/ws?ticket={ticket}"
+    if token:
+        url += f"&access_token={token}"
+    return await session.ws_connect(url)
 
 
 # --- talking to the agent --------------------------------------------------
