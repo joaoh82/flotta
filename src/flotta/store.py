@@ -173,6 +173,22 @@ CREATE TABLE IF NOT EXISTS tasks (
     cost_estimate REAL
 );
 
+-- Which repositories a box may use. A *set* per box, because a task can
+-- legitimately span several — fixing a bug in one repo and updating the client
+-- in another is one task, not two.
+--
+-- A new TABLE rather than a column on `boxes`, and that is load-bearing: the
+-- schema is re-executed with CREATE TABLE IF NOT EXISTS on every open, so a
+-- new table appears on an existing fleet by itself. A new *column* would not,
+-- and there is no migration machinery — the problem that pushed idle-sleep's
+-- activity signal into the event log.
+CREATE TABLE IF NOT EXISTS box_repos (
+    box_id      TEXT NOT NULL REFERENCES boxes(id),
+    repo        TEXT NOT NULL,
+    granted_at  TEXT NOT NULL,
+    PRIMARY KEY (box_id, repo)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
@@ -550,6 +566,50 @@ class FleetStore:
             ).fetchall()
         return [_workspace_from_row(r) for r in rows]
 
+    # -- repository grants --------------------------------------------
+
+    def grant_repo(self, box_id: str, repo: str) -> str:
+        """Let a box use a repository. Idempotent.
+
+        `repo` is normalised to `owner/name`: a grant recorded as a URL and a
+        grant recorded as a slug would look like two different grants for the
+        same repository, and the credential path compares them for equality.
+        """
+        self._require("box", box_id)
+        normalised = normalise_repo(repo)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?)"
+            if not self.is_postgres
+            else "INSERT INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (box_id, repo) DO UPDATE SET granted_at = EXCLUDED.granted_at",
+            (box_id, normalised, _utcnow()),
+        )
+        return normalised
+
+    def revoke_repo(self, box_id: str, repo: str) -> bool:
+        """Withdraw a grant. Returns whether there was one."""
+        normalised = normalise_repo(repo)
+        had = normalised in self.repos_for_box(box_id)
+        self._conn.execute(
+            "DELETE FROM box_repos WHERE box_id = ? AND repo = ?", (box_id, normalised)
+        )
+        return had
+
+    def repos_for_box(self, box_id: str) -> list[str]:
+        """Every repository this box may use, sorted."""
+        rows = self._conn.execute(
+            "SELECT repo FROM box_repos WHERE box_id = ? ORDER BY repo", (box_id,)
+        )
+        return [str(r["repo"]) for r in rows]
+
+    def may_use_repo(self, box_id: str, repo: str) -> bool:
+        """Whether a box has been granted a repository.
+
+        The question the credential path asks. Compares normalised slugs, so
+        `https://github.com/o/n.git` and `o/n` are the same grant.
+        """
+        return normalise_repo(repo) in self.repos_for_box(box_id)
+
     def count_live_workspaces(self) -> int:
         """How many workspaces are in a non-terminal state."""
         return len(self._live_workspace_ids())
@@ -819,6 +879,37 @@ def _box_from_row(row: db.Row) -> Box:
         created_at=row["created_at"],
         destroyed_at=row["destroyed_at"],
     )
+
+
+def normalise_repo(repo: str) -> str:
+    """Anything that names a GitHub repository → `owner/name`.
+
+    Accepts what a person or an agent would actually type: a slug, an https
+    URL, an ssh URL, with or without `.git`. They all mean one repository, and
+    a grant table that treated them as different entries would hand out access
+    or refuse it depending on how the caller happened to spell it.
+    """
+    value = (repo or "").strip()
+    if not value:
+        raise ValueError("a repository grant needs a repository")
+
+    for prefix in ("git@github.com:", "ssh://git@github.com/"):
+        if value.startswith(prefix):
+            value = value[len(prefix) :]
+            break
+    else:
+        for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+            if value.startswith(prefix):
+                value = value[len(prefix) :]
+                break
+
+    value = value.removesuffix(".git").strip("/")
+    parts = [p for p in value.split("/") if p]
+    if len(parts) != 2:
+        raise ValueError(
+            f"{repo!r} does not name a repository as owner/name (got {len(parts)} path segment(s))"
+        )
+    return "/".join(parts).lower()
 
 
 def _workspace_from_row(row: db.Row) -> Workspace:

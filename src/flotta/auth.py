@@ -46,6 +46,7 @@ Four, no wildcards, no hierarchy:
     fleet:write    create boxes
     box:destroy    tear a box down
     box:chat       talk to the agent on a box — and wake it to do so
+    git:credential mint a git credential for a repository a box is granted
 
 `box:destroy` is separated from `fleet:write` on purpose. It is the verb that
 deletes an agent's entire memory, it is the reason the control plane refused to
@@ -62,6 +63,11 @@ your conversations.
 asleep most of the time — that is the cost argument — so anything permitted to
 talk to one must be permitted to wake it, or the permission means nothing. A
 separate `box:wake` would be a scope nobody could sensibly withhold.
+
+`git:credential` is separate from `box:chat` for the opposite reason: talking
+to an agent and being able to push to its repositories are different powers,
+and the token a *person* holds to chat should not also be a key to their code.
+The box holds this one; a human normally does not.
 """
 
 from __future__ import annotations
@@ -85,8 +91,15 @@ SCOPE_FLEET_READ = "fleet:read"
 SCOPE_FLEET_WRITE = "fleet:write"
 SCOPE_BOX_DESTROY = "box:destroy"
 SCOPE_BOX_CHAT = "box:chat"
+SCOPE_GIT_CREDENTIAL = "git:credential"
 SCOPES: frozenset[str] = frozenset(
-    {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_DESTROY, SCOPE_BOX_CHAT}
+    {
+        SCOPE_FLEET_READ,
+        SCOPE_FLEET_WRITE,
+        SCOPE_BOX_DESTROY,
+        SCOPE_BOX_CHAT,
+        SCOPE_GIT_CREDENTIAL,
+    }
 )
 
 #: A default that is short because revocation is coarse. Long-lived tokens are

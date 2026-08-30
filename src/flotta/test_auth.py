@@ -183,14 +183,30 @@ def test_destroy_is_not_implied_by_write():
     assert not claims.allows(SCOPE_BOX_DESTROY)
 
 
-def test_the_known_scopes_are_exactly_these_four():
+def test_the_known_scopes_are_exactly_these_five():
     """A new scope should be a deliberate act, visible in a diff.
 
     This test earned its keep on the first change: adding `box:chat` for M5b
     failed here, which is exactly the prompt to ask whether the scope is
     warranted rather than to notice it in review three PRs later.
     """
-    assert {"fleet:read", "fleet:write", "box:destroy", "box:chat"} == SCOPES
+    assert {
+        "fleet:read",
+        "fleet:write",
+        "box:destroy",
+        "box:chat",
+        "git:credential",
+    } == SCOPES
+
+
+def test_chatting_does_not_grant_a_git_credential():
+    """Talking to an agent and pushing to its repositories are different powers.
+
+    The token a *person* holds to chat should not also be a key to their code —
+    and `box:chat` is the most widely handed out, since it is what the app needs.
+    """
+    claims = verify(mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY), key=KEY)
+    assert not claims.allows("git:credential")
 
 
 def test_reading_the_fleet_does_not_grant_reading_conversations():

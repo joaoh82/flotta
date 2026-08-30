@@ -696,3 +696,136 @@ def test_activity_is_rate_limited(secured, fleet, monkeypatch):
         assert len(written) == 1, f"five requests wrote {len(written)} events"
     finally:
         store.close()
+
+
+# -- repository grants and git credentials ----------------------------------
+#
+# The boundary that matters here is "which repositories may this box reach",
+# and it is enforced in exactly one place. These lean on that rather than on
+# the happy path.
+
+GH_SOURCE = "ghp_a_fleet_token_for_tests"
+
+
+def _grant(secured, box, repo, scope=None):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    return secured.post(
+        f"/api/boxes/{box}/repos",
+        json={"repo": repo},
+        headers=_bearer(scope or SCOPE_FLEET_WRITE),
+    )
+
+
+def test_a_box_can_be_granted_several_repositories(secured):
+    """A task can legitimately span repos — fix a bug in one, update the client
+    in another. That is one task, so a grant is a set."""
+    _grant(secured, "eng-a", "joaoh82/flotta")
+    body = _grant(secured, "eng-a", "joaoh82/flotta_parent").json()
+    assert body["repos"] == ["joaoh82/flotta", "joaoh82/flotta_parent"]
+
+
+def test_a_repository_is_the_same_grant_however_it_is_spelled(secured):
+    """A grant recorded as a URL and one recorded as a slug would look like two
+    grants for one repository, and the credential path compares for equality."""
+    _grant(secured, "eng-a", "https://github.com/joaoh82/Flotta.git")
+    body = _grant(secured, "eng-a", "git@github.com:joaoh82/flotta.git").json()
+    assert body["repos"] == ["joaoh82/flotta"], "the same repo was granted twice"
+
+
+def test_a_credential_is_refused_for_a_repository_that_was_not_granted(secured, monkeypatch):
+    """The whole point. A box asks for a repo; Flotta decides."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    _grant(secured, "eng-a", "joaoh82/flotta")
+
+    denied = secured.post(
+        "/api/boxes/eng-a/git-credential",
+        json={"repo": "someone-else/private"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL),
+    )
+    assert denied.status_code == 403
+    assert GH_SOURCE not in denied.text, "the token leaked in a refusal"
+
+
+def test_a_credential_is_issued_for_a_granted_repository(secured, monkeypatch):
+    from flotta.auth import SCOPE_GIT_CREDENTIAL
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    _grant(secured, "eng-a", "joaoh82/flotta")
+
+    ok = secured.post(
+        "/api/boxes/eng-a/git-credential",
+        json={"repo": "https://github.com/joaoh82/flotta.git"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL),
+    )
+    assert ok.status_code == 200
+    assert ok.json()["password"] == GH_SOURCE
+    assert ok.json()["username"] == "x-access-token"
+
+
+def test_chatting_does_not_mint_a_git_credential(secured, monkeypatch):
+    """`box:chat` is the most widely handed out token — it is what the app
+    needs. It must not also be a key to the user's code."""
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    _grant(secured, "eng-a", "joaoh82/flotta")
+
+    denied = secured.post(
+        "/api/boxes/eng-a/git-credential",
+        json={"repo": "joaoh82/flotta"},
+        headers=_bearer(SCOPE_BOX_CHAT),
+    )
+    assert denied.status_code == 403
+    assert GH_SOURCE not in denied.text
+
+
+def test_a_box_cannot_widen_its_own_access(secured, monkeypatch):
+    """Granting is an operator's act; minting is the box's.
+
+    A box holds `git:credential`. If that also let it grant, an agent could
+    add a repository to its own list and then ask for the key to it.
+    """
+    from flotta.auth import SCOPE_GIT_CREDENTIAL
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    denied = _grant(secured, "eng-a", "someone-else/private", scope=SCOPE_GIT_CREDENTIAL)
+    assert denied.status_code == 403
+
+
+def test_revoking_needs_no_redeploy(secured, monkeypatch):
+    """The box holds nothing to invalidate, which is the point of it holding
+    no credential: a revoke takes effect on the next request."""
+    from flotta.auth import SCOPE_FLEET_WRITE, SCOPE_GIT_CREDENTIAL
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    _grant(secured, "eng-a", "joaoh82/flotta")
+    ask = {"json": {"repo": "joaoh82/flotta"}, "headers": _bearer(SCOPE_GIT_CREDENTIAL)}
+    assert secured.post("/api/boxes/eng-a/git-credential", **ask).status_code == 200
+
+    secured.delete("/api/boxes/eng-a/repos/joaoh82/flotta", headers=_bearer(SCOPE_FLEET_WRITE))
+    assert secured.post("/api/boxes/eng-a/git-credential", **ask).status_code == 403
+
+
+def test_no_source_token_is_503_and_says_what_is_missing(secured, monkeypatch):
+    """A control plane without a GitHub token is a legitimate state — public
+    repositories still work — so it must not read as a broken box."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL
+
+    monkeypatch.delenv("FLOTTA_GITHUB_TOKEN", raising=False)
+    _grant(secured, "eng-a", "joaoh82/flotta")
+
+    response = secured.post(
+        "/api/boxes/eng-a/git-credential",
+        json={"repo": "joaoh82/flotta"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL),
+    )
+    assert response.status_code == 503
+    assert "FLOTTA_GITHUB_TOKEN" in response.json()["detail"]
+
+
+def test_a_malformed_repository_is_422_not_a_silent_grant(secured):
+    assert _grant(secured, "eng-a", "not-a-repo").status_code == 422
+    assert _grant(secured, "eng-a", "").status_code == 422
