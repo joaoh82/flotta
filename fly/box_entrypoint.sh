@@ -59,9 +59,26 @@ set -euo pipefail
 # container start, so anything the build wrote there is invisible afterwards.
 mkdir -p "$HERMES_HOME"
 
+# The working directory (§6a). On the rootfs, not the volume, and the split is
+# load-bearing: /data is ~1GB and holds the agent's memory, so one `npm
+# install` there would fill it and take the memory with it. /workspace has the
+# machine's whole rootfs (~7GB) and the right lifetime — a clone survives a
+# nap, and is lost when the machine is replaced.
+: "${FLOTTA_WORKDIR:=/workspace}"
+mkdir -p "$FLOTTA_WORKDIR"
+
 echo "[flotta-box] HERMES_HOME=$HERMES_HOME"
+echo "[flotta-box] workdir=$FLOTTA_WORKDIR"
 echo "[flotta-box] mount:"
 df -h /data 2>/dev/null || echo "  (no /data mount — the volume is missing)"
+df -h "$FLOTTA_WORKDIR" 2>/dev/null | tail -1
+
+# Loud, because it is the number that decides whether a task can run at all and
+# the failure without it is a build that dies halfway with ENOSPC.
+free_kb=$(df -Pk "$FLOTTA_WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "$free_kb" ] && [ "$free_kb" -lt 1048576 ]; then
+  echo "[flotta-box] WARNING: less than 1GB free in $FLOTTA_WORKDIR — builds will fail"
+fi
 
 # Fail loudly rather than serve something unreachable. Hermes refuses a
 # non-loopback bind with no auth provider, so without these the box would boot,

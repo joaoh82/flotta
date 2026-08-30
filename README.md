@@ -68,6 +68,10 @@ machine. That one rule shapes most of the design.
 
 - **Persistent cloud boxes.** A pinned image boots `hermes serve` as PID 1 on a Fly Machine with
   a volume at `/data/hermes`, so an agent's memory survives a stop/start.
+- **A box can do engineering work.** The image is Ubuntu with a real toolchain — `git`, `gh`,
+  `ripgrep`, `fd`, `jq`, a compiler, Python, Node, `uv`, `sqlite3` — so an agent can clone a repo,
+  install its dependencies, build a C extension and run its tests. Work happens in `/workspace` on
+  the rootfs; `/data` is the memory volume and stays out of it.
 - **Every transition recorded.** A local SQLite store is the single source of truth, split into
   `boxes` / `workspaces` / `tasks`, each with its own validated transition table. A box cannot be
   `done` and a task cannot be `stopped`; the store refuses both.
