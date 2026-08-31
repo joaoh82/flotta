@@ -46,6 +46,9 @@ server = ["flotta[postgres,control]"]
 
 [project.scripts]
 flotta = "flotta.cli:app"
+# git finds a helper named `X` as `git-credential-X` on PATH, so the name is
+# the interface: `credential.helper = flotta` on the box resolves to this.
+git-credential-flotta = "flotta.box.git_credential:main"
 
 [dependency-groups]
 dev = [

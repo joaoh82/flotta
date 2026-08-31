@@ -80,6 +80,48 @@ if [ -n "$free_kb" ] && [ "$free_kb" -lt 1048576 ]; then
   echo "[flotta-box] WARNING: less than 1GB free in $FLOTTA_WORKDIR — builds will fail"
 fi
 
+# ## Git identity (FLOTTA-20)
+#
+# Written on every boot from the environment rather than baked into the image
+# or kept on the volume. A box's identity is a property of the fleet record, so
+# renaming one or pointing it at a different control plane should take a
+# restart, not a rebuild.
+export HOME="${HOME:-/root}"
+BOX_NAME="${FLOTTA_BOX_NAME:-${FLY_APP_NAME:-box}}"
+
+# An agent asked to authenticate interactively hangs forever: there is no
+# terminal and nobody is watching. Fail fast instead — git's own error names
+# the repository, which is what a human needs to see.
+export GIT_TERMINAL_PROMPT=0
+export GH_PROMPT_DISABLED=1
+
+git config --global --replace-all user.name "$BOX_NAME"
+
+# `users.noreply.github.com` deliberately does NOT resolve to a GitHub account
+# — only `<id>+<login>@users.noreply.github.com` does. That is the property we
+# want: a commit says which *agent* made it and attributes itself to no person.
+# It is also the only shape GitHub accepts from accounts with "block command
+# line pushes that expose my email" enabled.
+git config --global --replace-all user.email "${BOX_NAME}@users.noreply.github.com"
+git config --global --replace-all init.defaultBranch main
+
+# The repository path is what makes per-box grants possible at all. Without it
+# git asks for "a credential for github.com" and a grant has nothing to key on.
+git config --global --replace-all credential.useHttpPath true
+
+if [ -n "${FLOTTA_CONTROL_URL:-}" ] && [ -n "${FLOTTA_BOX_TOKEN:-}" ] \
+   && [ -n "${FLOTTA_BOX_ID:-}" ]; then
+  git config --global --replace-all credential.helper flotta
+  echo "[flotta-box] git: $BOX_NAME <${BOX_NAME}@users.noreply.github.com>, credentials via control plane"
+else
+  # Unset rather than left over: a helper configured with nothing behind it
+  # costs a failed round trip on every fetch and reports it as a credential
+  # error, which reads like a revoked grant rather than a box nobody set up.
+  git config --global --unset-all credential.helper || true
+  echo "[flotta-box] git: $BOX_NAME, NO credential helper — public repositories only"
+  echo "[flotta-box]   fix with: just box-identity $BOX_NAME"
+fi
+
 # Fail loudly rather than serve something unreachable. Hermes refuses a
 # non-loopback bind with no auth provider, so without these the box would boot,
 # exit, and be restarted forever with the reason buried in the logs.

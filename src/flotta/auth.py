@@ -106,6 +106,33 @@ SCOPES: frozenset[str] = frozenset(
 #: an explicit `--expires` away.
 DEFAULT_TTL_S = 30 * 24 * 3600
 
+#: Subjects starting with this name a **box**, and are held by that box.
+#:
+#: Scopes answer "what may this token do"; they cannot answer "to which box",
+#: because the box is in the request path rather than the token. That gap did
+#: not matter while every token was held by a person. It matters now: a
+#: `git:credential` token lives on a machine whose agent has root, so a token
+#: leaked from one box could mint credentials for every *other* box's
+#: repositories — and per-box grants would mean nothing.
+#:
+#: The rule is deliberately one-directional. A box subject may act on its own
+#: box and no other; any other subject (an operator, a script) is unrestricted,
+#: because a human minting `git:credential` for debugging should not have to
+#: impersonate a box to use it.
+BOX_SUBJECT_PREFIX = "box:"
+
+
+def box_subject(box_id: str) -> str:
+    """The subject to mint a box's own token under."""
+    return f"{BOX_SUBJECT_PREFIX}{box_id}"
+
+
+def subject_box(subject: str) -> str | None:
+    """The box a subject names, or None if it does not name one."""
+    if not subject.startswith(BOX_SUBJECT_PREFIX):
+        return None
+    return subject[len(BOX_SUBJECT_PREFIX) :].strip() or None
+
 
 class AuthError(Exception):
     """A token is missing, malformed, expired, or not signed by this key."""

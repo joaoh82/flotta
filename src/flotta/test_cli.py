@@ -572,3 +572,71 @@ def test_dotenv_survives_a_malformed_line(tmp_path):
 
     parsed = parse_dotenv("garbage\n=novalue\nexport FLOTTA_A=1\nFLOTTA_B='two' # note\n")
     assert parsed == {"FLOTTA_A": "1", "FLOTTA_B": "two"}
+
+
+# -- `flotta token box` -----------------------------------------------------
+#
+# The one command whose output is loaded straight onto a machine an agent
+# controls. What it prints is a security boundary, so it is worth reading.
+
+
+def _token_box(tmp_path, monkeypatch, *args):
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+    from flotta.store import FleetStore
+
+    store = tmp_path / "fleet.db"
+    fleet = FleetStore(store)
+    box = fleet.create_box("eng-a")
+    fleet.close()
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    result = CliRunner().invoke(app, ["token", "box", "eng-a", "--store", str(store), *args])
+    return box, result
+
+
+def test_token_box_prints_the_identity_the_entrypoint_reads(tmp_path, monkeypatch):
+    """Four values, and the entrypoint needs all four. A token alone is not an
+    identity: the id goes in the credential URL and the name signs commits."""
+    box, result = _token_box(tmp_path, monkeypatch)
+    assert result.exit_code == 0
+    printed = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if line.startswith("FLOTTA_")
+    )
+    assert printed["FLOTTA_BOX_ID"] == box.id
+    assert printed["FLOTTA_BOX_NAME"] == "eng-a"
+    assert printed["FLOTTA_BOX_TOKEN"].startswith("flotta_")
+
+
+def test_token_box_mints_git_credential_and_nothing_else(tmp_path, monkeypatch):
+    """This token sits on a machine whose agent has root. A second scope here
+    would be a second thing that agent can do with it."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject, verify
+
+    box, result = _token_box(tmp_path, monkeypatch)
+    value = next(
+        line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("FLOTTA_BOX_TOKEN=")
+    )
+    claims = verify(value, key="k" * 32)
+    assert claims.scopes == frozenset({SCOPE_GIT_CREDENTIAL})
+    assert claims.subject == box_subject(box.id)
+
+
+def test_token_box_says_so_when_the_control_url_is_missing(tmp_path, monkeypatch):
+    """Without it the helper has nowhere to ask, and the failure would surface
+    on the box as "no credential" rather than as "you forgot a variable"."""
+    monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    _, result = _token_box(tmp_path, monkeypatch)
+    assert "FLOTTA_CONTROL_URL=" not in result.stdout
+    assert "FLOTTA_CONTROL_URL" in result.output
+
+
+def test_token_box_includes_the_control_url_when_it_knows_it(tmp_path, monkeypatch):
+    """The whole point of an env block is that it can be piped into
+    `flyctl secrets import` without editing."""
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    _, result = _token_box(tmp_path, monkeypatch)
+    assert "FLOTTA_CONTROL_URL=https://control.example" in result.stdout

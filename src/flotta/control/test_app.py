@@ -829,3 +829,126 @@ def test_no_source_token_is_503_and_says_what_is_missing(secured, monkeypatch):
 def test_a_malformed_repository_is_422_not_a_silent_grant(secured):
     assert _grant(secured, "eng-a", "not-a-repo").status_code == 422
     assert _grant(secured, "eng-a", "").status_code == 422
+
+
+# -- a box token speaks for its own box, and no other ------------------------
+#
+# Scopes say what a token may do; they never said *to which box*. That gap was
+# harmless while every token was held by a person. It stopped being harmless
+# when part 2 put a `git:credential` token on a machine whose agent has root:
+# one box's token would otherwise reach every other box's grants, and per-box
+# grants would be decoration.
+
+
+def _box_ids(secured):
+    from flotta.auth import SCOPE_FLEET_READ
+
+    listed = secured.get("/api/boxes", headers=_bearer(SCOPE_FLEET_READ)).json()
+    return {b["name"]: b["id"] for b in listed["boxes"]}
+
+
+@pytest.fixture
+def two_boxes(secured, fleet):
+    """`eng-a` from the fixture, plus a second box with its own grant."""
+    from flotta.store import FleetStore
+
+    store = FleetStore(fleet)
+    other = store.create_box("eng-b")
+    store.update_box_status(other.id, "running", endpoint="fly://app/m2")
+    store.grant_repo(other.id, "someone/secret")
+    store.close()
+    return _box_ids(secured)
+
+
+def test_a_box_token_cannot_mint_for_another_box(two_boxes, secured, monkeypatch):
+    """The containment the grants exist to provide."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+
+    denied = secured.post(
+        "/api/boxes/eng-b/git-credential",
+        json={"repo": "someone/secret"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(two_boxes["eng-a"])),
+    )
+    assert denied.status_code == 403
+    assert GH_SOURCE not in denied.text
+
+
+def test_a_box_token_works_for_its_own_box(two_boxes, secured, monkeypatch):
+    """The check must not cost a box the thing it exists to do."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+
+    ok = secured.post(
+        "/api/boxes/eng-b/git-credential",
+        json={"repo": "someone/secret"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(two_boxes["eng-b"])),
+    )
+    assert ok.status_code == 200
+    assert ok.json()["password"] == GH_SOURCE
+
+
+def test_a_box_token_may_name_its_box_by_id_or_by_name(two_boxes, secured, monkeypatch):
+    """The URL takes either, so the check has to accept either — otherwise
+    `flotta chat eng-b`-shaped addressing works everywhere except here."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+
+    ok = secured.post(
+        f"/api/boxes/{two_boxes['eng-b']}/git-credential",
+        json={"repo": "someone/secret"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject("eng-b")),
+    )
+    assert ok.status_code == 200
+
+
+def test_an_operator_token_is_not_restricted_to_one_box(two_boxes, secured, monkeypatch):
+    """A human debugging a grant should not have to impersonate a box. The rule
+    is one-directional: a box subject is confined, anything else is not."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+
+    ok = secured.post(
+        "/api/boxes/eng-b/git-credential",
+        json={"repo": "someone/secret"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject="joao"),
+    )
+    assert ok.status_code == 200
+
+
+def test_the_refusal_names_a_command_that_exists(secured, monkeypatch):
+    """The 403 is the only guidance anyone gets — it is what the box's helper
+    passes through to git's stderr, and the agent reads that and nothing else.
+
+    It said `flotta grant eng-a x/y` for a command that is `flotta repo grant`,
+    which is a wrong instruction delivered at exactly the moment someone is
+    stuck. Found by running the helper against a real control plane; no test
+    reads an error message for whether it is *true*.
+    """
+    import re
+
+    from typer.testing import CliRunner
+
+    from flotta.auth import SCOPE_GIT_CREDENTIAL
+    from flotta.cli import app as cli
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    denied = secured.post(
+        "/api/boxes/eng-a/git-credential",
+        json={"repo": "someone-else/private"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL),
+    )
+    quoted = re.findall(r"`flotta ([^`]+)`", denied.json()["detail"])
+    assert quoted, "the refusal stopped naming a way out"
+
+    for suggestion in quoted:
+        # Command words only: the rest are this box's name and repository.
+        words = list(suggestion.split())
+        while words and not words[-1].replace("-", "").isalpha():
+            words.pop()
+        result = CliRunner().invoke(cli, [*words[:2], "--help"])
+        assert result.exit_code == 0, f"`flotta {suggestion}` is not a command"

@@ -223,6 +223,68 @@ That round trip is the entire thesis of the project in one command.
 
 ---
 
+## Step 7 — Give an agent a GitHub identity (optional)
+
+Without this a box can read public repositories and nothing else: `git clone`
+of a private repo fails, `git push` fails, and `gh` reports that it is not
+logged in. With it, the box can clone, commit and open pull requests — **and
+still holds no GitHub credential of its own.**
+
+### How it works, in one paragraph
+
+The box's git is configured with a credential helper that calls the control
+plane, presenting a Flotta token scoped to `git:credential` and to that box.
+The control plane checks the repository against that box's grants and returns
+a GitHub credential for that request only. Nothing is stored on the box, so
+revoking a grant takes effect on the next fetch — no redeploy, no restart.
+
+### 7a. Give the control plane a source token
+
+Mint a **fine-grained** GitHub PAT over the repositories you want agents to
+reach. Contents read/write and pull requests; **not** administration and not
+`delete_repo`. Set it on Railway:
+
+```
+FLOTTA_GITHUB_TOKEN=github_pat_...
+```
+
+Without it the credential endpoint answers 503 and says so, which is a
+legitimate state rather than a broken box.
+
+> **What this does and does not enforce.** Flotta refuses to hand a box a
+> credential for a repository it was not granted. It does *not* constrain what
+> the returned token can reach — the source is one fleet token, so a box that
+> extracted it could use it beyond its grants. Per-box isolation is policy
+> enforced by the control plane, not by GitHub. Closing that means GitHub App
+> installation tokens scoped to `repository_ids`; the box side would not
+> change. Scope the PAT to the repositories you are willing to lose.
+
+### 7b. Load the identity onto the box, and grant it repositories
+
+```bash
+just box-identity eng-a                       # restarts the machine
+uv run flotta repo grant eng-a joaoh82/flotta
+uv run flotta repo list eng-a
+```
+
+`box-identity` mints a token whose subject is that box, so it cannot mint
+credentials for any other box's repositories. A box can hold several grants: a
+task that fixes a bug in one repo and updates the client in another is one
+task, not two.
+
+### 7c. Prove it
+
+Ask the agent to clone the private repo, make a commit and push a branch. The
+commit will be authored by `eng-a <eng-a@users.noreply.github.com>` — an
+address that deliberately resolves to no GitHub account, so an agent's commits
+are attributed to the agent and to no person.
+
+If it cannot, the reason is on git's stderr, prefixed `flotta:` — the box's
+helper passes the control plane's own words through rather than paraphrasing
+them.
+
+---
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would
