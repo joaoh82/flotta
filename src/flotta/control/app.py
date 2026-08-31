@@ -42,6 +42,7 @@ from flotta.auth import (
     SCOPE_BOX_DESTROY,
     SCOPE_FLEET_READ,
     SCOPE_FLEET_WRITE,
+    SCOPE_GIT_CREDENTIAL,
     SIGNING_KEY_ENV,
     AuthError,
     Token,
@@ -55,6 +56,9 @@ _log = logging.getLogger("flotta.control")
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 INTERVAL_ENV = "FLOTTA_RECONCILE_INTERVAL_S"
+#: The credential boxes borrow. Held here, never on a box — see
+#: `git_credential` for what that does and does not buy.
+GITHUB_TOKEN_ENV = "FLOTTA_GITHUB_TOKEN"
 
 
 class InsecureBindError(RuntimeError):
@@ -242,6 +246,7 @@ def create_app(
     needs_write = Depends(require(SCOPE_FLEET_WRITE))
     needs_destroy = Depends(require(SCOPE_BOX_DESTROY))
     needs_chat = Depends(require(SCOPE_BOX_CHAT))
+    needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
 
     @asynccontextmanager
     async def lifespan(app: Any):
@@ -399,6 +404,117 @@ def create_app(
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
             return {"events": [_event_dict(e) for e in store.get_box_timeline(box.id)]}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/repos")
+    def list_repos(box_id: str, _: Token | None = needs_read) -> Any:
+        """Which repositories a box may use."""
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/repos")
+    def grant_repo_endpoint(
+        box_id: str, body: dict[str, Any], _: Token | None = needs_write
+    ) -> Any:
+        """Grant a box a repository. Idempotent.
+
+        `fleet:write` rather than `git:credential`: granting is an operator's
+        act, minting is the box's. A box holding its own credential scope must
+        not be able to widen its own access.
+        """
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            try:
+                repo = store.grant_repo(box.id, str(body.get("repo") or ""))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            store.add_event("box", box.id, "repo_granted", {"repo": repo})
+            return {"box_id": box.id, "repos": store.repos_for_box(box.id)}
+        finally:
+            store.close()
+
+    @app.delete("/api/boxes/{box_id}/repos/{owner}/{name}")
+    def revoke_repo_endpoint(
+        box_id: str, owner: str, name: str, _: Token | None = needs_write
+    ) -> Any:
+        """Withdraw a grant. Takes effect on the box's next credential request.
+
+        No redeploy and no restart: the box holds nothing to invalidate, which
+        is the point of it not holding a credential.
+        """
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            had = store.revoke_repo(box.id, f"{owner}/{name}")
+            if had:
+                store.add_event("box", box.id, "repo_revoked", {"repo": f"{owner}/{name}"})
+            return {"box_id": box.id, "revoked": had, "repos": store.repos_for_box(box.id)}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/git-credential")
+    def git_credential(box_id: str, body: dict[str, Any], _: Token | None = needs_git) -> Any:
+        """Mint a git credential for a repository this box is granted.
+
+        Called by the box's git credential helper, which git invokes with the
+        repository path (`credential.useHttpPath=true`). The box holds no
+        GitHub credential of its own — that is the whole design: a token in the
+        agent's environment is a token a prompt-injected agent can print, and
+        we have watched this agent act on instructions that came from a
+        repository.
+
+        **What this does and does not enforce.** Flotta refuses to hand a
+        credential for a repository the box was not granted. It does *not*
+        constrain what the returned token can reach — the source is one fleet
+        token, so a box that extracted it could use it beyond its grants. That
+        is policy enforced here, not by GitHub, and closing it means minting
+        GitHub App installation tokens scoped to `repository_ids`. Stated
+        plainly because a soft boundary that reads as a hard one is worse than
+        no boundary at all.
+        """
+        source = (os.environ.get(GITHUB_TOKEN_ENV) or "").strip()
+        if not source:
+            raise HTTPException(
+                status_code=503,
+                detail=f"no ${GITHUB_TOKEN_ENV} configured on the control plane; "
+                f"boxes can read public repositories and nothing else",
+            )
+
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+
+            repo = str(body.get("repo") or "").strip()
+            if not repo:
+                raise HTTPException(status_code=422, detail="which repository?")
+            try:
+                if not store.may_use_repo(box.id, repo):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"box {box.name!r} is not granted {repo!r}. "
+                        f"Grant it with `flotta grant {box.name} {repo}`.",
+                    )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            store.add_event("box", box.id, "git_credential", {"repo": repo})
+            # The username is ignored by GitHub when the password is a token;
+            # `x-access-token` is the convention its own docs use.
+            return {"username": "x-access-token", "password": source, "repo": repo}
         finally:
             store.close()
 

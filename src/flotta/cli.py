@@ -1011,6 +1011,91 @@ def door(
     uvicorn.run(create_door(), host=host, port=port)
 
 
+# -- repository grants ------------------------------------------------------
+
+repo_app = typer.Typer(
+    name="repo",
+    help="Which repositories a box may use.",
+    no_args_is_help=True,
+)
+app.add_typer(repo_app)
+
+
+@repo_app.command("grant")
+def repo_grant(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    repo: str = typer.Argument(..., help="owner/name, or a GitHub URL"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Let a box use a repository.
+
+    A box can hold several: a task that fixes a bug in one repo and updates the
+    client in another is one task, not two.
+
+    Grants are what the box's git credential helper is checked against. The box
+    holds no GitHub credential itself — see `flotta.control.app.git_credential`
+    for what that does and does not enforce.
+    """
+    from flotta.store import normalise_repo
+
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        try:
+            normalise_repo(repo)
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        granted = fleet.grant_repo(box.id, repo)
+        fleet.add_event("box", box.id, "repo_granted", {"repo": granted})
+        emit(
+            {"box_id": box.id, "name": box.name, "repos": fleet.repos_for_box(box.id)},
+            f"{box.name} may now use {granted}",
+            as_json=as_json,
+        )
+
+
+@repo_app.command("revoke")
+def repo_revoke(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    repo: str = typer.Argument(..., help="owner/name, or a GitHub URL"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Withdraw a grant.
+
+    Takes effect on the box's next credential request — no redeploy and no
+    restart, because the box holds nothing to invalidate.
+    """
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        had = fleet.revoke_repo(box.id, repo)
+        if had:
+            fleet.add_event("box", box.id, "repo_revoked", {"repo": repo})
+        emit(
+            {"box_id": box.id, "revoked": had, "repos": fleet.repos_for_box(box.id)},
+            f"{box.name} {'no longer uses' if had else 'was not using'} {repo}",
+            as_json=as_json,
+        )
+
+
+@repo_app.command("list")
+def repo_list(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Every repository a box may use."""
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        repos = fleet.repos_for_box(box.id)
+        emit(
+            {"box_id": box.id, "name": box.name, "repos": repos},
+            "\n".join(f"  {r}" for r in repos) or "  (none — public repositories only)",
+            as_json=as_json,
+        )
+
+
 # -- tokens (M5) ------------------------------------------------------------
 
 token_app = typer.Typer(
