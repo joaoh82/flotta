@@ -97,12 +97,26 @@ export GH_PROMPT_DISABLED=1
 
 git config --global --replace-all user.name "$BOX_NAME"
 
-# `users.noreply.github.com` deliberately does NOT resolve to a GitHub account
-# — only `<id>+<login>@users.noreply.github.com` does. That is the property we
-# want: a commit says which *agent* made it and attributes itself to no person.
-# It is also the only shape GitHub accepts from accounts with "block command
-# line pushes that expose my email" enabled.
-git config --global --replace-all user.email "${BOX_NAME}@users.noreply.github.com"
+# ## The commit address must be one that cannot belong to a person
+#
+# This was `${BOX_NAME}@users.noreply.github.com`, on the belief that only
+# `<id>+<login>@users.noreply.github.com` resolves to an account. **That is
+# wrong.** The legacy noreply format is exactly `<login>@users.noreply.github.com`
+# and GitHub still links it — a box named `eng-a` had its first commit
+# attributed to github.com/Eng-A, a real account belonging to a stranger,
+# confirmed live on the pushed commit. Any box whose name happens to match a
+# GitHub username adopts that user's identity on everything it writes.
+#
+# So the address comes from a domain nobody else can hold. `$FLOTTA_DOMAIN`
+# when the fleet has one; otherwise `.invalid`, which RFC 2606 reserves and no
+# registry will ever sell (RFC 2606, carried forward by RFC 6761) — an address
+# that cannot be verified on a GitHub
+# account cannot be linked to one.
+#
+# Not "pick a name that is not taken": usernames are registered continuously,
+# so that is a property that can stop being true after the box is created.
+: "${FLOTTA_GIT_EMAIL_DOMAIN:=${FLOTTA_DOMAIN:-boxes.invalid}}"
+git config --global --replace-all user.email "${BOX_NAME}@${FLOTTA_GIT_EMAIL_DOMAIN}"
 git config --global --replace-all init.defaultBranch main
 
 # The repository path is what makes per-box grants possible at all. Without it
@@ -112,7 +126,7 @@ git config --global --replace-all credential.useHttpPath true
 if [ -n "${FLOTTA_CONTROL_URL:-}" ] && [ -n "${FLOTTA_BOX_TOKEN:-}" ] \
    && [ -n "${FLOTTA_BOX_ID:-}" ]; then
   git config --global --replace-all credential.helper flotta
-  echo "[flotta-box] git: $BOX_NAME <${BOX_NAME}@users.noreply.github.com>, credentials via control plane"
+  echo "[flotta-box] git: $BOX_NAME <${BOX_NAME}@${FLOTTA_GIT_EMAIL_DOMAIN}>, credentials via control plane"
 else
   # Unset rather than left over: a helper configured with nothing behind it
   # costs a failed round trip on every fetch and reports it as a credential

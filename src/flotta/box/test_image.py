@@ -152,12 +152,48 @@ def test_git_never_prompts_on_a_box():
     assert "GIT_TERMINAL_PROMPT=0" in _entrypoint()
 
 
-def test_commits_are_attributed_to_the_box_and_to_no_person():
-    """`<name>@users.noreply.github.com` deliberately resolves to no account —
-    only `<id>+<login>@` does. A real address here would attribute an agent's
-    commits to a human."""
-    assert "users.noreply.github.com" in _entrypoint()
-    assert 'user.name "$BOX_NAME"' in _entrypoint()
+def _git_config_lines() -> list[str]:
+    """Only the lines that *set* git config.
+
+    Reading the whole file was wrong: the entrypoint's comments name the
+    address this must never use, in order to explain why. A guard that greps
+    prose fails on the explanation of the bug it exists to prevent.
+    """
+    return [
+        line.strip() for line in _entrypoint().splitlines() if line.strip().startswith("git config")
+    ]
+
+
+def test_commits_are_attributed_to_the_box():
+    config = " ".join(_git_config_lines())
+    assert 'user.name "$BOX_NAME"' in config
+    assert "${BOX_NAME}@${FLOTTA_GIT_EMAIL_DOMAIN}" in config
+
+
+def test_the_commit_address_is_never_a_github_noreply():
+    """It was `${BOX_NAME}@users.noreply.github.com`, on the belief that only
+    `<id>+<login>@` resolves. It does not: the legacy form is exactly
+    `<login>@users.noreply.github.com`, and a box named `eng-a` had its first
+    pushed commit attributed to github.com/Eng-A — a real account belonging to
+    a stranger. Any box whose name matches a GitHub username takes that
+    person's identity on everything it writes.
+
+    Asserted as an absence because the fix is not "use a better local part":
+    every value on that domain is someone's potential address."""
+    assert not any("users.noreply.github.com" in line for line in _git_config_lines())
+
+
+def test_the_fallback_email_domain_can_never_be_registered():
+    """A fleet with no domain still needs an address nobody can claim.
+    `.invalid` is reserved by RFC 2606, carried forward by RFC 6761, and no
+    registry will ever sell it — so the address cannot be verified on a GitHub
+    account and therefore cannot be linked to one. "Pick a name nobody has
+    taken" is not an alternative: usernames are
+    registered continuously, so it can stop being true after the box exists."""
+    assert '"${FLOTTA_GIT_EMAIL_DOMAIN:=${FLOTTA_DOMAIN:-boxes.invalid}}"' in _entrypoint(), (
+        "the fallback must be a literal reserved-TLD domain — asserting only that "
+        "'.invalid' appears somewhere in the line would pass for `cdn.invalid-x.com`"
+    )
 
 
 def test_the_gh_shim_falls_through_rather_than_failing():

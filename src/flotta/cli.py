@@ -1406,6 +1406,25 @@ def token_box(
     typer.echo(f"FLOTTA_BOX_ID={box_identity}")
     typer.echo(f"FLOTTA_BOX_NAME={box_name}")
     typer.echo(f"FLOTTA_BOX_TOKEN={value}")
+
+    # The domain a box signs commits under, carried in the identity block
+    # because that is what an identity is. Nothing else reaches the machine:
+    # `fly.toml [env]` names three variables, `BoxSpec(name=name)` passes an
+    # empty env, and these secrets are the only other channel — so a
+    # `$FLOTTA_DOMAIN` set on a laptop was documented to reach the box and
+    # never did. Every box took the `boxes.invalid` fallback while the runbook
+    # said otherwise, which is the same confident-and-unchecked shape this
+    # command's own commit-address bug had.
+    #
+    # Omitted when the operator has no domain, rather than resolved to the
+    # fallback here: the entrypoint owns that default, and writing it into a
+    # Fly secret would freeze today's answer onto the machine.
+    email_domain = (
+        os.environ.get("FLOTTA_GIT_EMAIL_DOMAIN") or os.environ.get("FLOTTA_DOMAIN") or ""
+    ).strip()
+    if email_domain:
+        typer.echo(f"FLOTTA_GIT_EMAIL_DOMAIN={email_domain}")
+
     if base:
         typer.echo(f"FLOTTA_CONTROL_URL={base}")
     else:

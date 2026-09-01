@@ -727,6 +727,38 @@ def test_token_box_reads_the_control_url_from_a_dotenv(tmp_path, monkeypatch):
     assert "FLOTTA_CONTROL_URL=https://from-dotenv.example" in result.stdout
 
 
+def test_token_box_carries_the_commit_email_domain(tmp_path, monkeypatch):
+    """`$FLOTTA_DOMAIN` was documented to reach the box and never did. The
+    box's env comes from `fly.toml` (three variables), `BoxSpec.env` (empty),
+    and these secrets — so if the identity block does not carry it, nothing
+    does, and every box silently takes the `boxes.invalid` fallback while the
+    runbook says otherwise."""
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setenv("FLOTTA_DOMAIN", "flotta.dev")
+    _remote(monkeypatch)
+    _, result = _token_box(tmp_path, monkeypatch)
+    assert "FLOTTA_GIT_EMAIL_DOMAIN=flotta.dev" in result.stdout
+
+
+def test_an_explicit_email_domain_beats_the_addressing_domain(tmp_path, monkeypatch):
+    """Where a box is *reached* and where it *signs* are different choices."""
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setenv("FLOTTA_DOMAIN", "flotta.dev")
+    monkeypatch.setenv("FLOTTA_GIT_EMAIL_DOMAIN", "agents.example.com")
+    _remote(monkeypatch)
+    _, result = _token_box(tmp_path, monkeypatch)
+    assert "FLOTTA_GIT_EMAIL_DOMAIN=agents.example.com" in result.stdout
+
+
+def test_no_domain_emits_no_email_domain(tmp_path, monkeypatch):
+    """The entrypoint owns the fallback. Resolving it here would freeze today's
+    answer into a Fly secret, where a later change to the default could not
+    reach it."""
+    _remote(monkeypatch)
+    _, result = _token_box(tmp_path, monkeypatch)
+    assert "FLOTTA_GIT_EMAIL_DOMAIN" not in result.stdout
+
+
 # -- `flotta repo` against a deployed fleet ---------------------------------
 
 
