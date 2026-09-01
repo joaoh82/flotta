@@ -646,12 +646,73 @@ def test_token_box_says_so_when_the_control_url_is_missing(tmp_path, monkeypatch
     assert "FLOTTA_CONTROL_URL" in result.output
 
 
-def test_token_box_includes_the_control_url_when_it_knows_it(tmp_path, monkeypatch):
-    """The whole point of an env block is that it can be piped into
-    `flyctl secrets import` without editing."""
+# -- reaching a deployed fleet ----------------------------------------------
+#
+# `just box-identity eng-a` failed with "no fleet-state store at ./fleet.db" on
+# the one machine it exists to be run from. A deployed fleet's rows are in the
+# control plane's Postgres, and a store-first command cannot see them without
+# putting the production database URL on a laptop.
+
+
+def _remote(monkeypatch, box=None, fail=None):
+    """Stand in for the fleet API and record what was asked of it."""
+    from flotta import cli
+
+    calls = []
+
+    def fake(method, path, *, scopes, body=None, **kw):
+        calls.append((method, path, sorted(scopes), body))
+        if fail is not None:
+            raise cli.ControlPlaneError(fail)
+        return box if box is not None else {"id": "b-remote", "name": "eng-a"}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    return calls
+
+
+def test_token_box_resolves_the_box_through_the_fleet_api(tmp_path, monkeypatch):
+    """Not through a local store. There is no local store on a laptop that has
+    only ever talked to a deployed control plane."""
     monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    calls = _remote(monkeypatch, box={"id": "b-remote", "name": "eng-a"})
     _, result = _token_box(tmp_path, monkeypatch)
+
+    assert result.exit_code == 0
+    assert [c[0] for c in calls] == ["GET"]
+    assert calls[0][1] == "/api/boxes/eng-a"
+    assert calls[0][2] == ["fleet:read"], "reading a box must not need write"
+    assert "FLOTTA_BOX_ID=b-remote" in result.stdout
     assert "FLOTTA_CONTROL_URL=https://control.example" in result.stdout
+
+
+def test_token_box_signs_the_remote_id_not_the_local_one(tmp_path, monkeypatch):
+    """The subject is checked against the box in the credential URL, so a token
+    signed for a stale local id authenticates as nobody."""
+    from flotta.auth import box_subject, verify
+
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    _remote(monkeypatch, box={"id": "b-remote", "name": "eng-a"})
+    _, result = _token_box(tmp_path, monkeypatch)
+
+    value = next(
+        line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("FLOTTA_BOX_TOKEN=")
+    )
+    assert verify(value, key="k" * 32).subject == box_subject("b-remote")
+
+
+def test_token_box_reports_a_control_plane_failure_instead_of_printing_half(tmp_path, monkeypatch):
+    """`just box-identity` pipes this into `flyctl secrets import`. A command
+    that prints part of an env block and exits 0 would load a broken identity
+    onto a machine."""
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    _remote(monkeypatch, fail="GET /api/boxes/eng-a -> 404: no box 'eng-a'")
+    _, result = _token_box(tmp_path, monkeypatch)
+
+    assert result.exit_code != 0
+    assert "FLOTTA_BOX_" not in result.stdout
+    assert "no box 'eng-a'" in result.output
 
 
 def test_token_box_reads_the_control_url_from_a_dotenv(tmp_path, monkeypatch):
@@ -661,5 +722,79 @@ def test_token_box_reads_the_control_url_from_a_dotenv(tmp_path, monkeypatch):
     the tests above need `chdir` — one of the two had to be written down."""
     (tmp_path / ".env").write_text("FLOTTA_CONTROL_URL=https://from-dotenv.example\n")
     monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    _remote(monkeypatch, box={"id": "b-remote", "name": "eng-a"})
     _, result = _token_box(tmp_path, monkeypatch)
     assert "FLOTTA_CONTROL_URL=https://from-dotenv.example" in result.stdout
+
+
+# -- `flotta repo` against a deployed fleet ---------------------------------
+
+
+def _repo_cmd(tmp_path, monkeypatch, argv, box=None, fail=None):
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    calls = _remote(monkeypatch, box=box, fail=fail)
+    return calls, CliRunner().invoke(app, argv)
+
+
+def test_repo_grant_goes_to_the_control_plane_and_needs_write(tmp_path, monkeypatch):
+    calls, result = _repo_cmd(
+        tmp_path,
+        monkeypatch,
+        ["repo", "grant", "eng-a", "joaoh82/flotta"],
+        box={"id": "b-remote", "name": "eng-a", "repos": ["joaoh82/flotta"]},
+    )
+    assert result.exit_code == 0
+    assert calls[-1][0:2] == ("POST", "/api/boxes/b-remote/repos")
+    assert calls[-1][2] == ["fleet:write"]
+    assert calls[-1][3] == {"repo": "joaoh82/flotta"}
+
+
+def test_repo_list_needs_only_read(tmp_path, monkeypatch):
+    """Seeing which repositories a box may use is not permission to change them."""
+    calls, result = _repo_cmd(
+        tmp_path,
+        monkeypatch,
+        ["repo", "list", "eng-a"],
+        box={"id": "b-remote", "name": "eng-a", "repos": ["joaoh82/flotta"]},
+    )
+    assert result.exit_code == 0
+    assert {s for c in calls for s in c[2]} == {"fleet:read"}
+
+
+def test_repo_revoke_normalises_before_building_the_url(tmp_path, monkeypatch):
+    """The path is `/repos/{owner}/{name}`. Sending a URL would produce
+    `/repos/https:/github.com/...` and delete nothing while reporting success."""
+    calls, result = _repo_cmd(
+        tmp_path,
+        monkeypatch,
+        ["repo", "revoke", "eng-a", "https://github.com/joaoh82/Flotta.git"],
+        box={"id": "b-remote", "name": "eng-a", "revoked": True, "repos": []},
+    )
+    assert result.exit_code == 0
+    assert calls[-1][0:2] == ("DELETE", "/api/boxes/b-remote/repos/joaoh82/flotta")
+
+
+def test_a_malformed_repository_never_reaches_the_control_plane(tmp_path, monkeypatch):
+    """Exit 2 — a refusal, not a failure. Checked locally so a typo costs a
+    round trip to nothing."""
+    calls, result = _repo_cmd(tmp_path, monkeypatch, ["repo", "grant", "eng-a", "not-a-repo"])
+    assert result.exit_code == 2
+    assert calls == []
+
+
+def test_repo_reports_a_refusal_rather_than_a_traceback(tmp_path, monkeypatch):
+    calls, result = _repo_cmd(
+        tmp_path,
+        monkeypatch,
+        ["repo", "grant", "eng-a", "joaoh82/flotta"],
+        fail="POST /api/boxes/eng-a/repos -> 403: token lacks scope(s): fleet:write",
+    )
+    assert result.exit_code == 1
+    assert "fleet:write" in result.output
+    assert "Traceback" not in result.output
