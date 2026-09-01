@@ -476,9 +476,20 @@ box-identity NAME: fly-whoami
     set -euo pipefail
     APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
     : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the helper has nowhere to ask without it}"
-    # Piped rather than passed as arguments, like door-secrets: a token in argv
-    # is a token in `ps` and in your shell history.
-    uv run flotta token box {{NAME}} | flyctl secrets import --app "$APP"
+    # Minted into a variable FIRST, then piped. Straight into the pipe, a
+    # failure to mint still ran `flyctl secrets import` — on empty stdin, which
+    # merely errored, but the same shape with *partial* output would load half
+    # an identity onto the machine. `set -e` catches the assignment; the emptiness
+    # check catches a command that fails by printing nothing and exiting 0.
+    #
+    # A variable rather than arguments, like door-secrets: a token in argv is a
+    # token in `ps` and in your shell history.
+    IDENTITY=$(uv run flotta token box {{NAME}})
+    if [ -z "$IDENTITY" ]; then
+      echo "no identity was minted for {{NAME}} — nothing sent to Fly" >&2
+      exit 1
+    fi
+    printf '%s\n' "$IDENTITY" | flyctl secrets import --app "$APP"
     echo "loaded {{NAME}}'s identity onto $APP (values not echoed)"
     echo "grant it a repository next: uv run flotta repo grant {{NAME}} owner/name"
 

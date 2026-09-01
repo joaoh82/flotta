@@ -46,6 +46,7 @@ requires Modal credentials — losing a property worth keeping.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from dataclasses import asdict
@@ -365,6 +366,125 @@ def _require_box(store: FleetStore, box_id: str) -> Box:
         typer.secho(f"no box with id or name {box_id!r}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     return box
+
+
+# -- reaching a deployed fleet ----------------------------------------------
+#
+# `repo` and `token box` were written store-first, and a store-first command
+# does not work against a fleet that is deployed: the rows live in the control
+# plane's Postgres, and the alternative is putting the production database URL
+# on a laptop.
+#
+# `chat` already solved this — it goes through the door and needs no store at
+# all. These need the *fleet API* rather than the door, but the principle is
+# the same: the operator has a URL and a key, not a copy of the fleet.
+
+CONTROL_URL_ENV = "FLOTTA_CONTROL_URL"
+CONTROL_TOKEN_ENV = "FLOTTA_CONTROL_TOKEN"
+
+
+class ControlPlaneError(Exception):
+    """The control plane refused, or could not be reached."""
+
+
+def control_url(env: dict[str, str] | None = None) -> str | None:
+    """Where the fleet API lives, if this machine knows."""
+    env = os.environ if env is None else env
+    return (env.get(CONTROL_URL_ENV) or "").strip() or None
+
+
+def control_token(*scopes: str, env: dict[str, str] | None = None) -> str:
+    """A token for the fleet API — supplied, or minted from the signing key.
+
+    Minting rather than requiring a pasted `$FLOTTA_CONTROL_TOKEN` is the same
+    choice `just door-secrets` makes: a token minted from the key that has to
+    verify it cannot drift from it, and a mismatch surfaces as `bad signature`,
+    which reads like a broken token rather than two different keys.
+
+    It also means `just box-identity` works with the `.env` an operator already
+    has. Requiring one more secret to do a thing the signing key can already
+    authorise is a step that exists only to be forgotten.
+    """
+    env = os.environ if env is None else env
+    supplied = (env.get(CONTROL_TOKEN_ENV) or "").strip()
+    if supplied:
+        return supplied
+
+    from flotta.auth import AuthError, mint
+
+    try:
+        # Minutes, not days. This is minted per invocation for one request; a
+        # long life would only widen the window if it leaked from a shell.
+        return mint(subject="cli", scopes=set(scopes), ttl_s=300, env=env)
+    except AuthError as exc:
+        raise ControlPlaneError(
+            f"cannot authenticate to {control_url(env)}: {exc}\n"
+            f"Set ${CONTROL_TOKEN_ENV}, or $FLOTTA_SIGNING_KEY to mint one."
+        ) from exc
+
+
+def control_request(
+    method: str,
+    path: str,
+    *,
+    scopes: tuple[str, ...],
+    body: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+    timeout_s: float = 30.0,
+) -> Any:
+    """One call to the fleet API. Returns the decoded body.
+
+    stdlib rather than httpx: the CLI is installed with `uv tool install .` and
+    httpx is not a runtime dependency of it. Reaching for one here would make
+    `flotta repo list` fail to import on a machine where `flotta chat` works.
+    """
+    import urllib.error
+    import urllib.request
+
+    base = control_url(env)
+    if base is None:
+        raise ControlPlaneError(f"${CONTROL_URL_ENV} is not set")
+
+    url = f"{base.rstrip('/')}{path}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={
+            "Authorization": f"Bearer {control_token(*scopes, env=env)}",
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = json.loads(exc.read().decode()).get("detail", "")
+        raise ControlPlaneError(f"{method} {path} -> {exc.code}: {detail or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise ControlPlaneError(f"cannot reach the control plane at {base}: {exc.reason}") from exc
+
+
+def _remote_box(box_id: str) -> dict[str, Any]:
+    """A box's row from the fleet API. `{id, name, ...}`."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    box = control_request("GET", f"/api/boxes/{box_id}", scopes=(SCOPE_FLEET_READ,))
+    # The endpoint answers with the box itself or wraps it; accept both rather
+    # than coupling the CLI to a response shape it does not own.
+    if isinstance(box, dict) and "box" in box:
+        box = box["box"]
+    if not isinstance(box, dict) or not box.get("id"):
+        raise ControlPlaneError(f"the control plane returned no box for {box_id!r}")
+    return box
+
+
+def _fail(exc: Exception, code: int = 1):
+    typer.secho(str(exc), fg=typer.colors.RED, err=True)
+    return typer.Exit(code=code)
 
 
 def _resolve_task(store: FleetStore, ident: str) -> Task:
@@ -1037,20 +1157,39 @@ def repo_grant(
     holds no GitHub credential itself — see `flotta.control.app.git_credential`
     for what that does and does not enforce.
     """
+    from flotta.auth import SCOPE_FLEET_WRITE
     from flotta.store import normalise_repo
 
-    with _open_store(store) as fleet:
-        box = _require_box(fleet, box_id)
+    try:
+        normalise_repo(repo)
+    except ValueError as exc:
+        raise _fail(exc, code=2) from exc
+
+    if control_url():
         try:
-            normalise_repo(repo)
-        except ValueError as exc:
-            typer.secho(str(exc), fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=2) from exc
-        granted = fleet.grant_repo(box.id, repo)
-        fleet.add_event("box", box.id, "repo_granted", {"repo": granted})
+            box = _remote_box(box_id)
+            body = control_request(
+                "POST",
+                f"/api/boxes/{box['id']}/repos",
+                scopes=(SCOPE_FLEET_WRITE,),
+                body={"repo": repo},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
         emit(
-            {"box_id": box.id, "name": box.name, "repos": fleet.repos_for_box(box.id)},
-            f"{box.name} may now use {granted}",
+            {"box_id": box["id"], "name": box["name"], "repos": body["repos"]},
+            f"{box['name']} may now use {normalise_repo(repo)}",
+            as_json=as_json,
+        )
+        return
+
+    with _open_store(store) as fleet:
+        box_row = _require_box(fleet, box_id)
+        granted = fleet.grant_repo(box_row.id, repo)
+        fleet.add_event("box", box_row.id, "repo_granted", {"repo": granted})
+        emit(
+            {"box_id": box_row.id, "name": box_row.name, "repos": fleet.repos_for_box(box_row.id)},
+            f"{box_row.name} may now use {granted}",
             as_json=as_json,
         )
 
@@ -1067,14 +1206,35 @@ def repo_revoke(
     Takes effect on the box's next credential request — no redeploy and no
     restart, because the box holds nothing to invalidate.
     """
-    with _open_store(store) as fleet:
-        box = _require_box(fleet, box_id)
-        had = fleet.revoke_repo(box.id, repo)
-        if had:
-            fleet.add_event("box", box.id, "repo_revoked", {"repo": repo})
+    from flotta.auth import SCOPE_FLEET_WRITE
+    from flotta.store import normalise_repo
+
+    if control_url():
+        try:
+            slug = normalise_repo(repo)
+            box = _remote_box(box_id)
+            body = control_request(
+                "DELETE", f"/api/boxes/{box['id']}/repos/{slug}", scopes=(SCOPE_FLEET_WRITE,)
+            )
+        except ValueError as exc:
+            raise _fail(exc, code=2) from exc
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
         emit(
-            {"box_id": box.id, "revoked": had, "repos": fleet.repos_for_box(box.id)},
-            f"{box.name} {'no longer uses' if had else 'was not using'} {repo}",
+            {"box_id": box["id"], "revoked": body["revoked"], "repos": body["repos"]},
+            f"{box['name']} {'no longer uses' if body['revoked'] else 'was not using'} {slug}",
+            as_json=as_json,
+        )
+        return
+
+    with _open_store(store) as fleet:
+        box_row = _require_box(fleet, box_id)
+        had = fleet.revoke_repo(box_row.id, repo)
+        if had:
+            fleet.add_event("box", box_row.id, "repo_revoked", {"repo": repo})
+        emit(
+            {"box_id": box_row.id, "revoked": had, "repos": fleet.repos_for_box(box_row.id)},
+            f"{box_row.name} {'no longer uses' if had else 'was not using'} {repo}",
             as_json=as_json,
         )
 
@@ -1086,11 +1246,29 @@ def repo_list(
     as_json: bool = JsonOpt,
 ) -> None:
     """Every repository a box may use."""
-    with _open_store(store) as fleet:
-        box = _require_box(fleet, box_id)
-        repos = fleet.repos_for_box(box.id)
+    from flotta.auth import SCOPE_FLEET_READ
+
+    if control_url():
+        try:
+            box = _remote_box(box_id)
+            body = control_request(
+                "GET", f"/api/boxes/{box['id']}/repos", scopes=(SCOPE_FLEET_READ,)
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        repos = body["repos"]
         emit(
-            {"box_id": box.id, "name": box.name, "repos": repos},
+            {"box_id": box["id"], "name": box["name"], "repos": repos},
+            "\n".join(f"  {r}" for r in repos) or "  (none — public repositories only)",
+            as_json=as_json,
+        )
+        return
+
+    with _open_store(store) as fleet:
+        box_row = _require_box(fleet, box_id)
+        repos = fleet.repos_for_box(box_row.id)
+        emit(
+            {"box_id": box_row.id, "name": box_row.name, "repos": repos},
             "\n".join(f"  {r}" for r in repos) or "  (none — public repositories only)",
             as_json=as_json,
         )
@@ -1200,25 +1378,36 @@ def token_box(
     """
     from flotta.auth import SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
 
-    with _open_store(store) as fleet:
-        box = _require_box(fleet, box_id)
+    # Resolved through the fleet API when there is one. A deployed fleet's rows
+    # live in the control plane's Postgres, and the store-only version of this
+    # command failed with "no fleet-state store at ./fleet.db" on the one
+    # machine it was written to be run from — the operator's laptop.
+    base = control_url()
+    if base:
+        try:
+            found = _remote_box(box_id)
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        box_identity, box_name = found["id"], found["name"]
+    else:
+        with _open_store(store) as fleet:
+            row = _require_box(fleet, box_id)
+            box_identity, box_name = row.id, row.name
 
     try:
         value = mint(
-            subject=box_subject(box.id),
+            subject=box_subject(box_identity),
             scopes={SCOPE_GIT_CREDENTIAL},
             ttl_s=days * 24 * 3600,
         )
     except AuthError as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+        raise _fail(exc, code=2) from exc
 
-    control_url = (os.environ.get("FLOTTA_CONTROL_URL") or "").strip()
-    typer.echo(f"FLOTTA_BOX_ID={box.id}")
-    typer.echo(f"FLOTTA_BOX_NAME={box.name}")
+    typer.echo(f"FLOTTA_BOX_ID={box_identity}")
+    typer.echo(f"FLOTTA_BOX_NAME={box_name}")
     typer.echo(f"FLOTTA_BOX_TOKEN={value}")
-    if control_url:
-        typer.echo(f"FLOTTA_CONTROL_URL={control_url}")
+    if base:
+        typer.echo(f"FLOTTA_CONTROL_URL={base}")
     else:
         typer.secho(
             "\n$FLOTTA_CONTROL_URL is not set here, so it is not in the block above.\n"
@@ -1228,7 +1417,7 @@ def token_box(
         )
 
     typer.secho(
-        f"\n{box.name} · git:credential · expires in {days}d\n"
+        f"\n{box_name} · git:credential · expires in {days}d\n"
         "Load it onto the machine with `just box-identity`, which pipes this\n"
         "into `flyctl secrets import` so no value lands in your shell history.",
         fg=typer.colors.BRIGHT_BLACK,
