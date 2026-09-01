@@ -586,6 +586,18 @@ def _token_box(tmp_path, monkeypatch, *args):
     from flotta.cli import app
     from flotta.store import FleetStore
 
+    # Run from a directory with no `.env`. The CLI loads one at startup (#46),
+    # relative to the working directory — so without this, these tests read the
+    # developer's real control-plane URL and a `monkeypatch.delenv` is undone by
+    # the CLI itself, one frame later.
+    #
+    # It fails only for people who have deployed, which is nobody in CI. That is
+    # the same shape as the fifteen control-plane tests that returned 401
+    # locally and passed everywhere else, and the autouse fixture that strips
+    # `FLOTTA_*` cannot catch it: the file is re-read at run time, after the
+    # environment has been cleaned.
+    monkeypatch.chdir(tmp_path)
+
     store = tmp_path / "fleet.db"
     fleet = FleetStore(store)
     box = fleet.create_box("eng-a")
@@ -640,3 +652,14 @@ def test_token_box_includes_the_control_url_when_it_knows_it(tmp_path, monkeypat
     monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
     _, result = _token_box(tmp_path, monkeypatch)
     assert "FLOTTA_CONTROL_URL=https://control.example" in result.stdout
+
+
+def test_token_box_reads_the_control_url_from_a_dotenv(tmp_path, monkeypatch):
+    """Deliberate, not incidental: `just box-identity` runs this in a checkout
+    where `FLOTTA_CONTROL_URL` lives in `.env` and nowhere else, so reading the
+    file is the feature. Pinned here because the same behaviour is what makes
+    the tests above need `chdir` — one of the two had to be written down."""
+    (tmp_path / ".env").write_text("FLOTTA_CONTROL_URL=https://from-dotenv.example\n")
+    monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    _, result = _token_box(tmp_path, monkeypatch)
+    assert "FLOTTA_CONTROL_URL=https://from-dotenv.example" in result.stdout

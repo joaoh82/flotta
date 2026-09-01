@@ -15,6 +15,24 @@ who runs it.
 So every `FLOTTA_*` variable is stripped before each test. A test that wants one
 sets it explicitly with `monkeypatch.setenv`, which is also the only way to read
 a test and know what environment it runs in.
+
+## What this fixture cannot do
+
+It strips the environment **once**, before the test. It cannot stop code under
+test from reading `.env` *again* at run time — and the CLI does exactly that,
+loading it in its root callback (#46) relative to the working directory, which
+under pytest is the repo root.
+
+So `monkeypatch.delenv("FLOTTA_CONTROL_URL")` followed by a `CliRunner` call is
+undone by the CLI one frame later, and the test passes everywhere except on the
+machine of someone who has deployed. That is the same shape as the fifteen
+tests above, arrived at from the other direction.
+
+The fix is per-test rather than here: a CLI test invokes the app from a
+directory with no `.env` (`monkeypatch.chdir(tmp_path)`). Redirecting the
+default path globally was rejected — it would make the CLI's own dotenv
+behaviour untestable, and that behaviour is what `just box-identity` depends
+on. See `test_cli.py::_token_box` and the test directly below it.
 """
 
 from __future__ import annotations
