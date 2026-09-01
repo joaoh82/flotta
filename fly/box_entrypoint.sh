@@ -109,7 +109,8 @@ git config --global --replace-all user.name "$BOX_NAME"
 #
 # So the address comes from a domain nobody else can hold. `$FLOTTA_DOMAIN`
 # when the fleet has one; otherwise `.invalid`, which RFC 2606 reserves and no
-# registry will ever sell — an address that cannot be verified on a GitHub
+# registry will ever sell (RFC 2606, carried forward by RFC 6761) — an address
+# that cannot be verified on a GitHub
 # account cannot be linked to one.
 #
 # Not "pick a name that is not taken": usernames are registered continuously,

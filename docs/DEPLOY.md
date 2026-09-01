@@ -275,14 +275,20 @@ task, not two.
 ### 7c. Prove it
 
 Ask the agent to clone the private repo, make a commit and push a branch. The
-commit will be authored by `eng-a <eng-a@$FLOTTA_DOMAIN>` — or
-`eng-a@boxes.invalid` if the fleet has no domain set.
+commit will be authored by `eng-a <eng-a@$FLOTTA_DOMAIN>` — **provided
+`FLOTTA_DOMAIN` was set in `.env` when you ran `just box-identity`**, which is
+the only channel that carries it to the machine. Otherwise the box falls back
+to `eng-a@boxes.invalid`.
+
+Set `FLOTTA_GIT_EMAIL_DOMAIN` instead to put agent commits on a different
+domain you own. Either way, changing it means re-running `box-identity` — the
+box reads the value at boot, from its secrets.
 
 > **Not a `users.noreply.github.com` address, and this is deliberate.** The
 > legacy noreply format is `<login>@users.noreply.github.com` and GitHub still
 > links it to that account. A box named `eng-a` had its first commit attributed
 > to github.com/Eng-A — a real person. The address a box commits under has to
-> be one nobody can hold, which is why the fallback is the RFC 2606 `.invalid`
+> be one nobody can hold, which is why the fallback is the reserved `.invalid`
 > TLD rather than a name that merely looks unclaimed.
 
 If it cannot, the reason is on git's stderr, prefixed `flotta:` — the box's

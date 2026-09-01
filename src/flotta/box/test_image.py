@@ -185,14 +185,15 @@ def test_the_commit_address_is_never_a_github_noreply():
 
 def test_the_fallback_email_domain_can_never_be_registered():
     """A fleet with no domain still needs an address nobody can claim.
-    `.invalid` is reserved by RFC 2606 and no registry will ever sell it, so it
-    cannot be verified on a GitHub account and therefore cannot be linked to
-    one. "Pick a name nobody has taken" is not an alternative: usernames are
+    `.invalid` is reserved by RFC 2606, carried forward by RFC 6761, and no
+    registry will ever sell it — so the address cannot be verified on a GitHub
+    account and therefore cannot be linked to one. "Pick a name nobody has
+    taken" is not an alternative: usernames are
     registered continuously, so it can stop being true after the box exists."""
-    default = next(
-        line for line in _entrypoint().splitlines() if "FLOTTA_GIT_EMAIL_DOMAIN:=" in line
+    assert '"${FLOTTA_GIT_EMAIL_DOMAIN:=${FLOTTA_DOMAIN:-boxes.invalid}}"' in _entrypoint(), (
+        "the fallback must be a literal reserved-TLD domain — asserting only that "
+        "'.invalid' appears somewhere in the line would pass for `cdn.invalid-x.com`"
     )
-    assert ".invalid" in default
 
 
 def test_the_gh_shim_falls_through_rather_than_failing():
