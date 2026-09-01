@@ -1789,3 +1789,127 @@ def test_the_idle_threshold_comes_from_the_environment(monkeypatch):
     monkeypatch.setenv("FLOTTA_IDLE_AFTER_S", "120")
     assert resolve_idle_after() == 120
     assert resolve_idle_after(45) == 45, "an explicit value wins over the environment"
+
+
+# -- FLOTTA-21: a box gets its identity when it is created ------------------
+#
+# `just box-identity` was a second command, run from a shell, against a store a
+# deployed fleet does not use. That is wrong for the caller this is built for:
+# `POST /api/boxes` is one request, and M8's "create Agent B" is one button in
+# an app that has no `flyctl`.
+
+
+class Recording(FakeBackend):
+    """Keeps the spec it was handed, which is the thing under test here."""
+
+    def create(self, spec):
+        from flotta.backend import BoxHandle
+
+        self.calls.append("create")
+        self.spec = spec
+        return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+
+def _created(store, monkeypatch, **env):
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    impl = Recording()
+    out = create_box("eng-a", store=store, backend=impl)
+    return impl.spec, store.get_box(out["box_id"])
+
+
+def test_a_created_box_carries_its_own_identity(store, monkeypatch):
+    spec, box = _created(store, monkeypatch)
+    assert spec.env["FLOTTA_BOX_ID"] == box.id
+    assert spec.env["FLOTTA_BOX_NAME"] == "eng-a"
+    assert "FLOTTA_BOX_TOKEN" in spec.secrets
+
+
+def test_the_token_is_a_secret_and_never_an_env_var(store, monkeypatch):
+    """The load-bearing assertion. `BoxSpec.env` becomes `--env` on Fly, which
+    `fly machine status` prints — so a token there is a token anyone with read
+    access to the app can lift, and the whole design of the credential helper
+    is that no such value exists on the machine."""
+    spec, _ = _created(store, monkeypatch)
+    token = spec.secrets["FLOTTA_BOX_TOKEN"]
+    assert token not in spec.env.values()
+    assert not any(k.endswith("TOKEN") for k in spec.env), spec.env
+
+
+def test_the_token_speaks_only_for_this_box(store, monkeypatch):
+    from flotta.auth import box_subject, verify
+
+    spec, box = _created(store, monkeypatch)
+    claims = verify(spec.secrets["FLOTTA_BOX_TOKEN"], key="k" * 32)
+    assert claims.subject == box_subject(box.id)
+    assert claims.scopes == frozenset({"git:credential"})
+
+
+def test_the_control_url_and_email_domain_travel_with_it(store, monkeypatch):
+    """The channel that did not exist. `fly.toml [env]` names three variables,
+    the image bakes nothing, and `BoxSpec(name=name)` passed an empty env — so
+    `$FLOTTA_DOMAIN` was documented as reaching a box and reached nothing."""
+    spec, _ = _created(
+        store,
+        monkeypatch,
+        FLOTTA_CONTROL_URL="https://control.example",
+        FLOTTA_DOMAIN="flotta.dev",
+    )
+    assert spec.env["FLOTTA_CONTROL_URL"] == "https://control.example"
+    assert spec.env["FLOTTA_GIT_EMAIL_DOMAIN"] == "flotta.dev"
+
+
+def test_what_is_unknown_is_omitted_not_guessed(store, monkeypatch):
+    """The entrypoint owns the `boxes.invalid` fallback. Resolving it here
+    would freeze today's default into a machine's configuration, where a later
+    change to that default could not reach it."""
+    spec, _ = _created(store, monkeypatch)
+    assert "FLOTTA_GIT_EMAIL_DOMAIN" not in spec.env
+    assert "FLOTTA_CONTROL_URL" not in spec.env
+
+
+def test_a_box_is_still_creatable_with_no_signing_key(store):
+    """The loopback development path has no key at all — `require()` admits
+    every request there. Making identity a prerequisite would make auth a
+    prerequisite for having a fleet."""
+    impl = Recording()
+    out = create_box("eng-a", store=store, backend=impl)
+    assert out["status"] == "running"
+    assert impl.spec.secrets == {}
+    assert impl.spec.env["FLOTTA_BOX_NAME"] == "eng-a"
+
+    kinds = [e.type for e in store.get_events("box", out["box_id"])]
+    assert "identity_skipped" in kinds
+    assert "identity_minted" not in kinds
+
+
+def test_expiry_is_recorded_where_an_operator_can_see_it(store, monkeypatch):
+    """As an event, not a column: the store has no migration path, so a new
+    column would not appear on an existing fleet. An identity that expires
+    silently fails days later as a clone that cannot authenticate."""
+    from flotta.auth import verify
+
+    spec, box = _created(store, monkeypatch)
+    minted = [e for e in store.get_events("box", box.id) if e.type == "identity_minted"]
+    assert len(minted) == 1
+    assert (
+        minted[0].payload["expires_at"]
+        == verify(spec.secrets["FLOTTA_BOX_TOKEN"], key="k" * 32).expires_at
+    )
+
+
+def test_an_explicit_spec_is_not_overwritten_by_the_identity(store, monkeypatch):
+    """A caller that passed env meant it. Identity fills gaps, it does not win."""
+    from flotta.backend import BoxSpec
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    impl = Recording()
+    create_box(
+        "eng-a",
+        store=store,
+        backend=impl,
+        spec=BoxSpec(name="eng-a", env={"FLOTTA_BOX_NAME": "chosen-by-caller"}),
+    )
+    assert impl.spec.env["FLOTTA_BOX_NAME"] == "chosen-by-caller"
+    assert "FLOTTA_BOX_ID" in impl.spec.env, "the rest of the identity still arrives"

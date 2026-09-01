@@ -58,6 +58,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -331,6 +332,74 @@ def _require_task(store: FleetStore, task_id: str) -> Task:
     return task
 
 
+#: A box token's default lifetime. Longer than a person's (30d) on purpose: a
+#: box is unattended, so an expiry is a capability that stops working while
+#: nobody is watching, and the failure surfaces days later as a clone that
+#: cannot authenticate. The token is also the narrowest in the system —
+#: `git:credential` only, confined to one box — so a longer life buys less
+#: for an attacker than it costs in silent breakage.
+#:
+#: Rotation is still the answer, not a longer number: `just box-identity`.
+BOX_TOKEN_TTL_S = 90 * 24 * 3600
+
+
+def build_identity(
+    box_id: str,
+    box_name: str,
+    *,
+    ttl_s: int = BOX_TOKEN_TTL_S,
+    env: dict[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """A box's own identity, split by what may be read off the machine.
+
+    Returns `(env, secrets)`. The split is the point:
+
+    - **env** — `FLOTTA_BOX_ID`, `FLOTTA_BOX_NAME`, and where to reach the
+      control plane and what domain to sign commits under. All of it appears in
+      `fly machine status`, and none of it is a secret.
+    - **secrets** — `FLOTTA_BOX_TOKEN`, and nothing else. It authenticates as
+      the box, so it must never be in the machine's configuration.
+
+    Everything is omitted rather than guessed. A box with no token still boots
+    and still commits under its own name; it just cannot fetch a GitHub
+    credential, which is the same state every box was in before this existed.
+
+    Shared with `flotta token box` so the block that command prints is exactly
+    what creation injects. Two builders would drift, and the drift would be
+    invisible until a rotated identity behaved differently from a fresh one.
+    """
+    source = os.environ if env is None else env
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
+
+    box_env = {"FLOTTA_BOX_ID": box_id, "FLOTTA_BOX_NAME": box_name}
+
+    control_url = (source.get("FLOTTA_CONTROL_URL") or "").strip()
+    if control_url:
+        box_env["FLOTTA_CONTROL_URL"] = control_url
+
+    email_domain = (
+        source.get("FLOTTA_GIT_EMAIL_DOMAIN") or source.get("FLOTTA_DOMAIN") or ""
+    ).strip()
+    if email_domain:
+        box_env["FLOTTA_GIT_EMAIL_DOMAIN"] = email_domain
+
+    try:
+        token = mint(
+            subject=box_subject(box_id),
+            scopes={SCOPE_GIT_CREDENTIAL},
+            ttl_s=ttl_s,
+            env=source,
+        )
+    except AuthError:
+        # No signing key is a legitimate state — it is the whole loopback
+        # development path, where `create_app` admits every request. Refusing
+        # to create a box because auth is unconfigured would make identity a
+        # prerequisite for having a fleet at all.
+        return box_env, {}
+
+    return box_env, {"FLOTTA_BOX_TOKEN": token}
+
+
 def create_box(
     name: str,
     *,
@@ -372,8 +441,22 @@ def create_box(
     box = store.create_box(name)
     store.add_event("box", box.id, "provisioning", {"name": name, "backend": impl.scheme})
 
+    # Identity travels with the machine rather than arriving afterwards. The
+    # ordering already works: `store.create_box` produced the id above, so
+    # `box:<id>` can be signed before anything exists to sign for. Doing it in
+    # a second command — which is what `just box-identity` was — is wrong for a
+    # caller that has no shell: `POST /api/boxes` is one request, and M8's
+    # "create Agent B" is one button.
+    base = spec or BoxSpec(name=name)
+    identity_env, identity_secrets = build_identity(box.id, name)
+    spec = replace(
+        base,
+        env={**identity_env, **base.env},
+        secrets={**identity_secrets, **base.secrets},
+    )
+
     try:
-        handle = impl.create(spec or BoxSpec(name=name))
+        handle = impl.create(spec)
     except Exception as exc:
         # Deliberately broad. This caught only `BackendError`, which is the
         # failure a backend *means* to raise — but a flyctl timeout, an OSError,
@@ -389,6 +472,28 @@ def create_box(
         store.add_event("box", box.id, "torn_down", {"reason": detail})
         store.update_box_status(box.id, "torn_down")
         raise ProvisionError(detail) from exc
+
+    # Recorded as an event rather than a column: the store has no migration
+    # path, so a new column would not appear on an existing fleet. An event
+    # does, it is already polymorphic, and `flotta logs <box>` shows it — which
+    # is how an operator sees an identity approaching expiry before a clone
+    # fails for a reason nothing on the box can explain.
+    if identity_secrets:
+        from flotta.auth import verify
+
+        store.add_event(
+            "box",
+            box.id,
+            "identity_minted",
+            {"expires_at": verify(identity_secrets["FLOTTA_BOX_TOKEN"]).expires_at},
+        )
+    else:
+        store.add_event(
+            "box",
+            box.id,
+            "identity_skipped",
+            {"reason": "no signing key configured; this box cannot fetch git credentials"},
+        )
 
     # `Backend.create` may return before the box is running — the protocol says
     # so, and on a Firecracker pool that will be the normal case. Writing

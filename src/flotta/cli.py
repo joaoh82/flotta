@@ -1361,10 +1361,19 @@ def token_mint(
 @token_app.command("box")
 def token_box(
     box_id: str = typer.Argument(..., help="Box name or id"),
-    days: int = typer.Option(30, "--days", help="Lifetime in days"),
+    days: int = typer.Option(90, "--days", help="Lifetime in days"),
     store: str | None = StoreOpt,
 ) -> None:
     """Mint a box's own identity, as an env block to load onto the machine.
+
+    **Rotation.** A box created by `flotta create` already has an identity —
+    `create_box` mints and injects one, so nothing has to be run afterwards.
+    This is for renewing an identity that is expiring, moving a box to a new
+    control plane, or fixing one that predates all of this.
+
+    90 days by default, matching `provision.BOX_TOKEN_TTL_S`: longer than a
+    person's token because a box is unattended, and an expiry there stops a
+    capability working while nobody is watching.
 
     Four values, not one, because a token alone is not an identity: the box has
     to know which box it is (`FLOTTA_BOX_ID` — it is in the credential URL, not
@@ -1376,7 +1385,8 @@ def token_box(
     That check is the reason it is safe to put a Flotta token on a machine
     whose agent has root.
     """
-    from flotta.auth import SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
+    from flotta.auth import AuthError
+    from flotta.provision import build_identity
 
     # Resolved through the fleet API when there is one. A deployed fleet's rows
     # live in the control plane's Postgres, and the store-only version of this
@@ -1394,40 +1404,25 @@ def token_box(
             row = _require_box(fleet, box_id)
             box_identity, box_name = row.id, row.name
 
-    try:
-        value = mint(
-            subject=box_subject(box_identity),
-            scopes={SCOPE_GIT_CREDENTIAL},
-            ttl_s=days * 24 * 3600,
+    # The same builder `provision.create_box` uses, so this block is exactly
+    # what a freshly created box receives. Two builders would drift, and the
+    # drift would show up as a rotated identity behaving differently from a new
+    # one — which is the hardest kind of difference to notice.
+    box_env, box_secrets = build_identity(box_identity, box_name, ttl_s=days * 24 * 3600)
+    if not box_secrets:
+        raise _fail(
+            AuthError(
+                "no signing key, so there is no token to mint. "
+                "Generate one with `flotta token key` and set it wherever the "
+                "control plane runs."
+            ),
+            code=2,
         )
-    except AuthError as exc:
-        raise _fail(exc, code=2) from exc
 
-    typer.echo(f"FLOTTA_BOX_ID={box_identity}")
-    typer.echo(f"FLOTTA_BOX_NAME={box_name}")
-    typer.echo(f"FLOTTA_BOX_TOKEN={value}")
+    for key, value in {**box_env, **box_secrets}.items():
+        typer.echo(f"{key}={value}")
 
-    # The domain a box signs commits under, carried in the identity block
-    # because that is what an identity is. Nothing else reaches the machine:
-    # `fly.toml [env]` names three variables, `BoxSpec(name=name)` passes an
-    # empty env, and these secrets are the only other channel — so a
-    # `$FLOTTA_DOMAIN` set on a laptop was documented to reach the box and
-    # never did. Every box took the `boxes.invalid` fallback while the runbook
-    # said otherwise, which is the same confident-and-unchecked shape this
-    # command's own commit-address bug had.
-    #
-    # Omitted when the operator has no domain, rather than resolved to the
-    # fallback here: the entrypoint owns that default, and writing it into a
-    # Fly secret would freeze today's answer onto the machine.
-    email_domain = (
-        os.environ.get("FLOTTA_GIT_EMAIL_DOMAIN") or os.environ.get("FLOTTA_DOMAIN") or ""
-    ).strip()
-    if email_domain:
-        typer.echo(f"FLOTTA_GIT_EMAIL_DOMAIN={email_domain}")
-
-    if base:
-        typer.echo(f"FLOTTA_CONTROL_URL={base}")
-    else:
+    if "FLOTTA_CONTROL_URL" not in box_env:
         typer.secho(
             "\n$FLOTTA_CONTROL_URL is not set here, so it is not in the block above.\n"
             "The box needs it too — without it the helper has nowhere to ask.",

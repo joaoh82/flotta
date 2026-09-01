@@ -99,7 +99,20 @@ class BoxSpec:
     #: Where the durable volume is mounted. `HERMES_HOME` lives inside it —
     #: that relocation is the whole of M2.
     mount_path: str = "/data"
+    #: Plain environment. Visible in the machine's configuration — `fly machine
+    #: status` prints it — so nothing here is a secret.
     env: dict[str, str] = field(default_factory=dict)
+    #: Values that must **not** appear in the machine's configuration. Same
+    #: shape as `env` and a different promise, which is the only reason it is a
+    #: second field rather than a flag.
+    #:
+    #: Carried in the spec rather than set by a separate call, because *when*
+    #: they land is provider-specific and only the backend knows it: on Fly
+    #: they must be written to the app before the machine is created, since a
+    #: machine takes its secrets at creation. A `set_secrets()` verb would have
+    #: put that ordering in the caller, where it is neither portable nor
+    #: checkable.
+    secrets: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
