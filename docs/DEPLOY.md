@@ -275,9 +275,15 @@ task, not two.
 ### 7c. Prove it
 
 Ask the agent to clone the private repo, make a commit and push a branch. The
-commit will be authored by `eng-a <eng-a@users.noreply.github.com>` — an
-address that deliberately resolves to no GitHub account, so an agent's commits
-are attributed to the agent and to no person.
+commit will be authored by `eng-a <eng-a@$FLOTTA_DOMAIN>` — or
+`eng-a@boxes.invalid` if the fleet has no domain set.
+
+> **Not a `users.noreply.github.com` address, and this is deliberate.** The
+> legacy noreply format is `<login>@users.noreply.github.com` and GitHub still
+> links it to that account. A box named `eng-a` had its first commit attributed
+> to github.com/Eng-A — a real person. The address a box commits under has to
+> be one nobody can hold, which is why the fallback is the RFC 2606 `.invalid`
+> TLD rather than a name that merely looks unclaimed.
 
 If it cannot, the reason is on git's stderr, prefixed `flotta:` — the box's
 helper passes the control plane's own words through rather than paraphrasing
