@@ -464,6 +464,24 @@ fly-secrets: fly-whoami
 fly-cycle: fly-whoami
     uv run python scripts/m1_backend_cycle.py
 
+# Four values, and the box needs all four: the token is only useful with the id
+# that goes in the credential URL, and commits need the name. The box holds no
+# GitHub credential — this is what lets it ask for one.
+#
+# Setting secrets restarts the machine, which is how a new identity takes
+# effect: the entrypoint writes ~/.gitconfig at boot, from exactly these.
+# FLOTTA-20: load a box's GitHub identity onto its machine (this is how you rotate)
+box-identity NAME: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the helper has nowhere to ask without it}"
+    # Piped rather than passed as arguments, like door-secrets: a token in argv
+    # is a token in `ps` and in your shell history.
+    uv run flotta token box {{NAME}} | flyctl secrets import --app "$APP"
+    echo "loaded {{NAME}}'s identity onto $APP (values not echoed)"
+    echo "grant it a repository next: uv run flotta repo grant {{NAME}} owner/name"
+
 # M3: mint and push the box's dashboard credentials (this is how you rotate)
 fly-auth: fly-whoami
     #!/usr/bin/env bash

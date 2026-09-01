@@ -107,3 +107,75 @@ def test_the_entrypoint_creates_the_workdir():
     the workdir has to exist before the agent's first command."""
     entry = _DOCKERFILE.parent / "box_entrypoint.sh"
     assert 'mkdir -p "$FLOTTA_WORKDIR"' in entry.read_text(encoding="utf-8")
+
+
+# -- GitHub identity (FLOTTA-20) --------------------------------------------
+#
+# All of this lives in a Dockerfile, a shell script and a pyproject entry
+# point, and it only ever runs on a machine in Frankfurt. The failure mode is
+# an agent that reports "permission denied" for a repository it was granted —
+# indistinguishable, from the outside, from a grant that was never made.
+
+
+def _entrypoint() -> str:
+    return (_DOCKERFILE.parent / "box_entrypoint.sh").read_text(encoding="utf-8")
+
+
+def _gh_shim() -> str:
+    return (_DOCKERFILE.parent / "gh_shim.sh").read_text(encoding="utf-8")
+
+
+def test_the_helper_is_registered_under_the_name_git_looks_for():
+    """git resolves `credential.helper = flotta` by finding `git-credential-flotta`
+    on PATH. The console-script name *is* the wiring; renaming it breaks
+    authentication with no error anywhere that mentions the rename."""
+    pyproject = (_DOCKERFILE.parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'git-credential-flotta = "flotta.box.git_credential:main"' in pyproject
+    assert "credential.helper flotta" in _entrypoint()
+
+
+def test_the_repository_path_is_sent_to_the_helper():
+    """Without `useHttpPath`, git asks for "a credential for github.com" and
+    per-box grants have nothing to key on — every box would get every repo."""
+    assert "credential.useHttpPath true" in _entrypoint()
+
+
+def test_a_box_with_no_identity_has_no_helper_configured():
+    """A helper with nothing behind it costs a failed round trip on every fetch
+    and reports it as a credential error, which reads like a revoked grant."""
+    assert "--unset-all credential.helper" in _entrypoint()
+
+
+def test_git_never_prompts_on_a_box():
+    """There is no terminal and nobody is watching: an interactive prompt is a
+    task that hangs until the machine is killed."""
+    assert "GIT_TERMINAL_PROMPT=0" in _entrypoint()
+
+
+def test_commits_are_attributed_to_the_box_and_to_no_person():
+    """`<name>@users.noreply.github.com` deliberately resolves to no account —
+    only `<id>+<login>@` does. A real address here would attribute an agent's
+    commits to a human."""
+    assert "users.noreply.github.com" in _entrypoint()
+    assert 'user.name "$BOX_NAME"' in _entrypoint()
+
+
+def test_the_gh_shim_falls_through_rather_than_failing():
+    """It shadows /usr/bin/gh, so every path it cannot help with must end in
+    the real gh, unchanged. `gh --version` must stay `gh --version`."""
+    shim = _gh_shim()
+    assert shim.count('exec "$REAL_GH" "$@"') >= 3
+    assert 'exec env GH_TOKEN="$token" "$REAL_GH" "$@"' in shim
+
+
+def test_the_gh_shim_does_not_shadow_the_binary_it_wraps():
+    """/usr/local/bin/gh exec'ing /usr/local/bin/gh is an infinite loop, and the
+    Dockerfile installs it to exactly that path."""
+    assert "REAL_GH=/usr/bin/gh" in _gh_shim()
+    assert "COPY fly/gh_shim.sh /usr/local/bin/gh" in _dockerfile()
+
+
+def test_the_gh_shim_reuses_gits_own_credential_path():
+    """Calling the helper directly would let `gh pr create` succeed against a
+    repository `git push` had just refused."""
+    assert "git credential fill" in _gh_shim()

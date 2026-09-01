@@ -1180,6 +1180,62 @@ def token_mint(
     )
 
 
+@token_app.command("box")
+def token_box(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    days: int = typer.Option(30, "--days", help="Lifetime in days"),
+    store: str | None = StoreOpt,
+) -> None:
+    """Mint a box's own identity, as an env block to load onto the machine.
+
+    Four values, not one, because a token alone is not an identity: the box has
+    to know which box it is (`FLOTTA_BOX_ID` — it is in the credential URL, not
+    in the token) and what to sign commits as (`FLOTTA_BOX_NAME`).
+
+    The token carries `git:credential` and nothing else, and its subject is
+    `box:<id>` — which the control plane checks against the box in the request
+    path, so this token cannot mint credentials for anyone else's repositories.
+    That check is the reason it is safe to put a Flotta token on a machine
+    whose agent has root.
+    """
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
+
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+
+    try:
+        value = mint(
+            subject=box_subject(box.id),
+            scopes={SCOPE_GIT_CREDENTIAL},
+            ttl_s=days * 24 * 3600,
+        )
+    except AuthError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    control_url = (os.environ.get("FLOTTA_CONTROL_URL") or "").strip()
+    typer.echo(f"FLOTTA_BOX_ID={box.id}")
+    typer.echo(f"FLOTTA_BOX_NAME={box.name}")
+    typer.echo(f"FLOTTA_BOX_TOKEN={value}")
+    if control_url:
+        typer.echo(f"FLOTTA_CONTROL_URL={control_url}")
+    else:
+        typer.secho(
+            "\n$FLOTTA_CONTROL_URL is not set here, so it is not in the block above.\n"
+            "The box needs it too — without it the helper has nowhere to ask.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+    typer.secho(
+        f"\n{box.name} · git:credential · expires in {days}d\n"
+        "Load it onto the machine with `just box-identity`, which pipes this\n"
+        "into `flyctl secrets import` so no value lands in your shell history.",
+        fg=typer.colors.BRIGHT_BLACK,
+        err=True,
+    )
+
+
 @token_app.command("inspect")
 def token_inspect(
     value: str = typer.Argument(..., help="The token to check"),

@@ -118,6 +118,20 @@ RUN "$HERMES_VENV/bin/pip" install --no-cache-dir -e /app
 COPY fly/box_entrypoint.sh /usr/local/bin/box_entrypoint.sh
 RUN chmod +x /usr/local/bin/box_entrypoint.sh
 
+# ## GitHub identity (FLOTTA-20)
+#
+# `git-credential-flotta` is a console script from the package installed just
+# above — git resolves `credential.helper = flotta` by looking for exactly that
+# name on PATH, so the entry point in pyproject.toml *is* the wiring.
+#
+# The `gh` shim shadows /usr/bin/gh because `gh` has no credential-helper hook
+# and the alternative is a long-lived token in its hosts.yml. Read the header
+# of gh_shim.sh before changing it; it is deliberately transparent.
+COPY fly/gh_shim.sh /usr/local/bin/gh
+RUN chmod +x /usr/local/bin/gh \
+    && test -x /usr/bin/gh \
+    && test -x "$HERMES_VENV/bin/git-credential-flotta"
+
 # tini as PID 1 so a process the agent spawns and abandons is reaped rather
 # than accumulating as a zombie. An agent that runs `npm test` in a loop for a
 # month will produce plenty of those, and nothing else in this container is

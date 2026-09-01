@@ -47,6 +47,7 @@ from flotta.auth import (
     AuthError,
     Token,
     resolve_signing_key,
+    subject_box,
     verify,
 )
 from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loop
@@ -465,7 +466,7 @@ def create_app(
             store.close()
 
     @app.post("/api/boxes/{box_id}/git-credential")
-    def git_credential(box_id: str, body: dict[str, Any], _: Token | None = needs_git) -> Any:
+    def git_credential(box_id: str, body: dict[str, Any], token: Token | None = needs_git) -> Any:
         """Mint a git credential for a repository this box is granted.
 
         Called by the box's git credential helper, which git invokes with the
@@ -483,6 +484,12 @@ def create_app(
         GitHub App installation tokens scoped to `repository_ids`. Stated
         plainly because a soft boundary that reads as a hard one is worse than
         no boundary at all.
+
+        **A box token may only ask about its own box.** Scopes say what a token
+        may do, never to which box, and that gap became load-bearing the moment
+        a `git:credential` token started living on a machine whose agent has
+        root. Without this check one box's token would reach every other box's
+        grants, which is precisely the containment the grants exist to provide.
         """
         source = (os.environ.get(GITHUB_TOKEN_ENV) or "").strip()
         if not source:
@@ -498,6 +505,17 @@ def create_app(
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
 
+            # Before anything else: is this token allowed to speak for this
+            # box? A non-box subject (an operator) is unrestricted — see
+            # `auth.BOX_SUBJECT_PREFIX`.
+            claimed = subject_box(token.subject) if token else None
+            if claimed is not None and claimed not in {box.id, box.name}:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"token for box {claimed!r} cannot mint credentials for "
+                    f"box {box.name!r}",
+                )
+
             repo = str(body.get("repo") or "").strip()
             if not repo:
                 raise HTTPException(status_code=422, detail="which repository?")
@@ -506,7 +524,7 @@ def create_app(
                     raise HTTPException(
                         status_code=403,
                         detail=f"box {box.name!r} is not granted {repo!r}. "
-                        f"Grant it with `flotta grant {box.name} {repo}`.",
+                        f"Grant it with `flotta repo grant {box.name} {repo}`.",
                     )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -236,3 +236,47 @@ def test_generated_keys_are_long_and_distinct():
 def test_the_default_ttl_is_finite():
     """Revocation is coarse, so 'forever' is not an option the default picks."""
     assert 0 < DEFAULT_TTL_S <= 90 * 24 * 3600
+
+
+# -- box subjects -----------------------------------------------------------
+#
+# A scope answers "what may this token do" and never "to which box". The
+# `box:` subject namespace is what answers the second question, and it exists
+# because part 2 puts a token on a machine whose agent has root.
+
+
+def test_a_box_subject_round_trips():
+    from flotta.auth import box_subject, subject_box
+
+    assert subject_box(box_subject("b-123")) == "b-123"
+
+
+@pytest.mark.parametrize("subject", ["joao", "dashboard", "door", "", "boxes:all", "box"])
+def test_anything_else_names_no_box(subject):
+    """The rule is one-directional: a box subject is confined to its box, and
+    every other subject is left alone. A false positive here would confine an
+    operator's token to a box that does not exist."""
+    from flotta.auth import subject_box
+
+    assert subject_box(subject) is None
+
+
+def test_an_empty_box_id_names_no_box():
+    """`box:` alone must not read as "some box" and match by accident."""
+    from flotta.auth import subject_box
+
+    assert subject_box("box:") is None
+    assert subject_box("box:   ") is None
+
+
+def test_a_box_token_carries_the_subject_a_verifier_will_check():
+    """The mint path and the check path have to agree on the string, and they
+    are in different modules."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject, mint, subject_box, verify
+
+    key = "k" * 32
+    token = verify(
+        mint(subject=box_subject("b-9"), scopes={SCOPE_GIT_CREDENTIAL}, key=key), key=key
+    )
+    assert subject_box(token.subject) == "b-9"
+    assert token.scopes == frozenset({SCOPE_GIT_CREDENTIAL})
