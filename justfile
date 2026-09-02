@@ -130,6 +130,34 @@ token-key:
 token-mint SUBJECT SCOPE:
     uv run flotta token mint {{SUBJECT}} --scope {{SCOPE}}
 
+# `tauri dev` runs the Vite server and the Rust shell together, so this is the
+# only command needed — running `npm run dev` alone gives a page in a browser,
+# which is precisely the thing this app is not.
+# M8 — the Flotta app: a window listing your agents (needs a control plane + token)
+app:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd app
+    # `npm ci` like the dashboard recipes: install rewrites the lockfile for
+    # the local platform, and a dev command should not be able to change what
+    # CI installs.
+    [ -d node_modules ] || npm ci
+    npm run tauri dev
+
+# Type-check and lint the app — both halves. `just check` covers neither.
+check-app:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd app
+    [ -d node_modules ] || npm ci
+    npx tsc --noEmit
+    cd src-tauri
+    cargo fmt --check
+    # -D warnings: the Rust half holds the keychain and every outbound
+    # request, so a warning there is worth failing on rather than scrolling
+    # past.
+    cargo clippy --all-targets -- -D warnings
+
 # list available recipes
 default:
     @just --list
@@ -265,8 +293,8 @@ check-dashboard:
 # Exactly what .github/workflows/ci.yml runs, in one command — so "will CI go
 # green?" is answerable before pushing. The workflow's two jobs are separate so
 # a dashboard-only failure is obvious there; here they run in sequence.
-# Everything CI checks (python + dashboard) — no Fly, no cost
-ci: check check-dashboard
+# Everything CI checks (python + dashboard + app) — no Fly, no cost
+ci: check check-dashboard check-app
 
 # M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
 # arguments are re-split by the shell, so `just flotta spawn "a b c"` breaks on

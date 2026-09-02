@@ -1,0 +1,38 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+# The three reasons this is a desktop app rather than a page.
+#
+# `reqwest` — every request to the control plane and to a box is made from
+# here, not from the webview. Requests from Rust are not subject to CORS, so
+# the door needs no cross-origin headers, and the token never has to be handed
+# to JavaScript to make a call.
+#
+# `keyring` — the token lives in the OS keychain. A file in the repo would be
+# committed eventually and `localStorage` is readable by anything that gets
+# script execution in the webview.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
