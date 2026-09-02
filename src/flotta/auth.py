@@ -122,6 +122,29 @@ DEFAULT_TTL_S = 30 * 24 * 3600
 BOX_SUBJECT_PREFIX = "box:"
 
 
+def peek_subject(token: str) -> str | None:
+    """The subject a token *claims*, without verifying anything.
+
+    Deliberately unverified, and safe only for the one use it exists for:
+    letting a holder address the box it is a token for. The box has no signing
+    key — it could not verify if it wanted to — and the control plane verifies
+    on arrival, so a token that lied here would be refused there rather than
+    granted something.
+
+    It exists because a box that reads its own id from *somewhere else* can
+    disagree with its own token. That happened: adopting a machine rotated its
+    secret but not its environment, leaving `FLOTTA_BOX_ID` naming the previous
+    box while the token named the current one — so every credential request
+    addressed one box holding a token for another, and was refused by the very
+    check that makes box tokens safe. One source cannot drift from itself.
+    """
+    try:
+        payload = json.loads(_unb64(token.removeprefix(TOKEN_PREFIX).split(".", 1)[0]))
+        return subject_box(str(payload.get("sub", "")))
+    except Exception:
+        return None
+
+
 def box_subject(box_id: str) -> str:
     """The subject to mint a box's own token under."""
     return f"{BOX_SUBJECT_PREFIX}{box_id}"

@@ -28,7 +28,7 @@ def _offline_config():
     return FlyConfig.from_env({}, dotenv="/nonexistent/.env")
 
 
-def _never_runs(cmd, *, timeout, check):
+def _never_runs(cmd, *, timeout, check, stdin=None):
     raise AssertionError(f"the hermetic suite must not shell out: {cmd}")
 
 
@@ -263,7 +263,7 @@ def test_only_a_complete_release_is_bootable(releases, expected):
 
     backend = FlyBackend(
         config=_offline_config(),
-        runner=lambda cmd, *, timeout, check: subprocess.CompletedProcess(
+        runner=lambda cmd, *, timeout, check, stdin=None: subprocess.CompletedProcess(
             cmd, 0, _json.dumps(releases), ""
         ),
     )
@@ -275,7 +275,9 @@ def test_existing_endpoint_is_none_when_there_is_no_machine():
 
     backend = FlyBackend(
         config=_offline_config(),
-        runner=lambda cmd, *, timeout, check: subprocess.CompletedProcess(cmd, 0, "[]", ""),
+        runner=lambda cmd, *, timeout, check, stdin=None: subprocess.CompletedProcess(
+            cmd, 0, "[]", ""
+        ),
     )
     assert backend.existing_endpoint() is None
 
@@ -294,7 +296,7 @@ def test_create_refuses_before_provisioning_anything_billable():
 
     issued: list[list[str]] = []
 
-    def runner(cmd, *, timeout, check):
+    def runner(cmd, *, timeout, check, stdin=None):
         issued.append(cmd)
         # No apps, no machines, no releases: a completely fresh account.
         return subprocess.CompletedProcess(cmd, 0, "[]", "")
@@ -314,7 +316,7 @@ def test_create_boots_from_an_explicit_image_on_a_fresh_app():
 
     issued: list[list[str]] = []
 
-    def runner(cmd, *, timeout, check):
+    def runner(cmd, *, timeout, check, stdin=None):
         issued.append(cmd)
         if "machines" in cmd and "list" in cmd:
             # empty until the machine is run, then one
@@ -327,3 +329,67 @@ def test_create_boots_from_an_explicit_image_on_a_fresh_app():
     handle = backend.create(BoxSpec(name="eng-a", image="registry.fly.io/x:v1"))
     assert handle.id == "m9"
     assert any("run" in c for c in issued), "should have booted a machine"
+
+
+# -- FLOTTA-21: secrets reach the machine, and only through stdin -----------
+
+
+def _create_with_secrets(secrets):
+    """Drive a fresh-app create and return every (cmd, stdin) it issued."""
+    import json as _json
+    import subprocess
+
+    issued: list[tuple[list[str], str | None]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append((cmd, stdin))
+        if "machines" in cmd and "list" in cmd:
+            ran = any("run" in c for c, _ in issued)
+            body = _json.dumps([{"id": "m9", "state": "started"}] if ran else [])
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+    backend.create(BoxSpec(name="eng-a", image="registry.fly.io/x:v1", secrets=secrets))
+    return issued
+
+
+def test_secrets_are_written_before_the_machine_exists():
+    """A Fly machine takes the app's secrets when it is **created**. Setting
+    them afterwards means a box that boots once without its identity, and
+    `create_box` would report a running box that cannot authenticate — which is
+    exactly the failure this milestone exists to remove.
+
+    This ordering is why secrets travel in the spec rather than through a
+    `set_secrets()` verb: only the backend knows when they have to land."""
+    issued = _create_with_secrets({"FLOTTA_BOX_TOKEN": "flotta_x.y"})
+    order = [i for i, (cmd, _) in enumerate(issued) if "secrets" in cmd or "run" in cmd]
+    kinds = ["secrets" if "secrets" in issued[i][0] else "run" for i in order]
+    assert kinds == ["secrets", "run"], f"wrong order: {kinds}"
+
+
+def test_a_secret_is_piped_and_never_appears_in_argv():
+    """A secret in argv is a secret in `ps` and in a shell's history. The same
+    reason `just door-secrets` and `box-identity` pipe rather than pass."""
+    issued = _create_with_secrets({"FLOTTA_BOX_TOKEN": "flotta_supersecret.sig"})
+    for cmd, _ in issued:
+        assert not any("flotta_supersecret" in arg for arg in cmd), cmd
+    piped = [stdin for cmd, stdin in issued if "secrets" in cmd]
+    assert piped == ["FLOTTA_BOX_TOKEN=flotta_supersecret.sig\n"]
+
+
+def test_no_secrets_means_no_secrets_call():
+    """A fleet with no signing key still creates boxes. An empty
+    `secrets import` is an error from flyctl, not a no-op."""
+    issued = _create_with_secrets({})
+    assert not any("secrets" in cmd for cmd, _ in issued)
+
+
+def test_secrets_are_not_staged():
+    """`--stage` exists because `secrets set` waits for machines to become
+    healthy, which deadlocks when the app cannot be healthy yet. There are no
+    machines here — nothing to wait for — and staging would leave the secrets
+    undeployed for the machine created moments later."""
+    issued = _create_with_secrets({"FLOTTA_BOX_TOKEN": "flotta_x.y"})
+    secrets_cmd = next(cmd for cmd, _ in issued if "secrets" in cmd)
+    assert "--stage" not in secrets_cmd

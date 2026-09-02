@@ -32,10 +32,16 @@ def _run(argv, stdin_text, env=None, fetch=None):
     return code, out.getvalue(), err.getvalue()
 
 
+def _token_for(box_id: str) -> str:
+    """A real token, because the helper reads the box out of it now."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject, mint
+
+    return mint(subject=box_subject(box_id), scopes={SCOPE_GIT_CREDENTIAL}, key="k" * 32)
+
+
 ENV = {
     gc.CONTROL_URL_ENV: "https://control.example",
-    gc.BOX_TOKEN_ENV: "flotta_deadbeef.sig",
-    gc.BOX_ID_ENV: "b-123",
+    gc.BOX_TOKEN_ENV: _token_for("b-123"),
 }
 
 REQUEST = "protocol=https\nhost=github.com\npath=joaoh82/flotta.git\n\n"
@@ -133,7 +139,7 @@ def test_an_unconfigured_box_explains_itself_and_still_exits_zero():
     assert code == 0
     assert out == ""
     assert "box-identity" in err
-    for name in (gc.CONTROL_URL_ENV, gc.BOX_TOKEN_ENV, gc.BOX_ID_ENV):
+    for name in (gc.CONTROL_URL_ENV, gc.BOX_TOKEN_ENV):
         assert name in err
 
 
@@ -225,3 +231,52 @@ def test_an_empty_password_is_refused_rather_than_handed_to_git(monkeypatch):
     monkeypatch.setattr(gc.urllib.request, "urlopen", lambda r, timeout=None: _Response())
     with pytest.raises(gc.HelperError, match="no credential"):
         gc.fetch_credential("x/y", env=ENV)
+
+
+# -- the box a token speaks for is the box it addresses ---------------------
+
+
+def test_the_box_is_read_out_of_the_token_not_the_environment(monkeypatch):
+    """Found live. Adopting an existing machine rotates its secrets but not its
+    environment, so a box held a token for one id while `$FLOTTA_BOX_ID` still
+    named another. Addressing the environment's box with the token's identity
+    is refused by the subject check — and the fleet had already recorded the
+    identity as minted, so nothing pointed at the cause."""
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({"username": "x-access-token", "password": "ghs_x"}).encode()
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return _Response()
+
+    monkeypatch.setattr(gc.urllib.request, "urlopen", fake_urlopen)
+    gc.fetch_credential(
+        "a/b",
+        env={
+            gc.CONTROL_URL_ENV: "https://control.example",
+            gc.BOX_TOKEN_ENV: _token_for("b-from-token"),
+            # Stale, and exactly what a machine keeps after an adoption.
+            gc.BOX_ID_ENV: "b-stale-from-env",
+        },
+    )
+    assert "b-from-token" in captured["url"]
+    assert "b-stale-from-env" not in captured["url"]
+
+
+def test_a_token_that_names_no_box_is_refused_before_the_network():
+    """A malformed or non-box token has nothing to address. Better to say so
+    than to build a URL out of an empty string and get a confusing 404."""
+    with pytest.raises(gc.HelperError, match="does not name a box"):
+        gc.fetch_credential(
+            "a/b",
+            env={gc.CONTROL_URL_ENV: "https://control.example", gc.BOX_TOKEN_ENV: "nonsense"},
+        )

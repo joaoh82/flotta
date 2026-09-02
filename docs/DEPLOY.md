@@ -261,14 +261,20 @@ legitimate state rather than a broken box.
 
 ### 7b. Load the identity onto the box, and grant it repositories
 
+**A box created after this shipped already has an identity** — `flotta create`
+mints and injects one, so there is nothing to run afterwards. Grant it a
+repository and it can work:
+
 ```bash
-just box-identity eng-a                       # restarts the machine
 uv run flotta repo grant eng-a joaoh82/flotta
 uv run flotta repo list eng-a
 ```
 
-`box-identity` mints a token whose subject is that box, so it cannot mint
-credentials for any other box's repositories. A box can hold several grants: a
+For a box that predates it, or an identity that is expiring, `just box-identity
+eng-a` re-issues one and restarts the machine.
+
+Either way the token's subject is that box, so it cannot mint credentials for
+any other box's repositories. A box can hold several grants: a
 task that fixes a bug in one repo and updates the client in another is one
 task, not two.
 

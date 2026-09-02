@@ -106,7 +106,7 @@ class FlyBackend:
         existing = self._machines(app) if self._app_exists(app) else []
         if existing:
             machine_id = existing[0]["id"]
-            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id), adopted=True)
 
         # THEN decide whether a boot is even possible, BEFORE creating anything
         # billable. An earlier version created the app and a 1GB volume and only
@@ -124,6 +124,29 @@ class FlyBackend:
 
         if not self._app_exists(app):
             self._flyctl("apps", "create", app, "--org", self.config.org, app=None)
+        # Secrets BEFORE the machine, and this ordering is the whole reason
+        # they travel in the spec. A Fly machine takes the app's secrets when
+        # it is *created*; setting them afterwards means a box that boots once
+        # without its identity, and `create_box` would report a running box
+        # that cannot authenticate to anything.
+        #
+        # No `--stage`. Without machines there is nothing to deploy, so the
+        # command returns rather than waiting — the deadlock that made
+        # `door-secrets` need `--stage` needs an existing machine to happen.
+        #
+        # Piped, never argv: a secret in argv is a secret in `ps`.
+        #
+        # Note the adopt branch above returns before reaching this. Re-issuing
+        # an identity onto a machine that already exists is rotation, not
+        # creation, and it needs `--stage` and a restart — `just box-identity`.
+        if spec.secrets:
+            self._flyctl(
+                "secrets",
+                "import",
+                app=app,
+                stdin="".join(f"{k}={v}\n" for k, v in spec.secrets.items()),
+            )
+
         if not self._volume_exists(app, self.config.volume_name):
             self._flyctl(
                 "volumes",
@@ -171,6 +194,30 @@ class FlyBackend:
             raise BackendError(f"`machine run` reported success but app {app!r} has no machine")
         machine_id = machines[0]["id"]
         return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+
+    def apply_secrets(self, box_id: str, secrets: dict[str, str]) -> None:
+        """Rotation: secrets onto a machine that already exists.
+
+        No `--stage`, deliberately, and the opposite reasoning to
+        `door-secrets`. Staging writes the values and leaves them undeployed;
+        a machine takes secrets at create or update time, so a staged write
+        onto an existing machine changes nothing until something else updates
+        it. Without the flag, flyctl performs that update itself — which is
+        what `just box-identity` has always done, and what makes a rotation
+        take effect rather than merely being recorded.
+
+        The cost is a restart. That is inherent, not incidental: the entrypoint
+        reads its environment once, at boot.
+        """
+        if not secrets:
+            return
+        app, _ = self._addr(box_id)
+        self._flyctl(
+            "secrets",
+            "import",
+            app=app,
+            stdin="".join(f"{k}={v}\n" for k, v in secrets.items()),
+        )
 
     def existing_endpoint(self) -> str | None:
         """The endpoint `create` would adopt, without creating anything.
@@ -327,11 +374,12 @@ class FlyBackend:
         app: str | None,
         timeout: int = 300,
         check: bool = True,
+        stdin: str | None = None,
     ) -> subprocess.CompletedProcess:
         cmd = ["flyctl", *args]
         if app:
             cmd += ["--app", app]
-        return self._run(cmd, timeout=timeout, check=check)  # type: ignore[operator]
+        return self._run(cmd, timeout=timeout, check=check, stdin=stdin)  # type: ignore[operator]
 
     def _machines(self, app: str) -> list[dict]:
         result = self._flyctl("machines", "list", "--json", app=app, check=False)
@@ -408,14 +456,18 @@ class FlyBackend:
         )
 
 
-def _run_flyctl(cmd: list[str], *, timeout: int, check: bool) -> subprocess.CompletedProcess:
+def _run_flyctl(
+    cmd: list[str], *, timeout: int, check: bool, stdin: str | None = None
+) -> subprocess.CompletedProcess:
     if shutil.which("flyctl") is None:
         raise BackendError(
             "flyctl is not on PATH. Install it (`brew install flyctl`) and "
             "`fly auth login`; see `just fly-whoami`."
         )
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        result = subprocess.run(
+            cmd, input=stdin, capture_output=True, text=True, timeout=timeout, check=False
+        )
     except subprocess.TimeoutExpired as exc:
         # Must surface as BackendError: that is the only exception `create_box`
         # and `stop_box` catch, and anything else escapes past their cleanup —

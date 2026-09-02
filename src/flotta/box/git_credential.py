@@ -68,9 +68,12 @@ from collections.abc import Callable
 from typing import IO, Any
 
 #: Where the control plane lives, and the token to present to it. Both are set
-#: on the machine by `just box-identity`; neither is in the image.
+#: on the machine when the box is created; neither is in the image.
 CONTROL_URL_ENV = "FLOTTA_CONTROL_URL"
 BOX_TOKEN_ENV = "FLOTTA_BOX_TOKEN"
+#: Informational only — `printenv` on a box should say which box it is. The
+#: helper reads the id out of the **token**, because two sources can disagree
+#: and one cannot. See `fetch_credential`.
 BOX_ID_ENV = "FLOTTA_BOX_ID"
 
 #: GitHub only, for now. A helper that answered for every host would be asked
@@ -189,21 +192,32 @@ def fetch_credential(
     """Trade this box's Flotta token for a GitHub credential. ``(user, secret)``."""
     control_url = (env.get(CONTROL_URL_ENV) or "").strip()
     token = (env.get(BOX_TOKEN_ENV) or "").strip()
-    box_id = (env.get(BOX_ID_ENV) or "").strip()
 
     missing = [
         name
-        for name, value in (
-            (CONTROL_URL_ENV, control_url),
-            (BOX_TOKEN_ENV, token),
-            (BOX_ID_ENV, box_id),
-        )
+        for name, value in ((CONTROL_URL_ENV, control_url), (BOX_TOKEN_ENV, token))
         if not value
     ]
     if missing:
         raise HelperError(
             f"this box has no GitHub identity: ${', $'.join(missing)} not set. "
             "Configure it with `just box-identity <box>`."
+        )
+
+    # **The token names the box.** Not `$FLOTTA_BOX_ID`, which is informational
+    # only — a second source that can disagree with the first, and did: adopting
+    # an existing machine rotates its secrets but not its environment, so a box
+    # held a token for `b-d82e...` while its environment still said `b-2a94...`.
+    # Every request would have addressed one box with the other's token and been
+    # refused by the check that makes box tokens safe — while the fleet recorded
+    # the identity as successfully minted. One source cannot drift from itself.
+    from flotta.auth import peek_subject
+
+    box_id = peek_subject(token) or ""
+    if not box_id:
+        raise HelperError(
+            f"${BOX_TOKEN_ENV} does not name a box, so there is nothing to ask "
+            "about. Re-issue it with `just box-identity <box>`."
         )
 
     payload = _post(credential_url(control_url, box_id), token=token, repo=repo, timeout=timeout)

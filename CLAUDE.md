@@ -67,12 +67,20 @@ conventions, and the sharp edges below.
   channels could carry something to a machine and three of them do not: the
   `[env]` block in `fly/fly.toml` names three variables, `BoxSpec.env` is empty
   (`provision.create_box` builds `BoxSpec(name=name)`), and the image bakes in
-  nothing. So a variable set in your `.env` does **not** reach a box unless a
-  recipe puts it there — `$FLOTTA_DOMAIN` was documented as reaching one for a
-  whole PR and never did. `just fly-secrets` carries the provider vars, `just
-  fly-auth` the dashboard credentials, `just box-identity` the GitHub identity.
-  Setting a secret restarts the machine, which is how the new value takes
-  effect: the entrypoint reads them at boot.
+  nothing. So a variable set in your `.env` does **not** reach a box unless
+  something puts it there — `$FLOTTA_DOMAIN` was documented as reaching one for
+  a whole PR and never did. `just fly-secrets` carries the provider vars, `just
+  fly-auth` the dashboard credentials. Setting a secret restarts the machine,
+  which is how a new value takes effect: the entrypoint reads them at boot.
+- **A box's own identity is injected at creation**, not afterwards.
+  `create_box` mints `box:<id>` and hands it to the backend in `BoxSpec` —
+  `env` for what may be read off the machine (`FLOTTA_BOX_ID`,
+  `FLOTTA_BOX_NAME`, the control URL, the commit domain) and `secrets` for what
+  may not (`FLOTTA_BOX_TOKEN` alone). On Fly the secrets must be written
+  **before** `machine run`, because a machine takes the app's secrets when it
+  is created — which is why they travel in the spec rather than through a
+  `set_secrets()` verb the caller would have to sequence. `just box-identity`
+  is now rotation only.
 - **`--wait` or the row strands.** The *local* process records a task's
   outcome, not the container. Without `--wait` (and without a later `flotta
   watch`), the container finishes and the row sits at `running` forever.
