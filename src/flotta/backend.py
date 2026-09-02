@@ -121,6 +121,17 @@ class BoxHandle:
 
     id: str
     endpoint: str
+    #: True when `create` found a machine and took it over rather than making
+    #: one. The caller has to know, because anything that must be true *at
+    #: creation* — a box's identity, above all — was not applied to a machine
+    #: that already existed.
+    #:
+    #: This is not a corner case on Fly, it is the **normal** path: the only
+    #: way to get a released image is `fly deploy`, which creates a machine
+    #: while doing it, so by the time `create` can run there is always a
+    #: machine to adopt. Discovered by comparing timestamps — the fleet's first
+    #: box had a machine five days older than its row.
+    adopted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +175,20 @@ class Backend(Protocol):
 
     def destroy(self, box_id: str) -> None:
         """Destroy the box and its disk. Idempotent."""
+        ...
+
+    def apply_secrets(self, box_id: str, secrets: dict[str, str]) -> None:
+        """Put secrets on an **existing** box. Rotation, not creation.
+
+        Separate from `BoxSpec.secrets` because it is a different operation
+        with a different cost: creation writes secrets before the machine
+        exists and pays nothing, while this must reach a machine that is
+        already running and therefore restarts it.
+
+        Having both is not duplication. Having only the first would mean an
+        adopted box never gets an identity; having only this would mean every
+        fresh box boots once without one.
+        """
         ...
 
     def exec(self, box_id: str, command: str, *, timeout_s: int = 300) -> ExecResult:

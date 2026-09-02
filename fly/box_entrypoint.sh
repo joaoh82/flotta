@@ -123,8 +123,11 @@ git config --global --replace-all init.defaultBranch main
 # git asks for "a credential for github.com" and a grant has nothing to key on.
 git config --global --replace-all credential.useHttpPath true
 
-if [ -n "${FLOTTA_CONTROL_URL:-}" ] && [ -n "${FLOTTA_BOX_TOKEN:-}" ] \
-   && [ -n "${FLOTTA_BOX_ID:-}" ]; then
+# Two conditions, not three. `$FLOTTA_BOX_ID` used to be required here and is
+# informational now: the helper reads the box out of its own token, because an
+# adopted machine keeps the environment it booted with while its secrets are
+# rotated — so the two disagreed, and the id was the stale one.
+if [ -n "${FLOTTA_CONTROL_URL:-}" ] && [ -n "${FLOTTA_BOX_TOKEN:-}" ]; then
   git config --global --replace-all credential.helper flotta
   echo "[flotta-box] git: $BOX_NAME <${BOX_NAME}@${FLOTTA_GIT_EMAIL_DOMAIN}>, credentials via control plane"
 else

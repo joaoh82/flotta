@@ -106,7 +106,7 @@ class FlyBackend:
         existing = self._machines(app) if self._app_exists(app) else []
         if existing:
             machine_id = existing[0]["id"]
-            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+            return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id), adopted=True)
 
         # THEN decide whether a boot is even possible, BEFORE creating anything
         # billable. An earlier version created the app and a 1GB volume and only
@@ -194,6 +194,30 @@ class FlyBackend:
             raise BackendError(f"`machine run` reported success but app {app!r} has no machine")
         machine_id = machines[0]["id"]
         return BoxHandle(id=machine_id, endpoint=endpoint_for(app, machine_id))
+
+    def apply_secrets(self, box_id: str, secrets: dict[str, str]) -> None:
+        """Rotation: secrets onto a machine that already exists.
+
+        No `--stage`, deliberately, and the opposite reasoning to
+        `door-secrets`. Staging writes the values and leaves them undeployed;
+        a machine takes secrets at create or update time, so a staged write
+        onto an existing machine changes nothing until something else updates
+        it. Without the flag, flyctl performs that update itself — which is
+        what `just box-identity` has always done, and what makes a rotation
+        take effect rather than merely being recorded.
+
+        The cost is a restart. That is inherent, not incidental: the entrypoint
+        reads its environment once, at boot.
+        """
+        if not secrets:
+            return
+        app, _ = self._addr(box_id)
+        self._flyctl(
+            "secrets",
+            "import",
+            app=app,
+            stdin="".join(f"{k}={v}\n" for k, v in secrets.items()),
+        )
 
     def existing_endpoint(self) -> str | None:
         """The endpoint `create` would adopt, without creating anything.

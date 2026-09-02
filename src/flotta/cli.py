@@ -854,6 +854,9 @@ def logs(
 @app.command()
 def create(
     name: str = typer.Argument(..., help="Name for the new agent, e.g. eng-a"),
+    image: str | None = typer.Option(
+        None, "--image", help="Boot from this image instead of the app's last release"
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -889,7 +892,19 @@ def create(
                 fg=typer.colors.BRIGHT_BLACK,
             )
         try:
-            result = provision.create_box(name, store=fleet)
+            from flotta.backend import BoxSpec
+
+            # `--image` is the only way to create a box on an app that has
+            # never been deployed to: `create` refuses without a released
+            # image, and the thing that releases one (`fly deploy`) makes a
+            # machine while doing it. Without this flag a fresh app cannot be
+            # created into at all — which is how the adopt path came to be the
+            # only one anybody ever took.
+            result = provision.create_box(
+                name,
+                store=fleet,
+                spec=BoxSpec(name=name, image=image) if image else None,
+            )
         except (provision.ProvisionError, ValueError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc

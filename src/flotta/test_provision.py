@@ -155,6 +155,10 @@ class FakeBackend:
     def create(self, spec):
         raise NotSupported("not used in these tests")
 
+    def apply_secrets(self, box_id, secrets):
+        self.calls.append("apply_secrets")
+        self.applied = dict(secrets)
+
     def exec(self, box_id, command, *, timeout_s=300):
         raise NotSupported("not used in these tests")
 
@@ -1913,3 +1917,67 @@ def test_an_explicit_spec_is_not_overwritten_by_the_identity(store, monkeypatch)
     )
     assert impl.spec.env["FLOTTA_BOX_NAME"] == "chosen-by-caller"
     assert "FLOTTA_BOX_ID" in impl.spec.env, "the rest of the identity still arrives"
+
+
+class Adopting(Recording):
+    """A backend that finds a machine rather than making one.
+
+    On Fly this is not the unusual case — it is every case. `fly deploy` is the
+    only thing that releases an image, and it creates a machine while doing it,
+    so `create` always has one to adopt.
+    """
+
+    def create(self, spec):
+        from flotta.backend import BoxHandle
+
+        self.calls.append("create")
+        self.spec = spec
+        return BoxHandle(id="m1", endpoint="fake://app/m1", adopted=True)
+
+
+def test_an_adopted_machine_still_gets_its_identity(store, monkeypatch):
+    """The bug this whole path exists for. A machine that predates `create`
+    never saw `spec.secrets` — they are written before a machine is made, and
+    this one was already there. Without a second route, identity-at-creation
+    would have been correct, tested, and dead: it never fires in production."""
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    impl = Adopting()
+    out = create_box("eng-a", store=store, backend=impl)
+
+    assert "apply_secrets" in impl.calls
+    assert "FLOTTA_BOX_TOKEN" in impl.applied
+    kinds = [e.type for e in store.get_events("box", out["box_id"])]
+    assert "identity_minted" in kinds
+
+
+def test_a_provisioned_machine_is_not_restarted_to_receive_what_it_already_has(store, monkeypatch):
+    """`apply_secrets` restarts the machine. A box created from nothing already
+    booted with its identity, so calling it there would cost a restart to
+    deliver values that are already in place."""
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    impl = Recording()
+    create_box("eng-a", store=store, backend=impl)
+    assert "apply_secrets" not in impl.calls
+
+
+def test_a_failed_identity_does_not_destroy_a_working_box(store, monkeypatch):
+    """A box with no identity still boots, still talks, and still commits under
+    its own name. Tearing down a working machine over a missing capability
+    trades a small loss for a total one."""
+    from flotta.backend import BackendError
+
+    class Refuses(Adopting):
+        def apply_secrets(self, box_id, secrets):
+            raise BackendError("flyctl exploded")
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    out = create_box("eng-a", store=store, backend=Refuses())
+
+    assert out["status"] == "running"
+    skipped = [e for e in store.get_events("box", out["box_id"]) if e.type == "identity_skipped"]
+    assert len(skipped) == 1, "one event, or the reasons contradict each other"
+    assert "flyctl exploded" in skipped[0].payload["reason"]
+    # The first version cleared `identity_secrets` on failure, which made this
+    # indistinguishable from having no key — the box ended up carrying "no
+    # signing key configured" while the key was fine.
+    assert "no signing key" not in skipped[0].payload["reason"]

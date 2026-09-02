@@ -473,12 +473,39 @@ def create_box(
         store.update_box_status(box.id, "torn_down")
         raise ProvisionError(detail) from exc
 
+    # An adopted machine did not exist when its secrets were written, because
+    # it existed before `create` ran at all. On Fly that is the *normal* path,
+    # not an edge: the only way to release an image is `fly deploy`, which
+    # creates a machine while doing it — so `create` always has one to adopt,
+    # and the whole create-time injection above would never have fired in
+    # production. Found by comparing timestamps on the fleet's first box: its
+    # machine was five days older than its row.
+    identity_error: str | None = None
+    if handle.adopted and identity_secrets:
+        try:
+            impl.apply_secrets(handle.endpoint, identity_secrets)
+        except BackendError as exc:
+            # Not fatal. A box without an identity still boots, still talks,
+            # and still commits under its own name — it just cannot fetch a
+            # git credential. Tearing down a working machine over that would
+            # trade a small missing capability for a destroyed one.
+            #
+            # Recorded in a variable rather than by clearing `identity_secrets`,
+            # which is what this did first: that made the failure indistinguishable
+            # from having no signing key, and the box was left carrying an event
+            # saying "no signing key configured" when the key was fine. A false
+            # diagnosis is worse than none — it sends someone to check the one
+            # thing that is not broken.
+            identity_error = f"apply_secrets failed: {exc}"
+
     # Recorded as an event rather than a column: the store has no migration
     # path, so a new column would not appear on an existing fleet. An event
     # does, it is already polymorphic, and `flotta logs <box>` shows it — which
     # is how an operator sees an identity approaching expiry before a clone
     # fails for a reason nothing on the box can explain.
-    if identity_secrets:
+    if identity_error:
+        store.add_event("box", box.id, "identity_skipped", {"reason": identity_error})
+    elif identity_secrets:
         from flotta.auth import verify
 
         store.add_event(
