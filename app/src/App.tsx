@@ -61,13 +61,19 @@ function Empty({
     unreachable: "Cannot reach the control plane",
     rejected: "That token was refused",
     unexpected: "Unexpected answer from the control plane",
+    // Deliberately not blamed on the control plane, which has not been
+    // contacted at this point. Saying otherwise sent the first person who saw
+    // it looking at a Railway deployment that was fine.
+    keychain: "The keychain would not release the token",
   };
 
   return (
     <div className="p-8">
       <p className="text-sm font-medium text-neutral-900">{TITLES[error.kind]}</p>
       <p className="mt-1 max-w-prose text-xs text-neutral-600">{error.detail}</p>
-      {(error.kind === "not_configured" || error.kind === "rejected") && (
+      {(error.kind === "not_configured" ||
+        error.kind === "rejected" ||
+        error.kind === "keychain") && (
         <button
           onClick={onSettings}
           className="mt-3 rounded bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white"
@@ -126,12 +132,12 @@ export default function App() {
     if (view.token_error) {
       setLoading(false);
       setError({
-        kind: "unexpected",
+        kind: "keychain",
         detail:
-          `The keychain refused to hand over the token: ${view.token_error}. ` +
-          "On macOS a rebuilt binary is a different binary, so an item saved " +
-          "by an earlier build can be denied to this one — re-saving the token " +
-          "in Settings will fix it.",
+          `${view.token_error}. On macOS a rebuilt binary is a different ` +
+          "binary, so an item saved by an earlier build can be refused to this " +
+          "one. Saving the token again in Settings stores it fresh for this " +
+          "build and fixes it.",
       });
       return;
     }

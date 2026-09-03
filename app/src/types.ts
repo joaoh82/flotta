@@ -27,7 +27,9 @@ export type FleetError =
   | { kind: "not_configured"; detail: string }
   | { kind: "unreachable"; detail: string }
   | { kind: "rejected"; detail: string }
-  | { kind: "unexpected"; detail: string };
+  | { kind: "unexpected"; detail: string }
+  /** Local, and nothing to do with the control plane. */
+  | { kind: "keychain"; detail: string };
 
 export type SettingsView = {
   control_url: string;

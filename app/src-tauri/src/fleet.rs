@@ -64,6 +64,29 @@ pub enum FleetError {
     Rejected(String),
     /// It answered with something unexpected. Never silently an empty fleet.
     Unexpected(String),
+    /// The keychain would not release the token. **Local**, and nothing to do
+    /// with the control plane — which is why it is not `Unexpected`: the first
+    /// version reported a denied keychain read under the heading "Unexpected
+    /// answer from the control plane", about a control plane that had not been
+    /// contacted at all.
+    Keychain(String),
+}
+
+impl FleetError {
+    /// The sentence, without the variant wrapped around it.
+    ///
+    /// `format!("{err:?}")` put `Unexpected("keychain read failed: …")` on
+    /// screen, wrapper and quotes included. A person reading an error should
+    /// not have to parse Rust's Debug output to find the message inside it.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::NotConfigured(d)
+            | Self::Unreachable(d)
+            | Self::Rejected(d)
+            | Self::Unexpected(d)
+            | Self::Keychain(d) => d,
+        }
+    }
 }
 
 /// A box, as the fleet API reports it. Deliberately a subset: this mirrors
@@ -86,14 +109,14 @@ struct BoxList {
 
 fn entry() -> Result<keyring::Entry, FleetError> {
     keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| FleetError::Unexpected(format!("keychain unavailable: {e}")))
+        .map_err(|e| FleetError::Keychain(format!("the keychain is unavailable: {e}")))
 }
 
 pub fn read_token() -> Result<Option<String>, FleetError> {
     match entry()?.get_password() {
         Ok(token) => Ok(Some(token)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(FleetError::Unexpected(format!("keychain read failed: {e}"))),
+        Err(e) => Err(FleetError::Keychain(format!("{e}"))),
     }
 }
 
@@ -111,7 +134,7 @@ pub fn write_token(token: &str) -> Result<(), FleetError> {
     }
     entry
         .set_password(token)
-        .map_err(|e| FleetError::Unexpected(format!("keychain write failed: {e}")))
+        .map_err(|e| FleetError::Keychain(format!("saving it failed: {e}")))
 }
 
 /// GET a path on the control plane, with the token attached.

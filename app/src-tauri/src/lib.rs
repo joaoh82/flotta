@@ -65,7 +65,7 @@ fn load_settings(app: tauri::AppHandle) -> SettingsView {
     // its own, and a conclusion that was false at every step.
     let (has_token, token_error) = match fleet::read_token() {
         Ok(token) => (token.is_some(), None),
-        Err(err) => (false, Some(format!("{err:?}"))),
+        Err(err) => (false, Some(err.detail().to_string())),
     };
 
     SettingsView {
