@@ -46,3 +46,25 @@ export type SettingsView = {
 export function isFleetError(value: unknown): value is FleetError {
   return typeof value === "object" && value !== null && "kind" in value;
 }
+
+/**
+ * What the agent task reports as it happens.
+ *
+ * Mirrors `AgentEvent` in `src-tauri/src/agent.rs`. Tagged for the same reason
+ * `FleetError` is: "waking", "thinking" and "failed" are different states, and
+ * a UI that cannot tell them apart shows one spinner for all three — which
+ * reads as a hang at exactly the moment the box genuinely is not there yet.
+ */
+export type AgentEvent =
+  | { kind: "waking"; box_name: string }
+  | { kind: "ready"; box_name: string }
+  | { kind: "thinking"; box_name: string }
+  | { kind: "reply"; box_name: string; text: string }
+  | { kind: "failed"; box_name: string; detail: string }
+  | { kind: "closed"; box_name: string };
+
+/** One line of a transcript. `pending` marks a turn still in flight. */
+export type Turn = {
+  from: "you" | "agent" | "system";
+  text: string;
+};

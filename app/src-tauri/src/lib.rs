@@ -8,12 +8,16 @@
 //! commands here are a thin boundary: they exist so the webview can ask for
 //! work without ever holding a credential.
 
+mod agent;
 mod fleet;
 
 use fleet::{BoxRow, FleetError, Settings};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tauri::Manager;
+use tokio::sync::mpsc;
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, FleetError> {
     let dir = app
@@ -147,13 +151,80 @@ async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
     fleet::list_boxes(&read_settings(&app)).await
 }
 
+/// One live conversation per box, keyed by name.
+///
+/// The socket has to outlive a single command: reconnecting per message would
+/// re-pay the login, the ticket, and — if the box has gone back to sleep — the
+/// wake, which is 10-60 seconds the user would feel on every turn.
+#[derive(Default)]
+struct Conversations(Mutex<HashMap<String, mpsc::Sender<String>>>);
+
+#[tauri::command]
+async fn open_conversation(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Conversations>,
+    box_name: String,
+) -> Result<(), FleetError> {
+    // Idempotent: selecting an agent you are already talking to must not open
+    // a second socket to it, or the box sees two sessions and the reply for
+    // one arrives on the other.
+    if state.0.lock().unwrap().contains_key(&box_name) {
+        return Ok(());
+    }
+
+    let settings = read_settings(&app);
+    let Some(token) = fleet::read_token()? else {
+        return Err(FleetError::NotConfigured(
+            "No access token — set one in Settings before talking to an agent.".into(),
+        ));
+    };
+
+    // A small buffer, not zero: a person can type a second message while the
+    // first is in flight, and the alternative is the UI blocking on send.
+    let (tx, rx) = mpsc::channel(8);
+    state.0.lock().unwrap().insert(box_name.clone(), tx);
+
+    tauri::async_runtime::spawn(agent::run(app, settings, box_name, token, rx));
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_prompt(
+    state: tauri::State<'_, Conversations>,
+    box_name: String,
+    text: String,
+) -> Result<(), FleetError> {
+    let sender = state.0.lock().unwrap().get(&box_name).cloned();
+    let Some(sender) = sender else {
+        return Err(FleetError::Unexpected(format!(
+            "no open conversation with {box_name}"
+        )));
+    };
+    sender
+        .send(text)
+        .await
+        .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
+}
+
+#[tauri::command]
+fn close_conversation(state: tauri::State<'_, Conversations>, box_name: String) {
+    // Dropping the sender ends the task's receive loop, which closes the
+    // socket. No explicit shutdown message needed, and none that could be
+    // missed.
+    state.0.lock().unwrap().remove(&box_name);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(Conversations::default())
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
-            list_boxes
+            list_boxes,
+            open_conversation,
+            send_prompt,
+            close_conversation
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
