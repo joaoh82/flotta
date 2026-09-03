@@ -43,15 +43,36 @@ struct SettingsView {
     control_url: String,
     domain: String,
     has_token: bool,
+    /// Set when the keychain could not be *read*, which is a different thing
+    /// from there being no token in it — and the difference is the whole bug
+    /// this field exists to end. See `load_settings`.
+    token_error: Option<String>,
 }
 
 #[tauri::command]
 fn load_settings(app: tauri::AppHandle) -> SettingsView {
     let settings = read_settings(&app);
+
+    // This was `matches!(read_token(), Ok(Some(_)))`, which folded a keychain
+    // *failure* into "no token saved" — and on macOS that failure is routine
+    // rather than exotic: a rebuilt binary has a different signature, so the
+    // ACL on the existing item no longer matches it and the read is denied.
+    // Every `just app` during development can do it.
+    //
+    // The app then opened its settings screen saying "None saved yet", the
+    // token was right there in the keychain, and closing that screen left
+    // "No agents yet" on a fleet that had one. Three layers, each honest on
+    // its own, and a conclusion that was false at every step.
+    let (has_token, token_error) = match fleet::read_token() {
+        Ok(token) => (token.is_some(), None),
+        Err(err) => (false, Some(format!("{err:?}"))),
+    };
+
     SettingsView {
         control_url: settings.control_url,
         domain: settings.domain,
-        has_token: matches!(fleet::read_token(), Ok(Some(_))),
+        has_token,
+        token_error,
     }
 }
 
@@ -89,9 +110,23 @@ fn save_settings(
         )));
     }
 
+    // The domain gets the same treatment, for the same reason and one it
+    // learned the hard way: the first person to test the URL validation pasted
+    // the test value into *this* field instead, and it was stored without a
+    // murmur. A hostname is not a URL — `<box>.<domain>` is built from it — so
+    // a scheme here is as wrong as no scheme there, and silently accepting
+    // either produces an address that cannot resolve at a point (M8.2) far
+    // from where it was typed.
+    let domain = domain.trim().trim_end_matches('/').to_string();
+    if domain.contains("://") || domain.contains('/') {
+        return Err(FleetError::NotConfigured(format!(
+            "{domain:?} is not a domain — agents are reached at <name>.<domain>,              so it wants something like flotta.dev"
+        )));
+    }
+
     let settings = Settings {
         control_url,
-        domain: domain.trim().to_string(),
+        domain,
     };
     let path = settings_path(&app)?;
     fs::write(

@@ -129,7 +129,12 @@ export function Settings({
         />
         <span className="mt-1 block text-xs text-neutral-500">
           Stored in your keychain, never in a file.{" "}
-          {initial.has_token ? (
+          {initial.token_error ? (
+            <span className="text-amber-700">
+              The keychain could not be read, so whether one is saved is
+              unknown. Saving a token again will replace whatever is there.{" "}
+            </span>
+          ) : initial.has_token ? (
             <>
               One is saved.{" "}
               <button

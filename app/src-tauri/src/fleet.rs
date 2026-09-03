@@ -283,6 +283,25 @@ mod tests {
     }
 
     #[test]
+    fn a_real_fleet_response_parses_to_the_boxes_it_contains() {
+        // The literal body `GET /api/boxes` returned from the deployed control
+        // plane, captured rather than hand-written: the app showed "No agents
+        // yet" for a fleet that has one, and the parse was a suspect that
+        // could only be cleared by feeding it the exact bytes.
+        //
+        // It carries fields the app does not model (`destroyed_at`,
+        // `latest_task`, `task_count`, `cost_estimate`). Serde ignores unknown
+        // fields by default — this asserts that stays true, because the day it
+        // does not, every box silently disappears from the list.
+        let body = include_str!("../tests/fixture.json");
+        let list: BoxList = serde_json::from_str(body).expect("real response must parse");
+        assert_eq!(list.boxes.len(), 1);
+        assert_eq!(list.boxes[0].name, "eng-a");
+        assert_eq!(list.boxes[0].status, "stopped");
+        assert!(list.boxes[0].endpoint.is_some());
+    }
+
+    #[test]
     fn errors_serialise_as_the_tagged_shape_the_frontend_matches_on() {
         // `isFleetError` in types.ts tests for a `kind` field, and the empty
         // state picks its message from it. If this ever serialised as

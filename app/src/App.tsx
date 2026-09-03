@@ -29,10 +29,21 @@ function hostOf(url: string | undefined): string {
   }
 }
 
-function Empty({ error, onSettings }: { error: FleetError | null; onSettings: () => void }) {
+function Empty({
+  error,
+  loading,
+  onSettings,
+}: {
+  error: FleetError | null;
+  loading: boolean;
+  onSettings: () => void;
+}) {
   // Three failures, three fixes, three messages. An error string plus an empty
   // list would render all of them as "you have no agents", which is the one
   // reading that is never actionable.
+  if (loading) {
+    return <div className="p-8 text-center text-sm text-neutral-500">Loading…</div>;
+  }
   if (!error) {
     return (
       <div className="p-8 text-center">
@@ -94,8 +105,37 @@ export default function App() {
   }, []);
 
   const reload = useCallback(async () => {
-    const view = await invoke<SettingsView>("load_settings");
+    let view: SettingsView;
+    try {
+      view = await invoke<SettingsView>("load_settings");
+    } catch (err) {
+      // Unhandled, this left `loading` true and the list empty forever, which
+      // renders as "No agents yet" — the most confidently wrong thing the app
+      // can say. A screen that cannot load its own settings must say so.
+      setLoading(false);
+      setError(
+        isFleetError(err) ? err : { kind: "unexpected", detail: String(err) },
+      );
+      return;
+    }
     setSettings(view);
+
+    // A keychain that cannot be read is not a keychain with nothing in it.
+    // Sending this to the settings form would say "None saved yet" about a
+    // token that is sitting right there.
+    if (view.token_error) {
+      setLoading(false);
+      setError({
+        kind: "unexpected",
+        detail:
+          `The keychain refused to hand over the token: ${view.token_error}. ` +
+          "On macOS a rebuilt binary is a different binary, so an item saved " +
+          "by an earlier build can be denied to this one — re-saving the token " +
+          "in Settings will fix it.",
+      });
+      return;
+    }
+
     // Straight to settings on a first run: an empty list with a "configure me"
     // message is a worse first screen than the form itself.
     if (!view.control_url || !view.has_token) {
@@ -128,7 +168,12 @@ export default function App() {
             {loading ? "Loading…" : "Refresh"}
           </button>
           <button
-            onClick={() => setShowSettings((open) => !open)}
+            onClick={() => {
+              // Closing re-reads rather than revealing a stale list: settings
+              // are exactly the thing that changes what the list should show.
+              if (showSettings) void reload();
+              setShowSettings((open) => !open);
+            }}
             className="rounded px-2 py-1 text-xs text-neutral-600 hover:bg-neutral-100"
           >
             {showSettings ? "Close" : "Settings"}
@@ -146,7 +191,11 @@ export default function App() {
             }}
           />
         ) : boxes.length === 0 ? (
-          <Empty error={error} onSettings={() => setShowSettings(true)} />
+          <Empty
+            error={error}
+            loading={loading}
+            onSettings={() => setShowSettings(true)}
+          />
         ) : (
           <ul className="divide-y divide-neutral-100">
             {boxes.map((box) => (

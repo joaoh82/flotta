@@ -34,6 +34,11 @@ export type SettingsView = {
   domain: string;
   /** Whether a token is in the keychain. Never the token itself. */
   has_token: boolean;
+  /**
+   * Set when the keychain could not be read at all — which is not the same as
+   * it being empty, and used to be reported as if it were.
+   */
+  token_error?: string | null;
 };
 
 export function isFleetError(value: unknown): value is FleetError {
