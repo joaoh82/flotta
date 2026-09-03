@@ -65,8 +65,32 @@ fn save_settings(
     domain: String,
     token: Option<String>,
 ) -> Result<(), FleetError> {
+    let control_url = control_url.trim().to_string();
+
+    // Validated here, not just guarded at render. A scheme-less paste —
+    // `my-fleet.up.railway.app` — used to save cleanly and then throw in the
+    // header on every launch, *including* with settings open, because the
+    // header sits above the form. The only recovery was hand-editing
+    // settings.json, which is not a recovery a person will find.
+    //
+    // Both halves are fixed: this refuses to store one, and the header no
+    // longer trusts what it reads. Either alone would leave a way in — this
+    // one cannot help a settings.json that is already wrong, and the render
+    // guard alone would keep saving values that cannot work.
+    // Empty is allowed and means "not configured yet" — the app has a state for
+    // that. Anything else has to be absolute, because that is what `new URL`
+    // and `reqwest` both require.
+    let unset_or_absolute = control_url.is_empty()
+        || control_url.starts_with("http://")
+        || control_url.starts_with("https://");
+    if !unset_or_absolute {
+        return Err(FleetError::NotConfigured(format!(
+            "{control_url:?} is not a URL — it needs a scheme. Try https://{control_url}"
+        )));
+    }
+
     let settings = Settings {
-        control_url: control_url.trim().to_string(),
+        control_url,
         domain: domain.trim().to_string(),
     };
     let path = settings_path(&app)?;
@@ -91,7 +115,6 @@ async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,

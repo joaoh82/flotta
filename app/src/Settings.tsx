@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SettingsView } from "./types";
+import { isFleetError, type SettingsView } from "./types";
 
 /**
  * Where the fleet is, and the token to reach it.
@@ -11,6 +11,20 @@ import type { SettingsView } from "./types";
  * webview. Leaving the field blank keeps the stored token; that is why editing
  * a URL does not mean pasting a token again.
  */
+/**
+ * An error from the Rust side, as a sentence.
+ *
+ * `save_settings` returns the same tagged `FleetError` as everything else, so
+ * this reads `detail` rather than dumping the object. The fallback is not
+ * decorative: if Tauri ever stopped passing the serialised error through
+ * untouched, `isFleetError` would fail here first and the raw shape would be
+ * on screen — which is the cheapest possible way to notice.
+ */
+function describe(err: unknown): string {
+  if (isFleetError(err)) return err.detail;
+  return typeof err === "string" ? err : JSON.stringify(err);
+}
+
 export function Settings({
   initial,
   onSaved,
@@ -23,6 +37,27 @@ export function Settings({
   const [token, setToken] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Remove the stored token.
+   *
+   * Blank means "keep", which is right for editing a URL — and it left the
+   * keychain's clear path with no way to reach it from the UI. Signing out is
+   * a real thing to want, and a secret you cannot remove through the app that
+   * stored it is a secret you have to go and find in Keychain Access.
+   */
+  async function clearToken() {
+    setSaving(true);
+    setError(null);
+    try {
+      await invoke("save_settings", { controlUrl, domain, token: "" });
+      onSaved();
+    } catch (err) {
+      setError(describe(err));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
@@ -38,7 +73,7 @@ export function Settings({
       setToken("");
       onSaved();
     } catch (err) {
-      setError(typeof err === "string" ? err : JSON.stringify(err));
+      setError(describe(err));
     } finally {
       setSaving(false);
     }
@@ -94,8 +129,22 @@ export function Settings({
         />
         <span className="mt-1 block text-xs text-neutral-500">
           Stored in your keychain, never in a file.{" "}
-          {initial.has_token ? "One is saved." : "None saved yet."} Mint one
-          with{" "}
+          {initial.has_token ? (
+            <>
+              One is saved.{" "}
+              <button
+                type="button"
+                onClick={() => void clearToken()}
+                className="underline hover:text-neutral-700"
+              >
+                Forget it
+              </button>
+              .{" "}
+            </>
+          ) : (
+            "None saved yet. "
+          )}
+          Mint one with{" "}
           <code className="text-[11px]">
             flotta token mint you --scope fleet:read --scope box:chat
           </code>

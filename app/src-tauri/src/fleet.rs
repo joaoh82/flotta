@@ -138,7 +138,7 @@ async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
         .map_err(|e| FleetError::Unexpected(e.to_string()))?;
 
     let response = client
-        .get(format!("{base}{path}"))
+        .get(endpoint(base, path))
         .bearer_auth(token)
         .send()
         .await
@@ -148,23 +148,44 @@ async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
             FleetError::Unreachable(format!("could not reach {base}: {e}"))
         })?;
 
-    let status = response.status();
+    let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    if status.as_u16() == 401 || status.as_u16() == 403 {
+    match classify(status, path, &body) {
+        Some(error) => Err(error),
+        None => Ok(body),
+    }
+}
+
+/// `{base}{path}`, with exactly one slash between them.
+///
+/// Its own function so it can be tested: a trailing slash on a pasted URL is
+/// the most likely thing to be wrong about a setting, and `//api/boxes` is a
+/// 404 that reads like a missing endpoint rather than a typo.
+fn endpoint(base: &str, path: &str) -> String {
+    format!("{}{path}", base.trim().trim_end_matches('/'))
+}
+
+/// Which failure a response is, or `None` when it is not one.
+///
+/// Separated from the request so the mapping can be tested without a server.
+/// It is the part that decides which of three messages a person sees, and the
+/// distinction between them is the whole reason this module exists.
+fn classify(status: u16, path: &str, body: &str) -> Option<FleetError> {
+    if status == 401 || status == 403 {
         // The control plane's 403 names the scope the token lacks. Passing it
         // through beats anything this layer could guess.
-        return Err(FleetError::Rejected(detail_of(&body).unwrap_or_else(
-            || format!("the control plane refused this token ({status})"),
-        )));
+        return Some(FleetError::Rejected(detail_of(body).unwrap_or_else(|| {
+            format!("the control plane refused this token ({status})")
+        })));
     }
-    if !status.is_success() {
-        return Err(FleetError::Unexpected(format!(
+    if !(200..300).contains(&status) {
+        return Some(FleetError::Unexpected(format!(
             "{path} answered {status}: {}",
-            detail_of(&body).unwrap_or_else(|| body.chars().take(200).collect())
+            detail_of(body).unwrap_or_else(|| body.chars().take(200).collect())
         )));
     }
-    Ok(body)
+    None
 }
 
 /// FastAPI puts its message in `{"detail": …}`. Best-effort by design: a body
@@ -186,4 +207,93 @@ pub async fn list_boxes(settings: &Settings) -> Result<Vec<BoxRow>, FleetError> 
                 "the fleet API returned something unexpected ({e}); its shape may have changed"
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These four decisions are the reason this module is Rust rather than a
+    // `fetch()` in React, and none of them was covered until three reviewers
+    // said so on the same PR.
+
+    #[test]
+    fn a_refusal_is_told_apart_from_a_failure() {
+        // 401 and 403 mean "your token"; anything else non-2xx does not. The
+        // app renders three different screens off this distinction, and
+        // collapsing it is how an app tells you your fleet is empty when your
+        // token was simply refused.
+        assert!(matches!(
+            classify(403, "/api/boxes", ""),
+            Some(FleetError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify(401, "/api/boxes", ""),
+            Some(FleetError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify(500, "/api/boxes", ""),
+            Some(FleetError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn a_refusal_carries_the_control_planes_own_words() {
+        // Its 403 names the missing scope. Anything this layer invented
+        // instead would be less useful, and would go stale when the scopes
+        // change.
+        let body = r#"{"detail":"token for 'app' lacks scope(s): fleet:read"}"#;
+        match classify(403, "/api/boxes", body) {
+            Some(FleetError::Rejected(detail)) => {
+                assert!(detail.contains("fleet:read"), "{detail}")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_is_not_an_error() {
+        assert!(classify(200, "/api/boxes", "{}").is_none());
+        assert!(classify(201, "/api/boxes", "{}").is_none());
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_does_not_break_the_error_path() {
+        // An HTML error page from a proxy is the normal shape of "something
+        // between here and the control plane answered". Failing to parse it
+        // must not turn into a second, more confusing failure.
+        match classify(502, "/api/boxes", "<html>Bad Gateway</html>") {
+            Some(FleetError::Unexpected(detail)) => assert!(detail.contains("502"), "{detail}"),
+            other => panic!("expected unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_double_up() {
+        // The likeliest thing to be wrong about a pasted URL, and `//api/boxes`
+        // is a 404 that reads like a missing endpoint rather than a typo.
+        assert_eq!(
+            endpoint("https://fleet.example/", "/api/boxes"),
+            "https://fleet.example/api/boxes"
+        );
+        assert_eq!(
+            endpoint("  https://fleet.example  ", "/api/boxes"),
+            "https://fleet.example/api/boxes"
+        );
+    }
+
+    #[test]
+    fn errors_serialise_as_the_tagged_shape_the_frontend_matches_on() {
+        // `isFleetError` in types.ts tests for a `kind` field, and the empty
+        // state picks its message from it. If this ever serialised as
+        // `{"Rejected": "..."}` — serde's default for an enum — all three
+        // states would collapse into "unexpected" and the distinction the rest
+        // of this module exists to draw would be silently gone.
+        let json = serde_json::to_value(FleetError::Rejected("nope".into())).unwrap();
+        assert_eq!(json["kind"], "rejected");
+        assert_eq!(json["detail"], "nope");
+
+        let json = serde_json::to_value(FleetError::NotConfigured("set a url".into())).unwrap();
+        assert_eq!(json["kind"], "not_configured");
+    }
 }

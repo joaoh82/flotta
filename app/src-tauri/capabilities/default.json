@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "What the main window may do. Deliberately minimal: the app's own commands are always callable, and nothing else is granted. `opener:default` was scaffold \u2014 an unused capability handed to the webview is a capability someone who compromises it inherits.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
-    "core:default",
-    "opener:default"
+    "core:default"
   ]
 }

@@ -157,6 +157,7 @@ check-app:
     # request, so a warning there is worth failing on rather than scrolling
     # past.
     cargo clippy --all-targets -- -D warnings
+    cargo test
 
 # list available recipes
 default:

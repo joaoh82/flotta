@@ -12,6 +12,23 @@ import { isFleetError, type BoxRow, type FleetError, type SettingsView } from ".
  * a table of machines.
  */
 
+/**
+ * The host, or the raw string, or a placeholder — but never a thrown error.
+ *
+ * `new URL(x).host` throws on anything without a scheme, and this is rendered
+ * in the header, above everything. One bad value in settings.json took the
+ * whole window down on every launch, with no way back to the settings form
+ * that would have fixed it. A chrome element must not be able to do that.
+ */
+function hostOf(url: string | undefined): string {
+  if (!url) return "not configured";
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
 function Empty({ error, onSettings }: { error: FleetError | null; onSettings: () => void }) {
   // Three failures, three fixes, three messages. An error string plus an empty
   // list would render all of them as "you have no agents", which is the one
@@ -99,9 +116,7 @@ export default function App() {
         <div className="flex items-baseline gap-2">
           <h1 className="text-sm font-semibold tracking-tight">Flotta</h1>
           <span className="text-xs text-neutral-500">
-            {settings?.control_url
-              ? new URL(settings.control_url).host
-              : "not configured"}
+            {hostOf(settings?.control_url)}
           </span>
         </div>
         <div className="flex items-center gap-2">
