@@ -89,3 +89,51 @@ jobs:
       - run: npx tsc --noEmit
 
       - run: npx eslint .
+
+  app:
+    name: app (tsc + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # Tauri links against the system webview, so the Rust half does not
+      # compile on a bare runner. These are Tauri's own documented Linux
+      # dependencies; without them `cargo clippy` fails to find webkit2gtk and
+      # the failure reads like a broken lockfile rather than a missing library.
+      - name: Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev libssl-dev build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      # Inline rather than `just check-app`, for the same reason the dashboard
+      # job is: the recipe runs `npm ci` only when node_modules is absent,
+      # which is right on a laptop and wrong here. Keep these in step with it.
+      - run: npm ci
+        working-directory: app
+
+      - run: npx tsc --noEmit
+        working-directory: app
+
+      - run: cargo fmt --check
+        working-directory: app/src-tauri
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: app/src-tauri
+
+      - run: cargo test
+        working-directory: app/src-tauri

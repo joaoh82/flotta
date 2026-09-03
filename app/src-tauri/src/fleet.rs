@@ -1,0 +1,399 @@
+//! Everything that leaves this machine, and the one secret that does not.
+//!
+//! ## Why this is Rust and not JavaScript
+//!
+//! It would be shorter to `fetch()` the control plane from React. It would
+//! also make this a browser page with an installer, and give up the two things
+//! a desktop shell exists for:
+//!
+//! - **No CORS.** A request from here is not a browser request, so the control
+//!   plane and the door need no cross-origin headers. A page served at
+//!   `localhost` calling `https://…up.railway.app` would need them on every
+//!   endpoint, including the WebSocket upgrade the conversation uses.
+//! - **The token never reaches the webview.** It is read from the OS keychain
+//!   into a request header and dropped. JavaScript never holds it, so anything
+//!   that gets script execution in the webview — a rendered agent reply, a
+//!   dependency — cannot read it.
+//!
+//! The rule that keeps this true: **no URL of ours is ever fetched from the
+//! frontend.** If that changes, the reason for the whole shell is gone.
+
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// One keychain entry, named so a human browsing Keychain Access can tell what
+/// it is and delete it deliberately.
+const KEYCHAIN_SERVICE: &str = "dev.flotta.app";
+const KEYCHAIN_ACCOUNT: &str = "control-plane-token";
+
+/// Short. A control plane that is down should cost a few seconds, not a
+/// spinner that never resolves.
+const TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The non-secret half of the configuration.
+///
+/// In a plain file rather than the keychain because it is not a secret, and
+/// because someone debugging "why is it talking to the wrong fleet" should be
+/// able to read the answer without unlocking anything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default)]
+    pub control_url: String,
+    /// The domain boxes are addressed under: `<box>.<domain>`. Used by the
+    /// conversation (M8.2); carried here so both halves read one setting.
+    #[serde(default)]
+    pub domain: String,
+}
+
+/// What went wrong, in the terms the person looking at it can act on.
+///
+/// Modelled rather than stringified because the three failures have three
+/// different fixes and the empty state must not blur them: a fleet with no
+/// agents, a control plane that cannot be reached, and a token that was
+/// refused all render as "nothing here" if the UI is given only an error
+/// string and a list.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum FleetError {
+    /// No control-plane URL or no token — the app has never been set up.
+    NotConfigured(String),
+    /// DNS, TLS, timeout: the control plane did not answer.
+    Unreachable(String),
+    /// It answered, and said no. Carries the control plane's own words, which
+    /// name the missing scope — better than anything this could infer.
+    Rejected(String),
+    /// It answered with something unexpected. Never silently an empty fleet.
+    Unexpected(String),
+    /// The keychain would not release the token. **Local**, and nothing to do
+    /// with the control plane — which is why it is not `Unexpected`: the first
+    /// version reported a denied keychain read under the heading "Unexpected
+    /// answer from the control plane", about a control plane that had not been
+    /// contacted at all.
+    Keychain(String),
+}
+
+impl FleetError {
+    /// The sentence, without the variant wrapped around it.
+    ///
+    /// `format!("{err:?}")` put `Unexpected("keychain read failed: …")` on
+    /// screen, wrapper and quotes included. A person reading an error should
+    /// not have to parse Rust's Debug output to find the message inside it.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::NotConfigured(d)
+            | Self::Unreachable(d)
+            | Self::Rejected(d)
+            | Self::Unexpected(d)
+            | Self::Keychain(d) => d,
+        }
+    }
+}
+
+/// A box, as the fleet API reports it. Deliberately a subset: this mirrors
+/// what `GET /api/boxes` returns and nothing is computed here.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BoxRow {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BoxList {
+    boxes: Vec<BoxRow>,
+}
+
+fn entry() -> Result<keyring::Entry, FleetError> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| FleetError::Keychain(format!("the keychain is unavailable: {e}")))
+}
+
+/// A development-only escape hatch, and the reason it is not a weakening.
+///
+/// An unsigned binary's keychain ACL is tied to that exact binary, so **every**
+/// `cargo` rebuild is denied access to the item the previous one created. In
+/// release builds, signed with a stable identity, this never happens. In
+/// development it happens constantly — and re-pasting a token after every
+/// rebuild is the kind of friction that ends with someone hard-coding it.
+///
+/// So in debug builds only, `$FLOTTA_TOKEN` is honoured — the same variable
+/// `flotta chat` already reads, so there is nothing new to manage. It is
+/// compiled out of release builds entirely, not merely skipped: `cfg` removes
+/// the code, so no shipped binary can be made to read a token from the
+/// environment by setting one.
+#[cfg(debug_assertions)]
+fn token_from_env() -> Option<String> {
+    std::env::var("FLOTTA_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn token_from_env() -> Option<String> {
+    None
+}
+
+pub fn read_token() -> Result<Option<String>, FleetError> {
+    // Before the keychain, so a developer whose item has been orphaned by a
+    // rebuild is not blocked by it.
+    if let Some(token) = token_from_env() {
+        return Ok(Some(token));
+    }
+
+    match entry()?.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(FleetError::Keychain(format!("{e}"))),
+    }
+}
+
+pub fn write_token(token: &str) -> Result<(), FleetError> {
+    let entry = entry()?;
+    if token.is_empty() {
+        // Clearing is a real operation — signing out, or pasting the wrong
+        // token and wanting it gone rather than overwritten with a blank.
+        return match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(FleetError::Unexpected(format!(
+                "keychain clear failed: {e}"
+            ))),
+        };
+    }
+    // Write, and on refusal delete-then-write.
+    //
+    // `set_password` *updates* an existing item, and updating needs access to
+    // it — which is exactly what a rebuilt binary is denied on macOS, since an
+    // unsigned build's keychain ACL is tied to that build. So the obvious
+    // recovery ("just save the token again") failed with the same error as the
+    // read, and the app had no way to repair itself from the inside.
+    //
+    // Creating a fresh item needs no access to the old one. Deleting usually
+    // does not either, because the item's ACL governs reading its *secret*.
+    if let Err(first) = entry.set_password(token) {
+        let recovered = entry
+            .delete_credential()
+            .ok()
+            .and_then(|()| keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok())
+            .map(|fresh| fresh.set_password(token));
+
+        match recovered {
+            Some(Ok(())) => return Ok(()),
+            _ => {
+                return Err(FleetError::Keychain(format!(
+                    "saving it failed: {first}. The existing keychain item will not \
+                     accept this build. Remove it and try again:\n\n    security \
+                     delete-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// GET a path on the control plane, with the token attached.
+async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
+    let base = settings.control_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(FleetError::NotConfigured(
+            "No control plane configured. Set its URL in Settings — it is the \
+             https://… address the fleet API runs on."
+                .into(),
+        ));
+    }
+    let Some(token) = read_token()? else {
+        return Err(FleetError::NotConfigured(
+            "No access token. Mint one with `flotta token mint <you> --scope fleet:read \
+             --scope box:chat` and paste it in Settings."
+                .into(),
+        ));
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|e| FleetError::Unexpected(e.to_string()))?;
+
+    let response = client
+        .get(endpoint(base, path))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| {
+            // Everything from here is "the control plane did not answer",
+            // which is a different problem from it answering badly.
+            FleetError::Unreachable(format!("could not reach {base}: {e}"))
+        })?;
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    match classify(status, path, &body) {
+        Some(error) => Err(error),
+        None => Ok(body),
+    }
+}
+
+/// `{base}{path}`, with exactly one slash between them.
+///
+/// Its own function so it can be tested: a trailing slash on a pasted URL is
+/// the most likely thing to be wrong about a setting, and `//api/boxes` is a
+/// 404 that reads like a missing endpoint rather than a typo.
+fn endpoint(base: &str, path: &str) -> String {
+    format!("{}{path}", base.trim().trim_end_matches('/'))
+}
+
+/// Which failure a response is, or `None` when it is not one.
+///
+/// Separated from the request so the mapping can be tested without a server.
+/// It is the part that decides which of three messages a person sees, and the
+/// distinction between them is the whole reason this module exists.
+fn classify(status: u16, path: &str, body: &str) -> Option<FleetError> {
+    if status == 401 || status == 403 {
+        // The control plane's 403 names the scope the token lacks. Passing it
+        // through beats anything this layer could guess.
+        return Some(FleetError::Rejected(detail_of(body).unwrap_or_else(|| {
+            format!("the control plane refused this token ({status})")
+        })));
+    }
+    if !(200..300).contains(&status) {
+        return Some(FleetError::Unexpected(format!(
+            "{path} answered {status}: {}",
+            detail_of(body).unwrap_or_else(|| body.chars().take(200).collect())
+        )));
+    }
+    None
+}
+
+/// FastAPI puts its message in `{"detail": …}`. Best-effort by design: a body
+/// that is not JSON is not an error worth reporting *about* the error.
+fn detail_of(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("detail")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+pub async fn list_boxes(settings: &Settings) -> Result<Vec<BoxRow>, FleetError> {
+    let body = get(settings, "/api/boxes").await?;
+    serde_json::from_str::<BoxList>(&body)
+        .map(|list| list.boxes)
+        .map_err(|e| {
+            FleetError::Unexpected(format!(
+                "the fleet API returned something unexpected ({e}); its shape may have changed"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These four decisions are the reason this module is Rust rather than a
+    // `fetch()` in React, and none of them was covered until three reviewers
+    // said so on the same PR.
+
+    #[test]
+    fn a_refusal_is_told_apart_from_a_failure() {
+        // 401 and 403 mean "your token"; anything else non-2xx does not. The
+        // app renders three different screens off this distinction, and
+        // collapsing it is how an app tells you your fleet is empty when your
+        // token was simply refused.
+        assert!(matches!(
+            classify(403, "/api/boxes", ""),
+            Some(FleetError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify(401, "/api/boxes", ""),
+            Some(FleetError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify(500, "/api/boxes", ""),
+            Some(FleetError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn a_refusal_carries_the_control_planes_own_words() {
+        // Its 403 names the missing scope. Anything this layer invented
+        // instead would be less useful, and would go stale when the scopes
+        // change.
+        let body = r#"{"detail":"token for 'app' lacks scope(s): fleet:read"}"#;
+        match classify(403, "/api/boxes", body) {
+            Some(FleetError::Rejected(detail)) => {
+                assert!(detail.contains("fleet:read"), "{detail}")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_is_not_an_error() {
+        assert!(classify(200, "/api/boxes", "{}").is_none());
+        assert!(classify(201, "/api/boxes", "{}").is_none());
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_does_not_break_the_error_path() {
+        // An HTML error page from a proxy is the normal shape of "something
+        // between here and the control plane answered". Failing to parse it
+        // must not turn into a second, more confusing failure.
+        match classify(502, "/api/boxes", "<html>Bad Gateway</html>") {
+            Some(FleetError::Unexpected(detail)) => assert!(detail.contains("502"), "{detail}"),
+            other => panic!("expected unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_double_up() {
+        // The likeliest thing to be wrong about a pasted URL, and `//api/boxes`
+        // is a 404 that reads like a missing endpoint rather than a typo.
+        assert_eq!(
+            endpoint("https://fleet.example/", "/api/boxes"),
+            "https://fleet.example/api/boxes"
+        );
+        assert_eq!(
+            endpoint("  https://fleet.example  ", "/api/boxes"),
+            "https://fleet.example/api/boxes"
+        );
+    }
+
+    #[test]
+    fn a_real_fleet_response_parses_to_the_boxes_it_contains() {
+        // The literal body `GET /api/boxes` returned from the deployed control
+        // plane, captured rather than hand-written: the app showed "No agents
+        // yet" for a fleet that has one, and the parse was a suspect that
+        // could only be cleared by feeding it the exact bytes.
+        //
+        // It carries fields the app does not model (`destroyed_at`,
+        // `latest_task`, `task_count`, `cost_estimate`). Serde ignores unknown
+        // fields by default — this asserts that stays true, because the day it
+        // does not, every box silently disappears from the list.
+        let body = include_str!("../tests/fixture.json");
+        let list: BoxList = serde_json::from_str(body).expect("real response must parse");
+        assert_eq!(list.boxes.len(), 1);
+        assert_eq!(list.boxes[0].name, "eng-a");
+        assert_eq!(list.boxes[0].status, "stopped");
+        assert!(list.boxes[0].endpoint.is_some());
+    }
+
+    #[test]
+    fn errors_serialise_as_the_tagged_shape_the_frontend_matches_on() {
+        // `isFleetError` in types.ts tests for a `kind` field, and the empty
+        // state picks its message from it. If this ever serialised as
+        // `{"Rejected": "..."}` — serde's default for an enum — all three
+        // states would collapse into "unexpected" and the distinction the rest
+        // of this module exists to draw would be silently gone.
+        let json = serde_json::to_value(FleetError::Rejected("nope".into())).unwrap();
+        assert_eq!(json["kind"], "rejected");
+        assert_eq!(json["detail"], "nope");
+
+        let json = serde_json::to_value(FleetError::NotConfigured("set a url".into())).unwrap();
+        assert_eq!(json["kind"], "not_configured");
+    }
+}

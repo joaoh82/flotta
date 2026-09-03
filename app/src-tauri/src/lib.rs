@@ -1,0 +1,160 @@
+//! The Flotta app (M8).
+//!
+//! A list of agents from the control plane, and — from M8.2 — a conversation
+//! per agent straight to that box through the door. Hermes is the engine
+//! inside the box; this is the client, and it is ours.
+//!
+//! Everything that touches the network or the keychain is in `fleet`. The
+//! commands here are a thin boundary: they exist so the webview can ask for
+//! work without ever holding a credential.
+
+mod fleet;
+
+use fleet::{BoxRow, FleetError, Settings};
+use std::fs;
+use std::path::PathBuf;
+use tauri::Manager;
+
+fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, FleetError> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| FleetError::Unexpected(format!("no config directory: {e}")))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| FleetError::Unexpected(format!("cannot create {}: {e}", dir.display())))?;
+    Ok(dir.join("settings.json"))
+}
+
+fn read_settings(app: &tauri::AppHandle) -> Settings {
+    // A missing or unreadable file is "not configured yet", not an error: the
+    // first run has no file, and that is the normal path, not a failure.
+    settings_path(app)
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// What the settings screen shows. **Never the token** — the app can say
+/// whether one is stored, which is all the UI needs to render, and returning
+/// it would hand the webview the one thing this design keeps from it.
+#[derive(serde::Serialize)]
+struct SettingsView {
+    control_url: String,
+    domain: String,
+    has_token: bool,
+    /// Set when the keychain could not be *read*, which is a different thing
+    /// from there being no token in it — and the difference is the whole bug
+    /// this field exists to end. See `load_settings`.
+    token_error: Option<String>,
+}
+
+#[tauri::command]
+fn load_settings(app: tauri::AppHandle) -> SettingsView {
+    let settings = read_settings(&app);
+
+    // This was `matches!(read_token(), Ok(Some(_)))`, which folded a keychain
+    // *failure* into "no token saved" — and on macOS that failure is routine
+    // rather than exotic: a rebuilt binary has a different signature, so the
+    // ACL on the existing item no longer matches it and the read is denied.
+    // Every `just app` during development can do it.
+    //
+    // The app then opened its settings screen saying "None saved yet", the
+    // token was right there in the keychain, and closing that screen left
+    // "No agents yet" on a fleet that had one. Three layers, each honest on
+    // its own, and a conclusion that was false at every step.
+    let (has_token, token_error) = match fleet::read_token() {
+        Ok(token) => (token.is_some(), None),
+        Err(err) => (false, Some(err.detail().to_string())),
+    };
+
+    SettingsView {
+        control_url: settings.control_url,
+        domain: settings.domain,
+        has_token,
+        token_error,
+    }
+}
+
+/// Save settings. `token` is optional: `None` leaves the stored one alone, so
+/// editing a URL does not require pasting a token again. An empty string is a
+/// deliberate clear.
+#[tauri::command]
+fn save_settings(
+    app: tauri::AppHandle,
+    control_url: String,
+    domain: String,
+    token: Option<String>,
+) -> Result<(), FleetError> {
+    let control_url = control_url.trim().to_string();
+
+    // Validated here, not just guarded at render. A scheme-less paste —
+    // `my-fleet.up.railway.app` — used to save cleanly and then throw in the
+    // header on every launch, *including* with settings open, because the
+    // header sits above the form. The only recovery was hand-editing
+    // settings.json, which is not a recovery a person will find.
+    //
+    // Both halves are fixed: this refuses to store one, and the header no
+    // longer trusts what it reads. Either alone would leave a way in — this
+    // one cannot help a settings.json that is already wrong, and the render
+    // guard alone would keep saving values that cannot work.
+    // Empty is allowed and means "not configured yet" — the app has a state for
+    // that. Anything else has to be absolute, because that is what `new URL`
+    // and `reqwest` both require.
+    let unset_or_absolute = control_url.is_empty()
+        || control_url.starts_with("http://")
+        || control_url.starts_with("https://");
+    if !unset_or_absolute {
+        return Err(FleetError::NotConfigured(format!(
+            "{control_url:?} is not a URL — it needs a scheme. Try https://{control_url}"
+        )));
+    }
+
+    // The domain gets the same treatment, for the same reason and one it
+    // learned the hard way: the first person to test the URL validation pasted
+    // the test value into *this* field instead, and it was stored without a
+    // murmur. A hostname is not a URL — `<box>.<domain>` is built from it — so
+    // a scheme here is as wrong as no scheme there, and silently accepting
+    // either produces an address that cannot resolve at a point (M8.2) far
+    // from where it was typed.
+    let domain = domain.trim().trim_end_matches('/').to_string();
+    if domain.contains("://") || domain.contains('/') {
+        return Err(FleetError::NotConfigured(format!(
+            "{domain:?} is not a domain — agents are reached at <name>.<domain>,              so it wants something like flotta.dev"
+        )));
+    }
+
+    let settings = Settings {
+        control_url,
+        domain,
+    };
+    let path = settings_path(&app)?;
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&settings)
+            .map_err(|e| FleetError::Unexpected(e.to_string()))?,
+    )
+    .map_err(|e| FleetError::Unexpected(format!("cannot write {}: {e}", path.display())))?;
+
+    if let Some(token) = token {
+        fleet::write_token(token.trim())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
+    fleet::list_boxes(&read_settings(&app)).await
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            load_settings,
+            save_settings,
+            list_boxes
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

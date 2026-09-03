@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* System fonts only, like the dashboard: a downloaded webfont in a desktop app
+   is a network request on every cold start for something the OS already has,
+   and the app should look like it belongs on the machine it runs on. */
+@theme inline {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* The window has no browser chrome to inherit a background from. */
+html,
+body,
+#root {
+  height: 100%;
+}
