@@ -24,9 +24,11 @@
 use crate::fleet::{FleetError, Settings};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -79,6 +81,55 @@ impl AgentEvent {
         // propagating: there is nobody left to tell.
         let _ = app.emit("agent://event", self);
     }
+}
+
+/// One live conversation per box, keyed by name.
+///
+/// Lives here rather than in `lib.rs` because the task is what makes an entry
+/// live or dead, and the task has to be able to remove its own: when a
+/// conversation ends, an entry left behind is a sender nobody is listening to,
+/// and the next `open_conversation` succeeds against it while nothing happens.
+#[derive(Default)]
+pub struct Conversations(pub Mutex<HashMap<String, mpsc::Sender<String>>>);
+
+impl Conversations {
+    /// The sender for a box, if there is a task still reading from it.
+    ///
+    /// `is_closed` is the honest test: it becomes true the moment the receiver
+    /// drops, which is the moment the task returns. Checking only for the
+    /// key's presence treats a finished conversation as a live one.
+    pub fn live(&self, box_name: &str) -> Option<mpsc::Sender<String>> {
+        let mut map = self.0.lock().unwrap();
+        match map.get(box_name) {
+            Some(sender) if !sender.is_closed() => Some(sender.clone()),
+            Some(_) => {
+                map.remove(box_name);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub fn insert(&self, box_name: String, sender: mpsc::Sender<String>) {
+        self.0.lock().unwrap().insert(box_name, sender);
+    }
+
+    pub fn forget(&self, box_name: &str) {
+        self.0.lock().unwrap().remove(box_name);
+    }
+}
+
+/// Tell the UI a conversation is already up.
+///
+/// `Conversation` resets to "waking" whenever it mounts, so re-selecting an
+/// agent whose socket is already open left it waiting for an event that would
+/// never come again — stuck on "Waking…" with the composer disabled, for a
+/// connection that was working the whole time.
+pub fn announce_ready(app: &tauri::AppHandle, box_name: &str) {
+    AgentEvent::Ready {
+        box_name: box_name.to_string(),
+    }
+    .emit(app);
 }
 
 pub fn door_url(settings: &Settings, box_name: &str) -> String {
@@ -167,10 +218,19 @@ async fn connect(
     // The token goes in the query string because a WebSocket handshake cannot
     // carry headers in a browser — the door accepts it there and strips it
     // before proxying. Sending it the same way keeps one path tested.
-    let ws_url = format!(
-        "{}/api/ws?ticket={ticket}&access_token={token}",
-        base.replacen("https://", "wss://", 1)
-    );
+    //
+    // Built with the URL type rather than `format!`: a ticket is minted by the
+    // box and a token by whoever ran `flotta token mint`, so neither is ours
+    // to assume is query-safe. One `&` or `+` in either and the handshake
+    // fails with an error about the *other* parameter.
+    let mut ws_url = reqwest::Url::parse(&base.replacen("https://", "wss://", 1))
+        .map_err(|e| FleetError::Unexpected(format!("bad door url: {e}")))?;
+    ws_url.set_path("/api/ws");
+    ws_url
+        .query_pairs_mut()
+        .append_pair("ticket", &ticket)
+        .append_pair("access_token", token);
+    let ws_url = ws_url.to_string();
 
     // The session cookie has to come along by hand: the WebSocket client does
     // not share the HTTP client's jar, and the box's ticket check expects the
@@ -311,47 +371,89 @@ async fn one_turn(socket: &mut Socket, session_id: &str, text: &str) -> Result<S
         }
         let frame = next_frame(socket, remaining).await?;
 
-        // A refused submit — unknown session, bad params — comes back as a
-        // JSON-RPC error against our id, never as a completion. Treating it as
-        // noise means waiting out the whole turn deadline for an answer that
-        // was refused in milliseconds.
-        if frame.get("id").and_then(|v| v.as_u64()) == Some(id) {
-            if let Some(error) = frame.get("error") {
-                return Err(FleetError::Unexpected(format!(
-                    "the agent refused: {error}"
-                )));
-            }
-            continue;
+        match interpret(&frame, id) {
+            Verdict::Ignore => continue,
+            Verdict::Reply(text) => return Ok(text),
+            Verdict::Failed(err) => return Err(err),
         }
-
-        let params = match frame.get("params") {
-            Some(p) => p,
-            None => continue,
-        };
-        if params.get("type").and_then(|t| t.as_str()) != Some("message.complete") {
-            continue;
-        }
-        let payload = params.get("payload").cloned().unwrap_or_default();
-        let reply = payload
-            .get("text")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let status = payload.get("status").and_then(|s| s.as_str());
-
-        // The trap worth naming twice: a provider failure is a *successful*
-        // completion carrying an error string. Returning it as a reply prints
-        // "No inference provider configured" as though the agent had said it.
-        if let Some(status) = status {
-            if status != "complete" {
-                return Err(FleetError::Unexpected(format!(
-                    "the agent could not answer ({status}): {}",
-                    reply.chars().take(300).collect::<String>()
-                )));
-            }
-        }
-        return Ok(reply);
     }
+}
+
+/// What one frame means, mid-turn.
+///
+/// Split out of the loop so the three traps can be tested without a socket.
+/// They are the reason this is a loop over frames rather than an await on a
+/// call, and until now the only thing asserting them was prose.
+#[derive(Debug)]
+enum Verdict {
+    /// Not about this turn. Events interleave with responses constantly.
+    Ignore,
+    Reply(String),
+    Failed(FleetError),
+}
+
+fn interpret(frame: &serde_json::Value, id: u64) -> Verdict {
+    // A refused submit — unknown session, bad params — comes back as a
+    // JSON-RPC error against our id, never as a completion. Treated as noise
+    // it would burn the whole turn deadline waiting for an answer that was
+    // refused in milliseconds.
+    if frame.get("id").and_then(|v| v.as_u64()) == Some(id) {
+        return match frame.get("error") {
+            Some(error) => Verdict::Failed(FleetError::Unexpected(format!(
+                "the agent refused the message: {error}"
+            ))),
+            // The bare acknowledgement. The reply is still coming, as an event.
+            None => Verdict::Ignore,
+        };
+    }
+
+    let Some(params) = frame.get("params") else {
+        return Verdict::Ignore;
+    };
+    if params.get("type").and_then(|t| t.as_str()) != Some("message.complete") {
+        return Verdict::Ignore;
+    }
+
+    let payload = params.get("payload").cloned().unwrap_or_default();
+    let reply = payload
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // The trap worth naming twice: a provider failure is a *successful*
+    // completion carrying an error string. Returning it as a reply prints
+    // "No inference provider configured" as though the agent had said it.
+    match payload.get("status").and_then(|s| s.as_str()) {
+        Some(status) if status != "complete" => Verdict::Failed(FleetError::Unexpected(format!(
+            "the agent could not answer ({status}): {}",
+            reply.chars().take(300).collect::<String>()
+        ))),
+        _ => Verdict::Reply(reply),
+    }
+}
+
+/// End a conversation: tell the UI, and stop claiming it is open.
+///
+/// Every exit path goes through here. Without the `forget`, a failed
+/// conversation left its sender in the map, `open_conversation` saw a key and
+/// returned early, and the user could not reconnect to that agent without
+/// restarting the app — a dead entry is worse than no entry, because it
+/// silently absorbs every attempt to fix it.
+fn finish(app: &tauri::AppHandle, box_name: &str, failure: Option<String>) {
+    if let Some(state) = app.try_state::<Conversations>() {
+        state.forget(box_name);
+    }
+    match failure {
+        Some(detail) => AgentEvent::Failed {
+            box_name: box_name.to_string(),
+            detail,
+        },
+        None => AgentEvent::Closed {
+            box_name: box_name.to_string(),
+        },
+    }
+    .emit(app);
 }
 
 /// Own one conversation for as long as the UI wants it.
@@ -374,11 +476,7 @@ pub async fn run(
     let (mut socket, session_id) = match connect(&settings, &box_name, &token).await {
         Ok(pair) => pair,
         Err(err) => {
-            AgentEvent::Failed {
-                box_name,
-                detail: err.detail().to_string(),
-            }
-            .emit(&app);
+            finish(&app, &box_name, Some(err.detail().to_string()));
             return;
         }
     };
@@ -395,18 +493,14 @@ pub async fn run(
         tokio::select! {
             prompt = prompts.recv() => {
                 let Some(prompt) = prompt else {
-                    AgentEvent::Closed { box_name }.emit(&app);
+                    finish(&app, &box_name, None);
                     return;
                 };
                 AgentEvent::Thinking { box_name: box_name.clone() }.emit(&app);
                 match one_turn(&mut socket, &session_id, &prompt).await {
                     Ok(text) => AgentEvent::Reply { box_name: box_name.clone(), text }.emit(&app),
                     Err(err) => {
-                        AgentEvent::Failed {
-                            box_name,
-                            detail: err.detail().to_string(),
-                        }
-                        .emit(&app);
+                        finish(&app, &box_name, Some(err.detail().to_string()));
                         return;
                     }
                 }
@@ -415,11 +509,7 @@ pub async fn run(
                 // Cloudflare closes an idle proxied socket without telling
                 // either end, and the symptom is a reply that never arrives.
                 if socket.send(Message::Ping(Vec::new())).await.is_err() {
-                    AgentEvent::Failed {
-                        box_name,
-                        detail: "the connection to the agent dropped".into(),
-                    }
-                    .emit(&app);
+                    finish(&app, &box_name, Some("the connection to the agent dropped".into()));
                     return;
                 }
             }
@@ -456,6 +546,83 @@ mod tests {
             domain: ".flotta.dev.".into(),
         };
         assert_eq!(door_url(&settings, "eng-a"), "https://eng-a.flotta.dev");
+    }
+
+    #[test]
+    fn a_completion_is_the_reply() {
+        let v = interpret(
+            &serde_json::json!({
+                "params": {"type": "message.complete",
+                           "payload": {"text": "pong", "status": "complete"}}
+            }),
+            7,
+        );
+        assert!(matches!(v, Verdict::Reply(t) if t == "pong"));
+    }
+
+    #[test]
+    fn a_provider_failure_is_not_the_agent_talking() {
+        // It arrives as a *successful* completion whose status is not
+        // `complete`. Rendered as a reply, "No inference provider configured"
+        // appears in the transcript as though the agent had said it — wrong,
+        // and unactionable for whoever reads it.
+        let v = interpret(
+            &serde_json::json!({
+                "params": {"type": "message.complete",
+                           "payload": {"text": "No inference provider configured",
+                                       "status": "error"}}
+            }),
+            7,
+        );
+        match v {
+            Verdict::Failed(err) => {
+                assert!(
+                    err.detail().contains("could not answer"),
+                    "{}",
+                    err.detail()
+                )
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_submit_ends_the_turn_immediately() {
+        // Against our own id, and never as a completion. Ignored, it would
+        // cost the full turn deadline for an answer refused in milliseconds.
+        let v = interpret(
+            &serde_json::json!({"id": 7, "error": {"message": "unknown session"}}),
+            7,
+        );
+        match v {
+            Verdict::Failed(err) => assert!(err.detail().contains("unknown session")),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_acknowledgement_is_not_the_reply() {
+        // `prompt.submit` answers immediately with a bare result. Treating it
+        // as the reply returns an empty message before the agent has thought.
+        let v = interpret(&serde_json::json!({"id": 7, "result": {}}), 7);
+        assert!(matches!(v, Verdict::Ignore));
+    }
+
+    #[test]
+    fn another_turns_frames_are_ignored() {
+        let v = interpret(
+            &serde_json::json!({"id": 99, "error": {"message": "not ours"}}),
+            7,
+        );
+        assert!(matches!(v, Verdict::Ignore));
+    }
+
+    #[test]
+    fn interleaved_events_are_ignored() {
+        for kind in ["message.delta", "gateway.ready", "session.updated"] {
+            let v = interpret(&serde_json::json!({"params": {"type": kind}}), 7);
+            assert!(matches!(v, Verdict::Ignore), "{kind} should be ignored");
+        }
     }
 
     /// A real conversation with a real box. **Ignored by default** — it costs

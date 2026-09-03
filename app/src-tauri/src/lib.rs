@@ -11,11 +11,10 @@
 mod agent;
 mod fleet;
 
+use agent::Conversations;
 use fleet::{BoxRow, FleetError, Settings};
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use tauri::Manager;
 use tokio::sync::mpsc;
 
@@ -151,24 +150,21 @@ async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
     fleet::list_boxes(&read_settings(&app)).await
 }
 
-/// One live conversation per box, keyed by name.
-///
-/// The socket has to outlive a single command: reconnecting per message would
-/// re-pay the login, the ticket, and — if the box has gone back to sleep — the
-/// wake, which is 10-60 seconds the user would feel on every turn.
-#[derive(Default)]
-struct Conversations(Mutex<HashMap<String, mpsc::Sender<String>>>);
-
 #[tauri::command]
 async fn open_conversation(
     app: tauri::AppHandle,
     state: tauri::State<'_, Conversations>,
     box_name: String,
 ) -> Result<(), FleetError> {
-    // Idempotent: selecting an agent you are already talking to must not open
-    // a second socket to it, or the box sees two sessions and the reply for
-    // one arrives on the other.
-    if state.0.lock().unwrap().contains_key(&box_name) {
+    // Selecting an agent you are already talking to must not open a second
+    // socket — the box would see two sessions and one's reply would arrive on
+    // the other. But "already open" has to mean *live*: a finished task leaves
+    // a sender nobody reads, and returning early against one made the agent
+    // unreachable until the app restarted.
+    if state.live(&box_name).is_some() {
+        // The UI resets to "waking" on mount, so it needs telling that the
+        // connection it is waiting for already exists.
+        agent::announce_ready(&app, &box_name);
         return Ok(());
     }
 
@@ -182,7 +178,7 @@ async fn open_conversation(
     // A small buffer, not zero: a person can type a second message while the
     // first is in flight, and the alternative is the UI blocking on send.
     let (tx, rx) = mpsc::channel(8);
-    state.0.lock().unwrap().insert(box_name.clone(), tx);
+    state.insert(box_name.clone(), tx);
 
     tauri::async_runtime::spawn(agent::run(app, settings, box_name, token, rx));
     Ok(())
@@ -194,10 +190,9 @@ async fn send_prompt(
     box_name: String,
     text: String,
 ) -> Result<(), FleetError> {
-    let sender = state.0.lock().unwrap().get(&box_name).cloned();
-    let Some(sender) = sender else {
+    let Some(sender) = state.live(&box_name) else {
         return Err(FleetError::Unexpected(format!(
-            "no open conversation with {box_name}"
+            "the conversation with {box_name} is not open"
         )));
     };
     sender
@@ -211,7 +206,7 @@ fn close_conversation(state: tauri::State<'_, Conversations>, box_name: String) 
     // Dropping the sender ends the task's receive loop, which closes the
     // socket. No explicit shutdown message needed, and none that could be
     // missed.
-    state.0.lock().unwrap().remove(&box_name);
+    state.forget(&box_name);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

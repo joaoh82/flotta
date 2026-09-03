@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AgentEvent, Turn } from "./types";
+import { isFleetError, type AgentEvent, type Turn } from "./types";
+
+/** An error from the Rust side, as a sentence rather than an object. */
+function describe(err: unknown): string {
+  return isFleetError(err) ? err.detail : String(err);
+}
 
 /**
  * A conversation with one agent.
@@ -15,6 +20,10 @@ export function Conversation({ boxName }: { boxName: string }) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [status, setStatus] = useState<AgentEvent["kind"]>("waking");
   const [draft, setDraft] = useState("");
+  // Bumped to re-run the effect and reconnect. A failed conversation is
+  // forgotten on the Rust side, so opening again really does reconnect rather
+  // than returning success against a dead sender.
+  const [attempt, setAttempt] = useState(0);
   const bottom = useRef<HTMLDivElement>(null);
 
   // Keyed by box so switching agents starts a clean transcript rather than
@@ -24,35 +33,52 @@ export function Conversation({ boxName }: { boxName: string }) {
     setStatus("waking");
 
     let alive = true;
-    const unlisten = listen<AgentEvent>("agent://event", (event) => {
-      const payload = event.payload;
-      // Events carry the box they belong to because several conversations run
-      // at once (M8.3). Without this check, one agent's reply lands in
-      // another's transcript.
-      if (!alive || payload.box_name !== boxName) return;
+    let off: (() => void) | undefined;
 
-      setStatus(payload.kind);
-      if (payload.kind === "reply") {
-        setTurns((t) => [...t, { from: "agent", text: payload.text }]);
-      } else if (payload.kind === "failed") {
-        setTurns((t) => [...t, { from: "system", text: payload.detail }]);
+    // **Listen before asking.** `open_conversation` answers immediately when
+    // the socket is already up — it re-announces `ready` rather than opening a
+    // second one — so registering the listener afterwards races the event it
+    // exists to receive. Losing that race leaves the UI on "Waking…" forever,
+    // which is the exact bug this fix is for, reintroduced by ordering.
+    void (async () => {
+      off = await listen<AgentEvent>("agent://event", (event) => {
+        const payload = event.payload;
+        // Events carry the box they belong to because several conversations
+        // run at once (M8.3). Without this check, one agent's reply lands in
+        // another's transcript.
+        if (!alive || payload.box_name !== boxName) return;
+
+        setStatus(payload.kind);
+        if (payload.kind === "reply") {
+          setTurns((t) => [...t, { from: "agent", text: payload.text }]);
+        } else if (payload.kind === "failed") {
+          setTurns((t) => [...t, { from: "system", text: payload.detail }]);
+        }
+      });
+      if (!alive) {
+        off();
+        return;
       }
-    });
-
-    void invoke("open_conversation", { boxName }).catch((err) => {
-      if (!alive) return;
-      setStatus("failed");
-      setTurns((t) => [
-        ...t,
-        { from: "system", text: typeof err === "object" && err && "detail" in err ? String((err as { detail: unknown }).detail) : String(err) },
-      ]);
-    });
+      try {
+        await invoke("open_conversation", { boxName });
+      } catch (err) {
+        if (!alive) return;
+        setStatus("failed");
+        setTurns((t) => [...t, { from: "system", text: describe(err) }]);
+      }
+    })();
 
     return () => {
       alive = false;
-      void unlisten.then((off) => off());
+      off?.();
     };
-  }, [boxName]);
+  }, [boxName, attempt]);
+
+  /** Try again after a failure, without having to switch agents and back. */
+  async function reconnect() {
+    setStatus("waking");
+    setAttempt((n) => n + 1);
+  }
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
@@ -113,6 +139,14 @@ export function Conversation({ boxName }: { boxName: string }) {
         )}
         {status === "thinking" && (
           <p className="text-xs text-neutral-500">{boxName} is thinking…</p>
+        )}
+        {(status === "failed" || status === "closed") && (
+          <button
+            onClick={() => void reconnect()}
+            className="rounded border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:bg-neutral-50"
+          >
+            Reconnect to {boxName}
+          </button>
         )}
         <div ref={bottom} />
       </div>
