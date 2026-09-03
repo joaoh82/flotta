@@ -48,6 +48,35 @@ token goes in the keychain. On macOS you can confirm that:
 security find-generic-password -s dev.flotta.app -a control-plane-token
 ```
 
+## Development: the keychain and rebuilt binaries
+
+An unsigned binary's keychain ACL is tied to that exact binary. Every `cargo`
+rebuild therefore produces a binary the existing item does not trust, and macOS
+refuses it with:
+
+```
+Platform secure storage failure: The user name or passphrase you entered is not correct.
+```
+
+That is not a wrong passphrase and not a corrupted keychain — it is the item
+declining to talk to a build it has never seen. Release builds, signed with a
+stable identity, do not have the problem.
+
+Two things make it survivable:
+
+- **In debug builds only, `$FLOTTA_TOKEN` is read first** — the same variable
+  `flotta chat` uses. `cfg` compiles this out of release builds entirely, so a
+  shipped app cannot be made to take a token from the environment.
+- **Saving a token repairs the item.** `set_password` *updates* in place, which
+  needs access the new build does not have; when that fails the app deletes the
+  item and creates a fresh one, which needs no such access.
+
+If both somehow fail, remove it by hand and save again:
+
+```sh
+security delete-generic-password -s dev.flotta.app -a control-plane-token
+```
+
 ## What it does not have yet
 
 Conversation is M8.2, and creating or destroying agents is M8.3. There is also

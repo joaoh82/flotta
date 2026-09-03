@@ -112,7 +112,39 @@ fn entry() -> Result<keyring::Entry, FleetError> {
         .map_err(|e| FleetError::Keychain(format!("the keychain is unavailable: {e}")))
 }
 
+/// A development-only escape hatch, and the reason it is not a weakening.
+///
+/// An unsigned binary's keychain ACL is tied to that exact binary, so **every**
+/// `cargo` rebuild is denied access to the item the previous one created. In
+/// release builds, signed with a stable identity, this never happens. In
+/// development it happens constantly — and re-pasting a token after every
+/// rebuild is the kind of friction that ends with someone hard-coding it.
+///
+/// So in debug builds only, `$FLOTTA_TOKEN` is honoured — the same variable
+/// `flotta chat` already reads, so there is nothing new to manage. It is
+/// compiled out of release builds entirely, not merely skipped: `cfg` removes
+/// the code, so no shipped binary can be made to read a token from the
+/// environment by setting one.
+#[cfg(debug_assertions)]
+fn token_from_env() -> Option<String> {
+    std::env::var("FLOTTA_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn token_from_env() -> Option<String> {
+    None
+}
+
 pub fn read_token() -> Result<Option<String>, FleetError> {
+    // Before the keychain, so a developer whose item has been orphaned by a
+    // rebuild is not blocked by it.
+    if let Some(token) = token_from_env() {
+        return Ok(Some(token));
+    }
+
     match entry()?.get_password() {
         Ok(token) => Ok(Some(token)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -132,9 +164,35 @@ pub fn write_token(token: &str) -> Result<(), FleetError> {
             ))),
         };
     }
-    entry
-        .set_password(token)
-        .map_err(|e| FleetError::Keychain(format!("saving it failed: {e}")))
+    // Write, and on refusal delete-then-write.
+    //
+    // `set_password` *updates* an existing item, and updating needs access to
+    // it — which is exactly what a rebuilt binary is denied on macOS, since an
+    // unsigned build's keychain ACL is tied to that build. So the obvious
+    // recovery ("just save the token again") failed with the same error as the
+    // read, and the app had no way to repair itself from the inside.
+    //
+    // Creating a fresh item needs no access to the old one. Deleting usually
+    // does not either, because the item's ACL governs reading its *secret*.
+    if let Err(first) = entry.set_password(token) {
+        let recovered = entry
+            .delete_credential()
+            .ok()
+            .and_then(|()| keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok())
+            .map(|fresh| fresh.set_password(token));
+
+        match recovered {
+            Some(Ok(())) => return Ok(()),
+            _ => {
+                return Err(FleetError::Keychain(format!(
+                    "saving it failed: {first}. The existing keychain item will not \
+                     accept this build. Remove it and try again:\n\n    security \
+                     delete-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// GET a path on the control plane, with the token attached.
