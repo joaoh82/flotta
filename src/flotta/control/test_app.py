@@ -33,7 +33,7 @@ def fleet(tmp_path):
 
 @pytest.fixture
 def client(fleet):
-    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False)
+    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, background=False)
     with TestClient(app) as c:
         yield c
 
@@ -143,7 +143,7 @@ def test_events_span_all_three_tiers(client):
 def test_health_is_ok_when_the_loop_is_sweeping(fleet):
     import time
 
-    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False)
+    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, background=False)
     app.state.loop_state.started_at = time.monotonic()
     app.state.loop_state.last_sweep_at = time.monotonic()
 
@@ -190,7 +190,7 @@ def test_health_is_503_when_the_loop_has_stalled(fleet):
 def test_a_read_only_replica_is_healthy_without_sweeping(fleet):
     """Not every replica runs the loop; one that does not must not report
     degraded for failing to do a job it was told not to do."""
-    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False)
+    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, background=False)
     with TestClient(app) as c:
         response = c.get("/health")
     assert response.status_code == 200
@@ -416,7 +416,12 @@ AUTH_KEY = "a-signing-key-for-tests"
 @pytest.fixture
 def secured(fleet):
     """The control plane as it runs anywhere that is not someone's laptop."""
-    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, signing_key=AUTH_KEY)
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        signing_key=AUTH_KEY,
+    )
     with TestClient(app) as c:
         yield c
 
@@ -952,3 +957,64 @@ def test_the_refusal_names_a_command_that_exists(secured, monkeypatch):
             words.pop()
         result = CliRunner().invoke(cli, [*words[:2], "--help"])
         assert result.exit_code == 0, f"`flotta {suggestion}` is not a command"
+
+
+# -- FLOTTA-27: creating an agent answers immediately ------------------------
+
+
+def _async_client(fleet, created):
+    """A control plane that provisions in the background, like production."""
+    from flotta.control.app import create_app
+
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=True,
+        signing_key=AUTH_KEY,
+    )
+    return app
+
+
+def test_creating_an_agent_answers_before_the_machine_exists(fleet, monkeypatch):
+    """Provisioning is an app, a volume, a machine and a boot. Held open as one
+    request it outlives the proxy in front of it — Railway answered `502
+    Application failed to respond` while the work carried on, so the caller was
+    told it failed and a machine appeared anyway."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    slow: list[str] = []
+
+    def never_returns(name, **kwargs):
+        slow.append(name)
+        raise AssertionError("the request must not wait for this")
+
+    monkeypatch.setattr("flotta.provision.create_box", never_returns, raising=False)
+
+    with TestClient(_async_client(fleet, slow)) as client:
+        response = client.post(
+            "/api/boxes",
+            json={"name": "eng-x"},
+            headers=_bearer(SCOPE_FLEET_WRITE),
+        )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "provisioning"
+    assert body["box_id"], "the caller gets something real to poll"
+
+
+def test_a_duplicate_name_is_a_refusal_not_a_500(fleet):
+    """`boxes.name` is UNIQUE across every row including torn-down ones, so
+    recreating a destroyed agent raised an IntegrityError that surfaced as a
+    bare 500 with nothing in it for the caller."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    with TestClient(_async_client(fleet, [])) as client:
+        response = client.post(
+            "/api/boxes",
+            json={"name": "eng-a"},  # already in the fixture
+            headers=_bearer(SCOPE_FLEET_WRITE),
+        )
+
+    assert response.status_code == 409, response.text
+    assert "eng-a" in response.json()["detail"]

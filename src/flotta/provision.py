@@ -472,12 +472,142 @@ def build_identity(
     return box_env, {"FLOTTA_BOX_TOKEN": token}
 
 
+#: How long a box may sit in `provisioning` before it is presumed abandoned.
+#: Generous: a cold app, a volume and a boot is minutes on a bad day, and
+#: tearing down a provision that was merely slow would be worse than waiting.
+STALE_PROVISION_S = 20 * 60
+
+
+def reconcile_boxes(
+    store: FleetStore,
+    *,
+    backend_for: Callable[[str], Backend] | None = None,
+    now: datetime | None = None,
+    stale_after_s: int = STALE_PROVISION_S,
+) -> list[dict[str, Any]]:
+    """Make box rows agree with the substrate. Returns what it changed.
+
+    `reconcile` owns **tasks**; this owns **boxes**, and it exists because two
+    real failures had no owner:
+
+    **A provision that never finished.** The endpoint is written only once
+    `create` returns, so a control plane that dies mid-create leaves a row at
+    `provisioning` with `endpoint = None` — and a real machine that no Flotta
+    verb can reach, because every one of them addresses a box by its endpoint.
+    `DELETE` on such a row answered `200 torn_down` and destroyed nothing,
+    which is the orphan-machine-billing scenario `FlyBackend.create` already
+    warns about, arriving through a door nobody had checked. So: ask the
+    backend whether a machine exists under that name, record the endpoint if it
+    does, and close the row either way.
+
+    **A row that says `running` about a machine that is not.** `create_box`
+    observes `started`, which is true for the second before an entrypoint that
+    cannot boot exits. The row then claims a healthy agent while the machine
+    crash-loops and stops.
+
+    Nothing here *creates*. A sweeper that could provision would race the
+    caller that is already doing it; this only closes and corrects.
+    """
+    resolve = backend_for or _backend_for
+    moment = now or datetime.now(UTC)
+    changed: list[dict[str, Any]] = []
+
+    for box in store.list_boxes():
+        if box.status == "provisioning":
+            created = _parse_ts(box.created_at)
+            # An unparseable timestamp is not evidence of abandonment. Leaving
+            # the row alone is the safe reading — the alternative is tearing
+            # down a live provision over a formatting problem.
+            if created is None or (moment - created).total_seconds() < stale_after_s:
+                continue
+            changed.append(_close_stranded_provision(store, box, resolve))
+        elif box.status == "running" and box.endpoint:
+            drift = _correct_running(store, box, resolve)
+            if drift:
+                changed.append(drift)
+
+    return changed
+
+
+def _close_stranded_provision(
+    store: FleetStore, box: Box, resolve: Callable[[str], Backend]
+) -> dict[str, Any]:
+    """Tear down a provision nobody finished, machine included."""
+    detail: dict[str, Any] = {"box_id": box.id, "name": box.name, "action": "stranded_provision"}
+    endpoint = box.endpoint
+
+    if endpoint is None:
+        # The machine may exist under the box's name even though the row never
+        # learned its address. Finding it is the difference between a tidy row
+        # and a machine billing forever.
+        try:
+            endpoint = _peek_endpoint(resolve("fly://"), box.name)
+        except Exception as exc:  # noqa: BLE001 - a probe must never end a sweep
+            detail["probe_error"] = f"{type(exc).__name__}: {exc}"
+
+    if endpoint:
+        detail["endpoint"] = endpoint
+        try:
+            resolve(endpoint).destroy(endpoint)
+            detail["destroyed"] = True
+        except Exception as exc:  # noqa: BLE001
+            # Recorded, not raised: the row still has to be closed, and the
+            # endpoint is now written down so a human can finish the job.
+            detail["destroyed"] = False
+            detail["error"] = f"{type(exc).__name__}: {exc}"
+
+    store.add_event(
+        "box", box.id, "torn_down", {"reason": "provisioning never completed", **detail}
+    )
+    store.update_box_status(box.id, "torn_down", endpoint=endpoint)
+    return detail
+
+
+def _correct_running(
+    store: FleetStore, box: Box, resolve: Callable[[str], Backend]
+) -> dict[str, Any] | None:
+    """A row claiming `running` about a machine that is not."""
+    try:
+        observed = resolve(box.endpoint).state(box.endpoint)
+    except Exception:  # noqa: BLE001 - an unreadable substrate is not a verdict
+        return None
+
+    if observed in ("started", "starting", "replacing", "unknown"):
+        return None
+
+    # `gone` means the machine was destroyed outside Flotta; anything else
+    # settled means it is simply not up. Neither is `running`.
+    status = "torn_down" if observed == "gone" else "stopped"
+    store.add_event("box", box.id, status, {"reason": f"substrate says {observed!r}"})
+    store.update_box_status(box.id, status)
+    return {"box_id": box.id, "name": box.name, "action": "corrected", "observed": observed}
+
+
+def reserve_box(name: str, *, store: FleetStore, backend: Backend) -> Box:
+    """Write the row, and nothing else. Returns immediately.
+
+    Split out of `create_box` because provisioning takes *minutes* — an app, a
+    volume, a machine, a boot — and was modelled as one synchronous call. Behind
+    an HTTP request that means the proxy gives up first:
+
+        POST /api/boxes -> 502 Application failed to respond
+
+    while the work carries on. The caller is told it failed; a machine appears
+    anyway. Reserving the row separately lets the API answer at once with
+    something real to poll.
+    """
+    box = store.create_box(name)
+    store.add_event("box", box.id, "provisioning", {"name": name, "backend": backend.scheme})
+    return box
+
+
 def create_box(
     name: str,
     *,
     store: FleetStore,
     backend: Backend | None = None,
     spec: BoxSpec | None = None,
+    box: Box | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
 
@@ -500,7 +630,7 @@ def create_box(
     # endpoint. Two rows, one machine: `stop_box` on either would then lie
     # about the other. Unreachable through today's CLI, which is exactly why it
     # is worth closing before `flotta create` exists to reach it.
-    probe = _peek_endpoint(impl, name)
+    probe = None if box is not None else _peek_endpoint(impl, name)
     if probe:
         for existing in store.list_boxes():
             if existing.endpoint == probe and not is_terminal("box", existing.status):
@@ -510,8 +640,11 @@ def create_box(
                     "before creating another, or point FLOTTA_FLY_APP elsewhere."
                 )
 
-    box = store.create_box(name)
-    store.add_event("box", box.id, "provisioning", {"name": name, "backend": impl.scheme})
+    # A caller that already reserved the row passes it in — that is how the
+    # API answers immediately and provisions afterwards, without the row being
+    # created twice or the name being taken between the two halves.
+    if box is None:
+        box = reserve_box(name, store=store, backend=impl)
 
     # Identity travels with the machine rather than arriving afterwards. The
     # ordering already works: `store.create_box` produced the id above, so

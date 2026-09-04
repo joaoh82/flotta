@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -54,6 +55,44 @@ from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loo
 from flotta.store import FleetStore, UnknownEntityError, is_terminal
 
 _log = logging.getLogger("flotta.control")
+
+#: Live provisioning threads, held so nothing collects them mid-flight.
+_provisioning: set[threading.Thread] = set()
+
+
+def _build() -> str:
+    """Which commit is running.
+
+    `/health` said the process was up and nothing about *what* it was. That is
+    indistinguishable from the interesting question during a deploy: a restart
+    caused by a changed variable looks exactly like a restart caused by new
+    code, and reading one as the other cost this project a wasted machine and
+    an hour of misdiagnosis — the bug was hunted in Railway's variables, which
+    were correct all along.
+
+    Railway sets `RAILWAY_GIT_COMMIT_SHA`; `$FLOTTA_BUILD` is the override for
+    anywhere else. Unknown is reported as unknown rather than guessed.
+    """
+    for name in ("FLOTTA_BUILD", "RAILWAY_GIT_COMMIT_SHA"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value[:12]
+    return "unknown"
+
+
+def _peek_for(impl: Any, name: str) -> str | None:
+    """The endpoint `create` would adopt for a name, or None.
+
+    Best-effort by construction: a probe that fails must not stop a create, or
+    a Fly hiccup becomes an outage for the one verb that adds capacity.
+    """
+    from flotta.provision import _peek_endpoint
+
+    try:
+        return _peek_endpoint(impl, name)
+    except Exception:  # noqa: BLE001
+        return None
+
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 INTERVAL_ENV = "FLOTTA_RECONCILE_INTERVAL_S"
@@ -157,6 +196,10 @@ def create_app(
     *,
     store_factory: Any = _store_factory,
     run_loop: bool = True,
+    #: Answer `202` and provision on a background task rather than holding the
+    #: request open for minutes. Off in tests, where a synchronous create is
+    #: what the assertions are about — and where there is no proxy to time out.
+    background: bool = True,
     interval_s: float | None = None,
     loop_runner: Any = None,
     signing_key: str | None = None,
@@ -290,7 +333,11 @@ def create_app(
         # failing on a threading bug.
         healthy = not (loop["stale"] or loop["failing"]) if run_loop else True
         return JSONResponse(
-            {"status": "ok" if healthy else "degraded", "reconcile_loop": loop},
+            {
+                "status": "ok" if healthy else "degraded",
+                "build": _build(),
+                "reconcile_loop": loop,
+            },
             status_code=200 if healthy else 503,
         )
 
@@ -346,6 +393,9 @@ def create_app(
         if not name:
             raise HTTPException(status_code=422, detail="a box needs a name")
 
+        if background:
+            return _create_in_background(name)
+
         store = store_factory()
         try:
             try:
@@ -382,6 +432,81 @@ def create_app(
             return {"box": _box_dict(box), **result}
         finally:
             store.close()
+
+    def _create_in_background(name: str) -> Any:
+        """Reserve the row, answer, and provision afterwards.
+
+        Provisioning is an app, a volume, a machine and a boot — minutes on a
+        cold path. Held open as one request it outlives the proxy in front of
+        it: Railway answered `502 Application failed to respond` while the work
+        carried on, so the caller was told it had failed and a machine appeared
+        anyway.
+
+        Worse, the request being cancelled took `create_box` with it, leaving a
+        row at `provisioning` with no endpoint and a real machine nothing could
+        address. The reconcile loop closes those now, but not creating them is
+        better than sweeping them up.
+
+        So: `202`, the box id, and a row to poll. The work runs on the event
+        loop's own task, which no client disconnect can cancel.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import _backend_for, create_box, reserve_box
+
+        store = store_factory()
+        try:
+            impl = _backend_for("fly://")
+            probe = _peek_for(impl, name)
+            if probe:
+                for existing in store.list_boxes():
+                    if existing.endpoint == probe and not is_terminal("box", existing.status):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"box {existing.id} ({existing.name}) already occupies {probe}"
+                            ),
+                        )
+            try:
+                box = reserve_box(name, store=store, backend=impl)
+            except Exception as exc:
+                # A duplicate name is the common one, and it used to surface as
+                # a bare 500 with an IntegrityError behind it.
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"cannot create a box named {name!r}: {exc}",
+                ) from exc
+            payload = {"box": _box_dict(box), "box_id": box.id, "status": box.status}
+        finally:
+            store.close()
+
+        def provision() -> None:
+            inner = store_factory()
+            try:
+                create_box(name, store=inner, box=box)
+            except Exception as exc:  # noqa: BLE001
+                # `create_box` already records the failure against the row;
+                # this only stops a stray exception ending the thread in
+                # silence.
+                _log.warning("provisioning %s failed: %s: %s", name, type(exc).__name__, exc)
+            finally:
+                inner.close()
+
+        # A thread rather than an asyncio task: this endpoint is a sync `def`,
+        # so FastAPI runs it in a threadpool where there is no running loop and
+        # `create_task` raises. Capturing the loop at startup would work and is
+        # more machinery than the job needs — `create_box` is blocking
+        # subprocess work from end to end, so it belongs on a thread either
+        # way.
+        #
+        # If the process dies mid-provision the row is left at `provisioning`
+        # with a machine possibly created. That is not ignored: `reconcile_boxes`
+        # sweeps exactly that, which is why it was built alongside this.
+        worker = threading.Thread(target=provision, name=f"provision-{name}", daemon=True)
+        _provisioning.add(worker)
+        worker.start()
+
+        return JSONResponse(payload, status_code=202)
 
     @app.get("/api/boxes/{box_id}")
     def get_box(box_id: str, _: Token | None = needs_read) -> Any:
