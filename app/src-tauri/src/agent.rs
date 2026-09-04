@@ -626,20 +626,24 @@ pub async fn run(
                 };
                 match command {
                     Command::Resync => {
-                        // Asked of the box, not replayed from memory here.
-                        match call(
-                            &mut socket,
-                            "session.resume",
-                            serde_json::json!({"session_id": session_id}),
-                        )
-                        .await
-                        {
-                            Ok(payload) => {
-                                // The id can move under us here exactly as it
-                                // can at connect; ignoring it would leave the
-                                // next prompt addressing a session that no
-                                // longer exists.
-                                let (live, resumed) = read_resume(&payload, &session_id);
+                        // The same read `attach` does at connect, deliberately.
+                        //
+                        // The first version resumed `session_id` directly and
+                        // failed against a real box with
+                        // `{"code":4007,"message":"session not found"}` —
+                        // because **there are two ids**. `session.resume` looks
+                        // its argument up in the *database*; the id it hands
+                        // back is the live in-memory key that `prompt.submit`
+                        // needs. Resuming the live one asks the database for a
+                        // row that was never in it.
+                        //
+                        // Two ids to keep in step is two chances to use the
+                        // wrong one — and the same words, `session not found`,
+                        // for both mistakes under different codes (4001 and
+                        // 4007). Re-running `attach` keeps exactly one path
+                        // that knows which id is which.
+                        match attach(&mut socket).await {
+                            Ok((live, resumed)) => {
                                 session_id = live;
                                 AgentEvent::Ready {
                                     box_name: box_name.clone(),
@@ -942,6 +946,32 @@ mod tests {
                 "reconnecting did not bring the conversation back: {} lines, none with {marker}",
                 history.len()
             );
+
+            // **Resync on a socket that is already open.** This is what
+            // switching back to an agent does, and it was the one assumption
+            // in that fix with nothing behind it: `session.resume` is
+            // documented for *reattaching*, and calling it again on a live
+            // session could plausibly have returned nothing, or disturbed it.
+            let mut socket = _socket;
+
+            // Exactly what `Command::Resync` runs when you switch back to an
+            // agent whose socket is still open.
+            let (live, again) = attach(&mut socket)
+                .await
+                .unwrap_or_else(|e| panic!("resync failed: {}", e.detail()));
+            println!("resync -> session {live}, {} turns", again.len());
+            assert!(
+                again.iter().any(|line| line.text.contains(&marker)),
+                "a resync on a live socket lost the conversation: {} lines",
+                again.len()
+            );
+
+            // And the session stays usable afterwards — the failure the
+            // reviewer caught lands here, one message after the resync.
+            let after = one_turn(&mut socket, &live, "Reply with one word: still.")
+                .await
+                .unwrap_or_else(|e| panic!("the turn after a resync failed: {}", e.detail()));
+            println!("after resync: {after:?}");
         });
     }
 }
