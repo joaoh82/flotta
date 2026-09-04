@@ -223,7 +223,47 @@ That round trip is the entire thesis of the project in one command.
 
 ---
 
-## Step 6a — More than one agent
+## Step 6a — What the control plane needs to create working agents
+
+Creating an agent provisions a machine that must boot on its own, and a box
+refuses to serve without credentials. The control plane is what puts them
+there, so it needs them:
+
+```
+FLOTTA_BOX_PASSWORD=<the same value the door has>
+FLOTTA_MODEL=<e.g. z-ai/glm-5.2>
+FLOTTA_MODEL_BASE_URL=<e.g. https://openrouter.ai/api/v1>
+FLOTTA_API_KEY=<your provider key>
+FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
+FLOTTA_DOMAIN=flotta.dev
+```
+
+**`FLOTTA_BOX_PASSWORD` must match the door's.** The door logs into every box
+on the caller's behalf using its copy; a different value locks it out of the
+agent that was just created. That is also why creation does not generate one
+per box.
+
+**The last two look redundant on the control plane and are not.** It stamps
+them onto every box it creates, so the box knows where to fetch git credentials
+and what domain to sign commits under — and it cannot infer its own public URL.
+Before this was documented, an agent created through the API booted with no
+credential helper and committed as `boxes.invalid`, because creation from the
+CLI had been reading them from the operator's `.env` all along.
+
+Without these, creating an agent still returns `201` and the machine then
+restarts until Fly gives up:
+
+```
+box_entrypoint.sh: HERMES_DASHBOARD_BASIC_AUTH_USERNAME: set it with: just fly-auth
+Main child exited normally with code: 1
+```
+
+The box's own timeline says so — `flotta logs <box>` shows a
+`fleet_secrets_missing` event naming what was absent.
+
+---
+
+## Step 6b — More than one agent
 
 **A fleet with no `FLOTTA_FLY_APP_PREFIX` holds exactly one box.** `create`
 adopts the existing machine on `$FLOTTA_FLY_APP` rather than adding a second,
