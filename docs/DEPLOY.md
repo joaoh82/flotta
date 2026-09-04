@@ -223,6 +223,37 @@ That round trip is the entire thesis of the project in one command.
 
 ---
 
+## Creating an agent is asynchronous
+
+`POST /api/boxes` answers **202** with the box id and `status: provisioning`,
+then provisions on a background thread. Poll `GET /api/boxes/{id}` until it
+reaches `running`.
+
+It used to hold the request open for the whole thing — an app, a volume, a
+machine and a boot — and Railway's proxy gave up first:
+
+```
+HTTP 502 — Application failed to respond
+```
+
+while the work carried on. The caller was told it had failed and a machine
+appeared anyway. Worse, the cancelled request took the provisioning with it,
+leaving a row at `provisioning` with no endpoint and a real machine that no
+Flotta verb could address, because every one of them addresses a box by its
+endpoint.
+
+The reconcile loop now sweeps boxes as well as tasks: a provision still
+unfinished after 20 minutes is closed and its machine destroyed, and a row
+claiming `running` about a machine that is not gets corrected. `flotta logs
+<box>` shows both.
+
+`/health` reports the commit it is running, under `build`. Use it after a
+deploy — a restart caused by a changed variable looks exactly like one caused
+by new code, and reading one as the other has already cost this project a
+wasted machine.
+
+---
+
 ## Step 6a — What the control plane needs to create working agents
 
 Creating an agent provisions a machine that must boot on its own, and a box

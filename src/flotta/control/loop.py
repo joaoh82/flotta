@@ -139,6 +139,7 @@ async def run_reconcile_loop(
     store_factory: Callable[[], Any],
     reconcile: Callable[..., list[dict[str, Any]]] | None = None,
     sleeper: Callable[..., list[dict[str, Any]]] | None = None,
+    box_sweeper: Callable[..., list[dict[str, Any]]] | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep,
     max_sweeps: int | None = None,
 ) -> None:
@@ -161,6 +162,10 @@ async def run_reconcile_loop(
         from flotta.provision import sleep_idle_boxes
 
         sleeper = sleep_idle_boxes
+    if box_sweeper is None:
+        from flotta.provision import reconcile_boxes
+
+        box_sweeper = reconcile_boxes
 
     state.started_at = state._clock()
     _log.info("reconcile loop started, interval=%.0fs", state.interval_s)
@@ -190,6 +195,17 @@ async def run_reconcile_loop(
                         # reconciling because a suspend failed is worse than
                         # one paying for an extra half hour.
                         _log.warning("idle sweep failed: %s: %s", type(exc).__name__, exc)
+
+                # Boxes, not tasks. Closes provisions nobody finished — which
+                # otherwise leave a machine no verb can reach — and corrects
+                # rows claiming `running` about a machine that is not.
+                if box_sweeper is not None:
+                    try:
+                        corrected = box_sweeper(store)
+                        if corrected:
+                            _log.info("corrected %d box row(s)", len(corrected))
+                    except Exception as exc:
+                        _log.warning("box sweep failed: %s: %s", type(exc).__name__, exc)
                 return stranded, slept
             finally:
                 store.close()

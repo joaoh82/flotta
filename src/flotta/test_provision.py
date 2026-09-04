@@ -2143,3 +2143,121 @@ def test_openrouter_itself_still_uses_its_own_variable():
     for url in ("https://openrouter.ai/api/v1", "https://api.openrouter.ai/v1"):
         secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL=url))
         assert secrets["OPENROUTER_API_KEY"] == "sk-abc", url
+
+
+# -- FLOTTA-27: the row is the source of truth, and reconcile keeps it honest --
+
+
+def _aged(store, name, status, *, minutes, endpoint=None):
+    """A box row that was created `minutes` ago."""
+    from datetime import timedelta
+
+    box = store.create_box(name)
+    if status != "provisioning":
+        store.update_box_status(box.id, status, endpoint=endpoint)
+    with store._conn.transaction(guard="boxes"):
+        store._conn.execute(
+            "UPDATE boxes SET created_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(), box.id),
+        )
+    return store.get_box(box.id)
+
+
+def test_a_provision_nobody_finished_is_closed_and_its_machine_destroyed(store):
+    """The endpoint is written only once `create` returns, so a control plane
+    that dies mid-create leaves a row with `endpoint = None` and a real machine
+    no verb can address — `DELETE` answered `torn_down` and destroyed nothing.
+    """
+    from flotta.provision import reconcile_boxes
+
+    box = _aged(store, "eng-x", "provisioning", minutes=30)
+    impl = FakeBackend()
+    impl.existing = "fake://app/m9"
+
+    def peek(name=None):
+        return impl.existing
+
+    impl.existing_endpoint = peek
+
+    changed = reconcile_boxes(store, backend_for=lambda _: impl)
+
+    assert changed and changed[0]["destroyed"] is True
+    assert "destroy" in impl.calls, "the machine must actually go, not just the row"
+    row = store.get_box(box.id)
+    assert row.status == "torn_down"
+    assert row.endpoint == "fake://app/m9", "recorded so a human can finish the job"
+
+
+def test_a_slow_provision_is_left_alone(store):
+    """A cold app, a volume and a boot is minutes on a bad day. Tearing down a
+    provision that was merely slow is worse than waiting."""
+    from flotta.provision import reconcile_boxes
+
+    _aged(store, "eng-x", "provisioning", minutes=2)
+    impl = FakeBackend()
+    assert reconcile_boxes(store, backend_for=lambda _: impl) == []
+    assert impl.calls == []
+
+
+def test_a_row_claiming_running_about_a_stopped_machine_is_corrected(store):
+    """`create_box` observes `started`, which is true for the second before an
+    entrypoint that cannot boot exits. The row then claims a healthy agent."""
+    from flotta.provision import reconcile_boxes
+
+    box = _aged(store, "eng-x", "running", minutes=1, endpoint="fake://app/m1")
+    impl = FakeBackend()
+    impl.machine_state = "stopped"
+
+    changed = reconcile_boxes(store, backend_for=lambda _: impl)
+
+    assert changed and changed[0]["observed"] == "stopped"
+    assert store.get_box(box.id).status == "stopped"
+
+
+def test_a_machine_destroyed_outside_flotta_is_not_merely_stopped(store):
+    from flotta.provision import reconcile_boxes
+
+    box = _aged(store, "eng-x", "running", minutes=1, endpoint="fake://app/m1")
+    impl = FakeBackend()
+    impl.machine_state = "gone"
+
+    reconcile_boxes(store, backend_for=lambda _: impl)
+    assert store.get_box(box.id).status == "torn_down"
+
+
+def test_a_running_box_that_is_running_is_left_alone(store):
+    from flotta.provision import reconcile_boxes
+
+    _aged(store, "eng-x", "running", minutes=1, endpoint="fake://app/m1")
+    impl = FakeBackend()
+    impl.machine_state = "started"
+    assert reconcile_boxes(store, backend_for=lambda _: impl) == []
+
+
+def test_an_unreadable_substrate_is_not_a_verdict(store):
+    """A backend that cannot answer must not be read as "the box is down" —
+    that would close live agents during a Fly outage."""
+    from flotta.backend import BackendError
+    from flotta.provision import reconcile_boxes
+
+    box = _aged(store, "eng-x", "running", minutes=1, endpoint="fake://app/m1")
+
+    class Blind(FakeBackend):
+        def state(self, box_id):
+            raise BackendError("fly is having a bad minute")
+
+    assert reconcile_boxes(store, backend_for=lambda _: Blind()) == []
+    assert store.get_box(box.id).status == "running"
+
+
+def test_reserving_a_box_touches_no_substrate(store):
+    """What makes an immediate 202 honest: the row exists before any machine
+    does, so there is something real to poll."""
+    from flotta.provision import reserve_box
+
+    impl = FakeBackend()
+    box = reserve_box("eng-x", store=store, backend=impl)
+
+    assert box.status == "provisioning"
+    assert impl.calls == []
+    assert [e.type for e in store.get_events("box", box.id)] == ["provisioning"]
