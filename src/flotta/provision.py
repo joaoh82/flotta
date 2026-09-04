@@ -1348,6 +1348,12 @@ def teardown_box(
         },
     )
     store.update_box_status(box_id, "torn_down")
+
+    # The agent is gone; its *address* should not be held hostage by the row
+    # that records it. Renaming frees `eng-a` for a fresh agent while leaving
+    # the history intact — events are keyed by id, not by name.
+    released = store.release_name(box_id)
+
     return {
         "box_id": box_id,
         "status": "torn_down",
@@ -1355,6 +1361,7 @@ def teardown_box(
         "cancelled": cancelled,
         "cancel_error": cancel_error,
         "failed_tasks": failed_tasks,
+        "name_released": released,
     }
 
 

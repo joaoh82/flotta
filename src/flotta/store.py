@@ -401,6 +401,31 @@ class FleetStore:
 
     # -- boxes -------------------------------------------------------------
 
+    def release_name(self, box_id: str) -> str | None:
+        """Free a torn-down box's name for reuse. Returns the new name.
+
+        `name` is UNIQUE across **every** row, torn-down ones included, because
+        a name is the address: `flotta chat eng-a`, `eng-a.flotta.dev`. That is
+        worth keeping — but it meant a name was spent the moment it was used,
+        so destroying `eng-a` and wanting a fresh `eng-a` was impossible, and
+        the attempt surfaced as a bare 500.
+
+        The constraint stays and the tombstone moves out of the way: the row is
+        renamed `<name>@<id>`, which is unique by construction because the id
+        is. Its history is untouched — events are keyed by box id, so
+        `flotta logs <id>` still shows everything the agent ever did.
+
+        Idempotent: a row already carrying its own id is left alone, so tearing
+        a box down twice does not stack suffixes.
+        """
+        box = self.get_box(box_id)
+        if box is None or box.name.endswith(f"@{box.id}"):
+            return None
+        released = f"{box.name}@{box.id}"
+        with self._conn.transaction(guard="boxes"):
+            self._conn.execute("UPDATE boxes SET name = ? WHERE id = ?", (released, box.id))
+        return released
+
     def create_box(self, name: str, *, box_id: str | None = None) -> Box:
         """Insert a new box in status ``provisioning`` and return it.
 
