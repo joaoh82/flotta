@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Conversation } from "./Conversation";
+import { DestroyAgent } from "./DestroyAgent";
+import { NewAgent } from "./NewAgent";
 import { Settings } from "./Settings";
 import { StatusBadge } from "./StatusBadge";
 import { isFleetError, type BoxRow, type FleetError, type SettingsView } from "./types";
@@ -93,6 +95,7 @@ export default function App() {
   const [error, setError] = useState<FleetError | null>(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
+  const [destroying, setDestroying] = useState<BoxRow | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -158,6 +161,8 @@ export default function App() {
     void reload();
   }, [reload]);
 
+  const selectedBox = boxes.find((b) => b.name === selected) ?? null;
+
   return (
     <div className="flex h-full flex-col bg-white text-neutral-900">
       <header className="flex items-center justify-between border-b border-neutral-200 px-4 py-2.5">
@@ -210,7 +215,8 @@ export default function App() {
                 the primary object, not a row in a table of machines — which is
                 why selecting one opens a conversation rather than a detail
                 page. */}
-            <ul className="w-64 shrink-0 divide-y divide-neutral-100 overflow-auto border-r border-neutral-200">
+            <div className="flex w-64 shrink-0 flex-col border-r border-neutral-200">
+              <ul className="min-h-0 flex-1 divide-y divide-neutral-100 overflow-auto">
               {boxes.map((box) => (
                 <li key={box.id}>
                   <button
@@ -236,11 +242,46 @@ export default function App() {
                   </button>
                 </li>
               ))}
-            </ul>
+              </ul>
+              <NewAgent
+                onCreated={(box) => {
+                  void refresh();
+                  setSelected(box.name);
+                }}
+              />
+            </div>
 
-            <div className="min-w-0 flex-1">
-              {selected ? (
-                <Conversation key={selected} boxName={selected} />
+            <div className="flex min-w-0 flex-1 flex-col">
+              {destroying ? (
+                <DestroyAgent
+                  box={destroying}
+                  onCancel={() => setDestroying(null)}
+                  onDestroyed={() => {
+                    if (selected === destroying.name) setSelected(null);
+                    setDestroying(null);
+                    void refresh();
+                  }}
+                />
+              ) : selectedBox ? (
+                <>
+                  <div className="flex items-center justify-between border-b border-neutral-200 px-4 py-2">
+                    <span className="font-mono text-[11px] text-neutral-500">
+                      {selectedBox.name}.flotta.dev
+                    </span>
+                    <button
+                      onClick={() => setDestroying(selectedBox)}
+                      className="rounded px-2 py-1 text-xs text-neutral-500 hover:bg-red-50 hover:text-red-700"
+                    >
+                      Destroy
+                    </button>
+                  </div>
+                  {/* Keyed by name so switching agents remounts: a transcript
+                      belongs to one agent, and the box is asked for it again
+                      rather than the UI carrying it across. */}
+                  <div className="min-h-0 flex-1">
+                    <Conversation key={selectedBox.name} boxName={selectedBox.name} />
+                  </div>
+                </>
               ) : (
                 <p className="p-8 text-sm text-neutral-500">
                   Pick an agent to talk to.
