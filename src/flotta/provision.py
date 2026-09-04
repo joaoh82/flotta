@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import math
 import os
+import secrets as secrets_module
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -343,6 +344,71 @@ def _require_task(store: FleetStore, task_id: str) -> Task:
 BOX_TOKEN_TTL_S = 90 * 24 * 3600
 
 
+#: The box's dashboard user. Constant, because the door logs in as it — the
+#: username was never the secret, the password is.
+BOX_AUTH_USER = "flotta"
+
+
+def fleet_secrets(env: dict[str, str] | None = None) -> tuple[dict[str, str], list[str]]:
+    """What every box in this fleet needs to boot, and what is missing.
+
+    Returns `(secrets, missing)`. Distinct from `build_identity`, which is what
+    makes a box *itself*: these are the same for every agent, and until M8.3
+    they were never injected at all — one Fly app held the whole fleet and
+    `just fly-auth` / `just fly-secrets` had set them on it once, by hand.
+
+    One app per agent removed that accident, and the first box created through
+    the API crash-looped:
+
+        box_entrypoint.sh: HERMES_DASHBOARD_BASIC_AUTH_USERNAME: set it with:
+        just fly-auth
+        Main child exited normally with code: 1
+
+    **The password is fleet-wide and must stay so.** The door logs into every
+    box on the caller's behalf using its own copy; a password generated per box
+    would lock the door out of the agent it just created. The session *secret*
+    is per-app state and is generated fresh, because nothing else needs to know
+    it.
+    """
+    source = os.environ if env is None else env
+    secrets: dict[str, str] = {}
+    missing: list[str] = []
+
+    password = (source.get("FLOTTA_BOX_PASSWORD") or "").strip()
+    if password:
+        secrets["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] = BOX_AUTH_USER
+        secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = password
+        secrets["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = secrets_module.token_urlsafe(48)
+    else:
+        # Without it the entrypoint refuses to serve and the machine restarts
+        # forever, which is a far worse failure than being told now.
+        missing.append("FLOTTA_BOX_PASSWORD")
+
+    model = (source.get("FLOTTA_MODEL") or "").strip()
+    base_url = (source.get("FLOTTA_MODEL_BASE_URL") or "").strip()
+    api_key = (source.get("FLOTTA_API_KEY") or "").strip()
+    if model and base_url and api_key:
+        secrets["FLOTTA_MODEL"] = model
+        secrets["FLOTTA_MODEL_BASE_URL"] = base_url
+        secrets["FLOTTA_API_KEY"] = api_key
+
+        # **Two consumers, two vocabularies.** `flotta.box.run` reads the
+        # FLOTTA_* names; `hermes serve` — the surface the app actually talks
+        # to — resolves a provider through Hermes's own config and ignores
+        # them, so a box with only FLOTTA_* answers every turn with "No
+        # inference provider configured". The native name depends on the
+        # endpoint, so it is derived rather than guessed.
+        if "openrouter" in base_url.lower():
+            secrets["OPENROUTER_API_KEY"] = api_key
+        else:
+            secrets["OPENAI_API_KEY"] = api_key
+            secrets["OPENAI_BASE_URL"] = base_url
+    else:
+        missing.append("FLOTTA_MODEL / FLOTTA_MODEL_BASE_URL / FLOTTA_API_KEY")
+
+    return secrets, missing
+
+
 def build_identity(
     box_id: str,
     box_name: str,
@@ -449,10 +515,16 @@ def create_box(
     # "create Agent B" is one button.
     base = spec or BoxSpec(name=name)
     identity_env, identity_secrets = build_identity(box.id, name)
+
+    # What every box needs, as opposed to what makes this one itself. Missing
+    # values are recorded rather than raised: a box with no provider key still
+    # boots and can be fixed, and refusing to create would strand the operator
+    # with no agent and no obvious way to get one.
+    fleet, missing_fleet = fleet_secrets()
     spec = replace(
         base,
         env={**identity_env, **base.env},
-        secrets={**identity_secrets, **base.secrets},
+        secrets={**identity_secrets, **fleet, **base.secrets},
     )
 
     try:
@@ -503,6 +575,21 @@ def create_box(
     # does, it is already polymorphic, and `flotta logs <box>` shows it — which
     # is how an operator sees an identity approaching expiry before a clone
     # fails for a reason nothing on the box can explain.
+    # Said plainly, and *before* the identity event, because a box missing
+    # these does not merely lack a capability — it will not boot at all, and
+    # the only symptom is a machine that restarts until Fly gives up.
+    if missing_fleet:
+        store.add_event(
+            "box",
+            box.id,
+            "fleet_secrets_missing",
+            {
+                "missing": missing_fleet,
+                "reason": "this box cannot serve without them; set them wherever "
+                "the control plane runs and recreate it",
+            },
+        )
+
     if identity_error:
         store.add_event("box", box.id, "identity_skipped", {"reason": identity_error})
     elif identity_secrets:

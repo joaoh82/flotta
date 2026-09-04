@@ -1981,3 +1981,107 @@ def test_a_failed_identity_does_not_destroy_a_working_box(store, monkeypatch):
     # indistinguishable from having no key — the box ended up carrying "no
     # signing key configured" while the key was fine.
     assert "no signing key" not in skipped[0].payload["reason"]
+
+
+# -- FLOTTA-26: a created box has to be able to boot -------------------------
+#
+# `POST /api/boxes` returned 201 and `running`, and the machine crash-looped:
+#
+#     box_entrypoint.sh: HERMES_DASHBOARD_BASIC_AUTH_USERNAME: set it with:
+#     just fly-auth
+#     Main child exited normally with code: 1
+#
+# FLOTTA-21 injects what makes a box *itself*. Nothing injected what every box
+# needs, because until one app per agent they had been set on the single shared
+# app once, by hand, and no code path had ever needed to know.
+
+
+def _fleet_env(**overrides):
+    env = {
+        "FLOTTA_BOX_PASSWORD": "hunter2",
+        "FLOTTA_MODEL": "z-ai/glm-5.2",
+        "FLOTTA_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "FLOTTA_API_KEY": "sk-abc",
+    }
+    env.update(overrides)
+    return env
+
+
+def test_a_created_box_can_serve():
+    """The entrypoint refuses a non-loopback bind without these, so a box
+    without them exits 1 and restarts forever."""
+    from flotta.provision import fleet_secrets
+
+    secrets, missing = fleet_secrets(_fleet_env())
+    assert missing == []
+    assert secrets["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] == "flotta"
+    assert secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == "hunter2"
+    assert secrets["HERMES_DASHBOARD_BASIC_AUTH_SECRET"]
+
+
+def test_the_password_is_the_fleets_so_the_door_can_still_get_in():
+    """The door logs into every box with its own copy. A password generated per
+    box would lock it out of the agent it had just created."""
+    from flotta.provision import fleet_secrets
+
+    a, _ = fleet_secrets(_fleet_env())
+    b, _ = fleet_secrets(_fleet_env())
+    assert a["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == b["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]
+    # The session secret is per-app state that nothing else needs to know.
+    assert a["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] != b["HERMES_DASHBOARD_BASIC_AUTH_SECRET"]
+
+
+def test_the_provider_is_set_in_both_vocabularies():
+    """`hermes serve` ignores the FLOTTA_* names and resolves a provider
+    through Hermes's own config, so a box with only those answers every turn
+    with "No inference provider configured" — found by sending a real turn."""
+    from flotta.provision import fleet_secrets
+
+    secrets, _ = fleet_secrets(_fleet_env())
+    assert secrets["FLOTTA_API_KEY"] == "sk-abc"
+    assert secrets["OPENROUTER_API_KEY"] == "sk-abc", "the native name is what serve reads"
+
+
+def test_the_native_provider_name_is_derived_from_the_endpoint():
+    """OpenRouter has its own variable; everything OpenAI-compatible shares
+    OPENAI_*. Guessing one would silently configure the wrong provider."""
+    from flotta.provision import fleet_secrets
+
+    secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL="https://api.together.xyz/v1"))
+    assert secrets["OPENAI_API_KEY"] == "sk-abc"
+    assert secrets["OPENAI_BASE_URL"] == "https://api.together.xyz/v1"
+    assert "OPENROUTER_API_KEY" not in secrets
+
+
+def test_what_is_missing_is_named_rather_than_guessed():
+    from flotta.provision import fleet_secrets
+
+    _, missing = fleet_secrets({})
+    assert "FLOTTA_BOX_PASSWORD" in missing
+    assert any("FLOTTA_API_KEY" in m for m in missing)
+
+
+def test_creation_carries_the_fleets_secrets_onto_the_machine(store, monkeypatch):
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    for key, value in _fleet_env().items():
+        monkeypatch.setenv(key, value)
+
+    impl = Recording()
+    create_box("eng-b", store=store, backend=impl)
+
+    assert impl.spec.secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == "hunter2"
+    assert impl.spec.secrets["OPENROUTER_API_KEY"] == "sk-abc"
+    # And still a secret, never an env var anyone can read off the machine.
+    assert not any(k.startswith("HERMES_DASHBOARD") for k in impl.spec.env)
+
+
+def test_a_box_that_cannot_boot_says_so_in_its_own_timeline(store, monkeypatch):
+    """The API reported 201 and `running` for a machine that was already
+    restarting. The row cannot fix that on its own, but the reason must at
+    least be somewhere an operator can find it."""
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    out = create_box("eng-b", store=store, backend=Recording())
+
+    events = {e.type: e.payload for e in store.get_events("box", out["box_id"])}
+    assert "fleet_secrets_missing" in events
+    assert "FLOTTA_BOX_PASSWORD" in events["fleet_secrets_missing"]["missing"]
