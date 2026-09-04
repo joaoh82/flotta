@@ -35,11 +35,11 @@ export function Conversation({ boxName }: { boxName: string }) {
     let alive = true;
     let off: (() => void) | undefined;
 
-    // **Listen before asking.** `open_conversation` answers immediately when
-    // the socket is already up — it re-announces `ready` rather than opening a
-    // second one — so registering the listener afterwards races the event it
-    // exists to receive. Losing that race leaves the UI on "Waking…" forever,
-    // which is the exact bug this fix is for, reintroduced by ordering.
+    // **Listen before asking.** When the socket is already up,
+    // `open_conversation` does not reconnect — it asks the live conversation
+    // to resync, and the `ready` that carries the transcript arrives as an
+    // event. Registering the listener afterwards races that event: losing the
+    // race leaves the UI on "Waking…" with a conversation that is fine.
     void (async () => {
       off = await listen<AgentEvent>("agent://event", (event) => {
         const payload = event.payload;

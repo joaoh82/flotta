@@ -306,22 +306,7 @@ async fn attach(socket: &mut Socket) -> Result<(String, Vec<HistoryLine>), Fleet
             serde_json::json!({"session_id": session_id}),
         )
         .await?;
-
-        // **Use the id the resume answers with, not the one it was asked for.**
-        // They differ: the gateway follows a compression tip to the live
-        // session and echoes the requested id back as `resumed`, while
-        // `session_id` names the session that now exists in memory.
-        //
-        // Submitting against the requested id got `{"code":4001,"message":
-        // "session not found"}` — from a session that had just resumed
-        // successfully, which reads like the resume failing rather than the
-        // reply being read wrong.
-        let live = resumed
-            .get("session_id")
-            .and_then(|s| s.as_str())
-            .unwrap_or(session_id);
-
-        return Ok((live.to_string(), history_from(resumed.get("messages"))));
+        return Ok(read_resume(&resumed, session_id));
     }
 
     let created = call(socket, "session.create", serde_json::json!({})).await?;
@@ -435,6 +420,27 @@ fn history_from(messages: Option<&serde_json::Value>) -> Vec<HistoryLine> {
             })
         })
         .collect()
+}
+
+/// The session to talk to, and the transcript, from a `session.resume` reply.
+///
+/// **The id a resume answers with is not the one it was asked for.** The
+/// gateway follows a compression tip to the live session and echoes the
+/// request back as `resumed`, while `session_id` names the session that now
+/// exists in memory. Submitting against the requested id returns
+/// `{"code":4001,"message":"session not found"}` — from a session that has
+/// just resumed successfully.
+///
+/// This exists because that was learned once, written down in `attach`, and
+/// then reintroduced forty lines later in the resync path, where the same
+/// stale id would have killed the conversation on the *next* message rather
+/// than immediately. One function, two callers, no second chance to forget.
+fn read_resume(payload: &serde_json::Value, requested: &str) -> (String, Vec<HistoryLine>) {
+    let live = payload
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or(requested);
+    (live.to_string(), history_from(payload.get("messages")))
 }
 
 /// One request, and the `result` that answers it.
@@ -594,7 +600,7 @@ pub async fn run(
     }
     .emit(&app);
 
-    let (mut socket, session_id, resumed) = match connect(&settings, &box_name, &token).await {
+    let (mut socket, mut session_id, resumed) = match connect(&settings, &box_name, &token).await {
         Ok(pair) => pair,
         Err(err) => {
             finish(&app, &box_name, Some(err.detail().to_string()));
@@ -628,11 +634,19 @@ pub async fn run(
                         )
                         .await
                         {
-                            Ok(payload) => AgentEvent::Ready {
-                                box_name: box_name.clone(),
-                                resumed: history_from(payload.get("messages")),
+                            Ok(payload) => {
+                                // The id can move under us here exactly as it
+                                // can at connect; ignoring it would leave the
+                                // next prompt addressing a session that no
+                                // longer exists.
+                                let (live, resumed) = read_resume(&payload, &session_id);
+                                session_id = live;
+                                AgentEvent::Ready {
+                                    box_name: box_name.clone(),
+                                    resumed,
+                                }
+                                .emit(&app);
                             }
-                            .emit(&app),
                             Err(err) => {
                                 finish(&app, &box_name, Some(err.detail().to_string()));
                                 return;
@@ -816,6 +830,41 @@ mod tests {
     fn a_new_session_has_no_history_and_that_is_not_an_error() {
         assert!(history_from(None).is_empty());
         assert!(history_from(Some(&serde_json::Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn a_resume_is_answered_by_the_live_session_not_the_one_asked_for() {
+        // The gateway follows a compression tip and echoes the request back as
+        // `resumed`. Submitting against the requested id returns 4001 from a
+        // session that just resumed successfully — learned once at connect,
+        // then reintroduced in the resync path where it would have killed the
+        // conversation on the *next* message.
+        let payload = serde_json::json!({
+            "resumed": "asked-for",
+            "session_id": "the-live-one",
+            "messages": [{"role": "user", "text": "hey"}]
+        });
+        let (live, history) = read_resume(&payload, "asked-for");
+        assert_eq!(live, "the-live-one");
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn a_resume_with_no_id_falls_back_to_the_one_asked_for() {
+        let payload = serde_json::json!({"messages": []});
+        let (live, history) = read_resume(&payload, "asked-for");
+        assert_eq!(live, "asked-for");
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn a_resumed_session_with_no_messages_is_not_an_error() {
+        // A box that has been talked to but has nothing displayable — every
+        // turn a tool call, say. Empty history, still a usable session.
+        let payload = serde_json::json!({"session_id": "s1"});
+        let (live, history) = read_resume(&payload, "asked-for");
+        assert_eq!(live, "s1");
+        assert!(history.is_empty());
     }
 
     /// A real conversation with a real box. **Ignored by default** — it costs
