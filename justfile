@@ -144,6 +144,20 @@ app:
     [ -d node_modules ] || npm ci
     npm run tauri dev
 
+# One real conversation with a real box, through the app's own client — the
+# same code path the window uses, without the window. Costs a machine wake and
+# a model call, so it is opt-in and never runs in CI.
+#
+# Override the target with FLOTTA_BOX; defaults to eng-a.
+# M8.2 — prove the agent protocol against a live box (REAL infra + a model call)
+app-live:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env}"
+    export FLOTTA_TOKEN="${FLOTTA_TOKEN:-$(uv run flotta token mint app-live --scope box:chat --days 1)}"
+    cd app/src-tauri
+    cargo test -- --ignored --nocapture
+
 # Type-check and lint the app — both halves. `just check` covers neither.
 check-app:
     #!/usr/bin/env bash

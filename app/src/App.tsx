@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Conversation } from "./Conversation";
 import { Settings } from "./Settings";
 import { StatusBadge } from "./StatusBadge";
 import { isFleetError, type BoxRow, type FleetError, type SettingsView } from "./types";
@@ -91,6 +92,7 @@ export default function App() {
   const [boxes, setBoxes] = useState<BoxRow[]>([]);
   const [error, setError] = useState<FleetError | null>(null);
   const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -203,30 +205,49 @@ export default function App() {
             onSettings={() => setShowSettings(true)}
           />
         ) : (
-          <ul className="divide-y divide-neutral-100">
-            {boxes.map((box) => (
-              <li
-                key={box.id}
-                className="flex items-center justify-between px-4 py-3 hover:bg-neutral-50"
-              >
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-medium">{box.name}</span>
-                    <StatusBadge status={box.status} />
-                  </div>
-                  <p className="mt-0.5 truncate font-mono text-[11px] text-neutral-500">
-                    {box.id}
-                    {box.created_at ? ` · ${box.created_at.slice(0, 10)}` : ""}
-                  </p>
-                </div>
-                {/* A stopped agent is addressable — the door wakes it. Saying
-                    so here stops `stopped` reading as "unavailable". */}
-                <span className="ml-4 shrink-0 text-xs text-neutral-400">
-                  {box.status === "stopped" ? "wakes when addressed" : ""}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <div className="flex h-full">
+            {/* Agents on the left, the conversation beside them. The agent is
+                the primary object, not a row in a table of machines — which is
+                why selecting one opens a conversation rather than a detail
+                page. */}
+            <ul className="w-64 shrink-0 divide-y divide-neutral-100 overflow-auto border-r border-neutral-200">
+              {boxes.map((box) => (
+                <li key={box.id}>
+                  <button
+                    onClick={() => setSelected(box.name)}
+                    className={`w-full px-4 py-3 text-left hover:bg-neutral-50 ${
+                      selected === box.name ? "bg-neutral-100" : ""
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-sm font-medium">{box.name}</span>
+                      <StatusBadge status={box.status} />
+                    </div>
+                    <p className="mt-0.5 truncate font-mono text-[11px] text-neutral-500">
+                      {box.id}
+                    </p>
+                    {/* A stopped agent is addressable — the door wakes it.
+                        Saying so stops `stopped` reading as "unavailable". */}
+                    {box.status === "stopped" && (
+                      <p className="mt-0.5 text-[11px] text-neutral-400">
+                        wakes when addressed
+                      </p>
+                    )}
+                  </button>
+                </li>
+              ))}
+            </ul>
+
+            <div className="min-w-0 flex-1">
+              {selected ? (
+                <Conversation key={selected} boxName={selected} />
+              ) : (
+                <p className="p-8 text-sm text-neutral-500">
+                  Pick an agent to talk to.
+                </p>
+              )}
+            </div>
+          </div>
         )}
       </main>
     </div>
