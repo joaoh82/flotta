@@ -106,7 +106,26 @@ impl AgentEvent {
 /// conversation ends, an entry left behind is a sender nobody is listening to,
 /// and the next `open_conversation` succeeds against it while nothing happens.
 #[derive(Default)]
-pub struct Conversations(pub Mutex<HashMap<String, mpsc::Sender<String>>>);
+pub struct Conversations(pub Mutex<HashMap<String, mpsc::Sender<Command>>>);
+
+/// What the UI asks a live conversation to do.
+#[derive(Debug)]
+pub enum Command {
+    /// Send this to the agent.
+    Prompt(String),
+    /// Re-announce readiness *with the transcript*.
+    ///
+    /// Selecting an agent remounts its view, which clears the transcript —
+    /// the component is keyed by name so one agent's words can never appear
+    /// under another's. So returning to a conversation that is still open has
+    /// to be told the history again, and `Ready` with an empty `resumed` left
+    /// the pane reading "eng-d is listening" about an agent mid-conversation.
+    ///
+    /// It re-reads from the box rather than replaying a cache: the agent's
+    /// memory is the source of truth, and this is the one place a cache would
+    /// silently diverge from it.
+    Resync,
+}
 
 impl Conversations {
     /// The sender for a box, if there is a task still reading from it.
@@ -114,7 +133,7 @@ impl Conversations {
     /// `is_closed` is the honest test: it becomes true the moment the receiver
     /// drops, which is the moment the task returns. Checking only for the
     /// key's presence treats a finished conversation as a live one.
-    pub fn live(&self, box_name: &str) -> Option<mpsc::Sender<String>> {
+    pub fn live(&self, box_name: &str) -> Option<mpsc::Sender<Command>> {
         let mut map = self.0.lock().unwrap();
         match map.get(box_name) {
             Some(sender) if !sender.is_closed() => Some(sender.clone()),
@@ -126,29 +145,13 @@ impl Conversations {
         }
     }
 
-    pub fn insert(&self, box_name: String, sender: mpsc::Sender<String>) {
+    pub fn insert(&self, box_name: String, sender: mpsc::Sender<Command>) {
         self.0.lock().unwrap().insert(box_name, sender);
     }
 
     pub fn forget(&self, box_name: &str) {
         self.0.lock().unwrap().remove(box_name);
     }
-}
-
-/// Tell the UI a conversation is already up.
-///
-/// `Conversation` resets to "waking" whenever it mounts, so re-selecting an
-/// agent whose socket is already open left it waiting for an event that would
-/// never come again — stuck on "Waking…" with the composer disabled, for a
-/// connection that was working the whole time.
-pub fn announce_ready(app: &tauri::AppHandle, box_name: &str) {
-    // No history: the UI already has it from the first connect, and asking the
-    // box again would mean a round trip to redraw something unchanged.
-    AgentEvent::Ready {
-        box_name: box_name.to_string(),
-        resumed: Vec::new(),
-    }
-    .emit(app);
 }
 
 pub fn door_url(settings: &Settings, box_name: &str) -> String {
@@ -584,7 +587,7 @@ pub async fn run(
     settings: Settings,
     box_name: String,
     token: String,
-    mut prompts: mpsc::Receiver<String>,
+    mut commands: mpsc::Receiver<Command>,
 ) {
     AgentEvent::Waking {
         box_name: box_name.clone(),
@@ -610,17 +613,43 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            prompt = prompts.recv() => {
-                let Some(prompt) = prompt else {
+            command = commands.recv() => {
+                let Some(command) = command else {
                     finish(&app, &box_name, None);
                     return;
                 };
-                AgentEvent::Thinking { box_name: box_name.clone() }.emit(&app);
-                match one_turn(&mut socket, &session_id, &prompt).await {
-                    Ok(text) => AgentEvent::Reply { box_name: box_name.clone(), text }.emit(&app),
-                    Err(err) => {
-                        finish(&app, &box_name, Some(err.detail().to_string()));
-                        return;
+                match command {
+                    Command::Resync => {
+                        // Asked of the box, not replayed from memory here.
+                        match call(
+                            &mut socket,
+                            "session.resume",
+                            serde_json::json!({"session_id": session_id}),
+                        )
+                        .await
+                        {
+                            Ok(payload) => AgentEvent::Ready {
+                                box_name: box_name.clone(),
+                                resumed: history_from(payload.get("messages")),
+                            }
+                            .emit(&app),
+                            Err(err) => {
+                                finish(&app, &box_name, Some(err.detail().to_string()));
+                                return;
+                            }
+                        }
+                    }
+                    Command::Prompt(prompt) => {
+                        AgentEvent::Thinking { box_name: box_name.clone() }.emit(&app);
+                        match one_turn(&mut socket, &session_id, &prompt).await {
+                            Ok(text) => {
+                                AgentEvent::Reply { box_name: box_name.clone(), text }.emit(&app)
+                            }
+                            Err(err) => {
+                                finish(&app, &box_name, Some(err.detail().to_string()));
+                                return;
+                            }
+                        }
                     }
                 }
             }

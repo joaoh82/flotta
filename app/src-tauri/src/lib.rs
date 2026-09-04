@@ -191,11 +191,14 @@ async fn open_conversation(
     // the other. But "already open" has to mean *live*: a finished task leaves
     // a sender nobody reads, and returning early against one made the agent
     // unreachable until the app restarted.
-    if state.live(&box_name).is_some() {
-        // The UI resets to "waking" on mount, so it needs telling that the
-        // connection it is waiting for already exists.
-        agent::announce_ready(&app, &box_name);
-        return Ok(());
+    if let Some(sender) = state.live(&box_name) {
+        // Already talking. The view has just remounted and cleared its
+        // transcript, so re-announcing readiness with nothing in it left the
+        // pane claiming the agent had never said anything. Ask the live
+        // conversation to fetch the history and announce that instead.
+        return sender.send(agent::Command::Resync).await.map_err(|_| {
+            FleetError::Unreachable(format!("the conversation with {box_name} ended"))
+        });
     }
 
     let settings = read_settings(&app);
@@ -226,7 +229,7 @@ async fn send_prompt(
         )));
     };
     sender
-        .send(text)
+        .send(agent::Command::Prompt(text))
         .await
         .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
 }
