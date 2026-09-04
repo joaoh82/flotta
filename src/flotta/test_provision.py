@@ -2261,3 +2261,18 @@ def test_reserving_a_box_touches_no_substrate(store):
     assert box.status == "provisioning"
     assert impl.calls == []
     assert [e.type for e in store.get_events("box", box.id)] == ["provisioning"]
+
+
+def test_tearing_down_a_box_frees_its_name(store):
+    """The end-to-end of FLOTTA-28: destroy `eng-a`, create `eng-a` again."""
+    from flotta.provision import teardown_box
+
+    impl = FakeBackend()
+    first = store.create_box("eng-a")
+    store.update_box_status(first.id, "running", endpoint="fake://app/m1")
+
+    out = teardown_box(first.id, store=store, backend=impl)
+    assert out["name_released"] == f"eng-a@{first.id}"
+
+    second = store.create_box("eng-a")
+    assert store.get_box_by_name("eng-a").id == second.id

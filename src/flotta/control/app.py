@@ -388,6 +388,7 @@ def create_app(
             ProvisionError,
             create_box,
         )
+        from flotta.store import DuplicateBoxError
 
         name = str(body.get("name") or "").strip()
         if not name:
@@ -400,6 +401,12 @@ def create_app(
         try:
             try:
                 result = create_box(name, store=store)
+            except DuplicateBoxError as exc:
+                # A name still held by an existing box. Since teardown releases
+                # a destroyed agent's name, this now means a *live* one — which
+                # is a conflict the caller can act on, not the bare 500 an
+                # uncaught IntegrityError used to produce.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             except BoxOccupied as exc:
                 # The only create failure that is genuinely a *conflict*: the
                 # machine is taken, and the caller can act on that.
@@ -453,6 +460,7 @@ def create_app(
         from fastapi.responses import JSONResponse
 
         from flotta.provision import _backend_for, create_box, reserve_box
+        from flotta.store import DuplicateBoxError
 
         store = store_factory()
         try:
@@ -469,9 +477,11 @@ def create_app(
                         )
             try:
                 box = reserve_box(name, store=store, backend=impl)
+            except DuplicateBoxError as exc:
+                # A *live* box holds the name — a destroyed one no longer does,
+                # because teardown releases it.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             except Exception as exc:
-                # A duplicate name is the common one, and it used to surface as
-                # a bare 500 with an IntegrityError behind it.
                 raise HTTPException(
                     status_code=409,
                     detail=f"cannot create a box named {name!r}: {exc}",

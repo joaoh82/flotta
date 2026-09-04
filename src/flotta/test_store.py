@@ -718,3 +718,52 @@ def test_the_guard_names_a_real_table():
     named = set(re.findall(r'transaction\(guard="(\w+)"\)', inspect.getsource(store_module)))
     assert named, "expected guarded transactions"
     assert named <= tables, f"guard names a table that does not exist: {named - tables}"
+
+
+# -- FLOTTA-28: a destroyed agent's name comes back --------------------------
+
+
+def test_a_released_name_can_be_used_again(store):
+    """`name` is UNIQUE across every row, torn-down ones included — so a name
+    was spent the moment it was used, and destroying `eng-a` meant never having
+    an `eng-a` again."""
+    first = store.create_box("eng-a")
+    store.update_box_status(first.id, "torn_down")
+    store.release_name(first.id)
+
+    second = store.create_box("eng-a")
+    assert second.id != first.id
+    assert store.get_box_by_name("eng-a").id == second.id, "the name now points at the live box"
+
+
+def test_the_tombstone_keeps_its_history(store):
+    """Events are keyed by box id, so a renamed row loses nothing — the record
+    of what that agent did is the reason not to delete it outright."""
+    box = store.create_box("eng-a")
+    store.add_event("box", box.id, "running", {"endpoint": "fake://a/1"})
+    store.update_box_status(box.id, "torn_down")
+    released = store.release_name(box.id)
+
+    assert released == f"eng-a@{box.id}"
+    # `update_box_status` does not write events — callers do — so this is the
+    # one event the test itself recorded, still there after the rename.
+    assert [e.type for e in store.get_events("box", box.id)] == ["running"]
+    assert store.get_box(box.id).name == released, "still findable by id"
+
+
+def test_releasing_twice_does_not_stack_suffixes(store):
+    """Teardown is idempotent and may run again on an already-closed box."""
+    box = store.create_box("eng-a")
+    store.update_box_status(box.id, "torn_down")
+
+    first = store.release_name(box.id)
+    assert store.release_name(box.id) is None
+    assert store.get_box(box.id).name == first
+
+
+def test_a_live_box_still_owns_its_name(store):
+    """The constraint is not being loosened — it is the address. Only a
+    tombstone gets out of the way."""
+    store.create_box("eng-a")
+    with pytest.raises(DuplicateBoxError):
+        store.create_box("eng-a")
