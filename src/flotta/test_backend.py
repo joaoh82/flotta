@@ -5,6 +5,8 @@ which substrate a stored endpoint resolves to, and what happens when one cannot
 do what was asked. The live behaviour is `just fly-cycle`.
 """
 
+from dataclasses import replace
+
 import pytest
 
 from flotta.backend import (
@@ -393,3 +395,31 @@ def test_secrets_are_not_staged():
     issued = _create_with_secrets({"FLOTTA_BOX_TOKEN": "flotta_x.y"})
     secrets_cmd = next(cmd for cmd, _ in issued if "secrets" in cmd)
     assert "--stage" not in secrets_cmd
+
+
+def test_a_fleet_image_seeds_an_app_that_has_no_releases():
+    """With one app per agent, every new agent's app is brand new — and the
+    only thing that gives an app a release is a deploy, which would also make
+    the machine `create` is trying to make. So per-box apps and a fleet-wide
+    image arrive together or not at all."""
+    import json as _json
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        if "machines" in cmd and "list" in cmd:
+            ran = any("run" in c for c in issued)
+            body = _json.dumps([{"id": "m1", "state": "started"}] if ran else [])
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        # No releases, ever: a fresh app.
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    config = replace(_offline_config(), image="registry.fly.io/builder:deployment-01ABC")
+    backend = FlyBackend(config=config, runner=runner)
+    handle = backend.create(BoxSpec(name="eng-b"))
+
+    assert handle.id == "m1"
+    run = next(c for c in issued if "run" in c)
+    assert "registry.fly.io/builder:deployment-01ABC" in run

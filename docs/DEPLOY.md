@@ -223,6 +223,43 @@ That round trip is the entire thesis of the project in one command.
 
 ---
 
+## Step 6a — More than one agent
+
+**A fleet with no `FLOTTA_FLY_APP_PREFIX` holds exactly one box.** `create`
+adopts the existing machine on `$FLOTTA_FLY_APP` rather than adding a second,
+so the second agent is refused before anything reaches Fly:
+
+```
+box b-4cdc… (eng-a) already occupies fly://little-stream-574/48ed…
+```
+
+That was not a deliberate limit — it is M1's single-box shape surviving into a
+product about fleets. Two variables fix it, and they go together:
+
+```
+FLOTTA_FLY_APP_PREFIX=yourname-flotta
+FLOTTA_FLY_IMAGE=registry.fly.io/little-stream-574:deployment-01M1HY4QN88V205AZR44G3C7N3
+```
+
+**The prefix** gives each agent its own Fly app, named `<prefix>-<box>`. A
+prefix rather than a bare `flotta-<box>` because Fly app names are globally
+unique across all of Fly, not per organisation.
+
+**The image** is needed the moment agents have their own apps: `create` refuses
+without a released image, a brand-new app has no releases, and the only thing
+that makes one is `fly deploy` — which would also make the machine `create` is
+trying to make. `just fly-up` builds the image; this points every new agent at
+it. Read the current one with:
+
+```bash
+flyctl releases --app $FLOTTA_FLY_APP --json | jq -r '[.[]|select(.Status=="complete")][0].ImageRef'
+```
+
+Agents created before this keep working untouched: a box's app lives in its
+stored endpoint (`fly://app/machine`), so only *creation* consults these.
+
+---
+
 ## Step 7 — Give an agent a GitHub identity (optional)
 
 Without this a box can read public repositories and nothing else: `git clone`

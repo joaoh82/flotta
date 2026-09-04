@@ -32,7 +32,7 @@ from flotta.backend import (
     ExecResult,
     NotSupported,
 )
-from flotta.fly import FlyConfig
+from flotta.fly import IMAGE_ENV, FlyConfig
 
 SCHEME = "fly"
 
@@ -99,7 +99,7 @@ class FlyBackend:
         None, the app's current release image is used, which is what makes
         `create` work straight after a deploy.
         """
-        app = self.config.app
+        app = self.config.app_for(spec.name)
         region = spec.region or self.config.resolved_region()
 
         # Adopt first: a machine that already exists is the box.
@@ -114,12 +114,20 @@ class FlyBackend:
         # volume quietly costing $0.15/month — found in the Fly dashboard, not
         # by any test. Provisioning is not atomic and cannot be made so across
         # three API calls, so the order has to put the cheap refusal first.
-        image = spec.image or (self._current_image(app) if self._app_exists(app) else None)
+        # `$FLOTTA_FLY_IMAGE` before the app's own release history, because
+        # with one app per agent the app is new and *has* no history — and the
+        # only thing that would give it one is a deploy, which would also make
+        # the machine this is trying to create.
+        image = (
+            spec.image
+            or self.config.image
+            or (self._current_image(app) if self._app_exists(app) else None)
+        )
         if not image:
             raise BackendError(
-                f"no image to boot a box from: app {app!r} has no completed release "
-                "and BoxSpec.image was not set. Build and release one first "
-                "(`just fly-up`), or pass BoxSpec(image=...). Nothing was created."
+                f"no image to boot a box from: app {app!r} has no completed release, "
+                f"${IMAGE_ENV} is not set, and BoxSpec.image was not given. Build one "
+                f"with `just fly-up`, then point ${IMAGE_ENV} at it. Nothing was created."
             )
 
         if not self._app_exists(app):
@@ -219,14 +227,19 @@ class FlyBackend:
             stdin="".join(f"{k}={v}\n" for k, v in secrets.items()),
         )
 
-    def existing_endpoint(self) -> str | None:
-        """The endpoint `create` would adopt, without creating anything.
+    def existing_endpoint(self, box_name: str | None = None) -> str | None:
+        """The endpoint `create` would adopt for this name, without creating it.
 
         Lets `provision.create_box` notice that a machine is already spoken for
         before it mints a second row against it. Read-only by construction — it
         lists machines and nothing else.
+
+        **Takes the name** because with per-box apps the answer depends on it:
+        asking about the fleet's one app would have reported `eng-a`'s machine
+        as occupying the place `eng-b` was about to be created, and refused
+        every agent after the first.
         """
-        app = self.config.app
+        app = self.config.app_for(box_name) if box_name else self.config.app
         machines = self._machines(app)
         if not machines:
             return None

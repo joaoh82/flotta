@@ -69,6 +69,23 @@ DEFAULT_HERMES_HOME = f"{DEFAULT_MOUNT_PATH}/hermes"
 
 ORG_ENV = "FLOTTA_FLY_ORG"
 APP_ENV = "FLOTTA_FLY_APP"
+#: Namespace for per-box Fly apps. Set it and each agent gets its own app,
+#: named `<prefix>-<box>`; leave it unset and the whole fleet shares one app,
+#: which is the pre-M8.3 behaviour and holds exactly one box.
+#:
+#: A prefix rather than a bare `flotta-<box>` because **Fly app names are
+#: globally unique across all of Fly**, not per organisation — `flotta-eng-b`
+#: may already belong to a stranger, and the failure would arrive as a
+#: confusing permission error at create time.
+APP_PREFIX_ENV = "FLOTTA_FLY_APP_PREFIX"
+#: The image every new box boots from, e.g.
+#: `registry.fly.io/<builder-app>:deployment-01ABC…`.
+#:
+#: Needed the moment agents get their own apps: `create` refuses without a
+#: released image, and a brand-new app has no releases — the only thing that
+#: makes one is `fly deploy`, which also makes a machine. So per-box apps and a
+#: fleet-wide image reference arrive together or not at all.
+IMAGE_ENV = "FLOTTA_FLY_IMAGE"
 REGION_ENV = "FLOTTA_FLY_REGION"
 VOLUME_NAME_ENV = "FLOTTA_FLY_VOLUME_NAME"
 VOLUME_GB_ENV = "FLOTTA_FLY_VOLUME_GB"
@@ -156,6 +173,8 @@ class FlyConfig:
 
     org: str
     app: str
+    app_prefix: str | None
+    image: str | None
     region: str | None
     volume_name: str
     volume_gb: int
@@ -195,6 +214,8 @@ class FlyConfig:
         return cls(
             org=pick(ORG_ENV) or DEFAULT_ORG,
             app=pick(APP_ENV) or DEFAULT_APP,
+            app_prefix=pick(APP_PREFIX_ENV),
+            image=pick(IMAGE_ENV),
             # None here means "not configured", NOT "let Fly decide" — Fly
             # does not get a say, because `fly volumes create` refuses to run
             # without an explicit region off a TTY. `resolved_region()` turns
@@ -211,6 +232,24 @@ class FlyConfig:
     @property
     def durable_paths(self) -> tuple[str, ...]:
         return durable_paths(self.hermes_home)
+
+    def app_for(self, box_name: str) -> str:
+        """Which Fly app hosts a box being created.
+
+        With a prefix, one app per agent. Without one, the whole fleet shares
+        `$FLOTTA_FLY_APP` — and since `create` adopts an existing machine
+        rather than adding a second, that fleet holds exactly **one** box. That
+        was not a deliberate limit, it was the single-box shape of M1 surviving
+        into a milestone whose whole point is several agents.
+
+        This only decides where a box is *created*. Everything afterwards reads
+        the app out of the stored endpoint (`fly://app/machine`), so boxes made
+        before this existed keep working untouched.
+        """
+        prefix = (self.app_prefix or "").strip().strip("-")
+        if not prefix:
+            return self.app
+        return f"{prefix}-{box_name.strip()}"
 
     def resolved_region(self, fetch: Callable[[], str] | None = None) -> str:
         """A concrete region, always. Configured, else detected, else fallback.
