@@ -62,6 +62,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from flotta.backend import (
     Backend,
@@ -398,7 +399,12 @@ def fleet_secrets(env: dict[str, str] | None = None) -> tuple[dict[str, str], li
         # them, so a box with only FLOTTA_* answers every turn with "No
         # inference provider configured". The native name depends on the
         # endpoint, so it is derived rather than guessed.
-        if "openrouter" in base_url.lower():
+        # The **host**, not a substring of the URL: a self-hosted proxy at
+        # `https://proxy.internal/openrouter/v1` would otherwise be handed to
+        # Hermes as OpenRouter, and its traffic would leave for openrouter.ai
+        # with no base URL to redirect it.
+        host = urlparse(base_url).hostname or ""
+        if host == "openrouter.ai" or host.endswith(".openrouter.ai"):
             secrets["OPENROUTER_API_KEY"] = api_key
         else:
             secrets["OPENAI_API_KEY"] = api_key
@@ -521,6 +527,9 @@ def create_box(
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
     fleet, missing_fleet = fleet_secrets()
+    # A caller's own spec wins over both, which is the escape hatch a test or a
+    # one-off create needs — and the reason `base` is merged last rather than
+    # first.
     spec = replace(
         base,
         env={**identity_env, **base.env},
@@ -553,9 +562,22 @@ def create_box(
     # production. Found by comparing timestamps on the fleet's first box: its
     # machine was five days older than its row.
     identity_error: str | None = None
-    if handle.adopted and identity_secrets:
+
+    # **Everything the machine needs, not just what makes it itself.**
+    # This applied `identity_secrets` alone, so an adopted machine got its
+    # token and none of the credentials it needs to *serve* — and adoption is
+    # the normal path on Fly, as the comment below says. A single-app fleet
+    # would still have crash-looped on `HERMES_DASHBOARD_BASIC_AUTH_*` with the
+    # control plane holding the password all along, and `missing_fleet` would
+    # have been empty, so the new diagnostic could not have seen it: a worse
+    # failure with less observability than having nothing configured.
+    #
+    # The condition was also wrong in the same way — `and identity_secrets`
+    # skipped the fleet's secrets entirely when there was no signing key.
+    adopted_secrets = {**fleet, **identity_secrets}
+    if handle.adopted and adopted_secrets:
         try:
-            impl.apply_secrets(handle.endpoint, identity_secrets)
+            impl.apply_secrets(handle.endpoint, adopted_secrets)
         except BackendError as exc:
             # Not fatal. A box without an identity still boots, still talks,
             # and still commits under its own name — it just cannot fetch a

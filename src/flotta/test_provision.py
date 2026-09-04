@@ -2085,3 +2085,61 @@ def test_a_box_that_cannot_boot_says_so_in_its_own_timeline(store, monkeypatch):
     events = {e.type: e.payload for e in store.get_events("box", out["box_id"])}
     assert "fleet_secrets_missing" in events
     assert "FLOTTA_BOX_PASSWORD" in events["fleet_secrets_missing"]["missing"]
+
+
+def test_an_adopted_machine_gets_what_it_needs_to_serve(store, monkeypatch):
+    """Adoption is the normal path on Fly, and it was getting the token and
+    nothing else.
+
+    A single-app fleet would have crash-looped on the dashboard credentials
+    with the control plane holding the password all along — and `missing_fleet`
+    would have been empty, so the new diagnostic could not have seen it. A
+    worse failure with less observability than having nothing configured.
+    """
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    for key, value in _fleet_env().items():
+        monkeypatch.setenv(key, value)
+
+    impl = Adopting()
+    create_box("eng-b", store=store, backend=impl)
+
+    assert "apply_secrets" in impl.calls
+    assert impl.applied["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == "hunter2"
+    assert impl.applied["OPENROUTER_API_KEY"] == "sk-abc"
+    assert "FLOTTA_BOX_TOKEN" in impl.applied, "the identity still travels too"
+
+
+def test_an_adopted_machine_is_served_even_with_no_signing_key(store, monkeypatch):
+    """The condition was `and identity_secrets`, so a fleet with no signing key
+    skipped the box's serving credentials as well as its token — one missing
+    capability turning into a machine that cannot start."""
+    for key, value in _fleet_env().items():
+        monkeypatch.setenv(key, value)
+
+    impl = Adopting()
+    create_box("eng-b", store=store, backend=impl)
+
+    assert "apply_secrets" in impl.calls
+    assert "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" in impl.applied
+    assert "FLOTTA_BOX_TOKEN" not in impl.applied, "there was no key to mint one"
+
+
+def test_a_proxy_url_mentioning_openrouter_is_not_openrouter():
+    """Matched on the host rather than a substring: a self-hosted proxy at
+    `https://proxy.internal/openrouter/v1` would otherwise be handed to Hermes
+    as OpenRouter, and its traffic would leave for openrouter.ai."""
+    from flotta.provision import fleet_secrets
+
+    secrets, _ = fleet_secrets(
+        _fleet_env(FLOTTA_MODEL_BASE_URL="https://proxy.internal/openrouter/v1")
+    )
+    assert "OPENROUTER_API_KEY" not in secrets
+    assert secrets["OPENAI_BASE_URL"] == "https://proxy.internal/openrouter/v1"
+
+
+def test_openrouter_itself_still_uses_its_own_variable():
+    from flotta.provision import fleet_secrets
+
+    for url in ("https://openrouter.ai/api/v1", "https://api.openrouter.ai/v1"):
+        secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL=url))
+        assert secrets["OPENROUTER_API_KEY"] == "sk-abc", url
