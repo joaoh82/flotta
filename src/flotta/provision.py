@@ -1295,7 +1295,19 @@ def teardown_box(
     box = _require_box(store, box_id)
 
     if box.status == "torn_down":
-        return {"box_id": box_id, "status": "torn_down", "already_torn_down": True}
+        # Idempotent, and *convergent*: a box torn down before names were
+        # released still holds one, and returning early left it that way
+        # forever — a second teardown could not help, so freeing the name of an
+        # already-dead agent needed direct access to the fleet database.
+        #
+        # Releasing here means the rule applies to rows that predate it, which
+        # is the difference between a fix and a fix for new boxes only.
+        return {
+            "box_id": box_id,
+            "status": "torn_down",
+            "already_torn_down": True,
+            "name_released": store.release_name(box_id),
+        }
 
     # Destruction goes through the backend that owns the box: a Fly box loses
     # its machine *and* its volume. `canceller` survives as a pure injection

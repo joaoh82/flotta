@@ -2276,3 +2276,31 @@ def test_tearing_down_a_box_frees_its_name(store):
 
     second = store.create_box("eng-a")
     assert store.get_box_by_name("eng-a").id == second.id
+
+
+def test_tearing_down_an_already_dead_box_still_frees_its_name(store):
+    """Boxes torn down before names were released still hold one, and the
+    early return left them that way permanently — freeing such a name needed
+    direct access to the fleet database. Teardown converges instead."""
+    from flotta.provision import teardown_box
+
+    box = store.create_box("eng-c")
+    store.update_box_status(box.id, "torn_down")  # a tombstone from before
+
+    out = teardown_box(box.id, store=store, backend=FakeBackend())
+
+    assert out["already_torn_down"] is True
+    assert out["name_released"] == f"eng-c@{box.id}"
+    assert store.create_box("eng-c").id != box.id, "the name is usable again"
+
+
+def test_a_third_teardown_changes_nothing(store):
+    from flotta.provision import teardown_box
+
+    box = store.create_box("eng-c")
+    store.update_box_status(box.id, "torn_down")
+    teardown_box(box.id, store=store, backend=FakeBackend())
+
+    out = teardown_box(box.id, store=store, backend=FakeBackend())
+    assert out["name_released"] is None
+    assert store.get_box(box.id).name == f"eng-c@{box.id}"
