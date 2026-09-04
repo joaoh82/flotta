@@ -63,8 +63,17 @@ static RPC_ID: AtomicU64 = AtomicU64::new(1);
 pub enum AgentEvent {
     /// Connecting, and why it might be slow.
     Waking { box_name: String },
-    /// The socket is open and a session exists.
-    Ready { box_name: String },
+    /// The socket is open and a session exists. `resumed` is the conversation
+    /// the box already had — empty for a new one.
+    ///
+    /// The transcript arrives from the box rather than being kept in the UI,
+    /// which is the honest shape: the agent's memory is the source of truth,
+    /// and a client that cached it would show its own copy after the agent had
+    /// moved on.
+    Ready {
+        box_name: String,
+        resumed: Vec<HistoryLine>,
+    },
     /// A turn is in flight.
     Thinking { box_name: String },
     /// The agent answered.
@@ -73,6 +82,13 @@ pub enum AgentEvent {
     Failed { box_name: String, detail: String },
     /// The conversation closed cleanly.
     Closed { box_name: String },
+}
+
+/// One line of a conversation the box already had.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct HistoryLine {
+    pub role: String,
+    pub text: String,
 }
 
 impl AgentEvent {
@@ -126,8 +142,11 @@ impl Conversations {
 /// never come again — stuck on "Waking…" with the composer disabled, for a
 /// connection that was working the whole time.
 pub fn announce_ready(app: &tauri::AppHandle, box_name: &str) {
+    // No history: the UI already has it from the first connect, and asking the
+    // box again would mean a round trip to redraw something unchanged.
     AgentEvent::Ready {
         box_name: box_name.to_string(),
+        resumed: Vec::new(),
     }
     .emit(app);
 }
@@ -154,6 +173,7 @@ async fn connect(
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
         String,
+        Vec<HistoryLine>,
     ),
     FleetError,
 > {
@@ -254,8 +274,59 @@ async fn connect(
     // The server speaks first.
     expect_event(&mut socket, "gateway.ready").await?;
 
-    let session_id = create_session(&mut socket).await?;
-    Ok((socket, session_id))
+    let (session_id, resumed) = attach(&mut socket).await?;
+    Ok((socket, session_id, resumed))
+}
+
+/// Rejoin the conversation the box was already having, or start one.
+///
+/// M8.2 called `session.create` unconditionally, so switching agents and back
+/// showed a blank transcript against an agent that remembered the whole thing
+/// — the app contradicting the product's central claim.
+///
+/// The transcript is *asked for*, never cached. The agent's memory is the
+/// source of truth; a client holding its own copy would keep showing it after
+/// the agent had moved on.
+async fn attach(socket: &mut Socket) -> Result<(String, Vec<HistoryLine>), FleetError> {
+    // `session.most_recent` skips tool-source sessions, so it returns the
+    // conversational one rather than whatever a background task last touched.
+    let recent = call(socket, "session.most_recent", serde_json::json!({})).await?;
+    let existing = recent
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    if let Some(session_id) = existing {
+        let resumed = call(
+            socket,
+            "session.resume",
+            serde_json::json!({"session_id": session_id}),
+        )
+        .await?;
+
+        // **Use the id the resume answers with, not the one it was asked for.**
+        // They differ: the gateway follows a compression tip to the live
+        // session and echoes the requested id back as `resumed`, while
+        // `session_id` names the session that now exists in memory.
+        //
+        // Submitting against the requested id got `{"code":4001,"message":
+        // "session not found"}` — from a session that had just resumed
+        // successfully, which reads like the resume failing rather than the
+        // reply being read wrong.
+        let live = resumed
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or(session_id);
+
+        return Ok((live.to_string(), history_from(resumed.get("messages"))));
+    }
+
+    let created = call(socket, "session.create", serde_json::json!({})).await?;
+    let session_id = created
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| FleetError::Unexpected("session.create returned no id".into()))?;
+    Ok((session_id.to_string(), Vec::new()))
 }
 
 type Socket =
@@ -321,8 +392,60 @@ async fn rpc(
     Ok(id)
 }
 
-async fn create_session(socket: &mut Socket) -> Result<String, FleetError> {
-    let id = rpc(socket, "session.create", serde_json::json!({})).await?;
+/// A resumed conversation, as lines a transcript can show.
+///
+/// Read field by field rather than deserialised into a struct, and that is the
+/// point. A Hermes message carries `row_id`, `timestamp`, `reasoning` and more,
+/// and not every one has `text` — a tool call may have none at all. Decoding
+/// into `Vec<HistoryLine>` therefore failed on the whole array, and the
+/// `.ok().unwrap_or_default()` around it turned that failure into "this agent
+/// remembers nothing".
+///
+/// Which is the same mistake as "No agents yet", one layer down: a parse
+/// failure rendered as an empty truth. So this cannot fail — it takes what it
+/// understands and drops what it does not, because one unreadable line is not
+/// a reason to forget the conversation around it.
+fn history_from(messages: Option<&serde_json::Value>) -> Vec<HistoryLine> {
+    let Some(items) = messages.and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                // A tool call with no display text adds nothing to a
+                // transcript and would render as an empty bubble.
+                return None;
+            }
+            Some(HistoryLine {
+                role: item
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("assistant")
+                    .to_string(),
+                text: text.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// One request, and the `result` that answers it.
+///
+/// Generalised from `create_session` because reattachment needs three of these
+/// and they differ only in the method name — and because every one of them has
+/// to survive the same thing: events interleave with responses constantly, so
+/// a reply is found by id, not by being next.
+async fn call(
+    socket: &mut Socket,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, FleetError> {
+    let id = rpc(socket, method, params).await?;
     // A wall-clock deadline, not a per-frame one: events interleave with
     // responses, and resetting the clock on every ignored event means a chatty
     // gateway that never answers keeps the handshake alive forever.
@@ -330,9 +453,9 @@ async fn create_session(socket: &mut Socket) -> Result<String, FleetError> {
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(FleetError::Unreachable(
-                "the agent never opened a session".into(),
-            ));
+            return Err(FleetError::Unreachable(format!(
+                "the agent did not answer {method}"
+            )));
         }
         let frame = next_frame(socket, remaining).await?;
         if frame.get("id").and_then(|v| v.as_u64()) != Some(id) {
@@ -340,15 +463,10 @@ async fn create_session(socket: &mut Socket) -> Result<String, FleetError> {
         }
         if let Some(error) = frame.get("error") {
             return Err(FleetError::Unexpected(format!(
-                "the agent refused to open a session: {error}"
+                "the agent refused {method}: {error}"
             )));
         }
-        return frame
-            .get("result")
-            .and_then(|r| r.get("session_id"))
-            .and_then(|s| s.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| FleetError::Unexpected("session.create returned no id".into()));
+        return Ok(frame.get("result").cloned().unwrap_or_default());
     }
 }
 
@@ -473,7 +591,7 @@ pub async fn run(
     }
     .emit(&app);
 
-    let (mut socket, session_id) = match connect(&settings, &box_name, &token).await {
+    let (mut socket, session_id, resumed) = match connect(&settings, &box_name, &token).await {
         Ok(pair) => pair,
         Err(err) => {
             finish(&app, &box_name, Some(err.detail().to_string()));
@@ -483,6 +601,7 @@ pub async fn run(
 
     AgentEvent::Ready {
         box_name: box_name.clone(),
+        resumed,
     }
     .emit(&app);
 
@@ -625,6 +744,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn history_survives_fields_it_does_not_model() {
+        // The exact shape a live box returned. `row_id`, `timestamp` and
+        // `reasoning` are not modelled here, and decoding the array into a
+        // struct failed on them — which, wrapped in `.ok().unwrap_or_default()`,
+        // read as "this agent remembers nothing" about a box holding fifteen
+        // turns of real conversation.
+        let messages = serde_json::json!([
+            {"role": "user", "row_id": 130, "text": "hey", "timestamp": 1788470150.79},
+            {"role": "assistant", "row_id": 131, "text": "Hey! What can I help with?",
+             "reasoning": "The user is saying hey.",
+             "reasoning_content": "The user is saying hey."}
+        ]);
+        let lines = history_from(Some(&messages));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].role, "user");
+        assert_eq!(lines[0].text, "hey");
+    }
+
+    #[test]
+    fn one_unreadable_line_does_not_lose_the_conversation() {
+        // A tool call carries no display text. Dropping the array over it
+        // would forget everything said around it.
+        let messages = serde_json::json!([
+            {"role": "user", "text": "run the tests"},
+            {"role": "assistant", "tool_calls": [{"name": "shell"}]},
+            {"role": "assistant", "text": "all 622 passed"}
+        ]);
+        let lines = history_from(Some(&messages));
+        assert_eq!(lines.len(), 2, "the tool call is skipped, not fatal");
+        assert_eq!(lines[1].text, "all 622 passed");
+    }
+
+    #[test]
+    fn an_empty_message_is_not_a_blank_bubble() {
+        let messages = serde_json::json!([{"role": "assistant", "text": "   "}]);
+        assert!(history_from(Some(&messages)).is_empty());
+    }
+
+    #[test]
+    fn a_new_session_has_no_history_and_that_is_not_an_error() {
+        assert!(history_from(None).is_empty());
+        assert!(history_from(Some(&serde_json::Value::Null)).is_empty());
+    }
+
     /// A real conversation with a real box. **Ignored by default** — it costs
     /// a machine wake and one model call, and the suite's promise is that it
     /// is hermetic and free.
@@ -654,21 +818,52 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (mut socket, session) = connect(&settings, &box_name, &token)
+            // First connection: say something distinctive.
+            let (mut socket, session, resumed) = connect(&settings, &box_name, &token)
                 .await
                 .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
-            println!("connected, session {session}");
+            println!(
+                "connected, session {session}, {} earlier turns",
+                resumed.len()
+            );
 
+            // Unique per run: a box accumulates conversations, and yesterday's
+            // would let a broken resume pass.
+            let marker = format!("banana{}", std::process::id());
             let reply = one_turn(
                 &mut socket,
                 &session,
-                "Reply with exactly one word: pong. Nothing else.",
+                &format!("Reply with exactly one word: {marker}. Nothing else."),
             )
             .await
             .unwrap_or_else(|e| panic!("turn failed: {}", e.detail()));
-
             println!("reply: {reply:?}");
             assert!(!reply.trim().is_empty(), "the agent replied with nothing");
+            drop(socket);
+
+            // Second connection: the transcript must come back **from the box**.
+            // This is the acceptance criterion for reattachment, and the only
+            // honest way to test it is to reconnect.
+            let (_socket, resumed_session, history) = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("reconnect failed: {}", e.detail()));
+            println!(
+                "reconnected, session {resumed_session}, {} earlier turns",
+                history.len()
+            );
+            for line in &history {
+                println!(
+                    "  {}: {}",
+                    line.role,
+                    line.text.chars().take(60).collect::<String>()
+                );
+            }
+
+            assert!(
+                history.iter().any(|line| line.text.contains(&marker)),
+                "reconnecting did not bring the conversation back: {} lines, none with {marker}",
+                history.len()
+            );
         });
     }
 }

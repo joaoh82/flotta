@@ -151,6 +151,36 @@ async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
 }
 
 #[tauri::command]
+async fn create_agent(app: tauri::AppHandle, name: String) -> Result<BoxRow, FleetError> {
+    fleet::create_box(&read_settings(&app), &name).await
+}
+
+/// Destroy an agent. `confirm` must be the agent's own name.
+///
+/// The confirmation is checked here, not only in the UI, because this is the
+/// one verb that deletes an agent's entire memory — months of it — and a
+/// dialog is a thing people click through. Typing the name is a deliberate
+/// act; clicking "OK" is a reflex.
+#[tauri::command]
+async fn destroy_agent(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Conversations>,
+    id: String,
+    name: String,
+    confirm: String,
+) -> Result<(), FleetError> {
+    if confirm.trim() != name.trim() {
+        return Err(FleetError::Unexpected(format!(
+            "type {name} to confirm — this deletes everything it remembers"
+        )));
+    }
+    // Close the conversation first: a socket to a machine being destroyed
+    // fails in a way that reads like a network problem.
+    state.forget(&name);
+    fleet::destroy_box(&read_settings(&app), &id).await
+}
+
+#[tauri::command]
 async fn open_conversation(
     app: tauri::AppHandle,
     state: tauri::State<'_, Conversations>,
@@ -219,7 +249,9 @@ pub fn run() {
             list_boxes,
             open_conversation,
             send_prompt,
-            close_conversation
+            close_conversation,
+            create_agent,
+            destroy_agent
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

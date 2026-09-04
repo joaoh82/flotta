@@ -196,8 +196,13 @@ pub fn write_token(token: &str) -> Result<(), FleetError> {
 }
 
 /// GET a path on the control plane, with the token attached.
-async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
-    let base = settings.control_url.trim().trim_end_matches('/');
+/// The three things every call needs, or a reason it cannot be made.
+fn prepare(settings: &Settings) -> Result<(String, String, reqwest::Client), FleetError> {
+    let base = settings
+        .control_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     if base.is_empty() {
         return Err(FleetError::NotConfigured(
             "No control plane configured. Set its URL in Settings — it is the \
@@ -217,9 +222,13 @@ async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
         .timeout(TIMEOUT)
         .build()
         .map_err(|e| FleetError::Unexpected(e.to_string()))?;
+    Ok((base, token, client))
+}
 
+async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
+    let (base, token, client) = prepare(settings)?;
     let response = client
-        .get(endpoint(base, path))
+        .get(endpoint(&base, path))
         .bearer_auth(token)
         .send()
         .await
@@ -277,6 +286,73 @@ fn detail_of(body: &str) -> Option<String> {
         .get("detail")?
         .as_str()
         .map(str::to_owned)
+}
+
+/// POST/DELETE a path. Same auth and error handling as `get`.
+async fn send(
+    settings: &Settings,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<String, FleetError> {
+    let (base, token, client) = prepare(settings)?;
+    let mut request = client
+        .request(method, endpoint(&base, path))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| FleetError::Unreachable(format!("could not reach {base}: {e}")))?;
+
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    match classify(status, path, &text) {
+        Some(error) => Err(error),
+        None => Ok(text),
+    }
+}
+
+/// Create an agent.
+///
+/// One request, and the box comes back with its identity already on it —
+/// FLOTTA-21 injects it at creation, which is why this is a button and not a
+/// button followed by a terminal.
+pub async fn create_box(settings: &Settings, name: &str) -> Result<BoxRow, FleetError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(FleetError::Unexpected("an agent needs a name".into()));
+    }
+    let body = send(
+        settings,
+        reqwest::Method::POST,
+        "/api/boxes",
+        Some(serde_json::json!({"name": name})),
+    )
+    .await?;
+
+    // The endpoint answers 201 with the box, or with a warning wrapper when it
+    // made a machine that is not running — which must not read as a failure,
+    // because something real was created and billing for it starts either way.
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable answer: {e}")))?;
+    let row = value.get("box").unwrap_or(&value);
+    serde_json::from_value(row.clone())
+        .map_err(|e| FleetError::Unexpected(format!("created, but could not read it back: {e}")))
+}
+
+/// Destroy an agent, and everything it remembers.
+pub async fn destroy_box(settings: &Settings, id: &str) -> Result<(), FleetError> {
+    send(
+        settings,
+        reqwest::Method::DELETE,
+        &format!("/api/boxes/{id}"),
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub async fn list_boxes(settings: &Settings) -> Result<Vec<BoxRow>, FleetError> {

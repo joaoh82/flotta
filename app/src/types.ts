@@ -57,13 +57,23 @@ export function isFleetError(value: unknown): value is FleetError {
  */
 export type AgentEvent =
   | { kind: "waking"; box_name: string }
-  | { kind: "ready"; box_name: string }
+  /**
+   * `resumed` is the conversation the box already had — empty for a new one.
+   *
+   * The transcript comes **from the box**, not from anything the UI kept: the
+   * agent's memory is the source of truth, and a cached copy would keep being
+   * shown after the agent had moved on.
+   */
+  | { kind: "ready"; box_name: string; resumed: HistoryLine[] }
   | { kind: "thinking"; box_name: string }
   | { kind: "reply"; box_name: string; text: string }
   | { kind: "failed"; box_name: string; detail: string }
   | { kind: "closed"; box_name: string };
 
-/** One line of a transcript. `pending` marks a turn still in flight. */
+/** One line of a conversation the box already had. */
+export type HistoryLine = { role: string; text: string };
+
+/** One line of a transcript. */
 export type Turn = {
   from: "you" | "agent" | "system";
   text: string;

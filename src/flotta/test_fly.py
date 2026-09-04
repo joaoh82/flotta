@@ -215,3 +215,39 @@ def test_configured_region_beats_detection():
 def test_describe_says_the_region_is_detected_not_chosen_by_fly():
     """The old wording claimed Fly would pick one, which is false for volumes."""
     assert "detected at provision time" in cfg().describe()
+
+
+# -- M8.3: one Fly app per agent --------------------------------------------
+#
+# The fleet held exactly one box, and not deliberately: `FlyConfig.app` is a
+# single name and `create` adopts `machines[0]` of it, so the second agent was
+# refused before anything reached Fly. The single-box shape of M1 had survived
+# into the milestone whose whole point is several agents.
+
+
+def test_without_a_prefix_the_fleet_shares_one_app():
+    """The pre-M8.3 behaviour, kept for deployments that have not set one."""
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP": "little-stream-574"}, dotenv="/nonexistent")
+    assert config.app_for("eng-a") == "little-stream-574"
+    assert config.app_for("eng-b") == "little-stream-574"
+
+
+def test_a_prefix_gives_every_agent_its_own_app():
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP_PREFIX": "joaoh82-flotta"}, dotenv="/nonexistent")
+    assert config.app_for("eng-a") == "joaoh82-flotta-eng-a"
+    assert config.app_for("eng-b") == "joaoh82-flotta-eng-b"
+
+
+def test_two_agents_never_share_an_app_under_a_prefix():
+    """The actual bug: the second agent was told the first one's machine
+    already occupied the place it was about to be created."""
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP_PREFIX": "fleet"}, dotenv="/nonexistent")
+    assert config.app_for("eng-a") != config.app_for("eng-b")
+
+
+def test_a_prefix_is_tidied_rather_than_concatenated_blindly():
+    """A trailing dash is what someone writes when guessing the format, and
+    `fleet--eng-a` is a different app from `fleet-eng-a` — a typo that silently
+    provisions a second machine rather than failing."""
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP_PREFIX": "  fleet-  "}, dotenv="/nonexistent")
+    assert config.app_for("eng-a") == "fleet-eng-a"

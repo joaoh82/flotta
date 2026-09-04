@@ -428,7 +428,7 @@ def create_box(
     # endpoint. Two rows, one machine: `stop_box` on either would then lie
     # about the other. Unreachable through today's CLI, which is exactly why it
     # is worth closing before `flotta create` exists to reach it.
-    probe = _peek_endpoint(impl)
+    probe = _peek_endpoint(impl, name)
     if probe:
         for existing in store.list_boxes():
             if existing.endpoint == probe and not is_terminal("box", existing.status):
@@ -569,7 +569,7 @@ def create_box(
     )
 
 
-def _peek_endpoint(impl: Backend) -> str | None:
+def _peek_endpoint(impl: Backend, box_name: str | None = None) -> str | None:
     """The endpoint `create` would adopt, without creating anything.
 
     Best-effort and side-effect-free: used only to notice that a machine is
@@ -581,7 +581,13 @@ def _peek_endpoint(impl: Backend) -> str | None:
     if peek is None:
         return None
     try:
-        return peek()
+        # Older backends answer for the fleet, newer ones per box. Try the
+        # specific question first and fall back rather than requiring every
+        # implementation to change at once.
+        try:
+            return peek(box_name)
+        except TypeError:
+            return peek()
     except BackendError:
         return None
 

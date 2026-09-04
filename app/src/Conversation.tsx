@@ -49,7 +49,16 @@ export function Conversation({ boxName }: { boxName: string }) {
         if (!alive || payload.box_name !== boxName) return;
 
         setStatus(payload.kind);
-        if (payload.kind === "reply") {
+        if (payload.kind === "ready" && payload.resumed.length > 0) {
+          // Replace rather than append: this is what the box says was said,
+          // and it is more authoritative than anything on screen.
+          setTurns(
+            payload.resumed.map((line) => ({
+              from: line.role === "user" ? "you" : "agent",
+              text: line.text,
+            })),
+          );
+        } else if (payload.kind === "reply") {
           setTurns((t) => [...t, { from: "agent", text: payload.text }]);
         } else if (payload.kind === "failed") {
           setTurns((t) => [...t, { from: "system", text: payload.detail }]);
