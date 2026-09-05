@@ -13,14 +13,25 @@ import {
   type FleetError,
   type SettingsView,
 } from "./types";
+import { POLL_MS } from "./poll";
 
 /**
- * How often to re-read the fleet while something in it is still being built.
+ * Three failures, three fixes, three messages.
  *
- * Seconds, not sub-second: provisioning is minutes of work and the control
- * plane is not free.
+ * Module scope because two places render an error now: the empty screen, and
+ * a banner over the sidebar. They must not drift — the whole point of the
+ * tagged union is that these stay distinguishable.
  */
-const POLL_MS = 5000;
+const TITLES: Record<FleetError["kind"], string> = {
+  not_configured: "Not set up yet",
+  unreachable: "Cannot reach the control plane",
+  rejected: "That token was refused",
+  unexpected: "Unexpected answer from the control plane",
+  // Deliberately not blamed on the control plane, which has not been contacted
+  // at this point. Saying otherwise sent the first person who saw it looking
+  // at a Railway deployment that was fine.
+  keychain: "The keychain would not release the token",
+};
 
 /**
  * The Flotta app.
@@ -56,9 +67,8 @@ function Empty({
   loading: boolean;
   onSettings: () => void;
 }) {
-  // Three failures, three fixes, three messages. An error string plus an empty
-  // list would render all of them as "you have no agents", which is the one
-  // reading that is never actionable.
+  // An error string plus an empty list would render all of these as "you have
+  // no agents", which is the one reading that is never actionable.
   if (loading) {
     return <div className="p-8 text-center text-sm text-neutral-500">Loading…</div>;
   }
@@ -73,17 +83,6 @@ function Empty({
       </div>
     );
   }
-
-  const TITLES: Record<FleetError["kind"], string> = {
-    not_configured: "Not set up yet",
-    unreachable: "Cannot reach the control plane",
-    rejected: "That token was refused",
-    unexpected: "Unexpected answer from the control plane",
-    // Deliberately not blamed on the control plane, which has not been
-    // contacted at this point. Saying otherwise sent the first person who saw
-    // it looking at a Railway deployment that was fine.
-    keychain: "The keychain would not release the token",
-  };
 
   return (
     <div className="p-8">
@@ -328,6 +327,18 @@ export default function App() {
                 why selecting one opens a conversation rather than a detail
                 page. */}
             <div className="flex w-64 shrink-0 flex-col border-r border-neutral-200">
+              {/* The empty screen is not the only place an error can land.
+                  Once a failed creation is being explained, the sidebar
+                  layout renders even with an empty fleet — and `Empty`, the
+                  only component that showed `error`, is skipped. A control
+                  plane going down then looked like an empty sidebar with no
+                  explanation at all. */}
+              {error && (
+                <div className="border-b border-red-100 bg-red-50 px-4 py-2">
+                  <p className="text-[11px] font-medium text-red-900">{TITLES[error.kind]}</p>
+                  <p className="mt-0.5 text-[11px] text-red-800">{error.detail}</p>
+                </div>
+              )}
               <ul className="min-h-0 flex-1 divide-y divide-neutral-100 overflow-auto">
               {boxes.map((box) => (
                 <li key={box.id}>
@@ -420,6 +431,10 @@ export default function App() {
                       boxId={shown.id}
                       boxName={shown.name}
                       status={selectedBox?.status ?? null}
+                      // Stable, and it has to be: the timeline uses it in an
+                      // effect, and an inline arrow would re-fire it on every
+                      // render.
+                      onRefresh={poll}
                     />
                   </div>
                 </>

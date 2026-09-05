@@ -119,10 +119,26 @@ struct BoxList {
 /// `reconcile` writes whatever it learned. Modelling that here would mean
 /// updating Rust every time the control plane records something new, and the
 /// app only ever reads a couple of keys out of it.
+///
+/// **`entity_kind` is not optional, and dropping it was a bug.** The endpoint
+/// is box-scoped but the timeline is not: `get_box_timeline` unions the box's
+/// own events with those of its tasks *and* its workspaces, because "what has
+/// this agent been doing" spans all three tiers. Without this field, "the
+/// reason this box was torn down" is really "the last `torn_down` from any
+/// tier" — a workspace teardown shown as the agent's own fate. It reads
+/// correctly today only because `teardown_box` happens to write the workspace
+/// events first, which is ordering luck, not a guarantee.
+///
+/// Required rather than defaulted, deliberately. Guessing `box` would put the
+/// bug back for any event that stopped saying what it belonged to; failing to
+/// parse is loud, and the pane shows that error rather than a confident wrong
+/// answer.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BoxEvent {
     pub id: i64,
     pub ts: String,
+    /// `box`, `task` or `workspace`.
+    pub entity_kind: String,
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
@@ -274,6 +290,30 @@ async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
     }
 }
 
+/// One path segment, safe to interpolate.
+///
+/// Ids are `b-<hex>` and could be dropped in raw, but `get_box` and
+/// `box_events` both accept a **name** as well, and a name is not validated
+/// anywhere — `store.create_box` inserts the string it is handed, and
+/// FLOTTA-28's tombstones are `<name>@<id>`. A slash in one would silently
+/// address a different endpoint rather than fail.
+///
+/// Hand-rolled rather than pulling in `percent-encoding`: the unreserved set
+/// is the whole job, and a dependency for twelve lines is not worth the
+/// supply chain.
+fn encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 /// `{base}{path}`, with exactly one slash between them.
 ///
 /// Its own function so it can be tested: a trailing slash on a pasted URL is
@@ -412,7 +452,7 @@ pub async fn list_boxes(settings: &Settings) -> Result<Vec<BoxRow>, FleetError> 
 /// row explaining itself: the agent simply stops being in the answer. This is
 /// how the app can still say what became of one it was watching.
 pub async fn get_box(settings: &Settings, id: &str) -> Result<BoxRow, FleetError> {
-    let body = get(settings, &format!("/api/boxes/{id}")).await?;
+    let body = get(settings, &format!("/api/boxes/{}", encode_segment(id))).await?;
     box_from(&body, "could not read that agent")
 }
 
@@ -422,7 +462,11 @@ pub async fn get_box(settings: &Settings, id: &str) -> Result<BoxRow, FleetError
 /// *why*. A failed provision writes `torn_down` with a reason and leaves the
 /// list; the reason is here and nowhere else the app can reach.
 pub async fn box_events(settings: &Settings, id: &str) -> Result<Vec<BoxEvent>, FleetError> {
-    let body = get(settings, &format!("/api/boxes/{id}/events")).await?;
+    let body = get(
+        settings,
+        &format!("/api/boxes/{}/events", encode_segment(id)),
+    )
+    .await?;
     serde_json::from_str::<EventList>(&body)
         .map(|list| list.events)
         .map_err(|e| FleetError::Unexpected(format!("unreadable timeline: {e}")))
@@ -581,6 +625,7 @@ mod tests {
 
         let out = serde_json::to_value(&events[1]).unwrap();
         assert_eq!(out["type"], "torn_down", "the frontend reads `type`");
+        assert_eq!(out["entity_kind"], "box", "and it filters on this");
         assert_eq!(
             out["payload"]["reason"],
             "create failed: BackendError: no capacity"
@@ -605,6 +650,7 @@ mod tests {
         assert_eq!(events.len(), 18);
         assert_eq!(events[0].kind, "provisioning");
         assert!(events.iter().any(|e| e.kind == "addressed"));
+        assert!(events.iter().all(|e| e.entity_kind == "box"));
         // The one field the failure panel actually reads out of a payload.
         assert!(events.iter().any(|e| e
             .payload
@@ -613,12 +659,45 @@ mod tests {
     }
 
     #[test]
+    fn a_timeline_says_which_tier_each_event_belongs_to() {
+        // `get_box_timeline` unions box, task and workspace events. Dropping
+        // `entity_kind` made "why was this box torn down" mean "the last
+        // `torn_down` from any tier", so a workspace teardown could be shown
+        // as the agent's own fate. This is the field that stops it, and it has
+        // to survive into the webview, where the filtering happens.
+        let body = r#"{"events":[
+            {"id":1,"entity_kind":"workspace","entity_id":"w1","ts":"t",
+             "type":"torn_down","payload":{"reason":"box eng-f torn down"}},
+            {"id":2,"entity_kind":"box","entity_id":"b7","ts":"t",
+             "type":"torn_down","payload":{"reason":"create failed: no capacity"}}
+        ]}"#;
+        let events = serde_json::from_str::<EventList>(body)
+            .expect("must parse")
+            .events;
+        assert_eq!(events[0].entity_kind, "workspace");
+        assert_eq!(events[1].entity_kind, "box");
+        let boxes: Vec<_> = events.iter().filter(|e| e.entity_kind == "box").collect();
+        assert_eq!(boxes.len(), 1, "one of these two is the agent's own ending");
+    }
+
+    #[test]
+    fn a_path_segment_cannot_change_which_endpoint_is_called() {
+        // Both lookups take an id *or a name*, and a name is whatever
+        // `store.create_box` was handed. A slash would address something else
+        // entirely rather than fail.
+        assert_eq!(encode_segment("b-98777076972d"), "b-98777076972d");
+        assert_eq!(encode_segment("eng-a@b-1"), "eng-a%40b-1");
+        assert_eq!(encode_segment("a/../b"), "a%2F..%2Fb");
+        assert_eq!(encode_segment("two words"), "two%20words");
+    }
+
+    #[test]
     fn an_event_with_no_payload_still_parses() {
         // `add_event` takes the payload optionally and the column is nullable,
         // so a null is a real body and not a malformed one. Requiring it would
         // make the timeline unreadable the first time something recorded a
         // bare fact.
-        let body = r#"{"events":[{"id":1,"ts":"2026-09-05T08:00:00+00:00",
+        let body = r#"{"events":[{"id":1,"entity_kind":"box","ts":"2026-09-05T08:00:00+00:00",
                        "type":"running","payload":null}]}"#;
         let events = serde_json::from_str::<EventList>(body)
             .expect("must parse")

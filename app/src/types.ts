@@ -24,6 +24,15 @@ export type BoxRow = {
 export type BoxEvent = {
   id: number;
   ts: string;
+  /**
+   * `box`, `task` or `workspace`.
+   *
+   * The endpoint is box-scoped but the timeline is not — `get_box_timeline`
+   * unions all three tiers, because "what has this agent been doing" spans
+   * them. Anything asking "why did this box end" has to filter on this, or it
+   * is really asking "what ended last, whatever it was".
+   */
+  entity_kind: string;
   type: string;
   payload?: Record<string, unknown> | null;
 };
