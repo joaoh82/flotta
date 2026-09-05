@@ -155,6 +155,29 @@ async fn create_agent(app: tauri::AppHandle, name: String) -> Result<BoxRow, Fle
     fleet::create_box(&read_settings(&app), &name).await
 }
 
+/// One agent, by id — **including one that has been torn down**.
+///
+/// `list_boxes` hides terminal boxes, so an agent whose provision failed stops
+/// appearing there. This is the only way the app can find out that is what
+/// happened, rather than showing an empty pane where an agent used to be.
+#[tauri::command]
+async fn get_agent(app: tauri::AppHandle, id: String) -> Result<BoxRow, FleetError> {
+    fleet::get_box(&read_settings(&app), &id).await
+}
+
+/// What has happened to an agent, oldest first.
+///
+/// The reason a provision failed lives in this timeline and nowhere else the
+/// app can reach — `create_box` records it as a `torn_down` event and then
+/// moves the row out of the fleet list.
+#[tauri::command]
+async fn agent_timeline(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<fleet::BoxEvent>, FleetError> {
+    fleet::box_events(&read_settings(&app), &id).await
+}
+
 /// Destroy an agent. `confirm` must be the agent's own name.
 ///
 /// The confirmation is checked here, not only in the UI, because this is the
@@ -254,6 +277,8 @@ pub fn run() {
             send_prompt,
             close_conversation,
             create_agent,
+            get_agent,
+            agent_timeline,
             destroy_agent
         ])
         .run(tauri::generate_context!())
