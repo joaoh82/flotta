@@ -767,3 +767,84 @@ def test_a_live_box_still_owns_its_name(store):
     store.create_box("eng-a")
     with pytest.raises(DuplicateBoxError):
         store.create_box("eng-a")
+
+
+# -- a box name is an address -----------------------------------------------
+#
+# Nothing validated one until a typo in the app's Create box (`Eng-f`) reached
+# Fly, which answered "Name under 63 chars using numbers, lowercase letters and
+# dashes" — after the row existed. That cost a provision, left a `torn_down`
+# row, and took the name with it: `release_name` runs only in `teardown_box`,
+# so a failed provision keeps its name forever.
+
+
+@pytest.mark.parametrize("name", ["eng-a", "lead", "a", "b2", "x" * 63, "  eng-f  "])
+def test_a_name_that_can_be_an_address_is_accepted(name):
+    from flotta.store import validate_box_name
+
+    assert validate_box_name(name) == name.strip()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Eng-f",  # the one that actually happened
+        "ENG",
+        "eng_f",  # underscore: legal in a Fly app name, not in a DNS label
+        "eng f",
+        "-eng",
+        "eng-",
+        "eng.f",
+        "x" * 64,
+        "",
+        "   ",
+    ],
+)
+def test_a_name_that_cannot_be_an_address_is_refused(name):
+    from flotta.store import InvalidBoxNameError, validate_box_name
+
+    with pytest.raises(InvalidBoxNameError):
+        validate_box_name(name)
+
+
+def test_the_refusal_names_the_fix_rather_than_restating_the_rule():
+    """Case is the overwhelmingly common miss, and the fix is one keystroke."""
+    from flotta.store import InvalidBoxNameError, validate_box_name
+
+    with pytest.raises(InvalidBoxNameError, match="eng-f"):
+        validate_box_name("Eng-f")
+
+
+def test_a_refused_name_is_not_silently_corrected():
+    """Lowercasing `Eng-f` behind the caller would mean the name they typed is
+    not the name they got — and the address they were told about is not the one
+    that answers. Whitespace is the one exception: invisible, never meant."""
+    from flotta.store import InvalidBoxNameError, validate_box_name
+
+    with pytest.raises(InvalidBoxNameError):
+        validate_box_name("Eng-f")
+    assert validate_box_name(" eng-f ") == "eng-f"
+
+
+def test_a_refused_create_writes_nothing_and_keeps_the_name_free(store):
+    """The acceptance criterion. A refusal that inserted first would cost the
+    caller the very name they were about to correct."""
+    from flotta.store import InvalidBoxNameError
+
+    before = len(store.list_boxes())
+    with pytest.raises(InvalidBoxNameError):
+        store.create_box("Eng-f")
+    assert len(store.list_boxes()) == before
+
+    # And the name it should have been is untouched.
+    assert store.create_box("eng-f").name == "eng-f"
+
+
+def test_every_caller_inherits_the_rule_because_it_lives_in_create_box(store):
+    """Not three checks that drift. `provision.create_box` and the API validate
+    early to save a round trip; this is what makes them redundant rather than
+    load-bearing."""
+    from flotta.store import InvalidBoxNameError
+
+    with pytest.raises(InvalidBoxNameError):
+        store.create_box("Eng-f", box_id="b-forced")

@@ -388,11 +388,21 @@ def create_app(
             ProvisionError,
             create_box,
         )
-        from flotta.store import DuplicateBoxError
+        from flotta.store import DuplicateBoxError, InvalidBoxNameError, validate_box_name
 
         name = str(body.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=422, detail="a box needs a name")
+
+        # Here as well as in the store, and deliberately: the store is the
+        # guarantee — it is what makes this true for the CLI too — while this
+        # is the early exit. Without it a name that cannot work still costs a
+        # `flyctl` probe (`_peek_for` runs before the row is reserved) and
+        # comes back as a 409 about a duplicate, which is the wrong fix.
+        try:
+            name = validate_box_name(name)
+        except InvalidBoxNameError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         if background:
             return _create_in_background(name)

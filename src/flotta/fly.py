@@ -42,6 +42,12 @@ this default will collide for anyone who is not first. `$FLOTTA_FLY_APP`
 overrides it, and `just fly-up` says so when creation fails."""
 
 FALLBACK_REGION = "ams"
+
+#: Fly's own limit on an app name, which `app_for` composes from a prefix and
+#: a box name. Its error is "Name under 63 chars using numbers, lowercase
+#: letters and dashes" — arriving from `flyctl` after a row has been written,
+#: which is exactly the failure this constant exists to prevent.
+FLY_APP_NAME_MAX = 63
 """Used only when the nearest region cannot be detected.
 
 Not "let Fly choose": `fly volumes create` **requires** an explicit region when
@@ -249,7 +255,27 @@ class FlyConfig:
         prefix = (self.app_prefix or "").strip().strip("-")
         if not prefix:
             return self.app
-        return f"{prefix}-{box_name.strip()}"
+
+        # The store already refused anything that is not a DNS label, so the
+        # *name* is fine by the time it gets here. What the store cannot see is
+        # the prefix — it is this deployment's Fly config, not fleet state — so
+        # the composed length is checked where the two meet.
+        #
+        # Imported here rather than at module scope to keep `flotta.fly` free
+        # of a store import for one exception; the alternative is a second
+        # error type meaning the same thing, which is how a caller ends up
+        # having to catch both.
+        from flotta.store import InvalidBoxNameError
+
+        app = f"{prefix}-{box_name.strip()}"
+        if len(app) > FLY_APP_NAME_MAX:
+            raise InvalidBoxNameError(
+                f"{box_name.strip()!r} is too long for this fleet: its Fly app "
+                f"would be {app!r} ({len(app)} characters, max "
+                f"{FLY_APP_NAME_MAX}). The prefix {prefix!r} leaves "
+                f"{FLY_APP_NAME_MAX - len(prefix) - 1} for the name."
+            )
+        return app
 
     def resolved_region(self, fetch: Callable[[], str] | None = None) -> str:
         """A concrete region, always. Configured, else detected, else fallback.
