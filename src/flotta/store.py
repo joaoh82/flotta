@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -231,6 +232,14 @@ class DuplicateBoxError(StoreError):
 
     Names are the address — `lead`, `eng-a` — so a collision is a real
     conflict, not a detail to paper over with a suffix.
+    """
+
+
+class InvalidBoxNameError(StoreError):
+    """Raised when a box name could not be an address.
+
+    Separate from `DuplicateBoxError` because the fixes are opposite: a
+    duplicate means "pick another name", this means "spell that one properly".
     """
 
 
@@ -433,7 +442,16 @@ class FleetStore:
         worker was a running container; a box is a machine you *have*, and the
         fleet arithmetic in the pivot doc assumes tens of them. What is worth
         capping is concurrent execution — see `create_workspace`.
+
+        The name is validated **here**, before the insert, so every caller
+        inherits it — the CLI, ``POST /api/boxes`` and the app — rather than
+        three checks that drift. Before the insert matters as much as where:
+        a name that cannot work must not leave a row behind, and a row that
+        goes terminal keeps its name forever (`release_name` runs only in
+        `teardown_box`), so a refusal that wrote first would cost the caller
+        the name they were about to correct.
         """
+        name = validate_box_name(name)
         bid = box_id or f"b-{uuid.uuid4().hex[:12]}"
         try:
             self._conn.execute(
@@ -903,6 +921,59 @@ def _box_from_row(row: db.Row) -> Box:
         endpoint=row["endpoint"],
         created_at=row["created_at"],
         destroyed_at=row["destroyed_at"],
+    )
+
+
+#: A box name is a DNS label, and 63 is that standard's limit for one.
+BOX_NAME_MAX = 63
+
+#: Lowercase letters, digits and hyphens; a hyphen may not start or end it.
+_BOX_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def validate_box_name(name: str) -> str:
+    """A box name, or a refusal explaining why it could not be one.
+
+    **The name is the address**, and in two independent senses — which is what
+    makes this a domain rule rather than a substrate detail:
+
+    - a box is reached at ``<name>.<domain>``, so the name is a DNS label; and
+      the door lowercases the host it receives, so a box recorded as ``Eng-f``
+      is unreachable at ``Eng-f.flotta.dev`` *and* at ``eng-f.flotta.dev`` —
+      the lookup finds no such box either way;
+    - on Fly the name becomes part of an app name, which admits the same
+      characters for the same reason.
+
+    Two substrates and a hostname agreeing is not a coincidence to abstract
+    over; it is one constraint, and the store is where every caller meets it.
+
+    Surrounding whitespace is stripped rather than refused — it is invisible,
+    almost never meant, and ``POST /api/boxes`` already strips it. Everything
+    else is refused rather than corrected: silently lowercasing ``Eng-f``
+    would mean the name the caller typed is not the name they got, and the
+    address they were told about is not the one that answers.
+    """
+    value = (name or "").strip()
+    if not value:
+        raise InvalidBoxNameError("an agent needs a name")
+
+    if len(value) > BOX_NAME_MAX:
+        raise InvalidBoxNameError(
+            f"{value!r} is {len(value)} characters; a name is an address, "
+            f"so it has to fit in a DNS label ({BOX_NAME_MAX})"
+        )
+
+    if _BOX_NAME.match(value):
+        return value
+
+    # The overwhelmingly common miss is case, and it is worth naming the fix
+    # rather than restating the rule — the first person to hit this typed
+    # `Eng-f`, spent a provision on it and lost the name.
+    suggestion = value.strip().lower().replace("_", "-").replace(" ", "-")
+    hint = f" — try {suggestion!r}" if _BOX_NAME.match(suggestion) else ""
+    raise InvalidBoxNameError(
+        f"{value!r} cannot be an address: an agent name is lowercase letters, "
+        f"digits and dashes, and cannot start or end with a dash" + hint
     )
 
 

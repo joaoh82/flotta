@@ -251,3 +251,37 @@ def test_a_prefix_is_tidied_rather_than_concatenated_blindly():
     provisions a second machine rather than failing."""
     config = FlyConfig.from_env({"FLOTTA_FLY_APP_PREFIX": "  fleet-  "}, dotenv="/nonexistent")
     assert config.app_for("eng-a") == "fleet-eng-a"
+
+
+def test_a_name_the_prefix_pushes_over_flys_limit_is_refused_by_us():
+    """`app_for` composes `<prefix>-<name>`, and the prefix is this deployment's
+    Fly config — not fleet state — so the store cannot see it. Without this the
+    only complaint comes from `flyctl`, after a row has been written."""
+    from flotta.store import InvalidBoxNameError
+
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP_PREFIX": "joaoh82-flotta"}, dotenv="/nonexistent")
+    with pytest.raises(InvalidBoxNameError, match="48"):
+        config.app_for("x" * 60)
+
+
+def test_the_limit_is_on_the_composed_name_not_the_box_name():
+    """A 60-character name is a legal DNS label and a legal box name. What it
+    is not is legal *here*, with this prefix — and the message has to say which
+    of the two is the problem, or the fix reads as "rename your agent"."""
+    from flotta.store import InvalidBoxNameError
+
+    short = FlyConfig.from_env({"FLOTTA_FLY_APP_PREFIX": "f"}, dotenv="/nonexistent")
+    assert short.app_for("x" * 60) == "f-" + "x" * 60
+
+    long_prefix = FlyConfig.from_env(
+        {"FLOTTA_FLY_APP_PREFIX": "a-rather-long-organisation-prefix"}, dotenv="/nonexistent"
+    )
+    with pytest.raises(InvalidBoxNameError):
+        long_prefix.app_for("x" * 60)
+
+
+def test_without_a_prefix_there_is_nothing_to_compose_and_nothing_to_refuse():
+    """The shared-app deployment never builds a name from the box's, so the
+    limit does not apply and must not be invented."""
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP": "little-stream-574"}, dotenv="/nonexistent")
+    assert config.app_for("x" * 63) == "little-stream-574"

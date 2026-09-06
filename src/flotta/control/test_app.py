@@ -1018,3 +1018,49 @@ def test_a_duplicate_name_is_a_refusal_not_a_500(fleet):
 
     assert response.status_code == 409, response.text
     assert "eng-a" in response.json()["detail"]
+
+
+def test_a_name_that_cannot_be_an_address_is_422_before_anything_is_made(client, monkeypatch):
+    """422, not 409.
+
+    409 is what this answered before — routed through the generic "cannot
+    create a box named X" arm — and a conflict tells the caller to pick a
+    different name when the fix is to spell this one properly. It is also
+    refused *before* `_peek_for` shells out to Fly and before a row exists,
+    which is what stops a typo consuming the name: a terminal row keeps its
+    name forever, because `release_name` runs only in `teardown_box`.
+    """
+    import flotta.provision as provision
+
+    def never(*args, **kwargs):
+        raise AssertionError("nothing should be provisioned for an impossible name")
+
+    monkeypatch.setattr(provision, "create_box", never)
+    monkeypatch.setattr(provision, "reserve_box", never)
+
+    response = client.post("/api/boxes", json={"name": "Eng-f"})
+    assert response.status_code == 422
+    assert "eng-f" in response.json()["detail"]
+
+    # Nothing was written, so neither spelling is taken.
+    names = [b["name"] for b in client.get("/api/boxes").json()["boxes"]]
+    assert "Eng-f" not in names and "eng-f" not in names
+
+
+def test_surrounding_whitespace_is_still_accepted_and_trimmed(client, monkeypatch):
+    """Invisible and almost never meant — the one thing corrected rather than
+    refused. This endpoint already stripped it; the validator must not start
+    rejecting what it used to accept."""
+    import flotta.provision as provision
+
+    made = {}
+
+    def fake_create(name, *, store, **kwargs):
+        made["name"] = name
+        box = store.create_box(name)
+        return {"box_id": box.id, "endpoint": "fly://app/m-new"}
+
+    monkeypatch.setattr(provision, "create_box", fake_create)
+
+    assert client.post("/api/boxes", json={"name": "  eng-b  "}).status_code == 201
+    assert made["name"] == "eng-b"

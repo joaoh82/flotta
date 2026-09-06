@@ -78,6 +78,7 @@ from flotta.store import (
     Task,
     UnknownEntityError,
     is_terminal,
+    validate_box_name,
 )
 
 # How long a task may run before it is considered overdue. Lived in
@@ -622,6 +623,15 @@ def create_box(
     provision failed is closed rather than left in `provisioning` forever: there
     is no machine behind it, so nothing can ever move it forward.
     """
+    # First, before a substrate is even resolved. `_peek_endpoint` shells out,
+    # so validating only in the store would spend a `flyctl` round trip on a
+    # name that can never work — and would make refusing a typo depend on
+    # having a working Fly credential, which is the wrong dependency for
+    # "that name has a capital letter in it".
+    #
+    # The store validates again. That is the guarantee; this is the shortcut.
+    name = validate_box_name(name)
+
     impl = backend or _backend_for("fly://")  # default substrate for persistent boxes
 
     # `create` is idempotent over the *machine* — it adopts `machines[0]` rather

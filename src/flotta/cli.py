@@ -58,8 +58,10 @@ import typer
 
 from .store import (
     Box,
+    DuplicateBoxError,
     Event,
     FleetStore,
+    InvalidBoxNameError,
     LegacyStoreError,
     Task,
     UnknownEntityError,
@@ -905,6 +907,14 @@ def create(
                 store=fleet,
                 spec=BoxSpec(name=name, image=image) if image else None,
             )
+        except (InvalidBoxNameError, DuplicateBoxError) as exc:
+            # Exit 2: the caller asked for something impossible, which is a
+            # refusal rather than a failure (see the exit-code convention).
+            # `DuplicateBoxError` reached here uncaught before this — a name
+            # already taken printed a traceback, which reads as a crash rather
+            # than the one-word fix it is.
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
         except (provision.ProvisionError, ValueError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc

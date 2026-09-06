@@ -830,3 +830,50 @@ def test_repo_reports_a_refusal_rather_than_a_traceback(tmp_path, monkeypatch):
     assert result.exit_code == 1
     assert "fleet:write" in result.output
     assert "Traceback" not in result.output
+
+
+# -- `flotta create` refuses a name that cannot be an address ---------------
+
+
+def test_create_refuses_a_name_that_cannot_be_an_address(tmp_path, monkeypatch):
+    """Exit 2 — a refusal, not a failure — and it never reaches a substrate.
+
+    The same shape as a malformed repository above: checked locally, so a typo
+    costs a round trip to nothing. It matters more here, because on Fly the
+    round trip is a *provision*: the first person to type `Eng-f` spent one,
+    got a `torn_down` row, and lost the name.
+    """
+    from typer.testing import CliRunner
+
+    from flotta import provision
+    from flotta.cli import app
+
+    def no_backend(_scheme):
+        raise AssertionError("a name that cannot work must not reach a substrate")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(provision, "_backend_for", no_backend)
+    result = CliRunner().invoke(app, ["create", "Eng-f", "--store", str(tmp_path / "fleet.db")])
+    assert result.exit_code == 2
+
+
+def test_create_refuses_a_taken_name_without_a_traceback(tmp_path, monkeypatch):
+    """`DuplicateBoxError` used to escape this command uncaught, so a name
+    already in use printed a stack trace — which reads as a crash rather than
+    as the one-word fix it is."""
+    from typer.testing import CliRunner
+
+    from flotta import provision
+    from flotta.cli import app
+    from flotta.store import FleetStore
+
+    db = tmp_path / "fleet.db"
+    with FleetStore(db) as fleet:
+        fleet.create_box("eng-a")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(provision, "_backend_for", lambda _scheme: None)
+    monkeypatch.setattr(provision, "_peek_endpoint", lambda *a, **k: None)
+    result = CliRunner().invoke(app, ["create", "eng-a", "--store", str(db)])
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
