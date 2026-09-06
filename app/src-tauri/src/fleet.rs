@@ -107,6 +107,49 @@ struct BoxList {
     boxes: Vec<BoxRow>,
 }
 
+/// One line of a box's timeline, as `GET /api/boxes/{id}/events` reports it.
+///
+/// `type` is a Rust keyword, so the field is `kind` here and serde carries the
+/// wire name in both directions — the webview reads `type`, the same word the
+/// API and the store use. Renaming it for JavaScript's benefit would put three
+/// spellings on one field.
+///
+/// `payload` is deliberately untyped. Its shape depends on the event: a
+/// `torn_down` carries a `reason`, an `identity_minted` an `expires_at`, and
+/// `reconcile` writes whatever it learned. Modelling that here would mean
+/// updating Rust every time the control plane records something new, and the
+/// app only ever reads a couple of keys out of it.
+///
+/// **`entity_kind` is not optional, and dropping it was a bug.** The endpoint
+/// is box-scoped but the timeline is not: `get_box_timeline` unions the box's
+/// own events with those of its tasks *and* its workspaces, because "what has
+/// this agent been doing" spans all three tiers. Without this field, "the
+/// reason this box was torn down" is really "the last `torn_down` from any
+/// tier" — a workspace teardown shown as the agent's own fate. It reads
+/// correctly today only because `teardown_box` happens to write the workspace
+/// events first, which is ordering luck, not a guarantee.
+///
+/// Required rather than defaulted, deliberately. Guessing `box` would put the
+/// bug back for any event that stopped saying what it belonged to; failing to
+/// parse is loud, and the pane shows that error rather than a confident wrong
+/// answer.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BoxEvent {
+    pub id: i64,
+    pub ts: String,
+    /// `box`, `task` or `workspace`.
+    pub entity_kind: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct EventList {
+    events: Vec<BoxEvent>,
+}
+
 fn entry() -> Result<keyring::Entry, FleetError> {
     keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         .map_err(|e| FleetError::Keychain(format!("the keychain is unavailable: {e}")))
@@ -247,6 +290,30 @@ async fn get(settings: &Settings, path: &str) -> Result<String, FleetError> {
     }
 }
 
+/// One path segment, safe to interpolate.
+///
+/// Ids are `b-<hex>` and could be dropped in raw, but `get_box` and
+/// `box_events` both accept a **name** as well, and a name is not validated
+/// anywhere — `store.create_box` inserts the string it is handed, and
+/// FLOTTA-28's tombstones are `<name>@<id>`. A slash in one would silently
+/// address a different endpoint rather than fail.
+///
+/// Hand-rolled rather than pulling in `percent-encoding`: the unreserved set
+/// is the whole job, and a dependency for twelve lines is not worth the
+/// supply chain.
+fn encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 /// `{base}{path}`, with exactly one slash between them.
 ///
 /// Its own function so it can be tested: a trailing slash on a pasted URL is
@@ -333,14 +400,25 @@ pub async fn create_box(settings: &Settings, name: &str) -> Result<BoxRow, Fleet
     )
     .await?;
 
-    // The endpoint answers 201 with the box, or with a warning wrapper when it
-    // made a machine that is not running — which must not read as a failure,
-    // because something real was created and billing for it starts either way.
-    let value: serde_json::Value = serde_json::from_str(&body)
+    // Since FLOTTA-27 the usual answer is `202` with a box that is still
+    // `provisioning` — a machine appears a minute or two later. `classify`
+    // treats every 2xx alike, which is right: `201`, `201`-with-a-warning (a
+    // machine that was made but is not running) and `202` all mean something
+    // real was created and is billing, and none of them is a failure.
+    box_from(&body, "created, but could not read it back")
+}
+
+/// A `BoxRow` out of a body that may or may not wrap it.
+///
+/// `POST /api/boxes` answers `{"box": …}` — plus `warning`, or `box_id` and
+/// `status` on the async path — and `GET /api/boxes/{id}` answers `{"box": …,
+/// "tasks": …}`. Falling back to the whole body keeps this working if either
+/// ever answers with the row on its own.
+fn box_from(body: &str, what: &str) -> Result<BoxRow, FleetError> {
+    let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| FleetError::Unexpected(format!("unreadable answer: {e}")))?;
     let row = value.get("box").unwrap_or(&value);
-    serde_json::from_value(row.clone())
-        .map_err(|e| FleetError::Unexpected(format!("created, but could not read it back: {e}")))
+    serde_json::from_value(row.clone()).map_err(|e| FleetError::Unexpected(format!("{what}: {e}")))
 }
 
 /// Destroy an agent, and everything it remembers.
@@ -364,6 +442,34 @@ pub async fn list_boxes(settings: &Settings) -> Result<Vec<BoxRow>, FleetError> 
                 "the fleet API returned something unexpected ({e}); its shape may have changed"
             ))
         })
+}
+
+/// One agent by id or name, **including a torn-down one**.
+///
+/// That exception is the whole reason this exists beside `list_boxes`. The
+/// list endpoint filters terminal boxes, on purpose — a destroyed agent should
+/// not clutter a fleet — but it means a provision that fails does not leave a
+/// row explaining itself: the agent simply stops being in the answer. This is
+/// how the app can still say what became of one it was watching.
+pub async fn get_box(settings: &Settings, id: &str) -> Result<BoxRow, FleetError> {
+    let body = get(settings, &format!("/api/boxes/{}", encode_segment(id))).await?;
+    box_from(&body, "could not read that agent")
+}
+
+/// A box's timeline: what happened to it, oldest first.
+///
+/// The app reads this for the one question the fleet list cannot answer —
+/// *why*. A failed provision writes `torn_down` with a reason and leaves the
+/// list; the reason is here and nowhere else the app can reach.
+pub async fn box_events(settings: &Settings, id: &str) -> Result<Vec<BoxEvent>, FleetError> {
+    let body = get(
+        settings,
+        &format!("/api/boxes/{}/events", encode_segment(id)),
+    )
+    .await?;
+    serde_json::from_str::<EventList>(&body)
+        .map(|list| list.events)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable timeline: {e}")))
 }
 
 #[cfg(test)]
@@ -471,5 +577,131 @@ mod tests {
 
         let json = serde_json::to_value(FleetError::NotConfigured("set a url".into())).unwrap();
         assert_eq!(json["kind"], "not_configured");
+    }
+
+    #[test]
+    fn an_accepted_creation_reads_back_as_a_provisioning_box() {
+        // The exact `202` body `_create_in_background` answers with. It is not
+        // the `201` this used to get, and the difference is the bug: the row
+        // is real, its status is `provisioning`, and there is no machine yet.
+        // If this ever failed to parse, the app would report a creation that
+        // succeeded as an unexpected answer.
+        let body = r#"{"box":{"id":"b7","name":"eng-f","status":"provisioning",
+                       "endpoint":null,"created_at":"2026-09-05T08:00:00+00:00",
+                       "destroyed_at":null},"box_id":"b7","status":"provisioning"}"#;
+        let row = box_from(body, "nope").expect("a 202 body must parse");
+        assert_eq!(row.name, "eng-f");
+        assert_eq!(row.status, "provisioning");
+        assert!(row.endpoint.is_none(), "there is no machine yet");
+    }
+
+    #[test]
+    fn a_bare_row_parses_too() {
+        // The fallback for a body that is the row itself rather than `{"box":
+        // …}`. Three endpoints wrap it today and nothing guarantees a fourth
+        // will.
+        let row = box_from(r#"{"id":"b1","name":"eng-a","status":"running"}"#, "nope").unwrap();
+        assert_eq!(row.name, "eng-a");
+    }
+
+    #[test]
+    fn a_timeline_keeps_the_word_type() {
+        // `type` is a Rust keyword, so the field is `kind` — but the wire name
+        // has to survive in *both* directions. The webview matches on
+        // `torn_down` to decide whether an agent failed to be created, and it
+        // reads that off `event.type`. A rename on the way out would leave the
+        // app unable to tell a failure from a boot.
+        let body = r#"{"events":[
+            {"id":1,"entity_kind":"box","entity_id":"b7","ts":"2026-09-05T08:00:00+00:00",
+             "type":"provisioning","payload":{"name":"eng-f","backend":"fly://"}},
+            {"id":2,"entity_kind":"box","entity_id":"b7","ts":"2026-09-05T08:01:00+00:00",
+             "type":"torn_down","payload":{"reason":"create failed: BackendError: no capacity"}}
+        ]}"#;
+        let events = serde_json::from_str::<EventList>(body)
+            .expect("must parse")
+            .events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "torn_down");
+
+        let out = serde_json::to_value(&events[1]).unwrap();
+        assert_eq!(out["type"], "torn_down", "the frontend reads `type`");
+        assert_eq!(out["entity_kind"], "box", "and it filters on this");
+        assert_eq!(
+            out["payload"]["reason"],
+            "create failed: BackendError: no capacity"
+        );
+    }
+
+    #[test]
+    fn a_real_timeline_parses_to_the_events_it_contains() {
+        // The literal body `GET /api/boxes/{id}/events` returned for a live
+        // box, captured rather than hand-written — the same habit as
+        // `fixture.json`, and for the same reason: the app decides whether an
+        // agent failed to be created by reading this, and a hand-written
+        // sample can only prove that the sample parses.
+        //
+        // It carries `entity_kind` and `entity_id`, which the app does not
+        // model, and event types nothing here special-cases (`addressed`, the
+        // door waking a box). Both must stay harmless.
+        let body = include_str!("../tests/timeline.json");
+        let events = serde_json::from_str::<EventList>(body)
+            .expect("a real timeline must parse")
+            .events;
+        assert_eq!(events.len(), 18);
+        assert_eq!(events[0].kind, "provisioning");
+        assert!(events.iter().any(|e| e.kind == "addressed"));
+        assert!(events.iter().all(|e| e.entity_kind == "box"));
+        // The one field the failure panel actually reads out of a payload.
+        assert!(events.iter().any(|e| e
+            .payload
+            .as_ref()
+            .is_some_and(|p| p.get("reason").is_some())));
+    }
+
+    #[test]
+    fn a_timeline_says_which_tier_each_event_belongs_to() {
+        // `get_box_timeline` unions box, task and workspace events. Dropping
+        // `entity_kind` made "why was this box torn down" mean "the last
+        // `torn_down` from any tier", so a workspace teardown could be shown
+        // as the agent's own fate. This is the field that stops it, and it has
+        // to survive into the webview, where the filtering happens.
+        let body = r#"{"events":[
+            {"id":1,"entity_kind":"workspace","entity_id":"w1","ts":"t",
+             "type":"torn_down","payload":{"reason":"box eng-f torn down"}},
+            {"id":2,"entity_kind":"box","entity_id":"b7","ts":"t",
+             "type":"torn_down","payload":{"reason":"create failed: no capacity"}}
+        ]}"#;
+        let events = serde_json::from_str::<EventList>(body)
+            .expect("must parse")
+            .events;
+        assert_eq!(events[0].entity_kind, "workspace");
+        assert_eq!(events[1].entity_kind, "box");
+        let boxes: Vec<_> = events.iter().filter(|e| e.entity_kind == "box").collect();
+        assert_eq!(boxes.len(), 1, "one of these two is the agent's own ending");
+    }
+
+    #[test]
+    fn a_path_segment_cannot_change_which_endpoint_is_called() {
+        // Both lookups take an id *or a name*, and a name is whatever
+        // `store.create_box` was handed. A slash would address something else
+        // entirely rather than fail.
+        assert_eq!(encode_segment("b-98777076972d"), "b-98777076972d");
+        assert_eq!(encode_segment("eng-a@b-1"), "eng-a%40b-1");
+        assert_eq!(encode_segment("a/../b"), "a%2F..%2Fb");
+        assert_eq!(encode_segment("two words"), "two%20words");
+    }
+
+    #[test]
+    fn an_event_with_no_payload_still_parses() {
+        // `add_event` takes the payload optionally and the column is nullable,
+        // so a null is a real body and not a malformed one. Requiring it would
+        // make the timeline unreadable the first time something recorded a
+        // bare fact.
+        let body = r#"{"events":[{"id":1,"entity_kind":"box","ts":"2026-09-05T08:00:00+00:00",
+                       "type":"running","payload":null}]}"#;
+        let events = serde_json::from_str::<EventList>(body)
+            .expect("must parse")
+            .events;
+        assert!(events[0].payload.is_none() || events[0].payload.as_ref().unwrap().is_null());
     }
 }

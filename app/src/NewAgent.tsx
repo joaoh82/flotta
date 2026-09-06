@@ -8,6 +8,13 @@ import { isFleetError, type BoxRow } from "./types";
  * One request. The box arrives with its identity already on it — FLOTTA-21
  * injects it at creation — which is why this is a button rather than a button
  * followed by a terminal. That was the point of doing FLOTTA-21 before M8.
+ *
+ * The request is *not* the provisioning. Since FLOTTA-27 the control plane
+ * answers `202` in a moment and builds the machine on a thread, so this form
+ * finishes long before the agent exists. Saying "this takes a minute" here
+ * would attach that minute to the wrong thing and then stop saying it exactly
+ * when it became true — the waiting belongs to the agent, and `AgentTimeline`
+ * is where it is described.
  */
 export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
   const [name, setName] = useState("");
@@ -50,9 +57,7 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
         </button>
       </div>
       {busy && (
-        <p className="mt-2 text-[11px] text-neutral-500">
-          Provisioning a machine and a volume. This takes a minute.
-        </p>
+        <p className="mt-2 text-[11px] text-neutral-500">Asking the control plane…</p>
       )}
       {error && (
         <p className="mt-2 whitespace-pre-wrap rounded bg-red-50 px-2 py-1.5 text-[11px] text-red-800">

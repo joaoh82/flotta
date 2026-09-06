@@ -16,6 +16,45 @@ export type BoxRow = {
 };
 
 /**
+ * One line of a box's timeline. Mirrors `BoxEvent` in `src-tauri/src/fleet.rs`.
+ *
+ * `payload` is untyped on purpose — its shape depends on `type`, and the app
+ * reads two keys out of it. See `reasonOf`.
+ */
+export type BoxEvent = {
+  id: number;
+  ts: string;
+  /**
+   * `box`, `task` or `workspace`.
+   *
+   * The endpoint is box-scoped but the timeline is not — `get_box_timeline`
+   * unions all three tiers, because "what has this agent been doing" spans
+   * them. Anything asking "why did this box end" has to filter on this, or it
+   * is really asking "what ended last, whatever it was".
+   */
+  entity_kind: string;
+  type: string;
+  payload?: Record<string, unknown> | null;
+};
+
+/**
+ * Can you talk to this agent right now?
+ *
+ * `running` obviously. `stopped` too — the door wakes a sleeping box, and most
+ * of the fleet is stopped most of the time, which is the cost argument
+ * working rather than an outage.
+ *
+ * `provisioning` is the one this function exists for. A box in that state has
+ * a row and no machine, so the door cannot resolve it; opening a conversation
+ * against one shows a connection error for a creation that is going perfectly
+ * well. That was FLOTTA-29 — the same class of lie the `202` removed from the
+ * API, reintroduced one layer up.
+ */
+export function isAddressable(status: string): boolean {
+  return status === "running" || status === "stopped";
+}
+
+/**
  * Why this is a tagged union and not a string.
  *
  * "No agents", "cannot reach the control plane" and "your token was refused"
