@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { POLL_MS } from "./poll";
+import { endingOf, missingOf, reasonOf, warningsIn } from "./timeline";
 import { isAddressable, isFleetError, type BoxEvent, type BoxRow } from "./types";
 
 /**
@@ -26,24 +27,6 @@ import { isAddressable, isFleetError, type BoxEvent, type BoxRow } from "./types
  * other surface in the app to land on.
  */
 
-/** The reason an event carries, when it carries one. */
-function reasonOf(event: BoxEvent): string | null {
-  const value = event.payload?.reason;
-  return typeof value === "string" ? value : null;
-}
-
-/**
- * The secrets a `fleet_secrets_missing` event names.
- *
- * Its payload has `reason` *and* `missing`, and the reason is generic advice —
- * the list is the part that says which ones. Rendering only the reason left
- * the useful half on the floor.
- */
-function missingOf(event: BoxEvent): string[] {
-  const value = event.payload?.missing;
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-
 /** Time of day, which is all that is useful over a couple of minutes. */
 function timeOf(ts: string): string {
   const when = new Date(ts);
@@ -51,21 +34,6 @@ function timeOf(ts: string): string {
     ? ts
     : when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
-
-/**
- * Events that are worth saying out loud rather than only listing.
- *
- * A box can finish provisioning and still be unable to work: no provider key
- * means it answers every turn with "No inference provider configured", and no
- * signing key means it cannot fetch a git credential. Both are recorded and
- * neither changes the status, so a box that is `running` and useless looks
- * exactly like one that is fine.
- *
- * They matter *more* on a box that failed, not less: a machine that will not
- * boot for want of `FLOTTA_BOX_PASSWORD` ends as "provisioning never
- * completed", and this banner is the only place the actual cause appears.
- */
-const WARNINGS = new Set(["fleet_secrets_missing", "identity_skipped"]);
 
 export function AgentTimeline({
   boxId,
@@ -97,9 +65,8 @@ export function AgentTimeline({
   // what a failed provision looks like, because `GET /api/boxes` filters
   // terminal boxes — the box has to be asked for by id.
   const effective = status ?? fetched?.status ?? null;
-  // `torn_down` is the only terminal box status: the store's transition table
-  // gives boxes no `failed`, because machines get destroyed rather than fail.
-  const settled = effective === "torn_down";
+  const ending = endingOf(events ?? [], effective);
+  const settled = ending.kind !== "unfinished";
 
   const load = useCallback(async () => {
     try {
@@ -128,29 +95,12 @@ export function AgentTimeline({
     if (status === null && fetched && isAddressable(fetched.status)) onRefresh();
   }, [status, fetched, onRefresh]);
 
-  // **Only the box's own events.** `get_box_timeline` unions box, task and
-  // workspace events, so the last `torn_down` in the whole list can belong to
-  // a workspace — and "box eng-f torn down" would then be shown as the reason
-  // the agent itself ended.
-  const own = (events ?? []).filter((event) => event.entity_kind === "box");
-  const failure = settled
-    ? (own
-        .filter((event) => event.type === "torn_down")
-        .map(reasonOf)
-        .filter((reason): reason is string => reason !== null)
-        .pop() ?? null)
-    : null;
-  // Did a machine ever exist? An agent that ran for a week and was destroyed
-  // this morning is also `torn_down`, and telling it "you were not created"
-  // is wrong about the only thing this pane is for.
-  const lived = own.some((event) => event.type === "running" || event.type === "stopped");
-  const warnings = (events ?? []).filter(
-    (event) => event.entity_kind === "box" && WARNINGS.has(event.type),
-  );
+  const failure = ending.kind === "unfinished" ? null : ending.reason;
+  const warnings = warningsIn(events ?? []);
 
   return (
     <div className="flex h-full flex-col overflow-auto p-5">
-      {settled && lived ? (
+      {ending.kind === "gone" ? (
         <>
           <h2 className="text-sm font-medium text-neutral-900">{boxName} is gone</h2>
           <p className="mt-1 max-w-prose text-xs text-neutral-600">
@@ -159,7 +109,7 @@ export function AgentTimeline({
                 "went with it."}
           </p>
         </>
-      ) : settled ? (
+      ) : ending.kind === "never-created" ? (
         <>
           <h2 className="text-sm font-medium text-neutral-900">
             {boxName} was not created
