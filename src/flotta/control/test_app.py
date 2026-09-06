@@ -1064,3 +1064,95 @@ def test_surrounding_whitespace_is_still_accepted_and_trimmed(client, monkeypatc
 
     assert client.post("/api/boxes", json={"name": "  eng-b  "}).status_code == 201
     assert made["name"] == "eng-b"
+
+
+# -- fleet settings ---------------------------------------------------------
+#
+# The app is the product surface, so how the fleet behaves has to be settable
+# from a window rather than from a deployment variable and a restart.
+
+
+def test_settings_carry_the_catalogue_and_where_each_value_came_from(client):
+    rows = client.get("/api/settings").json()["settings"]
+    by_key = {row["key"]: row for row in rows}
+
+    assert "FLOTTA_IDLE_AFTER_S" in by_key
+    # Label and help travel with the value so the app renders a form without
+    # hardcoding one — a setting added server-side appears without a rebuild.
+    assert by_key["FLOTTA_IDLE_AFTER_S"]["label"]
+    assert by_key["FLOTTA_IDLE_AFTER_S"]["help"]
+    assert by_key["FLOTTA_IDLE_AFTER_S"]["source"] in {"store", "env", "default"}
+
+
+def test_a_setting_survives_being_written_and_read_back(client):
+    written = client.put("/api/settings", json={"values": {"FLOTTA_IDLE_AFTER_S": "300"}})
+    assert written.status_code == 200
+
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert rows["FLOTTA_IDLE_AFTER_S"]["value"] == "300"
+    assert rows["FLOTTA_IDLE_AFTER_S"]["source"] == "store"
+
+
+def test_an_emptied_field_clears_the_override(client):
+    client.put("/api/settings", json={"values": {"FLOTTA_IDLE_AFTER_S": "300"}})
+    client.put("/api/settings", json={"values": {"FLOTTA_IDLE_AFTER_S": ""}})
+
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert rows["FLOTTA_IDLE_AFTER_S"]["source"] != "store"
+
+
+def test_a_credential_cannot_be_set_through_the_settings_api(client):
+    """The security boundary, stated as a test.
+
+    `settings.layered` shadows environment lookups, so a settings endpoint that
+    accepted arbitrary keys would be a way to override the signing key — the
+    thing every token in the fleet is verified against — over authenticated
+    HTTP. The catalogue is an allowlist for exactly this reason.
+    """
+    for key in ("FLOTTA_SIGNING_KEY", "FLOTTA_GITHUB_TOKEN", "FLOTTA_BOX_PASSWORD"):
+        response = client.put("/api/settings", json={"values": {key: "stolen"}})
+        assert response.status_code == 422, key
+
+    # And nothing about them is readable either.
+    body = client.get("/api/settings").text
+    assert "SIGNING_KEY" not in body
+    assert "GITHUB_TOKEN" not in body
+
+
+def test_a_value_that_cannot_be_parsed_is_refused_whole(client):
+    """Validated before anything is written, and the request refused entirely.
+
+    A partial apply would leave the fleet in a state nobody asked for and the
+    form showing something else.
+    """
+    response = client.put(
+        "/api/settings",
+        json={"values": {"FLOTTA_IDLE_AFTER_S": "300", "FLOTTA_MAX_CONCURRENT": "lots"}},
+    )
+    assert response.status_code == 422
+
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert rows["FLOTTA_IDLE_AFTER_S"]["source"] != "store", "the good half was applied anyway"
+
+
+def test_settings_need_write_to_change_and_read_to_see(secured):
+    """Reading how the fleet is configured is not permission to reconfigure it.
+
+    The same split as the repo grants: `fleet:read` sees, `fleet:write` changes.
+    A dashboard token that could retune the sweep interval would be a surprise.
+    """
+    assert secured.get("/api/settings", headers=_bearer("fleet:read")).status_code == 200
+
+    refused = secured.put(
+        "/api/settings",
+        json={"values": {"FLOTTA_IDLE_AFTER_S": "300"}},
+        headers=_bearer("fleet:read"),
+    )
+    assert refused.status_code == 403
+
+    allowed = secured.put(
+        "/api/settings",
+        json={"values": {"FLOTTA_IDLE_AFTER_S": "300"}},
+        headers=_bearer("fleet:write"),
+    )
+    assert allowed.status_code == 200

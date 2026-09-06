@@ -145,6 +145,37 @@ pub struct BoxEvent {
     pub payload: Option<serde_json::Value>,
 }
 
+/// One thing about the fleet a person may change, as `GET /api/settings`
+/// reports it.
+///
+/// The catalogue travels with the value — `label`, `help`, `kind` and
+/// `default` all come from the control plane — so the window renders a form it
+/// does not hardcode. A setting added server-side appears here without the app
+/// being rebuilt, which is the point of the control plane owning the list.
+///
+/// `source` is `store`, `env` or `default`, and it earns its place: "why is my
+/// fleet not using the number I set" is otherwise unanswerable from a window,
+/// and the answer is usually a deployment variable still in play.
+///
+/// **Nothing in here is ever a credential.** The control plane's catalogue is
+/// an allowlist of configuration, so the settings API has no secret to return
+/// and this struct has nowhere to put one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FleetSetting {
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    pub kind: String,
+    pub default: String,
+    pub value: String,
+    pub source: String,
+}
+
+#[derive(Deserialize)]
+struct SettingList {
+    settings: Vec<FleetSetting>,
+}
+
 #[derive(Deserialize)]
 struct EventList {
     events: Vec<BoxEvent>,
@@ -456,6 +487,38 @@ pub async fn get_box(settings: &Settings, id: &str) -> Result<BoxRow, FleetError
     box_from(&body, "could not read that agent")
 }
 
+/// How the fleet is configured, and where each value came from.
+pub async fn fleet_settings(settings: &Settings) -> Result<Vec<FleetSetting>, FleetError> {
+    let body = get(settings, "/api/settings").await?;
+    settings_from(&body)
+}
+
+/// Change fleet settings. An empty value clears an override.
+///
+/// The whole map goes in one request because the control plane validates it
+/// as one: a bad value refuses the lot rather than applying half, which is
+/// what stops the fleet ending up in a state nobody asked for while the form
+/// shows something else.
+pub async fn set_fleet_settings(
+    settings: &Settings,
+    values: serde_json::Value,
+) -> Result<Vec<FleetSetting>, FleetError> {
+    let body = send(
+        settings,
+        reqwest::Method::PUT,
+        "/api/settings",
+        Some(serde_json::json!({ "values": values })),
+    )
+    .await?;
+    settings_from(&body)
+}
+
+fn settings_from(body: &str) -> Result<Vec<FleetSetting>, FleetError> {
+    serde_json::from_str::<SettingList>(body)
+        .map(|list| list.settings)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable settings: {e}")))
+}
+
 /// A box's timeline: what happened to it, oldest first.
 ///
 /// The app reads this for the one question the fleet list cannot answer —
@@ -656,6 +719,27 @@ mod tests {
             .payload
             .as_ref()
             .is_some_and(|p| p.get("reason").is_some())));
+    }
+
+    #[test]
+    fn settings_carry_their_own_catalogue_so_the_form_is_not_hardcoded() {
+        // The app renders label, help and default straight from this. If they
+        // ever stopped arriving, the window would show a row of unlabelled
+        // boxes named after environment variables — which is the thing this
+        // whole feature exists to stop being the interface.
+        let body = r#"{"settings":[
+            {"key":"FLOTTA_IDLE_AFTER_S","label":"Sleep agents after",
+             "help":"Seconds of quiet before an agent suspends itself.",
+             "kind":"seconds","default":"1800","value":"300","source":"store"},
+            {"key":"FLOTTA_MAX_CONCURRENT","label":"Live tasks at once",
+             "help":"How much work may run at once.","kind":"int",
+             "default":"1","value":"1","source":"default"}
+        ]}"#;
+        let settings = settings_from(body).expect("must parse");
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings[0].label, "Sleep agents after");
+        assert_eq!(settings[0].source, "store");
+        assert_eq!(settings[1].source, "default");
     }
 
     #[test]

@@ -155,6 +155,27 @@ async fn create_agent(app: tauri::AppHandle, name: String) -> Result<BoxRow, Fle
     fleet::create_box(&read_settings(&app), &name).await
 }
 
+/// How the fleet behaves, as the control plane reports it.
+///
+/// Distinct from `load_settings`, which is about *this app*: where the control
+/// plane is and whether a token is saved. These are the fleet's own settings,
+/// live on the other side of the network, shared by everything that talks to
+/// it.
+#[tauri::command]
+async fn fleet_settings(app: tauri::AppHandle) -> Result<Vec<fleet::FleetSetting>, FleetError> {
+    fleet::fleet_settings(&read_settings(&app)).await
+}
+
+/// Change them. Returns the fleet's settings as they now stand, so the form
+/// re-renders from what was actually stored rather than from what was typed.
+#[tauri::command]
+async fn set_fleet_settings(
+    app: tauri::AppHandle,
+    values: serde_json::Value,
+) -> Result<Vec<fleet::FleetSetting>, FleetError> {
+    fleet::set_fleet_settings(&read_settings(&app), values).await
+}
+
 /// One agent, by id — **including one that has been torn down**.
 ///
 /// `list_boxes` hides terminal boxes, so an agent whose provision failed stops
@@ -278,6 +299,8 @@ pub fn run() {
             close_conversation,
             create_agent,
             get_agent,
+            fleet_settings,
+            set_fleet_settings,
             agent_timeline,
             destroy_agent
         ])

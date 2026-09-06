@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { FleetSettings } from "./FleetSettings";
 import { isFleetError, type SettingsView } from "./types";
 
 /**
@@ -80,7 +81,8 @@ export function Settings({
   }
 
   return (
-    <form onSubmit={save} className="mx-auto max-w-lg space-y-5 p-6">
+    <div className="mx-auto max-w-lg space-y-8 p-6">
+      <form onSubmit={save} className="space-y-5">
       <div>
         <h2 className="text-sm font-semibold text-neutral-900">Settings</h2>
         <p className="mt-1 text-xs text-neutral-500">
@@ -170,6 +172,16 @@ export function Settings({
       >
         {saving ? "Saving…" : "Save"}
       </button>
-    </form>
+      </form>
+
+      {/* Only once the app knows where to ask. A fleet-settings form against
+          an unconfigured control plane can do nothing but fail, and on a first
+          run that failure would be the first thing anyone saw. */}
+      {initial.control_url && initial.has_token && (
+        <div className="border-t border-neutral-200 pt-6">
+          <FleetSettings />
+        </div>
+      )}
+    </div>
   );
 }

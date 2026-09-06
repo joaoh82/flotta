@@ -58,7 +58,7 @@ from __future__ import annotations
 import math
 import os
 import secrets as secrets_module
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -117,9 +117,15 @@ COST_PER_SECOND_ENV = "FLOTTA_COST_PER_SECOND"
 
 
 def resolve_cost_rate(
-    explicit: float | None = None, env: dict[str, str] | None = None
+    explicit: float | None = None, env: Mapping[str, str] | None = None
 ) -> float | None:
-    """Dollars per container-second, or None when the operator has not set one."""
+    """Dollars per container-second, or None when the operator has not set one.
+
+    `env` is a mapping rather than the process environment so a caller with a
+    store can pass `settings.layered(store)` — which is how a value set in the
+    app wins over one set at deploy time. Every resolver here takes it for the
+    same reason.
+    """
     import os
 
     env = os.environ if env is None else env
@@ -186,10 +192,27 @@ def estimate_cost(seconds: Any, rate: float | None) -> float | None:
 DEFAULT_GRACE_S = 60
 
 
+def _settings_env(store: FleetStore) -> Mapping[str, str] | None:
+    """`settings.layered(store)`, or the plain environment if that fails.
+
+    Deliberately forgiving. These resolvers run inside the reconcile loop and
+    on every create, and a settings read that raised — an old store, a database
+    hiccup — would take down the sweep that keeps the fleet honest. Falling
+    back to the environment is exactly the behaviour before this table existed,
+    so the failure mode is "your override is ignored", not "the fleet stops".
+    """
+    try:
+        from flotta.settings import layered
+
+        return layered(store)
+    except Exception:  # noqa: BLE001 - see above; never worth ending a sweep
+        return None
+
+
 def resolve_max_concurrent(
-    explicit: int | None = None, env: dict[str, str] | None = None
+    explicit: int | None = None, env: Mapping[str, str] | None = None
 ) -> int | None:
-    """How many tasks may be live at once: explicit -> env -> default.
+    """How many tasks may be live at once: explicit -> fleet setting -> env -> default.
 
     Returns ``None`` for *unlimited*, which is what ``0`` requests. Anyone
     setting that has said so deliberately; the default of 1 is what protects
@@ -1081,7 +1104,7 @@ def watch_task(
     # against a row still marked `running`, and `reconcile` — which resolves the
     # same way — could not rescue it either. Failing here costs nothing and says
     # exactly what is wrong.
-    rate = resolve_cost_rate(cost_per_second)
+    rate = resolve_cost_rate(cost_per_second, _settings_env(store))
 
     # No default waiter. Modal's `FunctionCall.get` used to be one, and cutting
     # the shard tier removed the only thing that could hand back a verdict.
@@ -1220,7 +1243,7 @@ def reconcile(
     """
     # Same reason as `watch_task`: resolved before any work, so a typo'd rate
     # cannot block the very recovery this function exists to perform.
-    rate = resolve_cost_rate(cost_per_second)
+    rate = resolve_cost_rate(cost_per_second, _settings_env(store))
 
     # Optional here, unlike `watch_task`. Reconciling is mostly *closing* rows
     # nothing will ever report on, and that works with no waiter at all — which
@@ -1404,8 +1427,14 @@ IDLE_AFTER_ENV = "FLOTTA_IDLE_AFTER_S"
 ADDRESSED_EVENT = "addressed"
 
 
-def resolve_idle_after(explicit: float | None = None, env: dict[str, str] | None = None) -> float:
-    """`--idle-after` → `$FLOTTA_IDLE_AFTER_S` → 30 minutes. 0 disables."""
+def resolve_idle_after(
+    explicit: float | None = None, env: Mapping[str, str] | None = None
+) -> float:
+    """`--idle-after` → the fleet setting → `$FLOTTA_IDLE_AFTER_S` → 30 minutes.
+
+    0 disables. The middle step is what `settings.layered` inserts: an explicit
+    argument still wins, because a caller who named a number meant it.
+    """
     if explicit is not None:
         return float(explicit)
     env = os.environ if env is None else env
@@ -1444,7 +1473,7 @@ def idle_boxes(
     Returns `(box, idle_seconds)` so a caller can log *why* rather than just
     what — an operator asking "why did my agent go to sleep" deserves a number.
     """
-    threshold = resolve_idle_after(idle_after_s)
+    threshold = resolve_idle_after(idle_after_s, _settings_env(store))
     if threshold <= 0:
         return []  # explicitly disabled
     current = now or datetime.now(UTC)

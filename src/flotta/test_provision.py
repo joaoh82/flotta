@@ -1795,6 +1795,36 @@ def test_the_idle_threshold_comes_from_the_environment(monkeypatch):
     assert resolve_idle_after(45) == 45, "an explicit value wins over the environment"
 
 
+def test_a_stored_setting_beats_the_environment_and_changes_what_sleeps(store, monkeypatch):
+    """The end of the chain, not just the resolver.
+
+    FLOTTA-41's claim is that a number typed into the app changes what the
+    fleet does — so this asserts on `sleep_idle_boxes`, which is the thing that
+    spends and unspends money, rather than on the value coming back from a
+    resolver. Without the store layer the deployment variable would still be
+    deciding and this box would stay awake.
+    """
+    from flotta.provision import sleep_idle_boxes
+
+    monkeypatch.setenv("FLOTTA_IDLE_AFTER_S", "10000")
+    box = store.create_box("eng-idle")
+    store.update_box_status(box.id, "running", endpoint="fly://app/m1")
+    # A timeline, then backdated. Without any events at all `idle_boxes`
+    # deliberately leaves a box alone — no history is not evidence of idleness
+    # — so a box built with the bare store method is never a valid subject here.
+    store.add_event("box", box.id, "running", {"endpoint": "fly://app/m1"})
+    old_ts = (datetime.now(UTC) - timedelta(seconds=600)).isoformat()
+    store._conn.execute("UPDATE events SET ts = ?", (old_ts,))
+
+    assert sleep_idle_boxes(store, backend=FakeBackend()) == [], (
+        "quiet for 600s, and the environment says 10000 — still awake"
+    )
+
+    store.set_setting("FLOTTA_IDLE_AFTER_S", "300")
+    slept = sleep_idle_boxes(store, backend=FakeBackend())
+    assert [entry["box_id"] for entry in slept] == [box.id]
+
+
 # -- FLOTTA-21: a box gets its identity when it is created ------------------
 #
 # `just box-identity` was a second command, run from a shell, against a store a

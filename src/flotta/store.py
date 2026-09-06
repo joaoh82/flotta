@@ -190,6 +190,30 @@ CREATE TABLE IF NOT EXISTS box_repos (
     PRIMARY KEY (box_id, repo)
 );
 
+-- Fleet configuration a person set, as opposed to what the process was
+-- started with. Flotta is used through the desktop app, so the app has to be
+-- able to change how the fleet behaves — and an environment variable on
+-- somebody else's Railway service is not reachable from a window on a laptop.
+--
+-- A new TABLE, for the same load-bearing reason as `box_repos` above: it
+-- appears on an existing fleet by itself, where a new column would not.
+--
+-- Keyed by the environment variable name it overrides, which looks odd and is
+-- deliberate. It makes "a stored value wins over the environment" one
+-- mechanical rule in one place (`settings.layered`) rather than a precedence
+-- chain reimplemented per setting — and every consumer already reads
+-- `env.get(NAME)`, so they inherit it without changing. What a person sees in
+-- the app is a label from the catalogue, never this key.
+--
+-- **Only keys in that catalogue may be written.** Without an allowlist this
+-- table would be a way to shadow *any* environment variable the control plane
+-- reads, `FLOTTA_SIGNING_KEY` included, through an authenticated HTTP call.
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
@@ -628,6 +652,42 @@ class FleetStore:
             (box_id, normalised, _utcnow()),
         )
         return normalised
+
+    # -- fleet settings ----------------------------------------------------
+
+    def all_settings(self) -> dict[str, str]:
+        """Every stored override, as `{key: value}`.
+
+        Read whole rather than per key: there are a handful of them, they are
+        read together on every create and every sweep, and a query per setting
+        would turn one round trip into six.
+        """
+        rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Store an override. Idempotent.
+
+        Validation of *which* keys are allowed lives in `flotta.settings`, not
+        here: the store's job is to hold what it is given, and the catalogue is
+        a fleet concern that a second caller (the API) has to enforce anyway.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)"
+            if not self.is_postgres
+            else "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+            "updated_at = EXCLUDED.updated_at",
+            (key, value, _utcnow()),
+        )
+
+    def clear_setting(self, key: str) -> bool:
+        """Forget an override, so the environment decides again. Returns whether
+        there was one — the difference between "reset to the default" and "there
+        was nothing to reset"."""
+        had = key in self.all_settings()
+        self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        return had
 
     def revoke_repo(self, box_id: str, repo: str) -> bool:
         """Withdraw a grant. Returns whether there was one."""
