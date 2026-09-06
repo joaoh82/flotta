@@ -165,6 +165,9 @@ check-app:
     cd app
     [ -d node_modules ] || npm ci
     npx tsc --noEmit
+    # The typechecker is not the test suite. Four of the five findings in
+    # FLOTTA-29's review were in `.tsx` and every one of them typechecked.
+    npm test
     cd src-tauri
     cargo fmt --check
     # -D warnings: the Rust half holds the keychain and every outbound

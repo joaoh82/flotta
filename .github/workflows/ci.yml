@@ -91,7 +91,7 @@ jobs:
       - run: npx eslint .
 
   app:
-    name: app (tsc + clippy)
+    name: app (tsc + vitest + clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -127,6 +127,9 @@ jobs:
         working-directory: app
 
       - run: npx tsc --noEmit
+        working-directory: app
+
+      - run: npm test
         working-directory: app
 
       - run: cargo fmt --check
