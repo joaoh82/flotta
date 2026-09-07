@@ -367,6 +367,23 @@ fn classify(status: u16, path: &str, body: &str) -> Option<FleetError> {
             format!("the control plane refused this token ({status})")
         })));
     }
+    // **The app and the control plane version independently**, and this is the
+    // first place that shows. The app is installed on a laptop; the control
+    // plane is deployed somewhere else and updated on its own schedule, so a
+    // window running ahead of its fleet is normal rather than exceptional.
+    //
+    // A bare "answered 404: Not Found" is true and useless — it reads as the
+    // app being broken. Named per path rather than globally, because
+    // `/api/boxes/{id}` answering 404 means something entirely different and
+    // correct: there is no such agent.
+    if status == 404 && path == "/api/settings" {
+        return Some(FleetError::Unexpected(
+            "this control plane is older than the app and has no fleet settings yet. \
+             Deploy the current version of the control plane, or keep setting these \
+             where it runs."
+                .into(),
+        ));
+    }
     if !(200..300).contains(&status) {
         return Some(FleetError::Unexpected(format!(
             "{path} answered {status}: {}",
@@ -719,6 +736,33 @@ mod tests {
             .payload
             .as_ref()
             .is_some_and(|p| p.get("reason").is_some())));
+    }
+
+    #[test]
+    fn an_old_control_plane_says_so_rather_than_reading_as_a_broken_app() {
+        // The app ships separately from the control plane, so a window running
+        // ahead of its fleet is normal. "answered 404: Not Found" is true and
+        // tells nobody what to do about it.
+        match classify(404, "/api/settings", "") {
+            Some(FleetError::Unexpected(detail)) => {
+                assert!(detail.contains("older than the app"), "{detail}");
+                assert!(
+                    !detail.contains("404"),
+                    "the status code is not the useful part"
+                );
+            }
+            other => panic!("expected a named failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_404_about_an_agent_still_means_there_is_no_such_agent() {
+        // The message above is per path on purpose: `/api/boxes/{id}` answering
+        // 404 is correct and means something else entirely.
+        match classify(404, "/api/boxes/b-nope", r#"{"detail":"no box 'b-nope'"}"#) {
+            Some(FleetError::Unexpected(detail)) => assert!(detail.contains("no box"), "{detail}"),
+            other => panic!("expected the control plane's own words, got {other:?}"),
+        }
     }
 
     #[test]
