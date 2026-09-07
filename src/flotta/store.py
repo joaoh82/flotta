@@ -681,6 +681,33 @@ class FleetStore:
             (key, value, _utcnow()),
         )
 
+    def set_settings(self, values: dict[str, str]) -> None:
+        """Apply several overrides at once, all or nothing.
+
+        An empty value clears that override rather than storing a blank, which
+        is what an emptied field in the app means.
+
+        One transaction because the API validates the whole request and refuses
+        it whole: writing key by key on autocommit would let a database failure
+        halfway through apply a prefix of the change, leaving the fleet
+        configured with part of what was asked for and the form showing the
+        rest.
+
+        Guarded, even though this is not a read-check-write against a cap.
+        `test_every_read_check_write_is_guarded` reads this file and insists
+        every transaction names a table, and that rule is worth keeping
+        absolute: it exists because three transactions once lost their guard
+        during the Postgres migration and all 453 tests still passed. Carving
+        out an exception is how that scanner stops being able to see anything.
+        The lock costs nothing here — settings are written by a person, rarely.
+        """
+        with self._conn.transaction(guard="settings"):
+            for key, value in values.items():
+                if value:
+                    self.set_setting(key, value)
+                else:
+                    self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
     def clear_setting(self, key: str) -> bool:
         """Forget an override, so the environment decides again. Returns whether
         there was one — the difference between "reset to the default" and "there

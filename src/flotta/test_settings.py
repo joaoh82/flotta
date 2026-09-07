@@ -57,15 +57,29 @@ def test_a_row_for_a_credential_would_still_not_shadow_the_environment(store, ke
 
 
 def test_every_catalogued_setting_is_configuration_not_a_credential():
-    """A guard against the catalogue growing something it should not. If a
-    secret is ever added here, `layered` starts shadowing it and the settings
-    API starts accepting it — in one edit, with nothing else to notice."""
+    """If a secret were added to the catalogue, `layered` would start shadowing
+    it and the API would start accepting it — one edit, nothing else to
+    notice."""
     suspicious = ("KEY", "TOKEN", "PASSWORD", "SECRET", "CREDENTIAL")
     for setting in SETTINGS:
         name = setting.key.upper()
         assert not any(word in name for word in suspicious), (
             f"{setting.key} looks like a credential; settings are configuration only"
         )
+
+
+@pytest.mark.parametrize("key", SECRETS)
+def test_the_catalogue_refuses_a_credential_at_construction(key):
+    """The same rule as a runtime failure, not only an assertion.
+
+    A test can be skipped, and this one guards a security boundary: raising in
+    `__post_init__` means a module that catalogued a secret would not import at
+    all, so the mistake cannot reach a running control plane.
+    """
+    from flotta.settings import Setting
+
+    with pytest.raises(ValueError, match="credential"):
+        Setting(key=key, label="x", help="x", kind="text", default="")
 
 
 # -- precedence -------------------------------------------------------------
@@ -113,16 +127,16 @@ def test_a_key_nobody_catalogued_passes_straight_through(store):
 
 
 def test_describe_says_where_each_value_came_from(store):
-    """"Why is my fleet not using the number I set" is otherwise unanswerable
+    """ "Why is my fleet not using the number I set" is otherwise unanswerable
     from outside, and the answer is usually a deployment variable still in
     play."""
     store.set_setting("FLOTTA_IDLE_AFTER_S", "300")
-    by_key = {row["key"]: row for row in describe(store, {"FLOTTA_MAX_CONCURRENT": "4"})}
+    by_key = {row["key"]: row for row in describe(store, {"FLOTTA_COST_PER_SECOND": "0.001"})}
 
     assert by_key["FLOTTA_IDLE_AFTER_S"]["value"] == "300"
     assert by_key["FLOTTA_IDLE_AFTER_S"]["source"] == "store"
-    assert by_key["FLOTTA_MAX_CONCURRENT"]["value"] == "4"
-    assert by_key["FLOTTA_MAX_CONCURRENT"]["source"] == "env"
+    assert by_key["FLOTTA_COST_PER_SECOND"]["value"] == "0.001"
+    assert by_key["FLOTTA_COST_PER_SECOND"]["source"] == "env"
     assert by_key["FLOTTA_RECONCILE_INTERVAL_S"]["source"] == "default"
 
 
@@ -145,9 +159,37 @@ def test_a_value_that_cannot_be_parsed_is_refused_before_it_is_stored():
     with pytest.raises(ValueError):
         validate("FLOTTA_IDLE_AFTER_S", "half an hour")
     with pytest.raises(ValueError):
-        validate("FLOTTA_MAX_CONCURRENT", "1.5")
-    with pytest.raises(ValueError):
         validate("FLOTTA_IDLE_AFTER_S", "-1")
+
+
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan", "Infinity", "NaN"])
+def test_a_number_that_is_not_a_real_number_is_refused(bad):
+    """`float("inf")` parses and is not `< 0`, so it would store.
+
+    As the sweep interval that is `await sleep(inf)` — the loop never ticks
+    again, and clearing the field afterwards cannot wake a sleep that never
+    ends. As a cost rate it fails `resolve_cost_rate`'s own finiteness check
+    and takes down a sweep. `nan` compares false against everything and
+    silently becomes whatever floor it meets.
+    """
+    with pytest.raises(ValueError, match="real number"):
+        validate("FLOTTA_IDLE_AFTER_S", bad)
+    with pytest.raises(ValueError, match="real number"):
+        validate("FLOTTA_COST_PER_SECOND", bad)
+
+
+def test_several_settings_are_applied_together(store):
+    """`set_settings` is one transaction, so a database failure partway cannot
+    leave the fleet configured with a prefix of what was asked for."""
+    store.set_settings({"FLOTTA_IDLE_AFTER_S": "300", "FLOTTA_RECONCILE_INTERVAL_S": "10"})
+    assert store.all_settings() == {
+        "FLOTTA_IDLE_AFTER_S": "300",
+        "FLOTTA_RECONCILE_INTERVAL_S": "10",
+    }
+
+    # An empty value in the same batch clears that one and leaves the other.
+    store.set_settings({"FLOTTA_IDLE_AFTER_S": "", "FLOTTA_RECONCILE_INTERVAL_S": "20"})
+    assert store.all_settings() == {"FLOTTA_RECONCILE_INTERVAL_S": "20"}
 
 
 def test_a_good_value_comes_back_clean():

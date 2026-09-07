@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -151,6 +152,17 @@ def _interval_from(store: Any, current: float) -> float:
         if not raw:
             return current
         value = float(raw)
+        # `inf` and `nan` parse and are not caught by the floor below: `inf`
+        # makes the next `await sleep(...)` never return — and clearing the
+        # field afterwards cannot wake a sleep that never ends, so the fleet
+        # would stop reconciling until somebody restarted the process — while
+        # `nan` compares false against everything and silently becomes 1.0.
+        #
+        # `validate` refuses to store either, so this is for a value that was
+        # already there: a guard that only lives at the write path cannot help
+        # a fleet that is already stuck.
+        if not math.isfinite(value):
+            return current
         return max(1.0, value)
     except Exception:  # noqa: BLE001 - see above
         return current

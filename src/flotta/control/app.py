@@ -394,11 +394,9 @@ def create_app(
 
         store = store_factory()
         try:
-            for key, value in cleaned.items():
-                if value:
-                    store.set_setting(key, value)
-                else:
-                    store.clear_setting(key)
+            # All or nothing, so "refused as a whole" covers a database failure
+            # and not only bad input.
+            store.set_settings(cleaned)
             return {"settings": describe(store)}
         finally:
             store.close()

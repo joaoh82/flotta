@@ -34,12 +34,16 @@ app rather than a web page.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 Kind = Literal["seconds", "int", "money", "text"]
+
+#: Names that must never appear in the catalogue. See `Setting.__post_init__`.
+_CREDENTIAL_WORDS = ("KEY", "TOKEN", "PASSWORD", "SECRET", "CREDENTIAL")
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,23 @@ class Setting:
     #: What happens with nothing stored and nothing in the environment. Rendered
     #: as the placeholder, so an empty field is never a mystery.
     default: str
+
+    def __post_init__(self) -> None:
+        """Refuse to catalogue anything that looks like a credential.
+
+        There is a test that asserts this too, and a test is the wrong place
+        for it on its own: `layered` shadows environment lookups and the API
+        writes whatever the catalogue admits, so one careless entry arms both
+        at once. Raising here means the module will not import — the failure
+        cannot be skipped, and it happens at the point of the mistake.
+        """
+        if any(word in self.key.upper() for word in _CREDENTIAL_WORDS):
+            raise ValueError(
+                f"{self.key!r} looks like a credential. Fleet settings are "
+                "configuration only: `layered` shadows the environment for "
+                "anything catalogued here, so admitting a secret would let it "
+                "be overridden over HTTP."
+            )
 
 
 #: Every setting the fleet exposes. Adding one here is what makes it settable —
@@ -84,17 +105,6 @@ SETTINGS: tuple[Setting, ...] = (
         default="60",
     ),
     Setting(
-        key="FLOTTA_MAX_CONCURRENT",
-        label="Live tasks at once",
-        help=(
-            "How much work may run across the whole fleet simultaneously. This "
-            "caps tasks, not agents — an agent costs a disk, a running task "
-            "costs CPU. 0 means unlimited."
-        ),
-        kind="int",
-        default="1",
-    ),
-    Setting(
         key="FLOTTA_COST_PER_SECOND",
         label="Cost per container-second",
         help=(
@@ -108,6 +118,14 @@ SETTINGS: tuple[Setting, ...] = (
     ),
 )
 
+# Deliberately **not** catalogued yet: `FLOTTA_MAX_CONCURRENT`.
+#
+# `resolve_max_concurrent` exists and is tested, but nothing in production
+# calls it — `store.create_task(max_live=...)` has no caller outside the
+# suite, because the thing that produces tasks arrives with the workspace tier
+# (M6). Exposing the field would persist a row nothing enforces and show a
+# number that decides nothing, which is the same class of lie FLOTTA-29 spent
+# a milestone removing. Add it here in the change that wires the gate.
 BY_KEY: dict[str, Setting] = {s.key: s for s in SETTINGS}
 
 
@@ -146,6 +164,14 @@ def validate(key: str, value: str) -> str:
             number = float(text)
         except ValueError as exc:
             raise ValueError(f"{setting.label} must be a number, got {text!r}") from exc
+        # `float("inf")` and `float("nan")` parse, and neither is `< 0`.
+        # Stored as the sweep interval, `inf` becomes `await sleep(inf)` and the
+        # reconcile loop never ticks again — and clearing the field afterwards
+        # cannot wake a sleep that never ends, so the fleet stops reconciling
+        # until someone restarts the process. `nan` compares false against
+        # everything and silently becomes the floor, i.e. a busy loop.
+        if not math.isfinite(number):
+            raise ValueError(f"{setting.label} must be a real number, got {text!r}")
         if number < 0:
             raise ValueError(f"{setting.label} cannot be negative, got {text!r}")
     elif setting.kind == "int":
