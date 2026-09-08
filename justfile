@@ -620,5 +620,5 @@ test-postgres:
     # The whole store suite runs too, not just the concurrency file: test_store
     # parameterises over both engines when this variable is set, which is where
     # "behaves identically" is actually proven.
-    FLOTTA_TEST_POSTGRES_URL="postgresql://postgres:flotta@127.0.0.1:$PORT/flotta" \
+    PYTEST_POSTGRES_URL="postgresql://postgres:flotta@127.0.0.1:$PORT/flotta" \
       uv run --extra postgres pytest src/flotta/test_store.py src/flotta/test_store_postgres.py -q

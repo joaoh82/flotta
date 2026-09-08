@@ -78,7 +78,7 @@ jobs:
       # variable per test does not take it away. `conftest.pytest_sessionstart`
       # refuses to run at all if this is missing while `$CI` is set, so this
       # line going away is a red check rather than a quiet return to skipping.
-      FLOTTA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      PYTEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
 
     steps:
       - uses: actions/checkout@v7

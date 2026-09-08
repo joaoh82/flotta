@@ -1,7 +1,7 @@
 """What the parameterised store suite cannot assert: two connections racing.
 
 `test_store.py` runs its whole ~90-test body against Postgres as well as
-SQLite when `$FLOTTA_TEST_POSTGRES_URL` is set — that is where "the store
+SQLite when `$PYTEST_POSTGRES_URL` is set — that is where "the store
 behaves identically on both engines" is actually proven, by holding the
 behaviour fixed and swapping what is underneath.
 
@@ -24,11 +24,11 @@ import uuid
 
 import pytest
 
-POSTGRES_URL = os.environ.get("FLOTTA_TEST_POSTGRES_URL", "").strip()
+POSTGRES_URL = os.environ.get("PYTEST_POSTGRES_URL", "").strip()
 
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL,
-    reason="set FLOTTA_TEST_POSTGRES_URL to run the concurrency checks",
+    reason="set PYTEST_POSTGRES_URL to run the concurrency checks",
 )
 
 
