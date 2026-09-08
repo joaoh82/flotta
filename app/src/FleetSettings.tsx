@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { sourceNote } from "./provenance";
 import { isFleetError, type FleetSetting } from "./types";
 
 /**
@@ -25,14 +26,6 @@ import { isFleetError, type FleetSetting } from "./types";
 function describe(err: unknown): string {
   if (isFleetError(err)) return err.detail;
   return typeof err === "string" ? err : JSON.stringify(err);
-}
-
-/** Where a value came from, said plainly enough to act on. */
-function sourceNote(setting: FleetSetting): string | null {
-  if (setting.source === "store") return null; // it is simply set; no note needed
-  if (setting.source === "env")
-    return "set where the control plane is deployed — saving here takes over";
-  return `default: ${setting.default || "unset"}`;
 }
 
 export function FleetSettings() {
@@ -107,7 +100,6 @@ export function FleetSettings() {
       </div>
 
       {settings.map((setting) => {
-        const note = sourceNote(setting);
         const current = edits[setting.key] ?? setting.value;
         return (
           <label key={setting.key} className="block">
@@ -122,7 +114,7 @@ export function FleetSettings() {
             />
             <span className="mt-1 block text-xs text-neutral-500">
               {setting.help}
-              {note && <span className="text-neutral-400"> · {note}</span>}
+              <span className="text-neutral-400"> · {sourceNote(setting)}</span>
             </span>
           </label>
         );
