@@ -435,16 +435,35 @@ async fn send(
 /// One request, and the box comes back with its identity already on it —
 /// FLOTTA-21 injects it at creation, which is why this is a button and not a
 /// button followed by a terminal.
-pub async fn create_box(settings: &Settings, name: &str) -> Result<BoxRow, FleetError> {
+pub async fn create_box(
+    settings: &Settings,
+    name: &str,
+    volume_gb: Option<u32>,
+    region: Option<String>,
+) -> Result<BoxRow, FleetError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(FleetError::Unexpected("an agent needs a name".into()));
     }
+
+    // Omitted, not nulled, when the agent takes the fleet default — which is
+    // the common case. A body carrying `"volume_gb": null` would work, but
+    // "this field is absent" and "this field is deliberately nothing" are
+    // worth keeping distinct on a wire somebody will read in a log one day.
+    let mut body = serde_json::Map::new();
+    body.insert("name".into(), serde_json::Value::from(name));
+    if let Some(gb) = volume_gb {
+        body.insert("volume_gb".into(), serde_json::Value::from(gb));
+    }
+    if let Some(region) = region.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        body.insert("region".into(), serde_json::Value::from(region));
+    }
+
     let body = send(
         settings,
         reqwest::Method::POST,
         "/api/boxes",
-        Some(serde_json::json!({"name": name})),
+        Some(serde_json::Value::Object(body)),
     )
     .await?;
 

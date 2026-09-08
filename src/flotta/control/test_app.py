@@ -1156,3 +1156,57 @@ def test_settings_need_write_to_change_and_read_to_see(secured):
         headers=_bearer("fleet:write"),
     )
     assert allowed.status_code == 200
+
+
+# -- FLOTTA-42: an agent that is not like the others ------------------------
+
+
+def test_create_carries_per_agent_resources_through(client, monkeypatch):
+    import flotta.provision as provision
+
+    seen = {}
+
+    def fake_create(name, *, store, **kwargs):
+        seen.update(kwargs)
+        box = store.create_box(name)
+        return {"box_id": box.id, "endpoint": "fly://app/m-new"}
+
+    monkeypatch.setattr(provision, "create_box", fake_create)
+
+    assert client.post(
+        "/api/boxes", json={"name": "eng-big", "volume_gb": 10, "region": "lhr"}
+    ).status_code == 201
+    assert seen["volume_gb"] == 10
+    assert seen["region"] == "lhr"
+
+
+def test_create_without_resources_lets_the_fleet_decide(client, monkeypatch):
+    """The common case stays a one-field request, and `None` means "fleet
+    default" all the way down rather than a number invented at the edge."""
+    import flotta.provision as provision
+
+    seen = {}
+
+    def fake_create(name, *, store, **kwargs):
+        seen.update(kwargs)
+        box = store.create_box(name)
+        return {"box_id": box.id, "endpoint": "fly://app/m-new"}
+
+    monkeypatch.setattr(provision, "create_box", fake_create)
+
+    assert client.post("/api/boxes", json={"name": "eng-plain"}).status_code == 201
+    assert seen["volume_gb"] is None
+    assert seen["region"] is None
+
+
+def test_a_nonsense_volume_is_422_before_anything_is_provisioned(client, monkeypatch):
+    import flotta.provision as provision
+
+    def never(*args, **kwargs):
+        raise AssertionError("nothing should be provisioned for an impossible size")
+
+    monkeypatch.setattr(provision, "create_box", never)
+
+    assert client.post("/api/boxes", json={"name": "a", "volume_gb": "big"}).status_code == 422
+    assert client.post("/api/boxes", json={"name": "a", "volume_gb": 0}).status_code == 422
+    assert client.post("/api/boxes", json={"name": "a", "volume_gb": -5}).status_code == 422

@@ -150,9 +150,16 @@ async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
     fleet::list_boxes(&read_settings(&app)).await
 }
 
+/// Create an agent. `volume_gb` and `region` are per-agent overrides; leaving
+/// them out means the fleet's own defaults decide, which is the usual case.
 #[tauri::command]
-async fn create_agent(app: tauri::AppHandle, name: String) -> Result<BoxRow, FleetError> {
-    fleet::create_box(&read_settings(&app), &name).await
+async fn create_agent(
+    app: tauri::AppHandle,
+    name: String,
+    volume_gb: Option<u32>,
+    region: Option<String>,
+) -> Result<BoxRow, FleetError> {
+    fleet::create_box(&read_settings(&app), &name, volume_gb, region).await
 }
 
 /// How the fleet behaves, as the control plane reports it.

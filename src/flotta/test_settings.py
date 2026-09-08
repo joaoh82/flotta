@@ -68,6 +68,13 @@ def test_every_catalogued_setting_actually_changes_something():
     assert {s.key for s in SETTINGS} == {
         "FLOTTA_IDLE_AFTER_S",
         "FLOTTA_RECONCILE_INTERVAL_S",
+        # Both read by `provision.resolve_box_resources` and carried to the
+        # machine in `BoxSpec`. The volume one was *not* wired when this test
+        # was written — `FlyConfig.volume_gb` was read by nothing but the
+        # `fly-whoami` banner — and FLOTTA-42 fixing that is what made it
+        # eligible, rather than the other way round.
+        "FLOTTA_FLY_VOLUME_GB",
+        "FLOTTA_FLY_REGION",
     }, (
         "a setting was added or removed — confirm the new one is read by "
         "something that runs, the way idle sleep and the sweep interval are"

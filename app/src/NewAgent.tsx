@@ -48,6 +48,12 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Hidden by default. Most agents want the fleet's defaults, and a create
+  // form asking three questions to answer one makes the common case worse to
+  // serve the rare one.
+  const [showOptions, setShowOptions] = useState(false);
+  const [volumeGb, setVolumeGb] = useState("");
+  const [region, setRegion] = useState("");
 
   const problem = nameProblem(name);
 
@@ -58,8 +64,18 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
     setBusy(true);
     setError(null);
     try {
-      const box = await invoke<BoxRow>("create_agent", { name: trimmed });
+      const parsed = Number.parseInt(volumeGb.trim(), 10);
+      const box = await invoke<BoxRow>("create_agent", {
+        name: trimmed,
+        // undefined, not null: absent means "the fleet decides", and that is
+        // the answer for almost every agent.
+        volumeGb: volumeGb.trim() === "" || Number.isNaN(parsed) ? undefined : parsed,
+        region: region.trim() === "" ? undefined : region.trim(),
+      });
       setName("");
+      setVolumeGb("");
+      setRegion("");
+      setShowOptions(false);
       onCreated(box);
     } catch (err) {
       setError(isFleetError(err) ? err.detail : String(err));
@@ -86,6 +102,44 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
           {busy ? "…" : "Create"}
         </button>
       </div>
+      <button
+        type="button"
+        onClick={() => setShowOptions((open) => !open)}
+        className="mt-2 text-[11px] text-neutral-500 underline hover:text-neutral-700"
+      >
+        {showOptions ? "Use the fleet's defaults" : "Give it a different size or region"}
+      </button>
+
+      {showOptions && (
+        <div className="mt-2 space-y-2">
+          <label className="block">
+            <span className="text-[11px] text-neutral-600">Disk (GB)</span>
+            <input
+              value={volumeGb}
+              onChange={(e) => setVolumeGb(e.target.value)}
+              placeholder="the fleet's default"
+              inputMode="numeric"
+              className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 text-xs focus:border-neutral-500 focus:outline-none"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] text-neutral-600">Region</span>
+            <input
+              value={region}
+              onChange={(e) => setRegion(e.target.value)}
+              placeholder="the fleet's default"
+              className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 text-xs focus:border-neutral-500 focus:outline-none"
+            />
+          </label>
+          {/* Said here because it is the one thing about this that cannot be
+              undone: a volume cannot be resized afterwards. */}
+          <p className="text-[11px] text-neutral-400">
+            Both are fixed once the agent exists — a volume cannot be resized
+            later.
+          </p>
+        </div>
+      )}
+
       {problem && (
         <p className="mt-2 text-[11px] text-amber-700">
           A name is an agent's address: {problem}

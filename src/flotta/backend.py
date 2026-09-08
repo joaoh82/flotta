@@ -95,7 +95,15 @@ class BoxSpec:
     #: `create` usable straight after a deploy.
     image: str | None = None
     region: str | None = None
-    volume_gb: int = 1
+    #: How much disk the agent's memory gets. **None means "ask the backend"**,
+    #: the same shape as `region` and `image` above — a spec that does not care
+    #: gets the fleet's configured size rather than a number invented here.
+    #:
+    #: It was `int = 1`, and that quietly made `$FLOTTA_FLY_VOLUME_GB` dead
+    #: config: `create_box` builds `BoxSpec(name=name)`, so every agent got 1 GB
+    #: while `just fly-whoami` printed whatever the variable said. Config that
+    #: reports itself as in effect and is not is worse than config nobody reads.
+    volume_gb: int | None = None
     #: Where the durable volume is mounted. `HERMES_HOME` lives inside it —
     #: that relocation is the whole of M2.
     mount_path: str = "/data"

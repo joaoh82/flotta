@@ -625,6 +625,53 @@ def reserve_box(name: str, *, store: FleetStore, backend: Backend) -> Box:
     return box
 
 
+def resolve_box_resources(
+    store: FleetStore,
+    *,
+    volume_gb: int | None = None,
+    region: str | None = None,
+) -> tuple[int | None, str | None]:
+    """What this agent gets: what was asked for, else the fleet's default.
+
+    Returns `(volume_gb, region)`, either of which may be None — meaning "the
+    backend decides", which for Fly is `FlyConfig`. Three levels, and the last
+    one is deliberately *not* resolved here: `FlyConfig` is the substrate's
+    config, and reaching into it from `provision` would put Fly in a module
+    that routes across substrates.
+
+    This is the whole per-agent seam, and it turned out not to need one.
+    `BoxSpec` already carries `region` and `volume_gb` as portable fields, and
+    `FlyBackend.create` already prefers them over its own config — so a value
+    reaches a machine by travelling in the spec, exactly as `image` and
+    `secrets` do. No registry change, no new protocol verb, and nothing
+    provider-specific in the shared shape.
+
+    What stays fleet-wide is what has no portable field: `vm_size` is a Fly
+    machine preset (`shared-cpu-1x`) and means nothing to a Firecracker pool.
+    Giving it one would mean designing portable cpu/memory first, which is a
+    real decision and not this one.
+    """
+    from flotta.settings import layered
+
+    env = layered(store)
+
+    if volume_gb is None:
+        raw = (env.get("FLOTTA_FLY_VOLUME_GB") or "").strip()
+        if raw:
+            try:
+                volume_gb = int(raw)
+            except ValueError:
+                # The fleet default being unreadable must not stop a create:
+                # the backend still has its own, and refusing here would strand
+                # someone with no agent over a typo in a settings field.
+                volume_gb = None
+
+    if region is None:
+        region = (env.get("FLOTTA_FLY_REGION") or "").strip() or None
+
+    return volume_gb, region
+
+
 def create_box(
     name: str,
     *,
@@ -632,6 +679,8 @@ def create_box(
     backend: Backend | None = None,
     spec: BoxSpec | None = None,
     box: Box | None = None,
+    volume_gb: int | None = None,
+    region: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
 
@@ -688,6 +737,13 @@ def create_box(
     base = spec or BoxSpec(name=name)
     identity_env, identity_secrets = build_identity(box.id, name)
 
+    # What this agent gets, as opposed to what every agent gets. Travels in the
+    # spec because that is what the portable fields are for — see
+    # `resolve_box_resources`.
+    resolved_volume, resolved_region = resolve_box_resources(
+        store, volume_gb=volume_gb, region=region
+    )
+
     # What every box needs, as opposed to what makes this one itself. Missing
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
@@ -698,9 +754,26 @@ def create_box(
     # first.
     spec = replace(
         base,
+        # A caller's own spec still wins, the same rule as `env` and `secrets`
+        # below: a test or a one-off create that named a size meant it.
+        volume_gb=base.volume_gb if base.volume_gb is not None else resolved_volume,
+        region=base.region or resolved_region,
         env={**identity_env, **base.env},
         secrets={**identity_secrets, **fleet, **base.secrets},
     )
+
+    if spec.volume_gb is not None or spec.region is not None:
+        # What makes this agent different from the fleet default, recorded
+        # before the machine exists so it survives a provision that fails.
+        # An event rather than a column: this is an immutable fact about one
+        # create, which is the case events are actually good at — and the store
+        # still has no way to add a column to an existing fleet.
+        store.add_event(
+            "box",
+            box.id,
+            "resources",
+            {"volume_gb": spec.volume_gb, "region": spec.region},
+        )
 
     try:
         handle = impl.create(spec)
