@@ -52,3 +52,34 @@ def _hermetic_environment(monkeypatch):
     """
     for name in [k for k in os.environ if k.startswith("FLOTTA_")]:
         monkeypatch.delenv(name, raising=False)
+
+
+def pytest_sessionstart(session):
+    """On CI, refuse to run at all without a Postgres to race against.
+
+    The whole point of `test_store_postgres.py` is that a dropped transaction
+    guard is invisible to every other test — three of them lost their guard
+    during the M4 migration and all 453 tests still passed. That file was then
+    skipped on every PR for want of one environment variable, and **a skip
+    reports as a pass**: the check said green while measuring nothing.
+
+    Skipping is right on a laptop, where not everyone has Docker. It is wrong
+    on the independent check, which exists precisely so a green tick means
+    something. So here the absence is an error rather than a skip — the failure
+    is loud, at the start, and says how to fix it.
+
+    Read from the real environment, before `_hermetic_environment` strips
+    anything: this runs at session start, and the stripping is per test. The
+    module-level `POSTGRES_URL` in the test file is captured at import for the
+    same reason, which is why that fixture survives the stripping too.
+    """
+    if not os.environ.get("CI"):
+        return
+    if os.environ.get("FLOTTA_TEST_POSTGRES_URL", "").strip():
+        return
+    raise pytest.UsageError(
+        "FLOTTA_TEST_POSTGRES_URL is unset on CI, so the Postgres transaction "
+        "guards would skip — and a skip reports as a pass. Point it at the "
+        "workflow's service container, or unset CI to run the hermetic suite "
+        "alone."
+    )

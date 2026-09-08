@@ -6,9 +6,12 @@
 # check on the commit is the difference.
 #
 # WHAT THIS DELIBERATELY DOES NOT RUN. The suite below is hermetic and $0 —
-# every Fly touchpoint is injected, nothing reaches the network. The
-# recipes that DO reach real infrastructure must never run here: they cost
-# money and need credentials that do not belong in CI.
+# every Fly touchpoint is injected, and nothing reaches a network anyone bills
+# for. The one server it does talk to is a Postgres **service container**: free
+# on a runner, thrown away with the job, holding nothing. That distinction is
+# the line, not "no sockets" — the recipes that reach real infrastructure must
+# never run here, because they cost money and need credentials that do not
+# belong in CI.
 #
 #   just fly-up / fly-cycle / fly-proof / fly-doctor / fly-auth / fly-secrets
 #   just e2e-live                        the above, plus real model tokens
@@ -35,13 +38,48 @@ permissions:
 
 jobs:
   python:
-    name: python (ruff + pytest)
+    name: python (ruff + pytest + postgres)
     runs-on: ubuntu-latest
+
+    # The store runs on SQLite or Postgres, and one claim about it cannot be
+    # checked on SQLite: that the Postgres dialect's
+    # `LOCK TABLE … IN SHARE ROW EXCLUSIVE MODE` makes the concurrency cap's
+    # count-then-insert atomic. SQLite gets that from `BEGIN IMMEDIATE`;
+    # Postgres's `BEGIN` is optimistic, so two sessions can both read a count of
+    # zero and both insert.
+    #
+    # Only a race can tell whether the lock is doing its job, and until now the
+    # race only ran when somebody remembered `just test-postgres` on a laptop.
+    # Three of those tests skipped on every PR — and a skip reports as a pass,
+    # which is the same failure #36 found in `test_app.py`.
+    #
+    # `postgres:16-alpine` matches what `just test-postgres` starts locally, so
+    # the two places these run cannot disagree about the server.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     env:
       # Every `uv run` inside the justfile resolves against the committed
       # lockfile and refuses to silently update it, so a pyproject.toml change
       # without a matching `uv lock` fails here instead of drifting.
       UV_FROZEN: "1"
+      # Read at *import* by `test_store_postgres.py` and by `test_store.py`'s
+      # engine list, which is why the autouse fixture stripping every `FLOTTA_*`
+      # variable per test does not take it away. `conftest.pytest_sessionstart`
+      # refuses to run at all if this is missing while `$CI` is set, so this
+      # line going away is a red check rather than a quiet return to skipping.
+      FLOTTA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+
     steps:
       - uses: actions/checkout@v7
 
