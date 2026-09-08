@@ -41,7 +41,6 @@ import os
 
 import pytest
 
-
 #: The one `FLOTTA_*` variable that survives, because it configures the
 #: **harness** rather than the code under test.
 #:

@@ -1173,9 +1173,12 @@ def test_create_carries_per_agent_resources_through(client, monkeypatch):
 
     monkeypatch.setattr(provision, "create_box", fake_create)
 
-    assert client.post(
-        "/api/boxes", json={"name": "eng-big", "volume_gb": 10, "region": "lhr"}
-    ).status_code == 201
+    assert (
+        client.post(
+            "/api/boxes", json={"name": "eng-big", "volume_gb": 10, "region": "lhr"}
+        ).status_code
+        == 201
+    )
     assert seen["volume_gb"] == 10
     assert seen["region"] == "lhr"
 
