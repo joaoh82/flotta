@@ -56,6 +56,24 @@ def test_a_row_for_a_credential_would_still_not_shadow_the_environment(store, ke
     assert env.get(key) == "the real one"
 
 
+def test_every_catalogued_setting_actually_changes_something():
+    """A field that decides nothing is a window telling a lie.
+
+    Both settings pulled from this catalogue were pulled for that reason —
+    `FLOTTA_MAX_CONCURRENT` gates nothing and `FLOTTA_COST_PER_SECOND` prices
+    nothing, because no code path creates a task. This is the reminder to check
+    before adding the next one; it cannot be automated, because "is this wired"
+    is not a property of the catalogue.
+    """
+    assert {s.key for s in SETTINGS} == {
+        "FLOTTA_IDLE_AFTER_S",
+        "FLOTTA_RECONCILE_INTERVAL_S",
+    }, (
+        "a setting was added or removed — confirm the new one is read by "
+        "something that runs, the way idle sleep and the sweep interval are"
+    )
+
+
 def test_every_catalogued_setting_is_configuration_not_a_credential():
     """If a secret were added to the catalogue, `layered` would start shadowing
     it and the API would start accepting it — one edit, nothing else to
@@ -131,13 +149,15 @@ def test_describe_says_where_each_value_came_from(store):
     from outside, and the answer is usually a deployment variable still in
     play."""
     store.set_setting("FLOTTA_IDLE_AFTER_S", "300")
-    by_key = {row["key"]: row for row in describe(store, {"FLOTTA_COST_PER_SECOND": "0.001"})}
+    by_key = {
+        row["key"]: row
+        for row in describe(store, {"FLOTTA_RECONCILE_INTERVAL_S": "10"})
+    }
 
     assert by_key["FLOTTA_IDLE_AFTER_S"]["value"] == "300"
     assert by_key["FLOTTA_IDLE_AFTER_S"]["source"] == "store"
-    assert by_key["FLOTTA_COST_PER_SECOND"]["value"] == "0.001"
-    assert by_key["FLOTTA_COST_PER_SECOND"]["source"] == "env"
-    assert by_key["FLOTTA_RECONCILE_INTERVAL_S"]["source"] == "default"
+    assert by_key["FLOTTA_RECONCILE_INTERVAL_S"]["value"] == "10"
+    assert by_key["FLOTTA_RECONCILE_INTERVAL_S"]["source"] == "env"
 
 
 def test_describe_carries_the_catalogue_so_the_app_hardcodes_nothing(store):
@@ -175,7 +195,7 @@ def test_a_number_that_is_not_a_real_number_is_refused(bad):
     with pytest.raises(ValueError, match="real number"):
         validate("FLOTTA_IDLE_AFTER_S", bad)
     with pytest.raises(ValueError, match="real number"):
-        validate("FLOTTA_COST_PER_SECOND", bad)
+        validate("FLOTTA_RECONCILE_INTERVAL_S", bad)
 
 
 def test_several_settings_are_applied_together(store):
@@ -194,7 +214,7 @@ def test_several_settings_are_applied_together(store):
 
 def test_a_good_value_comes_back_clean():
     assert validate("FLOTTA_IDLE_AFTER_S", "  300 ") == "300"
-    assert validate("FLOTTA_COST_PER_SECOND", "0.0000131") == "0.0000131"
+    assert validate("FLOTTA_RECONCILE_INTERVAL_S", "0.5") == "0.5"
     assert validate("FLOTTA_IDLE_AFTER_S", "0") == "0"  # disabling is legal
 
 
