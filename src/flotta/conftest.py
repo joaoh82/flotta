@@ -42,15 +42,34 @@ import os
 import pytest
 
 
+#: The one `FLOTTA_*` variable that survives, because it configures the
+#: **harness** rather than the code under test.
+#:
+#: Nothing in `src/flotta` reads it — it selects which engine the store suite
+#: runs against. Stripping it therefore buys no hermeticity and costs the whole
+#: parameterisation: `test_store.py`'s `_ENGINES` is computed at *import* and so
+#: still says `postgres`, while its fixture reads `os.environ` at *fixture*
+#: time and finds nothing. That is 94 errors reading `KeyError:
+#: 'FLOTTA_TEST_POSTGRES_URL'`, and it is what the first CI run with a service
+#: container actually produced.
+#:
+#: `test_store_postgres.py` escaped it by accident: its `POSTGRES_URL` is a
+#: module-level constant captured at import. Relying on that distinction file
+#: by file is how this comes back, so the exemption lives here instead.
+HARNESS_ENV = frozenset({"FLOTTA_TEST_POSTGRES_URL"})
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_environment(monkeypatch):
     """Remove every `FLOTTA_*` variable for the duration of a test.
 
-    Autouse and unconditional. An opt-in version would be applied to the tests
-    someone remembered, and the failure mode here is silence — a test that
-    passes for a reason its author did not intend.
+    Autouse and unconditional, bar `HARNESS_ENV` above. An opt-in version would
+    be applied to the tests someone remembered, and the failure mode here is
+    silence — a test that passes for a reason its author did not intend.
     """
     for name in [k for k in os.environ if k.startswith("FLOTTA_")]:
+        if name in HARNESS_ENV:
+            continue
         monkeypatch.delenv(name, raising=False)
 
 
@@ -68,10 +87,10 @@ def pytest_sessionstart(session):
     something. So here the absence is an error rather than a skip — the failure
     is loud, at the start, and says how to fix it.
 
-    Read from the real environment, before `_hermetic_environment` strips
-    anything: this runs at session start, and the stripping is per test. The
-    module-level `POSTGRES_URL` in the test file is captured at import for the
-    same reason, which is why that fixture survives the stripping too.
+    Read from the real environment: this runs at session start, before any
+    per-test stripping. The variable is exempt from that stripping anyway — see
+    `HARNESS_ENV` — because it configures the harness rather than the code
+    under test.
     """
     if not os.environ.get("CI"):
         return
