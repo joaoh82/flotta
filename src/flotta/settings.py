@@ -104,28 +104,32 @@ SETTINGS: tuple[Setting, ...] = (
         kind="seconds",
         default="60",
     ),
-    Setting(
-        key="FLOTTA_COST_PER_SECOND",
-        label="Cost per container-second",
-        help=(
-            "Your rate, from your provider's pricing for the agent's CPU and "
-            "memory. Left blank the cost column stays blank, which is the "
-            "honest answer — a made-up figure that looks authoritative is worse "
-            "than none. Model tokens are never included."
-        ),
-        kind="money",
-        default="",
-    ),
 )
 
-# Deliberately **not** catalogued yet: `FLOTTA_MAX_CONCURRENT`.
+# Deliberately **not** catalogued yet, and both for the same reason:
+# `FLOTTA_MAX_CONCURRENT` and `FLOTTA_COST_PER_SECOND`.
 #
-# `resolve_max_concurrent` exists and is tested, but nothing in production
-# calls it — `store.create_task(max_live=...)` has no caller outside the
-# suite, because the thing that produces tasks arrives with the workspace tier
-# (M6). Exposing the field would persist a row nothing enforces and show a
-# number that decides nothing, which is the same class of lie FLOTTA-29 spent
-# a milestone removing. Add it here in the change that wires the gate.
+# **Nothing in production creates a task.** The only `create_task(` calls in
+# this package are `asyncio.create_task`; the producer arrives with the
+# workspace tier (M6). So the concurrency cap gates nothing and the cost rate
+# prices nothing — verified against the live fleet, which holds five agents and
+# zero tasks.
+#
+# A field that changes nothing is the same class of lie FLOTTA-29 spent a
+# milestone removing from this app, and it would be a strange one to reintroduce
+# in the change whose whole premise is that the window tells the truth.
+#
+# The two are not equally far away, which is worth knowing when they come back:
+# `resolve_cost_rate` is already called by `watch_task` and `reconcile`, so the
+# rate starts working the moment tasks exist. `resolve_max_concurrent` has no
+# caller at all and needs the gate built. Add each here in the change that gives
+# it something to do.
+#
+# One consequence: only `seconds` is catalogued today, so `validate`'s `int` and
+# `money` branches are unreachable until one of these returns. They are the
+# validation vocabulary rather than product surface, so they stay — an unused
+# enum member misleads nobody, which is exactly what separates it from a field
+# in a window.
 BY_KEY: dict[str, Setting] = {s.key: s for s in SETTINGS}
 
 
