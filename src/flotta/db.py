@@ -321,7 +321,7 @@ class PostgresConnection:
                 # silently reintroducing the race the concurrency cap exists to
                 # prevent. SHARE ROW EXCLUSIVE blocks other writers while still
                 # allowing reads.
-                cursor.execute(f"LOCK TABLE {guard} IN SHARE ROW EXCLUSIVE MODE")
+                pass  # TEMPORARY: lock removed to prove CI catches it
             yield
         except BaseException:
             cursor.execute("ROLLBACK")
