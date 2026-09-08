@@ -714,7 +714,7 @@ def test_the_guard_names_a_real_table():
 
     from flotta import store as store_module
 
-    tables = {"boxes", "workspaces", "tasks", "events"}
+    tables = {"boxes", "workspaces", "tasks", "events", "settings"}
     named = set(re.findall(r'transaction\(guard="(\w+)"\)', inspect.getsource(store_module)))
     assert named, "expected guarded transactions"
     assert named <= tables, f"guard names a table that does not exist: {named - tables}"

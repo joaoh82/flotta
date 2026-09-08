@@ -336,3 +336,75 @@ def test_a_failing_idle_sweep_does_not_stop_reconciling():
     assert reconciled, "a failing idle sweep skipped reconciliation"
     assert state.last_error is None, "an idle failure must not mark the loop unhealthy"
     assert state.slept == 0
+
+
+# -- the sweep cadence a person set -----------------------------------------
+#
+# `_interval_from` runs on every sweep and decides how long the loop waits.
+# Every failure path has to keep the fleet reconciling, because the alternative
+# is a control plane that stops sweeping because somebody typed into a form.
+
+
+class _Settings:
+    """A store that answers `all_settings`, and nothing else."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def all_settings(self):
+        return dict(self._values)
+
+
+def test_a_stored_cadence_is_used():
+    from flotta.control.loop import _interval_from
+
+    assert _interval_from(_Settings({"FLOTTA_RECONCILE_INTERVAL_S": "5"}), 60.0) == 5.0
+
+
+def test_nothing_stored_keeps_what_is_already_running():
+    from flotta.control.loop import _interval_from
+
+    assert _interval_from(_Settings({}), 60.0) == 60.0
+    assert _interval_from(_Settings({"FLOTTA_RECONCILE_INTERVAL_S": "  "}), 60.0) == 60.0
+
+
+def test_a_value_that_is_not_a_number_keeps_the_current_cadence():
+    """Fails open. A loop that stopped reconciling because of a typo would be
+    far worse than the setting being ignored."""
+    from flotta.control.loop import _interval_from
+
+    assert _interval_from(_Settings({"FLOTTA_RECONCILE_INTERVAL_S": "sixty"}), 60.0) == 60.0
+
+
+def test_zero_is_floored_rather_than_believed():
+    """A zero interval is a busy loop against a database and a substrate —
+    which is a bill, not an error message."""
+    from flotta.control.loop import _interval_from
+
+    assert _interval_from(_Settings({"FLOTTA_RECONCILE_INTERVAL_S": "0"}), 60.0) == 1.0
+
+
+def test_a_non_finite_cadence_cannot_stop_the_loop_forever():
+    """`inf` would make the next `await sleep(...)` never return, and clearing
+    the field afterwards cannot wake a sleep that never ends — the fleet would
+    stop reconciling until the process was restarted. `nan` compares false
+    against everything and would silently become the floor.
+
+    `validate` refuses to store either; this is the guard for a value that is
+    already there, because a check at the write path cannot help a fleet that
+    is already stuck.
+    """
+    from flotta.control.loop import _interval_from
+
+    for bad in ("inf", "-inf", "nan", "Infinity"):
+        assert _interval_from(_Settings({"FLOTTA_RECONCILE_INTERVAL_S": bad}), 60.0) == 60.0
+
+
+def test_an_unreadable_store_keeps_the_loop_sweeping():
+    from flotta.control.loop import _interval_from
+
+    class Broken:
+        def all_settings(self):
+            raise RuntimeError("database is down")
+
+    assert _interval_from(Broken(), 60.0) == 60.0

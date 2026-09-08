@@ -70,6 +70,27 @@ export type FleetError =
   /** Local, and nothing to do with the control plane. */
   | { kind: "keychain"; detail: string };
 
+/**
+ * One fleet setting, as `GET /api/settings` reports it. Mirrors `FleetSetting`
+ * in `src-tauri/src/fleet.rs`.
+ *
+ * The catalogue travels with the value — label, help, kind and default all come
+ * from the control plane — so the form is rendered rather than hardcoded, and a
+ * setting added server-side appears without the app being rebuilt.
+ *
+ * `source` says whether the value came from the store (somebody set it), the
+ * environment (a deployment variable is still deciding) or the default.
+ */
+export type FleetSetting = {
+  key: string;
+  label: string;
+  help: string;
+  kind: string;
+  default: string;
+  value: string;
+  source: string;
+};
+
 export type SettingsView = {
   control_url: string;
   domain: string;

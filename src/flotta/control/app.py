@@ -341,6 +341,66 @@ def create_app(
             status_code=200 if healthy else 503,
         )
 
+    @app.get("/api/settings")
+    def get_settings(_: Token | None = needs_read) -> Any:
+        """What the fleet is configured with, and where each value came from.
+
+        The catalogue travels with the values so the app renders a form without
+        hardcoding one: a setting added here appears in the window without the
+        app being rebuilt, which is the point of having a catalogue at all.
+
+        **No secret is reachable through this.** `flotta.settings.SETTINGS` is
+        an allowlist of configuration, and the signing key, the GitHub token and
+        the box password are not in it — by construction, not by filtering.
+        """
+        from flotta.settings import describe
+
+        store = store_factory()
+        try:
+            return {"settings": describe(store)}
+        finally:
+            store.close()
+
+    @app.put("/api/settings")
+    def put_settings(body: dict[str, Any], _: Token | None = needs_write) -> Any:
+        """Change fleet settings. `{"values": {"KEY": "value", ...}}`.
+
+        An empty string clears an override, which is what an emptied field in
+        the app means — the value falls back to the environment, or to the
+        default. That is the same verb as "reset this", so there is no separate
+        delete endpoint to get out of step with it.
+
+        Values are validated *before* anything is written, and the whole
+        request is refused if any of them is bad. A partial apply would leave
+        the fleet in a state nobody asked for and the form showing something
+        else.
+        """
+        from flotta.settings import UnknownSettingError, describe, validate
+
+        values = body.get("values")
+        if not isinstance(values, dict):
+            raise HTTPException(status_code=422, detail="expected {'values': {key: value}}")
+
+        cleaned: dict[str, str] = {}
+        for key, raw in values.items():
+            try:
+                cleaned[str(key)] = validate(str(key), "" if raw is None else str(raw))
+            except UnknownSettingError as exc:
+                # A key nobody may set. 422 rather than 403: the caller has the
+                # right scope, they named something that is not a setting.
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        store = store_factory()
+        try:
+            # All or nothing, so "refused as a whole" covers a database failure
+            # and not only bad input.
+            store.set_settings(cleaned)
+            return {"settings": describe(store)}
+        finally:
+            store.close()
+
     @app.get("/api/boxes")
     def list_boxes(all_: bool = False, _: Token | None = needs_read) -> Any:
         store = store_factory()

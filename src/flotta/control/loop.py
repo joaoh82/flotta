@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -133,6 +134,40 @@ class LoopState:
         }
 
 
+def _interval_from(store: Any, current: float) -> float:
+    """The sweep cadence a person set, or the one already in use.
+
+    Every failure path returns `current`: an unreadable store, a value that is
+    not a number, a nonsensical one. This runs on every sweep, and a loop that
+    stopped reconciling because somebody typed "sixty" into a settings field
+    would be a far worse bug than the setting being ignored.
+
+    Floored rather than trusted. A zero or negative interval is a busy loop
+    against a database and a substrate — which is a bill, not an error message.
+    """
+    try:
+        from flotta.settings import layered
+
+        raw = (layered(store).get("FLOTTA_RECONCILE_INTERVAL_S") or "").strip()
+        if not raw:
+            return current
+        value = float(raw)
+        # `inf` and `nan` parse and are not caught by the floor below: `inf`
+        # makes the next `await sleep(...)` never return — and clearing the
+        # field afterwards cannot wake a sleep that never ends, so the fleet
+        # would stop reconciling until somebody restarted the process — while
+        # `nan` compares false against everything and silently becomes 1.0.
+        #
+        # `validate` refuses to store either, so this is for a value that was
+        # already there: a guard that only lives at the write path cannot help
+        # a fleet that is already stuck.
+        if not math.isfinite(value):
+            return current
+        return max(1.0, value)
+    except Exception:  # noqa: BLE001 - see above
+        return current
+
+
 async def run_reconcile_loop(
     state: LoopState,
     *,
@@ -181,6 +216,12 @@ async def run_reconcile_loop(
             # test, because the tests inject a fake store.
             store = store_factory()
             try:
+                # Re-read the cadence each sweep, so changing it in the app
+                # takes effect on the next tick rather than at the next
+                # deploy. Read here because this is where a store is open —
+                # and a wrong or unreadable value must never end the loop, so
+                # it falls back to what we are already using.
+                state.interval_s = _interval_from(store, state.interval_s)
                 stranded = reconcile(store)
                 # Separate call, same sweep. Reconciling resolves rows that
                 # lie; sleeping spends money and can interrupt an agent
