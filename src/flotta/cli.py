@@ -859,6 +859,12 @@ def create(
     image: str | None = typer.Option(
         None, "--image", help="Boot from this image instead of the app's last release"
     ),
+    volume_gb: int | None = typer.Option(
+        None, "--volume-gb", help="Disk for this agent's memory. Default: the fleet's"
+    ),
+    region: str | None = typer.Option(
+        None, "--region", help="Where to create it. Default: the fleet's"
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -906,6 +912,8 @@ def create(
                 name,
                 store=fleet,
                 spec=BoxSpec(name=name, image=image) if image else None,
+                volume_gb=volume_gb,
+                region=region,
             )
         except (InvalidBoxNameError, DuplicateBoxError) as exc:
             # Exit 2: the caller asked for something impossible, which is a

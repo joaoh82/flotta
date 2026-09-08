@@ -2334,3 +2334,74 @@ def test_a_third_teardown_changes_nothing(store):
     out = teardown_box(box.id, store=store, backend=FakeBackend())
     assert out["name_released"] is None
     assert store.get_box(box.id).name == f"eng-c@{box.id}"
+
+
+# -- FLOTTA-42: what one agent gets, as opposed to every agent ---------------
+
+
+def test_the_fleets_volume_size_reaches_a_machine(store):
+    """The regression. `BoxSpec.volume_gb` defaulted to `1`, `create_box` built
+    a bare spec, and `FlyBackend.create` used `spec.volume_gb` — so
+    `$FLOTTA_FLY_VOLUME_GB` was read by nothing except the `fly-whoami` banner,
+    which printed it as though it were in effect. Every agent got 1 GB.
+    """
+    from flotta.provision import create_box
+
+    store.set_setting("FLOTTA_FLY_VOLUME_GB", "10")
+    backend = Recording()
+    create_box("eng-big", store=store, backend=backend)
+    assert backend.spec.volume_gb == 10
+
+
+def test_one_agent_can_be_bigger_than_the_fleet_default(store):
+    from flotta.provision import create_box
+
+    store.set_setting("FLOTTA_FLY_VOLUME_GB", "10")
+    backend = Recording()
+    create_box("eng-huge", store=store, backend=backend, volume_gb=50, region="lhr")
+    assert backend.spec.volume_gb == 50
+    assert backend.spec.region == "lhr"
+
+
+def test_no_override_and_no_setting_leaves_it_to_the_backend(store):
+    """None rather than a number invented in `provision`: the substrate's own
+    default is the last word, and hard-coding one here would put Fly's
+    configuration in a module that routes across substrates."""
+    from flotta.provision import create_box
+
+    backend = Recording()
+    create_box("eng-plain", store=store, backend=backend)
+    assert backend.spec.volume_gb is None
+    assert backend.spec.region is None
+
+
+def test_an_unreadable_fleet_default_does_not_stop_a_create(store):
+    """Someone typed into a settings field. That must cost them the override,
+    not the agent."""
+    from flotta.provision import create_box
+
+    store.set_setting("FLOTTA_FLY_VOLUME_GB", "ten")
+    backend = Recording()
+    create_box("eng-typo", store=store, backend=backend)
+    assert backend.spec.volume_gb is None
+
+
+def test_what_an_agent_was_asked_for_is_recorded(store):
+    """Written before the machine exists, so it survives a provision that
+    fails — and as an event, because it is an immutable fact about one create
+    and the store still cannot add a column to an existing fleet."""
+    from flotta.provision import create_box
+
+    result = create_box("eng-noted", store=store, backend=Recording(), volume_gb=25)
+    events = [e for e in store.get_box_timeline(result["box_id"]) if e.type == "resources"]
+    assert len(events) == 1
+    assert events[0].payload["volume_gb"] == 25
+
+
+def test_an_agent_with_nothing_special_records_nothing(store):
+    """No event for a box that took the fleet default — a timeline full of
+    "this agent is normal" is a timeline nobody reads."""
+    from flotta.provision import create_box
+
+    result = create_box("eng-default", store=store, backend=Recording())
+    assert not [e for e in store.get_box_timeline(result["box_id"]) if e.type == "resources"]

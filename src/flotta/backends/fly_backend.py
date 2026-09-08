@@ -161,7 +161,11 @@ class FlyBackend:
                 "create",
                 self.config.volume_name,
                 "--size",
-                str(spec.volume_gb),
+                # Spec first, then the fleet's configured size — the same
+                # precedence as `region` and `image` above. Before this the
+                # spec's default won unconditionally and the config was read by
+                # nothing but the `fly-whoami` banner.
+                str(spec.volume_gb or self.config.volume_gb),
                 "--region",
                 region,
                 "-y",

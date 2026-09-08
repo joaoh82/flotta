@@ -464,13 +464,31 @@ def create_app(
         except InvalidBoxNameError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # What makes this agent different from the fleet default. Absent means
+        # "the fleet decides", which is the common case and stays a one-field
+        # request.
+        raw_volume = body.get("volume_gb")
+        volume_gb: int | None = None
+        if raw_volume not in (None, ""):
+            try:
+                volume_gb = int(raw_volume)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"volume_gb must be a whole number, got {raw_volume!r}"
+                ) from exc
+            if volume_gb <= 0:
+                raise HTTPException(
+                    status_code=422, detail=f"volume_gb must be at least 1, got {volume_gb}"
+                )
+        region = (str(body.get("region") or "")).strip() or None
+
         if background:
-            return _create_in_background(name)
+            return _create_in_background(name, volume_gb=volume_gb, region=region)
 
         store = store_factory()
         try:
             try:
-                result = create_box(name, store=store)
+                result = create_box(name, store=store, volume_gb=volume_gb, region=region)
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
                 # a destroyed agent's name, this now means a *live* one — which
@@ -510,7 +528,9 @@ def create_app(
         finally:
             store.close()
 
-    def _create_in_background(name: str) -> Any:
+    def _create_in_background(
+        name: str, *, volume_gb: int | None = None, region: str | None = None
+    ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
         Provisioning is an app, a volume, a machine and a boot — minutes on a
@@ -563,7 +583,7 @@ def create_app(
         def provision() -> None:
             inner = store_factory()
             try:
-                create_box(name, store=inner, box=box)
+                create_box(name, store=inner, box=box, volume_gb=volume_gb, region=region)
             except Exception as exc:  # noqa: BLE001
                 # `create_box` already records the failure against the row;
                 # this only stops a stray exception ending the thread in

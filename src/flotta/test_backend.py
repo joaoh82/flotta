@@ -423,3 +423,74 @@ def test_a_fleet_image_seeds_an_app_that_has_no_releases():
     assert handle.id == "m1"
     run = next(c for c in issued if "run" in c)
     assert "registry.fly.io/builder:deployment-01ABC" in run
+
+
+def _fly_fake():
+    """A flyctl that behaves like a fresh app being provisioned once.
+
+    Stateful in the one way that matters: `machines list` answers empty until a
+    `machine run` has happened, and a machine afterwards — otherwise `create`
+    refuses with "reported success but app has no machine", which is a guard
+    doing its job against an incoherent fake.
+    """
+    import json as _json
+    import subprocess
+
+    issued: list[list[str]] = []
+    ran = {"machine": False}
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        machine = {"id": "m-1", "state": "started", "name": "eng-a"}
+        if "run" in cmd:
+            ran["machine"] = True
+            return subprocess.CompletedProcess(cmd, 0, _json.dumps(machine), "")
+        if "list" in cmd:
+            payload = [machine] if ran["machine"] else []
+            return subprocess.CompletedProcess(cmd, 0, _json.dumps(payload), "")
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    return issued, runner
+
+
+def _volume_call(issued):
+    return next((c for c in issued if "volumes" in c and "create" in c), None)
+
+
+def test_the_configured_volume_size_reaches_flyctl_when_the_spec_is_silent():
+    """The dead-config regression (FLOTTA-42).
+
+    `BoxSpec.volume_gb` defaulted to `1` and `create` used it unconditionally,
+    so `$FLOTTA_FLY_VOLUME_GB` was read by nothing but `FlyConfig.describe()` —
+    the `just fly-whoami` banner, which printed it as though it were in effect
+    while every agent got 1 GB. Config that reports itself as working is worse
+    than config nobody reads.
+
+    Asserted on the argv handed to `flyctl`, because that is the only place the
+    number stops being a Python attribute and becomes a disk.
+    """
+    from flotta.fly import FlyConfig
+
+    issued, runner = _fly_fake()
+    config = FlyConfig.from_env({"FLOTTA_FLY_VOLUME_GB": "10"}, dotenv="/nonexistent/.env")
+    FlyBackend(config=config, runner=runner).create(
+        BoxSpec(name="eng-a", image="registry.fly.io/x:deployment-1")
+    )
+
+    volume = _volume_call(issued)
+    assert volume is not None, f"no volume was created: {issued}"
+    assert "10" in volume, f"the fleet's configured size never reached flyctl: {volume}"
+
+
+def test_a_spec_that_names_a_size_still_wins():
+    """Per-agent beats fleet-wide, the same precedence as `region` and `image`."""
+    from flotta.fly import FlyConfig
+
+    issued, runner = _fly_fake()
+    config = FlyConfig.from_env({"FLOTTA_FLY_VOLUME_GB": "10"}, dotenv="/nonexistent/.env")
+    FlyBackend(config=config, runner=runner).create(
+        BoxSpec(name="eng-a", image="registry.fly.io/x:deployment-1", volume_gb=50)
+    )
+
+    volume = _volume_call(issued)
+    assert volume is not None and "50" in volume, f"{volume}"

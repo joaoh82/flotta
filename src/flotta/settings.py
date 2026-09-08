@@ -104,6 +104,28 @@ SETTINGS: tuple[Setting, ...] = (
         kind="seconds",
         default="60",
     ),
+    Setting(
+        key="FLOTTA_FLY_VOLUME_GB",
+        label="Disk per agent",
+        help=(
+            "Gigabytes of durable disk a new agent gets for its memory. Applies "
+            "to agents created from now on — a volume cannot be resized after "
+            "the fact, so this never changes an agent that already exists."
+        ),
+        kind="int",
+        default="1",
+    ),
+    Setting(
+        key="FLOTTA_FLY_REGION",
+        label="Region for new agents",
+        help=(
+            "Where new agents are created, as a Fly region code — ams, iad, lhr. "
+            "Left blank one is detected at provision time. Existing agents stay "
+            "where they are."
+        ),
+        kind="text",
+        default="",
+    ),
 )
 
 # Deliberately **not** catalogued yet, and both for the same reason:
@@ -119,17 +141,19 @@ SETTINGS: tuple[Setting, ...] = (
 # milestone removing from this app, and it would be a strange one to reintroduce
 # in the change whose whole premise is that the window tells the truth.
 #
+# `FLOTTA_FLY_VOLUME_GB` was in the same category until FLOTTA-42, and is the
+# sharper version of the lesson: it was not merely unread,
+# it was *printed back* by `just fly-whoami` as though it were in effect, while
+# every agent got `BoxSpec`'s default of 1 GB. Config that reports itself as
+# working is worse than config nobody reads. It is catalogued now because the
+# fix made it real, not the other way round.
+#
 # The two are not equally far away, which is worth knowing when they come back:
 # `resolve_cost_rate` is already called by `watch_task` and `reconcile`, so the
 # rate starts working the moment tasks exist. `resolve_max_concurrent` has no
 # caller at all and needs the gate built. Add each here in the change that gives
 # it something to do.
 #
-# One consequence: only `seconds` is catalogued today, so `validate`'s `int` and
-# `money` branches are unreachable until one of these returns. They are the
-# validation vocabulary rather than product surface, so they stay — an unused
-# enum member misleads nobody, which is exactly what separates it from a field
-# in a window.
 BY_KEY: dict[str, Setting] = {s.key: s for s in SETTINGS}
 
 
