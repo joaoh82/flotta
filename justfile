@@ -133,10 +133,32 @@ token-mint SUBJECT SCOPE:
 # `tauri dev` runs the Vite server and the Rust shell together, so this is the
 # only command needed — running `npm run dev` alone gives a page in a browser,
 # which is precisely the thing this app is not.
-# M8 — the Flotta app: a window listing your agents (needs a control plane + token)
+# M8 — the Flotta app: a window listing your agents (needs a control plane)
 app:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The token, without the manual mint.
+    #
+    # A debug build reads $FLOTTA_TOKEN before the keychain (`token_from_env`
+    # in fleet.rs) because an unsigned binary's keychain ACL is tied to that
+    # exact binary — every `cargo` rebuild is denied the item its predecessor
+    # wrote. So running the app in development has always meant a token in the
+    # environment, and every smoke test in this repo opened with the same mint
+    # line pasted by hand.
+    #
+    # These are the four scopes the window actually uses: list agents and read
+    # their timelines (fleet:read), create one (fleet:write), destroy one
+    # (box:destroy), and talk to one through the door (box:chat).
+    #
+    # Nothing is minted when you already have a token, and nothing is required:
+    # with no signing key here the app falls through to the keychain, which is
+    # what a release build does in any case.
+    if [ -z "${FLOTTA_TOKEN:-}" ] && [ -n "${FLOTTA_SIGNING_KEY:-}" ]; then
+      export FLOTTA_TOKEN="$(uv run flotta token mint app \
+          --scope fleet:read --scope fleet:write \
+          --scope box:chat --scope box:destroy --days 1)"
+      echo "minted a 1-day app token: fleet:read fleet:write box:chat box:destroy"
+    fi
     cd app
     # `npm ci` like the dashboard recipes: install rewrites the lockfile for
     # the local platform, and a dev command should not be able to change what

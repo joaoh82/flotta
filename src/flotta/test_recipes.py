@@ -55,6 +55,36 @@ def test_every_recipe_import_resolves(module, name):
     )
 
 
+#: `--scope box:chat` anywhere in a recipe.
+_SCOPE = re.compile(r"--scope\s+([\w:]+)")
+
+
+def _scopes() -> list[str]:
+    if not _JUSTFILE.is_file():  # pragma: no cover - only if run outside the repo
+        pytest.skip(f"no justfile at {_JUSTFILE}")
+    return sorted(set(_SCOPE.findall(_JUSTFILE.read_text(encoding="utf-8"))))
+
+
+def test_the_justfile_mints_something():
+    """Guard the guard, as above."""
+    assert _scopes(), "no `--scope …` found — has the pattern rotted?"
+
+
+@pytest.mark.parametrize("scope", _scopes())
+def test_every_scope_a_recipe_mints_is_a_real_scope(scope):
+    """A typo mints a token that is refused at the first request.
+
+    `flotta token mint` does not validate what it is handed, so the failure
+    surfaces as a 403 from the control plane — which reads as "my token is
+    wrong" rather than "the recipe asked for a scope that does not exist".
+    `just app` mints four of the five, so this is now four chances to misspell
+    one in a file nothing else checks.
+    """
+    from flotta.auth import SCOPES
+
+    assert scope in SCOPES, f"a recipe mints `{scope}`, which is not a scope: {sorted(SCOPES)}"
+
+
 def test_the_suite_is_hermetic_against_a_developers_env():
     """`FLOTTA_*` must not reach a test from the ambient environment.
 
