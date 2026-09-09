@@ -123,9 +123,12 @@ class FakeBackend:
 
     scheme = "fake"
 
-    def __init__(self, *, can_suspend=True):
+    def __init__(self, *, can_suspend=True, can_reimage=True, reimage_fails=False, image=None):
         self.calls: list[str] = []
         self.can_suspend = can_suspend
+        self.can_reimage = can_reimage
+        self.reimage_fails = reimage_fails
+        self.image = image
         self.machine_state = "started"
 
     def suspend(self, box_id):
@@ -141,6 +144,17 @@ class FakeBackend:
     def start(self, box_id):
         self.calls.append("start")
         self.machine_state = "started"
+
+    def reimage(self, box_id, image):
+        self.calls.append("reimage")
+        if not self.can_reimage:
+            raise NotSupported("this fake cannot re-image")
+        if self.reimage_fails:
+            raise BackendError("the substrate refused")
+        self.image = image
+
+    def image_of(self, box_id):
+        return self.image
 
     def destroy(self, box_id):
         self.calls.append("destroy")
@@ -2405,3 +2419,173 @@ def test_an_agent_with_nothing_special_records_nothing(store):
 
     result = create_box("eng-default", store=store, backend=Recording())
     assert not [e for e in store.get_box_timeline(result["box_id"]) if e.type == "resources"]
+
+
+# -- FLOTTA-38: a live agent can be moved forward ---------------------------
+#
+# `HERMES_REF` pins what the box image is built from, and bumping it only ever
+# reached boxes created afterwards. Destroy-and-recreate is not the workaround:
+# `teardown_box` takes the volume, and the volume is the agent.
+
+
+def _running(store, name="eng-a", endpoint="fake://app/m1"):
+    box = store.create_box(name)
+    store.update_box_status(box.id, "running", endpoint=endpoint)
+    return box
+
+
+def test_upgrade_reaches_the_substrate_and_names_the_image(store):
+    from flotta.provision import upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:old")
+    result = upgrade_box(box.id, store=store, image="registry.fly.io/flotta:new", backend=backend)
+
+    assert "reimage" in backend.calls
+    assert backend.image == "registry.fly.io/flotta:new"
+    assert result["previous_image"] == "registry.fly.io/flotta:old"
+    assert result["image"] == "registry.fly.io/flotta:new"
+
+
+def test_the_upgrade_is_recorded_with_where_it_came_from(store):
+    """`from` and `to`, because "which of my agents are behind" is otherwise
+    unanswerable without asking the substrate about every one of them."""
+    from flotta.provision import upgrade_box
+
+    box = _running(store)
+    upgrade_box(
+        box.id,
+        store=store,
+        image="registry.fly.io/flotta:new",
+        backend=FakeBackend(image="registry.fly.io/flotta:old"),
+    )
+    events = [e for e in store.get_box_timeline(box.id) if e.type == "reimaged"]
+    assert len(events) == 1
+    assert events[0].payload["from"] == "registry.fly.io/flotta:old"
+    assert events[0].payload["to"] == "registry.fly.io/flotta:new"
+
+
+def test_an_image_must_be_named_rather_than_guessed(store, monkeypatch):
+    """With one app per agent, "the app's last release" is the image the box
+    already runs — inferring it would re-image a box to itself and report an
+    upgrade."""
+    from flotta.provision import ProvisionError, upgrade_box
+
+    monkeypatch.delenv("FLOTTA_FLY_IMAGE", raising=False)
+    box = _running(store)
+    with pytest.raises(ProvisionError, match="no image to upgrade to"):
+        upgrade_box(box.id, store=store, backend=FakeBackend())
+
+
+def test_the_fleet_image_is_the_default_target(store, monkeypatch):
+    from flotta.provision import upgrade_box
+
+    monkeypatch.setenv("FLOTTA_FLY_IMAGE", "registry.fly.io/flotta:fleet")
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:old")
+    upgrade_box(box.id, store=store, backend=backend)
+    assert backend.image == "registry.fly.io/flotta:fleet"
+
+
+def test_a_box_already_on_that_image_is_left_alone(store):
+    """Idempotent, and it must not reach the substrate: `machine update`
+    restarts the machine, so a no-op upgrade would still cost an agent its
+    uptime."""
+    from flotta.provision import upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:same")
+    result = upgrade_box(box.id, store=store, image="registry.fly.io/flotta:same", backend=backend)
+
+    assert result["already_current"] is True
+    assert "reimage" not in backend.calls
+    assert not [e for e in store.get_box_timeline(box.id) if e.type == "reimaged"]
+
+
+def test_a_failed_upgrade_leaves_the_agent_as_it_was(store):
+    """The acceptance criterion that matters. A half-migrated agent with months
+    of memory is worse than an old one."""
+    from flotta.provision import UpgradeFailed, upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:old", reimage_fails=True)
+    with pytest.raises(UpgradeFailed, match="could not upgrade"):
+        upgrade_box(box.id, store=store, image="registry.fly.io/flotta:new", backend=backend)
+
+    assert store.get_box(box.id).status == "running"
+    assert not [e for e in store.get_box_timeline(box.id) if e.type == "reimaged"]
+
+
+def test_a_failure_names_the_image_the_box_still_runs(store):
+    """The only way back. Without it, undoing an upgrade means asking the
+    substrate what the box used to run — which is what you cannot do while it
+    is broken."""
+    from flotta.provision import UpgradeFailed, upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:old", reimage_fails=True)
+    with pytest.raises(UpgradeFailed, match="registry.fly.io/flotta:old"):
+        upgrade_box(box.id, store=store, image="registry.fly.io/flotta:new", backend=backend)
+
+
+def test_a_substrate_failure_is_not_a_refusal(store):
+    """`UpgradeFailed` is a `ProvisionError`, so old handlers still catch it —
+    but the API answers it 502 and a refusal 409, and the CLI exits 1 rather
+    than 2. Conflating them tells the caller they asked for the wrong thing
+    when flyctl was simply having a bad minute."""
+    from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
+
+    assert issubclass(UpgradeFailed, ProvisionError)
+
+    box = _running(store)
+    with pytest.raises(ProvisionError) as refusal:
+        upgrade_box(box.id, store=store, image="", backend=FakeBackend())
+    assert not isinstance(refusal.value, UpgradeFailed), (
+        "a missing image is the caller's to fix, not the substrate's"
+    )
+
+
+def test_a_substrate_that_cannot_reimage_says_so(store):
+    from flotta.provision import ProvisionError, upgrade_box
+
+    box = _running(store)
+    with pytest.raises(ProvisionError, match="cannot re-image"):
+        upgrade_box(
+            box.id,
+            store=store,
+            image="registry.fly.io/flotta:new",
+            backend=FakeBackend(can_reimage=False),
+        )
+
+
+def test_a_torn_down_box_has_no_machine_to_reimage(store):
+    from flotta.provision import ProvisionError, upgrade_box
+
+    box = _running(store)
+    store.update_box_status(box.id, "torn_down")
+    with pytest.raises(ProvisionError, match="no machine left"):
+        upgrade_box(box.id, store=store, image="x", backend=FakeBackend())
+
+
+def test_upgrading_mid_provision_is_refused(store):
+    """It would race the thread building the box — the same reason the app
+    offers no Destroy while an agent is provisioning."""
+    from flotta.provision import ProvisionError, upgrade_box
+
+    box = store.create_box("eng-new")
+    with pytest.raises(ProvisionError, match="still provisioning"):
+        upgrade_box(box.id, store=store, image="x", backend=FakeBackend())
+
+
+def test_a_stopped_agent_can_be_upgraded(store):
+    """Most of the fleet is asleep most of the time, which is the cost argument
+    working. An upgrade path that only reached running agents would reach
+    almost none of them."""
+    from flotta.provision import upgrade_box
+
+    box = store.create_box("eng-asleep")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    store.update_box_status(box.id, "stopped")
+    backend = FakeBackend(image="old")
+    upgrade_box(box.id, store=store, image="new", backend=backend)
+    assert backend.image == "new"

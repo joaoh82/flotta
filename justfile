@@ -261,6 +261,14 @@ hermes-bump REF:
     echo "    just fly-up      # build and boot a box on the new ref"
     echo "    just fly-proof   # memory survives a stop/start"
     echo "    just fly-doctor  # it is actually serving"
+    echo
+    # The loop this recipe used to leave open. A machine runs the image it was
+    # created with, so bumping the pin reaches *new* agents only — every agent
+    # you already have stays where it is until it is moved, one at a time and
+    # on purpose (FLOTTA-38).
+    echo "  Existing agents are NOT affected. Each keeps the image it was"
+    echo "  created with until you move it:"
+    echo "    uv run flotta upgrade <name>   # keeps its disk, costs a restart"
     trap - ERR
 
 

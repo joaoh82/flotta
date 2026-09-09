@@ -199,6 +199,27 @@ class Backend(Protocol):
         """
         ...
 
+    def reimage(self, box_id: str, image: str) -> None:
+        """Replace the box's image, **keeping its disk**. `NotSupported` if it cannot.
+
+        The upgrade path, and the reason it has to be a verb rather than
+        destroy-and-recreate: `destroy` takes the volume, and on this fleet the
+        volume *is* the agent — `/data/hermes` holds its memories, its skills
+        and its conversation history. Recreating gives you a new agent wearing
+        the old one's name.
+
+        Portable despite sounding like a Fly detail: swapping a rootfs while
+        keeping the data volume is what a Firecracker pool does too, which is
+        the test for whether something belongs in this protocol. What is *not*
+        portable is how it happens, which is why the caller names an image and
+        nothing else.
+
+        Costs a restart, like `apply_secrets` and for the same reason: a box
+        reads its environment once, at boot. A failure must leave the box as it
+        was — a half-upgraded agent is worse than an old one.
+        """
+        ...
+
     def exec(self, box_id: str, command: str, *, timeout_s: int = 300) -> ExecResult:
         """Run a shell command on the box."""
         ...

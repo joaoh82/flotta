@@ -690,6 +690,53 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/boxes/{box_id}/upgrade")
+    def upgrade_box_endpoint(
+        box_id: str, body: dict[str, Any] | None = None, _: Token | None = needs_write
+    ) -> Any:
+        """Move an agent onto a new image, keeping its disk.
+
+        `fleet:write` rather than `box:destroy`: this is the *opposite* of
+        destroying — the volume is what it exists to preserve — and gating it
+        behind the destroy scope would mean handing out the ability to delete
+        an agent in order to update one.
+
+        **Synchronous, and that is a known limit rather than a decision.**
+        `flyctl machine update` waits up to 300s by default, and a proxy in
+        front of this cut `POST /api/boxes` at 60s once already — answering
+        `502 Application failed to respond` while the work carried on. The same
+        will happen here for an upgrade that pulls a large image, and the reply
+        will be wrong in the same way.
+
+        It is shipped anyway because nothing consumes it yet — there is no
+        Upgrade button — and `flotta upgrade` runs outside any proxy. Anything
+        that puts this behind a UI should background it first, the way
+        FLOTTA-27 did for create.
+        """
+        from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
+
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            image = str((body or {}).get("image") or "").strip() or None
+            try:
+                return upgrade_box(box.id, store=store, image=image)
+            except UpgradeFailed as exc:
+                # The substrate broke. 502, matching what `POST /api/boxes`
+                # answers for the same class of failure — and *not* 409, which
+                # would tell the caller they asked for the wrong thing when
+                # flyctl was simply having a bad minute.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except ProvisionError as exc:
+                # 409: the caller asked for something this box cannot do right
+                # now — terminal, mid-provision, or no image named. Every one of
+                # them is actionable, which is what separates it from the above.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/git-credential")
     def git_credential(box_id: str, body: dict[str, Any], token: Token | None = needs_git) -> Any:
         """Mint a git credential for a repository this box is granted.
