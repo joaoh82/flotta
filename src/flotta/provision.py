@@ -1121,10 +1121,22 @@ def upgrade_box(
         # back. Without it an operator who wants to undo this has to go and ask
         # the substrate what the box used to run, which is exactly what they
         # cannot do while it is broken.
-        raise UpgradeFailed(
+        failure = (
             f"could not upgrade box {box_id}: {exc}. It still runs "
             f"{before or '(unknown)'}; nothing was changed."
-        ) from exc
+        )
+        # Recorded, not only raised. A caller that is still holding the
+        # exception can read it; a caller that is not — the app, which asked
+        # for this in the background and went back to polling — has nowhere
+        # else to learn the upgrade failed, and an upgrade that silently does
+        # nothing is indistinguishable from one that has not finished.
+        store.add_event(
+            "box",
+            box_id,
+            "upgrade_failed",
+            {"reason": reason, "from": before, "to": target_image, "error": str(exc)},
+        )
+        raise UpgradeFailed(failure) from exc
 
     after = _peek_image(impl, target)
     store.add_event(

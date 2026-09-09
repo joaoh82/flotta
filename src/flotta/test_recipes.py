@@ -97,3 +97,38 @@ def test_the_suite_is_hermetic_against_a_developers_env():
 
     leaked = sorted(k for k in os.environ if k.startswith("FLOTTA_"))
     assert leaked == [], f"the autouse fixture in conftest.py did not strip: {leaked}"
+
+
+# -- the Dockerfile is code the suite could not see either -------------------
+
+_DOCKERFILE = _JUSTFILE.parent / "fly" / "Dockerfile"
+
+
+def test_the_image_records_which_hermes_it_carries():
+    """The label is the only place a running agent's Hermes version exists.
+
+    `HERMES_REF` is a build arg: it decides what gets cloned and then
+    evaporates. Before this label, nothing on a machine — and nothing anyone
+    could ask a machine — said which Hermes was inside it, and the app showed
+    the deployment tag in its place, which is a different fact entirely.
+
+    Hermetic, so it does not prove Docker's substitution works; it proves the
+    line has not been dropped, which is the failure that would be invisible
+    until somebody opened the panel and found a blank where a version was.
+    """
+    from flotta.backends.fly_backend import HERMES_REF_LABEL
+
+    if not _DOCKERFILE.is_file():  # pragma: no cover - only outside the repo
+        pytest.skip(f"no Dockerfile at {_DOCKERFILE}")
+    body = _DOCKERFILE.read_text(encoding="utf-8")
+
+    label = next(
+        (line for line in body.splitlines() if line.startswith(f"LABEL {HERMES_REF_LABEL}")),
+        None,
+    )
+    assert label, f"fly/Dockerfile no longer labels the image with {HERMES_REF_LABEL}"
+    assert "$HERMES_REF" in label, (
+        f"{HERMES_REF_LABEL} must carry the build arg, not a literal — "
+        f"a hardcoded version is worse than none: {label!r}"
+    )
+    assert "ARG HERMES_REF" in body, "the label would substitute to empty with no ARG in scope"

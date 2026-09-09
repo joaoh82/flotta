@@ -173,6 +173,10 @@ class MachineInfo:
     cpu_kind: str | None = None
     cpus: int | None = None
     memory_mb: int | None = None
+    #: Which Hermes this image carries, read from a label baked in at build
+    #: time. `None` for an image built before the label existed — which is not
+    #: the same as "no Hermes", and the app must not render it as one.
+    hermes_ref: str | None = None
     #: The disk, which on this fleet *is* the agent. Its id surviving an
     #: upgrade is the proof that the memory did.
     volume_id: str | None = None

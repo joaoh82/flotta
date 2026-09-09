@@ -72,6 +72,35 @@ what makes a status change show up without anyone pressing Refresh.
 Which Hermes version an image carries is still recorded nowhere — the image tag
 is the closest thing until FLOTTA-43.
 
+## Hermes versions, and upgrading from the window
+
+Three facts that are easy to collapse into one, kept apart in the Info panel
+because they have never been the same fact:
+
+- **This agent runs** — a label baked into the image it boots
+  (`dev.flotta.hermes-ref`, written by `fly/Dockerfile` from its `HERMES_REF`
+  build arg). Blank for an image built before that label existed, which is
+  every agent in the fleet until it is upgraded; the panel says so rather than
+  showing "unknown".
+- **Fleet builds** — the pin the *next* image would be built from. Says nothing
+  about any running agent.
+- **Newest release** — what upstream has. An unreachable GitHub reads as
+  unknown, never as up to date.
+
+Moving the pin is `just hermes-bump <tag>`, not a button: it rebuilds the image
+and re-runs the live checks, because the headless-boot recipe was validated
+against one version and a bump is not mechanical.
+
+What the window *can* do is move an agent onto the image the fleet already
+builds. `POST /api/boxes/{id}/upgrade` answers `202` and re-images on a thread
+— `flyctl machine update` waits up to 300s and a proxy in front of this cut
+`POST /api/boxes` at 60s once already — so the button reports "started" and the
+outcome lands in the agent's timeline as `reimaged` or `upgrade_failed`.
+
+It costs a restart, and the confirmation says so. It does **not** cost the
+disk: keeping `/data/hermes` is the entire point of an upgrade being a
+re-image rather than a rebuild.
+
 ## Development: the keychain and rebuilt binaries
 
 An unsigned binary's keychain ACL is tied to that exact binary. Every `cargo`

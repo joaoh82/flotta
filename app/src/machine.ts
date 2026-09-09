@@ -156,3 +156,103 @@ export function fieldsOf(machine: Machine): Field[] {
 function memory(mb: number): string {
   return mb >= 1024 && mb % 1024 === 0 ? `${mb / 1024} GB` : `${mb} MB`;
 }
+
+/** A verdict the panel can render, with the sentence that goes under it. */
+export type Standing = {
+  kind: "current" | "behind" | "unknown";
+  detail: string;
+};
+
+/**
+ * Is this agent on the image the fleet builds?
+ *
+ * The verdict comes from the control plane (`image_current`), which compares
+ * with `_same_image` — Fly reports a digest the configured image does not
+ * carry, and that comparison has been wrong three times here. This only turns
+ * it into words.
+ *
+ * `unknown` is a real answer and must stay one. Rendering it as `behind` would
+ * offer an Upgrade button on no evidence, and an upgrade restarts the agent.
+ */
+export function imageStanding(view: {
+  image_current?: boolean | null;
+  fleet_image?: string | null;
+  machine?: { image?: string | null } | null;
+}): Standing {
+  if (view.image_current === true) {
+    return { kind: "current", detail: "On the image this fleet builds." };
+  }
+  if (view.image_current === false) {
+    return {
+      kind: "behind",
+      detail: "This agent runs an older image than the one the fleet builds.",
+    };
+  }
+  if (!view.fleet_image) {
+    return {
+      kind: "unknown",
+      detail:
+        "The control plane has no fleet image configured, so there is nothing to compare " +
+        "against. Set FLOTTA_FLY_IMAGE where it runs.",
+    };
+  }
+  return {
+    kind: "unknown",
+    detail: "The substrate did not say which image this machine runs.",
+  };
+}
+
+/**
+ * Is the fleet's Hermes pin behind the newest release?
+ *
+ * Note what this is *not* about: any running agent. It compares what the next
+ * image would be built from against what upstream has. An agent can be on an
+ * older Hermes than the pin — that is `imageStanding`, and the two answer
+ * different questions on purpose.
+ */
+export function hermesStanding(versions: {
+  pinned: string;
+  latest?: string | null;
+  behind?: boolean;
+  unavailable?: string | null;
+}): Standing {
+  if (versions.unavailable || !versions.latest) {
+    return {
+      kind: "unknown",
+      detail:
+        versions.unavailable ??
+        "Could not check for a newer Hermes. This is not the same as being up to date.",
+    };
+  }
+  if (versions.behind) {
+    return {
+      kind: "behind",
+      detail:
+        `Hermes ${versions.latest} is out; this fleet builds ${versions.pinned}. ` +
+        `Moving the pin rebuilds the image — \`just hermes-bump ${versions.latest}\` — ` +
+        "and is not something the app does, because it re-runs the live checks.",
+    };
+  }
+  return { kind: "current", detail: `The newest Hermes is ${versions.latest}.` };
+}
+
+/**
+ * What to show for the Hermes an agent is running.
+ *
+ * The blank case is the interesting one and it is temporary: an image built
+ * before `fly/Dockerfile` grew its version label says nothing about what is
+ * inside it. Saying "unknown" invites "so is it broken?"; saying *why*, and
+ * that upgrading fixes it, is the true and useful sentence — upgrading swaps
+ * in a labelled image.
+ */
+export function hermesOf(machine: { hermes_ref?: string | null } | null): {
+  value: string | null;
+  note: string | null;
+} {
+  const ref = machine?.hermes_ref?.trim();
+  if (ref) return { value: ref, note: null };
+  return {
+    value: null,
+    note: "This image was built before Flotta recorded its Hermes version. Upgrading replaces it with one that does.",
+  };
+}

@@ -26,6 +26,13 @@ export type BoxRow = {
 export type Machine = {
   state: string;
   machine_id?: string | null;
+  /**
+   * Which Hermes this image carries, from a label baked in at build time.
+   *
+   * Absent for an image built before that label existed — which is not the
+   * same as "no Hermes", and every agent in the fleet is one until upgraded.
+   */
+  hermes_ref?: string | null;
   app?: string | null;
   image?: string | null;
   region?: string | null;
@@ -53,6 +60,34 @@ export type MachineView = {
   box: BoxRow;
   machine?: Machine | null;
   unavailable?: string | null;
+  /** What an upgrade with no argument would move this agent onto. */
+  fleet_image?: string | null;
+  /**
+   * Whether it is already on that image.
+   *
+   * **`null` is not `false`.** One side being unknown must not offer an
+   * upgrade. Decided on the control plane with `_same_image`, because Fly
+   * reports a digest the configured image does not carry, and comparing the
+   * two as strings has been wrong three times in this repo.
+   */
+  image_current?: boolean | null;
+};
+
+/**
+ * Which Hermes the fleet builds, and whether upstream has a newer one.
+ *
+ * Three facts, kept apart on purpose: `pinned` is what the *next* image would
+ * be built from, `latest` is what upstream has, and what an individual agent
+ * runs is neither — that is `Machine.hermes_ref`. They were one line of
+ * justfile output before, and they have never been the same fact.
+ */
+export type HermesVersions = {
+  pinned: string;
+  /** `null` when GitHub could not be reached: unknown, never "up to date". */
+  latest?: string | null;
+  behind?: boolean;
+  unavailable?: string | null;
+  fleet_image?: string | null;
 };
 
 /**

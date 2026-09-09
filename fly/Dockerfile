@@ -95,6 +95,24 @@ ENV HERMES_SRC=/opt/hermes
 RUN git clone --depth 1 --branch "$HERMES_REF" "$HERMES_REPO" "$HERMES_SRC" \
     && "$HERMES_VENV/bin/pip" install --no-cache-dir -e "$HERMES_SRC"
 
+# Which Hermes this image carries, recorded **in the image**.
+#
+# It was recorded nowhere before this line. `HERMES_REF` is a build arg: it
+# decides what gets cloned and then evaporates, so a running agent could not
+# say what it was running and neither could anything looking at it. The app
+# showed the deployment tag instead, which says which *build* this is and
+# nothing about which Hermes is inside it.
+#
+# A label rather than an `ENV` because a label cannot drift. `ENV` is machine
+# configuration — it is set when a machine is created, survives a
+# `machine update --image`, and would therefore keep asserting the old version
+# after precisely the operation that changed it. The label travels with the
+# image, so it is right by construction: change the image, change the answer.
+#
+# Fly reports image labels in `machines list --json` under `image_ref.labels`,
+# which is how `FlyBackend.inspect` reads it back without asking the box.
+LABEL dev.flotta.hermes-ref="$HERMES_REF"
+
 ENV HERMES_HOME=/data/hermes
 
 # ## Where work happens — and where it must not

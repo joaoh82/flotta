@@ -401,6 +401,41 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/hermes")
+    def hermes_versions(_: Token | None = needs_read) -> Any:
+        """Which Hermes the fleet would build next, and whether a newer exists.
+
+        Three different facts have been one sentence until now, and the app
+        needs them apart:
+
+        - **`pinned`** — what the *next* image would be built from. It is this
+          control plane's own `HERMES_REF`, so it says nothing about any
+          running agent.
+        - **`latest`** — the newest Hermes there is. `None` when GitHub could
+          not be reached, which must read as *unknown*: reporting "up to date"
+          on a failed check hides a real upgrade, and "behind" nags people into
+          rebuilding for nothing.
+        - **`fleet_image`** — the image an upgrade with no argument would move
+          an agent onto. Reported rather than assumed correct: it is a
+          deployment variable, and a stale one points at an app that may not
+          exist any more.
+
+        What an individual agent runs is none of these. That is the label on
+        the image it boots, and it comes back from
+        `GET /api/boxes/{id}/machine`.
+        """
+        from flotta.hermes import report
+        from flotta.provision import _fleet_image
+
+        found = report()
+        return {
+            "pinned": found.pinned,
+            "latest": found.latest,
+            "behind": found.behind,
+            "unavailable": found.unavailable,
+            "fleet_image": _fleet_image(),
+        }
+
     @app.get("/api/boxes")
     def list_boxes(all_: bool = False, _: Token | None = needs_read) -> Any:
         store = store_factory()
@@ -653,6 +688,7 @@ def create_app(
         current by every verb that touches a box.
         """
         from flotta.backend import BackendError, backend_for
+        from flotta.provision import _fleet_image, _same_image
 
         store = store_factory()
         try:
@@ -667,14 +703,42 @@ def create_app(
                     "box": row,
                     "machine": None,
                     "unavailable": "this agent has no machine yet",
+                    "fleet_image": _fleet_image(),
+                    "image_current": None,
                 }
             try:
                 info = backend_for(box.endpoint).inspect(box.endpoint)
             except (BackendError, OSError, NotImplementedError) as exc:
-                return {"box": row, "machine": None, "unavailable": str(exc)}
+                return {
+                    "box": row,
+                    "machine": None,
+                    "unavailable": str(exc),
+                    "fleet_image": _fleet_image(),
+                    "image_current": None,
+                }
             from dataclasses import asdict
 
-            return {"box": row, "machine": asdict(info), "unavailable": None}
+            # Whether this agent is on the image the fleet builds — computed
+            # **here**, with `_same_image`, rather than in the app.
+            #
+            # Fly reports `repo:tag@sha256:…` while `$FLOTTA_FLY_IMAGE` is
+            # written without the digest, so string equality never matches.
+            # That comparison has been wrong three times in this repo; a second
+            # implementation in TypeScript would be the fourth. `None` means
+            # one side is unknown, which is not the same as "behind" and must
+            # not put an Upgrade button in front of somebody.
+            fleet_image = _fleet_image()
+            current: bool | None = None
+            if fleet_image and info.image:
+                current = _same_image(info.image, fleet_image)
+
+            return {
+                "box": row,
+                "machine": asdict(info),
+                "unavailable": None,
+                "fleet_image": fleet_image,
+                "image_current": current,
+            }
         finally:
             store.close()
 
@@ -753,10 +817,24 @@ def create_app(
         will happen here for an upgrade that pulls a large image, and the reply
         will be wrong in the same way.
 
-        It is shipped anyway because nothing consumes it yet — there is no
-        Upgrade button — and `flotta upgrade` runs outside any proxy. Anything
-        that puts this behind a UI should background it first, the way
-        FLOTTA-27 did for create.
+        **Backgrounded, because there is an Upgrade button now.** The note this
+        docstring used to carry — "anything that puts this behind a UI should
+        background it first, the way FLOTTA-27 did for create" — was the
+        instruction, and this is it being followed. `flyctl machine update`
+        waits up to 300s, and a proxy in front of this cut `POST /api/boxes` at
+        60s once already, answering `502 Application failed to respond` while
+        the work carried on.
+
+        What stays synchronous is everything the caller can *act* on: no such
+        box, a terminal or mid-provision one, no image to move to. Those are
+        409s worth having in the reply. Everything after is the substrate
+        taking as long as it takes, and the answer is `202` plus a timeline to
+        watch — `reimaged` on success, `upgrade_failed` on failure, both
+        written by `upgrade_box`.
+
+        `background=False` keeps the synchronous path, which is what the tests
+        assert against and what `flotta upgrade` gets when it talks to a local
+        store.
         """
         from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
 
@@ -766,6 +844,8 @@ def create_app(
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
             image = str((body or {}).get("image") or "").strip() or None
+            if background:
+                return _upgrade_in_background(box, image)
             try:
                 return upgrade_box(box.id, store=store, image=image)
             except UpgradeFailed as exc:
@@ -781,6 +861,68 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
+
+    def _upgrade_in_background(box: Any, image: str | None) -> Any:
+        """Refuse what is refusable, answer, then re-image on a thread.
+
+        The refusals are checked here rather than in the thread because they
+        are the caller's to fix: a `202` for a box that can never be upgraded
+        is a lie the app would render as a spinner. `upgrade_box` checks them
+        again — it is also the CLI's entry point — and doing it twice is the
+        price of the early exit.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import _fleet_image
+
+        if is_terminal("box", box.status):
+            raise HTTPException(
+                status_code=409,
+                detail=f"box {box.id} is {box.status!r}; there is no machine left to re-image.",
+            )
+        if box.status == "provisioning":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"box {box.id} is still provisioning. Upgrading mid-create would race "
+                    "the thread building it; wait for it to settle."
+                ),
+            )
+        target = (image or "").strip() or _fleet_image()
+        if not target:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "no image to upgrade to. Pass one explicitly or set $FLOTTA_FLY_IMAGE "
+                    "on the control plane."
+                ),
+            )
+
+        def run() -> None:
+            from flotta.provision import upgrade_box
+
+            inner = store_factory()
+            try:
+                upgrade_box(box.id, store=inner, image=target)
+            except Exception as exc:  # noqa: BLE001
+                # `upgrade_box` writes `upgrade_failed` before raising, so the
+                # app learns about this from the timeline. This only stops a
+                # stray exception ending the thread in silence.
+                _log.warning("upgrading %s failed: %s: %s", box.name, type(exc).__name__, exc)
+            finally:
+                inner.close()
+
+        # A thread, for the same reason `_create_in_background` uses one: this
+        # endpoint is a sync `def`, so there is no running loop to schedule on,
+        # and the work is blocking subprocess calls end to end.
+        worker = threading.Thread(target=run, name=f"upgrade-{box.name}", daemon=True)
+        _provisioning.add(worker)
+        worker.start()
+
+        return JSONResponse(
+            {"box_id": box.id, "box": _box_dict(box), "image": target, "started": True},
+            status_code=202,
+        )
 
     @app.post("/api/boxes/{box_id}/git-credential")
     def git_credential(box_id: str, body: dict[str, Any], token: Token | None = needs_git) -> Any:

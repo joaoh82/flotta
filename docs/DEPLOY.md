@@ -309,8 +309,16 @@ product about fleets. Two variables fix it, and they go together:
 
 ```
 FLOTTA_FLY_APP_PREFIX=yourname-flotta
-FLOTTA_FLY_IMAGE=registry.fly.io/little-stream-574:deployment-01M1HY4QN88V205AZR44G3C7N3
+FLOTTA_FLY_IMAGE=registry.fly.io/<builder-app>:deployment-01ABC…
 ```
+
+**Keep `FLOTTA_FLY_IMAGE` current.** It is what `create` gives a new agent and
+what an upgrade with no argument moves an existing one onto, so a stale value
+quietly builds every new agent from an old image and makes the app's Upgrade
+button a no-op — or worse, points at an app that has since been deleted, which
+has already happened here. `GET /api/hermes` reports what the control plane
+currently has, and the app shows it in each agent's Info panel: if it does not
+match what `just fly-up` last printed, this variable is the thing to fix.
 
 **The prefix** gives each agent its own Fly app, named `<prefix>-<box>`. A
 prefix rather than a bare `flotta-<box>` because Fly app names are globally

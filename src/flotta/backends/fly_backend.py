@@ -358,6 +358,7 @@ class FlyBackend:
                 # The same preference `image_of` documents: `config.image` is
                 # the only fully-qualified form.
                 image=self._image_from(machine),
+                hermes_ref=_hermes_ref(machine),
                 region=machine.get("region"),
                 cpu_kind=guest.get("cpu_kind"),
                 cpus=guest.get("cpus"),
@@ -658,6 +659,33 @@ def _run_flyctl(
             raise NotSupported(f"this machine cannot be suspended: {stderr[:200]}")
         raise BackendError(f"{' '.join(cmd)} failed ({result.returncode}): {stderr[:300]}")
     return result
+
+
+#: The image label carrying the Hermes the box runs. Written by `fly/Dockerfile`
+#: from its `HERMES_REF` build arg — see the comment there for why a label and
+#: not an `ENV`.
+HERMES_REF_LABEL = "dev.flotta.hermes-ref"
+
+
+def _hermes_ref(machine: dict) -> str | None:
+    """The Hermes an image was built with, or `None` if it does not say.
+
+    Labels live under `image_ref` even though the image *string* is read from
+    `config.image` — Fly reports the parsed reference and the raw one in
+    different places, and only the parsed one carries labels.
+
+    `None` means "this image predates the label", not "no Hermes". An image
+    built before `fly/Dockerfile` grew that line carries no clue about its
+    contents, and every agent in the fleet is one until it is upgraded.
+    """
+    ref = machine.get("image_ref")
+    if not isinstance(ref, dict):
+        return None
+    labels = ref.get("labels")
+    if not isinstance(labels, dict):
+        return None
+    value = labels.get(HERMES_REF_LABEL)
+    return str(value).strip() or None if value else None
 
 
 def _reason(stderr: str | None) -> str:
