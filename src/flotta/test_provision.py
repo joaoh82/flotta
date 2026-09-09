@@ -2589,3 +2589,54 @@ def test_a_stopped_agent_can_be_upgraded(store):
     backend = FakeBackend(image="old")
     upgrade_box(box.id, store=store, image="new", backend=backend)
     assert backend.image == "new"
+
+
+# -- the same image, written two ways ---------------------------------------
+#
+# Captured from a live machine rather than imagined. `flyctl machines list`
+# reports what `eng-g` runs as tag *and* digest; `--image` is written without
+# one. Compared as strings they never match, so the short-circuit never fired
+# and every no-op upgrade restarted the agent — the third time this comparison
+# was wrong in the same way, and the first time caught by looking at a machine.
+
+LIVE_IMAGE = (
+    "registry.fly.io/little-stream-574:deployment-01M1HY4QN88V205AZR44G3C7N3"
+    "@sha256:7159850327b7fa45b29c7839807775b40ab9211e4710b5ec609b64d9ff520722"
+)
+LIVE_TAG_ONLY = "registry.fly.io/little-stream-574:deployment-01M1HY4QN88V205AZR44G3C7N3"
+
+
+def test_a_digest_and_its_tag_are_the_same_image():
+    from flotta.provision import _same_image
+
+    assert _same_image(LIVE_IMAGE, LIVE_TAG_ONLY)
+    assert _same_image(LIVE_TAG_ONLY, LIVE_IMAGE)
+
+
+def test_two_digests_that_differ_are_different_images():
+    """The digest is the exact identity: two of them disagreeing means two
+    images, whatever their tags claim."""
+    from flotta.provision import _same_image
+
+    other = LIVE_TAG_ONLY + "@sha256:" + "f" * 64
+    assert not _same_image(LIVE_IMAGE, other)
+
+
+def test_a_different_tag_is_a_different_image():
+    from flotta.provision import _same_image
+
+    assert not _same_image(LIVE_IMAGE, "registry.fly.io/little-stream-574:deployment-OTHER")
+
+
+def test_an_agent_on_that_image_is_not_restarted_for_nothing(store):
+    """The end of the chain, on the real strings. Asserted on the substrate
+    call rather than the return value, because the cost this prevents is a
+    restart — `machine update` recreates the machine."""
+    from flotta.provision import upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image=LIVE_IMAGE)
+    result = upgrade_box(box.id, store=store, image=LIVE_TAG_ONLY, backend=backend)
+
+    assert result["already_current"] is True
+    assert "reimage" not in backend.calls
