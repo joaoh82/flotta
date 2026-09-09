@@ -1213,3 +1213,71 @@ def test_a_nonsense_volume_is_422_before_anything_is_provisioned(client, monkeyp
     assert client.post("/api/boxes", json={"name": "a", "volume_gb": "big"}).status_code == 422
     assert client.post("/api/boxes", json={"name": "a", "volume_gb": 0}).status_code == 422
     assert client.post("/api/boxes", json={"name": "a", "volume_gb": -5}).status_code == 422
+
+
+# -- FLOTTA-38: upgrading an agent through the API --------------------------
+
+
+def test_upgrade_moves_the_box_and_reports_both_images(client, monkeypatch):
+    import flotta.provision as provision
+
+    seen = {}
+
+    def fake_upgrade(box_id, *, store, image=None, **kwargs):
+        seen["box_id"] = box_id
+        seen["image"] = image
+        return {"box_id": box_id, "image": image, "previous_image": "old", "already_current": False}
+
+    monkeypatch.setattr(provision, "upgrade_box", fake_upgrade)
+
+    response = client.post("/api/boxes/eng-a/upgrade", json={"image": "registry/flotta:new"})
+    assert response.status_code == 200
+    assert seen["image"] == "registry/flotta:new"
+    assert response.json()["previous_image"] == "old"
+
+
+def test_upgrade_without_a_body_uses_the_fleet_image(client, monkeypatch):
+    import flotta.provision as provision
+
+    seen = {}
+
+    def fake_upgrade(box_id, *, store, image=None, **kwargs):
+        seen["image"] = image
+        return {"box_id": box_id, "image": "fleet", "previous_image": None}
+
+    monkeypatch.setattr(provision, "upgrade_box", fake_upgrade)
+    assert client.post("/api/boxes/eng-a/upgrade").status_code == 200
+    assert seen["image"] is None, "an absent body means the fleet decides, not an empty string"
+
+
+def test_a_refused_upgrade_is_409_not_502(client, monkeypatch):
+    """Terminal, mid-provision, or no image named — all actionable by the
+    caller, which is what separates them from a substrate failure."""
+    import flotta.provision as provision
+
+    def refuse(box_id, *, store, image=None, **kwargs):
+        raise provision.ProvisionError("box b-1 is 'torn_down'; there is no machine left")
+
+    monkeypatch.setattr(provision, "upgrade_box", refuse)
+    response = client.post("/api/boxes/eng-a/upgrade", json={})
+    assert response.status_code == 409
+    assert "no machine left" in response.json()["detail"]
+
+
+def test_upgrading_an_unknown_agent_is_404(client):
+    assert client.post("/api/boxes/nobody/upgrade", json={}).status_code == 404
+
+
+def test_upgrade_needs_write_not_destroy(secured):
+    """Deliberately not `box:destroy`. Upgrading is the opposite of destroying —
+    the volume is what it exists to preserve — and gating it there would mean
+    handing out the ability to delete an agent in order to update one.
+    """
+    assert (
+        secured.post("/api/boxes/eng-a/upgrade", json={}, headers=_bearer("fleet:read")).status_code
+        == 403
+    )
+    # `fleet:write` gets past auth; 404/409 afterwards is the endpoint working.
+    assert secured.post(
+        "/api/boxes/eng-a/upgrade", json={}, headers=_bearer("fleet:write")
+    ).status_code in (200, 404, 409)

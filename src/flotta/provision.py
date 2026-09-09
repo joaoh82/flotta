@@ -68,6 +68,7 @@ from flotta.backend import (
     Backend,
     BackendError,
     BoxSpec,
+    NotSupported,
     UnknownBackendError,
 )
 from flotta.backend import backend_for as _backend_for
@@ -1029,6 +1030,116 @@ def stop_box(
         "already_stopped": False,
         "method": method,
     }
+
+
+def upgrade_box(
+    box_id: str,
+    *,
+    store: FleetStore,
+    image: str | None = None,
+    backend: Backend | None = None,
+    reason: str = "requested",
+) -> dict[str, Any]:
+    """Move a live agent onto a new image, keeping everything it remembers.
+
+    The gap this closes: `HERMES_REF` pins what a box image is built from, and
+    `just hermes-bump` moves it — but a machine runs the image it was created
+    with, so every existing agent stays on whatever Hermes was pinned the day
+    it was made, and the distance grows with every bump.
+
+    Destroy-and-recreate is not the workaround. `teardown_box` removes the
+    volume, and the volume is the agent: `/data/hermes` holds its memories, its
+    skills and its conversation history. The M2 note that "a box's memory
+    outlives its machine" was true when destroy was machine-only; it has not
+    described `teardown_box` since.
+
+    **An image must be named.** Explicitly, or by `$FLOTTA_FLY_IMAGE` — never
+    inferred from the box's own app. With one app per agent, "the app's last
+    release" *is* what this machine already runs, so guessing would re-image a
+    box to itself and report an upgrade. Refusing is the honest failure.
+
+    Never automatic. Upgrading an agent with months of memory is strictly
+    riskier than building a fresh one — `hermes-bump`'s own comment says
+    bumping is not mechanical — so this is a verb somebody calls, like
+    destroying.
+    """
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(
+            f"box {box_id} is {box.status!r}; there is no machine left to re-image."
+        )
+    if box.status == "provisioning":
+        raise ProvisionError(
+            f"box {box_id} is still provisioning. Upgrading mid-create would race the "
+            "thread building it; wait for it to settle."
+        )
+
+    target_image = (image or "").strip() or _fleet_image()
+    if not target_image:
+        raise ProvisionError(
+            "no image to upgrade to. Pass one explicitly or set $FLOTTA_FLY_IMAGE — "
+            "this deliberately does not fall back to the box's own app, because with "
+            "one app per agent that is the image it already runs."
+        )
+
+    impl = _resolve_backend(box, backend)
+    target = box.endpoint or box_id
+    before = _peek_image(impl, target)
+    if before and before == target_image:
+        return {
+            "box_id": box_id,
+            "image": target_image,
+            "already_current": True,
+            "previous_image": before,
+        }
+
+    try:
+        impl.reimage(target, target_image)
+    except NotSupported as exc:
+        raise ProvisionError(f"this substrate cannot re-image a box: {exc}") from exc
+    except BackendError as exc:
+        # The row is untouched, so the agent is exactly as it was. That is the
+        # acceptance criterion that matters: a failed upgrade must not leave a
+        # half-migrated box.
+        raise ProvisionError(f"could not upgrade box {box_id}: {exc}") from exc
+
+    after = _peek_image(impl, target)
+    store.add_event(
+        "box",
+        box_id,
+        "reimaged",
+        {"reason": reason, "from": before, "to": after or target_image},
+    )
+    return {
+        "box_id": box_id,
+        "image": after or target_image,
+        "previous_image": before,
+        "already_current": False,
+    }
+
+
+def _fleet_image(env: Mapping[str, str] | None = None) -> str | None:
+    """The image this fleet builds, from config — never from a box's own app."""
+    from flotta.fly import IMAGE_ENV
+
+    source = os.environ if env is None else env
+    return (source.get(IMAGE_ENV) or "").strip() or None
+
+
+def _peek_image(impl: Backend, target: str) -> str | None:
+    """What the substrate says this box runs, or None if it will not say.
+
+    Optional capability, read through `getattr` the same way `_peek_endpoint`
+    reads `existing_endpoint`: a backend that cannot answer should cost the
+    event a field, not fail the upgrade.
+    """
+    reader = getattr(impl, "image_of", None)
+    if reader is None:
+        return None
+    try:
+        return reader(target)
+    except Exception:  # noqa: BLE001 - a probe must never fail the operation
+        return None
 
 
 def start_box(

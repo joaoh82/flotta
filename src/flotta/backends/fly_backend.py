@@ -231,6 +231,49 @@ class FlyBackend:
             stdin="".join(f"{k}={v}\n" for k, v in secrets.items()),
         )
 
+    def reimage(self, box_id: str, image: str) -> None:
+        """`flyctl machine update --image`, which keeps the volume mount.
+
+        Update rather than destroy-and-create: the machine's configuration is
+        preserved except for what is named, so the volume, its mount path, the
+        VM size and the environment all survive. That is the whole point — the
+        volume is the agent.
+
+        `--yes` because flyctl asks for confirmation otherwise and CI, the
+        control plane and a background thread have no one to ask. `--skip-health-checks`
+        is deliberately *not* passed: a box that will not come up on the new
+        image should fail the upgrade loudly rather than be left broken and
+        reported as done.
+        """
+        app, machine_id = self._addr(box_id)
+        self._flyctl("machine", "update", machine_id, "--image", image, "--yes", app=app)
+
+    def image_of(self, box_id: str) -> str | None:
+        """What image this machine is actually running, or None.
+
+        Best-effort and read-only. Distinct from `_current_image`, which reads
+        the *app's release history* — with one app per agent that answers "what
+        was last deployed here", not "what is this machine running", and after
+        a `machine update` those two disagree.
+
+        Parsed defensively across the shapes flyctl has used, the same way
+        `_current_image` reads `ImageRef` or `imageRef`: this is one external
+        tool's JSON, and a key that moves should cost a blank rather than an
+        exception on the upgrade path.
+        """
+        app, machine_id = self._addr(box_id)
+        for machine in self._machines(app):
+            if machine.get("id") != machine_id:
+                continue
+            config = machine.get("config") or {}
+            ref = machine.get("image_ref") or {}
+            if isinstance(ref, dict) and ref.get("repository"):
+                tag = ref.get("tag") or ref.get("digest") or ""
+                sep = ":" if ref.get("tag") else "@"
+                return f"{ref['repository']}{sep}{tag}" if tag else str(ref["repository"])
+            return config.get("image") or machine.get("image") or None
+        return None
+
     def existing_endpoint(self, box_name: str | None = None) -> str | None:
         """The endpoint `create` would adopt for this name, without creating it.
 

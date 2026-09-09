@@ -1020,6 +1020,47 @@ def start(
 
 
 @app.command()
+def upgrade(
+    box_id: str = typer.Argument(..., help="Box id or name"),
+    image: str | None = typer.Option(
+        None, "--image", help="Image to move to. Default: $FLOTTA_FLY_IMAGE"
+    ),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+    reason: str = typer.Option("cli", "--reason", help="Recorded on the reimaged event"),
+) -> None:
+    """Move an agent onto a new image, keeping everything it remembers.
+
+    `just hermes-bump` moves the pin the *image* is built from; a machine runs
+    the image it was created with, so existing agents stay where they are until
+    this is run against each of them.
+
+    Not destroy-and-recreate: `flotta kill` takes the volume, and the volume is
+    the agent. Costs a restart, like any secret rotation.
+    """
+    provision = _provision()
+
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        try:
+            result = provision.upgrade_box(box.id, store=fleet, image=image, reason=reason)
+        except UnknownEntityError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        except provision.ProvisionError as exc:
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=2) from exc
+        if result.get("already_current"):
+            emit(result, f"{box.id}  already on {result['image']}", as_json=as_json)
+            return
+        emit(
+            result,
+            f"{box.id}  {result.get('previous_image') or '(unknown)'} -> {result['image']}",
+            as_json=as_json,
+        )
+
+
+@app.command()
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address"),
     port: int = typer.Option(8080, "--port", help="Bind port"),

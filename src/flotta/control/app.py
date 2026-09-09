@@ -690,6 +690,39 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/boxes/{box_id}/upgrade")
+    def upgrade_box_endpoint(
+        box_id: str, body: dict[str, Any] | None = None, _: Token | None = needs_write
+    ) -> Any:
+        """Move an agent onto a new image, keeping its disk.
+
+        `fleet:write` rather than `box:destroy`: this is the *opposite* of
+        destroying — the volume is what it exists to preserve — and gating it
+        behind the destroy scope would mean handing out the ability to delete
+        an agent in order to update one.
+
+        Synchronous, unlike create. Re-imaging one machine is a `flyctl machine
+        update` and a restart, not an app plus a volume plus a boot, so the
+        202-and-poll machinery `POST /api/boxes` needs would be ceremony here.
+        """
+        from flotta.provision import ProvisionError, upgrade_box
+
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            image = str((body or {}).get("image") or "").strip() or None
+            try:
+                return upgrade_box(box.id, store=store, image=image)
+            except ProvisionError as exc:
+                # 409: the caller asked for something this box cannot do right
+                # now — terminal, mid-provision, or no image named. Every one of
+                # them is actionable, which is what separates it from a 502.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/git-credential")
     def git_credential(box_id: str, body: dict[str, Any], token: Token | None = needs_git) -> Any:
         """Mint a git credential for a repository this box is granted.
