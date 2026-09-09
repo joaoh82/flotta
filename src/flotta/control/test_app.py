@@ -1281,3 +1281,17 @@ def test_upgrade_needs_write_not_destroy(secured):
     assert secured.post(
         "/api/boxes/eng-a/upgrade", json={}, headers=_bearer("fleet:write")
     ).status_code in (200, 404, 409)
+
+
+def test_a_substrate_failure_upgrading_is_502_not_409(client, monkeypatch):
+    """Matching `POST /api/boxes`, which answers the same class of failure the
+    same way. 409 would tell the caller they asked for the wrong thing."""
+    import flotta.provision as provision
+
+    def explode(box_id, *, store, image=None, **kwargs):
+        raise provision.UpgradeFailed("could not upgrade box b-1: flyctl exploded")
+
+    monkeypatch.setattr(provision, "upgrade_box", explode)
+    response = client.post("/api/boxes/eng-a/upgrade", json={})
+    assert response.status_code == 502
+    assert "flyctl exploded" in response.json()["detail"]

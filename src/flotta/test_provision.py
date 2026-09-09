@@ -2505,15 +2505,44 @@ def test_a_box_already_on_that_image_is_left_alone(store):
 def test_a_failed_upgrade_leaves_the_agent_as_it_was(store):
     """The acceptance criterion that matters. A half-migrated agent with months
     of memory is worse than an old one."""
-    from flotta.provision import ProvisionError, upgrade_box
+    from flotta.provision import UpgradeFailed, upgrade_box
 
     box = _running(store)
     backend = FakeBackend(image="registry.fly.io/flotta:old", reimage_fails=True)
-    with pytest.raises(ProvisionError, match="could not upgrade"):
+    with pytest.raises(UpgradeFailed, match="could not upgrade"):
         upgrade_box(box.id, store=store, image="registry.fly.io/flotta:new", backend=backend)
 
     assert store.get_box(box.id).status == "running"
     assert not [e for e in store.get_box_timeline(box.id) if e.type == "reimaged"]
+
+
+def test_a_failure_names_the_image_the_box_still_runs(store):
+    """The only way back. Without it, undoing an upgrade means asking the
+    substrate what the box used to run — which is what you cannot do while it
+    is broken."""
+    from flotta.provision import UpgradeFailed, upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:old", reimage_fails=True)
+    with pytest.raises(UpgradeFailed, match="registry.fly.io/flotta:old"):
+        upgrade_box(box.id, store=store, image="registry.fly.io/flotta:new", backend=backend)
+
+
+def test_a_substrate_failure_is_not_a_refusal(store):
+    """`UpgradeFailed` is a `ProvisionError`, so old handlers still catch it —
+    but the API answers it 502 and a refusal 409, and the CLI exits 1 rather
+    than 2. Conflating them tells the caller they asked for the wrong thing
+    when flyctl was simply having a bad minute."""
+    from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
+
+    assert issubclass(UpgradeFailed, ProvisionError)
+
+    box = _running(store)
+    with pytest.raises(ProvisionError) as refusal:
+        upgrade_box(box.id, store=store, image="", backend=FakeBackend())
+    assert not isinstance(refusal.value, UpgradeFailed), (
+        "a missing image is the caller's to fix, not the substrate's"
+    )
 
 
 def test_a_substrate_that_cannot_reimage_says_so(store):

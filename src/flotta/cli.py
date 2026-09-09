@@ -1047,6 +1047,11 @@ def upgrade(
         except UnknownEntityError as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
+        except provision.UpgradeFailed as exc:
+            # Exit 1: the substrate broke. A refusal (exit 2, below) is
+            # something the caller can fix by asking differently; this is not.
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
         except provision.ProvisionError as exc:
             typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
             raise typer.Exit(code=2) from exc

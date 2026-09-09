@@ -239,14 +239,34 @@ class FlyBackend:
         VM size and the environment all survive. That is the whole point — the
         volume is the agent.
 
+        **Leaves the box running or not, as it found it.** `machine update`
+        recreates the machine and *starts it by default* — flyctl's own
+        `--skip-start` is documented as "Updates machine without starting it",
+        which is only a flag worth having because of what happens without it.
+
+        That default is a money bug on this fleet, not a nicety: most agents are
+        asleep most of the time (the cost argument working), so upgrading one
+        would silently wake it while its row still said `stopped`. The reconcile
+        loop corrects a row claiming `running` about a machine that is not — it
+        does not look for the reverse — so the machine would bill until somebody
+        noticed.
+
+        Deciding here rather than taking a flag from the caller, because
+        "re-image without changing whether it is running" is the portable
+        promise: a Firecracker pool swapping a rootfs under a stopped VM should
+        not boot it either.
+
         `--yes` because flyctl asks for confirmation otherwise and CI, the
-        control plane and a background thread have no one to ask. `--skip-health-checks`
-        is deliberately *not* passed: a box that will not come up on the new
-        image should fail the upgrade loudly rather than be left broken and
-        reported as done.
+        control plane and a background thread have no one to ask.
+        `--skip-health-checks` is deliberately *not* passed: a box that will not
+        come up on the new image should fail the upgrade loudly rather than be
+        left broken and reported as done.
         """
         app, machine_id = self._addr(box_id)
-        self._flyctl("machine", "update", machine_id, "--image", image, "--yes", app=app)
+        args = ["machine", "update", machine_id, "--image", image, "--yes"]
+        if self._state(app, machine_id) != "started":
+            args.append("--skip-start")
+        self._flyctl(*args, app=app)
 
     def image_of(self, box_id: str) -> str | None:
         """What image this machine is actually running, or None.
@@ -256,22 +276,38 @@ class FlyBackend:
         was last deployed here", not "what is this machine running", and after
         a `machine update` those two disagree.
 
-        Parsed defensively across the shapes flyctl has used, the same way
-        `_current_image` reads `ImageRef` or `imageRef`: this is one external
-        tool's JSON, and a key that moves should cost a blank rather than an
-        exception on the upgrade path.
+        **`config.image` first**, because it is the only field that carries the
+        *fully-qualified* reference — `registry.fly.io/joaoh82-flotta-eng-a:tag`
+        — which is the form `$FLOTTA_FLY_IMAGE` and `--image` are written in.
+        `image_ref.repository` is the bare name, and an earlier version of this
+        preferred it: the comparison in `upgrade_box` then never matched, so
+        every "already on this image" upgrade ran `machine update` anyway and
+        restarted the agent. That is precisely the uptime the short-circuit
+        exists to protect, lost to a string that looked close enough.
+
+        The `image_ref` path is the fallback and now composes the whole thing,
+        registry included. Parsed defensively across shapes for the same reason
+        `_current_image` reads `ImageRef` or `imageRef`: one external tool's
+        JSON, where a moved key should cost a blank rather than an exception on
+        the upgrade path.
         """
         app, machine_id = self._addr(box_id)
         for machine in self._machines(app):
             if machine.get("id") != machine_id:
                 continue
             config = machine.get("config") or {}
+            direct = config.get("image") or machine.get("image")
+            if direct:
+                return str(direct)
             ref = machine.get("image_ref") or {}
-            if isinstance(ref, dict) and ref.get("repository"):
-                tag = ref.get("tag") or ref.get("digest") or ""
-                sep = ":" if ref.get("tag") else "@"
-                return f"{ref['repository']}{sep}{tag}" if tag else str(ref["repository"])
-            return config.get("image") or machine.get("image") or None
+            if not isinstance(ref, dict) or not ref.get("repository"):
+                return None
+            name = "/".join(p for p in (ref.get("registry"), ref.get("repository")) if p)
+            if ref.get("tag"):
+                return f"{name}:{ref['tag']}"
+            if ref.get("digest"):
+                return f"{name}@{ref['digest']}"
+            return name
         return None
 
     def existing_endpoint(self, box_name: str | None = None) -> str | None:

@@ -1032,6 +1032,16 @@ def stop_box(
     }
 
 
+class UpgradeFailed(ProvisionError):
+    """The substrate refused or broke while re-imaging a box.
+
+    Distinct from a plain `ProvisionError` here, which means the caller asked
+    for something this box cannot do — terminal, mid-provision, no image named.
+    Those are actionable by the caller; this one is not, and conflating them
+    would answer a flyctl outage with "you asked for the wrong thing".
+    """
+
+
 def upgrade_box(
     box_id: str,
     *,
@@ -1101,7 +1111,20 @@ def upgrade_box(
         # The row is untouched, so the agent is exactly as it was. That is the
         # acceptance criterion that matters: a failed upgrade must not leave a
         # half-migrated box.
-        raise ProvisionError(f"could not upgrade box {box_id}: {exc}") from exc
+        #
+        # `UpgradeFailed`, not a bare `ProvisionError`: the substrate broke,
+        # which is not the same as the caller asking for something impossible.
+        # The API answers the first with 502 and the second with 409, matching
+        # `POST /api/boxes`, and the CLI exits 1 rather than 2.
+        #
+        # The previous image travels in the message because it is the only way
+        # back. Without it an operator who wants to undo this has to go and ask
+        # the substrate what the box used to run, which is exactly what they
+        # cannot do while it is broken.
+        raise UpgradeFailed(
+            f"could not upgrade box {box_id}: {exc}. It still runs "
+            f"{before or '(unknown)'}; nothing was changed."
+        ) from exc
 
     after = _peek_image(impl, target)
     store.add_event(

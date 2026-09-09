@@ -196,7 +196,21 @@ def test_the_backend_satisfies_the_protocol():
 
 
 @pytest.mark.parametrize(
-    "verb", ["create", "start", "suspend", "stop", "destroy", "exec", "state", "endpoint"]
+    "verb",
+    [
+        "create",
+        "start",
+        "suspend",
+        "stop",
+        "destroy",
+        # Both of these were added to the protocol without being listed here,
+        # which is how a list like this quietly stops being the protocol.
+        "apply_secrets",
+        "reimage",
+        "exec",
+        "state",
+        "endpoint",
+    ],
 )
 def test_every_protocol_verb_exists(verb):
     """Named individually so a missing one fails by name, not as a bare
@@ -494,3 +508,104 @@ def test_a_spec_that_names_a_size_still_wins():
 
     volume = _volume_call(issued)
     assert volume is not None and "50" in volume, f"{volume}"
+
+
+# -- FLOTTA-38: re-imaging keeps the disk, and keeps the box as it found it --
+#
+# Both of these are Fly-contract facts that `FakeBackend` in test_provision.py
+# cannot model: it compares one string against itself and has no notion of a
+# machine that `update` would start. Two reviewers found both, and neither was
+# visible from the provision tests.
+
+
+def _machines_list(state="started", image="registry.fly.io/joaoh82-flotta-eng-a:deployment-01J"):
+    """The shape `flyctl machines list --json` really returns.
+
+    Both `config.image` (fully qualified) and `image_ref` (split), because the
+    difference between them is what broke the "already on this image" check.
+    """
+    return [
+        {
+            "id": "m-1",
+            "name": "eng-a",
+            "state": state,
+            "config": {"image": image},
+            "image_ref": {
+                "registry": "registry.fly.io",
+                "repository": "joaoh82-flotta-eng-a",
+                "tag": "deployment-01J",
+                "digest": "sha256:abc",
+            },
+        }
+    ]
+
+
+def _recording_fly(machines):
+    import json as _json
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        if "list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, _json.dumps(machines), "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    return issued, FlyBackend(config=_offline_config(), runner=runner)
+
+
+def test_image_of_reports_the_fully_qualified_reference():
+    """`--image` and `$FLOTTA_FLY_IMAGE` are written fully qualified, so this
+    has to answer in the same form or `upgrade_box`'s "already current" check
+    never matches — and every no-op upgrade restarts the agent."""
+    _, backend = _recording_fly(_machines_list())
+    assert (
+        backend.image_of("fly://joaoh82-flotta-eng-a/m-1")
+        == "registry.fly.io/joaoh82-flotta-eng-a:deployment-01J"
+    )
+
+
+def test_image_of_composes_the_whole_reference_when_only_the_split_form_is_there():
+    """The fallback must include the registry. Returning the bare repository
+    was the bug: `joaoh82-flotta-eng-a` never equals
+    `registry.fly.io/joaoh82-flotta-eng-a:tag`, so the comparison silently
+    always said "different"."""
+    machines = _machines_list()
+    machines[0]["config"] = {}
+    _, backend = _recording_fly(machines)
+    assert (
+        backend.image_of("fly://joaoh82-flotta-eng-a/m-1")
+        == "registry.fly.io/joaoh82-flotta-eng-a:deployment-01J"
+    )
+
+
+def test_image_of_is_blank_rather_than_an_exception_when_the_shape_moves():
+    machines = _machines_list()
+    machines[0]["config"] = {}
+    machines[0]["image_ref"] = {}
+    _, backend = _recording_fly(machines)
+    assert backend.image_of("fly://joaoh82-flotta-eng-a/m-1") is None
+
+
+def test_reimaging_a_stopped_box_does_not_start_it():
+    """`fly machine update` recreates the machine and starts it by default —
+    `--skip-start` exists only because of that. Most of this fleet is asleep,
+    so without the flag an upgrade would wake an agent while its row still said
+    `stopped`, and the reconcile loop only looks for the opposite drift. The
+    machine would bill until somebody noticed."""
+    issued, backend = _recording_fly(_machines_list(state="stopped"))
+    backend.reimage("fly://joaoh82-flotta-eng-a/m-1", "registry.fly.io/x:new")
+
+    update = next(c for c in issued if "update" in c)
+    assert "--skip-start" in update, update
+
+
+def test_reimaging_a_running_box_leaves_it_running():
+    """The other half of the same promise: as it found it."""
+    issued, backend = _recording_fly(_machines_list(state="started"))
+    backend.reimage("fly://joaoh82-flotta-eng-a/m-1", "registry.fly.io/x:new")
+
+    update = next(c for c in issued if "update" in c)
+    assert "--skip-start" not in update, update
+    assert "--skip-health-checks" not in update, "a box that will not boot must fail loudly"

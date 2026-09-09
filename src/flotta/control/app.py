@@ -701,11 +701,19 @@ def create_app(
         behind the destroy scope would mean handing out the ability to delete
         an agent in order to update one.
 
-        Synchronous, unlike create. Re-imaging one machine is a `flyctl machine
-        update` and a restart, not an app plus a volume plus a boot, so the
-        202-and-poll machinery `POST /api/boxes` needs would be ceremony here.
+        **Synchronous, and that is a known limit rather than a decision.**
+        `flyctl machine update` waits up to 300s by default, and a proxy in
+        front of this cut `POST /api/boxes` at 60s once already — answering
+        `502 Application failed to respond` while the work carried on. The same
+        will happen here for an upgrade that pulls a large image, and the reply
+        will be wrong in the same way.
+
+        It is shipped anyway because nothing consumes it yet — there is no
+        Upgrade button — and `flotta upgrade` runs outside any proxy. Anything
+        that puts this behind a UI should background it first, the way
+        FLOTTA-27 did for create.
         """
-        from flotta.provision import ProvisionError, upgrade_box
+        from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
 
         store = store_factory()
         try:
@@ -715,10 +723,16 @@ def create_app(
             image = str((body or {}).get("image") or "").strip() or None
             try:
                 return upgrade_box(box.id, store=store, image=image)
+            except UpgradeFailed as exc:
+                # The substrate broke. 502, matching what `POST /api/boxes`
+                # answers for the same class of failure — and *not* 409, which
+                # would tell the caller they asked for the wrong thing when
+                # flyctl was simply having a bad minute.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             except ProvisionError as exc:
                 # 409: the caller asked for something this box cannot do right
                 # now — terminal, mid-provision, or no image named. Every one of
-                # them is actionable, which is what separates it from a 502.
+                # them is actionable, which is what separates it from the above.
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
