@@ -877,3 +877,121 @@ def test_create_refuses_a_taken_name_without_a_traceback(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["create", "eng-a", "--store", str(db)])
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+# -- `flotta upgrade` against a deployed fleet -------------------------------
+#
+# Shipped store-first, which made it unusable against every fleet that actually
+# exists: the boxes live in the control plane's Postgres, and `_open_store`
+# reads `./fleet.db`. `flotta ps` on a laptop that has only ever talked to a
+# deployment says "no fleet-state store" — and so did this.
+
+
+def _upgrade(tmp_path, monkeypatch, argv, responses=None, fail_on=None):
+    """Run `flotta upgrade` against a scripted fleet API."""
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+
+    calls = []
+    attempted = {"upgrade": False}
+
+    def fake(method, path, *, scopes, body=None, **kw):
+        calls.append((method, path, sorted(scopes), body))
+        if fail_on and fail_on in path and method == "POST":
+            attempted["upgrade"] = True
+            raise cli.ControlPlaneError("POST /upgrade -> 502: Application failed to respond")
+        # The timeline is *stateful*: empty before the attempt, carrying the
+        # event afterwards. A fake that answered the same both times would make
+        # the before-marker already include the event, and the recovery could
+        # never fire — which is what the first version of this test proved.
+        if "/events" in path and not attempted["upgrade"]:
+            return {"events": []}
+        for pattern, value in (responses or {}).items():
+            if pattern in path:
+                return value
+        return {"id": "b-remote", "name": "eng-g"}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    return calls, CliRunner().invoke(cli.app, argv)
+
+
+def test_upgrade_goes_to_the_control_plane_and_needs_write(tmp_path, monkeypatch):
+    calls, result = _upgrade(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g", "--image", "registry/flotta:new"],
+        responses={
+            "/upgrade": {"box_id": "b-remote", "image": "registry/flotta:new",
+                         "previous_image": "registry/flotta:old"},
+        },
+    )
+    assert result.exit_code == 0
+    post = next(c for c in calls if c[0] == "POST")
+    assert post[1] == "/api/boxes/b-remote/upgrade"
+    assert post[2] == ["fleet:write"]
+    assert post[3] == {"image": "registry/flotta:new"}
+
+
+def test_upgrade_without_an_image_lets_the_fleet_decide(tmp_path, monkeypatch):
+    calls, result = _upgrade(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g"],
+        responses={"/upgrade": {"box_id": "b-remote", "image": "fleet", "previous_image": None}},
+    )
+    assert result.exit_code == 0
+    assert next(c for c in calls if c[0] == "POST")[3] == {}
+
+
+def test_a_dropped_connection_asks_the_box_what_happened(tmp_path, monkeypatch):
+    """The FLOTTA-27 failure, not repeated. A proxy answered 502 while the work
+    carried on, so the caller was told it had failed and a machine appeared
+    anyway. `reimaged` is written only after the substrate call returns, so an
+    event newer than the marker means the connection is what broke."""
+    calls, result = _upgrade(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g", "--image", "registry/flotta:new"],
+        responses={
+            # Empty before the attempt, carrying the upgrade afterwards.
+            "/events": {"events": [{"id": 9, "type": "reimaged",
+                                    "payload": {"to": "registry/flotta:new"}}]},
+        },
+        fail_on="/upgrade",
+    )
+    assert result.exit_code == 0, result.output
+    assert "upgrade landed" in result.output
+    assert [c[0] for c in calls].count("GET") >= 2, "before-marker and after-check"
+
+
+def test_a_dropped_connection_that_changed_nothing_still_fails(tmp_path, monkeypatch):
+    """The recovery must not turn every failure into a success. With no new
+    `reimaged` event the original error stands."""
+    _, result = _upgrade(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g", "--image", "registry/flotta:new"],
+        responses={"/events": {"events": []}},
+        fail_on="/upgrade",
+    )
+    assert result.exit_code == 1
+    assert "502" in result.output
+
+
+def test_an_upgrade_that_was_already_current_says_so(tmp_path, monkeypatch):
+    _, result = _upgrade(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g", "--image", "registry/flotta:same"],
+        responses={
+            "/upgrade": {"box_id": "b-remote", "image": "registry/flotta:same",
+                         "already_current": True},
+        },
+    )
+    assert result.exit_code == 0
+    assert "already on" in result.output
