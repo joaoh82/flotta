@@ -118,16 +118,20 @@ export type Field = { label: string; value: string; mono?: boolean };
 export function fieldsOf(machine: Machine): Field[] {
   const fields: Field[] = [];
   const add = (label: string, value: string | number | null | undefined, mono = false) => {
-    if (value === null || value === undefined || value === "") return;
+    // `== null` catches both null and undefined and nothing else. A truthiness
+    // check would treat `0` as unreported, which for a size is the difference
+    // between "the substrate did not say" and "it said zero".
+    if (value == null || value === "") return;
     fields.push({ label, value: String(value), mono });
   };
 
   add("Machine", machine.machine_id, true);
   add("Fly app", machine.app, true);
   add("Region", machine.region);
-  if (machine.cpus || machine.memory_mb) {
-    const cpu = machine.cpus ? `${machine.cpus} ${machine.cpu_kind ?? ""} vCPU`.trim() : null;
-    const ram = machine.memory_mb ? `${memory(machine.memory_mb)} RAM` : null;
+  if (machine.cpus != null || machine.memory_mb != null) {
+    const cpu =
+      machine.cpus != null ? `${machine.cpus} ${machine.cpu_kind ?? ""} vCPU`.trim() : null;
+    const ram = machine.memory_mb != null ? `${memory(machine.memory_mb)} RAM` : null;
     add("Size", [cpu, ram].filter(Boolean).join(", "));
   }
   // The disk, named as what it is. On this fleet the volume *is* the agent:

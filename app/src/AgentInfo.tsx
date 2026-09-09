@@ -32,6 +32,11 @@ export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }
       setView(await invoke<MachineView>("agent_machine", { id: box.id }));
       setError(null);
     } catch (e) {
+      // Drop what was on screen. Keeping it would leave a fresh error sitting
+      // beside machine fields read minutes ago, presented exactly like fields
+      // read just now — a panel whose whole premise is "these are two sources,
+      // not a blend" quietly serving a third thing: a stale one, unlabelled.
+      setView(null);
       setError(isFleetError(e) ? e.detail : String(e));
     } finally {
       setLoading(false);

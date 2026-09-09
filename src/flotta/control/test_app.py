@@ -1376,4 +1376,16 @@ def test_a_box_with_no_machine_yet_is_not_an_error(client, fleet, monkeypatch):
 
 
 def test_the_machine_endpoint_404s_for_a_box_that_does_not_exist(client):
-    assert client.get("/api/boxes/nope/machine").status_code == 404
+    """The body is a contract, not decoration.
+
+    The app has to tell this 404 from the other one — a control plane too old
+    to have this route, which FastAPI answers with a bare `Not Found`. It
+    splits on exactly this text, so a reworded detail here would retarget every
+    missing agent as "deploy the current control plane".
+    """
+    response = client.get("/api/boxes/nope/machine")
+
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert detail != "Not Found"
+    assert "nope" in detail

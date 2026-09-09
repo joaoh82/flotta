@@ -132,4 +132,13 @@ describe("the lines of the panel", () => {
   it("does not invent a size from a machine that reported none", () => {
     expect(find(fieldsOf({ state: "started", region: "ams" }), "Size")).toBeUndefined();
   });
+
+  it("treats a reported zero as a value, not as a blank", () => {
+    // Not a Fly shape today, but the rule this module keeps is "blank means
+    // the substrate did not say". A truthiness check makes `0` indistinguishable
+    // from silence, which is the same class of lie as printing "undefined".
+    expect(find(fieldsOf({ ...full, cpus: 0, memory_mb: 0 }), "Size")).toBe(
+      "0 shared vCPU, 0 MB RAM",
+    );
+  });
 });

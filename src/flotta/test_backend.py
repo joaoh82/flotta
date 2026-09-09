@@ -11,6 +11,7 @@ import pytest
 
 from flotta.backend import (
     Backend,
+    BackendError,
     BoxSpec,
     ExecResult,
     NotSupported,
@@ -727,3 +728,82 @@ def test_inspect_never_acts_on_the_machine():
     """Read-only by construction, not by intention: the stub runner fails the
     test if `inspect` ever issues anything but a list."""
     assert _inspecting([_LIVE_MACHINE]).state == "started"
+
+
+def test_inspect_raises_when_the_listing_fails_rather_than_saying_gone():
+    """The bug both reviewers found, and the one this whole panel exists to
+    prevent.
+
+    `_machines` swallows a non-zero `flyctl` — the right default for callers
+    that ask "is there a machine here" before doing something. For `inspect` it
+    is a lie with consequences: an empty list becomes `state="gone"`, which the
+    app renders as *"its machine is not there. Nothing is running, and nothing
+    is billing."* A logged-out `flyctl` would print that about a live agent,
+    and invite someone to destroy and recreate it.
+
+    Raising instead sends the control plane down the `unavailable` path, which
+    says "we could not ask" — a different sentence, and the true one.
+    """
+    import subprocess
+
+    def logged_out(cmd, *, timeout, check, stdin=None):
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: no access token available")
+
+    backend = FlyBackend(config=_offline_config(), runner=logged_out)
+    with pytest.raises(BackendError, match="could not list machines"):
+        backend.inspect("fly://joaoh82-flotta-eng-g/815990c9246728")
+
+
+def test_inspect_carries_flyctls_own_reason():
+    """So the panel can say *why* it could not ask. "Something went wrong" sends
+    someone to check the fleet; "no access token" sends them to `fly auth`."""
+    import subprocess
+
+    def logged_out(cmd, *, timeout, check, stdin=None):
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: no access token available")
+
+    backend = FlyBackend(config=_offline_config(), runner=logged_out)
+    with pytest.raises(BackendError, match="no access token"):
+        backend.inspect("fly://joaoh82-flotta-eng-g/815990c9246728")
+
+
+def test_a_failed_listing_still_reads_as_empty_for_the_lenient_callers():
+    """The default must not change with it.
+
+    `create` asks whether a machine already exists and treats a failed listing
+    as "assume not", going on to guards that fail safely. Making every listing
+    raise would turn a transient `flyctl` blip into a failed provision.
+    """
+    import subprocess
+
+    def failing(cmd, *, timeout, check, stdin=None):
+        return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+    backend = FlyBackend(config=_offline_config(), runner=failing)
+    assert backend._machines("any-app") == []
+
+
+def test_the_reason_skips_flyctls_telemetry_noise():
+    """A real failed listing, verbatim.
+
+    Truncating from the top hands the panel a warning about metrics and cuts
+    the sentence that says authentication failed — the one thing a person needs
+    to know which of `fly auth login` or the fleet is broken.
+    """
+    from flotta.backends.fly_backend import _reason
+
+    stderr = (
+        "Warning: Metrics send issue: metrics send failed with status 401\n"
+        "Error: failed to list VMs: Authentication credentials are missing or invalid\n"
+    )
+    assert _reason(stderr) == (
+        "Error: failed to list VMs: Authentication credentials are missing or invalid"
+    )
+
+
+def test_the_reason_falls_back_to_whatever_was_said():
+    from flotta.backends.fly_backend import _reason
+
+    assert _reason("something went wrong\n") == "something went wrong"
+    assert _reason("") == ""
+    assert _reason(None) == ""
