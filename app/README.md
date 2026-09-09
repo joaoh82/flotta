@@ -3,7 +3,10 @@
 The desktop client. A list of your agents, and — from M8.2 — a conversation
 with each one.
 
-Run it with `just app` from the repo root.
+Run it with `just app` from the repo root. With `$FLOTTA_SIGNING_KEY` in
+`.env` that recipe mints its own one-day token, so there is nothing to paste
+— see *the keychain and rebuilt binaries* below for why development needs one
+in the environment at all.
 
 ## Why a desktop app and not a page
 
@@ -66,7 +69,9 @@ Two things make it survivable:
 
 - **In debug builds only, `$FLOTTA_TOKEN` is read first** — the same variable
   `flotta chat` uses. `cfg` compiles this out of release builds entirely, so a
-  shipped app cannot be made to take a token from the environment.
+  shipped app cannot be made to take a token from the environment. `just app`
+  sets it for you (`fleet:read`, `fleet:write`, `box:chat`, `box:destroy`, one
+  day) when the signing key is present and you have not exported one yourself.
 - **Saving a token repairs the item.** `set_password` *updates* in place, which
   needs access the new build does not have; when that fails the app deletes the
   item and creates a fresh one, which needs no such access.
