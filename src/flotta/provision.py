@@ -1095,7 +1095,7 @@ def upgrade_box(
     impl = _resolve_backend(box, backend)
     target = box.endpoint or box_id
     before = _peek_image(impl, target)
-    if before and before == target_image:
+    if before and _same_image(before, target_image):
         return {
             "box_id": box_id,
             "image": target_image,
@@ -1147,6 +1147,36 @@ def _fleet_image(env: Mapping[str, str] | None = None) -> str | None:
 
     source = os.environ if env is None else env
     return (source.get(IMAGE_ENV) or "").strip() or None
+
+
+def _same_image(a: str, b: str) -> bool:
+    """Whether two OCI references name the same image.
+
+    Not string equality, because the two sides are written differently and a
+    live machine proved it. Fly reports what a machine runs as
+
+        registry.fly.io/little-stream-574:deployment-01M1HY4…@sha256:715985…
+
+    — tag **and** digest — while `--image` and `$FLOTTA_FLY_IMAGE` are written
+    without the digest. Compared as strings those never match, so the
+    "already on this image" short-circuit never fires and every no-op upgrade
+    restarts the agent. That is the third time this comparison has been wrong
+    in the same way, and the first time against a real machine's output rather
+    than a fixture.
+
+    Digests win when both sides have one: that is the exact identity, and two
+    different digests are two different images whatever their tags say. With
+    only one digest there is nothing to compare it to, so the `name:tag` half
+    decides — safe here because Fly's deployment tags are unique per release
+    and never move. A registry where a tag *is* re-pointed would make this
+    read a moved tag as unchanged; passing the digest explicitly is the way to
+    be sure, and is why the digest branch exists at all.
+    """
+    left_a, _, digest_a = a.strip().partition("@")
+    left_b, _, digest_b = b.strip().partition("@")
+    if digest_a and digest_b:
+        return digest_a == digest_b
+    return left_a == left_b
 
 
 def _peek_image(impl: Backend, target: str) -> str | None:
