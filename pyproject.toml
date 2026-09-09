@@ -75,6 +75,16 @@ dev = [
     # extra-only test dependencies are how a test file goes quiet without
     # anyone noticing (see the M4.5 importorskip incident).
     "websockets>=13",
+    # And the same again, one file over. `test_store_postgres.py` skips without
+    # `$FLOTTA_TEST_POSTGRES_URL`, and the driver being extra-only meant that
+    # even *with* a server the run would have failed on the import — so the
+    # skip was load-bearing in the worst way. Having the driver here is what
+    # lets CI point at a service container and actually run the transaction
+    # guards, which are the one thing the hermetic suite provably cannot see.
+    #
+    # The `postgres` extra stays for *runtime*: someone pointing
+    # $FLOTTA_DATABASE_URL at a real server still opts in.
+    "psycopg[binary]>=3.1",
 ]
 
 [build-system]

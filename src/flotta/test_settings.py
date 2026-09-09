@@ -156,10 +156,7 @@ def test_describe_says_where_each_value_came_from(store):
     from outside, and the answer is usually a deployment variable still in
     play."""
     store.set_setting("FLOTTA_IDLE_AFTER_S", "300")
-    by_key = {
-        row["key"]: row
-        for row in describe(store, {"FLOTTA_RECONCILE_INTERVAL_S": "10"})
-    }
+    by_key = {row["key"]: row for row in describe(store, {"FLOTTA_RECONCILE_INTERVAL_S": "10"})}
 
     assert by_key["FLOTTA_IDLE_AFTER_S"]["value"] == "300"
     assert by_key["FLOTTA_IDLE_AFTER_S"]["source"] == "store"

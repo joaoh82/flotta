@@ -30,11 +30,11 @@ from flotta.store import (
 )
 
 #: Engines this suite runs against. Postgres is included only when
-#: `$FLOTTA_TEST_POSTGRES_URL` names a server, so `just check` stays hermetic,
+#: `$PYTEST_POSTGRES_URL` names a server, so `just check` stays hermetic,
 #: offline and $0 — and `just test-postgres` runs the *same* ~90 tests against a
 #: real server rather than a separate, smaller file that could drift.
 _ENGINES = ["sqlite"]
-if os.environ.get("FLOTTA_TEST_POSTGRES_URL", "").strip():
+if os.environ.get("PYTEST_POSTGRES_URL", "").strip():
     _ENGINES.append("postgres")
 
 
@@ -59,7 +59,7 @@ def store(request, tmp_path):
 
     import psycopg
 
-    url = os.environ["FLOTTA_TEST_POSTGRES_URL"].strip()
+    url = os.environ["PYTEST_POSTGRES_URL"].strip()
     schema = f"t{uuid.uuid4().hex[:12]}"
     admin = psycopg.connect(url, autocommit=True)
     admin.execute(f'CREATE SCHEMA "{schema}"')
