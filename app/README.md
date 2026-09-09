@@ -51,6 +51,27 @@ token goes in the keychain. On macOS you can confirm that:
 security find-generic-password -s dev.flotta.app -a control-plane-token
 ```
 
+## Info: the store's belief, and the substrate's answer
+
+Every read in this window comes from the fleet store, which is a *belief* — a
+row written by whatever last reached the machine. The list is right to use it:
+it is cheap, and every verb that touches a box updates it. But it means the app
+could not say what image an agent runs, how big its disk is, or whether the row
+was even still true.
+
+`⋯ → Info` asks the substrate (`GET /api/boxes/{id}/machine`) and shows the
+answer **beside** the row rather than instead of it. When they disagree — a row
+saying `running` about a machine Fly stopped during a host drain, an agent
+woken through the door before the row caught up — the panel says so. Merging
+them into one status would mean silently picking a winner.
+
+It is fetched on open and on Recheck, **never on a timer**: it is a `flyctl`
+subprocess on the control plane. The list keeps polling the store, which is
+what makes a status change show up without anyone pressing Refresh.
+
+Which Hermes version an image carries is still recorded nowhere — the image tag
+is the closest thing until FLOTTA-43.
+
 ## Development: the keychain and rebuilt binaries
 
 An unsigned binary's keychain ACL is tied to that exact binary. Every `cargo`

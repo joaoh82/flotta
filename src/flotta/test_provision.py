@@ -156,6 +156,14 @@ class FakeBackend:
     def image_of(self, box_id):
         return self.image
 
+    def inspect(self, box_id):
+        """Read-only, and it must stay that way: `calls` is what the provision
+        tests assert on, so a verb that recorded itself here would make every
+        one of them care whether a panel had been opened."""
+        from flotta.backend import MachineInfo
+
+        return MachineInfo(state=self.machine_state, image=self.image)
+
     def destroy(self, box_id):
         self.calls.append("destroy")
         self.machine_state = "gone"

@@ -171,6 +171,64 @@ pub struct FleetSetting {
     pub source: String,
 }
 
+/// What the substrate says about a box's machine, right now.
+///
+/// Every other read the app makes is the store's **belief** — written by
+/// whatever last reached the substrate. Usually the two agree. When they do
+/// not, that is the interesting part: Fly stops a machine during a host drain
+/// and the row still says `running`; an agent upgraded from another laptop
+/// runs an image this fleet's row has never mentioned.
+///
+/// So the panel shows both, unmerged. Every field but `state` is optional
+/// because this is `flyctl`'s JSON at two removes, and a key that moves should
+/// blank one line rather than fail the whole read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Machine {
+    pub state: String,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub app: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub cpu_kind: Option<String>,
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub volume_id: Option<String>,
+    #[serde(default)]
+    pub volume_gb: Option<u32>,
+    #[serde(default)]
+    pub volume_path: Option<String>,
+    #[serde(default)]
+    pub private_ip: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub host_status: Option<String>,
+}
+
+/// The row and the machine together, plus why the machine is missing when it
+/// is. All three are needed: a panel with no row has nothing to show while the
+/// substrate is unreachable, and a missing machine with no reason is the
+/// "No agents yet" failure again, one screen along.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MachineView {
+    #[serde(rename = "box")]
+    pub row: BoxRow,
+    #[serde(default)]
+    pub machine: Option<Machine>,
+    #[serde(default)]
+    pub unavailable: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct SettingList {
     settings: Vec<FleetSetting>,
@@ -384,6 +442,22 @@ fn classify(status: u16, path: &str, body: &str) -> Option<FleetError> {
                 .into(),
         ));
     }
+    // The same skew, one endpoint later — but here 404 is genuinely ambiguous:
+    // this route answers it for an agent that does not exist, and FastAPI
+    // answers it for a route that does not exist. They are told apart by the
+    // body: the endpoint's 404 names the box (`no box 'eng-q'`), while a
+    // missing route is FastAPI's bare `Not Found`.
+    if status == 404 && path.ends_with("/machine") {
+        let detail = detail_of(body);
+        if detail.is_none() || detail.as_deref() == Some("Not Found") {
+            return Some(FleetError::Unexpected(
+                "this control plane is older than the app and cannot report machine \
+                 details yet. Deploy the current version of the control plane."
+                    .into(),
+            ));
+        }
+        return Some(FleetError::Unexpected(detail.unwrap()));
+    }
     if !(200..300).contains(&status) {
         return Some(FleetError::Unexpected(format!(
             "{path} answered {status}: {}",
@@ -569,6 +643,22 @@ pub async fn box_events(settings: &Settings, id: &str) -> Result<Vec<BoxEvent>, 
     serde_json::from_str::<EventList>(&body)
         .map(|list| list.events)
         .map_err(|e| FleetError::Unexpected(format!("unreadable timeline: {e}")))
+}
+
+/// What the substrate says about one agent's machine.
+///
+/// **Never polled.** It is a `flyctl` subprocess on the control plane, so it
+/// is asked when a person opens the panel and not on a timer. The list view
+/// stays on the store, which is cheap and, for status, written by every verb
+/// that touches a box.
+pub async fn machine(settings: &Settings, id: &str) -> Result<MachineView, FleetError> {
+    let body = get(
+        settings,
+        &format!("/api/boxes/{}/machine", encode_segment(id)),
+    )
+    .await?;
+    serde_json::from_str::<MachineView>(&body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable machine info: {e}")))
 }
 
 #[cfg(test)]
@@ -850,5 +940,97 @@ mod tests {
             .expect("must parse")
             .events;
         assert!(events[0].payload.is_none() || events[0].payload.as_ref().unwrap().is_null());
+    }
+
+    // -- the machine panel -------------------------------------------------
+
+    /// A real `GET /api/boxes/eng-g/machine` body, trimmed. Invented JSON
+    /// would pin the shape I assumed rather than the one the control plane
+    /// sends.
+    const MACHINE_BODY: &str = r#"{
+      "box": {"id": "b-79c6ca696e62", "name": "eng-g", "status": "stopped",
+              "endpoint": "fly://joaoh82-flotta-eng-g/815990c9246728"},
+      "machine": {"state": "started", "machine_id": "815990c9246728",
+                  "app": "joaoh82-flotta-eng-g", "region": "ams",
+                  "image": "registry.fly.io/joaoh82-flotta-images:deployment-01M2@sha256:bbaf",
+                  "cpu_kind": "shared", "cpus": 1, "memory_mb": 1024,
+                  "volume_id": "vol_vwnl2n2zqend82nv", "volume_gb": 2,
+                  "volume_path": "/data", "private_ip": "fdaa:bd::2",
+                  "created_at": "2026-09-08T21:00:43Z",
+                  "updated_at": "2026-09-09T19:58:47Z", "host_status": "ok"},
+      "unavailable": null
+    }"#;
+
+    #[test]
+    fn a_machine_body_parses_whole() {
+        let view: MachineView = serde_json::from_str(MACHINE_BODY).unwrap();
+        let machine = view.machine.expect("a machine");
+
+        assert_eq!(view.row.name, "eng-g");
+        assert_eq!(machine.state, "started");
+        assert_eq!(machine.region.as_deref(), Some("ams"));
+        assert_eq!(machine.volume_id.as_deref(), Some("vol_vwnl2n2zqend82nv"));
+        assert_eq!(machine.memory_mb, Some(1024));
+        assert!(view.unavailable.is_none());
+    }
+
+    #[test]
+    fn the_row_survives_a_machine_that_could_not_be_read() {
+        // The panel must still render: without the row it has nothing to show
+        // while the substrate is unreachable, which is when a person is most
+        // likely to be looking at it.
+        let body = r#"{"box": {"id": "b-1", "name": "eng-a", "status": "running"},
+                       "machine": null,
+                       "unavailable": "flyctl: not authenticated"}"#;
+        let view: MachineView = serde_json::from_str(body).unwrap();
+
+        assert!(view.machine.is_none());
+        assert_eq!(
+            view.unavailable.as_deref(),
+            Some("flyctl: not authenticated")
+        );
+        assert_eq!(view.row.name, "eng-a");
+    }
+
+    #[test]
+    fn a_machine_missing_every_optional_field_still_parses() {
+        // `state` is the only thing the substrate always knows. Everything
+        // else is one external tool's JSON, and a moved key must cost a blank
+        // line in a panel rather than the whole read.
+        let body = r#"{"box": {"id": "b-1", "name": "eng-a", "status": "running"},
+                       "machine": {"state": "gone"}}"#;
+        let view: MachineView = serde_json::from_str(body).unwrap();
+        let machine = view.machine.expect("a machine");
+
+        assert_eq!(machine.state, "gone");
+        assert!(machine.image.is_none() && machine.cpus.is_none());
+        assert!(view.unavailable.is_none());
+    }
+
+    #[test]
+    fn an_old_control_plane_says_so_rather_than_answering_404() {
+        // The app is on a laptop and the control plane is deployed elsewhere,
+        // so a window running ahead of its fleet is normal. "answered 404: Not
+        // Found" is true and reads as the app being broken.
+        match classify(404, "/api/boxes/eng-a/machine", r#"{"detail":"Not Found"}"#) {
+            Some(FleetError::Unexpected(detail)) => {
+                assert!(detail.contains("older than the app"), "{detail}");
+            }
+            other => panic!("expected a version-skew message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_agent_is_not_reported_as_a_stale_deployment() {
+        // The same status on the same path, meaning the opposite thing. Told
+        // apart by the body, because nothing else distinguishes them.
+        match classify(
+            404,
+            "/api/boxes/eng-q/machine",
+            r#"{"detail":"no box 'eng-q'"}"#,
+        ) {
+            Some(FleetError::Unexpected(detail)) => assert_eq!(detail, "no box 'eng-q'"),
+            other => panic!("expected the API's own reason, got {other:?}"),
+        }
     }
 }

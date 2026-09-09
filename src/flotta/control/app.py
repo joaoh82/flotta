@@ -633,6 +633,51 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/boxes/{box_id}/machine")
+    def get_machine(box_id: str, _: Token | None = needs_read) -> Any:
+        """What the substrate says about this box's machine, beside the row.
+
+        Every other read the app makes is the store's *belief*. This is the one
+        that asks. Both are returned, unmerged and unreconciled, because the
+        disagreements are the interesting part — a row saying `running` about a
+        machine Fly stopped during a host drain is a real thing that happens,
+        and a single blended answer would hide precisely it.
+
+        **Never 500s on the substrate.** A person clicked "Info"; `flyctl`
+        being unreachable, slow, or logged out is an answer to render
+        (`unavailable`), not a failed request. The row is always returned, so
+        the panel has something to show either way.
+
+        Not polled, and it must not become polled: it is a subprocess per call.
+        The list view stays on the store, which is cheap and, for status, kept
+        current by every verb that touches a box.
+        """
+        from flotta.backend import BackendError, backend_for
+
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            row = _box_dict(box)
+            if not box.endpoint:
+                # Not a failure: a box being built has no machine yet, which is
+                # the honest thing to say rather than an error about flyctl.
+                return {
+                    "box": row,
+                    "machine": None,
+                    "unavailable": "this agent has no machine yet",
+                }
+            try:
+                info = backend_for(box.endpoint).inspect(box.endpoint)
+            except (BackendError, OSError, NotImplementedError) as exc:
+                return {"box": row, "machine": None, "unavailable": str(exc)}
+            from dataclasses import asdict
+
+            return {"box": row, "machine": asdict(info), "unavailable": None}
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}/repos")
     def list_repos(box_id: str, _: Token | None = needs_read) -> Any:
         """Which repositories a box may use."""

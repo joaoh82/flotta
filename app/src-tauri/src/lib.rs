@@ -206,6 +206,18 @@ async fn agent_timeline(
     fleet::box_events(&read_settings(&app), &id).await
 }
 
+/// What the substrate says about an agent's machine — image, region, disk.
+///
+/// The one read that goes past the store. Costs a subprocess on the control
+/// plane, so it happens when a person opens the panel, never on a timer.
+#[tauri::command]
+async fn agent_machine(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<fleet::MachineView, FleetError> {
+    fleet::machine(&read_settings(&app), &id).await
+}
+
 /// Destroy an agent. `confirm` must be the agent's own name.
 ///
 /// The confirmation is checked here, not only in the UI, because this is the
@@ -309,6 +321,7 @@ pub fn run() {
             fleet_settings,
             set_fleet_settings,
             agent_timeline,
+            agent_machine,
             destroy_agent
         ])
         .run(tauri::generate_context!())
