@@ -484,6 +484,46 @@ def _remote_box(box_id: str) -> dict[str, Any]:
     return box
 
 
+def _newest_event_id(box_id: str) -> int:
+    """The id of the box's newest event, or 0. Best-effort by construction."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    try:
+        body = control_request(
+            "GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,)
+        )
+    except Exception:  # noqa: BLE001 - a marker that cannot be read is just 0
+        return 0
+    events = (body or {}).get("events") or []
+    return max((int(e.get("id") or 0) for e in events), default=0)
+
+
+def _upgrade_landed(box_id: str, since: int) -> dict[str, Any] | None:
+    """The `reimaged` event this attempt produced, if the work happened anyway.
+
+    A request that dies in transit says nothing about whether the work
+    completed. `POST /api/boxes` proved that the expensive way: a proxy
+    answered `502 Application failed to respond` at 60s while the provision
+    carried on, so the caller was told it had failed and a machine appeared.
+
+    The event log settles it. `upgrade_box` writes `reimaged` only after the
+    substrate call returns, so an event newer than the marker means the upgrade
+    landed and the connection is what broke.
+    """
+    from flotta.auth import SCOPE_FLEET_READ
+
+    try:
+        body = control_request(
+            "GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,)
+        )
+    except Exception:  # noqa: BLE001 - report the original failure instead
+        return None
+    for event in reversed((body or {}).get("events") or []):
+        if event.get("type") == "reimaged" and int(event.get("id") or 0) > since:
+            return event.get("payload") or {}
+    return None
+
+
 def _fail(exc: Exception, code: int = 1):
     typer.secho(str(exc), fg=typer.colors.RED, err=True)
     return typer.Exit(code=code)
@@ -1037,7 +1077,61 @@ def upgrade(
 
     Not destroy-and-recreate: `flotta kill` takes the volume, and the volume is
     the agent. Costs a restart, like any secret rotation.
+
+    Goes through the control plane when `$FLOTTA_CONTROL_URL` is set, for the
+    reason `repo` does: a store-first command cannot see a deployed fleet, and
+    the alternative is putting the production database URL on a laptop. Shipped
+    without this once — which made the command unusable against every fleet
+    that actually exists.
     """
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if control_url():
+        try:
+            box = _remote_box(box_id)
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+
+        # What the timeline said before the attempt, so a request that dies in
+        # transit can still be answered truthfully. See `_upgrade_landed`.
+        before_events = _newest_event_id(box["id"])
+        try:
+            body = control_request(
+                "POST",
+                f"/api/boxes/{box['id']}/upgrade",
+                scopes=(SCOPE_FLEET_WRITE,),
+                body={"image": image} if image else {},
+                # `flyctl machine update` waits up to 300s; 30 would report a
+                # timeout on an upgrade that was going fine.
+                timeout_s=300.0,
+            )
+        except ControlPlaneError as exc:
+            # A proxy in front of the control plane cut `POST /api/boxes` at 60s
+            # once already, answering 502 while the work carried on. Rather than
+            # repeat that lie, ask the box what happened: the `reimaged` event
+            # is written on success, so the timeline is the ground truth and a
+            # dropped connection does not have to mean a failed upgrade.
+            landed = _upgrade_landed(box["id"], before_events)
+            if landed is None:
+                raise _fail(exc) from exc
+            emit(
+                {"box_id": box["id"], "image": landed.get("to"), "recovered": True},
+                f"{box['name']}  the request did not come back ({exc}), but the "
+                f"upgrade landed: now on {landed.get('to')}",
+                as_json=as_json,
+            )
+            return
+
+        if body.get("already_current"):
+            emit(body, f"{box['name']}  already on {body['image']}", as_json=as_json)
+            return
+        emit(
+            body,
+            f"{box['name']}  {body.get('previous_image') or '(unknown)'} -> {body['image']}",
+            as_json=as_json,
+        )
+        return
+
     provision = _provision()
 
     with _open_store(store) as fleet:
