@@ -210,6 +210,7 @@ def test_the_backend_satisfies_the_protocol():
         "exec",
         "state",
         "endpoint",
+        "inspect",
     ],
 )
 def test_every_protocol_verb_exists(verb):
@@ -609,3 +610,120 @@ def test_reimaging_a_running_box_leaves_it_running():
     update = next(c for c in issued if "update" in c)
     assert "--skip-start" not in update, update
     assert "--skip-health-checks" not in update, "a box that will not boot must fail loudly"
+
+
+# -- inspect: the substrate's own account of a machine ----------------------
+#
+# The fixture is a real `flyctl machines list --json` record, trimmed —
+# captured from `eng-g` after its upgrade. Invented JSON would pin the shape I
+# assumed rather than the shape flyctl emits, and this file has already been
+# wrong about `image_ref` once.
+
+_LIVE_MACHINE = {
+    "id": "815990c9246728",
+    "name": "eng-g",
+    "state": "started",
+    "region": "ams",
+    "image_ref": {
+        "registry": "registry.fly.io",
+        "repository": "joaoh82-flotta-images",
+        "tag": "deployment-01M23SRMHTJZQEP4ZDWQAPZXE1",
+        "digest": "sha256:bbaf60bf20a7",
+    },
+    "private_ip": "fdaa:bd:1a14:a7b:330:bcbb:5361:2",
+    "created_at": "2026-09-08T21:00:43Z",
+    "updated_at": "2026-09-09T19:58:47Z",
+    "host_status": "ok",
+    "config": {
+        "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 1024},
+        "mounts": [
+            {
+                "path": "/data",
+                "size_gb": 2,
+                "volume": "vol_vwnl2n2zqend82nv",
+                "name": "flotta_data",
+            }
+        ],
+        "image": (
+            "registry.fly.io/joaoh82-flotta-images:"
+            "deployment-01M23SRMHTJZQEP4ZDWQAPZXE1@sha256:bbaf60bf20a7"
+        ),
+    },
+}
+
+
+def _listing(machines):
+    import json as _json
+    import subprocess
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        assert "list" in cmd, f"inspect must only list, never act: {cmd}"
+        return subprocess.CompletedProcess(cmd, 0, _json.dumps(machines), "")
+
+    return runner
+
+
+def _inspecting(machines):
+    return FlyBackend(config=_offline_config(), runner=_listing(machines)).inspect(
+        "fly://joaoh82-flotta-eng-g/815990c9246728"
+    )
+
+
+def test_inspect_reports_what_the_substrate_says():
+    """The whole panel, from one call — that is the point of the verb."""
+    info = _inspecting([_LIVE_MACHINE])
+
+    assert info.state == "started"
+    assert info.machine_id == "815990c9246728"
+    assert info.app == "joaoh82-flotta-eng-g"
+    assert info.region == "ams"
+    assert (info.cpu_kind, info.cpus, info.memory_mb) == ("shared", 1, 1024)
+    assert (info.volume_id, info.volume_gb, info.volume_path) == (
+        "vol_vwnl2n2zqend82nv",
+        2,
+        "/data",
+    )
+    assert info.created_at == "2026-09-08T21:00:43Z"
+    assert info.host_status == "ok"
+
+
+def test_inspect_reports_the_fully_qualified_image():
+    """Same preference as `image_of`, and the reason it is shared code.
+
+    A panel showing `joaoh82-flotta-images` cannot be compared by eye with the
+    `registry.fly.io/…@sha256:…` a deploy prints — and the bare form is what
+    the `image_ref` fallback yields, which is how the upgrade short-circuit
+    silently stopped matching.
+    """
+    assert _inspecting([_LIVE_MACHINE]).image == _LIVE_MACHINE["config"]["image"]
+
+
+def test_inspect_composes_an_image_when_there_is_no_config_image():
+    machine = {**_LIVE_MACHINE, "config": {}}
+    assert _inspecting([machine]).image == (
+        "registry.fly.io/joaoh82-flotta-images:deployment-01M23SRMHTJZQEP4ZDWQAPZXE1"
+    )
+
+
+def test_inspect_says_gone_rather_than_raising():
+    """A row naming a machine the substrate has never heard of is a thing the
+    app must be able to *display* — it is the orphan case, and an exception
+    would render as "Info is broken"."""
+    info = _inspecting([])
+    assert info.state == "gone"
+    assert info.machine_id == "815990c9246728"
+    assert info.image is None
+
+
+def test_inspect_blanks_a_moved_key_instead_of_raising():
+    """This is one external tool's JSON. A person clicked Info; half a panel
+    beats a traceback, which is the same call `image_of` makes."""
+    info = _inspecting([{"id": "815990c9246728", "state": "suspended"}])
+    assert info.state == "suspended"
+    assert (info.region, info.cpus, info.volume_id, info.image) == (None, None, None, None)
+
+
+def test_inspect_never_acts_on_the_machine():
+    """Read-only by construction, not by intention: the stub runner fails the
+    test if `inspect` ever issues anything but a list."""
+    assert _inspecting([_LIVE_MACHINE]).state == "started"

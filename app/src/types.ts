@@ -16,6 +16,46 @@ export type BoxRow = {
 };
 
 /**
+ * What the substrate says about a machine. Mirrors `Machine` in
+ * `src-tauri/src/fleet.rs`, which mirrors `MachineInfo` in `backend.py`.
+ *
+ * Everything but `state` is optional at all three layers, deliberately: this
+ * is `flyctl`'s JSON, and a key that moves should blank one line of a panel
+ * rather than break the read.
+ */
+export type Machine = {
+  state: string;
+  machine_id?: string | null;
+  app?: string | null;
+  image?: string | null;
+  region?: string | null;
+  cpu_kind?: string | null;
+  cpus?: number | null;
+  memory_mb?: number | null;
+  volume_id?: string | null;
+  volume_gb?: number | null;
+  volume_path?: string | null;
+  private_ip?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  host_status?: string | null;
+};
+
+/**
+ * The row and the machine, unmerged.
+ *
+ * Both, because they can disagree and the disagreement is the interesting
+ * part. `unavailable` says why there is no machine — no substrate reached, or
+ * no machine yet — which is the difference between "Info is broken" and "this
+ * agent is still being built".
+ */
+export type MachineView = {
+  box: BoxRow;
+  machine?: Machine | null;
+  unavailable?: string | null;
+};
+
+/**
  * One line of a box's timeline. Mirrors `BoxEvent` in `src-tauri/src/fleet.rs`.
  *
  * `payload` is untyped on purpose — its shape depends on `type`, and the app

@@ -30,6 +30,7 @@ from flotta.backend import (
     BoxHandle,
     BoxSpec,
     ExecResult,
+    MachineInfo,
     NotSupported,
 )
 from flotta.fly import IMAGE_ENV, FlyConfig
@@ -293,22 +294,74 @@ class FlyBackend:
         """
         app, machine_id = self._addr(box_id)
         for machine in self._machines(app):
+            if machine.get("id") == machine_id:
+                return self._image_from(machine)
+        return None
+
+    @staticmethod
+    def _image_from(machine: dict) -> str | None:
+        """The parsing half of `image_of`, shared with `inspect`.
+
+        Extracted rather than duplicated because the preference order is the
+        bug: a second copy that reached for `image_ref.repository` first would
+        make one caller compare bare names and the other fully-qualified ones,
+        which is the exact mismatch that made every upgrade restart the agent.
+        """
+        config = machine.get("config") or {}
+        direct = config.get("image") or machine.get("image")
+        if direct:
+            return str(direct)
+        ref = machine.get("image_ref") or {}
+        if not isinstance(ref, dict) or not ref.get("repository"):
+            return None
+        name = "/".join(p for p in (ref.get("registry"), ref.get("repository")) if p)
+        if ref.get("tag"):
+            return f"{name}:{ref['tag']}"
+        if ref.get("digest"):
+            return f"{name}@{ref['digest']}"
+        return name
+
+    def inspect(self, box_id: str) -> MachineInfo:
+        """One `machines list`, parsed into the protocol's shape.
+
+        Defensive to the same degree as `image_of`, and for the same reason:
+        this is `flyctl`'s JSON, not ours. A key that moves should blank one
+        line of a panel, never raise — the caller is a person who clicked
+        "Info", and half an answer beats a traceback.
+
+        A machine that is not there answers `state="gone"` rather than raising,
+        which is the honest reading of "the row names a machine and the
+        substrate has never heard of it" — and exactly what the app should be
+        able to display.
+        """
+        app, machine_id = self._addr(box_id)
+        for machine in self._machines(app):
             if machine.get("id") != machine_id:
                 continue
             config = machine.get("config") or {}
-            direct = config.get("image") or machine.get("image")
-            if direct:
-                return str(direct)
-            ref = machine.get("image_ref") or {}
-            if not isinstance(ref, dict) or not ref.get("repository"):
-                return None
-            name = "/".join(p for p in (ref.get("registry"), ref.get("repository")) if p)
-            if ref.get("tag"):
-                return f"{name}:{ref['tag']}"
-            if ref.get("digest"):
-                return f"{name}@{ref['digest']}"
-            return name
-        return None
+            guest = config.get("guest") or {}
+            mounts = config.get("mounts") or []
+            mount = mounts[0] if mounts and isinstance(mounts[0], dict) else {}
+            return MachineInfo(
+                state=str(machine.get("state") or "unknown"),
+                machine_id=machine_id,
+                app=app,
+                # The same preference `image_of` documents: `config.image` is
+                # the only fully-qualified form.
+                image=self._image_from(machine),
+                region=machine.get("region"),
+                cpu_kind=guest.get("cpu_kind"),
+                cpus=guest.get("cpus"),
+                memory_mb=guest.get("memory_mb"),
+                volume_id=mount.get("volume"),
+                volume_gb=mount.get("size_gb"),
+                volume_path=mount.get("path"),
+                private_ip=machine.get("private_ip"),
+                created_at=machine.get("created_at"),
+                updated_at=machine.get("updated_at"),
+                host_status=machine.get("host_status"),
+            )
+        return MachineInfo(state="gone", machine_id=machine_id, app=app)
 
     def existing_endpoint(self, box_name: str | None = None) -> str | None:
         """The endpoint `create` would adopt for this name, without creating it.

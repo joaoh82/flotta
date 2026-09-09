@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { AgentInfo } from "./AgentInfo";
 import { AgentTimeline } from "./AgentTimeline";
 import { Conversation } from "./Conversation";
 import { DestroyAgent } from "./DestroyAgent";
@@ -110,6 +111,9 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   const [destroying, setDestroying] = useState<BoxRow | null>(null);
+  /** The agent whose machine is being inspected, and whose row menu is open. */
+  const [info, setInfo] = useState<BoxRow | null>(null);
+  const [menuFor, setMenuFor] = useState<string | null>(null);
   /**
    * The agent we just made, until it is either talkable-to or gone.
    *
@@ -214,16 +218,27 @@ export default function App() {
     void reload();
   }, [reload]);
 
-  const building = boxes.some((box) => box.status === "provisioning");
-
-  // Poll while anything is unfinished, and only then. A fleet that is entirely
-  // running or asleep changes when somebody changes it, and the Refresh button
-  // is how you ask.
+  // Poll while the window is showing the fleet — not only while something the
+  // *app* started is unfinished.
+  //
+  // This used to stop as soon as nothing was provisioning, on the reasoning
+  // that "a fleet that is entirely running or asleep changes when somebody
+  // changes it". That is wrong, and it is wrong in the way the whole product
+  // is about: a box wakes because anyone talked to it through the door, from
+  // any machine, and goes back to sleep because the idle sweep put it down.
+  // Neither passes through this window. So an agent that had just been woken
+  // sat there labelled `stopped` until somebody thought to press Refresh —
+  // the window telling a lie with total confidence, which is the failure
+  // FLOTTA-29 was supposed to have ended.
+  //
+  // It is a store read, so it costs the control plane a query and no
+  // substrate call at all. What is emphatically *not* on this timer is the
+  // machine panel, which shells out to `flyctl`.
   useEffect(() => {
-    if (showSettings || (!building && !watching)) return;
+    if (showSettings) return;
     const timer = setInterval(() => void poll(), POLL_MS);
     return () => clearInterval(timer);
-  }, [building, watching, showSettings, poll]);
+  }, [showSettings, poll]);
 
   // Stop watching once the answer is in. Both endings settle it: the agent is
   // addressable, or it is no longer in the fleet and the timeline says why.
@@ -341,10 +356,20 @@ export default function App() {
               )}
               <ul className="min-h-0 flex-1 divide-y divide-neutral-100 overflow-auto">
               {boxes.map((box) => (
-                <li key={box.id}>
+                <li key={box.id} className="group relative">
+                  {/* The menu is a sibling of the row button, not inside it: a
+                      button within a button is invalid, and the browser's
+                      recovery is to drop one of them. */}
                   <button
-                    onClick={() => setSelected(box.name)}
-                    className={`w-full px-4 py-3 text-left hover:bg-neutral-50 ${
+                    onClick={() => {
+                      setSelected(box.name);
+                      // Selecting an agent leaves Info. Otherwise the panel
+                      // stays open showing the machine of the agent you just
+                      // navigated away from, which is the most confusing thing
+                      // a panel about "what is actually true" could do.
+                      setInfo(null);
+                    }}
+                    className={`w-full px-4 py-3 pr-9 text-left hover:bg-neutral-50 ${
                       selected === box.name ? "bg-neutral-100" : ""
                     }`}
                   >
@@ -370,6 +395,53 @@ export default function App() {
                       </p>
                     )}
                   </button>
+
+                  <button
+                    aria-label={`Actions for ${box.name}`}
+                    onClick={() => setMenuFor((open) => (open === box.id ? null : box.id))}
+                    className="absolute right-1.5 top-2.5 rounded px-1.5 py-0.5 text-neutral-400 opacity-0 hover:bg-neutral-200 hover:text-neutral-700 focus:opacity-100 group-hover:opacity-100"
+                  >
+                    ⋯
+                  </button>
+
+                  {menuFor === box.id && (
+                    <>
+                      {/* A backdrop rather than a document listener: it closes
+                          on any click outside, including one that would have
+                          opened another menu, without this component reaching
+                          outside its own tree. */}
+                      <button
+                        aria-label="Close menu"
+                        onClick={() => setMenuFor(null)}
+                        className="fixed inset-0 z-10 cursor-default"
+                      />
+                      <div className="absolute right-1.5 top-8 z-20 w-36 overflow-hidden rounded border border-neutral-200 bg-white py-1 shadow-lg">
+                        <button
+                          onClick={() => {
+                            setInfo(box);
+                            setSelected(box.name);
+                            setMenuFor(null);
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs hover:bg-neutral-100"
+                        >
+                          Info
+                        </button>
+                        {/* Destroy lived only in the conversation header, which
+                            meant an agent you could not open — one whose
+                            provision failed — had no way to be got rid of from
+                            the window at all. */}
+                        <button
+                          onClick={() => {
+                            setDestroying(box);
+                            setMenuFor(null);
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs text-red-700 hover:bg-red-50"
+                        >
+                          Destroy
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </li>
               ))}
               </ul>
@@ -377,15 +449,30 @@ export default function App() {
             </div>
 
             <div className="flex min-w-0 flex-1 flex-col">
+              {/* Info wins over the conversation while it is open: it was asked
+                  for about a specific agent, and closing it returns to
+                  whatever the pane would otherwise show. Destroy still wins
+                  over both — it is a confirmation, and burying it under a
+                  panel would be a way to lose it. */}
               {destroying ? (
                 <DestroyAgent
                   box={destroying}
                   onCancel={() => setDestroying(null)}
                   onDestroyed={() => {
                     if (selected === destroying.name) setSelected(null);
+                    if (info?.id === destroying.id) setInfo(null);
                     setDestroying(null);
                     void refresh();
                   }}
+                />
+              ) : info ? (
+                <AgentInfo
+                  key={info.id}
+                  // The freshest row for this agent, so an Info panel left open
+                  // while the list polls does not keep showing the status the
+                  // agent had when it was opened.
+                  box={boxes.find((b) => b.id === info.id) ?? info}
+                  onClose={() => setInfo(null)}
                 />
               ) : selectedBox && isAddressable(selectedBox.status) ? (
                 <>

@@ -143,6 +143,48 @@ class BoxHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class MachineInfo:
+    """What the substrate says about a box's machine, right now.
+
+    Every other read in the app comes from the store, and the store is a
+    *belief* — written by whatever last reached the substrate, which for a box
+    nobody has touched in a week is a week-old sentence. Most of the time the
+    two agree. The times they do not are the ones worth seeing: Fly stops a
+    machine during a host drain and the row still says `running`; an agent
+    upgraded from another laptop runs an image this fleet's row never mentions.
+
+    So this is deliberately *not* merged into the box row. The app shows both
+    and says when they disagree — a single reconciled number would be the
+    window telling you a comfortable story about which source it picked.
+
+    Every field but `state` is optional, because this is one external tool's
+    JSON and a moved key should cost a blank line in a panel rather than an
+    exception on a read a human asked for.
+    """
+
+    #: The substrate's own word: `started`, `stopped`, `suspended`, `gone`.
+    state: str
+    machine_id: str | None = None
+    app: str | None = None
+    #: Fully qualified, digest included when the substrate reports one — the
+    #: form `--image` is written in, so it can be compared with a fleet image.
+    image: str | None = None
+    region: str | None = None
+    cpu_kind: str | None = None
+    cpus: int | None = None
+    memory_mb: int | None = None
+    #: The disk, which on this fleet *is* the agent. Its id surviving an
+    #: upgrade is the proof that the memory did.
+    volume_id: str | None = None
+    volume_gb: int | None = None
+    volume_path: str | None = None
+    private_ip: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    host_status: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ExecResult:
     exit_code: int
     stdout: str
@@ -226,6 +268,21 @@ class Backend(Protocol):
 
     def state(self, box_id: str) -> str:
         """The substrate's own view: `started`, `stopped`, `suspended`, `gone`."""
+        ...
+
+    def inspect(self, box_id: str) -> MachineInfo:
+        """Everything the substrate knows about this machine, in one call.
+
+        `state` answers one question and this answers the rest — image, region,
+        size, disk — because they arrive together. On Fly they are fields of a
+        single `machines list`, and asking six times for six fields would make
+        an info panel six subprocesses deep.
+
+        Read-only, and the only protocol verb that is. It exists for a window,
+        not for a control path: nothing in `provision` may branch on it, or the
+        fleet starts deciding things from a shape one substrate happens to
+        report.
+        """
         ...
 
     def endpoint(self, box_id: str) -> str:

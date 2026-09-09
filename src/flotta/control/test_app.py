@@ -1295,3 +1295,85 @@ def test_a_substrate_failure_upgrading_is_502_not_409(client, monkeypatch):
     response = client.post("/api/boxes/eng-a/upgrade", json={})
     assert response.status_code == 502
     assert "flyctl exploded" in response.json()["detail"]
+
+
+# -- the machine panel ------------------------------------------------------
+
+
+def _fake_backend(monkeypatch, inspect):
+    """Swap the substrate lookup the endpoint resolves through."""
+    from flotta import backend as backend_mod
+
+    class Fake:
+        scheme = "fly"
+
+        def inspect(self, box_id):
+            return inspect(box_id)
+
+    monkeypatch.setattr(backend_mod, "backend_for", lambda endpoint: Fake())
+
+
+def test_the_machine_endpoint_returns_the_row_and_the_substrate_unmerged(
+    client, monkeypatch
+):
+    """Both, side by side, because the disagreements are the point.
+
+    A merged answer would have to pick a winner, and the app would then be
+    reporting a choice it never told anyone it made.
+    """
+    from flotta.backend import MachineInfo
+
+    _fake_backend(
+        monkeypatch,
+        lambda box_id: MachineInfo(state="started", region="ams", image="reg/x:tag"),
+    )
+    body = client.get("/api/boxes/eng-a/machine").json()
+
+    assert body["box"]["status"] == "running"
+    assert body["machine"]["state"] == "started"
+    assert body["machine"]["region"] == "ams"
+    assert body["unavailable"] is None
+
+
+def test_the_machine_endpoint_reports_a_substrate_failure_rather_than_500ing(
+    client, monkeypatch
+):
+    """A person clicked Info. `flyctl` being logged out is something to render,
+    not a failed request — and the row must still arrive so the panel has
+    something to show."""
+    from flotta.backend import BackendError
+
+    def boom(box_id):
+        raise BackendError("flyctl: not authenticated")
+
+    _fake_backend(monkeypatch, boom)
+    response = client.get("/api/boxes/eng-a/machine")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["machine"] is None
+    assert "not authenticated" in body["unavailable"]
+    assert body["box"]["name"] == "eng-a"
+
+
+def test_a_box_with_no_machine_yet_is_not_an_error(client, fleet, monkeypatch):
+    """`provisioning` has a row and no endpoint. Saying "no machine yet" is the
+    truth; an error about the substrate would be a lie about a creation that is
+    going perfectly well — FLOTTA-29's exact shape."""
+
+    def never(box_id):  # pragma: no cover - the endpoint must not reach here
+        raise AssertionError("must not ask the substrate about a box with no endpoint")
+
+    _fake_backend(monkeypatch, never)
+    with FleetStore(fleet) as store:
+        assert store.create_box("eng-new").endpoint is None
+
+    body = client.get("/api/boxes/eng-new/machine").json()
+
+    assert body["machine"] is None
+    assert body["unavailable"] == "this agent has no machine yet"
+    assert body["box"]["status"] == "provisioning"
+
+
+def test_the_machine_endpoint_404s_for_a_box_that_does_not_exist(client):
+    assert client.get("/api/boxes/nope/machine").status_code == 404
