@@ -1316,9 +1316,7 @@ def _fake_backend(monkeypatch, inspect):
     monkeypatch.setattr(backend_mod, "backend_for", lambda endpoint: Fake())
 
 
-def test_the_machine_endpoint_returns_the_row_and_the_substrate_unmerged(
-    client, monkeypatch
-):
+def test_the_machine_endpoint_returns_the_row_and_the_substrate_unmerged(client, monkeypatch):
     """Both, side by side, because the disagreements are the point.
 
     A merged answer would have to pick a winner, and the app would then be
@@ -1338,9 +1336,7 @@ def test_the_machine_endpoint_returns_the_row_and_the_substrate_unmerged(
     assert body["unavailable"] is None
 
 
-def test_the_machine_endpoint_reports_a_substrate_failure_rather_than_500ing(
-    client, monkeypatch
-):
+def test_the_machine_endpoint_reports_a_substrate_failure_rather_than_500ing(client, monkeypatch):
     """A person clicked Info. `flyctl` being logged out is something to render,
     not a failed request — and the row must still arrive so the panel has
     something to show."""
@@ -1516,16 +1512,12 @@ def test_an_explicit_image_wins_over_the_fleet_default(async_client, monkeypatch
     monkeypatch.setattr(provision, "upgrade_box", record)
     monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:fleet")
 
-    body = async_client.post(
-        "/api/boxes/eng-a/upgrade", json={"image": "registry/x:pinned"}
-    ).json()
+    body = async_client.post("/api/boxes/eng-a/upgrade", json={"image": "registry/x:pinned"}).json()
 
     assert body["image"] == "registry/x:pinned"
 
 
-def test_the_machine_endpoint_says_whether_the_agent_is_on_the_fleet_image(
-    client, monkeypatch
-):
+def test_the_machine_endpoint_says_whether_the_agent_is_on_the_fleet_image(client, monkeypatch):
     """Computed here, with `_same_image`, and not in the app.
 
     Fly reports `repo:tag@sha256:…` while the configured image is written
@@ -1551,9 +1543,7 @@ def test_an_agent_on_an_older_image_is_reported_as_behind(client, monkeypatch):
     from flotta.backend import MachineInfo
 
     monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
-    _fake_backend(
-        monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old")
-    )
+    _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old"))
 
     assert client.get("/api/boxes/eng-a/machine").json()["image_current"] is False
 
@@ -1566,8 +1556,59 @@ def test_an_unknown_side_is_not_reported_as_behind(client, monkeypatch):
     from flotta.backend import MachineInfo
 
     monkeypatch.setattr(provision, "_fleet_image", lambda env=None: None)
-    _fake_backend(
-        monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old")
-    )
+    _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old"))
 
     assert client.get("/api/boxes/eng-a/machine").json()["image_current"] is None
+
+
+def test_the_version_endpoint_says_where_the_fleet_image_came_from(client, monkeypatch):
+    """"Why is my fleet not using the image I just built" is otherwise
+    unanswerable from a window."""
+    import flotta.provision as provision
+
+    monkeypatch.setattr(
+        provision, "resolve_fleet_image", lambda env=None, **kw: ("registry/x:pinned", "env")
+    )
+    monkeypatch.setattr(provision, "_newest_release_image", lambda app, **kw: "registry/x:newest")
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+
+    body = client.get("/api/hermes").json()
+
+    assert body["fleet_image"] == "registry/x:pinned"
+    assert body["fleet_image_source"] == "env"
+    # The divergence is the trap, and this is the only place it is visible.
+    assert body["newest_release"] == "registry/x:newest"
+
+
+def test_the_newest_release_is_reported_as_the_source_when_it_decides(client, monkeypatch):
+    import flotta.provision as provision
+
+    monkeypatch.setattr(
+        provision, "resolve_fleet_image", lambda env=None, **kw: ("registry/x:newest", "release")
+    )
+    monkeypatch.setattr(provision, "_newest_release_image", lambda app, **kw: "registry/x:newest")
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+
+    body = client.get("/api/hermes").json()
+
+    assert body["fleet_image_source"] == "release"
+    assert body["fleet_image"] == body["newest_release"]
+
+
+def test_no_fly_app_means_no_release_lookup(client, monkeypatch):
+    """No app configured is not an app named 'flotta-box'. Guessing would read
+    a stranger's registry."""
+    import flotta.provision as provision
+
+    monkeypatch.delenv("FLOTTA_FLY_APP", raising=False)
+    monkeypatch.setattr(provision, "resolve_fleet_image", lambda env=None, **kw: (None, "none"))
+
+    def must_not_run(app, **kw):  # pragma: no cover - the guard
+        raise AssertionError("looked up releases with no app configured")
+
+    monkeypatch.setattr(provision, "_newest_release_image", must_not_run)
+
+    body = client.get("/api/hermes").json()
+    assert body["fleet_image"] is None
+    assert body["fleet_image_source"] == "none"
+    assert body["newest_release"] is None

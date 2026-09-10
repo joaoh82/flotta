@@ -88,6 +88,16 @@ export type HermesVersions = {
   behind?: boolean;
   unavailable?: string | null;
   fleet_image?: string | null;
+  /** `env`, `release` or `none` — where `fleet_image` came from. */
+  fleet_image_source?: string | null;
+  /**
+   * What the build app last released.
+   *
+   * Reported even when the environment won, because the two disagreeing is
+   * the trap: a deployment variable naming an image older than the newest
+   * build makes the window offer the wrong upgrade with total confidence.
+   */
+  newest_release?: string | null;
 };
 
 /**

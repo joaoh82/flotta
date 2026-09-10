@@ -122,7 +122,7 @@ class FlyBackend:
         image = (
             spec.image
             or self.config.image
-            or (self._current_image(app) if self._app_exists(app) else None)
+            or (self.current_image(app) if self._app_exists(app) else None)
         )
         if not image:
             raise BackendError(
@@ -272,7 +272,7 @@ class FlyBackend:
     def image_of(self, box_id: str) -> str | None:
         """What image this machine is actually running, or None.
 
-        Best-effort and read-only. Distinct from `_current_image`, which reads
+        Best-effort and read-only. Distinct from `current_image`, which reads
         the *app's release history* — with one app per agent that answers "what
         was last deployed here", not "what is this machine running", and after
         a `machine update` those two disagree.
@@ -288,7 +288,7 @@ class FlyBackend:
 
         The `image_ref` path is the fallback and now composes the whole thing,
         registry included. Parsed defensively across shapes for the same reason
-        `_current_image` reads `ImageRef` or `imageRef`: one external tool's
+        `current_image` reads `ImageRef` or `imageRef`: one external tool's
         JSON, where a moved key should cost a blank rather than an exception on
         the upgrade path.
         """
@@ -391,7 +391,7 @@ class FlyBackend:
             return None
         return endpoint_for(app, machines[0]["id"])
 
-    def _current_image(self, app: str) -> str | None:
+    def current_image(self, app: str) -> str | None:
         """The image this app last released, if any.
 
         Read from `flyctl releases`, not `flyctl image show`. The latter

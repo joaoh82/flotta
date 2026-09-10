@@ -285,7 +285,7 @@ def test_only_a_complete_release_is_bootable(releases, expected):
             cmd, 0, _json.dumps(releases), ""
         ),
     )
-    assert backend._current_image("app") == expected
+    assert backend.current_image("app") == expected
 
 
 def test_existing_endpoint_is_none_when_there_is_no_machine():

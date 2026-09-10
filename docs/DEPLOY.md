@@ -312,13 +312,25 @@ FLOTTA_FLY_APP_PREFIX=yourname-flotta
 FLOTTA_FLY_IMAGE=registry.fly.io/<builder-app>:deployment-01ABC…
 ```
 
-**Keep `FLOTTA_FLY_IMAGE` current.** It is what `create` gives a new agent and
-what an upgrade with no argument moves an existing one onto, so a stale value
-quietly builds every new agent from an old image and makes the app's Upgrade
-button a no-op — or worse, points at an app that has since been deleted, which
-has already happened here. `GET /api/hermes` reports what the control plane
-currently has, and the app shows it in each agent's Info panel: if it does not
-match what `just fly-up` last printed, this variable is the thing to fix.
+**`FLOTTA_FLY_IMAGE` is now optional, and leaving it unset is the better
+default.** With it unset, the control plane resolves the fleet image from the
+newest **complete** release on `$FLOTTA_FLY_APP` — the app `just fly-up`
+deploys into — which is the answer that cannot go stale, because building a new
+image *is* updating it.
+
+Set it only to pin deliberately. It wins when present, the same way a stored
+setting wins over the environment, and a pin that is older than the newest
+build is a real trap: it silently gives every new agent an old image and makes
+the app's Upgrade button move agents onto the pinned one. It has gone stale
+twice here, once naming an app that had since been deleted. `GET /api/hermes`
+reports the value, **where it came from** (`env`, `release` or `none`) and what
+the build app last released, and the app shows a warning in each agent's Info
+panel when a pin and the newest build disagree.
+
+Note the app must be *configured*: `$FLOTTA_FLY_APP` has a default
+(`flotta-box`) and Fly app names are globally unique, so the resolver refuses
+to read releases from a name it was not given rather than risk reading a
+stranger's registry.
 
 **The prefix** gives each agent its own Fly app, named `<prefix>-<box>`. A
 prefix rather than a bare `flotta-<box>` because Fly app names are globally
