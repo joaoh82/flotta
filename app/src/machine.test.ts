@@ -256,8 +256,10 @@ describe("whether the control plane is pinned to a stale image", () => {
   });
 
   it("says so when there is no image at all", () => {
-    const said = fleetImageNote({ fleet_image: null, fleet_image_source: "none" });
-    expect(said).toContain("nothing to upgrade agents onto");
+    // What kind of nothing is asserted in "which kind of nothing" below.
+    expect(fleetImageNote({ fleet_image: null, fleet_image_source: "none" })).toContain(
+      "No fleet image",
+    );
   });
 
   it("does not invent a warning from a missing newest build", () => {
@@ -265,5 +267,24 @@ describe("whether the control plane is pinned to a stale image", () => {
     expect(
       fleetImageNote({ fleet_image: "r/x:t", fleet_image_source: "env", newest_release: null }),
     ).toBeNull();
+  });
+});
+
+describe("which kind of nothing", () => {
+  it("names the missing setting when no build app is configured", () => {
+    const said = fleetImageNote({ fleet_image: null, fleet_image_source: "none" });
+    expect(said).toContain("FLOTTA_FLY_APP");
+  });
+
+  it("names the app when one is configured but yields nothing", () => {
+    // The live case that cost a debugging round: source "none" with an app set
+    // to one that had been deleted looked identical to no app at all.
+    const said = fleetImageNote({
+      fleet_image: null,
+      fleet_image_source: "none",
+      fleet_image_app: "little-stream-574",
+    });
+    expect(said).toContain("little-stream-574");
+    expect(said).not.toContain("FLOTTA_FLY_APP");
   });
 });

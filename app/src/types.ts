@@ -98,6 +98,8 @@ export type HermesVersions = {
    * build makes the window offer the wrong upgrade with total confidence.
    */
   newest_release?: string | null;
+  /** Which app releases are read from, or null when none is configured. */
+  fleet_image_app?: string | null;
 };
 
 /**
