@@ -2784,3 +2784,64 @@ def test_fleet_image_keeps_its_one_value_shape():
 
     assert _fleet_image({"FLOTTA_FLY_IMAGE": "registry/x:t"}) == "registry/x:t"
     assert _fleet_image({}) is None
+
+
+class _Recording(FakeBackend):
+    """Captures the spec `create_box` hands the substrate."""
+
+    def create(self, spec):
+        from flotta.backend import BoxHandle
+
+        self.calls.append("create")
+        self.spec = spec
+        self.machine_state = "started"
+        return BoxHandle(id="m1", endpoint="fake://app/m1")
+
+
+def test_create_uses_the_same_fleet_image_an_upgrade_would(store, monkeypatch):
+    """Create and upgrade must agree about what "the fleet image" is.
+
+    They did not. `FlyBackend.create` fell back to `self.config.image` and then
+    to the *box's own app's* release history — which with one app per agent is
+    a brand-new app with no releases. So unsetting `$FLOTTA_FLY_IMAGE` left
+    upgrades working and creation refusing, which is worse than either
+    behaviour alone.
+    """
+    import flotta.provision as provision
+
+    monkeypatch.setattr(
+        provision, "resolve_fleet_image", lambda env=None, **kw: ("registry/x:newest", "release")
+    )
+    impl = _Recording()
+    create_box("eng-new", store=store, backend=impl)
+
+    assert impl.spec.image == "registry/x:newest"
+
+
+def test_an_explicitly_named_image_still_wins_over_the_fleet_default(store, monkeypatch):
+    """A caller naming an image means it."""
+    import flotta.provision as provision
+    from flotta.backend import BoxSpec
+
+    monkeypatch.setattr(
+        provision, "resolve_fleet_image", lambda env=None, **kw: ("registry/x:fleet", "release")
+    )
+    impl = _Recording()
+    create_box(
+        "eng-new", store=store, backend=impl, spec=BoxSpec(name="eng-new", image="registry/x:asked")
+    )
+
+    assert impl.spec.image == "registry/x:asked"
+
+
+def test_no_fleet_image_leaves_the_backend_to_refuse(store, monkeypatch):
+    """Not this layer's refusal to make. `FlyBackend.create` already declines
+    before creating anything billable, and its message names the fix — an
+    earlier version created an app and a volume first and left them orphaned."""
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "resolve_fleet_image", lambda env=None, **kw: (None, "none"))
+    impl = _Recording()
+    create_box("eng-new", store=store, backend=impl)
+
+    assert impl.spec.image is None

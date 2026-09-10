@@ -737,6 +737,24 @@ def create_box(
     # caller that has no shell: `POST /api/boxes` is one request, and M8's
     # "create Agent B" is one button.
     base = spec or BoxSpec(name=name)
+
+    # The image every agent is born on, resolved the same way an upgrade
+    # resolves it — `$FLOTTA_FLY_IMAGE`, else the newest release on the build
+    # app.
+    #
+    # Without this, `create` and `upgrade` disagree about what "the fleet
+    # image" means. `FlyBackend.create` falls back to `self.config.image` and
+    # then to *the box's own app's* release history, which with one app per
+    # agent is a brand-new app with no releases — so unsetting the variable
+    # would leave upgrades working and creation refusing, which is worse than
+    # either behaviour on its own.
+    #
+    # An explicit `spec.image` still wins: a caller naming an image means it.
+    if not base.image:
+        fleet_image, _ = resolve_fleet_image()
+        if fleet_image:
+            base = replace(base, image=fleet_image)
+
     identity_env, identity_secrets = build_identity(box.id, name)
 
     # What this agent gets, as opposed to what every agent gets. Travels in the
