@@ -134,9 +134,15 @@ conventions, and the sharp edges below.
   gateway/CLI path, not by `AIAgent.run_conversation`. So conversation
   *history* does not survive that path — **memories and skills do**, and that is
   the surface the pivot's claim actually rests on. **M3 changed this for boxes:**
-  `hermes serve` brings up all 22 tables, so a box's conversation history now
-  survives a restart. The note is kept because the distinction still bites —
-  the headless path writes one table, the serving path writes the schema.
+  `hermes serve` brings up the whole schema, so a box's conversation history
+  now survives a restart. The note is kept because the distinction still bites
+  — the headless path writes one table, the serving path writes the schema.
+  **The table count is a Hermes version detail, not a constant:** v2026.8.19
+  brought up 22, v2026.9.7 brings up 38, and an existing box's `state.db`
+  created by the older one was **migrated in place** by the newer — measured on
+  `eng-b` after a real upgrade, on its own durable volume. That migration
+  happening is what makes a Hermes bump safe for agents that already have
+  history; it is worth re-checking on the next bump rather than assumed.
 - **The memory tool must be named in the prompt.** "Remember X" is treated as
   conversational and writes nothing; the box then honestly reports an empty
   memory store on recall, which looks exactly like a durability failure and is

@@ -22,7 +22,7 @@ import os
 # The Hermes release a box runs. Bump with `just hermes-bump`, which also
 # re-runs the live checks — the headless boot recipe in SEAM_NOTES was
 # validated against a specific version, so a bump is not purely mechanical.
-DEFAULT_HERMES_REF = "v2026.8.19"
+DEFAULT_HERMES_REF = "v2026.9.7"
 HERMES_REF_ENV = "FLOTTA_HERMES_REF"
 
 HERMES_REF = os.environ.get(HERMES_REF_ENV, "").strip() or DEFAULT_HERMES_REF
