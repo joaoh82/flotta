@@ -276,11 +276,30 @@ export function fleetImageNote(versions: {
   fleet_image?: string | null;
   fleet_image_source?: string | null;
   newest_release?: string | null;
+  fleet_image_app?: string | null;
 }): string | null {
-  const { fleet_image: image, fleet_image_source: source, newest_release: newest } = versions;
+  const {
+    fleet_image: image,
+    fleet_image_source: source,
+    newest_release: newest,
+    fleet_image_app: app,
+  } = versions;
 
+  // Two causes with two different fixes, and they used to render as one
+  // sentence: nothing configured at all, versus an app named whose releases
+  // cannot be read — a wrong name, a deleted app, a flyctl that cannot reach
+  // it. Saying which one turns "it does not work" into an action.
   if (source === "none" || (!image && !newest)) {
-    return "No fleet image is configured, so there is nothing to upgrade agents onto.";
+    if (!app) {
+      return (
+        "No fleet image, and no build app configured to find one. Set FLOTTA_FLY_APP " +
+        "on the control plane to the app `just fly-up` deploys into."
+      );
+    }
+    return (
+      `No fleet image: nothing could be read from the app ${app}. Either that is not ` +
+      "the app `just fly-up` deploys into, or it has no completed release."
+    );
   }
   if (source !== "env" || !newest || !image) return null;
   // Compared as written. The control plane does the digest-aware comparison

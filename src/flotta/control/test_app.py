@@ -1612,3 +1612,26 @@ def test_no_fly_app_means_no_release_lookup(client, monkeypatch):
     assert body["fleet_image"] is None
     assert body["fleet_image_source"] == "none"
     assert body["newest_release"] is None
+
+
+def test_no_image_says_which_kind_of_nothing(client, monkeypatch):
+    """`source: "none"` has two causes and two different fixes.
+
+    No app configured means "set FLOTTA_FLY_APP". An app configured whose
+    releases cannot be read means "that app is wrong, or flyctl cannot reach
+    it". From outside they were identical, and telling them apart meant opening
+    the deployment's variables — which is exactly the trip this endpoint exists
+    to save.
+    """
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "resolve_fleet_image", lambda env=None, **kw: (None, "none"))
+    monkeypatch.setattr(provision, "_newest_release_image", lambda app, **kw: None)
+
+    monkeypatch.delenv("FLOTTA_FLY_APP", raising=False)
+    assert client.get("/api/hermes").json()["fleet_image_app"] is None
+
+    monkeypatch.setenv("FLOTTA_FLY_APP", "a-deleted-app")
+    body = client.get("/api/hermes").json()
+    assert body["fleet_image_app"] == "a-deleted-app"
+    assert body["newest_release"] is None

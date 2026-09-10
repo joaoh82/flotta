@@ -57,7 +57,7 @@ Variables:
 FLOTTA_SIGNING_KEY=<from step 0>
 FLOTTA_DATABASE_URL=${{Postgres.DATABASE_URL}}
 FLY_API_TOKEN=<flyctl tokens create org>
-FLOTTA_FLY_APP=<the app your boxes live in>
+FLOTTA_FLY_APP=<the app `just fly-up` deploys the image into>
 FLOTTA_FLY_ORG=personal
 ```
 

@@ -436,7 +436,7 @@ def create_app(
         # offer the wrong upgrade with total confidence, and there is nowhere
         # else a person could notice.
         newest = None
-        app = (os.environ.get("FLOTTA_FLY_APP") or "").strip()
+        app = (os.environ.get("FLOTTA_FLY_APP") or "").strip() or None
         if app:
             newest = _newest_release_image(app)
 
@@ -450,6 +450,14 @@ def create_app(
             #: image I just built" is otherwise unanswerable from a window.
             "fleet_image_source": source,
             "newest_release": newest,
+            #: Which app releases are read from, or `null` when none is
+            #: configured. Without this, `source: "none"` has two causes with
+            #: two different fixes — no app configured, and an app configured
+            #: whose releases cannot be read — and they are indistinguishable
+            #: from outside. That ambiguity cost a live debugging round: the
+            #: answer was the same either way, so the only way to tell was to
+            #: go and look at the deployment's variables.
+            "fleet_image_app": app,
         }
 
     @app.get("/api/boxes")
