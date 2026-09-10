@@ -256,3 +256,40 @@ export function hermesOf(machine: { hermes_ref?: string | null } | null): {
     note: "This image was built before Flotta recorded its Hermes version. Upgrading replaces it with one that does.",
   };
 }
+
+/**
+ * Is the control plane pinned to something older than the newest build?
+ *
+ * The specific failure this exists for: `FLOTTA_FLY_IMAGE` is a deployment
+ * variable naming an image in another Fly app, and it has gone stale twice —
+ * most recently still naming an app that had been *deleted*, which made this
+ * panel offer to downgrade the one agent that had been upgraded and report the
+ * stale ones as current.
+ *
+ * Nothing was wrong with the panel; the configuration was lying, and there was
+ * no way to see that from here. Now there is.
+ *
+ * Silent unless there is something to say — a `release` source cannot be
+ * stale, and an unknown newest build is not evidence of anything.
+ */
+export function fleetImageNote(versions: {
+  fleet_image?: string | null;
+  fleet_image_source?: string | null;
+  newest_release?: string | null;
+}): string | null {
+  const { fleet_image: image, fleet_image_source: source, newest_release: newest } = versions;
+
+  if (source === "none" || (!image && !newest)) {
+    return "No fleet image is configured, so there is nothing to upgrade agents onto.";
+  }
+  if (source !== "env" || !newest || !image) return null;
+  // Compared as written. The control plane does the digest-aware comparison
+  // where it matters (`image_current`); here both strings come from the same
+  // side and a difference is a difference.
+  if (image === newest) return null;
+  return (
+    "This control plane is pinned to an image by FLOTTA_FLY_IMAGE, and it is not " +
+    "the newest one built. Upgrading an agent would move it onto the pinned image, " +
+    "not the latest."
+  );
+}

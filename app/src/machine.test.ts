@@ -3,6 +3,7 @@ import {
   asStoreStatus,
   drift,
   fieldsOf,
+  fleetImageNote,
   hermesOf,
   hermesStanding,
   imageParts,
@@ -217,5 +218,52 @@ describe("the Hermes an agent runs", () => {
       expect(said.value).toBeNull();
       expect(said.note).toContain("Upgrading");
     }
+  });
+});
+
+describe("whether the control plane is pinned to a stale image", () => {
+  it("says nothing when the newest build is what is configured", () => {
+    expect(
+      fleetImageNote({
+        fleet_image: "r/x:new",
+        fleet_image_source: "env",
+        newest_release: "r/x:new",
+      }),
+    ).toBeNull();
+  });
+
+  it("says nothing when the release decides, because that cannot be stale", () => {
+    // Building a new image *is* updating it, so there is no gap to report.
+    expect(
+      fleetImageNote({
+        fleet_image: "r/x:new",
+        fleet_image_source: "release",
+        newest_release: "r/x:new",
+      }),
+    ).toBeNull();
+  });
+
+  it("names the pin when it is older than the newest build", () => {
+    // The exact failure: a variable naming an image in another Fly app, which
+    // went stale twice — once naming an app that had been deleted.
+    const said = fleetImageNote({
+      fleet_image: "r/old:tag",
+      fleet_image_source: "env",
+      newest_release: "r/new:tag",
+    });
+    expect(said).toContain("FLOTTA_FLY_IMAGE");
+    expect(said).toContain("not the latest");
+  });
+
+  it("says so when there is no image at all", () => {
+    const said = fleetImageNote({ fleet_image: null, fleet_image_source: "none" });
+    expect(said).toContain("nothing to upgrade agents onto");
+  });
+
+  it("does not invent a warning from a missing newest build", () => {
+    // An unknown newest release is not evidence the pin is stale.
+    expect(
+      fleetImageNote({ fleet_image: "r/x:t", fleet_image_source: "env", newest_release: null }),
+    ).toBeNull();
   });
 });

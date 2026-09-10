@@ -262,6 +262,13 @@ pub struct HermesVersions {
     pub unavailable: Option<String>,
     #[serde(default)]
     pub fleet_image: Option<String>,
+    /// `env`, `release` or `none` — where `fleet_image` came from.
+    #[serde(default)]
+    pub fleet_image_source: Option<String>,
+    /// What the build app last released. Reported even when the environment
+    /// won, because the two disagreeing is the failure worth seeing.
+    #[serde(default)]
+    pub newest_release: Option<String>,
 }
 
 #[derive(Deserialize)]

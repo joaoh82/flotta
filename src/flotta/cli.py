@@ -489,9 +489,7 @@ def _newest_event_id(box_id: str) -> int:
     from flotta.auth import SCOPE_FLEET_READ
 
     try:
-        body = control_request(
-            "GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,)
-        )
+        body = control_request("GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,))
     except Exception:  # noqa: BLE001 - a marker that cannot be read is just 0
         return 0
     events = (body or {}).get("events") or []
@@ -513,9 +511,7 @@ def _upgrade_landed(box_id: str, since: int) -> dict[str, Any] | None:
     from flotta.auth import SCOPE_FLEET_READ
 
     try:
-        body = control_request(
-            "GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,)
-        )
+        body = control_request("GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,))
     except Exception:  # noqa: BLE001 - report the original failure instead
         return None
     for event in reversed((body or {}).get("events") or []):

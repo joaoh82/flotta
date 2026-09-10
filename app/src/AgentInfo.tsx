@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { StatusBadge } from "./StatusBadge";
-import { drift, fieldsOf, hermesOf, hermesStanding, imageParts, imageStanding } from "./machine";
+import {
+  drift,
+  fieldsOf,
+  fleetImageNote,
+  hermesOf,
+  hermesStanding,
+  imageParts,
+  imageStanding,
+} from "./machine";
 import {
   isFleetError,
   type BoxRow,
@@ -74,6 +82,7 @@ export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }
   const standing = imageStanding(view ?? {});
   const hermes = hermesOf(machine);
   const upstream = versions ? hermesStanding(versions) : null;
+  const fleetNote = versions ? fleetImageNote(versions) : null;
 
   const startUpgrade = async () => {
     setUpgradeError(null);
@@ -200,6 +209,16 @@ export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }
             >
               {standing.detail}
             </p>
+
+            {/* Before the button, not after: if the control plane is pinned to
+                something older than the newest build, pressing Upgrade moves
+                the agent onto the pinned image and the panel would otherwise
+                look like it had worked. */}
+            {fleetNote && (
+              <p className="mt-2 rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-900">
+                {fleetNote}
+              </p>
+            )}
 
             {standing.kind === "behind" && upgrade === null && (
               <button

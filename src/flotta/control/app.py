@@ -425,15 +425,31 @@ def create_app(
         `GET /api/boxes/{id}/machine`.
         """
         from flotta.hermes import report
-        from flotta.provision import _fleet_image
+        from flotta.provision import _newest_release_image, resolve_fleet_image
 
         found = report()
+        fleet_image, source = resolve_fleet_image()
+
+        # What the build app last released, reported even when the environment
+        # won — because the two disagreeing *is* the trap. A deployment
+        # variable naming an image older than the newest build makes the app
+        # offer the wrong upgrade with total confidence, and there is nowhere
+        # else a person could notice.
+        newest = None
+        app = (os.environ.get("FLOTTA_FLY_APP") or "").strip()
+        if app:
+            newest = _newest_release_image(app)
+
         return {
             "pinned": found.pinned,
             "latest": found.latest,
             "behind": found.behind,
             "unavailable": found.unavailable,
-            "fleet_image": _fleet_image(),
+            "fleet_image": fleet_image,
+            #: `env`, `release`, or `none`. "Why is my fleet not using the
+            #: image I just built" is otherwise unanswerable from a window.
+            "fleet_image_source": source,
+            "newest_release": newest,
         }
 
     @app.get("/api/boxes")

@@ -926,8 +926,11 @@ def test_upgrade_goes_to_the_control_plane_and_needs_write(tmp_path, monkeypatch
         monkeypatch,
         ["upgrade", "eng-g", "--image", "registry/flotta:new"],
         responses={
-            "/upgrade": {"box_id": "b-remote", "image": "registry/flotta:new",
-                         "previous_image": "registry/flotta:old"},
+            "/upgrade": {
+                "box_id": "b-remote",
+                "image": "registry/flotta:new",
+                "previous_image": "registry/flotta:old",
+            },
         },
     )
     assert result.exit_code == 0
@@ -959,8 +962,9 @@ def test_a_dropped_connection_asks_the_box_what_happened(tmp_path, monkeypatch):
         ["upgrade", "eng-g", "--image", "registry/flotta:new"],
         responses={
             # Empty before the attempt, carrying the upgrade afterwards.
-            "/events": {"events": [{"id": 9, "type": "reimaged",
-                                    "payload": {"to": "registry/flotta:new"}}]},
+            "/events": {
+                "events": [{"id": 9, "type": "reimaged", "payload": {"to": "registry/flotta:new"}}]
+            },
         },
         fail_on="/upgrade",
     )
@@ -989,8 +993,11 @@ def test_an_upgrade_that_was_already_current_says_so(tmp_path, monkeypatch):
         monkeypatch,
         ["upgrade", "eng-g", "--image", "registry/flotta:same"],
         responses={
-            "/upgrade": {"box_id": "b-remote", "image": "registry/flotta:same",
-                         "already_current": True},
+            "/upgrade": {
+                "box_id": "b-remote",
+                "image": "registry/flotta:same",
+                "already_current": True,
+            },
         },
     )
     assert result.exit_code == 0

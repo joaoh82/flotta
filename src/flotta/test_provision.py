@@ -2672,3 +2672,115 @@ def test_an_agent_on_that_image_is_not_restarted_for_nothing(store):
 
     assert result["already_current"] is True
     assert "reimage" not in backend.calls
+
+
+# -- where the fleet image comes from ---------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_release_cache():
+    """The cache is process-global; without this one test's answer leaks into
+    the next and the "refuses to guess" tests pass for the wrong reason."""
+    import flotta.provision as provision
+
+    provision._release_cache = None
+    yield
+    provision._release_cache = None
+
+
+def test_an_explicit_image_still_wins():
+    """Explicit configuration beats a lookup, the same way a stored setting
+    beats the environment. Reversing it would mean quietly ignoring something
+    somebody deliberately wrote down."""
+    from flotta.provision import resolve_fleet_image
+
+    image, source = resolve_fleet_image(
+        {"FLOTTA_FLY_IMAGE": "registry/x:pinned", "FLOTTA_FLY_APP": "build-app"},
+        lookup=lambda app: "registry/x:newest",
+    )
+    assert (image, source) == ("registry/x:pinned", "env")
+
+
+def test_the_newest_release_is_used_when_nothing_is_configured():
+    """The answer that cannot go stale: building a new image *is* updating it."""
+    from flotta.provision import resolve_fleet_image
+
+    assert resolve_fleet_image(
+        {"FLOTTA_FLY_APP": "build-app"}, lookup=lambda app: "registry/x:newest"
+    ) == ("registry/x:newest", "release")
+
+
+def test_it_refuses_to_guess_which_app_is_ours():
+    """`FlyConfig.app` defaults to `flotta-box`, and Fly app names are globally
+    unique — so that default may well be somebody else's app. Resolving a
+    release from a guessed name would read a stranger's registry and hand the
+    fleet whatever they last built."""
+    from flotta.provision import resolve_fleet_image
+
+    def must_not_run(app):  # pragma: no cover - the guard this test exists for
+        raise AssertionError(f"looked up releases for a guessed app: {app!r}")
+
+    assert resolve_fleet_image({}, lookup=must_not_run) == (None, "none")
+
+
+def test_a_lookup_that_finds_nothing_is_not_an_image():
+    from flotta.provision import resolve_fleet_image
+
+    assert resolve_fleet_image({"FLOTTA_FLY_APP": "build-app"}, lookup=lambda app: None) == (
+        None,
+        "none",
+    )
+    assert resolve_fleet_image({"FLOTTA_FLY_APP": "build-app"}, lookup=lambda app: "  ") == (
+        None,
+        "none",
+    )
+
+
+def test_a_broken_flyctl_costs_an_answer_not_an_exception():
+    """This feeds a panel and an upgrade's default. Raising here would turn a
+    bad `flyctl` minute into a 500 on a read somebody asked for."""
+    from flotta.provision import resolve_fleet_image
+
+    def boom(app):
+        raise RuntimeError("flyctl fell over")
+
+    assert resolve_fleet_image({"FLOTTA_FLY_APP": "build-app"}, lookup=boom) == (None, "none")
+
+
+def test_the_release_lookup_is_cached_so_a_panel_is_not_a_subprocess_storm():
+    from flotta.provision import _RELEASE_CACHE_S, _newest_release_image
+
+    calls = []
+
+    def counting(app):
+        calls.append(app)
+        return "registry/x:newest"
+
+    assert _newest_release_image("build-app", lookup=counting, now=100.0) == "registry/x:newest"
+    _newest_release_image("build-app", lookup=counting, now=100.0 + _RELEASE_CACHE_S - 1)
+    assert len(calls) == 1
+
+    _newest_release_image("build-app", lookup=counting, now=100.0 + _RELEASE_CACHE_S + 1)
+    assert len(calls) == 2
+
+
+def test_the_cache_is_keyed_by_app():
+    """Two apps are two answers. A cache that ignored the name would serve one
+    fleet's image to another, which on a shared host is somebody else's."""
+    from flotta.provision import _newest_release_image
+
+    assert (
+        _newest_release_image("a", lookup=lambda app: f"image-for-{app}", now=1.0) == "image-for-a"
+    )
+    assert (
+        _newest_release_image("b", lookup=lambda app: f"image-for-{app}", now=1.0) == "image-for-b"
+    )
+
+
+def test_fleet_image_keeps_its_one_value_shape():
+    """`upgrade_box` and the machine endpoint only want the image; they should
+    not have to unpack a source they do not use."""
+    from flotta.provision import _fleet_image
+
+    assert _fleet_image({"FLOTTA_FLY_IMAGE": "registry/x:t"}) == "registry/x:t"
+    assert _fleet_image({}) is None

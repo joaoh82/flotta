@@ -58,6 +58,7 @@ from __future__ import annotations
 import math
 import os
 import secrets as secrets_module
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -1153,12 +1154,109 @@ def upgrade_box(
     }
 
 
-def _fleet_image(env: Mapping[str, str] | None = None) -> str | None:
-    """The image this fleet builds, from config — never from a box's own app."""
-    from flotta.fly import IMAGE_ENV
+#: How long a resolved release image is reused. The lookup is a `flyctl`
+#: subprocess and the answer changes only when somebody builds, so a minute of
+#: staleness costs nothing and saves a subprocess per Info panel opened.
+_RELEASE_CACHE_S = 60.0
+_release_cache: tuple[float, str, str | None] | None = None
+
+
+def resolve_fleet_image(
+    env: Mapping[str, str] | None = None,
+    *,
+    lookup: Callable[[str], str | None] | None = None,
+    now: float | None = None,
+) -> tuple[str | None, str]:
+    """The image an upgrade moves onto, and **where that answer came from**.
+
+    Two sources, in this order:
+
+    1. `$FLOTTA_FLY_IMAGE`, when it is set. Explicit configuration wins, the
+       same way a stored setting wins over the environment — reversing that
+       would mean quietly ignoring something a person deliberately wrote down.
+    2. Otherwise the newest **complete** release on the fleet's build app,
+       which is the app `just fly-up` deploys into. This is the answer that
+       cannot go stale: building a new image *is* updating it.
+
+    The source travels with the value because the first option is a standing
+    trap. It is a deployment variable naming an image in another Fly app, and
+    it has gone stale twice — most recently still naming an app that had been
+    deleted, which made the window offer to *downgrade* the one agent that had
+    been upgraded. Reporting "this came from the environment, and the newest
+    build is something else" is what makes that diagnosable from the app rather
+    than from a Railway dashboard.
+
+    **The app must be configured, not defaulted.** `FlyConfig.app` falls back
+    to `flotta-box`, which is a name somebody else may own — Fly app names are
+    globally unique. Resolving a release from a guessed app would mean reading
+    a stranger's registry and handing the fleet whatever they last built. So
+    this reads `$FLOTTA_FLY_APP` directly and refuses to guess.
+    """
+    from flotta.fly import APP_ENV, IMAGE_ENV
 
     source = os.environ if env is None else env
-    return (source.get(IMAGE_ENV) or "").strip() or None
+
+    configured = (source.get(IMAGE_ENV) or "").strip()
+    if configured:
+        return configured, "env"
+
+    app = (source.get(APP_ENV) or "").strip()
+    if not app:
+        return None, "none"
+
+    found = _newest_release_image(app, lookup=lookup, now=now)
+    return (found, "release") if found else (None, "none")
+
+
+def _newest_release_image(
+    app: str,
+    *,
+    lookup: Callable[[str], str | None] | None = None,
+    now: float | None = None,
+) -> str | None:
+    """The build app's newest complete release, cached briefly.
+
+    Never raises: this feeds a panel and an upgrade's default, and a `flyctl`
+    that is having a bad minute should cost "we do not know" rather than an
+    exception on a read somebody asked for.
+    """
+    global _release_cache
+
+    moment = time.monotonic() if now is None else now
+    if (
+        _release_cache is not None
+        and _release_cache[1] == app
+        and moment - _release_cache[0] < _RELEASE_CACHE_S
+    ):
+        return _release_cache[2]
+
+    reader = lookup
+    if reader is None:
+
+        def reader(name: str) -> str | None:
+            impl = _backend_for("fly://")
+            current = getattr(impl, "current_image", None)
+            # A substrate with no notion of "the app's last release" is not a
+            # failure; it just has no answer to this question.
+            return current(name) if callable(current) else None
+
+    try:
+        found = reader(app)
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+
+    found = (found or "").strip() or None
+    _release_cache = (moment, app, found)
+    return found
+
+
+def _fleet_image(env: Mapping[str, str] | None = None) -> str | None:
+    """The image this fleet builds — never from a box's own app.
+
+    Kept as the one-value form because every caller that only needs the image
+    should not have to unpack a source it does not use.
+    """
+    return resolve_fleet_image(env)[0]
 
 
 def _same_image(a: str, b: str) -> bool:
