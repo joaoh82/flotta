@@ -155,3 +155,27 @@ def test_the_build_recipe_only_destroys_machines_it_created():
         "fly-build destroys machines without diffing against the ones that "
         "existed first — against a single-app deployment that is the agent"
     )
+
+    # The two listings must have **opposite** failure policies, which is the
+    # bug both reviewers caught: one `ids()` ending in `|| true` meant a failed
+    # *before* listing produced an empty list, and every machine afterwards
+    # then looked new — including the agent the diff exists to protect.
+    #
+    # Before is fail-closed (no `|| true`), after is fail-open. Asserted as a
+    # difference rather than by reading each, because "they are not the same
+    # function" is the property that was violated.
+    before = recipe.split("ids_after()", 1)[0]
+    after = recipe.split("ids_after()", 1)[1] if "ids_after()" in recipe else ""
+
+    assert "ids_before()" in recipe and "ids_after()" in recipe, (
+        "the two listings share one implementation again — a single `ids()` "
+        "with `|| true` makes a failed pre-build listing widen what is destroyed"
+    )
+    assert "|| true" not in before.split("ids_before()", 1)[-1], (
+        "the pre-build listing swallows failures; an empty BEFORE makes every "
+        "machine look new, and on a single-app fleet that is your agent"
+    )
+    assert "|| true" in after, (
+        "the post-build listing is fail-closed, so a flyctl blip aborts after a "
+        "successful release for the sake of a tidying step"
+    )

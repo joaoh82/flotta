@@ -428,19 +428,42 @@ fly-build: fly-whoami
     set -euo pipefail
     APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
 
-    ids() {
+    # Two listings, two failure policies, and they must not be the same one.
+    #
+    # **Before is fail-closed.** If this cannot be read, an empty list makes
+    # every machine afterwards look new — including the fleet's box on an
+    # unprefixed app, which is precisely the agent the diff exists to protect.
+    # A blip in `flyctl` must stop the build, not silently widen what gets
+    # destroyed. Its stderr is deliberately not hidden: the reason is the
+    # useful part.
+    #
+    # **After is fail-open.** If *that* cannot be read, the worst case is an
+    # orphan machine left behind, which costs money and is recoverable. Failing
+    # here would abort after a successful release for a tidying step.
+    ids_before() {
+      flyctl machines list --app "$APP" --json \
+        | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin)))"
+    }
+
+    ids_after() {
       flyctl machines list --app "$APP" --json 2>/dev/null \
         | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin)))" \
         || true
     }
 
-    BEFORE=" $(ids) "
-    echo "machines before: ${BEFORE:-none}"
+    if ! BEFORE=" $(ids_before) "; then
+      echo "ERROR: could not list machines on $APP before building." >&2
+      echo "  Refusing to continue: without that list, the cleanup after the" >&2
+      echo "  deploy cannot tell a machine it created from one that was" >&2
+      echo "  already there — and on a single-app fleet that is your agent." >&2
+      exit 1
+    fi
+    echo "machines before:${BEFORE% }"
 
     just fly-up
 
     KEPT=0
-    for id in $(ids); do
+    for id in $(ids_after); do
       case "$BEFORE" in
         *" $id "*)
           echo "keeping $id — it existed before this build"
