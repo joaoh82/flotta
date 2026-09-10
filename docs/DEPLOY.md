@@ -312,6 +312,13 @@ FLOTTA_FLY_APP_PREFIX=yourname-flotta
 FLOTTA_FLY_IMAGE=registry.fly.io/<builder-app>:deployment-01ABC…
 ```
 
+**Use `just fly-build`, not `just fly-up`, to publish a new image.** Both
+release one; `fly-up` also brings up a box and leaves it running, which is what
+you want for a first deployment or for checking a new image boots, and is an
+orphan billing for nothing when all you wanted was the image. `fly-build`
+destroys the machine it created — only that one, never a machine that existed
+before it ran.
+
 **`FLOTTA_FLY_IMAGE` is now optional, and leaving it unset is the better
 default.** With it unset, the control plane resolves the fleet image from the
 newest **complete** release on `$FLOTTA_FLY_APP` — the app `just fly-up`

@@ -132,3 +132,26 @@ def test_the_image_records_which_hermes_it_carries():
         f"a hardcoded version is worse than none: {label!r}"
     )
     assert "ARG HERMES_REF" in body, "the label would substitute to empty with no ARG in scope"
+
+
+def test_the_build_recipe_only_destroys_machines_it_created():
+    """A guard on a destructive line, read from the file it lives in.
+
+    `fly-build` destroys machines after deploying, and against an app with no
+    prefix the deployed machine **is** the fleet's box. The diff against the
+    ids present beforehand is the only thing standing between "clean up the
+    orphan" and "destroy the agent", and it is three lines of shell that no
+    test would otherwise see.
+    """
+    if not _JUSTFILE.is_file():  # pragma: no cover - only outside the repo
+        pytest.skip(f"no justfile at {_JUSTFILE}")
+    body = _JUSTFILE.read_text(encoding="utf-8")
+    recipe = body.split("\nfly-build: fly-whoami\n", 1)
+    assert len(recipe) == 2, "fly-build is gone or renamed"
+    recipe = recipe[1].split("\n\n# ", 1)[0]
+
+    assert "machine destroy" in recipe, "fly-build no longer cleans up"
+    assert "BEFORE" in recipe and "existed before this build" in recipe, (
+        "fly-build destroys machines without diffing against the ones that "
+        "existed first — against a single-app deployment that is the agent"
+    )
