@@ -2524,6 +2524,30 @@ def test_a_failed_upgrade_leaves_the_agent_as_it_was(store):
     assert not [e for e in store.get_box_timeline(box.id) if e.type == "reimaged"]
 
 
+def test_a_failed_upgrade_is_written_down_and_not_only_raised(store):
+    """Because the caller may not be holding the exception.
+
+    The API backgrounds this now, so the thread that catches `UpgradeFailed`
+    logs it and ends. The app went back to polling the timeline — and an
+    upgrade that failed silently is indistinguishable from one still running,
+    which is how a person waits ten minutes for something that stopped in the
+    first second.
+    """
+    from flotta.provision import UpgradeFailed, upgrade_box
+
+    box = _running(store)
+    backend = FakeBackend(image="registry.fly.io/flotta:old", reimage_fails=True)
+    with pytest.raises(UpgradeFailed):
+        upgrade_box(box.id, store=store, image="registry.fly.io/flotta:new", backend=backend)
+
+    failed = [e for e in store.get_box_timeline(box.id) if e.type == "upgrade_failed"]
+    assert len(failed) == 1
+    payload = failed[0].payload
+    assert payload["to"] == "registry.fly.io/flotta:new"
+    assert payload["from"] == "registry.fly.io/flotta:old"
+    assert payload["error"]
+
+
 def test_a_failure_names_the_image_the_box_still_runs(store):
     """The only way back. Without it, undoing an upgrade means asking the
     substrate what the box used to run — which is what you cannot do while it

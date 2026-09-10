@@ -191,6 +191,11 @@ pub struct Machine {
     pub app: Option<String>,
     #[serde(default)]
     pub image: Option<String>,
+    /// Which Hermes this image carries, from a label baked in at build time.
+    /// `None` for an image built before that label existed, which is not the
+    /// same as "no Hermes" and must not be rendered as one.
+    #[serde(default)]
+    pub hermes_ref: Option<String>,
     #[serde(default)]
     pub region: Option<String>,
     #[serde(default)]
@@ -227,6 +232,36 @@ pub struct MachineView {
     pub machine: Option<Machine>,
     #[serde(default)]
     pub unavailable: Option<String>,
+    /// What an upgrade with no argument would move this agent onto.
+    #[serde(default)]
+    pub fleet_image: Option<String>,
+    /// Whether it is already on that image. **`None` is not `false`** — one
+    /// side being unknown must not put an Upgrade button in front of anyone.
+    /// Computed on the control plane with `_same_image`, because Fly reports a
+    /// digest the configured image does not carry and comparing them as
+    /// strings has been wrong three times here.
+    #[serde(default)]
+    pub image_current: Option<bool>,
+}
+
+/// Which Hermes the fleet builds, and whether a newer one exists.
+///
+/// Three facts that are easy to collapse into one and must not be: `pinned` is
+/// what the *next* image would be built from, `latest` is what upstream has,
+/// and what an individual agent runs is neither — that is `Machine::hermes_ref`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HermesVersions {
+    pub pinned: String,
+    /// `None` when GitHub could not be reached. Renders as *unknown*, never as
+    /// up to date.
+    #[serde(default)]
+    pub latest: Option<String>,
+    #[serde(default)]
+    pub behind: bool,
+    #[serde(default)]
+    pub unavailable: Option<String>,
+    #[serde(default)]
+    pub fleet_image: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -661,6 +696,30 @@ pub async fn machine(settings: &Settings, id: &str) -> Result<MachineView, Fleet
         .map_err(|e| FleetError::Unexpected(format!("unreadable machine info: {e}")))
 }
 
+/// Which Hermes the fleet builds, and whether upstream has a newer one.
+pub async fn hermes_versions(settings: &Settings) -> Result<HermesVersions, FleetError> {
+    let body = get(settings, "/api/hermes").await?;
+    serde_json::from_str::<HermesVersions>(&body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable Hermes versions: {e}")))
+}
+
+/// Move an agent onto a new image, keeping its disk.
+///
+/// Answers `202` and re-images on a thread, so this returns as soon as the
+/// control plane has accepted it — the outcome arrives in the agent's timeline
+/// as `reimaged` or `upgrade_failed`. A `409` here means the agent cannot be
+/// upgraded at all and is worth showing; anything else is the substrate.
+pub async fn upgrade_agent(settings: &Settings, id: &str) -> Result<(), FleetError> {
+    send(
+        settings,
+        reqwest::Method::POST,
+        &format!("/api/boxes/{}/upgrade", encode_segment(id)),
+        Some(serde_json::json!({})),
+    )
+    .await
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,5 +1091,54 @@ mod tests {
             Some(FleetError::Unexpected(detail)) => assert_eq!(detail, "no box 'eng-q'"),
             other => panic!("expected the API's own reason, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_hermes_ref_and_the_image_verdict_parse() {
+        let body = r#"{
+          "box": {"id": "b-1", "name": "eng-b", "status": "stopped"},
+          "machine": {"state": "suspended", "hermes_ref": "v2026.8.19"},
+          "fleet_image": "registry.fly.io/images:deployment-01M2",
+          "image_current": false
+        }"#;
+        let view: MachineView = serde_json::from_str(body).unwrap();
+
+        assert_eq!(
+            view.machine.unwrap().hermes_ref.as_deref(),
+            Some("v2026.8.19")
+        );
+        assert_eq!(view.image_current, Some(false));
+        assert!(view.fleet_image.is_some());
+    }
+
+    #[test]
+    fn an_unknown_image_verdict_is_none_and_not_false() {
+        // `false` means "behind", which puts an Upgrade button in front of
+        // someone. Absent must not decay into it.
+        let body = r#"{"box": {"id": "b-1", "name": "eng-b", "status": "stopped"},
+                       "machine": {"state": "suspended"}}"#;
+        let view: MachineView = serde_json::from_str(body).unwrap();
+
+        assert_eq!(view.image_current, None);
+        assert!(view.machine.unwrap().hermes_ref.is_none());
+    }
+
+    #[test]
+    fn hermes_versions_parse_including_a_failed_check() {
+        let ok: HermesVersions = serde_json::from_str(
+            r#"{"pinned":"v2026.8.19","latest":"v2026.9.7","behind":true,"fleet_image":"r/x:t"}"#,
+        )
+        .unwrap();
+        assert!(ok.behind && ok.latest.as_deref() == Some("v2026.9.7"));
+
+        // The one that matters: unreachable GitHub is unknown, not up to date.
+        let down: HermesVersions = serde_json::from_str(
+            r#"{"pinned":"v2026.8.19","latest":null,"behind":false,
+                "unavailable":"could not reach GitHub"}"#,
+        )
+        .unwrap();
+        assert!(!down.behind);
+        assert!(down.latest.is_none());
+        assert!(down.unavailable.is_some());
     }
 }

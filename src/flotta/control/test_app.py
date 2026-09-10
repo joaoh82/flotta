@@ -9,6 +9,9 @@ delete sixteen tests from it.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1389,3 +1392,182 @@ def test_the_machine_endpoint_404s_for_a_box_that_does_not_exist(client):
     detail = response.json()["detail"]
     assert detail != "Not Found"
     assert "nope" in detail
+
+
+# -- Hermes versions --------------------------------------------------------
+
+
+def test_the_version_endpoint_separates_the_pin_from_the_latest(client, monkeypatch):
+    """Three facts that were one line of justfile output. The app needs them
+    apart, because only one of them is about any running agent — and it is not
+    either of these."""
+    import flotta.hermes as hermes
+
+    monkeypatch.setattr(hermes, "latest_release", lambda **kw: ("v2026.9.7", None))
+    body = client.get("/api/hermes").json()
+
+    assert body["latest"] == "v2026.9.7"
+    assert body["pinned"]  # whatever this checkout pins
+    assert body["behind"] is (body["pinned"] != "v2026.9.7")
+    assert body["unavailable"] is None
+
+
+def test_an_unreachable_github_reads_as_unknown_not_as_up_to_date(client, monkeypatch):
+    """The failure that matters. "Up to date" on a failed check hides a real
+    upgrade behind a reassuring word."""
+    import flotta.hermes as hermes
+
+    monkeypatch.setattr(hermes, "latest_release", lambda **kw: (None, "could not reach GitHub"))
+    body = client.get("/api/hermes").json()
+
+    assert body["latest"] is None
+    assert body["behind"] is False  # not true either — see `unavailable`
+    assert "could not reach GitHub" in body["unavailable"]
+
+
+def test_the_version_endpoint_needs_a_token(client):
+    """It is behind `fleet:read` like everything else. Nothing here is secret,
+    but an unauthenticated route on this app is a precedent, not a convenience."""
+    from flotta.control.app import create_app
+
+    app = create_app(
+        store_factory=lambda: FleetStore(":memory:"),
+        run_loop=False,
+        background=False,
+        signing_key="k" * 32,
+    )
+    with TestClient(app) as guarded:
+        assert guarded.get("/api/hermes").status_code == 401
+
+
+# -- upgrading from a button ------------------------------------------------
+
+
+@pytest.fixture
+def async_client(fleet):
+    """The endpoint as the app meets it: backgrounded, like production."""
+    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, background=True)
+    with TestClient(app) as c:
+        yield c
+
+
+def test_an_upgrade_answers_before_the_substrate_does(async_client, monkeypatch):
+    """`flyctl machine update` waits up to 300s and the proxy in front of this
+    cuts at 60. Held open, this answers `502 Application failed to respond`
+    while the upgrade carries on — the exact failure `POST /api/boxes` had."""
+    import flotta.provision as provision
+
+    started = threading.Event()
+
+    def slow(box_id, **kwargs):
+        started.set()
+        time.sleep(0.2)
+        return {"box_id": box_id}
+
+    monkeypatch.setattr(provision, "upgrade_box", slow)
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
+
+    response = async_client.post("/api/boxes/eng-a/upgrade")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["image"] == "registry/x:new"
+    assert body["started"] is True
+    assert started.wait(timeout=5), "the upgrade should be running on a thread"
+
+
+def test_a_box_that_cannot_be_upgraded_is_refused_in_the_reply(async_client, fleet):
+    """Not everything moves to the thread. A `202` for a box that can never be
+    upgraded is a lie the app renders as a spinner that never ends."""
+    with FleetStore(fleet) as store:
+        box = store.create_box("eng-doomed")
+        store.update_box_status(box.id, "torn_down")
+
+    response = async_client.post("/api/boxes/eng-doomed/upgrade")
+
+    assert response.status_code == 409
+    assert "torn_down" in response.json()["detail"]
+
+
+def test_an_upgrade_with_no_image_anywhere_is_refused_rather_than_started(
+    async_client, monkeypatch
+):
+    """The live trap this endpoint would otherwise hide: the fleet image is a
+    deployment variable, and an unset one must not become a background thread
+    that fails where nobody is looking."""
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: None)
+    response = async_client.post("/api/boxes/eng-a/upgrade")
+
+    assert response.status_code == 409
+    assert "no image to upgrade to" in response.json()["detail"]
+
+
+def test_an_explicit_image_wins_over_the_fleet_default(async_client, monkeypatch):
+    import flotta.provision as provision
+
+    seen = {}
+
+    def record(box_id, **kwargs):
+        seen.update(kwargs)
+        return {"box_id": box_id}
+
+    monkeypatch.setattr(provision, "upgrade_box", record)
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:fleet")
+
+    body = async_client.post(
+        "/api/boxes/eng-a/upgrade", json={"image": "registry/x:pinned"}
+    ).json()
+
+    assert body["image"] == "registry/x:pinned"
+
+
+def test_the_machine_endpoint_says_whether_the_agent_is_on_the_fleet_image(
+    client, monkeypatch
+):
+    """Computed here, with `_same_image`, and not in the app.
+
+    Fly reports `repo:tag@sha256:…` while the configured image is written
+    without the digest, so string equality never matches. That comparison has
+    been wrong three times in this repo; a TypeScript copy would be the fourth.
+    """
+    import flotta.provision as provision
+    from flotta.backend import MachineInfo
+
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
+    _fake_backend(
+        monkeypatch,
+        lambda box_id: MachineInfo(state="started", image="registry/x:new@sha256:abc"),
+    )
+    body = client.get("/api/boxes/eng-a/machine").json()
+
+    assert body["fleet_image"] == "registry/x:new"
+    assert body["image_current"] is True, "a digest must not make the same image look different"
+
+
+def test_an_agent_on_an_older_image_is_reported_as_behind(client, monkeypatch):
+    import flotta.provision as provision
+    from flotta.backend import MachineInfo
+
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
+    _fake_backend(
+        monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old")
+    )
+
+    assert client.get("/api/boxes/eng-a/machine").json()["image_current"] is False
+
+
+def test_an_unknown_side_is_not_reported_as_behind(client, monkeypatch):
+    """`None`, not `False`. "Behind" puts an Upgrade button in front of
+    somebody, and offering one on no evidence is how an agent gets restarted
+    for nothing."""
+    import flotta.provision as provision
+    from flotta.backend import MachineInfo
+
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: None)
+    _fake_backend(
+        monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old")
+    )
+
+    assert client.get("/api/boxes/eng-a/machine").json()["image_current"] is None

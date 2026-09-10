@@ -218,6 +218,23 @@ async fn agent_machine(
     fleet::machine(&read_settings(&app), &id).await
 }
 
+/// Which Hermes the fleet builds, and whether a newer one exists.
+#[tauri::command]
+async fn hermes_versions(app: tauri::AppHandle) -> Result<fleet::HermesVersions, FleetError> {
+    fleet::hermes_versions(&read_settings(&app)).await
+}
+
+/// Move an agent onto the fleet's current image, keeping its disk.
+///
+/// No name confirmation, unlike destroy: this is the *opposite* of destroying
+/// — the volume, which is the agent's months of memory, is the thing it exists
+/// to preserve. What it does cost is a restart, and the window says so before
+/// asking.
+#[tauri::command]
+async fn upgrade_agent(app: tauri::AppHandle, id: String) -> Result<(), FleetError> {
+    fleet::upgrade_agent(&read_settings(&app), &id).await
+}
+
 /// Destroy an agent. `confirm` must be the agent's own name.
 ///
 /// The confirmation is checked here, not only in the UI, because this is the
@@ -322,6 +339,8 @@ pub fn run() {
             set_fleet_settings,
             agent_timeline,
             agent_machine,
+            hermes_versions,
+            upgrade_agent,
             destroy_agent
         ])
         .run(tauri::generate_context!())
