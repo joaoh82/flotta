@@ -727,6 +727,51 @@ pub async fn upgrade_agent(settings: &Settings, id: &str) -> Result<(), FleetErr
     .map(|_| ())
 }
 
+/// One attempt to build the box image. Mirrors `Build` in `store.py`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Build {
+    pub id: String,
+    pub hermes_ref: String,
+    /// `building`, `done` or `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BuildList {
+    builds: Vec<Build>,
+}
+
+/// Build the box image at a Hermes ref and roll every agent onto it.
+///
+/// Answers `202` — a cold build is minutes — so this returns as soon as the
+/// control plane has accepted the job. Progress is `builds()` plus the usual
+/// per-agent timeline events.
+pub async fn update_hermes(settings: &Settings, hermes_ref: &str) -> Result<(), FleetError> {
+    send(
+        settings,
+        reqwest::Method::POST,
+        "/api/hermes/update",
+        Some(serde_json::json!({ "hermes_ref": hermes_ref })),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// What the fleet has built, newest first.
+pub async fn builds(settings: &Settings) -> Result<Vec<Build>, FleetError> {
+    let body = get(settings, "/api/hermes/builds").await?;
+    serde_json::from_str::<BuildList>(&body)
+        .map(|list| list.builds)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable build list: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1635,3 +1635,148 @@ def test_no_image_says_which_kind_of_nothing(client, monkeypatch):
     body = client.get("/api/hermes").json()
     assert body["fleet_image_app"] == "a-deleted-app"
     assert body["newest_release"] is None
+
+
+# -- the button -------------------------------------------------------------
+
+
+def _no_build(monkeypatch, image="registry/x:built", fails=None):
+    """Replace the builder. Nothing in this file may run flyctl."""
+    import flotta.images as images
+
+    def fake(ref, *, app, region="ams", **kwargs):
+        if fails:
+            raise images.BuildError(fails)
+        return image
+
+    monkeypatch.setattr(images, "build_box_image", fake)
+
+
+def _wait(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_the_update_answers_immediately_and_builds_on_a_thread(async_client, fleet, monkeypatch):
+    """A cold build is minutes; the proxy cuts at 60 seconds."""
+    _no_build(monkeypatch)
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "upgrade_box", lambda box_id, **kw: {"box_id": box_id})
+
+    response = async_client.post("/api/hermes/update", json={"hermes_ref": "v2026.9.8"})
+
+    assert response.status_code == 202
+    assert response.json()["hermes_ref"] == "v2026.9.8"
+
+    with FleetStore(fleet) as store:
+        assert _wait(lambda: (store.latest_build() or None) and store.latest_build().status == "done")
+        assert store.latest_build().image == "registry/x:built"
+
+
+def test_every_live_agent_is_rolled_onto_the_new_image(async_client, fleet, monkeypatch):
+    _no_build(monkeypatch)
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    import flotta.provision as provision
+
+    rolled: list[str] = []
+    monkeypatch.setattr(
+        provision,
+        "upgrade_box",
+        lambda box_id, **kw: rolled.append(kw.get("image")) or {"box_id": box_id},
+    )
+
+    async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
+
+    assert _wait(lambda: rolled), "no agent was rolled"
+    assert rolled == ["registry/x:built"]
+
+
+def test_rolling_stops_at_the_first_agent_that_fails(async_client, fleet, monkeypatch):
+    """The first agent is the canary.
+
+    A Hermes that will not serve should cost one agent a restart, not the
+    fleet — and `upgrade_box` leaves a failed agent exactly as it was, which is
+    what makes stopping a recovery rather than a half-migrated fleet.
+    """
+    _no_build(monkeypatch)
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    import flotta.provision as provision
+    from flotta.provision import UpgradeFailed
+
+    attempts: list[str] = []
+
+    def refuse(box_id, **kw):
+        attempts.append(box_id)
+        raise UpgradeFailed("the substrate said no")
+
+    monkeypatch.setattr(provision, "upgrade_box", refuse)
+    with FleetStore(fleet) as store:
+        second = store.create_box("eng-second")
+        store.update_box_status(second.id, "running", endpoint="fly://app/m2")
+
+    async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
+
+    assert _wait(lambda: attempts)
+    time.sleep(0.3)
+    assert len(attempts) == 1, f"rolling continued past a failure: {attempts}"
+
+
+def test_a_failed_build_touches_no_agent(async_client, fleet, monkeypatch):
+    _no_build(monkeypatch, fails="build failed: no space left")
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    import flotta.provision as provision
+
+    rolled: list[str] = []
+    monkeypatch.setattr(provision, "upgrade_box", lambda box_id, **kw: rolled.append(box_id))
+
+    async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
+
+    with FleetStore(fleet) as store:
+        assert _wait(lambda: (store.latest_build() or None) and store.latest_build().status == "failed")
+        assert "no space left" in store.latest_build().error
+    assert rolled == [], "a build that failed must not move any agent"
+
+
+def test_a_second_update_while_one_is_running_is_refused(async_client, fleet, monkeypatch):
+    """Two builds race for the same app's release history, and the loser's
+    agents get rolled onto an image the winner replaced."""
+    _no_build(monkeypatch)
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    with FleetStore(fleet) as store:
+        store.start_build("v1")
+
+    response = async_client.post("/api/hermes/update", json={"hermes_ref": "v2"})
+
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+def test_no_build_app_is_recorded_rather_than_crashing_the_thread(
+    async_client, fleet, monkeypatch
+):
+    """The thread is where nobody is looking. A build that cannot start must
+    leave a row saying why, not a log line."""
+    monkeypatch.delenv("FLOTTA_FLY_APP", raising=False)
+
+    async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
+
+    with FleetStore(fleet) as store:
+        assert _wait(lambda: (store.latest_build() or None) and store.latest_build().status == "failed")
+        assert "FLOTTA_FLY_APP" in store.latest_build().error
+
+
+def test_builds_are_listed_newest_first(client, fleet):
+    with FleetStore(fleet) as store:
+        first = store.start_build("v1")
+        store.finish_build(first.id, image="registry/x:1")
+        store.start_build("v2")
+
+    builds = client.get("/api/hermes/builds").json()["builds"]
+    assert [b["hermes_ref"] for b in builds] == ["v2", "v1"]
+    assert builds[0]["status"] == "building"

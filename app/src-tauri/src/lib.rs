@@ -235,6 +235,21 @@ async fn upgrade_agent(app: tauri::AppHandle, id: String) -> Result<(), FleetErr
     fleet::upgrade_agent(&read_settings(&app), &id).await
 }
 
+/// Build the box image at a Hermes ref and roll every agent onto it.
+///
+/// The one control this whole feature exists for: the window said a newer
+/// Hermes was out and, until this, could do nothing about it.
+#[tauri::command]
+async fn update_hermes(app: tauri::AppHandle, hermes_ref: String) -> Result<(), FleetError> {
+    fleet::update_hermes(&read_settings(&app), &hermes_ref).await
+}
+
+/// What the fleet has built, newest first.
+#[tauri::command]
+async fn hermes_builds(app: tauri::AppHandle) -> Result<Vec<fleet::Build>, FleetError> {
+    fleet::builds(&read_settings(&app)).await
+}
+
 /// Destroy an agent. `confirm` must be the agent's own name.
 ///
 /// The confirmation is checked here, not only in the UI, because this is the
@@ -341,6 +356,8 @@ pub fn run() {
             agent_machine,
             hermes_versions,
             upgrade_agent,
+            update_hermes,
+            hermes_builds,
             destroy_agent
         ])
         .run(tauri::generate_context!())

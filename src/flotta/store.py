@@ -214,6 +214,29 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at  TEXT NOT NULL
 );
 
+-- What the fleet has built, and what happened while it was building.
+--
+-- A build is not a box, a task or a workspace, so it cannot live in `events`
+-- — that table's `entity_kind` is checked against the three tiers, and
+-- `add_event` refuses an entity that does not exist. It needs its own row
+-- because it outlives the request that started it: the app asks for an image
+-- and comes back later to find out how it went, exactly as it does for a
+-- create.
+--
+-- A **new table** is the one schema change this store can absorb. `CREATE
+-- TABLE IF NOT EXISTS` gives an existing database a new table on the next
+-- open, while a new *column* on an old table would silently not appear. That
+-- is why this is a table and not two columns on `settings`.
+CREATE TABLE IF NOT EXISTS builds (
+    id           TEXT PRIMARY KEY,
+    hermes_ref   TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('building', 'done', 'failed')),
+    image        TEXT,
+    error        TEXT,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
@@ -228,6 +251,7 @@ CREATE INDEX IF NOT EXISTS idx_workspaces_box_id ON workspaces(box_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_box_id ON tasks(box_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_kind, entity_id);
+CREATE INDEX IF NOT EXISTS idx_builds_started ON builds(started_at);
 """
 
 
@@ -337,6 +361,19 @@ class Event:
     ts: str
     type: str
     payload: dict[str, Any] | None
+
+
+@dataclass(frozen=True, slots=True)
+class Build:
+    """One attempt to build the fleet's box image."""
+
+    id: str
+    hermes_ref: str
+    status: str
+    image: str | None
+    error: str | None
+    started_at: str
+    finished_at: str | None
 
 
 def _utcnow() -> str:
@@ -680,6 +717,61 @@ class FleetStore:
             "updated_at = EXCLUDED.updated_at",
             (key, value, _utcnow()),
         )
+
+    # -- builds -------------------------------------------------------------
+
+    def start_build(self, hermes_ref: str) -> Build:
+        """Record that a build has begun, and return the row to poll.
+
+        Written *before* the builder is called, for the same reason
+        `reserve_box` reserves a row before provisioning: a control plane that
+        dies mid-build should leave something that says so, not silence.
+        """
+        build_id = f"bld-{uuid.uuid4().hex[:12]}"
+        now = _utcnow()
+        with self._conn.transaction(guard="builds"):
+            # Guarded because `latest_build` reads it to decide whether another
+            # build may start — a read-check-write, and an unguarded one on
+            # Postgres is an optimistic BEGIN that lets two builds race.
+            self._conn.execute(
+                "INSERT INTO builds (id, hermes_ref, status, started_at) VALUES (?, ?, ?, ?)",
+                (build_id, hermes_ref, "building", now),
+            )
+        return Build(
+            id=build_id,
+            hermes_ref=hermes_ref,
+            status="building",
+            image=None,
+            error=None,
+            started_at=now,
+            finished_at=None,
+        )
+
+    def finish_build(
+        self, build_id: str, *, image: str | None = None, error: str | None = None
+    ) -> None:
+        """Close a build. `image` on success, `error` on failure — never both."""
+        if (image is None) == (error is None):
+            raise ValueError("a finished build has exactly one of an image or an error")
+        self._conn.execute(
+            "UPDATE builds SET status = ?, image = ?, error = ?, finished_at = ? WHERE id = ?",
+            ("done" if image else "failed", image, error, _utcnow(), build_id),
+        )
+
+    def latest_build(self) -> Build | None:
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds ORDER BY started_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        return _build_from_row(row) if row else None
+
+    def list_builds(self, limit: int = 10) -> list[Build]:
+        rows = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds ORDER BY started_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_build_from_row(r) for r in rows]
 
     def set_settings(self, values: dict[str, str]) -> None:
         """Apply several overrides at once, all or nothing.
@@ -1119,6 +1211,18 @@ def _task_from_row(row: db.Row) -> Task:
         finished_at=row["finished_at"],
         result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
         cost_estimate=row["cost_estimate"],
+    )
+
+
+def _build_from_row(row: db.Row) -> Build:
+    return Build(
+        id=row["id"],
+        hermes_ref=row["hermes_ref"],
+        status=row["status"],
+        image=row["image"],
+        error=row["error"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
     )
 
 
