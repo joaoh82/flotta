@@ -709,13 +709,23 @@ def test_every_read_check_write_is_guarded():
 
 
 def test_the_guard_names_a_real_table():
+    """Read from the schema, not from a list kept beside it.
+
+    This test used to hardcode the table names, and the list had already gone
+    stale — it never learned about `box_repos`, so a guard naming that table
+    would have failed for being right. A duplicate of the schema is a thing
+    that drifts; the schema is the only copy that cannot.
+    """
     import inspect
     import re
 
     from flotta import store as store_module
 
-    tables = {"boxes", "workspaces", "tasks", "events", "settings"}
-    named = set(re.findall(r'transaction\(guard="(\w+)"\)', inspect.getsource(store_module)))
+    source = inspect.getsource(store_module)
+    tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", source))
+    named = set(re.findall(r'transaction\(guard="(\w+)"\)', source))
+
+    assert tables, "no tables found — has the schema moved?"
     assert named, "expected guarded transactions"
     assert named <= tables, f"guard names a table that does not exist: {named - tables}"
 

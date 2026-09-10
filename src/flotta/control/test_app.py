@@ -1652,6 +1652,12 @@ def _no_build(monkeypatch, image="registry/x:built", fails=None):
     monkeypatch.setattr(images, "build_box_image", fake)
 
 
+def _status(store):
+    """The latest build's status, or None — the thing every wait here is about."""
+    build = store.latest_build()
+    return build.status if build else None
+
+
 def _wait(predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1675,7 +1681,7 @@ def test_the_update_answers_immediately_and_builds_on_a_thread(async_client, fle
     assert response.json()["hermes_ref"] == "v2026.9.8"
 
     with FleetStore(fleet) as store:
-        assert _wait(lambda: (store.latest_build() or None) and store.latest_build().status == "done")
+        assert _wait(lambda: _status(store) == "done")
         assert store.latest_build().image == "registry/x:built"
 
 
@@ -1738,7 +1744,7 @@ def test_a_failed_build_touches_no_agent(async_client, fleet, monkeypatch):
     async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
 
     with FleetStore(fleet) as store:
-        assert _wait(lambda: (store.latest_build() or None) and store.latest_build().status == "failed")
+        assert _wait(lambda: _status(store) == "failed")
         assert "no space left" in store.latest_build().error
     assert rolled == [], "a build that failed must not move any agent"
 
@@ -1767,7 +1773,7 @@ def test_no_build_app_is_recorded_rather_than_crashing_the_thread(
     async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
 
     with FleetStore(fleet) as store:
-        assert _wait(lambda: (store.latest_build() or None) and store.latest_build().status == "failed")
+        assert _wait(lambda: _status(store) == "failed")
         assert "FLOTTA_FLY_APP" in store.latest_build().error
 
 

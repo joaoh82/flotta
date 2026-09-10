@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -37,7 +38,7 @@ class Fly:
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
         if "deploy" in cmd:
-            self.config = open(cmd[cmd.index("--config") + 1]).read()
+            self.config = Path(cmd[cmd.index("--config") + 1]).read_text()
             if self.deploy_fails:
                 return subprocess.CompletedProcess(
                     cmd, 1, "", "Warning: metrics\nError: build failed: no space left\n"

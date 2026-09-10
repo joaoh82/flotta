@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { POLL_MS } from "./poll";
+import { offerOf } from "./updates";
 import { isFleetError, type Build, type HermesVersions } from "./types";
 
 /**
@@ -44,7 +45,8 @@ export function HermesUpdate({
     void load();
   }, [load]);
 
-  const building = build?.status === "building";
+  const offer = offerOf(versions, build);
+  const building = offer.kind === "building";
 
   // Poll only while something is happening. A build is minutes, and the roll
   // that follows changes agents one at a time — both need the fleet re-read.
@@ -61,38 +63,12 @@ export function HermesUpdate({
     setError(null);
     setAsking(false);
     try {
-      await invoke("update_hermes", { hermesRef: versions?.latest ?? "" });
+      await invoke("update_hermes", { hermesRef: offer.kind === "none" ? "" : offer.ref });
       await load();
     } catch (e) {
       setError(isFleetError(e) ? e.detail : String(e));
     }
   };
-
-  if (building) {
-    return (
-      <Bar tone="busy">
-        <span>
-          Building Hermes {build?.hermes_ref} — a few minutes. Agents are upgraded one at a
-          time once it lands.
-        </span>
-      </Bar>
-    );
-  }
-
-  // A failed build is worth keeping on screen until something replaces it:
-  // nothing changed for any agent, and the reason is the only way to know why.
-  if (build?.status === "failed") {
-    return (
-      <Bar tone="bad">
-        <span>
-          Building Hermes {build.hermes_ref} failed — no agent was changed. {build.error}
-        </span>
-        <button onClick={() => void start()} className={BUTTON}>
-          Try again
-        </button>
-      </Bar>
-    );
-  }
 
   if (error) {
     return (
@@ -102,16 +78,31 @@ export function HermesUpdate({
     );
   }
 
-  // Nothing to offer: up to date, or the check could not be made. An
-  // unreachable GitHub must not become an invitation to rebuild for nothing.
-  if (!versions?.behind || !versions.latest) return null;
+  if (offer.kind === "building") {
+    return (
+      <Bar tone="busy">
+        <span>{offer.detail}</span>
+      </Bar>
+    );
+  }
+
+  if (offer.kind === "failed") {
+    return (
+      <Bar tone="bad">
+        <span>{offer.detail}</span>
+        <button onClick={() => void start()} className={BUTTON}>
+          Try again
+        </button>
+      </Bar>
+    );
+  }
+
+  if (offer.kind === "none") return null;
 
   if (!asking) {
     return (
       <Bar tone="offer">
-        <span>
-          Hermes {versions.latest} is available. Your agents run {versions.pinned}.
-        </span>
+        <span>{offer.detail}</span>
         <button onClick={() => setAsking(true)} className={BUTTON}>
           Update agents
         </button>
@@ -122,8 +113,8 @@ export function HermesUpdate({
   return (
     <Bar tone="offer">
       <span>
-        This builds a new box image on Hermes {versions.latest}, then moves every agent onto
-        it. Disks are kept — memories, skills and history all survive. Each agent{" "}
+        This builds a new box image on Hermes {offer.ref}, then moves every agent onto it.
+        Disks are kept — memories, skills and history all survive. Each agent{" "}
         <strong>restarts</strong>, and if one fails to come up the rest are left alone.
       </span>
       <button onClick={() => void start()} className={BUTTON}>
