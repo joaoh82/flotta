@@ -364,12 +364,13 @@ just door                   # the front door, 127.0.0.1:8081
 just dashboard              # the fleet view on http://localhost:3001 (needs `just serve`)
 just deploy-config          # every secret a first deployment needs — see docs/DEPLOY.md
 just hermes-check           # Hermes version drift: pinned vs. latest vs. your local install
+just fly-build              # COSTS MONEY: build + release the fleet image, leaving nothing running
 just fly-doctor             # what is true about a live box (starts it first)
 ```
 
 **Run `just check` in the main checkout, not only in a worktree** — it loads `.env`, and code under test may re-read that file at run time.
 
-**Recipes that touch real infrastructure cost money** and are never run in CI: `fly-up`, `fly-cycle`, `fly-proof`, `fly-down`, `fly-auth`, `fly-secrets`, `box-identity`, `door-deploy`, `door-secrets`.
+**Recipes that touch real infrastructure cost money** and are never run in CI: `fly-build`, `fly-up`, `fly-cycle`, `fly-proof`, `fly-down`, `fly-auth`, `fly-secrets`, `box-identity`, `door-deploy`, `door-secrets`.
 
 The dashboard reads the control-plane API, not the store — `just dashboard` alone answers 503 on every page. Run both. It is on **port 3001**, never 3000 (reserved; see parent `CLAUDE.md`), baked into `dashboard/package.json` rather than passed as a flag, because a flag is too easy to forget.
 

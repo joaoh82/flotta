@@ -390,6 +390,111 @@ fly-whoami:
     echo -n "  logged in as  "
     flyctl auth whoami
 
+# COSTS MONEY: builds and releases the fleet image, leaving nothing running.
+#
+# This is the recipe for "there is a new image" — a Hermes bump, a Dockerfile
+# change — and it is what `FLOTTA_FLY_APP`'s release history is for, since
+# FLOTTA-49 resolves the fleet image from it.
+#
+# ## Why it deploys and then destroys, rather than building only
+#
+# `flyctl deploy --build-only --push` pushes an image and creates **no
+# release**, and a release is exactly what the control plane reads. An image
+# the fleet cannot see is not an image.
+#
+# So the release comes from a real deploy, and `fly deploy` always makes a
+# machine while releasing. That machine has no consumer: nothing addresses it,
+# no row in the fleet store claims it, and it bills until somebody notices —
+# three of them accumulated on the build app in two days before this existed.
+# The image survives its removal, which was measured rather than assumed: two
+# were destroyed by hand and `flyctl releases` and the fleet image resolution
+# were unaffected.
+#
+# ## Why it only destroys machines *this run* created
+#
+# Because `fly-up` against an app with no prefix creates the fleet's box, and
+# "destroy the machine afterwards" would then destroy the agent. The diff is
+# the safety property: a machine that existed before this ran is somebody
+# else's and is never touched. If the deploy adopted an existing machine
+# instead of making one, nothing is destroyed and that is correct.
+#
+# The volume is deliberately left. It is reused by the next build (the check
+# in `fly-up` is by name), it costs cents, and deleting a disk on a recipe
+# whose job is building images is the wrong instinct to encode.
+#
+# COSTS MONEY: build and release the fleet image, leaving nothing running
+fly-build: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
+
+    # Two listings, two failure policies, and they must not be the same one.
+    #
+    # **Before is fail-closed.** If this cannot be read, an empty list makes
+    # every machine afterwards look new — including the fleet's box on an
+    # unprefixed app, which is precisely the agent the diff exists to protect.
+    # A blip in `flyctl` must stop the build, not silently widen what gets
+    # destroyed. Its stderr is deliberately not hidden: the reason is the
+    # useful part.
+    #
+    # **After is fail-open.** If *that* cannot be read, the worst case is an
+    # orphan machine left behind, which costs money and is recoverable. Failing
+    # here would abort after a successful release for a tidying step.
+    ids_before() {
+      flyctl machines list --app "$APP" --json \
+        | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin)))"
+    }
+
+    ids_after() {
+      flyctl machines list --app "$APP" --json 2>/dev/null \
+        | uv run python -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin)))" \
+        || true
+    }
+
+    if ! BEFORE=" $(ids_before) "; then
+      echo "ERROR: could not list machines on $APP before building." >&2
+      echo "  Refusing to continue: without that list, the cleanup after the" >&2
+      echo "  deploy cannot tell a machine it created from one that was" >&2
+      echo "  already there — and on a single-app fleet that is your agent." >&2
+      exit 1
+    fi
+    echo "machines before:${BEFORE% }"
+
+    just fly-up
+
+    KEPT=0
+    for id in $(ids_after); do
+      case "$BEFORE" in
+        *" $id "*)
+          echo "keeping $id — it existed before this build"
+          KEPT=$((KEPT+1))
+          continue
+          ;;
+      esac
+      echo "destroying $id — created by this build, nothing claims it"
+      flyctl machine destroy "$id" --app "$APP" --force
+    done
+    # An `if` rather than `[ ... ] && echo`. Not because `set -e` would abort
+    # on the false case — it does not, AND-OR lists are exempt — but because
+    # such a line returns 1, and as the *last* command in a recipe that makes
+    # `just` report a failure for a build that worked. This one is not last
+    # today. It would be one edit away from being last.
+    if [ "$KEPT" -gt 0 ]; then
+      echo "note: $KEPT pre-existing machine(s) left alone"
+    fi
+
+    echo
+    echo "released:"
+    uv run python -c "from flotta.backend import backend_for; print(' ', backend_for('fly://').current_image('$APP') or '(no completed release)')"
+    echo
+    echo "Every agent will now read as behind. Nothing has booted this image —"
+    echo "'just fly-up' brings one up so you can check it before upgrading anyone."
+
+# Leaves a running machine on purpose: that is the point when the app IS where
+# a box lives, and it is the cheap way to check a new image boots (`just
+# fly-doctor`) before any agent is moved onto it. If you only wanted an image,
+# `just fly-build` is the one that cleans up after itself.
+#
 # M2: provision the box — app + volume + first deploy (REAL infra, costs money)
 fly-up: fly-whoami
     #!/usr/bin/env bash

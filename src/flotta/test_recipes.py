@@ -132,3 +132,50 @@ def test_the_image_records_which_hermes_it_carries():
         f"a hardcoded version is worse than none: {label!r}"
     )
     assert "ARG HERMES_REF" in body, "the label would substitute to empty with no ARG in scope"
+
+
+def test_the_build_recipe_only_destroys_machines_it_created():
+    """A guard on a destructive line, read from the file it lives in.
+
+    `fly-build` destroys machines after deploying, and against an app with no
+    prefix the deployed machine **is** the fleet's box. The diff against the
+    ids present beforehand is the only thing standing between "clean up the
+    orphan" and "destroy the agent", and it is three lines of shell that no
+    test would otherwise see.
+    """
+    if not _JUSTFILE.is_file():  # pragma: no cover - only outside the repo
+        pytest.skip(f"no justfile at {_JUSTFILE}")
+    body = _JUSTFILE.read_text(encoding="utf-8")
+    recipe = body.split("\nfly-build: fly-whoami\n", 1)
+    assert len(recipe) == 2, "fly-build is gone or renamed"
+    recipe = recipe[1].split("\n\n# ", 1)[0]
+
+    assert "machine destroy" in recipe, "fly-build no longer cleans up"
+    assert "BEFORE" in recipe and "existed before this build" in recipe, (
+        "fly-build destroys machines without diffing against the ones that "
+        "existed first — against a single-app deployment that is the agent"
+    )
+
+    # The two listings must have **opposite** failure policies, which is the
+    # bug both reviewers caught: one `ids()` ending in `|| true` meant a failed
+    # *before* listing produced an empty list, and every machine afterwards
+    # then looked new — including the agent the diff exists to protect.
+    #
+    # Before is fail-closed (no `|| true`), after is fail-open. Asserted as a
+    # difference rather than by reading each, because "they are not the same
+    # function" is the property that was violated.
+    before = recipe.split("ids_after()", 1)[0]
+    after = recipe.split("ids_after()", 1)[1] if "ids_after()" in recipe else ""
+
+    assert "ids_before()" in recipe and "ids_after()" in recipe, (
+        "the two listings share one implementation again — a single `ids()` "
+        "with `|| true` makes a failed pre-build listing widen what is destroyed"
+    )
+    assert "|| true" not in before.split("ids_before()", 1)[-1], (
+        "the pre-build listing swallows failures; an empty BEFORE makes every "
+        "machine look new, and on a single-app fleet that is your agent"
+    )
+    assert "|| true" in after, (
+        "the post-build listing is fail-closed, so a flyctl blip aborts after a "
+        "successful release for the sake of a tidying step"
+    )
