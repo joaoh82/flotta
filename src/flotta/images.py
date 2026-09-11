@@ -29,16 +29,29 @@ safe to build at any time.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
-#: Where the shipped build context lives, relative to the installed package.
-#: `flotta/images.py` -> `flotta/` -> `src/` -> the install root holding
-#: `pyproject.toml` and `fly/`.
-_ROOT = Path(__file__).resolve().parents[2]
+#: The build context in a **checkout**: `src/flotta/images.py` -> `flotta/`
+#: -> `src/` -> the repo root holding `pyproject.toml` and `fly/`.
+#:
+#: Wrong for the deployed control plane, and it was shipped that way. There
+#: the package is `pip install`ed into site-packages, so this resolves to
+#: `/usr/local/lib/python3.11` — a directory with none of the files — while
+#: the Dockerfile has copied them to `/app`. The first press of "Update
+#: agents" failed on exactly that, safely and legibly, which is what the
+#: guard in `build_context` is for. The deployed image names its context
+#: explicitly instead: see `CONTEXT_ENV`.
+_CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
+
+#: Set by the control plane's Dockerfile to where it copied the context.
+#: Explicit, because "two directories up from this file" is only true in a
+#: checkout, and the deployed layout is the one that matters.
+CONTEXT_ENV = "FLOTTA_BUILD_CONTEXT"
 
 #: Long. A cold image build is minutes, and the failure mode of a short timeout
 #: is a build that succeeded being recorded as a failure.
@@ -61,21 +74,27 @@ class BuildError(Exception):
     """The image could not be built. Nothing has changed for any agent."""
 
 
-def build_context(root: Path | None = None) -> Path:
+def build_context(root: Path | None = None, env: Mapping[str, str] | None = None) -> Path:
     """The directory to hand the builder, or raise saying what is missing.
+
+    Resolution: an explicit `root`, else `$FLOTTA_BUILD_CONTEXT` (the deployed
+    control plane), else the checkout this file lives in (development).
 
     Checked rather than assumed, because the failure it prevents is silent:
     `flyctl deploy` against a context missing `src/` produces a *successful*
     build of an image whose entrypoint is not there, and the first thing that
     notices is a box that will not boot.
     """
-    base = root or _ROOT
+    source = os.environ if env is None else env
+    configured = (source.get(CONTEXT_ENV) or "").strip()
+    base = root or (Path(configured) if configured else _CHECKOUT_ROOT)
     missing = [name for name in shipped_context_files() if not (base / name).exists()]
     if missing:
+        how = f"${CONTEXT_ENV}" if configured and root is None else "the checkout"
         raise BuildError(
-            f"cannot build here: {base} is missing {', '.join(missing)}. "
-            "The control plane's image must ship the build context — see the "
-            "COPY lines in the root Dockerfile."
+            f"cannot build here: {base} (from {how}) is missing {', '.join(missing)}. "
+            f"The control plane's image must ship the build context and set "
+            f"${CONTEXT_ENV} to where it put it — see the root Dockerfile."
         )
     return base
 

@@ -251,3 +251,39 @@ def test_the_refs_people_actually_use_are_accepted(good, monkeypatch):
     monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
     assert build_box_image(good, app="build-app", runner=fly) == "registry/x:new"
     assert f'HERMES_REF = "{good}"' in fly.config
+
+
+def test_the_deployed_control_plane_names_its_context(tmp_path):
+    """The bug the first real press found.
+
+    Installed, this module lives in site-packages and "two directories up" is
+    `/usr/local/lib/python3.11` — a directory with none of the files — while
+    the Dockerfile copied them to `/app`. The checkout test above could never
+    see that; it only ever ran from a checkout. So the deployed image says
+    where the context is, and this proves the module listens.
+    """
+    context = tmp_path / "app"
+    for name in ("pyproject.toml", "README.md", "fly/Dockerfile", "fly/box_entrypoint.sh"):
+        (context / name).parent.mkdir(parents=True, exist_ok=True)
+        (context / name).write_text("x")
+    (context / "src").mkdir()
+
+    assert build_context(env={"FLOTTA_BUILD_CONTEXT": str(context)}) == context
+
+
+def test_a_wrong_context_setting_says_which_path_it_tried(tmp_path):
+    """"Missing pyproject.toml" is only useful with the path that was looked
+    in and how it was chosen — that is the difference between fixing an ENV
+    line and going to look for a file that exists."""
+    with pytest.raises(BuildError, match=r"\$FLOTTA_BUILD_CONTEXT") as err:
+        build_context(env={"FLOTTA_BUILD_CONTEXT": str(tmp_path / "nowhere")})
+    assert "nowhere" in str(err.value)
+
+
+def test_the_dockerfile_sets_the_context_where_it_copies_it():
+    """The two halves of the fix live in different files; this ties them."""
+    dockerfile = build_context().joinpath("Dockerfile").read_text(encoding="utf-8")
+    assert "ENV FLOTTA_BUILD_CONTEXT=/app" in dockerfile
+    assert "WORKDIR /app" in dockerfile
+    for copied in ("COPY pyproject.toml README.md ./", "COPY src/ ./src/", "COPY fly/ ./fly/"):
+        assert copied in dockerfile, f"the context is incomplete without {copied!r}"
