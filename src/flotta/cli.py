@@ -61,6 +61,7 @@ from .store import (
     DuplicateBoxError,
     Event,
     FleetStore,
+    InvalidBoxMetaError,
     InvalidBoxNameError,
     LegacyStoreError,
     Task,
@@ -990,7 +991,7 @@ def create(
                 description=description,
                 instructions=instructions,
             )
-        except (InvalidBoxNameError, DuplicateBoxError) as exc:
+        except (InvalidBoxNameError, InvalidBoxMetaError, DuplicateBoxError) as exc:
             # Exit 2: the caller asked for something impossible, which is a
             # refusal rather than a failure (see the exit-code convention).
             # `DuplicateBoxError` reached here uncaught before this — a name

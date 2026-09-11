@@ -1017,3 +1017,20 @@ def test_box_row_shows_the_label_beside_the_address():
 def test_render_boxes_has_a_label_column_even_when_nothing_is_labelled():
     out = render_boxes([make_box()], now=NOW)
     assert "LABEL" in out.splitlines()[0]
+
+
+def test_a_bad_description_is_a_refusal_not_a_failure(tmp_path):
+    """Exit 2, like a bad name. Both are the caller asking for something the
+    fleet will not record; exit 1 is reserved for the substrate failing, and
+    a script telling them apart by code must not be told "something broke"
+    when it was told "no". Reviewers caught the mismatch."""
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    result = CliRunner().invoke(
+        app,
+        ["create", "eng-x", "--store", str(tmp_path / "f.db"), "--description", "x" * 501],
+    )
+    assert result.exit_code == 2, result.output
+    assert "too long" in result.output

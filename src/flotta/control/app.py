@@ -896,6 +896,12 @@ def create_app(
         about what the agent runs. Changing a live agent's instructions means
         reaching the volume, and that is a separate verb with a restart or an
         exec behind it — not a field on this endpoint.
+
+        **A full replace, not a merge.** Omitting `display_name` or
+        `description` clears it. The app always sends both; a CLI `flotta
+        meta` would have to as well. Chosen because "PUT the whole identity"
+        has one meaning and "PATCH some of it" has several — and the store's
+        `test_meta_is_replaced_not_merged` pins it.
         """
         from flotta.store import InvalidBoxMetaError
 

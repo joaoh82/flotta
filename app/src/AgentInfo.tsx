@@ -89,7 +89,17 @@ export function AgentInfo({
   // moment as the machine, so comparing them is comparing two things that were
   // true together. Falling back to the list's row would compare the substrate
   // now against a row from up to a poll ago and invent drift out of the gap.
+  // Two rows, two jobs — and they must not be the same variable.
+  //
+  // `row` is the machine endpoint's snapshot of the box, read at the same
+  // instant as the machine, and it is what the drift comparison needs:
+  // status against state, both true together. `box` is the list's row, kept
+  // fresh by the poll and patched by `onRenamed`. Identity — name,
+  // description, the seed — has to come from `box`, or a Rename updates the
+  // sidebar and leaves this panel showing the old name until Recheck. Both
+  // reviewers caught exactly that.
   const row = view?.box ?? box;
+  const identity = box;
   const disagreement = machine ? drift(row.status, machine.state) : null;
   const image = machine?.image ? imageParts(machine.image) : null;
   const standing = imageStanding(view ?? {});
@@ -98,8 +108,10 @@ export function AgentInfo({
   const fleetNote = versions ? fleetImageNote(versions) : null;
 
   const beginEdit = () => {
-    setDraftName(box.display_name ?? "");
-    setDraftDescription(box.description ?? "");
+    // From `identity`, the same source the panel shows — so a second Rename
+    // starts from what is on screen, not from an older snapshot.
+    setDraftName(identity.display_name ?? "");
+    setDraftDescription(identity.description ?? "");
     setRenameError(null);
     setEditing(true);
   };
@@ -392,8 +404,8 @@ export function AgentInfo({
             </div>
           ) : null}
           <dl className="mt-1.5 space-y-1">
-            {row.display_name && <Line label="Called" value={row.display_name} />}
-            {row.description && <Line label="For" value={row.description} />}
+            {identity.display_name && <Line label="Called" value={identity.display_name} />}
+            {identity.description && <Line label="For" value={identity.description} />}
             <Line label="Id" value={row.id} mono />
             <Line label="Address" value={`${row.name}.flotta.dev`} mono />
             {row.endpoint && <Line label="Endpoint" value={row.endpoint} mono />}
@@ -405,13 +417,13 @@ export function AgentInfo({
             volume, which it may have changed since; this is the record of
             what it started with, and saying otherwise would be the panel
             claiming to know what the agent thinks. */}
-        {row.instructions && (
+        {identity.instructions && (
           <section>
             <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">
               Standing instructions (as seeded)
             </h3>
             <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-neutral-200 bg-neutral-50 p-2.5 font-mono text-[11px] text-neutral-800">
-              {row.instructions}
+              {identity.instructions}
             </pre>
             <p className="mt-1 text-[11px] text-neutral-400">
               Written to the agent&rsquo;s SOUL.md at creation. It&rsquo;s the agent&rsquo;s own

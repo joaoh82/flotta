@@ -119,7 +119,7 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
         onClick={() => setShowOptions((open) => !open)}
         className="mt-2 text-[11px] text-neutral-500 underline hover:text-neutral-700"
       >
-        {showOptions ? "Fewer options" : "Instructions, size or region"}
+        {showOptions ? "Use the fleet's defaults" : "Give it a different size or region"}
       </button>
 
       {/* Who it is. Visible without expanding anything, because an agent with
@@ -145,27 +145,34 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
         />
       </div>
 
+      {/* Always visible, not behind the expander. An agent is defined by
+          what it is told at least as much as by its name, and the product
+          ask lists instructions beside the name — a field that is easy to
+          miss on first create is a field that goes unset. */}
+      <div className="mt-2">
+        <label className="block">
+          <span className="text-[11px] text-neutral-600">Standing instructions</span>
+          <textarea
+            value={instructions}
+            onChange={(e) => setInstructions(e.target.value)}
+            placeholder="Its system prompt. Who it is, what it works on, how it should behave."
+            rows={4}
+            maxLength={16000}
+            disabled={busy}
+            className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 font-mono text-[11px] focus:border-neutral-500 focus:outline-none disabled:bg-neutral-50"
+          />
+          {/* Seeded once. Said here because it is the one thing about
+              instructions that is not obvious: after this the file is the
+              agent's, on its volume, and this form never touches it again. */}
+          <span className="text-[11px] text-neutral-400">
+            Written to the agent&rsquo;s SOUL.md once, at creation. From then on it&rsquo;s
+            the agent&rsquo;s own to keep or change.
+          </span>
+        </label>
+      </div>
+
       {showOptions && (
         <div className="mt-2 space-y-2">
-          <label className="block">
-            <span className="text-[11px] text-neutral-600">Standing instructions</span>
-            <textarea
-              value={instructions}
-              onChange={(e) => setInstructions(e.target.value)}
-              placeholder="Its system prompt. Who it is, what it works on, how it should behave."
-              rows={4}
-              maxLength={16000}
-              disabled={busy}
-              className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 font-mono text-[11px] focus:border-neutral-500 focus:outline-none disabled:bg-neutral-50"
-            />
-            {/* Seeded once. Said here because it is the one thing about
-                instructions that is not obvious: after this the file is the
-                agent's, on its volume, and this form never touches it again. */}
-            <span className="text-[11px] text-neutral-400">
-              Written to the agent&rsquo;s SOUL.md once, at creation. From then on it&rsquo;s
-              the agent&rsquo;s own to keep or change.
-            </span>
-          </label>
           <label className="block">
             <span className="text-[11px] text-neutral-600">Disk (GB)</span>
             <input
