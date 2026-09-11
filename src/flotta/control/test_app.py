@@ -1904,3 +1904,131 @@ def test_a_failed_build_does_not_count_as_what_the_fleet_runs(client, fleet, mon
     body = client.get("/api/hermes").json()
     assert body["fleet_ref_source"] == "pin"
     assert body["behind"] is True
+
+
+# -- FLOTTA-40: who an agent is ---------------------------------------------
+
+
+def _fake_create_recording(monkeypatch):
+    """`create_box` that records what it was handed and writes a plausible row."""
+    import flotta.provision as provision
+
+    seen: dict = {}
+
+    def fake(name, *, store, box=None, **kwargs):
+        seen.update(kwargs)
+        row = box or store.create_box(name)
+        # What the real `reserve_box` does with these; the fake has to too, or
+        # it is testing the fake.
+        identity = {k: kwargs.get(k) for k in ("display_name", "description", "instructions")}
+        if any(identity.values()):
+            store.set_box_meta(row.id, **identity)
+        store.update_box_status(row.id, "running", endpoint="fly://app/m9")
+        return {"box_id": row.id, "endpoint": "fly://app/m9"}
+
+    monkeypatch.setattr(provision, "create_box", fake)
+    return seen
+
+
+def test_an_agent_is_created_with_a_name_a_description_and_instructions(client, monkeypatch):
+    seen = _fake_create_recording(monkeypatch)
+
+    body = client.post(
+        "/api/boxes",
+        json={
+            "name": "eng-r",
+            "display_name": "Reviewer — backend PRs",
+            "description": "Reviews backend pull requests.",
+            "instructions": "You are a careful backend reviewer.",
+        },
+    ).json()
+
+    assert body["box"]["name"] == "eng-r"  # the address
+    assert body["box"]["display_name"] == "Reviewer — backend PRs"
+    assert body["box"]["description"] == "Reviews backend pull requests."
+    assert body["box"]["instructions"] == "You are a careful backend reviewer."
+    assert seen["instructions"] == "You are a careful backend reviewer."
+
+
+def test_the_202_row_already_carries_the_display_name(async_client, fleet, monkeypatch):
+    """That row goes straight into the app's sidebar without waiting for a
+    poll. Without the name on it, the agent appears under its address for five
+    seconds and then changes — the window contradicting itself."""
+    from types import SimpleNamespace
+
+    import flotta.control.app as app_module
+    import flotta.provision as provision
+
+    # No substrate: `_peek_for` is the app's probe, `_backend_for` is what the
+    # row's `provisioning` event records a scheme from.
+    monkeypatch.setattr(app_module, "_peek_for", lambda impl, name: None)
+    monkeypatch.setattr(provision, "_backend_for", lambda scheme: SimpleNamespace(scheme="fly"))
+    monkeypatch.setattr(provision, "create_box", lambda name, **kw: {"box_id": "x"})
+
+    response = async_client.post(
+        "/api/boxes", json={"name": "eng-r", "display_name": "Reviewer", "instructions": "Be kind."}
+    )
+
+    assert response.status_code == 202
+    assert response.json()["box"]["display_name"] == "Reviewer"
+    with FleetStore(fleet) as store:
+        meta = store.meta_for_box(response.json()["box_id"])
+        assert meta.instructions == "Be kind.", "the thread reads instructions from the store"
+
+
+def test_the_fleet_list_carries_identity_in_one_query(client, fleet):
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name("eng-a")
+        store.set_box_meta(box.id, display_name="Alpha", description="First agent")
+
+    rows = {b["name"]: b for b in client.get("/api/boxes").json()["boxes"]}
+    assert rows["eng-a"]["display_name"] == "Alpha"
+    assert rows["eng-a"]["description"] == "First agent"
+
+
+def test_an_agent_with_no_identity_reports_none_not_undefined(client):
+    """`None` is a state the app renders as "no description". A missing key
+    renders as the word `undefined`."""
+    row = client.get("/api/boxes").json()["boxes"][0]
+    assert row["display_name"] is None
+    assert "description" in row and "instructions" in row
+
+
+def test_a_description_that_cannot_be_stored_is_refused_before_the_name_is_spent(
+    client, fleet, monkeypatch
+):
+    seen = _fake_create_recording(monkeypatch)
+    response = client.post("/api/boxes", json={"name": "eng-r", "description": "x" * 501})
+
+    assert response.status_code == 422
+    assert "too long" in response.json()["detail"]
+    assert seen == {}, "create_box ran despite an invalid description"
+    with FleetStore(fleet) as store:
+        assert store.get_box_by_name("eng-r") is None
+
+
+def test_an_agent_can_be_renamed_and_redescribed_but_not_reinstructed(client, fleet):
+    """The store row is the *record* of what the agent was seeded with; the
+    copy it reads is SOUL.md on its own volume. Editing the record here would
+    make it lie about what the agent runs."""
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name("eng-a")
+        store.set_box_meta(box.id, display_name="Old", instructions="Original seed.")
+
+    body = client.put(
+        "/api/boxes/eng-a/meta",
+        json={"display_name": "New", "description": "Now described", "instructions": "Hijack"},
+    ).json()
+
+    assert body["box"]["display_name"] == "New"
+    assert body["box"]["description"] == "Now described"
+    assert body["box"]["instructions"] == "Original seed.", "instructions changed through PUT"
+
+
+def test_renaming_never_touches_the_address(client):
+    body = client.put("/api/boxes/eng-a/meta", json={"display_name": "Anything At All!"}).json()
+    assert body["box"]["name"] == "eng-a"
+
+
+def test_renaming_a_missing_agent_is_404(client):
+    assert client.put("/api/boxes/nope/meta", json={"display_name": "x"}).status_code == 404

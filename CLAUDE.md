@@ -143,6 +143,17 @@ conventions, and the sharp edges below.
   `eng-b` after a real upgrade, on its own durable volume. That migration
   happening is what makes a Hermes bump safe for agents that already have
   history; it is worth re-checking on the next bump rather than assumed.
+- **Standing instructions are `$HERMES_HOME/SOUL.md`, seeded once.** Hermes
+  reads it while building every prompt (`agent/prompt_builder.py`,
+  `load_soul_md` — verified at v2026.9.7), so it is per turn, not per boot: an
+  agent that edits its own persona sees the change on the next message with
+  no restart. The control plane hands the seed over as `FLOTTA_INSTRUCTIONS`
+  in the machine's env, and `box_entrypoint.sh` writes the file **only when
+  it is absent** — the volume copy is the agent's from then on, and a re-image
+  keeps it. The store's `box_meta.instructions` is the *record* of the seed,
+  not the live prompt; `PUT /api/boxes/{id}/meta` refuses to change it for
+  exactly that reason. `box_meta` is a side table because a new column on
+  `boxes` would not appear on an existing store (FLOTTA-40).
 - **The memory tool must be named in the prompt.** "Remember X" is treated as
   conversational and writes nothing; the box then honestly reports an empty
   memory store on recall, which looks exactly like a durability failure and is

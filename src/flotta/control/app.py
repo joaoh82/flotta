@@ -198,10 +198,27 @@ def _build_region() -> str:
     return FlyConfig.from_env().resolved_region()
 
 
-def _box_dict(box: Any) -> dict[str, Any]:
+def _box_dict(box: Any, meta: Any = None) -> dict[str, Any]:
+    """The row, plus who the agent is when the caller has looked that up.
+
+    `display_name` / `description` / `instructions` are always present so the
+    app never reads `undefined` — `None` means "not set", which is a real
+    state. `meta` is optional because the identity is a side table: the list
+    endpoint fetches it in one query for the fleet, the single-box endpoints
+    fetch one row, and a few internal callers have no store handy and get
+    Nones — which is honest, since they did not look.
+    """
     from dataclasses import asdict
 
-    return asdict(box)
+    out = asdict(box)
+    out["display_name"] = meta.display_name if meta else None
+    out["description"] = meta.description if meta else None
+    out["instructions"] = meta.instructions if meta else None
+    return out
+
+
+def _with_meta(store: Any, box: Any) -> dict[str, Any]:
+    return _box_dict(box, store.meta_for_box(box.id))
 
 
 def create_app(
@@ -624,7 +641,12 @@ def create_app(
                     # "no rate configured", a zero claims the box ran for free.
                     "cost_estimate": sum(costs) if costs else None,
                 }
-            return {"boxes": [{**_box_dict(b), **summaries[b.id]} for b in boxes]}
+            metas = store.meta_for_boxes([b.id for b in boxes])
+            return {
+                "boxes": [
+                    {**_box_dict(b, metas.get(b.id)), **summaries[b.id]} for b in boxes
+                ]
+            }
         finally:
             store.close()
 
@@ -680,13 +702,40 @@ def create_app(
                 )
         region = (str(body.get("region") or "")).strip() or None
 
+        # Who the agent is. Validated here for the early exit and again in the
+        # store for the guarantee; a description that cannot be stored must
+        # refuse before a name is spent.
+        from flotta.store import InvalidBoxMetaError, validate_box_meta
+
+        try:
+            display_name, description, instructions = validate_box_meta(
+                body.get("display_name"), body.get("description"), body.get("instructions")
+            )
+        except InvalidBoxMetaError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
         if background:
-            return _create_in_background(name, volume_gb=volume_gb, region=region)
+            return _create_in_background(
+                name,
+                volume_gb=volume_gb,
+                region=region,
+                display_name=display_name,
+                description=description,
+                instructions=instructions,
+            )
 
         store = store_factory()
         try:
             try:
-                result = create_box(name, store=store, volume_gb=volume_gb, region=region)
+                result = create_box(
+                    name,
+                    store=store,
+                    volume_gb=volume_gb,
+                    region=region,
+                    display_name=display_name,
+                    description=description,
+                    instructions=instructions,
+                )
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
                 # a destroyed agent's name, this now means a *live* one — which
@@ -722,12 +771,18 @@ def create_app(
                 # already reports a failed teardown that way.
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             box = store.get_box(result["box_id"])
-            return {"box": _box_dict(box), **result}
+            return {"box": _with_meta(store, box), **result}
         finally:
             store.close()
 
     def _create_in_background(
-        name: str, *, volume_gb: int | None = None, region: str | None = None
+        name: str,
+        *,
+        volume_gb: int | None = None,
+        region: str | None = None,
+        display_name: str | None = None,
+        description: str | None = None,
+        instructions: str | None = None,
     ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
@@ -764,7 +819,14 @@ def create_app(
                             ),
                         )
             try:
-                box = reserve_box(name, store=store, backend=impl)
+                box = reserve_box(
+                    name,
+                    store=store,
+                    backend=impl,
+                    display_name=display_name,
+                    description=description,
+                    instructions=instructions,
+                )
             except DuplicateBoxError as exc:
                 # A *live* box holds the name — a destroyed one no longer does,
                 # because teardown releases it.
@@ -774,7 +836,10 @@ def create_app(
                     status_code=409,
                     detail=f"cannot create a box named {name!r}: {exc}",
                 ) from exc
-            payload = {"box": _box_dict(box), "box_id": box.id, "status": box.status}
+            # This row goes straight into the app's sidebar without waiting
+            # for a poll, so it has to carry the display name or the agent
+            # shows up under its address for five seconds.
+            payload = {"box": _with_meta(store, box), "box_id": box.id, "status": box.status}
         finally:
             store.close()
 
@@ -814,9 +879,42 @@ def create_app(
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
             return {
-                "box": _box_dict(box),
+                "box": _with_meta(store, box),
                 "tasks": [_task_dict(t) for t in store.list_tasks(box_id=box.id)],
             }
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/meta")
+    def set_meta(box_id: str, body: dict[str, Any], _: Token | None = needs_write) -> Any:
+        """Rename or re-describe an agent. The address never changes.
+
+        **Instructions are deliberately not editable here.** The store row is
+        the *record* of what the agent was seeded with; the copy it reads is
+        `SOUL.md` on its own volume, which the entrypoint writes once and never
+        touches again. Editing the record after creation would make it lie
+        about what the agent runs. Changing a live agent's instructions means
+        reaching the volume, and that is a separate verb with a restart or an
+        exec behind it — not a field on this endpoint.
+        """
+        from flotta.store import InvalidBoxMetaError
+
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            current = store.meta_for_box(box.id)
+            try:
+                meta = store.set_box_meta(
+                    box.id,
+                    display_name=body.get("display_name"),
+                    description=body.get("description"),
+                    instructions=current.instructions if current else None,
+                )
+            except InvalidBoxMetaError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"box": _box_dict(box, meta)}
         finally:
             store.close()
 
@@ -858,7 +956,7 @@ def create_app(
             box = store.get_box(box_id) or store.get_box_by_name(box_id)
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
-            row = _box_dict(box)
+            row = _with_meta(store, box)
             if not box.endpoint:
                 # Not a failure: a box being built has no machine yet, which is
                 # the honest thing to say rather than an error about flyctl.

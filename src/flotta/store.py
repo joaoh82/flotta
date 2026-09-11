@@ -246,6 +246,31 @@ CREATE TABLE IF NOT EXISTS builds (
     finished_at  TEXT
 );
 
+-- Who an agent is, as opposed to where it lives.
+--
+-- `boxes.name` is the ADDRESS — a DNS label, immutable, part of a Fly app
+-- name. It cannot carry "Reviewer — backend PRs". A person-facing name and a
+-- description are fleet metadata, and they are a **side table** rather than
+-- columns on `boxes` for the reason the file keeps stating: the schema is
+-- `CREATE TABLE IF NOT EXISTS`, so a new table appears on every existing
+-- store and a new column on `boxes` silently does not. `box_repos` and
+-- `builds` got in the same way. Building a migration framework to add two
+-- columns would be machinery for one feature; if a real column change ever
+-- becomes unavoidable, that is the moment to build it.
+--
+-- `instructions` is here as the RECORD of what the agent was seeded with —
+-- the app shows it, and a re-created machine can be seeded again. The copy
+-- the agent actually reads is `$HERMES_HOME/SOUL.md` on its volume, which is
+-- the agent's to evolve. The two diverge on purpose once the agent edits its
+-- own; this row is the seed, not the live prompt.
+CREATE TABLE IF NOT EXISTS box_meta (
+    box_id        TEXT PRIMARY KEY,
+    display_name  TEXT,
+    description   TEXT,
+    instructions  TEXT,
+    updated_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
@@ -382,6 +407,50 @@ BUILD_STALE_S = 3600
 
 class BuildInProgressError(RuntimeError):
     """Another update is already running."""
+
+
+#: Standing instructions are carried to the box as an environment value at
+#: creation, and Fly machine config is JSON with practical limits. A system
+#: prompt is a few KB; this is a ceiling, not a target.
+INSTRUCTIONS_MAX = 16_000
+DISPLAY_NAME_MAX = 80
+DESCRIPTION_MAX = 500
+
+
+class InvalidBoxMetaError(ValueError):
+    """A display name, description or instructions that cannot be stored."""
+
+
+def validate_box_meta(
+    display_name: str | None, description: str | None, instructions: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Normalise the three, or raise. Empty becomes None — "no description"
+    is a real state and must not be stored as an empty string that renders as
+    a blank line."""
+    out: list[str | None] = []
+    for value, limit, what in (
+        (display_name, DISPLAY_NAME_MAX, "display name"),
+        (description, DESCRIPTION_MAX, "description"),
+        (instructions, INSTRUCTIONS_MAX, "instructions"),
+    ):
+        cleaned = (value or "").strip() or None
+        if cleaned is not None and len(cleaned) > limit:
+            raise InvalidBoxMetaError(f"{what} is too long ({len(cleaned)} > {limit} characters)")
+        if cleaned is not None and "\x00" in cleaned:
+            raise InvalidBoxMetaError(f"{what} contains a NUL byte")
+        out.append(cleaned)
+    return out[0], out[1], out[2]
+
+
+@dataclass(frozen=True, slots=True)
+class BoxMeta:
+    """Who an agent is. See the `box_meta` table for why it is not on `boxes`."""
+
+    box_id: str
+    display_name: str | None
+    description: str | None
+    instructions: str | None
+    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -738,6 +807,60 @@ class FleetStore:
             "updated_at = EXCLUDED.updated_at",
             (key, value, _utcnow()),
         )
+
+    # -- identity -----------------------------------------------------------
+
+    def set_box_meta(
+        self,
+        box_id: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        instructions: str | None = None,
+    ) -> BoxMeta:
+        """Record who a box is. Idempotent; replaces the row.
+
+        Validated here as well as at the API, because the store is the
+        guarantee — it is what makes the limits true for the CLI too.
+        """
+        if self.get_box(box_id) is None:
+            raise UnknownEntityError(f"no box {box_id!r}")
+        display_name, description, instructions = validate_box_meta(
+            display_name, description, instructions
+        )
+        now = _utcnow()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO box_meta "
+            "(box_id, display_name, description, instructions, updated_at) VALUES (?, ?, ?, ?, ?)"
+            if not self.is_postgres
+            else "INSERT INTO box_meta "
+            "(box_id, display_name, description, instructions, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (box_id) DO UPDATE SET display_name = EXCLUDED.display_name, "
+            "description = EXCLUDED.description, instructions = EXCLUDED.instructions, "
+            "updated_at = EXCLUDED.updated_at",
+            (box_id, display_name, description, instructions, now),
+        )
+        return BoxMeta(box_id, display_name, description, instructions, now)
+
+    def meta_for_box(self, box_id: str) -> BoxMeta | None:
+        row = self._conn.execute(
+            "SELECT box_id, display_name, description, instructions, updated_at "
+            "FROM box_meta WHERE box_id = ?",
+            (box_id,),
+        ).fetchone()
+        return _meta_from_row(row) if row else None
+
+    def meta_for_boxes(self, box_ids: list[str]) -> dict[str, BoxMeta]:
+        """One query for the fleet list, not one per row."""
+        if not box_ids:
+            return {}
+        marks = ", ".join("?" for _ in box_ids)
+        rows = self._conn.execute(
+            "SELECT box_id, display_name, description, instructions, updated_at "
+            f"FROM box_meta WHERE box_id IN ({marks})",
+            tuple(box_ids),
+        ).fetchall()
+        return {str(r["box_id"]): _meta_from_row(r) for r in rows}
 
     # -- builds -------------------------------------------------------------
 
@@ -1297,6 +1420,16 @@ def _task_from_row(row: db.Row) -> Task:
         finished_at=row["finished_at"],
         result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
         cost_estimate=row["cost_estimate"],
+    )
+
+
+def _meta_from_row(row: db.Row) -> BoxMeta:
+    return BoxMeta(
+        box_id=row["box_id"],
+        display_name=row["display_name"],
+        description=row["description"],
+        instructions=row["instructions"],
+        updated_at=row["updated_at"],
     )
 
 

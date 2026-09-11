@@ -858,3 +858,91 @@ def test_every_caller_inherits_the_rule_because_it_lives_in_create_box(store):
 
     with pytest.raises(InvalidBoxNameError):
         store.create_box("Eng-f", box_id="b-forced")
+
+
+# -- FLOTTA-40: who an agent is, as opposed to where it lives ---------------
+
+
+def test_an_agent_can_have_a_name_that_is_not_its_address(store):
+    """`name` is a DNS label because it is the address. This is the other
+    thing — the label a person uses — and it may contain anything."""
+    b = store.create_box("eng-f")
+    meta = store.set_box_meta(
+        b.id,
+        display_name="Reviewer — backend PRs",
+        description="Reviews backend pull requests and leaves comments.",
+        instructions="You are a careful backend reviewer.",
+    )
+    assert meta.display_name == "Reviewer — backend PRs"
+    assert store.meta_for_box(b.id) == meta
+    assert store.get_box(b.id).name == "eng-f"  # the address is untouched
+
+
+def test_meta_is_absent_until_set_and_empty_becomes_none(store):
+    """"No description" is a state, not an empty string that renders as a
+    blank line."""
+    b = store.create_box("eng-f")
+    assert store.meta_for_box(b.id) is None
+    meta = store.set_box_meta(b.id, display_name="   ", description="", instructions=None)
+    assert (meta.display_name, meta.description, meta.instructions) == (None, None, None)
+
+
+def test_meta_is_replaced_not_merged(store):
+    b = store.create_box("eng-f")
+    store.set_box_meta(b.id, display_name="One", description="first")
+    store.set_box_meta(b.id, display_name="Two")
+    assert store.meta_for_box(b.id).description is None
+
+
+def test_meta_for_boxes_is_one_query_for_the_fleet(store):
+    a = store.create_box("eng-a")
+    b = store.create_box("eng-b")
+    store.set_box_meta(a.id, display_name="A")
+    found = store.meta_for_boxes([a.id, b.id, "b-nope"])
+    assert set(found) == {a.id}
+    assert store.meta_for_boxes([]) == {}
+
+
+def test_meta_needs_a_real_box(store):
+    with pytest.raises(UnknownEntityError):
+        store.set_box_meta("b-nope", display_name="ghost")
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [("display_name", 80), ("description", 500), ("instructions", 16_000)],
+)
+def test_meta_has_a_ceiling_per_field(store, field, limit):
+    """Instructions travel to the box as an environment value, and machine
+    config has practical limits. A ceiling, not a target."""
+    from flotta.store import InvalidBoxMetaError
+
+    b = store.create_box("eng-f")
+    store.set_box_meta(b.id, **{field: "x" * limit})  # at the limit is fine
+    with pytest.raises(InvalidBoxMetaError, match="too long"):
+        store.set_box_meta(b.id, **{field: "x" * (limit + 1)})
+
+
+def test_the_meta_table_appears_on_a_store_that_predates_it(tmp_path):
+    """The reason this is a side table and not two columns on `boxes`.
+
+    A store created before `box_meta` existed gains the table on the next
+    open, because `CREATE TABLE IF NOT EXISTS` adds a missing table and
+    leaves everything else alone. A new *column* on `boxes` would not appear.
+    """
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        "CREATE TABLE boxes (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, "
+        "endpoint TEXT, created_at TEXT NOT NULL, destroyed_at TEXT);"
+        "INSERT INTO boxes VALUES ('b-old', 'eng-old', 'stopped', 'fly://a/m', '2026-01-01', NULL);"
+    )
+    old.commit()
+    old.close()
+
+    with FleetStore(path) as store:
+        assert store.meta_for_box("b-old") is None
+        store.set_box_meta("b-old", display_name="Survivor")
+        assert store.meta_for_box("b-old").display_name == "Survivor"

@@ -67,6 +67,22 @@ mkdir -p "$HERMES_HOME"
 : "${FLOTTA_WORKDIR:=/workspace}"
 mkdir -p "$FLOTTA_WORKDIR"
 
+# Standing instructions, seeded once.
+#
+# Hermes reads `$HERMES_HOME/SOUL.md` while building every prompt
+# (agent/prompt_builder.py, load_soul_md), so this is the persona file the
+# product means by "instructions". It lives on the VOLUME — the disk that is
+# the agent — and this only writes it when it is absent: the control plane
+# hands over the seed at creation as `$FLOTTA_INSTRUCTIONS`, and from then on
+# the file is the agent's own. A re-image keeps the volume, so it keeps the
+# file; a re-created machine on a fresh volume gets seeded again. Never
+# overwritten, or an agent that has evolved its own instructions would lose
+# them on every boot.
+if [ -n "${FLOTTA_INSTRUCTIONS:-}" ] && [ ! -f "$HERMES_HOME/SOUL.md" ]; then
+  printf '%s\n' "$FLOTTA_INSTRUCTIONS" > "$HERMES_HOME/SOUL.md"
+  echo "[flotta-box] seeded SOUL.md from FLOTTA_INSTRUCTIONS ($(wc -c < "$HERMES_HOME/SOUL.md") bytes)"
+fi
+
 echo "[flotta-box] HERMES_HOME=$HERMES_HOME"
 echo "[flotta-box] workdir=$FLOTTA_WORKDIR"
 echo "[flotta-box] mount:"

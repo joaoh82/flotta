@@ -54,6 +54,12 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
   const [showOptions, setShowOptions] = useState(false);
   const [volumeGb, setVolumeGb] = useState("");
   const [region, setRegion] = useState("");
+  // Who it is (FLOTTA-40). The address is `name`; these are what a person
+  // calls it, what it is for, and what it is told. Instructions become the
+  // agent's SOUL.md on its own volume and are its to evolve from then on.
+  const [displayName, setDisplayName] = useState("");
+  const [description, setDescription] = useState("");
+  const [instructions, setInstructions] = useState("");
 
   const problem = nameProblem(name);
 
@@ -71,10 +77,16 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
         // the answer for almost every agent.
         volumeGb: volumeGb.trim() === "" || Number.isNaN(parsed) ? undefined : parsed,
         region: region.trim() === "" ? undefined : region.trim(),
+        displayName: displayName.trim() === "" ? undefined : displayName.trim(),
+        description: description.trim() === "" ? undefined : description.trim(),
+        instructions: instructions.trim() === "" ? undefined : instructions.trim(),
       });
       setName("");
       setVolumeGb("");
       setRegion("");
+      setDisplayName("");
+      setDescription("");
+      setInstructions("");
       setShowOptions(false);
       onCreated(box);
     } catch (err) {
@@ -107,11 +119,53 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
         onClick={() => setShowOptions((open) => !open)}
         className="mt-2 text-[11px] text-neutral-500 underline hover:text-neutral-700"
       >
-        {showOptions ? "Use the fleet's defaults" : "Give it a different size or region"}
+        {showOptions ? "Fewer options" : "Instructions, size or region"}
       </button>
+
+      {/* Who it is. Visible without expanding anything, because an agent with
+          no description is one nobody can pick by role — and because the
+          address rules above stop needing an apology: call it what you like,
+          it lives at `<name>.flotta.dev`. */}
+      <div className="mt-2 flex gap-2">
+        <input
+          value={displayName}
+          onChange={(e) => setDisplayName(e.target.value)}
+          placeholder="what people call it (optional)"
+          maxLength={80}
+          disabled={busy}
+          className="min-w-0 flex-1 rounded border border-neutral-300 px-2 py-1 text-xs focus:border-neutral-500 focus:outline-none disabled:bg-neutral-50"
+        />
+        <input
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="what it is for (optional)"
+          maxLength={500}
+          disabled={busy}
+          className="min-w-0 flex-1 rounded border border-neutral-300 px-2 py-1 text-xs focus:border-neutral-500 focus:outline-none disabled:bg-neutral-50"
+        />
+      </div>
 
       {showOptions && (
         <div className="mt-2 space-y-2">
+          <label className="block">
+            <span className="text-[11px] text-neutral-600">Standing instructions</span>
+            <textarea
+              value={instructions}
+              onChange={(e) => setInstructions(e.target.value)}
+              placeholder="Its system prompt. Who it is, what it works on, how it should behave."
+              rows={4}
+              maxLength={16000}
+              disabled={busy}
+              className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 font-mono text-[11px] focus:border-neutral-500 focus:outline-none disabled:bg-neutral-50"
+            />
+            {/* Seeded once. Said here because it is the one thing about
+                instructions that is not obvious: after this the file is the
+                agent's, on its volume, and this form never touches it again. */}
+            <span className="text-[11px] text-neutral-400">
+              Written to the agent&rsquo;s SOUL.md once, at creation. From then on it&rsquo;s
+              the agent&rsquo;s own to keep or change.
+            </span>
+          </label>
           <label className="block">
             <span className="text-[11px] text-neutral-600">Disk (GB)</span>
             <input

@@ -2845,3 +2845,70 @@ def test_no_fleet_image_leaves_the_backend_to_refuse(store, monkeypatch):
     create_box("eng-new", store=store, backend=impl)
 
     assert impl.spec.image is None
+
+
+# -- FLOTTA-40: identity reaches the box ------------------------------------
+
+
+def test_reserve_box_records_who_the_agent_is(store):
+    from flotta.provision import reserve_box
+
+    box = reserve_box(
+        "eng-r",
+        store=store,
+        backend=FakeBackend(),
+        display_name="Reviewer",
+        description="Reviews PRs",
+        instructions="Be thorough.",
+    )
+    meta = store.meta_for_box(box.id)
+    assert (meta.display_name, meta.description, meta.instructions) == (
+        "Reviewer",
+        "Reviews PRs",
+        "Be thorough.",
+    )
+
+
+def test_a_bad_description_refuses_before_the_name_is_spent(store):
+    """Same rule as the name check at the top of `store.create_box`: a
+    provision that cannot be recorded must not leave a row holding the name."""
+    from flotta.provision import reserve_box
+    from flotta.store import InvalidBoxMetaError
+
+    with pytest.raises(InvalidBoxMetaError):
+        reserve_box("eng-r", store=store, backend=FakeBackend(), description="x" * 501)
+    assert store.get_box_by_name("eng-r") is None
+
+
+def test_instructions_reach_the_box_as_the_seed(store):
+    """The entrypoint writes `$FLOTTA_INSTRUCTIONS` to `$HERMES_HOME/SOUL.md`
+    once. If this stopped travelling, every agent would be born with no
+    persona and nothing would say so."""
+    impl = _Recording()
+    create_box("eng-r", store=store, backend=impl, instructions="You review backend PRs.")
+
+    assert impl.spec.env["FLOTTA_INSTRUCTIONS"] == "You review backend PRs."
+    assert "FLOTTA_INSTRUCTIONS" not in impl.spec.secrets, (
+        "instructions are meant to be read by the agent; they are not a secret"
+    )
+
+
+def test_no_instructions_means_no_env_key(store):
+    impl = _Recording()
+    create_box("eng-r", store=store, backend=impl)
+    assert "FLOTTA_INSTRUCTIONS" not in impl.spec.env
+
+
+def test_the_202_path_reads_instructions_from_the_store(store):
+    """The API reserves the row (with meta) and provisions on a thread that
+    passes `box=` and no instructions. One source, both paths — otherwise the
+    button's agents would be born without the persona the form set."""
+    from flotta.provision import reserve_box
+
+    impl = _Recording()
+    reserved = reserve_box(
+        "eng-r", store=store, backend=impl, instructions="From the form."
+    )
+    create_box("eng-r", store=store, backend=impl, box=reserved)
+
+    assert impl.spec.env["FLOTTA_INSTRUCTIONS"] == "From the form."

@@ -94,12 +94,23 @@ impl FleetError {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BoxRow {
     pub id: String,
+    /// The ADDRESS — a DNS label, immutable. Not what a person calls it.
     pub name: String,
     pub status: String,
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// What a person calls it (FLOTTA-40). `None` is "not set", which the
+    /// window renders by falling back to the address — never as `undefined`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The standing instructions the agent was *seeded* with. The copy it
+    /// reads is `SOUL.md` on its own volume; this is the record.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -565,6 +576,9 @@ pub async fn create_box(
     name: &str,
     volume_gb: Option<u32>,
     region: Option<String>,
+    display_name: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
 ) -> Result<BoxRow, FleetError> {
     let name = name.trim();
     if name.is_empty() {
@@ -577,6 +591,20 @@ pub async fn create_box(
     // worth keeping distinct on a wire somebody will read in a log one day.
     let mut body = serde_json::Map::new();
     body.insert("name".into(), serde_json::Value::from(name));
+    // Who it is. Absent means "not set", same rule as the size and region:
+    // only a value that was actually typed goes on the wire.
+    for (key, value) in [
+        ("display_name", display_name),
+        ("description", description),
+        ("instructions", instructions),
+    ] {
+        if let Some(v) = value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            body.insert(key.into(), serde_json::Value::from(v));
+        }
+    }
     if let Some(gb) = volume_gb {
         body.insert("volume_gb".into(), serde_json::Value::from(gb));
     }
@@ -780,6 +808,28 @@ pub async fn builds(settings: &Settings) -> Result<Vec<Build>, FleetError> {
     serde_json::from_str::<BuildList>(&body)
         .map(|list| list.builds)
         .map_err(|e| FleetError::Unexpected(format!("unreadable build list: {e}")))
+}
+
+/// Rename or re-describe an agent. The address never changes, and neither do
+/// the instructions — those live on the agent's own volume; see the control
+/// plane's `PUT /api/boxes/{id}/meta` for why.
+pub async fn rename_agent(
+    settings: &Settings,
+    id: &str,
+    display_name: Option<String>,
+    description: Option<String>,
+) -> Result<BoxRow, FleetError> {
+    let body = send(
+        settings,
+        reqwest::Method::PUT,
+        &format!("/api/boxes/{}/meta", encode_segment(id)),
+        Some(serde_json::json!({
+            "display_name": display_name,
+            "description": description,
+        })),
+    )
+    .await?;
+    box_from(&body, "could not rename that agent")
 }
 
 #[cfg(test)]
@@ -1202,5 +1252,26 @@ mod tests {
         assert!(!down.behind);
         assert!(down.latest.is_none());
         assert!(down.unavailable.is_some());
+    }
+
+    #[test]
+    fn identity_fields_are_optional_and_default_to_none() {
+        // An older control plane, or an agent nobody has named: the row must
+        // still parse, and the window falls back to the address.
+        let bare: BoxRow =
+            serde_json::from_str(r#"{"id":"b-1","name":"eng-a","status":"stopped"}"#).unwrap();
+        assert!(bare.display_name.is_none() && bare.description.is_none());
+
+        let named: BoxRow = serde_json::from_str(
+            r#"{"id":"b-1","name":"eng-a","status":"stopped",
+                "display_name":"Reviewer","description":"Reviews PRs","instructions":"Be kind."}"#,
+        )
+        .unwrap();
+        assert_eq!(named.display_name.as_deref(), Some("Reviewer"));
+        assert_eq!(named.instructions.as_deref(), Some("Be kind."));
+        assert_eq!(
+            named.name, "eng-a",
+            "the address is untouched by a display name"
+        );
     }
 }
