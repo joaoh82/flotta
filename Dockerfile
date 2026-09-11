@@ -69,6 +69,12 @@ RUN apt-get update \
 # Fleet state comes from the environment, never baked in. §8.3 is specific that
 # the Railway template must wire DATABASE_URL *by reference* rather than
 # copy-pasting it, because a hardcoded value breaks on first redeploy.
+# Where the box image's build context was copied to (the COPY lines above).
+# `flotta.images.build_context` reads this; without it the module guesses
+# "two directories up from itself", which is the repo root in a checkout and
+# `/usr/local/lib/python3.11` here, where the package is installed. The first
+# "Update agents" press failed on exactly that.
+ENV FLOTTA_BUILD_CONTEXT=/app
 ENV FLOTTA_DATABASE_URL=""
 
 # 0.0.0.0 because a container's loopback is reachable by nothing. The bind

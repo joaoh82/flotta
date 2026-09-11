@@ -143,6 +143,20 @@ conventions, and the sharp edges below.
   `eng-b` after a real upgrade, on its own durable volume. That migration
   happening is what makes a Hermes bump safe for agents that already have
   history; it is worth re-checking on the next bump rather than assumed.
+- **Anything under `fly/` ships in the box image, so it needs a build before
+  it can be observed.** `box_entrypoint.sh` is `COPY`'d into the image; a
+  change to it merged and deployed to the control plane changes *nothing* on
+  any agent until `just fly-build` or "Update agents" makes a new image and
+  agents move onto it. FLOTTA-40's seeding landed on the control plane, was
+  tested against an image built the day before, and did nothing — the env
+  reached the machine and no entrypoint read it. Say "needs a build" in the
+  PR, and build before asking anyone to test.
+- **The deployed control plane is `pip install`ed, not run from `src/`.** A
+  path resolved relative to a module (`Path(__file__).parents[n]`) is the
+  repo root in a checkout and somewhere under site-packages on Railway.
+  `flotta.images` guessed and the first "Update agents" failed on it, safely;
+  it now reads `$FLOTTA_BUILD_CONTEXT`, which the Dockerfile sets to `/app`.
+  A test that "this checkout is valid" cannot see this class of bug.
 - **Standing instructions are `$HERMES_HOME/SOUL.md`, seeded once.** Hermes
   reads it while building every prompt (`agent/prompt_builder.py`,
   `load_soul_md` — verified at v2026.9.7), so it is per turn, not per boot: an
