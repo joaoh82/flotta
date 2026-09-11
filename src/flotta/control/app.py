@@ -186,6 +186,18 @@ def _record_activity(store: Any, box_id: str) -> bool:
     return True
 
 
+def _build_region() -> str:
+    """Where the throwaway build machine is created.
+
+    `fly volumes create` refuses to run without a region off a TTY and a deploy
+    wants one too, so "unset" cannot mean "decide later" — `resolved_region`
+    turns an unset config into a concrete one, exactly as `fly-up` does.
+    """
+    from flotta.fly import FlyConfig
+
+    return FlyConfig.from_env().resolved_region()
+
+
 def _box_dict(box: Any) -> dict[str, Any]:
     from dataclasses import asdict
 
@@ -459,6 +471,121 @@ def create_app(
             #: go and look at the deployment's variables.
             "fleet_image_app": app,
         }
+
+    @app.get("/api/hermes/builds")
+    def list_builds(_: Token | None = needs_read) -> Any:
+        """What the fleet has built, newest first — the app's progress view."""
+        store = store_factory()
+        try:
+            from dataclasses import asdict
+
+            return {"builds": [asdict(b) for b in store.list_builds()]}
+        finally:
+            store.close()
+
+    @app.post("/api/hermes/update", status_code=202)
+    def update_hermes(body: dict[str, Any] | None = None, _: Token | None = needs_write) -> Any:
+        """Build the box image at a Hermes ref, then move every agent onto it.
+
+        **This is the button.** Everything else in this API is a piece of it:
+        `/api/hermes` says a newer Hermes exists, `images.build_box_image`
+        makes an image carrying it, and `upgrade_box` moves an agent without
+        touching its disk. Until this endpoint they were three things a person
+        did from a terminal, which meant the window could report the problem
+        and not fix it.
+
+        **Answers 202 and works on a thread.** A cold image build is minutes
+        and a proxy in front of this cuts at 60 seconds — the same reason
+        create and upgrade are backgrounded. Progress is a `builds` row plus
+        the usual `reimaged` / `upgrade_failed` events on each agent.
+
+        **Agents are rolled one at a time and it stops at the first failure.**
+        Not for tidiness: the first agent *is* the canary. A Hermes that will
+        not serve should cost one agent a restart, not the whole fleet — and a
+        failed upgrade leaves that agent exactly as it was, which is what makes
+        stopping a real recovery rather than a half-migrated fleet.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.box.image import HERMES_REF
+
+        ref = str((body or {}).get("hermes_ref") or "").strip() or HERMES_REF
+
+        from flotta.store import BuildInProgressError
+
+        store = store_factory()
+        try:
+            # The check lives inside `start_build`'s transaction. Read here and
+            # insert after — which is what this did — lets two POSTs pass the
+            # same check and both start, because the guard serialises the write
+            # and not the decision behind it.
+            #
+            # Two concurrent updates race for one app's release history, and
+            # the loser's agents get rolled onto an image the winner replaced.
+            build = store.start_build(ref)
+        except BuildInProgressError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+        def run() -> None:
+            from flotta.images import BuildError, build_box_image
+            from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
+
+            inner = store_factory()
+            try:
+                app_name = (os.environ.get("FLOTTA_FLY_APP") or "").strip()
+                if not app_name:
+                    inner.finish_build(
+                        build.id,
+                        error=(
+                            "no build app configured. Set FLOTTA_FLY_APP on the control "
+                            "plane to the app the box image is released into."
+                        ),
+                    )
+                    return
+                try:
+                    image = build_box_image(ref, app=app_name, region=_build_region())
+                except BuildError as exc:
+                    inner.finish_build(build.id, error=str(exc))
+                    return
+                # Not `finish_build`: the operation is not over. Marking it
+                # done here made "one update at a time" true for the build
+                # minutes and false for the roll — a second update could start
+                # while agents were still moving, and the app re-offered its
+                # button mid-roll.
+                inner.mark_rolling(build.id)
+
+                for box in inner.list_boxes():
+                    if is_terminal("box", box.status) or box.status == "provisioning":
+                        continue
+                    try:
+                        upgrade_box(box.id, store=inner, image=image, reason="hermes-update")
+                    except (UpgradeFailed, ProvisionError) as exc:
+                        # `upgrade_box` has already written `upgrade_failed`
+                        # against the box, so the app can say which agent and
+                        # why. Stopping here is the point: see the docstring.
+                        _log.warning("rolling stopped at %s: %s", box.name, exc)
+                        inner.finish_build(
+                            build.id, error=f"{box.name} could not be upgraded: {exc}"
+                        )
+                        return
+
+                inner.finish_build(build.id, image=image)
+            except Exception as exc:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    inner.finish_build(build.id, error=f"{type(exc).__name__}: {exc}")
+                _log.warning("hermes update failed: %s: %s", type(exc).__name__, exc)
+            finally:
+                inner.close()
+
+        worker = threading.Thread(target=run, name=f"hermes-{ref}", daemon=True)
+        _provisioning.add(worker)
+        worker.start()
+
+        return JSONResponse(
+            {"build_id": build.id, "hermes_ref": ref, "status": "building"}, status_code=202
+        )
 
     @app.get("/api/boxes")
     def list_boxes(all_: bool = False, _: Token | None = needs_read) -> Any:

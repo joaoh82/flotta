@@ -4,6 +4,7 @@ import { AgentInfo } from "./AgentInfo";
 import { AgentTimeline } from "./AgentTimeline";
 import { Conversation } from "./Conversation";
 import { DestroyAgent } from "./DestroyAgent";
+import { HermesUpdate } from "./HermesUpdate";
 import { NewAgent } from "./NewAgent";
 import { Settings } from "./Settings";
 import { StatusBadge } from "./StatusBadge";
@@ -12,6 +13,7 @@ import {
   isFleetError,
   type BoxRow,
   type FleetError,
+  type HermesVersions,
   type SettingsView,
 } from "./types";
 import { POLL_MS } from "./poll";
@@ -114,6 +116,8 @@ export default function App() {
   /** The agent whose machine is being inspected, and whose row menu is open. */
   const [info, setInfo] = useState<BoxRow | null>(null);
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  /** Hermes versions, for the fleet-wide update banner. */
+  const [versions, setVersions] = useState<HermesVersions | null>(null);
   /**
    * The agent we just made, until it is either talkable-to or gone.
    *
@@ -240,6 +244,14 @@ export default function App() {
     return () => clearInterval(timer);
   }, [showSettings, poll]);
 
+  // Read once when the fleet loads, not on the poll: it reaches GitHub, and
+  // the answer changes when upstream releases, not every five seconds. The
+  // control plane caches it for ten minutes anyway.
+  useEffect(() => {
+    if (showSettings) return;
+    invoke<HermesVersions>("hermes_versions").then(setVersions).catch(() => setVersions(null));
+  }, [showSettings]);
+
   // Stop watching once the answer is in. Both endings settle it: the agent is
   // addressable, or it is no longer in the fleet and the timeline says why.
   useEffect(() => {
@@ -336,7 +348,12 @@ export default function App() {
             )}
           </div>
         ) : (
-          <div className="flex h-full">
+          <div className="flex h-full flex-col">
+            {/* Above the agent list, because it is about all of them. This is
+                the control the Hermes work exists for: the window could say a
+                newer Hermes was out and do nothing about it. */}
+            <HermesUpdate versions={versions} onChanged={poll} />
+            <div className="flex min-h-0 flex-1">
             {/* Agents on the left, the conversation beside them. The agent is
                 the primary object, not a row in a table of machines — which is
                 why selecting one opens a conversation rather than a detail
@@ -530,6 +547,7 @@ export default function App() {
                   Pick an agent to talk to.
                 </p>
               )}
+            </div>
             </div>
           </div>
         )}

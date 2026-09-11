@@ -214,6 +214,38 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at  TEXT NOT NULL
 );
 
+-- What the fleet has built, and what happened while it was building.
+--
+-- A build is not a box, a task or a workspace, so it cannot live in `events`
+-- — that table's `entity_kind` is checked against the three tiers, and
+-- `add_event` refuses an entity that does not exist. It needs its own row
+-- because it outlives the request that started it: the app asks for an image
+-- and comes back later to find out how it went, exactly as it does for a
+-- create.
+--
+-- A **new table** is the one schema change this store can absorb. `CREATE
+-- TABLE IF NOT EXISTS` gives an existing database a new table on the next
+-- open, while a new *column* on an old table would silently not appear. That
+-- is why this is a table and not two columns on `settings`.
+-- `rolling` is not decoration. `done` used to be set the moment the image
+-- existed, which made "one update at a time" true for the build minutes and
+-- false for the roll that follows — a second update could start while agents
+-- were still moving, and the app re-offered its button mid-roll. The operation
+-- is not over until the last agent is.
+--
+-- This CHECK can only be got right now: `CREATE TABLE IF NOT EXISTS` leaves an
+-- existing table alone, so a vocabulary change after this table exists
+-- anywhere would silently not apply there.
+CREATE TABLE IF NOT EXISTS builds (
+    id           TEXT PRIMARY KEY,
+    hermes_ref   TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('building', 'rolling', 'done', 'failed')),
+    image        TEXT,
+    error        TEXT,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
@@ -228,6 +260,7 @@ CREATE INDEX IF NOT EXISTS idx_workspaces_box_id ON workspaces(box_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_box_id ON tasks(box_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_kind, entity_id);
+CREATE INDEX IF NOT EXISTS idx_builds_started ON builds(started_at);
 """
 
 
@@ -337,6 +370,31 @@ class Event:
     ts: str
     type: str
     payload: dict[str, Any] | None
+
+
+#: How long a build may sit unfinished before it stops blocking new ones.
+#:
+#: Generous: a cold image build is minutes and a roll across a fleet is more,
+#: so a timeout that fires early would let two updates run at once — the thing
+#: the lock exists to prevent. It only needs to be shorter than "forever".
+BUILD_STALE_S = 3600
+
+
+class BuildInProgressError(RuntimeError):
+    """Another update is already running."""
+
+
+@dataclass(frozen=True, slots=True)
+class Build:
+    """One attempt to build the fleet's box image."""
+
+    id: str
+    hermes_ref: str
+    status: str
+    image: str | None
+    error: str | None
+    started_at: str
+    finished_at: str | None
 
 
 def _utcnow() -> str:
@@ -680,6 +738,110 @@ class FleetStore:
             "updated_at = EXCLUDED.updated_at",
             (key, value, _utcnow()),
         )
+
+    # -- builds -------------------------------------------------------------
+
+    def start_build(self, hermes_ref: str, *, now: datetime | None = None) -> Build:
+        """Claim the fleet for an update, or raise `BuildInProgressError`.
+
+        The check and the insert are **one guarded transaction**. Read first
+        and insert after — which is what this did — leaves two POSTs able to
+        pass the same check and both start, because `guard="builds"` serialises
+        the write and not the decision that led to it. That is the same
+        read-check-write the concurrency caps are guarded for.
+
+        Written before the builder is called, for the reason `reserve_box`
+        reserves a row before provisioning: a control plane that dies mid-build
+        should leave something that says so rather than silence.
+        """
+        build_id = f"bld-{uuid.uuid4().hex[:12]}"
+        moment = now or datetime.now(UTC)
+        with self._conn.transaction(guard="builds"):
+            active = self._active_build(moment)
+            if active is not None:
+                raise BuildInProgressError(
+                    f"an update is already running ({active.id}, {active.hermes_ref}, "
+                    f"{active.status})"
+                )
+            self._conn.execute(
+                "INSERT INTO builds (id, hermes_ref, status, started_at) VALUES (?, ?, ?, ?)",
+                (build_id, hermes_ref, "building", moment.isoformat()),
+            )
+        now_s = moment.isoformat()
+        return Build(
+            id=build_id,
+            hermes_ref=hermes_ref,
+            status="building",
+            image=None,
+            error=None,
+            started_at=now_s,
+            finished_at=None,
+        )
+
+    def _active_build(self, now: datetime) -> Build | None:
+        """An update that is still running, ignoring ones that never ended.
+
+        A control plane killed mid-build leaves `building` behind forever, and
+        without this every later update would be refused by a job that stopped
+        existing when the process did. A stale row is not marked finished — it
+        is unknown, not failed, and saying otherwise would be inventing an
+        outcome nothing observed.
+        """
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds WHERE status IN ('building', 'rolling') "
+            "ORDER BY started_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        build = _build_from_row(row)
+        try:
+            started = datetime.fromisoformat(build.started_at)
+        except ValueError:
+            # An unparseable timestamp is not evidence of abandonment; leaving
+            # the lock in place is the safe reading.
+            return build
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        return None if (now - started).total_seconds() > BUILD_STALE_S else build
+
+    def mark_rolling(self, build_id: str) -> None:
+        """The image exists; agents are moving. Still not finished."""
+        self._conn.execute("UPDATE builds SET status = ? WHERE id = ?", ("rolling", build_id))
+
+    def finish_build(
+        self, build_id: str, *, image: str | None = None, error: str | None = None
+    ) -> None:
+        """Close a build. `image` on success, `error` on failure — never both."""
+        if (image is None) == (error is None):
+            raise ValueError("a finished build has exactly one of an image or an error")
+        self._conn.execute(
+            "UPDATE builds SET status = ?, image = ?, error = ?, finished_at = ? WHERE id = ?",
+            ("done" if image else "failed", image, error, _utcnow(), build_id),
+        )
+
+    def latest_build(self) -> Build | None:
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds ORDER BY started_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        return _build_from_row(row) if row else None
+
+    def get_build(self, build_id: str) -> Build | None:
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds WHERE id = ?",
+            (build_id,),
+        ).fetchone()
+        return _build_from_row(row) if row else None
+
+    def list_builds(self, limit: int = 10) -> list[Build]:
+        rows = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds ORDER BY started_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_build_from_row(r) for r in rows]
 
     def set_settings(self, values: dict[str, str]) -> None:
         """Apply several overrides at once, all or nothing.
@@ -1119,6 +1281,18 @@ def _task_from_row(row: db.Row) -> Task:
         finished_at=row["finished_at"],
         result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
         cost_estimate=row["cost_estimate"],
+    )
+
+
+def _build_from_row(row: db.Row) -> Build:
+    return Build(
+        id=row["id"],
+        hermes_ref=row["hermes_ref"],
+        status=row["status"],
+        image=row["image"],
+        error=row["error"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
     )
 
 

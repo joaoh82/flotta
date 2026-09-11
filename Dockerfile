@@ -21,6 +21,17 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
+# The box image's build context.
+#
+# The control plane builds that image now (`flotta.images`), and `flyctl
+# deploy` needs the Dockerfile and the two scripts it copies in. The other
+# three things that context needs — pyproject.toml, README.md and src/ — are
+# already here, because the box and the control plane are the same package.
+#
+# `flotta.images.build_context` refuses to build if any of them is missing, so
+# dropping this line fails loudly at the first build rather than producing an
+# image whose entrypoint is not there.
+COPY fly/ ./fly/
 
 # `[server]` = postgres + control. A deployed control plane always wants both:
 # fleet state on a server is the whole reason this process exists.

@@ -81,6 +81,18 @@ export type MachineView = {
  * runs is neither — that is `Machine.hermes_ref`. They were one line of
  * justfile output before, and they have never been the same fact.
  */
+/** One attempt to build the box image. Mirrors `Build` in `store.py`. */
+export type Build = {
+  id: string;
+  hermes_ref: string;
+  /** `building`, `rolling`, `done` or `failed`. `rolling` is still running. */
+  status: string;
+  image?: string | null;
+  error?: string | null;
+  started_at: string;
+  finished_at?: string | null;
+};
+
 export type HermesVersions = {
   pinned: string;
   /** `null` when GitHub could not be reached: unknown, never "up to date". */
