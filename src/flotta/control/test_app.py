@@ -1855,3 +1855,52 @@ def test_an_abandoned_build_stops_blocking_after_an_hour(fleet):
         later = datetime.now(UTC) + timedelta(hours=2)
         assert store.start_build("v2", now=later).hermes_ref == "v2"
         assert store.get_build(abandoned.id).status == "building"
+
+
+def test_the_version_check_measures_what_was_built_not_the_source_pin(client, fleet, monkeypatch):
+    """End to end, the bug that would have bitten on first use.
+
+    An update started from the app builds at a given ref and never edits
+    source, so the pin stays put. Compared against the pin, a fleet that had
+    just been updated still read as behind and the banner went on offering an
+    update it had already applied.
+    """
+    import flotta.hermes as hermes
+    from flotta.box.image import HERMES_REF
+
+    newer = "v9999.1.1"
+    monkeypatch.setattr(hermes, "latest_release", lambda **kw: (newer, None))
+
+    # Before any build: nothing to go on but the pin, and upstream is ahead.
+    first = client.get("/api/hermes").json()
+    assert first["fleet_ref"] == HERMES_REF
+    assert first["fleet_ref_source"] == "pin"
+    assert first["behind"] is True
+
+    # Now the fleet is built at that newer ref — as the button would do.
+    with FleetStore(fleet) as store:
+        build = store.start_build(newer)
+        store.finish_build(build.id, image="registry/x:new")
+
+    after = client.get("/api/hermes").json()
+    assert after["fleet_ref"] == newer
+    assert after["fleet_ref_source"] == "build"
+    assert after["behind"] is False, "the banner would have offered the update it just applied"
+    # The pin is unchanged, and still reported — it is a different fact.
+    assert after["pinned"] == HERMES_REF
+
+
+def test_a_failed_build_does_not_count_as_what_the_fleet_runs(client, fleet, monkeypatch):
+    """Otherwise a build that never produced an image would mark the fleet as
+    up to date, which is the reassuring half of the same lie."""
+    import flotta.hermes as hermes
+
+    newer = "v9999.1.1"
+    monkeypatch.setattr(hermes, "latest_release", lambda **kw: (newer, None))
+    with FleetStore(fleet) as store:
+        build = store.start_build(newer)
+        store.finish_build(build.id, error="no space left")
+
+    body = client.get("/api/hermes").json()
+    assert body["fleet_ref_source"] == "pin"
+    assert body["behind"] is True

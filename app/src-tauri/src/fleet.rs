@@ -251,7 +251,16 @@ pub struct MachineView {
 /// and what an individual agent runs is neither — that is `Machine::hermes_ref`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HermesVersions {
+    /// What the *next* image would be built at. An intention: after an update
+    /// started from the window it stays put while the fleet moves on.
     pub pinned: String,
+    /// What the fleet's newest image was actually built at — the fact
+    /// `behind` is measured against.
+    #[serde(default)]
+    pub fleet_ref: Option<String>,
+    /// `build` or `pin`.
+    #[serde(default)]
+    pub fleet_ref_source: Option<String>,
     /// `None` when GitHub could not be reached. Renders as *unknown*, never as
     /// up to date.
     #[serde(default)]

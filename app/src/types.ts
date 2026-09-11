@@ -94,7 +94,16 @@ export type Build = {
 };
 
 export type HermesVersions = {
+  /**
+   * What the *next* image would be built at if nobody said otherwise. An
+   * intention — it says nothing about any image that exists, and after an
+   * update started from the app it stays put while the fleet moves on.
+   */
   pinned: string;
+  /** What the fleet's newest image was actually built at. The fact. */
+  fleet_ref?: string | null;
+  /** `build` when a build produced it, `pin` when nothing has been built. */
+  fleet_ref_source?: string | null;
   /** `null` when GitHub could not be reached: unknown, never "up to date". */
   latest?: string | null;
   behind?: boolean;

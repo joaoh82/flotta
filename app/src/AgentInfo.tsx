@@ -175,7 +175,12 @@ export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }
               value={hermes.value ?? "not recorded"}
               mono={hermes.value !== null}
             />
-            {versions && <Line label="Fleet builds" value={versions.pinned} mono />}
+            {/* What the newest image was built at — a fact. It used to show
+                the source pin under this label, which is an intention and
+                diverges the moment an update is started from the window. */}
+            {versions && (
+              <Line label="Fleet image built at" value={versions.fleet_ref ?? versions.pinned} mono />
+            )}
             {versions?.latest && <Line label="Newest release" value={versions.latest} mono />}
           </dl>
           {hermes.note && (

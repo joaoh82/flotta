@@ -56,9 +56,14 @@ export function offerOf(versions: HermesVersions | null, build: Build | null): O
   // not be reached. Both have to hold before a button appears.
   if (!versions?.behind || !versions.latest) return { kind: "none" };
 
+  // `fleet_ref`, not `pinned`. The pin is what the next build *would* use;
+  // what the agents run is what the last build actually used, and after an
+  // update started here the two never converge again.
   return {
     kind: "offer",
     ref: versions.latest,
-    detail: `Hermes ${versions.latest} is available. Your agents run ${versions.pinned}.`,
+    detail:
+      `Hermes ${versions.latest} is available. Your agents run ` +
+      `${versions.fleet_ref ?? versions.pinned}.`,
   };
 }
