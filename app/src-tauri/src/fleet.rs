@@ -732,7 +732,8 @@ pub async fn upgrade_agent(settings: &Settings, id: &str) -> Result<(), FleetErr
 pub struct Build {
     pub id: String,
     pub hermes_ref: String,
-    /// `building`, `done` or `failed`.
+    /// `building`, `rolling`, `done` or `failed`. `rolling` is still running:
+    /// the image exists and agents are being moved onto it one at a time.
     pub status: String,
     #[serde(default)]
     pub image: Option<String>,

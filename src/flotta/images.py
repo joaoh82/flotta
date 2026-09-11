@@ -29,6 +29,7 @@ safe to build at any time.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
@@ -46,6 +47,16 @@ BUILD_TIMEOUT_S = 1800
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
+#: What a Hermes ref may look like: a tag, branch or SHA, as `git clone
+#: --branch` will accept.
+#:
+#: Validated because the ref is interpolated into a generated TOML file and
+#: into a `git clone` on the builder. The app only ever sends a GitHub release
+#: tag, but the endpoint takes a string from anyone holding a `fleet:write`
+#: token, and "the caller is trusted" is how an injection gets written.
+_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+
+
 class BuildError(Exception):
     """The image could not be built. Nothing has changed for any agent."""
 
@@ -59,11 +70,7 @@ def build_context(root: Path | None = None) -> Path:
     notices is a box that will not boot.
     """
     base = root or _ROOT
-    missing = [
-        name
-        for name in ("pyproject.toml", "fly/Dockerfile", "fly/box_entrypoint.sh", "src")
-        if not (base / name).exists()
-    ]
+    missing = [name for name in shipped_context_files() if not (base / name).exists()]
     if missing:
         raise BuildError(
             f"cannot build here: {base} is missing {', '.join(missing)}. "
@@ -102,13 +109,41 @@ def _reason(result: subprocess.CompletedProcess) -> str:
     return (lines[-1] if lines else f"flyctl exited {result.returncode}")[:400]
 
 
-def _machine_ids(app: str, runner: Runner | None = None) -> set[str]:
-    result = _flyctl("machines", "list", "--app", app, "--json", runner=runner, check=False)
+def _machine_ids(app: str, runner: Runner | None, *, strict: bool) -> set[str]:
+    """The app's machines. Two callers, two opposite failure policies.
+
+    **Before the deploy, `strict=True`.** If this cannot be read, an empty set
+    makes every machine afterwards look new — including the fleet's box on an
+    app with no prefix, which is the agent the diff exists to protect. A
+    `flyctl` blip must stop the build, not silently widen what gets destroyed.
+
+    **After the deploy, `strict=False`.** The worst case there is an orphan
+    machine left behind: it costs money and is recoverable, and raising would
+    report a *successful release* as a failed build over a tidying step.
+
+    This is the same bug the justfile's `fly-build` had — one `ids()` ending in
+    `|| true` used for both — caught in review there and then written again
+    here. Two parameters rather than two functions so the call sites have to
+    say which they mean.
+    """
+    result = _flyctl(
+        "machines", "list", "--app", app, "--json", runner=runner, check=False
+    )
     if result.returncode != 0:
+        if strict:
+            raise BuildError(
+                f"could not list machines on {app} before building: {_reason(result)}. "
+                "Refusing to continue: without that list the cleanup afterwards cannot "
+                "tell a machine it created from one that was already there."
+            )
         return set()
     try:
         return {m["id"] for m in json.loads(result.stdout or "[]") if m.get("id")}
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as exc:
+        if strict:
+            raise BuildError(
+                f"could not read the machine list on {app}: {exc}. Nothing was built."
+            ) from exc
         return set()
 
 
@@ -158,8 +193,14 @@ def build_box_image(
     ref = hermes_ref.strip()
     if not ref:
         raise BuildError("a build needs a Hermes ref")
+    if not _REF.match(ref):
+        raise BuildError(
+            f"{hermes_ref!r} is not a usable Hermes ref. Expected a tag, branch or "
+            "commit — letters, digits, and . _ - / only."
+        )
 
-    before = _machine_ids(app, runner)
+    # Fail-closed, and before anything is built: see `_machine_ids`.
+    before = _machine_ids(app, runner, strict=True)
 
     with tempfile.TemporaryDirectory() as tmp:
         config = Path(tmp) / "fly.toml"
@@ -183,7 +224,7 @@ def build_box_image(
     # Best effort, and after the release exists: a machine left behind costs
     # money but the image is already safe, so a failure to tidy must not be
     # reported as a failure to build.
-    for machine_id in sorted(_machine_ids(app, runner) - before):
+    for machine_id in sorted(_machine_ids(app, runner, strict=False) - before):
         _flyctl(
             "machine", "destroy", machine_id, "--app", app, "--force", runner=runner, check=False
         )
@@ -218,8 +259,13 @@ def _released_image(app: str, runner: Runner | None) -> str | None:
 
 
 def shipped_context_files() -> Sequence[str]:
-    """What the control plane's image must carry. Used by a test and by docs."""
-    return ("pyproject.toml", "README.md", "src", "fly")
+    """Every path the box image's build context needs, and the only list of them.
+
+    `build_context` checks exactly this, so the two cannot disagree — they did:
+    this said `README.md` and the check did not, which meant a context missing
+    it would pass the check and fail on the builder.
+    """
+    return ("pyproject.toml", "README.md", "src", "fly/Dockerfile", "fly/box_entrypoint.sh")
 
 
 __all__ = [

@@ -158,3 +158,96 @@ def test_a_context_missing_the_package_is_refused(tmp_path):
 def test_this_checkout_is_a_valid_build_context():
     """Guard the guard — a check that can only fail proves nothing."""
     assert (build_context() / "fly" / "Dockerfile").is_file()
+
+
+def test_a_failed_listing_before_the_deploy_builds_nothing(monkeypatch):
+    """The bug both reviewers caught, in the function whose job is preventing it.
+
+    `_machine_ids` returned an empty set on a failed listing, so `before` was
+    empty and every machine afterwards looked new — including the fleet's box
+    on an app with no prefix. That is `|| true` by another spelling, and it is
+    the same defect review had just closed on `just fly-build`.
+
+    Fail-closed means: no deploy, no destroy, and a reason.
+    """
+
+    class NoList(Fly):
+        def __call__(self, cmd, **kwargs):
+            if cmd[1:3] == ["machines", "list"] and not self.deployed:
+                self.calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 1, "", "Error: could not reach Fly")
+            return super().__call__(cmd, **kwargs)
+
+    fly = NoList(before=["m-theirs"])
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+
+    with pytest.raises(BuildError, match="before building"):
+        _build(fly)
+
+    assert not any("deploy" in c for c in fly.calls), "deployed despite an unreadable before-list"
+    assert fly.destroyed == []
+
+
+def test_an_unreadable_listing_before_the_deploy_is_the_same_refusal(monkeypatch):
+    """Exit code 0 with a body that is not JSON is the same hazard: an empty
+    set that looks like an answer."""
+
+    class Garbage(Fly):
+        def __call__(self, cmd, **kwargs):
+            if cmd[1:3] == ["machines", "list"] and not self.deployed:
+                self.calls.append(cmd)
+                return _ok("<html>maintenance</html>")
+            return super().__call__(cmd, **kwargs)
+
+    fly = Garbage(before=["m-theirs"])
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+
+    with pytest.raises(BuildError, match="could not read the machine list"):
+        _build(fly)
+    assert not any("deploy" in c for c in fly.calls)
+
+
+def test_a_failed_listing_after_the_deploy_leaves_an_orphan_rather_than_failing(monkeypatch):
+    """The opposite policy, and it has to be opposite.
+
+    The image is already released by then. Raising would report a successful
+    build as a failure over a tidying step, and the worst case of not raising
+    is a machine left behind — costly and recoverable.
+    """
+
+    class NoListAfter(Fly):
+        def __call__(self, cmd, **kwargs):
+            if cmd[1:3] == ["machines", "list"] and self.deployed:
+                self.calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 1, "", "Error: gone")
+            return super().__call__(cmd, **kwargs)
+
+    fly = NoListAfter()
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+
+    assert _build(fly) == "registry/x:new"
+    assert fly.destroyed == [], "nothing could be identified, so nothing was destroyed"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ['v1"\nHERMES_REF = "evil', "; rm -rf /", "../../etc/passwd", "$(whoami)", "a" * 200],
+)
+def test_a_ref_that_is_not_a_ref_is_refused_before_anything_runs(bad):
+    """It is interpolated into a generated TOML file and into a `git clone` on
+    the builder. The app only ever sends a release tag; the endpoint takes a
+    string from anyone with a write token."""
+    fly = Fly()
+    with pytest.raises(BuildError, match="not a usable Hermes ref"):
+        build_box_image(bad, app="build-app", runner=fly)
+    assert fly.calls == []
+
+
+@pytest.mark.parametrize("good", ["v2026.9.7", "main", "feature/x", "a1b2c3d4", "v1.2.3-rc1"])
+def test_the_refs_people_actually_use_are_accepted(good, monkeypatch):
+    """Guard the guard: a pattern that rejects everything would pass the tests
+    above and break every build."""
+    fly = Fly()
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    assert build_box_image(good, app="build-app", runner=fly) == "registry/x:new"
+    assert f'HERMES_REF = "{good}"' in fly.config

@@ -511,18 +511,20 @@ def create_app(
 
         ref = str((body or {}).get("hermes_ref") or "").strip() or HERMES_REF
 
+        from flotta.store import BuildInProgressError
+
         store = store_factory()
         try:
-            running = store.latest_build()
-            if running is not None and running.status == "building":
-                # Two concurrent builds would race for the same app's release
-                # history, and the loser's agents would be rolled onto an image
-                # the winner replaced.
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"a build is already running ({running.id}, {running.hermes_ref})",
-                )
+            # The check lives inside `start_build`'s transaction. Read here and
+            # insert after — which is what this did — lets two POSTs pass the
+            # same check and both start, because the guard serialises the write
+            # and not the decision behind it.
+            #
+            # Two concurrent updates race for one app's release history, and
+            # the loser's agents get rolled onto an image the winner replaced.
             build = store.start_build(ref)
+        except BuildInProgressError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
 
@@ -547,7 +549,12 @@ def create_app(
                 except BuildError as exc:
                     inner.finish_build(build.id, error=str(exc))
                     return
-                inner.finish_build(build.id, image=image)
+                # Not `finish_build`: the operation is not over. Marking it
+                # done here made "one update at a time" true for the build
+                # minutes and false for the roll — a second update could start
+                # while agents were still moving, and the app re-offered its
+                # button mid-roll.
+                inner.mark_rolling(build.id)
 
                 for box in inner.list_boxes():
                     if is_terminal("box", box.status) or box.status == "provisioning":
@@ -559,7 +566,12 @@ def create_app(
                         # against the box, so the app can say which agent and
                         # why. Stopping here is the point: see the docstring.
                         _log.warning("rolling stopped at %s: %s", box.name, exc)
+                        inner.finish_build(
+                            build.id, error=f"{box.name} could not be upgraded: {exc}"
+                        )
                         return
+
+                inner.finish_build(build.id, image=image)
             except Exception as exc:  # noqa: BLE001
                 with contextlib.suppress(Exception):
                     inner.finish_build(build.id, error=f"{type(exc).__name__}: {exc}")

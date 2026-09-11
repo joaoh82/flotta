@@ -85,7 +85,7 @@ export type MachineView = {
 export type Build = {
   id: string;
   hermes_ref: string;
-  /** `building`, `done` or `failed`. */
+  /** `building`, `rolling`, `done` or `failed`. `rolling` is still running. */
   status: string;
   image?: string | null;
   error?: string | null;

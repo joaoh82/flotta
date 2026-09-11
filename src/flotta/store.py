@@ -227,10 +227,19 @@ CREATE TABLE IF NOT EXISTS settings (
 -- TABLE IF NOT EXISTS` gives an existing database a new table on the next
 -- open, while a new *column* on an old table would silently not appear. That
 -- is why this is a table and not two columns on `settings`.
+-- `rolling` is not decoration. `done` used to be set the moment the image
+-- existed, which made "one update at a time" true for the build minutes and
+-- false for the roll that follows — a second update could start while agents
+-- were still moving, and the app re-offered its button mid-roll. The operation
+-- is not over until the last agent is.
+--
+-- This CHECK can only be got right now: `CREATE TABLE IF NOT EXISTS` leaves an
+-- existing table alone, so a vocabulary change after this table exists
+-- anywhere would silently not apply there.
 CREATE TABLE IF NOT EXISTS builds (
     id           TEXT PRIMARY KEY,
     hermes_ref   TEXT NOT NULL,
-    status       TEXT NOT NULL CHECK (status IN ('building', 'done', 'failed')),
+    status       TEXT NOT NULL CHECK (status IN ('building', 'rolling', 'done', 'failed')),
     image        TEXT,
     error        TEXT,
     started_at   TEXT NOT NULL,
@@ -361,6 +370,18 @@ class Event:
     ts: str
     type: str
     payload: dict[str, Any] | None
+
+
+#: How long a build may sit unfinished before it stops blocking new ones.
+#:
+#: Generous: a cold image build is minutes and a roll across a fleet is more,
+#: so a timeout that fires early would let two updates run at once — the thing
+#: the lock exists to prevent. It only needs to be shorter than "forever".
+BUILD_STALE_S = 3600
+
+
+class BuildInProgressError(RuntimeError):
+    """Another update is already running."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -720,32 +741,73 @@ class FleetStore:
 
     # -- builds -------------------------------------------------------------
 
-    def start_build(self, hermes_ref: str) -> Build:
-        """Record that a build has begun, and return the row to poll.
+    def start_build(self, hermes_ref: str, *, now: datetime | None = None) -> Build:
+        """Claim the fleet for an update, or raise `BuildInProgressError`.
 
-        Written *before* the builder is called, for the same reason
-        `reserve_box` reserves a row before provisioning: a control plane that
-        dies mid-build should leave something that says so, not silence.
+        The check and the insert are **one guarded transaction**. Read first
+        and insert after — which is what this did — leaves two POSTs able to
+        pass the same check and both start, because `guard="builds"` serialises
+        the write and not the decision that led to it. That is the same
+        read-check-write the concurrency caps are guarded for.
+
+        Written before the builder is called, for the reason `reserve_box`
+        reserves a row before provisioning: a control plane that dies mid-build
+        should leave something that says so rather than silence.
         """
         build_id = f"bld-{uuid.uuid4().hex[:12]}"
-        now = _utcnow()
+        moment = now or datetime.now(UTC)
         with self._conn.transaction(guard="builds"):
-            # Guarded because `latest_build` reads it to decide whether another
-            # build may start — a read-check-write, and an unguarded one on
-            # Postgres is an optimistic BEGIN that lets two builds race.
+            active = self._active_build(moment)
+            if active is not None:
+                raise BuildInProgressError(
+                    f"an update is already running ({active.id}, {active.hermes_ref}, "
+                    f"{active.status})"
+                )
             self._conn.execute(
                 "INSERT INTO builds (id, hermes_ref, status, started_at) VALUES (?, ?, ?, ?)",
-                (build_id, hermes_ref, "building", now),
+                (build_id, hermes_ref, "building", moment.isoformat()),
             )
+        now_s = moment.isoformat()
         return Build(
             id=build_id,
             hermes_ref=hermes_ref,
             status="building",
             image=None,
             error=None,
-            started_at=now,
+            started_at=now_s,
             finished_at=None,
         )
+
+    def _active_build(self, now: datetime) -> Build | None:
+        """An update that is still running, ignoring ones that never ended.
+
+        A control plane killed mid-build leaves `building` behind forever, and
+        without this every later update would be refused by a job that stopped
+        existing when the process did. A stale row is not marked finished — it
+        is unknown, not failed, and saying otherwise would be inventing an
+        outcome nothing observed.
+        """
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds WHERE status IN ('building', 'rolling') "
+            "ORDER BY started_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        build = _build_from_row(row)
+        try:
+            started = datetime.fromisoformat(build.started_at)
+        except ValueError:
+            # An unparseable timestamp is not evidence of abandonment; leaving
+            # the lock in place is the safe reading.
+            return build
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        return None if (now - started).total_seconds() > BUILD_STALE_S else build
+
+    def mark_rolling(self, build_id: str) -> None:
+        """The image exists; agents are moving. Still not finished."""
+        self._conn.execute("UPDATE builds SET status = ? WHERE id = ?", ("rolling", build_id))
 
     def finish_build(
         self, build_id: str, *, image: str | None = None, error: str | None = None
@@ -762,6 +824,14 @@ class FleetStore:
         row = self._conn.execute(
             "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
             "FROM builds ORDER BY started_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        return _build_from_row(row) if row else None
+
+    def get_build(self, build_id: str) -> Build | None:
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds WHERE id = ?",
+            (build_id,),
         ).fetchone()
         return _build_from_row(row) if row else None
 

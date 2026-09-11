@@ -36,6 +36,20 @@ describe("what the fleet banner offers", () => {
     expect(said).toMatchObject({ kind: "building", ref: "v2" });
   });
 
+  it("keeps saying so while agents are still being rolled", () => {
+    // The window used to re-offer the button here: `done` was set as soon as
+    // the image existed, so "one update at a time" covered the build and not
+    // the roll that follows it.
+    const said = offerOf({ pinned: "v1", latest: "v2", behind: true }, {
+      id: "b1",
+      hermes_ref: "v2",
+      status: "rolling",
+      started_at: "now",
+    });
+    expect(said).toMatchObject({ kind: "building" });
+    expect(said.kind === "building" && said.detail).toContain("Upgrading agents");
+  });
+
   it("keeps a failed build on screen even when nothing is behind", () => {
     // Nothing changed for any agent, and the reason is the only way to know
     // why — losing it because the pin happens to match upstream would hide a

@@ -1786,3 +1786,72 @@ def test_builds_are_listed_newest_first(client, fleet):
     builds = client.get("/api/hermes/builds").json()["builds"]
     assert [b["hermes_ref"] for b in builds] == ["v2", "v1"]
     assert builds[0]["status"] == "building"
+
+
+def test_a_second_update_during_the_roll_is_refused_too(async_client, fleet, monkeypatch):
+    """The lock has to cover the whole operation.
+
+    `finish_build` used to run the moment the image existed, so "one update at
+    a time" was true for the build minutes and false for the roll — a second
+    POST could start while agents were still moving.
+    """
+    _no_build(monkeypatch)
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    import flotta.provision as provision
+
+    rolling = threading.Event()
+    release = threading.Event()
+
+    def slow_roll(box_id, **kw):
+        rolling.set()
+        release.wait(timeout=5)
+        return {"box_id": box_id}
+
+    monkeypatch.setattr(provision, "upgrade_box", slow_roll)
+    async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
+
+    assert rolling.wait(timeout=5), "the roll never started"
+    try:
+        second = async_client.post("/api/hermes/update", json={"hermes_ref": "v2"})
+        assert second.status_code == 409, "a second update started while agents were moving"
+        assert "rolling" in second.json()["detail"]
+    finally:
+        release.set()
+
+
+def test_a_roll_that_fails_records_which_agent(async_client, fleet, monkeypatch):
+    """Otherwise the build row says `rolling` forever and the only trace is a
+    per-agent event somebody has to go looking for."""
+    _no_build(monkeypatch)
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    import flotta.provision as provision
+    from flotta.provision import UpgradeFailed
+
+    monkeypatch.setattr(
+        provision, "upgrade_box", lambda box_id, **kw: (_ for _ in ()).throw(UpgradeFailed("nope"))
+    )
+
+    async_client.post("/api/hermes/update", json={"hermes_ref": "v1"})
+
+    with FleetStore(fleet) as store:
+        assert _wait(lambda: _status(store) == "failed")
+        assert "eng-a" in store.latest_build().error
+
+
+def test_an_abandoned_build_stops_blocking_after_an_hour(fleet):
+    """A control plane killed mid-build leaves `building` behind, and without a
+    timeout every later update is refused by a job that stopped existing when
+    the process did. The stale row is not marked failed — it is unknown, not
+    finished, and saying otherwise would invent an outcome nothing saw."""
+    from datetime import UTC, datetime, timedelta
+
+    from flotta.store import BuildInProgressError
+
+    with FleetStore(fleet) as store:
+        abandoned = store.start_build("v1")
+        with pytest.raises(BuildInProgressError):
+            store.start_build("v2")
+
+        later = datetime.now(UTC) + timedelta(hours=2)
+        assert store.start_build("v2", now=later).hermes_ref == "v2"
+        assert store.get_build(abandoned.id).status == "building"

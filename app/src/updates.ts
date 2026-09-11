@@ -27,11 +27,18 @@ export function offerOf(versions: HermesVersions | null, build: Build | null): O
   // A build in progress beats everything, including a newer Hermes appearing
   // mid-build: the control plane refuses a second build, and offering a button
   // that will be refused is worse than saying what is happening.
-  if (build?.status === "building") {
+  // `rolling` counts too, and that is the point of it existing. `done` used
+  // to be set the moment the image was built, so the button came back while
+  // agents were still moving — and pressing it would have been refused by a
+  // control plane that knows the operation is not over.
+  if (build?.status === "building" || build?.status === "rolling") {
     return {
       kind: "building",
       ref: build.hermes_ref,
-      detail: `Building Hermes ${build.hermes_ref}. Agents are upgraded one at a time once it lands.`,
+      detail:
+        build.status === "rolling"
+          ? `Hermes ${build.hermes_ref} is built. Upgrading agents one at a time.`
+          : `Building Hermes ${build.hermes_ref}. Agents are upgraded one at a time once it lands.`,
     };
   }
 
