@@ -177,13 +177,20 @@ def _fly_toml(app: str, region: str, hermes_ref: str) -> str:
 
     The machine is still made — `fly deploy` always makes one — and is
     destroyed immediately afterwards. It never has to work.
+
+    **No `dockerfile =` line, and that is load-bearing.** flyctl resolves a
+    `[build] dockerfile` path relative to the *config file's* directory — and
+    this config lives in a temp dir, so `fly/Dockerfile` became
+    `/tmp/tmpXXXX/fly/Dockerfile`, which does not exist, and it won over the
+    `--dockerfile` flag. The second real press of "Update agents" failed on
+    exactly that. The flag carries an absolute path into the real context;
+    the config carries only the build arg.
     """
     return (
         f'app = "{app}"\n'
         f'primary_region = "{region}"\n'
         "\n"
         "[build]\n"
-        '  dockerfile = "fly/Dockerfile"\n'
         "  [build.args]\n"
         f'    HERMES_REF = "{hermes_ref}"\n'
     )

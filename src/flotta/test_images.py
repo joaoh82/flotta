@@ -287,3 +287,21 @@ def test_the_dockerfile_sets_the_context_where_it_copies_it():
     assert "WORKDIR /app" in dockerfile
     for copied in ("COPY pyproject.toml README.md ./", "COPY src/ ./src/", "COPY fly/ ./fly/"):
         assert copied in dockerfile, f"the context is incomplete without {copied!r}"
+
+
+def test_the_generated_config_never_names_the_dockerfile(monkeypatch):
+    """flyctl resolves `[build] dockerfile` relative to the config file, and
+    the config is written to a temp dir — so `fly/Dockerfile` in it means
+    `/tmp/…/fly/Dockerfile`, which is nothing, and it beats the flag. The
+    absolute `--dockerfile` flag is the only path that may name it. The second
+    real press of the button failed on this; a hermetic suite could not have
+    seen it, but it can stop it coming back."""
+    fly = Fly()
+    monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
+    _build(fly)
+
+    assert "dockerfile" not in fly.config.lower()
+    deploy = next(c for c in fly.calls if "deploy" in c)
+    flagged = Path(deploy[deploy.index("--dockerfile") + 1])
+    assert flagged.is_absolute() and flagged.name == "Dockerfile"
+    assert flagged.parent.name == "fly"
