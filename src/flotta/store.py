@@ -827,6 +827,22 @@ class FleetStore:
         ).fetchone()
         return _build_from_row(row) if row else None
 
+    def last_successful_build(self) -> Build | None:
+        """The newest build that produced an image.
+
+        This is **what the fleet actually runs**, as opposed to the source pin,
+        which is only what the next build would use if nobody said otherwise.
+        The two diverge permanently the moment an update is started from the
+        app: it builds at the ref it was given and never edits source, so a
+        comparison against the pin would report the fleet as behind forever,
+        offering an update that had already been applied.
+        """
+        row = self._conn.execute(
+            "SELECT id, hermes_ref, status, image, error, started_at, finished_at "
+            "FROM builds WHERE status = 'done' ORDER BY finished_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        return _build_from_row(row) if row else None
+
     def get_build(self, build_id: str) -> Build | None:
         row = self._conn.execute(
             "SELECT id, hermes_ref, status, image, error, started_at, finished_at "

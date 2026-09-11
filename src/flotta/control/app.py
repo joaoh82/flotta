@@ -439,7 +439,13 @@ def create_app(
         from flotta.hermes import report
         from flotta.provision import _newest_release_image, resolve_fleet_image
 
-        found = report()
+        store = store_factory()
+        try:
+            built = store.last_successful_build()
+        finally:
+            store.close()
+
+        found = report(fleet_ref=built.hermes_ref if built else None)
         fleet_image, source = resolve_fleet_image()
 
         # What the build app last released, reported even when the environment
@@ -454,6 +460,12 @@ def create_app(
 
         return {
             "pinned": found.pinned,
+            #: What the fleet's newest image was built at, and where that came
+            #: from. `pinned` is an intention; this is what exists. They
+            #: diverge permanently after the first update started from the app,
+            #: which builds at a given ref and never edits source.
+            "fleet_ref": found.fleet_ref,
+            "fleet_ref_source": found.fleet_ref_source,
             "latest": found.latest,
             "behind": found.behind,
             "unavailable": found.unavailable,

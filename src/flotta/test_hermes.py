@@ -117,7 +117,58 @@ def test_a_failure_is_not_cached():
     assert hermes.latest_release(fetch=_answering("v2"), now=2.0) == ("v2", None)
 
 
+def _report(fleet_ref, latest, **kw):
+    return hermes.Report(
+        pinned="v-whatever-source-says",
+        fleet_ref=fleet_ref,
+        fleet_ref_source="build",
+        latest=latest,
+        **kw,
+    )
+
+
 def test_behind_is_only_ever_true_on_evidence():
-    assert hermes.Report(pinned="v1", latest="v2").behind is True
-    assert hermes.Report(pinned="v1", latest="v1").behind is False
-    assert hermes.Report(pinned="v1", latest=None, unavailable="down").behind is False
+    assert _report("v1", "v2").behind is True
+    assert _report("v1", "v1").behind is False
+    assert _report("v1", None, unavailable="down").behind is False
+
+
+def test_behind_measures_what_the_fleet_runs_not_the_source_pin():
+    """The bug this comparison had, and it only appeared after the first update
+    started from the app.
+
+    That path builds at the ref it is given and never edits source, so the pin
+    stays where it was. Measured against the pin, a fleet that had just been
+    updated to the newest Hermes still reported as behind — and the window went
+    on offering an update it had already applied, forever.
+    """
+    updated = hermes.Report(
+        pinned="v2026.9.7",  # source, untouched by an app-driven update
+        fleet_ref="v2026.9.8",  # what the fleet was actually built at
+        fleet_ref_source="build",
+        latest="v2026.9.8",
+    )
+    assert updated.behind is False
+
+    stale = hermes.Report(
+        pinned="v2026.9.8",  # a merged pin bump that has not been built yet
+        fleet_ref="v2026.9.7",
+        fleet_ref_source="build",
+        latest="v2026.9.8",
+    )
+    assert stale.behind is True, (
+        "a pin merged but not built must still read as behind — the agents are"
+    )
+
+
+def test_with_nothing_built_the_pin_stands_in():
+    """Correct exactly once: before any image has ever been made, the default
+    is the only evidence there is."""
+    found = hermes.report(fetch=_answering("v2"))
+    assert found.fleet_ref == found.pinned
+    assert found.fleet_ref_source == "pin"
+
+
+def test_a_built_ref_wins_over_the_pin():
+    found = hermes.report(fleet_ref="v9", fetch=_answering("v9"))
+    assert (found.fleet_ref, found.fleet_ref_source, found.behind) == ("v9", "build", False)

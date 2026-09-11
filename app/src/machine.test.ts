@@ -178,9 +178,15 @@ describe("whether an agent is on the fleet's image", () => {
 
 describe("whether the fleet's Hermes pin is behind", () => {
   it("reports a newer release and how to take it", () => {
-    const said = hermesStanding({ pinned: "v2026.8.19", latest: "v2026.9.7", behind: true });
+    const said = hermesStanding({
+      pinned: "v2026.8.19",
+      fleet_ref: "v2026.8.19",
+      latest: "v2026.9.7",
+      behind: true,
+    });
     expect(said.kind).toBe("behind");
-    expect(said.detail).toContain("hermes-bump v2026.9.7");
+    // It points at the button now, not at a terminal command.
+    expect(said.detail).toContain("Update agents");
   });
 
   it("never reports a failed check as up to date", () => {

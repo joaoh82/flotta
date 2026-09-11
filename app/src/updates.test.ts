@@ -7,6 +7,17 @@ describe("what the fleet banner offers", () => {
     expect(said).toMatchObject({ kind: "offer", ref: "v2" });
   });
 
+  it("says what the agents run, not what source is pinned at", () => {
+    // After an update started from the window those diverge permanently: the
+    // build takes a ref and never edits source.
+    const said = offerOf(
+      { pinned: "v1", fleet_ref: "v2", latest: "v3", behind: true },
+      null,
+    );
+    expect(said.kind === "offer" && said.detail).toContain("Your agents run v2");
+    expect(said.kind === "offer" && said.detail).not.toContain("v1");
+  });
+
   it("offers nothing when up to date", () => {
     expect(offerOf({ pinned: "v2", latest: "v2", behind: false }, null).kind).toBe("none");
   });

@@ -212,6 +212,7 @@ export function imageStanding(view: {
  */
 export function hermesStanding(versions: {
   pinned: string;
+  fleet_ref?: string | null;
   latest?: string | null;
   behind?: boolean;
   unavailable?: string | null;
@@ -228,9 +229,9 @@ export function hermesStanding(versions: {
     return {
       kind: "behind",
       detail:
-        `Hermes ${versions.latest} is out; this fleet builds ${versions.pinned}. ` +
-        `Moving the pin rebuilds the image — \`just hermes-bump ${versions.latest}\` — ` +
-        "and is not something the app does, because it re-runs the live checks.",
+        `Hermes ${versions.latest} is out; this fleet is built at ` +
+        `${versions.fleet_ref ?? versions.pinned}. ` +
+        "Update agents in the fleet view builds it and rolls every agent onto it.",
     };
   }
   return { kind: "current", detail: `The newest Hermes is ${versions.latest}.` };

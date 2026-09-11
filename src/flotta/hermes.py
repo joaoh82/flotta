@@ -54,8 +54,16 @@ _cache: tuple[float, str] | None = None
 class Report:
     """What is known about Hermes versions right now."""
 
-    #: What the next image would be built from — `flotta.box.image.HERMES_REF`.
+    #: What the next image would be built from if nobody said otherwise —
+    #: `flotta.box.image.HERMES_REF`. An *intention*, and it says nothing
+    #: about any image that exists.
     pinned: str
+    #: What the fleet's newest image was actually built at. A *fact*, and the
+    #: one `behind` is measured against.
+    fleet_ref: str
+    #: Where `fleet_ref` came from: `build` when a build produced it, `pin`
+    #: when nothing has ever been built and the default is the best guess.
+    fleet_ref_source: str
     #: The newest release upstream, or `None` if it could not be checked.
     latest: str | None
     #: Why it could not be checked, in words a person can act on.
@@ -65,11 +73,17 @@ class Report:
     def behind(self) -> bool:
         """Only ever true on evidence.
 
+        Measured against `fleet_ref` — what the fleet runs — and not against
+        the pin. Comparing with the pin was wrong in a way that only appeared
+        after the first app-driven update: that path builds at the ref it is
+        given and never edits source, so the pin stayed where it was and the
+        window went on offering an update it had already applied.
+
         An unreachable GitHub must read as "unknown", never as "up to date"
         and never as "behind" — the first hides a real upgrade, the second
         nags people into rebuilding for nothing.
         """
-        return self.latest is not None and self.latest != self.pinned
+        return self.latest is not None and self.latest != self.fleet_ref
 
 
 def _fetch(url: str, *, timeout: float) -> str:
@@ -129,8 +143,26 @@ def latest_release(
     return tag, None
 
 
-def report(*, fetch: Callable[..., str] | None = None, **kwargs: Any) -> Report:
+def report(
+    *,
+    fleet_ref: str | None = None,
+    fetch: Callable[..., str] | None = None,
+    **kwargs: Any,
+) -> Report:
+    """What is known about Hermes versions.
+
+    `fleet_ref` is what the fleet's newest image was built at — the caller has
+    the store and this module does not. Absent, the pin stands in, which is
+    correct exactly once: before anything has ever been built.
+    """
     from flotta.box.image import HERMES_REF
 
     latest, unavailable = latest_release(fetch=fetch, **kwargs)
-    return Report(pinned=HERMES_REF, latest=latest, unavailable=unavailable)
+    built = (fleet_ref or "").strip()
+    return Report(
+        pinned=HERMES_REF,
+        fleet_ref=built or HERMES_REF,
+        fleet_ref_source="build" if built else "pin",
+        latest=latest,
+        unavailable=unavailable,
+    )
