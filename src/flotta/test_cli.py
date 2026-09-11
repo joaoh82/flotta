@@ -229,19 +229,20 @@ def test_box_row_shape():
     row = box_row(make_box(), make_task(), now=NOW)
     assert row[0] == "b-abc123"
     assert row[1] == "eng-b"
-    assert row[2] == "running"
-    assert row[3] == "summarize the logs"
-    assert row[4] == "30s ago"
+    assert row[2] == "-"  # label: none set (FLOTTA-40)
+    assert row[3] == "running"
+    assert row[4] == "summarize the logs"
+    assert row[5] == "30s ago"
 
 
 def test_box_row_without_a_task_yet():
     """A box you have created and not yet given work to is normal, not broken."""
-    assert box_row(make_box(), None, now=NOW)[3] == "-"
+    assert box_row(make_box(), None, now=NOW)[4] == "-"
 
 
 def test_box_row_truncates_a_long_task():
     row = box_row(make_box(), make_task(prompt="x" * 200), now=NOW)
-    assert len(row[3]) == 40
+    assert len(row[4]) == 40
 
 
 def test_task_row_shape():
@@ -1002,3 +1003,34 @@ def test_an_upgrade_that_was_already_current_says_so(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0
     assert "already on" in result.output
+
+
+def test_box_row_shows_the_label_beside_the_address():
+    """`name` is where the agent lives; `label` is what a person calls it.
+    Both, in separate columns, because renaming an agent must never look like
+    moving it."""
+    row = box_row(make_box(), None, label="Reviewer — backend PRs", now=NOW)
+    assert row[1] == "eng-b"
+    assert row[2] == "Reviewer — backend PRs"
+
+
+def test_render_boxes_has_a_label_column_even_when_nothing_is_labelled():
+    out = render_boxes([make_box()], now=NOW)
+    assert "LABEL" in out.splitlines()[0]
+
+
+def test_a_bad_description_is_a_refusal_not_a_failure(tmp_path):
+    """Exit 2, like a bad name. Both are the caller asking for something the
+    fleet will not record; exit 1 is reserved for the substrate failing, and
+    a script telling them apart by code must not be told "something broke"
+    when it was told "no". Reviewers caught the mismatch."""
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    result = CliRunner().invoke(
+        app,
+        ["create", "eng-x", "--store", str(tmp_path / "f.db"), "--description", "x" * 501],
+    )
+    assert result.exit_code == 2, result.output
+    assert "too long" in result.output

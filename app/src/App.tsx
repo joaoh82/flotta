@@ -5,6 +5,7 @@ import { AgentTimeline } from "./AgentTimeline";
 import { Conversation } from "./Conversation";
 import { DestroyAgent } from "./DestroyAgent";
 import { HermesUpdate } from "./HermesUpdate";
+import { labelOf } from "./identity";
 import { NewAgent } from "./NewAgent";
 import { Settings } from "./Settings";
 import { StatusBadge } from "./StatusBadge";
@@ -391,11 +392,14 @@ export default function App() {
                     }`}
                   >
                     <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">{box.name}</span>
+                      <span className="truncate text-sm font-medium">{labelOf(box).primary}</span>
                       <StatusBadge status={box.status} />
                     </div>
+                    {/* The address when a display name is shown, the id when
+                        it is not — the address never disappears, because
+                        renaming must never look like moving. */}
                     <p className="mt-0.5 truncate font-mono text-[11px] text-neutral-500">
-                      {box.id}
+                      {labelOf(box).secondary}
                     </p>
                     {/* A stopped agent is addressable — the door wakes it.
                         Saying so stops `stopped` reading as "unavailable". */}
@@ -490,6 +494,9 @@ export default function App() {
                   // agent had when it was opened.
                   box={boxes.find((b) => b.id === info.id) ?? info}
                   onClose={() => setInfo(null)}
+                  onRenamed={(updated) =>
+                    setBoxes((rows) => rows.map((r) => (r.id === updated.id ? updated : r)))
+                  }
                 />
               ) : selectedBox && isAddressable(selectedBox.status) ? (
                 <>

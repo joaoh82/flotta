@@ -80,6 +80,7 @@ from flotta.store import (
     Task,
     UnknownEntityError,
     is_terminal,
+    validate_box_meta,
     validate_box_name,
 )
 
@@ -445,6 +446,7 @@ def build_identity(
     box_id: str,
     box_name: str,
     *,
+    instructions: str | None = None,
     ttl_s: int = BOX_TOKEN_TTL_S,
     env: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
@@ -470,6 +472,14 @@ def build_identity(
     from flotta.auth import SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
 
     box_env = {"FLOTTA_BOX_ID": box_id, "FLOTTA_BOX_NAME": box_name}
+
+    # Standing instructions ride along as env, not as a secret: the agent is
+    # meant to read them, and nothing about "you review backend PRs" needs
+    # hiding from `machine status`. The entrypoint writes them to
+    # `$HERMES_HOME/SOUL.md` exactly once — the volume copy is the agent's
+    # after that — so this is the seed, and the store row is its record.
+    if instructions:
+        box_env["FLOTTA_INSTRUCTIONS"] = instructions
 
     control_url = (source.get("FLOTTA_CONTROL_URL") or "").strip()
     if control_url:
@@ -609,7 +619,15 @@ def _correct_running(
     return {"box_id": box.id, "name": box.name, "action": "corrected", "observed": observed}
 
 
-def reserve_box(name: str, *, store: FleetStore, backend: Backend) -> Box:
+def reserve_box(
+    name: str,
+    *,
+    store: FleetStore,
+    backend: Backend,
+    display_name: str | None = None,
+    description: str | None = None,
+    instructions: str | None = None,
+) -> Box:
     """Write the row, and nothing else. Returns immediately.
 
     Split out of `create_box` because provisioning takes *minutes* — an app, a
@@ -622,8 +640,19 @@ def reserve_box(name: str, *, store: FleetStore, backend: Backend) -> Box:
     anyway. Reserving the row separately lets the API answer at once with
     something real to poll.
     """
+    # Validated before the row exists, so a description that cannot be stored
+    # refuses without spending the name — the same reason the name itself is
+    # checked at the top of `store.create_box`.
+    validate_box_meta(display_name, description, instructions)
     box = store.create_box(name)
     store.add_event("box", box.id, "provisioning", {"name": name, "backend": backend.scheme})
+    if display_name or description or instructions:
+        store.set_box_meta(
+            box.id,
+            display_name=display_name,
+            description=description,
+            instructions=instructions,
+        )
     return box
 
 
@@ -683,6 +712,9 @@ def create_box(
     box: Box | None = None,
     volume_gb: int | None = None,
     region: str | None = None,
+    display_name: str | None = None,
+    description: str | None = None,
+    instructions: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
 
@@ -728,7 +760,14 @@ def create_box(
     # API answers immediately and provisions afterwards, without the row being
     # created twice or the name being taken between the two halves.
     if box is None:
-        box = reserve_box(name, store=store, backend=impl)
+        box = reserve_box(
+            name,
+            store=store,
+            backend=impl,
+            display_name=display_name,
+            description=description,
+            instructions=instructions,
+        )
 
     # Identity travels with the machine rather than arriving afterwards. The
     # ordering already works: `store.create_box` produced the id above, so
@@ -755,7 +794,13 @@ def create_box(
         if fleet_image:
             base = replace(base, image=fleet_image)
 
-    identity_env, identity_secrets = build_identity(box.id, name)
+    # From the store, not the argument: on the 202 path the row (and its
+    # meta) was reserved by the API before this ran on a thread, and the
+    # argument is None. One source, both paths.
+    meta = store.meta_for_box(box.id)
+    identity_env, identity_secrets = build_identity(
+        box.id, name, instructions=meta.instructions if meta else None
+    )
 
     # What this agent gets, as opposed to what every agent gets. Travels in the
     # spec because that is what the portable fields are for — see

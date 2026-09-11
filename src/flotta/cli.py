@@ -61,6 +61,7 @@ from .store import (
     DuplicateBoxError,
     Event,
     FleetStore,
+    InvalidBoxMetaError,
     InvalidBoxNameError,
     LegacyStoreError,
     Task,
@@ -193,10 +194,17 @@ def render_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def box_row(box: Box, latest: Task | None = None, *, now: datetime | None = None) -> list[str]:
+def box_row(
+    box: Box,
+    latest: Task | None = None,
+    *,
+    label: str | None = None,
+    now: datetime | None = None,
+) -> list[str]:
     return [
         box.id,
         box.name,
+        truncate(label, 28),
         box.status,
         truncate(latest.prompt if latest else None, 40),
         fmt_age(box.created_at, now=now),
@@ -207,11 +215,18 @@ def render_boxes(
     boxes: list[Box],
     latest: dict[str, Task] | None = None,
     *,
+    labels: dict[str, str | None] | None = None,
     now: datetime | None = None,
 ) -> str:
+    """`name` is the address and stays in its column; `label` is what a person
+    calls the agent (FLOTTA-40), blank until one is set."""
     latest = latest or {}
-    headers = ["id", "name", "status", "latest task", "created"]
-    return render_table(headers, [box_row(b, latest.get(b.id), now=now) for b in boxes])
+    labels = labels or {}
+    headers = ["id", "name", "label", "status", "latest task", "created"]
+    return render_table(
+        headers,
+        [box_row(b, latest.get(b.id), label=labels.get(b.id), now=now) for b in boxes],
+    )
 
 
 def task_row(task: Task, *, now: datetime | None = None) -> list[str]:
@@ -551,6 +566,18 @@ def _resolve_task(store: FleetStore, ident: str) -> Task:
 
 StoreOpt = typer.Option(None, "--store", help="Path to the fleet-state store [$FLOTTA_STORE]")
 JsonOpt = typer.Option(False, "--json", help="Emit JSON instead of a table")
+# FLOTTA-40: who an agent is. `--display-name` is what people call it; the
+# positional name stays the address and never changes.
+DisplayNameOpt = typer.Option(
+    None, "--display-name", help="What people call it; the name stays the address"
+)
+DescriptionOpt = typer.Option(None, "--description", help="What it is for")
+InstructionsOpt = typer.Option(
+    None, "--instructions", help="Standing instructions — seeded into the agent's SOUL.md"
+)
+InstructionsFileOpt = typer.Option(
+    None, "--instructions-file", help="Read the standing instructions from a file"
+)
 # Module-level for the same reason as the two above: a `typer.Option(...)` call
 # sitting in an argument default is evaluated at import, which the linter flags
 # and which this file already avoids by naming them here.
@@ -607,12 +634,14 @@ def ps(
         if tasks:
             typer.echo(render_tasks(rows))
         else:
+            metas = fleet.meta_for_boxes([box.id for box in rows])
+            labels = {bid: m.display_name for bid, m in metas.items()}
             latest: dict[str, Task] = {}
             for box in rows:
                 box_tasks = fleet.list_tasks(box_id=box.id)
                 if box_tasks:
                     latest[box.id] = box_tasks[0]
-            typer.echo(render_boxes(rows, latest))
+            typer.echo(render_boxes(rows, latest, labels=labels))
 
         if not rows:
             # Naming the file matters most when there is nothing to show: an
@@ -898,6 +927,10 @@ def create(
     volume_gb: int | None = typer.Option(
         None, "--volume-gb", help="Disk for this agent's memory. Default: the fleet's"
     ),
+    display_name: str | None = DisplayNameOpt,
+    description: str | None = DescriptionOpt,
+    instructions: str | None = InstructionsOpt,
+    instructions_file: Path | None = InstructionsFileOpt,
     region: str | None = typer.Option(
         None, "--region", help="Where to create it. Default: the fleet's"
     ),
@@ -944,14 +977,21 @@ def create(
             # machine while doing it. Without this flag a fresh app cannot be
             # created into at all — which is how the adopt path came to be the
             # only one anybody ever took.
+            if instructions_file is not None:
+                if instructions is not None:
+                    raise typer.BadParameter("give --instructions or --instructions-file, not both")
+                instructions = instructions_file.read_text(encoding="utf-8")
             result = provision.create_box(
                 name,
                 store=fleet,
                 spec=BoxSpec(name=name, image=image) if image else None,
                 volume_gb=volume_gb,
                 region=region,
+                display_name=display_name,
+                description=description,
+                instructions=instructions,
             )
-        except (InvalidBoxNameError, DuplicateBoxError) as exc:
+        except (InvalidBoxNameError, InvalidBoxMetaError, DuplicateBoxError) as exc:
             # Exit 2: the caller asked for something impossible, which is a
             # refusal rather than a failure (see the exit-code convention).
             # `DuplicateBoxError` reached here uncaught before this — a name

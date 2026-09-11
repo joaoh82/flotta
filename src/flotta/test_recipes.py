@@ -179,3 +179,47 @@ def test_the_build_recipe_only_destroys_machines_it_created():
         "the post-build listing is fail-closed, so a flyctl blip aborts after a "
         "successful release for the sake of a tidying step"
     )
+
+
+# -- the entrypoint seeds the persona, and only once ---------------------------
+
+_ENTRYPOINT = _JUSTFILE.parent / "fly" / "box_entrypoint.sh"
+
+
+def test_the_entrypoint_seeds_soul_md_only_when_absent(tmp_path):
+    """Run the seeding lines for real, against a temp HERMES_HOME.
+
+    The property that matters is *only once*: an agent that has evolved its
+    own SOUL.md must not have it overwritten on every boot by the seed it
+    started from. So: seeded when absent, untouched when present, nothing
+    written when there is no seed.
+    """
+    import subprocess
+
+    body = _ENTRYPOINT.read_text(encoding="utf-8")
+    start = body.index("if [ -n \"${FLOTTA_INSTRUCTIONS:-}\" ]")
+    end = body.index("fi\n", start) + 3
+    snippet = body[start:end]
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    soul = home / "SOUL.md"
+
+    def run(env):
+        return subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", snippet],
+            env={"HERMES_HOME": str(home), "PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    run({})
+    assert not soul.exists(), "wrote a SOUL.md with nothing to seed it from"
+
+    run({"FLOTTA_INSTRUCTIONS": "You review backend PRs."})
+    assert soul.read_text() == "You review backend PRs.\n"
+
+    soul.write_text("I have evolved.\n")
+    run({"FLOTTA_INSTRUCTIONS": "You review backend PRs."})
+    assert soul.read_text() == "I have evolved.\n", "the seed overwrote the agent's own persona"

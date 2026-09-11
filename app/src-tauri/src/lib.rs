@@ -158,8 +158,31 @@ async fn create_agent(
     name: String,
     volume_gb: Option<u32>,
     region: Option<String>,
+    display_name: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
 ) -> Result<BoxRow, FleetError> {
-    fleet::create_box(&read_settings(&app), &name, volume_gb, region).await
+    fleet::create_box(
+        &read_settings(&app),
+        &name,
+        volume_gb,
+        region,
+        display_name,
+        description,
+        instructions,
+    )
+    .await
+}
+
+/// Rename or re-describe an agent. Never the address, never the instructions.
+#[tauri::command]
+async fn rename_agent(
+    app: tauri::AppHandle,
+    id: String,
+    display_name: Option<String>,
+    description: Option<String>,
+) -> Result<BoxRow, FleetError> {
+    fleet::rename_agent(&read_settings(&app), &id, display_name, description).await
 }
 
 /// How the fleet behaves, as the control plane reports it.
@@ -349,6 +372,7 @@ pub fn run() {
             send_prompt,
             close_conversation,
             create_agent,
+            rename_agent,
             get_agent,
             fleet_settings,
             set_fleet_settings,

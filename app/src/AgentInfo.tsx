@@ -34,8 +34,21 @@ import {
  * It is fetched on open and on Recheck, never on a timer: it costs a `flyctl`
  * subprocess on the control plane.
  */
-export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }) {
+export function AgentInfo({
+  box,
+  onClose,
+  onRenamed,
+}: {
+  box: BoxRow;
+  onClose: () => void;
+  /** The list holds the row; a rename has to reach it or the sidebar lies. */
+  onRenamed: (box: BoxRow) => void;
+}) {
   const [view, setView] = useState<MachineView | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [draftDescription, setDraftDescription] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
   const [versions, setVersions] = useState<HermesVersions | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -76,13 +89,45 @@ export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }
   // moment as the machine, so comparing them is comparing two things that were
   // true together. Falling back to the list's row would compare the substrate
   // now against a row from up to a poll ago and invent drift out of the gap.
+  // Two rows, two jobs — and they must not be the same variable.
+  //
+  // `row` is the machine endpoint's snapshot of the box, read at the same
+  // instant as the machine, and it is what the drift comparison needs:
+  // status against state, both true together. `box` is the list's row, kept
+  // fresh by the poll and patched by `onRenamed`. Identity — name,
+  // description, the seed — has to come from `box`, or a Rename updates the
+  // sidebar and leaves this panel showing the old name until Recheck. Both
+  // reviewers caught exactly that.
   const row = view?.box ?? box;
+  const identity = box;
   const disagreement = machine ? drift(row.status, machine.state) : null;
   const image = machine?.image ? imageParts(machine.image) : null;
   const standing = imageStanding(view ?? {});
   const hermes = hermesOf(machine);
   const upstream = versions ? hermesStanding(versions) : null;
   const fleetNote = versions ? fleetImageNote(versions) : null;
+
+  const beginEdit = () => {
+    // From `identity`, the same source the panel shows — so a second Rename
+    // starts from what is on screen, not from an older snapshot.
+    setDraftName(identity.display_name ?? "");
+    setDraftDescription(identity.description ?? "");
+    setRenameError(null);
+    setEditing(true);
+  };
+  const saveEdit = async () => {
+    try {
+      const updated = await invoke<BoxRow>("rename_agent", {
+        id: box.id,
+        displayName: draftName,
+        description: draftDescription,
+      });
+      onRenamed(updated);
+      setEditing(false);
+    } catch (e) {
+      setRenameError(isFleetError(e) ? e.detail : String(e));
+    }
+  };
 
   const startUpgrade = async () => {
     setUpgradeError(null);
@@ -308,14 +353,84 @@ export function AgentInfo({ box, onClose }: { box: BoxRow; onClose: () => void }
         )}
 
         <section>
-          <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">Agent</h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">Agent</h3>
+            {!editing && (
+              <button
+                onClick={beginEdit}
+                className="rounded px-1.5 py-0.5 text-[11px] text-neutral-500 hover:bg-neutral-100"
+              >
+                Rename
+              </button>
+            )}
+          </div>
+          {editing ? (
+            <div className="mt-1.5 space-y-1.5 rounded border border-neutral-200 p-2.5">
+              <input
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                placeholder="what people call it"
+                maxLength={80}
+                className="w-full rounded border border-neutral-300 px-2 py-1 text-xs focus:border-neutral-500 focus:outline-none"
+              />
+              <input
+                value={draftDescription}
+                onChange={(e) => setDraftDescription(e.target.value)}
+                placeholder="what it is for"
+                maxLength={500}
+                className="w-full rounded border border-neutral-300 px-2 py-1 text-xs focus:border-neutral-500 focus:outline-none"
+              />
+              {/* The address is shown and not editable: renaming an agent is
+                  not moving it, and this is where that is made visible. */}
+              <p className="text-[11px] text-neutral-400">
+                Lives at <span className="font-mono">{row.name}.flotta.dev</span> — that part
+                doesn&rsquo;t change.
+              </p>
+              {renameError && <p className="text-[11px] text-red-800">{renameError}</p>}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => void saveEdit()}
+                  className="rounded bg-neutral-900 px-2.5 py-1 text-xs text-white hover:bg-neutral-700"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => setEditing(false)}
+                  className="rounded px-2.5 py-1 text-xs text-neutral-600 hover:bg-neutral-100"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
           <dl className="mt-1.5 space-y-1">
+            {identity.display_name && <Line label="Called" value={identity.display_name} />}
+            {identity.description && <Line label="For" value={identity.description} />}
             <Line label="Id" value={row.id} mono />
             <Line label="Address" value={`${row.name}.flotta.dev`} mono />
             {row.endpoint && <Line label="Endpoint" value={row.endpoint} mono />}
             {row.created_at && <Line label="Agent created" value={row.created_at} />}
           </dl>
         </section>
+
+        {/* The seed, labelled as the seed. The agent reads SOUL.md on its own
+            volume, which it may have changed since; this is the record of
+            what it started with, and saying otherwise would be the panel
+            claiming to know what the agent thinks. */}
+        {identity.instructions && (
+          <section>
+            <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">
+              Standing instructions (as seeded)
+            </h3>
+            <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-neutral-200 bg-neutral-50 p-2.5 font-mono text-[11px] text-neutral-800">
+              {identity.instructions}
+            </pre>
+            <p className="mt-1 text-[11px] text-neutral-400">
+              Written to the agent&rsquo;s SOUL.md at creation. It&rsquo;s the agent&rsquo;s own
+              since, and may have moved on from this.
+            </p>
+          </section>
+        )}
       </div>
     </div>
   );

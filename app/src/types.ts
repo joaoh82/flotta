@@ -9,10 +9,23 @@
 
 export type BoxRow = {
   id: string;
+  /** The ADDRESS — a DNS label, immutable. Not what a person calls it. */
   name: string;
   status: string;
   endpoint?: string | null;
   created_at?: string | null;
+  /**
+   * What a person calls it (FLOTTA-40). `null` is "not set" and the window
+   * falls back to the address; a missing key would render as `undefined`.
+   */
+  display_name?: string | null;
+  description?: string | null;
+  /**
+   * The standing instructions the agent was *seeded* with. The copy it reads
+   * is `SOUL.md` on its own volume; this is the record, and it is not
+   * editable from here for that reason.
+   */
+  instructions?: string | null;
 };
 
 /**
