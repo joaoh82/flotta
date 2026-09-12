@@ -107,10 +107,21 @@ pub struct BoxRow {
     pub display_name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
-    /// The standing instructions the agent was *seeded* with. The copy it
-    /// reads is `SOUL.md` on its own volume; this is the record.
+    /// The standing instructions last written to the agent's volume. The copy
+    /// it reads is `SOUL.md` there; this is the record of what we put in it,
+    /// and the two diverge once an agent edits its own.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// When those instructions were last written, in **seconds since the Unix
+    /// epoch** — the same units as a Hermes session's `started_at`, so the
+    /// decision to resume or start fresh is a subtraction rather than a date
+    /// parse.
+    ///
+    /// Only the single-box read fills this in; the fleet list leaves it
+    /// `None`, because it is a query per box on the path that redraws the
+    /// sidebar on a timer.
+    #[serde(default)]
+    pub instructions_changed_at: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -830,6 +841,40 @@ pub async fn rename_agent(
     )
     .await?;
     box_from(&body, "could not rename that agent")
+}
+
+/// What was written to the agent's volume, and when.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrittenInstructions {
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Seconds since the Unix epoch. `None` only if the control plane could
+    /// not read back the event it had just written, which is not worth failing
+    /// the save over — the window falls back to resetting unconditionally.
+    #[serde(default)]
+    pub changed_at: Option<f64>,
+}
+
+/// Rewrite an agent's standing instructions on its own volume.
+///
+/// Separate from `rename_agent` because it is a different kind of act: a
+/// display name is a label the fleet keeps, while this wakes a machine and
+/// writes to its disk. It can fail — a box that is torn down, a machine that
+/// will not start — where renaming cannot.
+pub async fn set_instructions(
+    settings: &Settings,
+    id: &str,
+    instructions: Option<String>,
+) -> Result<WrittenInstructions, FleetError> {
+    let body = send(
+        settings,
+        reqwest::Method::PUT,
+        &format!("/api/boxes/{}/instructions", encode_segment(id)),
+        Some(serde_json::json!({ "instructions": instructions })),
+    )
+    .await?;
+    serde_json::from_str(&body)
+        .map_err(|e| FleetError::Unexpected(format!("could not save those instructions: {e}")))
 }
 
 #[cfg(test)]
