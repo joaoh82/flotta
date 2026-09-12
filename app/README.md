@@ -51,6 +51,32 @@ token goes in the keychain. On macOS you can confirm that:
 security find-generic-password -s dev.flotta.app -a control-plane-token
 ```
 
+## Start over, and why a conversation has a boundary at all
+
+Hermes renders an agent's system prompt **once, when a session starts**, and
+stores it on the agent's volume keyed by hash. An agent's standing
+instructions (`$HERMES_HOME/SOUL.md`) are read at that moment and never again
+for the life of that session. The freeze is deliberate — the prompt is built in
+cache tiers so a provider can reuse the longest unchanged prefix, and
+re-rendering the identity every turn would re-bill the whole thing.
+
+So changing what an agent *is* needs a new session, and **Start over** in the
+conversation header is how the window asks for one. It is the only way: there
+is no "reload the instructions" call, and rebuilding the machine does not help,
+because the frozen prompt lives on the volume that a re-image preserves.
+
+Nothing is destroyed. The agent's memory is under `HERMES_HOME`, not inside the
+conversation, so it keeps what it learned and loses only the visible
+back-and-forth. The previous transcript stays on the volume; the window does
+not offer a way back to it, because `session.most_recent` answers with the
+newest and **Flotta deliberately has no concept of a session list**. A person
+here has one conversation with each agent, and Hermes's vocabulary stays inside
+Hermes.
+
+Found the hard way: an agent created before instruction-seeding shipped kept
+introducing itself as stock Hermes through a re-image and two fleet updates
+(FLOTTA-58).
+
 ## Info: the store's belief, and the substrate's answer
 
 Every read in this window comes from the fleet store, which is a *belief* — a

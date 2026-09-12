@@ -157,11 +157,30 @@ conventions, and the sharp edges below.
   `flotta.images` guessed and the first "Update agents" failed on it, safely;
   it now reads `$FLOTTA_BUILD_CONTEXT`, which the Dockerfile sets to `/app`.
   A test that "this checkout is valid" cannot see this class of bug.
-- **Standing instructions are `$HERMES_HOME/SOUL.md`, seeded once.** Hermes
-  reads it while building every prompt (`agent/prompt_builder.py`,
-  `load_soul_md` — verified at v2026.9.7), so it is per turn, not per boot: an
-  agent that edits its own persona sees the change on the next message with
-  no restart. The control plane hands the seed over as `FLOTTA_INSTRUCTIONS`
+- **Standing instructions are `$HERMES_HOME/SOUL.md`, seeded once — and read
+  once per *session*, not per turn.** The earlier version of this note said
+  "per turn, not per boot, so an agent that edits its own persona sees the
+  change on the next message". **That is wrong**, and believing it cost a
+  whole debugging session. `load_soul_md` does run while building a prompt,
+  but `build_system_prompt_parts` is rendered once when a session starts and
+  is documented "Never re-rendered mid-session"; the result is persisted in
+  `state.db` (`system_prompts(hash, prompt)` + `sessions.system_prompt_hash`)
+  and the upsert that stores it is
+  `system_prompt_hash = COALESCE(sessions.system_prompt_hash, excluded…)`, so
+  **the first hash a session gets is the one it keeps, forever.** The freeze is
+  deliberate: the prompt is assembled in `stable`/`context`/`volatile` cache
+  tiers so a provider can reuse the longest prefix, and re-rendering the
+  identity slot mid-conversation would re-bill every turn.
+  So **changing an agent's instructions requires a session boundary.** Two
+  exist: `session.create` (what the app's "Start over" and every `flotta chat`
+  do) and compaction, which forks a *child* session with a freshly rendered
+  prompt (`publish_compression_child`). There is **no `session.reset` RPC** —
+  the name appears in `tui_gateway/host_supervisor.py` as an idle-gating
+  policy entry only, and `_reset_session_agent` is reachable from the terminal's
+  `/new`, not over the app's socket. Measured on `eng-r` at v2026.9.11: a
+  session started before the file existed kept the stock Hermes identity across
+  a re-image and every "Update agents", because the frozen prompt lives on the
+  volume, which is exactly what a roll preserves. The control plane hands the seed over as `FLOTTA_INSTRUCTIONS`
   in the machine's env, and `box_entrypoint.sh` writes the file **only when
   it is absent** — the volume copy is the agent's from then on, and a re-image
   keeps it. The store's `box_meta.instructions` is the *record* of the seed,

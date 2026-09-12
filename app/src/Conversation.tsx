@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isFleetError, type AgentEvent, type Turn } from "./types";
+import { statusAfter, turnsAfter } from "./transcript";
 
 /** An error from the Rust side, as a sentence rather than an object. */
 function describe(err: unknown): string {
@@ -48,21 +49,8 @@ export function Conversation({ boxName }: { boxName: string }) {
         // another's transcript.
         if (!alive || payload.box_name !== boxName) return;
 
-        setStatus(payload.kind);
-        if (payload.kind === "ready" && payload.resumed.length > 0) {
-          // Replace rather than append: this is what the box says was said,
-          // and it is more authoritative than anything on screen.
-          setTurns(
-            payload.resumed.map((line) => ({
-              from: line.role === "user" ? "you" : "agent",
-              text: line.text,
-            })),
-          );
-        } else if (payload.kind === "reply") {
-          setTurns((t) => [...t, { from: "agent", text: payload.text }]);
-        } else if (payload.kind === "failed") {
-          setTurns((t) => [...t, { from: "system", text: payload.detail }]);
-        }
+        setStatus(statusAfter(payload));
+        setTurns((t) => turnsAfter(t, payload));
       });
       if (!alive) {
         off();

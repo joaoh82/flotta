@@ -74,6 +74,15 @@ pub enum AgentEvent {
         box_name: String,
         resumed: Vec<HistoryLine>,
     },
+    /// The conversation was started over, and the transcript is now empty.
+    ///
+    /// Distinct from `Ready` with an empty `resumed`, which the window
+    /// deliberately ignores: an empty `Ready` also arrives from a resync that
+    /// found nothing yet, and treating that as "clear the screen" wiped the
+    /// transcript of an agent mid-conversation. One event means "there is
+    /// nothing to show yet", the other means "there is nothing any more", and
+    /// they are not the same instruction.
+    Reset { box_name: String },
     /// A turn is in flight.
     Thinking { box_name: String },
     /// The agent answered.
@@ -125,6 +134,22 @@ pub enum Command {
     /// memory is the source of truth, and this is the one place a cache would
     /// silently diverge from it.
     Resync,
+    /// Start the conversation over.
+    ///
+    /// **A reset is a new session, because nothing else can be.** Hermes
+    /// renders an agent's system prompt once, when a session starts, and
+    /// stores it keyed by hash; the upsert that writes it keeps the first hash
+    /// a session ever gets. So the standing instructions on the volume reach a
+    /// running agent only across a session boundary, and there is no
+    /// "reload SOUL.md" — the frozen prefix is what makes provider caching
+    /// work, and re-rendering it mid-conversation would re-bill every turn.
+    ///
+    /// The old transcript is **not** deleted. It stays on the box's volume
+    /// while `session.most_recent` answers with the newest, so reopening the
+    /// agent lands on the fresh one. `session.delete` exists and is
+    /// deliberately not used: forgetting a conversation is not what "start
+    /// over" should mean.
+    Reset,
 }
 
 impl Conversations {
@@ -309,12 +334,33 @@ async fn attach(socket: &mut Socket) -> Result<(String, Vec<HistoryLine>), Fleet
         return Ok(read_resume(&resumed, session_id));
     }
 
+    Ok((create_session(socket).await?, Vec::new()))
+}
+
+/// Open a brand-new conversation on a socket that is already connected.
+///
+/// The id `session.create` answers with is the live one — the id
+/// `prompt.submit` takes. That is *not* true of `session.resume`, whose reply
+/// names a different id from the one it was asked for, which is why these two
+/// paths are written out separately rather than shared.
+async fn create_session(socket: &mut Socket) -> Result<String, FleetError> {
     let created = call(socket, "session.create", serde_json::json!({})).await?;
-    let session_id = created
+    read_created(&created)
+        .ok_or_else(|| FleetError::Unexpected("session.create returned no id".into()))
+}
+
+/// The session id a `session.create` reply names, if it named a usable one.
+///
+/// An **empty** id is refused rather than carried. Taken as the session, it
+/// would be sent with every `prompt.submit` and come back as `session not
+/// found` — a failure that reads as the box having lost the conversation,
+/// several turns away from the reply that was actually malformed.
+fn read_created(payload: &serde_json::Value) -> Option<String> {
+    payload
         .get("session_id")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| FleetError::Unexpected("session.create returned no id".into()))?;
-    Ok((session_id.to_string(), Vec::new()))
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 type Socket =
@@ -657,6 +703,21 @@ pub async fn run(
                             }
                         }
                     }
+                    Command::Reset => {
+                        match create_session(&mut socket).await {
+                            Ok(fresh) => {
+                                session_id = fresh;
+                                AgentEvent::Reset {
+                                    box_name: box_name.clone(),
+                                }
+                                .emit(&app);
+                            }
+                            Err(err) => {
+                                finish(&app, &box_name, Some(err.detail().to_string()));
+                                return;
+                            }
+                        }
+                    }
                     Command::Prompt(prompt) => {
                         AgentEvent::Thinking { box_name: box_name.clone() }.emit(&app);
                         match one_turn(&mut socket, &session_id, &prompt).await {
@@ -869,6 +930,29 @@ mod tests {
         let (live, history) = read_resume(&payload, "asked-for");
         assert_eq!(live, "s1");
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn a_created_session_names_the_id_prompts_are_sent_against() {
+        // Unlike `session.resume`, `session.create` answers with the live id
+        // directly — there is no second id to keep in step.
+        let payload = serde_json::json!({"session_id": "fresh", "info": {}});
+        assert_eq!(read_created(&payload).as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn a_create_reply_without_an_id_is_not_a_session() {
+        assert_eq!(read_created(&serde_json::json!({})), None);
+        assert_eq!(read_created(&serde_json::json!({"session_id": null})), None);
+    }
+
+    #[test]
+    fn an_empty_created_id_is_refused_rather_than_carried() {
+        // The one that matters. Carried, an empty id becomes the session every
+        // `prompt.submit` names, and the box answers `session not found` — a
+        // failure that reads as the conversation having been lost, several
+        // turns away from the malformed reply that caused it.
+        assert_eq!(read_created(&serde_json::json!({"session_id": ""})), None);
     }
 
     /// A real conversation with a real box. **Ignored by default** — it costs
