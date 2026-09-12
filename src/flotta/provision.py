@@ -75,6 +75,7 @@ from flotta.backend import (
 from flotta.backend import backend_for as _backend_for
 from flotta.backend import pause as _pause
 from flotta.store import (
+    INSTRUCTIONS_CHANGED,
     Box,
     FleetStore,
     Task,
@@ -1104,6 +1105,93 @@ class UpgradeFailed(ProvisionError):
     Those are actionable by the caller; this one is not, and conflating them
     would answer a flyctl outage with "you asked for the wrong thing".
     """
+
+
+#: Where Hermes keeps an agent's identity. Matches `HERMES_HOME` in
+#: `fly/Dockerfile`; a box that ever moves it would need this to follow.
+SOUL_PATH = "/data/hermes/SOUL.md"
+
+
+def set_instructions(
+    box_id: str,
+    instructions: str | None,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Rewrite an agent's standing instructions on its own volume.
+
+    **Why this cannot be a store write.** The row in `box_meta` is a record;
+    the copy an agent reads is `SOUL.md` on its volume, written once by the
+    entrypoint and never touched again. Changing the record alone would make
+    the app describe a persona the agent is not running — the exact class of
+    lie FLOTTA-29 spent a milestone removing.
+
+    **Why the change is not live until a conversation restarts.** Hermes
+    renders a system prompt once, when a session starts, and keeps it for that
+    session's life (FLOTTA-58). So this writes the file and records *when*; it
+    is the app, holding the conversation, that starts the fresh one. Nothing
+    here restarts the machine: a restart would not help either, because the
+    frozen prompt lives in `state.db` on the same volume.
+
+    The content is **base64 in transit**. `exec` runs through `flyctl ssh`,
+    where multi-line input is mangled and every shell metacharacter in a
+    person's prose is a way to run something else on a machine whose agent has
+    root. Base64 is alphabet-only, so the command is a fixed shape no matter
+    what was typed.
+
+    Clearing the instructions removes the file rather than writing an empty
+    one: Hermes seeds its own default when `SOUL.md` is absent, and an empty
+    file would leave an agent with no identity at all.
+    """
+    import base64
+
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is None:
+        raise ProvisionError(f"no box {box_id!r}")
+    # `stopped` is allowed on purpose: an agent is asleep most of the time, and
+    # `exec` starts the machine itself. Only a torn-down box has no volume to
+    # write to — refusing a sleeping one would refuse the normal case.
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
+
+    _, _, cleaned = validate_box_meta(None, None, instructions)
+    impl = _resolve_backend(box, backend)
+
+    if cleaned is None:
+        command = f"rm -f {SOUL_PATH}"
+    else:
+        blob = base64.b64encode(cleaned.encode("utf-8")).decode("ascii")
+        # `-d` on GNU coreutils and busybox alike; the box is Ubuntu.
+        command = f"printf %s {blob} | base64 -d > {SOUL_PATH}"
+
+    result = impl.exec(box.id, command)
+    if result.exit_code != 0:
+        detail = (result.stderr or result.stdout or "").strip() or "no output"
+        store.add_event("box", box.id, "instructions_write_failed", {"detail": detail[:500]})
+        raise ProvisionError(f"could not write {SOUL_PATH} on {box.name}: {detail}")
+
+    current = store.meta_for_box(box.id)
+    meta = store.set_box_meta(
+        box.id,
+        display_name=current.display_name if current else None,
+        description=current.description if current else None,
+        instructions=cleaned,
+    )
+    # Written **after** the file, never before: an event saying the persona
+    # changed, on a box where the write failed, is a lie in the audit trail
+    # that outlives the traceback.
+    store.add_event(
+        "box",
+        box.id,
+        INSTRUCTIONS_CHANGED,
+        {"chars": len(cleaned) if cleaned else 0, "cleared": cleaned is None},
+    )
+    return {
+        "box_id": box.id,
+        "instructions": meta.instructions,
+        "changed_at": store.instructions_changed_at(box.id),
+    }
 
 
 def upgrade_box(

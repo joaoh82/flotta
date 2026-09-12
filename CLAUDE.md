@@ -183,10 +183,30 @@ conventions, and the sharp edges below.
   volume, which is exactly what a roll preserves. The control plane hands the seed over as `FLOTTA_INSTRUCTIONS`
   in the machine's env, and `box_entrypoint.sh` writes the file **only when
   it is absent** — the volume copy is the agent's from then on, and a re-image
-  keeps it. The store's `box_meta.instructions` is the *record* of the seed,
-  not the live prompt; `PUT /api/boxes/{id}/meta` refuses to change it for
-  exactly that reason. `box_meta` is a side table because a new column on
-  `boxes` would not appear on an existing store (FLOTTA-40).
+  keeps it. The store's `box_meta.instructions` is the *record* of what Flotta
+  last wrote, not the live prompt — the agent may have edited its own copy
+  since. `box_meta` is a side table because a new column on `boxes` would not
+  appear on an existing store (FLOTTA-40).
+- **Changing instructions is `PUT /api/boxes/{id}/instructions`, never
+  `/meta`.** `/meta` is a label the fleet keeps; this reaches a machine.
+  `provision.set_instructions` wakes the box (`exec` starts it), writes
+  `/data/hermes/SOUL.md`, records the value and appends an
+  `instructions_changed` event. **The content travels base64** — `exec` runs
+  through `flyctl ssh`, where multi-line input is mangled and every shell
+  metacharacter in a person's prose is a way to run something else on a
+  machine whose agent has root. Clearing removes the file rather than writing
+  an empty one, because Hermes seeds its own default when it is absent and an
+  empty file is an agent with no identity at all.
+- **"When did the instructions change" is read from the events table, not a
+  column.** `box_meta.updated_at` also moves on a *rename*, and the app starts
+  a fresh conversation when instructions are newer than the session it was
+  about to resume — so conflating the two would throw away a transcript over a
+  typo fix. `store.instructions_changed_at` reads the newest
+  `instructions_changed` event, ordered by `id` rather than `ts` because two
+  events in the same second tie on the timestamp. The single-box API exposes it
+  as **epoch seconds** (the fleet list does not — it is a query per box on the
+  path that redraws the sidebar on a timer), so the window compares it against
+  a Hermes session's `started_at` with a subtraction instead of a date parser.
 - **The memory tool must be named in the prompt.** "Remember X" is treated as
   conversational and writes nothing; the box then honestly reports an empty
   memory store on recall, which looks exactly like a durability failure and is

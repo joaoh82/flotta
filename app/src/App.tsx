@@ -495,7 +495,7 @@ export default function App() {
                   // agent had when it was opened.
                   box={boxes.find((b) => b.id === info.id) ?? info}
                   onClose={() => setInfo(null)}
-                  onRenamed={(updated) =>
+                  onChanged={(updated) =>
                     setBoxes((rows) => rows.map((r) => (r.id === updated.id ? updated : r)))
                   }
                 />

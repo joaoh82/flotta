@@ -352,6 +352,37 @@ async fn send_prompt(
         .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
 }
 
+/// Rewrite an agent's standing instructions, then start its conversation over
+/// so they take effect.
+///
+/// **The reset is part of the save, not a second thing to remember.** Hermes
+/// keeps a session's system prompt for that session's life, so instructions
+/// saved without a fresh conversation change nothing an agent says — which is
+/// precisely the bug FLOTTA-58 was filed for. Doing it here means the window
+/// cannot offer the broken half.
+///
+/// A conversation that is not open needs nothing: `attach` compares the saved
+/// timestamp against the session it was about to resume and starts a fresh one
+/// on its own.
+#[tauri::command]
+async fn set_instructions(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Conversations>,
+    id: String,
+    box_name: String,
+    instructions: Option<String>,
+) -> Result<fleet::WrittenInstructions, FleetError> {
+    let written = fleet::set_instructions(&read_settings(&app), &id, instructions).await?;
+    if let Some(sender) = state.live(&box_name) {
+        // A send failure here means the conversation ended between the save
+        // and now. The instructions are written and recorded, so the next
+        // `attach` starts fresh on the timestamp — reporting a failed save
+        // would be a lie about the part that succeeded.
+        let _ = sender.send(agent::Command::Reset).await;
+    }
+    Ok(written)
+}
+
 /// Start this agent's conversation over.
 ///
 /// Only meaningful against a *live* conversation, so this does not open one:
@@ -392,6 +423,7 @@ pub fn run() {
             list_boxes,
             open_conversation,
             send_prompt,
+            set_instructions,
             reset_conversation,
             close_conversation,
             create_agent,

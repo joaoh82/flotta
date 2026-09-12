@@ -417,6 +417,12 @@ DISPLAY_NAME_MAX = 80
 DESCRIPTION_MAX = 500
 
 
+#: The event that says an agent's standing instructions were rewritten on its
+#: volume. Named once because the writer and the reader must agree, and a typo
+#: in either is a silent "never changed" rather than an error.
+INSTRUCTIONS_CHANGED = "instructions_changed"
+
+
 class InvalidBoxMetaError(ValueError):
     """A display name, description or instructions that cannot be stored."""
 
@@ -849,6 +855,30 @@ class FleetStore:
             (box_id,),
         ).fetchone()
         return _meta_from_row(row) if row else None
+
+    def instructions_changed_at(self, box_id: str) -> str | None:
+        """When this box's standing instructions were last written to its
+        volume, or None if Flotta has never written them after creation.
+
+        **Read from the events table rather than a column**, for two reasons.
+        `box_meta.updated_at` moves when an agent is *renamed*, and a rename
+        must not look like an instruction change — the app starts a fresh
+        conversation on one and not the other, so conflating them would throw
+        away a transcript for a typo fix. And changing what an agent *is* is
+        exactly the kind of thing the timeline exists to record, so the fact
+        has to be an event regardless; storing it twice would be the copy that
+        goes stale.
+
+        Ordered by `id`, not `ts`: the id is monotonic per insert, while two
+        events written inside the same second are tied on the timestamp.
+        """
+        self._require("box", box_id)
+        row = self._conn.execute(
+            "SELECT ts FROM events WHERE entity_kind = 'box' AND entity_id = ? "
+            "AND type = ? ORDER BY id DESC LIMIT 1",
+            (box_id, INSTRUCTIONS_CHANGED),
+        ).fetchone()
+        return str(row["ts"]) if row else None
 
     def meta_for_boxes(self, box_ids: list[str]) -> dict[str, BoxMeta]:
         """One query for the fleet list, not one per row."""
