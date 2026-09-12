@@ -4,6 +4,7 @@ import { AgentInfo } from "./AgentInfo";
 import { AgentTimeline } from "./AgentTimeline";
 import { Conversation } from "./Conversation";
 import { DestroyAgent } from "./DestroyAgent";
+import { StartOver } from "./StartOver";
 import { HermesUpdate } from "./HermesUpdate";
 import { labelOf } from "./identity";
 import { NewAgent } from "./NewAgent";
@@ -504,12 +505,23 @@ export default function App() {
                     <span className="font-mono text-[11px] text-neutral-500">
                       {selectedBox.name}.flotta.dev
                     </span>
-                    <button
-                      onClick={() => setDestroying(selectedBox)}
-                      className="rounded px-2 py-1 text-xs text-neutral-500 hover:bg-red-50 hover:text-red-700"
-                    >
-                      Destroy
-                    </button>
+                    <div className="flex items-center gap-1">
+                      {/* Lives in the conversation header, not the row menu:
+                          it acts on the conversation that is on screen, and
+                          the Rust side refuses it for an agent that has no
+                          live one rather than waking a box to mint a session
+                          nobody asked to see. */}
+                      {/* Keyed by name for the reason the transcript is: an
+                          open confirm belongs to one agent, and switching
+                          agents must not leave it armed against another. */}
+                      <StartOver key={selectedBox.name} boxName={selectedBox.name} />
+                      <button
+                        onClick={() => setDestroying(selectedBox)}
+                        className="rounded px-2 py-1 text-xs text-neutral-500 hover:bg-red-50 hover:text-red-700"
+                      >
+                        Destroy
+                      </button>
+                    </div>
                   </div>
                   {/* Keyed by name so switching agents remounts: a transcript
                       belongs to one agent, and the box is asked for it again

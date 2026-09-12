@@ -246,6 +246,15 @@ export type AgentEvent =
    * shown after the agent had moved on.
    */
   | { kind: "ready"; box_name: string; resumed: HistoryLine[] }
+  /**
+   * The conversation was started over and the transcript is now empty.
+   *
+   * Deliberately not `ready` with an empty `resumed`: that arrives from a
+   * resync too, and clearing on it wiped the transcript of an agent that was
+   * mid-conversation. "Nothing to show yet" and "nothing any more" are
+   * different instructions.
+   */
+  | { kind: "reset"; box_name: string }
   | { kind: "thinking"; box_name: string }
   | { kind: "reply"; box_name: string; text: string }
   | { kind: "failed"; box_name: string; detail: string }

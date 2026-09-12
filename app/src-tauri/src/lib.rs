@@ -352,6 +352,28 @@ async fn send_prompt(
         .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
 }
 
+/// Start this agent's conversation over.
+///
+/// Only meaningful against a *live* conversation, so this does not open one:
+/// resetting an agent you are not talking to would connect, wake the box and
+/// mint a session nobody asked to see. The window only offers it where a
+/// transcript is on screen.
+#[tauri::command]
+async fn reset_conversation(
+    state: tauri::State<'_, Conversations>,
+    box_name: String,
+) -> Result<(), FleetError> {
+    let Some(sender) = state.live(&box_name) else {
+        return Err(FleetError::Unexpected(format!(
+            "the conversation with {box_name} is not open"
+        )));
+    };
+    sender
+        .send(agent::Command::Reset)
+        .await
+        .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
+}
+
 #[tauri::command]
 fn close_conversation(state: tauri::State<'_, Conversations>, box_name: String) {
     // Dropping the sender ends the task's receive loop, which closes the
@@ -370,6 +392,7 @@ pub fn run() {
             list_boxes,
             open_conversation,
             send_prompt,
+            reset_conversation,
             close_conversation,
             create_agent,
             rename_agent,
