@@ -142,6 +142,7 @@ class FakeBackend:
         #: matter here are about *what* was sent to the machine, not that
         #: something was.
         self.commands: list[str] = []
+        self.addressed: list[str] = []
         self.exec_result = exec_result
 
     def suspend(self, box_id):
@@ -199,6 +200,13 @@ class FakeBackend:
 
         self.calls.append("exec")
         self.commands.append(command)
+        #: What the verb was *addressed* with. Recorded because ignoring it is
+        #: how a fake hides a real bug: `set_instructions` passed `box.id`
+        #: where every other verb passes an endpoint, and FlyBackend read that
+        #: as a machine id in the fleet's default app — ninety seconds of
+        #: polling for a machine that does not exist, then a 500, with the
+        #: whole suite green.
+        self.addressed.append(box_id)
         return self.exec_result or ExecResult(0, "", "")
 
 
@@ -2941,7 +2949,9 @@ def test_the_202_path_reads_instructions_from_the_store(store):
 def _running_box(store, name="eng-r"):
     box = store.create_box(name)
     store.update_box_status(box.id, "running", endpoint="fake://m-1")
-    return box
+    # Re-read: the row returned by `create_box` predates the endpoint, and a
+    # stale copy here would let a test assert against `None` and pass.
+    return store.get_box(box.id)
 
 
 def test_instructions_are_written_to_the_volume_not_just_the_store(store):
@@ -3087,3 +3097,37 @@ def test_an_unknown_agent_is_a_refusal_not_a_crash(store):
 
     with pytest.raises(ProvisionError, match="no box"):
         set_instructions("nope", "hello", store=store, backend=FakeBackend())
+
+
+def test_the_machine_is_addressed_by_endpoint_not_by_box_id(store):
+    """**The bug that shipped twice.** Every backend verb takes an endpoint;
+    `FlyBackend._addr` reads anything without a `fly://` scheme as a bare
+    machine id in the fleet's *default* app. Passing `box.id` therefore looked
+    for a machine named `b-…` in the wrong app — ninety seconds of polling for
+    something that will never exist, then a 500 in the window.
+
+    It survived a full suite because the fake ignored the argument. So the fake
+    records it now, and this asserts on it."""
+    from flotta.provision import set_instructions
+
+    box = _running_box(store)
+    impl = FakeBackend()
+
+    set_instructions(box.id, "Review backend PRs.", store=store, backend=impl)
+
+    assert impl.addressed == [box.endpoint]
+    assert box.id not in impl.addressed
+
+
+def test_a_box_that_was_never_launched_has_no_machine_to_write_to(store):
+    """`endpoint` is empty until something provisions a machine. Reaching the
+    backend with it would fall back to the default app again."""
+    from flotta.provision import ProvisionError, set_instructions
+
+    box = store.create_box("eng-new")
+    impl = FakeBackend()
+
+    with pytest.raises(ProvisionError, match="no endpoint"):
+        set_instructions(box.id, "Review backend PRs.", store=store, backend=impl)
+
+    assert not impl.commands

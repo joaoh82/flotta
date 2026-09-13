@@ -1165,7 +1165,18 @@ def set_instructions(
         # `-d` on GNU coreutils and busybox alike; the box is Ubuntu.
         command = f"printf %s {blob} | base64 -d > {SOUL_PATH}"
 
-    result = impl.exec(box.id, command)
+    # **The endpoint, not the box id.** Every backend verb is addressed by
+    # endpoint; `FlyBackend._addr` treats anything without a `fly://` scheme as
+    # a bare *machine id* in the fleet's default app. Passing `box.id` sent it
+    # hunting for a machine called `b-…` in the wrong app, which is not an
+    # error — it is ninety seconds of polling for a machine that will never
+    # appear, then a 500. The fake backend ignores this argument, so the whole
+    # suite was green while the live call could not work.
+    if not box.endpoint:
+        raise ProvisionError(
+            f"box {box.name} has no endpoint, so there is no machine to write to"
+        )
+    result = impl.exec(box.endpoint, command)
     if result.exit_code != 0:
         detail = (result.stderr or result.stdout or "").strip() or "no output"
         store.add_event("box", box.id, "instructions_write_failed", {"detail": detail[:500]})
