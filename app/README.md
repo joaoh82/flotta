@@ -85,10 +85,16 @@ volume, and it starts a fresh conversation. Saving without the restart would
 change nothing the agent says, so the window does not offer that half on its
 own — the button says what it does.
 
-If the conversation is not open when you save, nothing extra is needed.
-`attach` compares when the instructions were last written against the session
-it was about to resume, and starts a fresh one instead when the instructions
-are newer. Both timestamps are epoch seconds: the box's own `started_at`, and
+You do not have to have the conversation open when you save. `attach` compares
+when the instructions were last written against the session it was about to
+resume, and starts a fresh one instead when the instructions are newer.
+
+**That comparison re-reads the timestamp every time it attaches**, including on
+a resync. Reading it once when the conversation task started looked like an
+obvious saving and was the bug: saving from the Info panel unmounts the
+transcript, so coming back runs a resync, and a resync holding a timestamp from
+before the edit resumed the old session and kept the old persona with nothing
+on screen to say why. Both timestamps are epoch seconds: the box's own `started_at`, and
 the control plane's, from the `instructions_changed` event.
 
 Clearing the field removes the file rather than leaving an empty one, so the

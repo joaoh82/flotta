@@ -195,7 +195,6 @@ async fn connect(
     settings: &Settings,
     box_name: &str,
     token: &str,
-    instructions_at: Option<f64>,
 ) -> Result<
     (
         tokio_tungstenite::WebSocketStream<
@@ -303,7 +302,7 @@ async fn connect(
     // The server speaks first.
     expect_event(&mut socket, "gateway.ready").await?;
 
-    let (session_id, resumed) = attach(&mut socket, instructions_at).await?;
+    let (session_id, resumed) = attach(&mut socket, settings, box_name).await?;
     Ok((socket, session_id, resumed))
 }
 
@@ -318,8 +317,24 @@ async fn connect(
 /// the agent had moved on.
 async fn attach(
     socket: &mut Socket,
-    instructions_at: Option<f64>,
+    settings: &Settings,
+    box_name: &str,
 ) -> Result<(String, Vec<HistoryLine>), FleetError> {
+    // **Read now, not once at connect.** The first version captured this when
+    // the conversation task started and reused it for every resync, so an
+    // agent whose instructions changed *during* the conversation could never
+    // notice: saving from the Info panel unmounts the transcript, and coming
+    // back runs a resync that compared against a timestamp from before the
+    // edit. It resumed the old session and the agent kept the old persona,
+    // with nothing on screen to say why.
+    //
+    // Best-effort by construction. A metadata read that fails must not make an
+    // agent unreachable — the cost of missing it is a conversation that needed
+    // restarting and did not, which is the state we are already in.
+    let instructions_at = crate::fleet::get_box(settings, box_name)
+        .await
+        .ok()
+        .and_then(|row| row.instructions_changed_at);
     // `session.most_recent` skips tool-source sessions, so it returns the
     // conversational one rather than whatever a background task last touched.
     let recent = call(socket, "session.most_recent", serde_json::json!({})).await?;
@@ -683,25 +698,13 @@ pub async fn run(
     }
     .emit(&app);
 
-    // Read once, before the socket, and reused for the resync below: the only
-    // thing that changes it mid-conversation is a save from this window, and
-    // that starts a fresh conversation itself. A failure here is **not** fatal
-    // — the fleet list is already open, so this read is a refinement, and an
-    // agent you cannot talk to because a metadata call timed out would be a
-    // worse bug than the one it guards against.
-    let instructions_at = crate::fleet::get_box(&settings, &box_name)
-        .await
-        .ok()
-        .and_then(|row| row.instructions_changed_at);
-
-    let (mut socket, mut session_id, resumed) =
-        match connect(&settings, &box_name, &token, instructions_at).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                finish(&app, &box_name, Some(err.detail().to_string()));
-                return;
-            }
-        };
+    let (mut socket, mut session_id, resumed) = match connect(&settings, &box_name, &token).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            finish(&app, &box_name, Some(err.detail().to_string()));
+            return;
+        }
+    };
 
     AgentEvent::Ready {
         box_name: box_name.clone(),
@@ -737,7 +740,7 @@ pub async fn run(
                         // for both mistakes under different codes (4001 and
                         // 4007). Re-running `attach` keeps exactly one path
                         // that knows which id is which.
-                        match attach(&mut socket, instructions_at).await {
+                        match attach(&mut socket, &settings, &box_name).await {
                             Ok((live, resumed)) => {
                                 session_id = live;
                                 AgentEvent::Ready {
@@ -1071,7 +1074,7 @@ mod tests {
 
         runtime.block_on(async {
             // First connection: say something distinctive.
-            let (mut socket, session, resumed) = connect(&settings, &box_name, &token, None)
+            let (mut socket, session, resumed) = connect(&settings, &box_name, &token)
                 .await
                 .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
             println!(
@@ -1096,7 +1099,7 @@ mod tests {
             // Second connection: the transcript must come back **from the box**.
             // This is the acceptance criterion for reattachment, and the only
             // honest way to test it is to reconnect.
-            let (_socket, resumed_session, history) = connect(&settings, &box_name, &token, None)
+            let (_socket, resumed_session, history) = connect(&settings, &box_name, &token)
                 .await
                 .unwrap_or_else(|e| panic!("reconnect failed: {}", e.detail()));
             println!(
@@ -1126,10 +1129,7 @@ mod tests {
 
             // Exactly what `Command::Resync` runs when you switch back to an
             // agent whose socket is still open.
-            // `None`: this box's instructions have not been rewritten mid-test,
-            // so the resync must resume rather than start fresh — which is the
-            // property the assertion below is checking.
-            let (live, again) = attach(&mut socket, None)
+            let (live, again) = attach(&mut socket, &settings, &box_name)
                 .await
                 .unwrap_or_else(|e| panic!("resync failed: {}", e.detail()));
             println!("resync -> session {live}, {} turns", again.len());
