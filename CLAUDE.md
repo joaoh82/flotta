@@ -311,8 +311,17 @@ conventions, and the sharp edges below.
   `Exit code: 3` on stdout and returns success to the shell. Reading
   `returncode` calls every failure a success — the same fail-open shape as the
   `|| true` listing bug, now caught three separate times in this repo. Use
-  `--json` and read `exit_code`; a reply that will not parse must fail closed,
-  because "no exit code" is not zero.
+  `--json` and read `exit_code`.
+- **In that JSON, an absent `exit_code` means zero.** flyctl omits every empty
+  field, so a command that succeeds silently answers `{}` — and writing a file
+  is exactly that, because a redirect produces no stdout. Measured on `eng-r`:
+  `echo hi` gives `{"stdout": "hi\n"}` with no `exit_code`, `echo hi > /tmp/x`
+  gives `{}` **and the file is written**, `exit 3` gives `{"exit_code": 3}`.
+  Defaulting the absent field to a failure looks like prudence and is not: it
+  reported every successful instruction write as a refusal while the file was
+  on the volume. The guards that keep this honest are elsewhere — flyctl
+  exiting non-zero, and a body that will not parse, are both refusals before
+  the exit code is ever read.
 - **Suspend is not faster than stop — it keeps memory.** Measured, 3 runs
   each: cold stop reaches `started` in ~0.31s, suspend in ~0.43s. What suspend
   buys is the VM's RAM (uptime 44.4s -> 53.5s, versus 72.1s -> 6.7s cold).
