@@ -100,6 +100,30 @@ the control plane's, from the `instructions_changed` event.
 Clearing the field removes the file rather than leaving an empty one, so the
 agent falls back to Hermes's own default identity instead of having none.
 
+## Repositories, and what a grant actually is
+
+The Info panel grants and revokes the repositories an agent may clone, commit
+to and push. The capability shipped long before the panel: a box has held a git
+credential helper since FLOTTA-20, asking the control plane per repository and
+per invocation, holding no GitHub credential of its own.
+
+Paste a slug, an https URL or an ssh URL — the control plane decides what it
+meant, and the list comes back normalised, so what is displayed is what was
+granted rather than what was typed.
+
+**The panel says the boundary is Flotta's, not GitHub's, and that sentence is
+load-bearing.** The source is one fleet token, so a box that extracted a
+credential could reach repositories it was never granted. Flotta refuses to
+hand one over for an ungranted repository; GitHub does not enforce the
+narrowing. A tidy list of granted repositories reads like enforcement, and a
+soft boundary that reads as a hard one is worse than no boundary. FLOTTA-22
+closes it with GitHub App installation tokens scoped to `repository_ids`, and
+that is the day this sentence gets to change.
+
+Verified live on a private repository, on one running machine with no restart:
+ungranted clones fail with a 403 from the credential helper, granting makes the
+same clone succeed, and revoking makes the next one fail again.
+
 ## Info: the store's belief, and the substrate's answer
 
 Every read in this window comes from the fleet store, which is a *belief* — a
