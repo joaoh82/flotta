@@ -176,7 +176,18 @@ app-live:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env}"
-    export FLOTTA_TOKEN="${FLOTTA_TOKEN:-$(uv run flotta token mint app-live --scope box:chat --days 1)}"
+    # **fleet:read as well as box:chat.** `attach` asks the control plane when
+    # this agent's instructions last changed, and that read needs fleet:read.
+    # With a chat-only token it fails, falls back to "never changed", and the
+    # staleness branch can never fire — so the live test sails past the one
+    # path it is here to prove while reporting success. Measured: the
+    # instruction test failed on exactly that and passed once the scope was
+    # added.
+    export FLOTTA_TOKEN="${FLOTTA_TOKEN:-$(uv run flotta token mint app-live --scope box:chat --scope fleet:read --days 1)}"
+    # Separate, and deliberately not folded into the one above: rewriting an
+    # agent's persona is not something a conversation token should be able to
+    # do, so the test swaps it in for that one call.
+    export FLOTTA_WRITE_TOKEN="${FLOTTA_WRITE_TOKEN:-$(uv run flotta token mint app-live-write --scope fleet:write --days 1)}"
     cd app/src-tauri
     cargo test -- --ignored --nocapture
 

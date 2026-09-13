@@ -1061,8 +1061,13 @@ mod tests {
         let Ok(token) = std::env::var("FLOTTA_TOKEN") else {
             panic!("set FLOTTA_TOKEN to a box:chat token");
         };
+        // **The real control URL, not an empty string.** `attach` asks the
+        // control plane when this agent's instructions last changed, and with
+        // no URL that read fails, falls back to `None`, and the staleness
+        // check can never fire — so the test would sail past the one branch
+        // FLOTTA-58 exists for while looking like it covered the path.
         let settings = Settings {
-            control_url: String::new(),
+            control_url: std::env::var("FLOTTA_CONTROL_URL").unwrap_or_default(),
             domain: std::env::var("FLOTTA_DOMAIN").unwrap_or_else(|_| "flotta.dev".into()),
         };
         let box_name = std::env::var("FLOTTA_BOX").unwrap_or_else(|_| "eng-a".into());
@@ -1145,6 +1150,113 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("the turn after a resync failed: {}", e.detail()));
             println!("after resync: {after:?}");
+        });
+    }
+
+    /// **FLOTTA-58's acceptance criterion, and it is live by necessity.**
+    ///
+    /// Changing an agent's standing instructions only takes effect across a
+    /// conversation boundary, because Hermes renders a system prompt once per
+    /// session and keeps it. Four separate bugs sat between "the button
+    /// exists" and "the agent changes", and *every one of them was invisible
+    /// to a green suite*: ssh that only works from a laptop, a fake backend
+    /// that ignored the address it was given, a JSON shape that was assumed
+    /// rather than measured, and a timestamp read once and then reused.
+    ///
+    /// What they have in common is that each lived at a boundary a test
+    /// double was standing in for. So this one uses no doubles: the real
+    /// control plane, the real box, and the same `attach` the window runs.
+    ///
+    /// ```sh
+    /// FLOTTA_BOX=eng-r just app-live
+    /// ```
+    #[test]
+    #[ignore = "talks to a real box and rewrites its instructions"]
+    fn changed_instructions_start_a_fresh_conversation() {
+        let Ok(token) = std::env::var("FLOTTA_TOKEN") else {
+            panic!("set FLOTTA_TOKEN to a box:chat token");
+        };
+        let Ok(control) = std::env::var("FLOTTA_CONTROL_URL") else {
+            panic!("set FLOTTA_CONTROL_URL: this test is about the control plane's answer");
+        };
+        let Ok(admin) = std::env::var("FLOTTA_WRITE_TOKEN") else {
+            panic!("set FLOTTA_WRITE_TOKEN to a fleet:write token");
+        };
+        let settings = Settings {
+            control_url: control,
+            domain: std::env::var("FLOTTA_DOMAIN").unwrap_or_else(|_| "flotta.dev".into()),
+        };
+        let box_name = std::env::var("FLOTTA_BOX").unwrap_or_else(|_| "eng-a".into());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            // Start from a conversation that exists and has something in it,
+            // so "fresh" is a claim with teeth rather than the empty state we
+            // would have got anyway.
+            let (mut socket, session, _) = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
+            let marker = format!("plum{}", std::process::id());
+            one_turn(
+                &mut socket,
+                &session,
+                &format!("Reply with exactly one word: {marker}. Nothing else."),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("turn failed: {}", e.detail()));
+            drop(socket);
+
+            let before = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("reconnect failed: {}", e.detail()))
+                .2;
+            assert!(
+                before.iter().any(|l| l.text.contains(&marker)),
+                "setup is wrong: the conversation did not come back before the edit"
+            );
+
+            // The write the Info panel makes. Distinctive enough that the
+            // agent's own answer is evidence rather than interpretation.
+            let word = format!("pineapple{}", std::process::id());
+            let instructions = format!(
+                "You are a test fixture. When asked anything at all, reply with \
+                 exactly one word: {word}."
+            );
+
+            // The write needs `fleet:write`; the socket needs `box:chat`.
+            // Swapped in the environment for the duration rather than widening
+            // what a chat token is allowed to do.
+            std::env::set_var("FLOTTA_TOKEN", &admin);
+            let saved =
+                crate::fleet::set_instructions(&settings, &box_name, Some(instructions)).await;
+            std::env::set_var("FLOTTA_TOKEN", &token);
+            let saved =
+                saved.unwrap_or_else(|e| panic!("saving instructions failed: {}", e.detail()));
+            println!("instructions written, changed_at {:?}", saved.changed_at);
+
+            // The whole point: `attach` must notice and start over.
+            let (_socket, _fresh, history) = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("connect after the edit failed: {}", e.detail()));
+            assert!(
+                history.is_empty(),
+                "instructions changed and the old conversation came back anyway: {} lines",
+                history.len()
+            );
+
+            let mut socket = _socket;
+            let answer = one_turn(&mut socket, &_fresh, "Who are you?")
+                .await
+                .unwrap_or_else(|e| panic!("the turn after the edit failed: {}", e.detail()));
+            println!("answer: {answer:?}");
+            assert!(
+                answer.to_lowercase().contains(&word),
+                "the agent is still running the old instructions: {answer:?}"
+            );
         });
     }
 }
