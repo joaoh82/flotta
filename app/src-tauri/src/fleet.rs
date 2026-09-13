@@ -874,6 +874,102 @@ pub async fn rename_agent(
     box_from(&body, "could not rename that agent")
 }
 
+/// The repositories an agent may use.
+///
+/// Every one of the three endpoints answers with the **whole list** after the
+/// change, so the window never has to reason about what a grant did — it
+/// replaces what it is showing with what the fleet now says. That also carries
+/// the normalisation for free: a pasted URL comes back as `owner/name`, so what
+/// is displayed is what was actually granted.
+#[derive(Debug, Clone, Deserialize)]
+struct RepoList {
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+/// Which repositories this agent may clone, commit to and push.
+pub async fn list_repos(settings: &Settings, id: &str) -> Result<Vec<String>, FleetError> {
+    let body = get(
+        settings,
+        &format!("/api/boxes/{}/repos", encode_segment(id)),
+    )
+    .await?;
+    repos_from(&body)
+}
+
+/// Grant one. Idempotent, and the control plane decides what the text meant:
+/// a slug, an https URL and an ssh URL are one repository, and normalising
+/// here as well would be a second opinion that can drift from the first.
+pub async fn grant_repo(
+    settings: &Settings,
+    id: &str,
+    repo: &str,
+) -> Result<Vec<String>, FleetError> {
+    let body = send(
+        settings,
+        reqwest::Method::POST,
+        &format!("/api/boxes/{}/repos", encode_segment(id)),
+        Some(serde_json::json!({ "repo": repo })),
+    )
+    .await?;
+    repos_from(&body)
+}
+
+/// Withdraw one. Takes effect on the box's next fetch, with no restart —
+/// there is nothing on the machine to invalidate, which is the point of the
+/// box holding no credential.
+pub async fn revoke_repo(
+    settings: &Settings,
+    id: &str,
+    repo: &str,
+) -> Result<Vec<String>, FleetError> {
+    let (owner, name) = split_repo(repo)?;
+    let body = send(
+        settings,
+        reqwest::Method::DELETE,
+        &format!(
+            "/api/boxes/{}/repos/{}/{}",
+            encode_segment(id),
+            encode_segment(&owner),
+            encode_segment(&name),
+        ),
+        None,
+    )
+    .await?;
+    repos_from(&body)
+}
+
+/// `owner/name` as two path segments.
+///
+/// The revoke route spells the repository as a path rather than a body, so it
+/// has to be split — and split *here*, not by string surgery at the call site,
+/// because getting it wrong builds a URL that deletes something else or
+/// nothing at all. Anything that is not exactly two segments is refused rather
+/// than guessed at.
+fn split_repo(repo: &str) -> Result<(String, String), FleetError> {
+    // Strict, and deliberately stricter than `normalise_repo` on the Python
+    // side: that one *normalises* what a person typed, and dropping an empty
+    // segment there is a kindness. This one splits a value the control plane
+    // has already normalised, so an empty segment means something upstream is
+    // wrong — and quietly turning `a//b` into `a/b` would send a DELETE for a
+    // repository nobody named.
+    let parts: Vec<&str> = repo.split('/').collect();
+    match parts.as_slice() {
+        [owner, name] if !owner.is_empty() && !name.is_empty() => {
+            Ok((owner.to_string(), name.to_string()))
+        }
+        _ => Err(FleetError::Unexpected(format!(
+            "{repo:?} does not name a repository as owner/name"
+        ))),
+    }
+}
+
+fn repos_from(body: &str) -> Result<Vec<String>, FleetError> {
+    let value: RepoList = serde_json::from_str(body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable repository list: {e}")))?;
+    Ok(value.repos)
+}
+
 /// What was written to the agent's volume, and when.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrittenInstructions {
@@ -1039,6 +1135,52 @@ mod tests {
         // will.
         let row = box_from(r#"{"id":"b1","name":"eng-a","status":"running"}"#, "nope").unwrap();
         assert_eq!(row.name, "eng-a");
+    }
+
+    #[test]
+    fn a_repository_splits_into_two_path_segments() {
+        // Revoke spells the repository as a path rather than a body, so this
+        // decides which URL is called. A wrong split deletes something else or
+        // nothing at all, and either reads as "revoke did not work".
+        assert_eq!(
+            split_repo("joaoh82/flotta").unwrap(),
+            ("joaoh82".to_string(), "flotta".to_string())
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_owner_and_name_is_refused_rather_than_guessed() {
+        // These reach `revoke` only from a list the control plane normalised,
+        // so none of them should ever arrive — which is exactly why the
+        // failure has to be loud rather than a URL built from a guess.
+        for bad in ["flotta", "", "/", "a/b/c", "https://github.com/a/b"] {
+            assert!(split_repo(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn an_empty_segment_does_not_silently_become_a_shorter_path() {
+        // `a//b` has three segments, one empty. Filtering without counting
+        // would turn it into `a/b` and revoke a repository nobody named.
+        assert!(split_repo("a//b").is_err());
+    }
+
+    #[test]
+    fn the_repository_list_is_read_from_the_answer_not_the_request() {
+        // Every endpoint returns the whole list after the change, which is
+        // what carries normalisation back: a pasted URL was granted as
+        // `owner/name` and that is what must be displayed.
+        let repos = repos_from(r#"{"box_id":"b1","repos":["joaoh82/flotta","a/b"]}"#).unwrap();
+        assert_eq!(repos, vec!["joaoh82/flotta", "a/b"]);
+    }
+
+    #[test]
+    fn an_agent_with_no_grants_is_an_empty_list_not_a_failure() {
+        assert!(repos_from(r#"{"box_id":"b1","repos":[]}"#)
+            .unwrap()
+            .is_empty());
+        // And a body that omits the key entirely — "none" is a real state.
+        assert!(repos_from(r#"{"box_id":"b1"}"#).unwrap().is_empty());
     }
 
     #[test]

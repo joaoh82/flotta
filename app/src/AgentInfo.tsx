@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { AgentRepos } from "./AgentRepos";
 import { StatusBadge } from "./StatusBadge";
 import {
   drift,
@@ -445,6 +446,10 @@ export function AgentInfo({
             {row.created_at && <Line label="Agent created" value={row.created_at} />}
           </dl>
         </section>
+
+        {/* Keyed by id so switching agents refetches rather than showing one
+            agent's grants under another's name. */}
+        <AgentRepos key={box.id} boxId={box.id} />
 
         {/* Always rendered, including when there are none: an agent with no
             standing instructions is the case you most want to be able to fix,

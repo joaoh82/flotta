@@ -352,6 +352,35 @@ async fn send_prompt(
         .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
 }
 
+/// Which repositories this agent may clone, commit to and push.
+#[tauri::command]
+async fn agent_repos(app: tauri::AppHandle, id: String) -> Result<Vec<String>, FleetError> {
+    fleet::list_repos(&read_settings(&app), &id).await
+}
+
+/// Grant one. `repo` is whatever was typed — a slug, an https URL, an ssh URL
+/// — and the control plane decides what it meant, answering with the list as
+/// it now stands.
+#[tauri::command]
+async fn grant_repo(
+    app: tauri::AppHandle,
+    id: String,
+    repo: String,
+) -> Result<Vec<String>, FleetError> {
+    fleet::grant_repo(&read_settings(&app), &id, &repo).await
+}
+
+/// Withdraw one. No restart: the box holds no credential to invalidate, so
+/// this takes effect on its next fetch.
+#[tauri::command]
+async fn revoke_repo(
+    app: tauri::AppHandle,
+    id: String,
+    repo: String,
+) -> Result<Vec<String>, FleetError> {
+    fleet::revoke_repo(&read_settings(&app), &id, &repo).await
+}
+
 /// Rewrite an agent's standing instructions, then start its conversation over
 /// so they take effect.
 ///
@@ -423,6 +452,9 @@ pub fn run() {
             list_boxes,
             open_conversation,
             send_prompt,
+            agent_repos,
+            grant_repo,
+            revoke_repo,
             set_instructions,
             reset_conversation,
             close_conversation,
