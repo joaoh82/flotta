@@ -299,6 +299,20 @@ conventions, and the sharp edges below.
   `b` — no error, just quietly wrong output. `FlyBackend.exec` wraps commands
   in `/bin/sh -c` for this reason. Heredocs are still mangled in transit
   (base64 them), and a backgrounded process does not survive the session.
+- **`exec` goes through `flyctl machine exec`, not `ssh`, because ssh does not
+  work from the control plane.** `ssh console` needs a WireGuard tunnel and an
+  org SSH certificate, set up per invocation. FLOTTA-58's instruction write was
+  the **first caller of `exec` from Railway** — every other control-plane verb
+  uses the Fly API — and it spent 90 seconds and returned 500. The same probe
+  through `machine exec` takes **0.4s**. A capability nothing had exercised is
+  not a capability you have; the hermetic suite could not see this because the
+  fake backend answers either way.
+- **`flyctl machine exec` exits 0 when the command fails.** It prints
+  `Exit code: 3` on stdout and returns success to the shell. Reading
+  `returncode` calls every failure a success — the same fail-open shape as the
+  `|| true` listing bug, now caught three separate times in this repo. Use
+  `--json` and read `exit_code`; a reply that will not parse must fail closed,
+  because "no exit code" is not zero.
 - **Suspend is not faster than stop — it keeps memory.** Measured, 3 runs
   each: cold stop reaches `started` in ~0.31s, suspend in ~0.43s. What suspend
   buys is the VM's RAM (uptime 44.4s -> 53.5s, versus 72.1s -> 6.7s cold).

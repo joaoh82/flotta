@@ -807,3 +807,141 @@ def test_the_reason_falls_back_to_whatever_was_said():
     assert _reason("something went wrong\n") == "something went wrong"
     assert _reason("") == ""
     assert _reason(None) == ""
+
+
+# -- exec goes through the Machines API, not ssh ----------------------------
+#
+# FLOTTA-58 was the first caller of `exec` from the deployed control plane, and
+# it did not work: `flyctl ssh console` needs a WireGuard tunnel and an org SSH
+# certificate, which cost 90 seconds on Railway and then a 500. `machine exec`
+# is an HTTP call to the same API every other verb uses.
+
+
+def _exec_runner(answer, *, rc=0, stderr=""):
+    """A flyctl that starts a machine and answers one `machine exec`."""
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        if "exec" in cmd:
+            return subprocess.CompletedProcess(cmd, rc, answer, stderr)
+        if "machines" in cmd and "list" in cmd:
+            # `start` waits for the machine to settle before returning, and an
+            # empty listing reads as `gone` — which polls for ninety seconds
+            # and then raises, in every test in this section.
+            return subprocess.CompletedProcess(
+                cmd, 0, '[{"id": "m-1", "state": "started"}]', ""
+            )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    return runner, issued
+
+
+def test_exec_does_not_use_ssh():
+    """The whole point. An ssh path works from a laptop and not from the
+    control plane, which is where this verb actually runs."""
+    runner, issued = _exec_runner('{"exit_code": 0, "stdout": "hi\\n", "stderr": ""}')
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    backend.exec("fly://app-1/m-1", "echo hi")
+
+    assert not any("ssh" in c for c in issued), f"still shelling out to ssh: {issued}"
+    exec_cmd = next(c for c in issued if "exec" in c)
+    assert "machine" in exec_cmd and "--json" in exec_cmd
+    assert "m-1" in exec_cmd
+
+
+def test_a_failed_command_is_not_reported_as_success():
+    """**`flyctl machine exec` exits 0 after running a command that failed**,
+    and prints `Exit code: 3` on stdout instead. Reading the process status
+    would call every failure a success — the fail-open shape this codebase has
+    now written three times."""
+    runner, _ = _exec_runner(
+        '{"exit_code": 3, "stdout": "out\\n", "stderr": "no space left"}', rc=0
+    )
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    result = backend.exec("fly://app-1/m-1", "write something")
+
+    assert result.exit_code == 3, "a failed command came back as a success"
+    assert not result.ok
+    assert result.stderr == "no space left"
+
+
+def test_the_command_is_run_through_a_shell():
+    """`-C` execs argv, so `a > b` without a shell writes the literal `>`."""
+    runner, issued = _exec_runner('{"exit_code": 0, "stdout": "", "stderr": ""}')
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    backend.exec("fly://app-1/m-1", "printf %s eA== | base64 -d > /data/hermes/SOUL.md")
+
+    exec_cmd = next(c for c in issued if "exec" in c)
+    assert any(part.startswith("/bin/sh -c ") for part in exec_cmd)
+
+
+def test_a_sleeping_machine_is_started_first():
+    """An agent is asleep most of the time, and a stopped machine cannot run
+    anything. `exec` must not be a verb that only works on a box you happen to
+    have woken already."""
+    import json
+    import subprocess
+
+    issued: list[list[str]] = []
+    state = {"value": "stopped"}
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        if "exec" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, '{"exit_code": 0, "stdout": "", "stderr": ""}', ""
+            )
+        if "machines" in cmd and "list" in cmd:
+            body = json.dumps([{"id": "m-1", "state": state["value"]}])
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        if "start" in cmd:
+            state["value"] = "started"
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+    backend.exec("fly://app-1/m-1", "true")
+
+    started = [c for c in issued if "start" in c]
+    assert started, "exec on a stopped machine would fail"
+    assert issued.index(started[0]) < issued.index(
+        next(c for c in issued if "exec" in c)
+    ), "started the machine after trying to run on it"
+
+
+def test_flyctl_failing_is_a_refusal_not_an_exit_status():
+    """No machine, no credentials, a timeout. Distinct from the command
+    failing, and it must not be reported as an exit code the command never
+    produced."""
+    from flotta.backend import BackendError
+
+    runner, _ = _exec_runner("", rc=1, stderr="Error: machine not found")
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    with pytest.raises(BackendError, match="machine not found"):
+        backend.exec("fly://app-1/m-1", "true")
+
+
+def test_an_unparseable_answer_fails_closed():
+    """A reply that is not JSON is not a success. Defaulting to zero here would
+    be the same fail-open bug wearing a different hat."""
+    from flotta.backend import BackendError
+
+    runner, _ = _exec_runner("Exit code: 3\n")
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    with pytest.raises(BackendError, match="not JSON"):
+        backend.exec("fly://app-1/m-1", "true")
+
+
+def test_a_json_answer_missing_its_exit_code_is_a_failure():
+    """Absent is not zero."""
+    runner, _ = _exec_runner('{"stdout": "", "stderr": ""}')
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    assert backend.exec("fly://app-1/m-1", "true").exit_code == 1

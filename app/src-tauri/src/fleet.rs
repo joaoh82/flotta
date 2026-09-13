@@ -30,6 +30,19 @@ const KEYCHAIN_ACCOUNT: &str = "control-plane-token";
 /// spinner that never resolves.
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// For the calls that reach a *machine* rather than the fleet database.
+///
+/// Writing an agent's instructions starts its box if it is asleep, then runs a
+/// command on it. Fifteen seconds is right for a database read and wrong for
+/// that: the first version of this shipped on the short timeout and every save
+/// came back "could not reach the control plane" while the request was still
+/// in flight — an error blaming the network for a deadline we set.
+///
+/// Still bounded, and deliberately shorter than the control plane's own
+/// `exec` timeout, so a hung machine surfaces here as a save that failed
+/// rather than a button that never returns.
+const MACHINE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The non-secret half of the configuration.
 ///
 /// In a plain file rather than the keychain because it is not a secret, and
@@ -557,10 +570,28 @@ async fn send(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<String, FleetError> {
+    send_within(settings, method, path, body, None).await
+}
+
+/// `send`, with a deadline of its own for the calls that reach a machine.
+///
+/// Per-request rather than a second client: the override is the exception, and
+/// building a client per call would lose connection reuse for every ordinary
+/// read to save one line here.
+async fn send_within(
+    settings: &Settings,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    timeout: Option<Duration>,
+) -> Result<String, FleetError> {
     let (base, token, client) = prepare(settings)?;
     let mut request = client
         .request(method, endpoint(&base, path))
         .bearer_auth(token);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -866,11 +897,12 @@ pub async fn set_instructions(
     id: &str,
     instructions: Option<String>,
 ) -> Result<WrittenInstructions, FleetError> {
-    let body = send(
+    let body = send_within(
         settings,
         reqwest::Method::PUT,
         &format!("/api/boxes/{}/instructions", encode_segment(id)),
         Some(serde_json::json!({ "instructions": instructions })),
+        Some(MACHINE_TIMEOUT),
     )
     .await?;
     serde_json::from_str(&body)

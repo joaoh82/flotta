@@ -485,38 +485,62 @@ class FlyBackend:
         return endpoint_for(app, mid)
 
     def exec(self, box_id: str, command: str, *, timeout_s: int = 300) -> ExecResult:
-        """Run a shell command on the box over ssh.
+        """Run a shell command on the box, through the Machines API.
 
-        **`flyctl ssh console -C` does not run a shell.** It execs the string
-        as argv, so `echo a; cat b` runs `echo` with the literal arguments
-        `a;`, `cat`, `b` — no error, just quietly wrong output. Found by
-        writing a two-command probe that reported success and returned nothing
-        useful. Since this method promises "run a shell command", it wraps the
-        command in `/bin/sh -c` and the caller gets the semantics they expect.
+        **Not ssh.** `flyctl ssh console` needs a WireGuard tunnel and an org
+        SSH certificate, which it sets up per invocation. That is slow from a
+        laptop and does not work at all from the deployed control plane: the
+        first caller to try it — FLOTTA-58's instruction write — spent 90
+        seconds on Railway and came back 500. `machine exec` is an HTTP call to
+        the same API every other verb here uses, and the same probe returns in
+        under half a second.
 
-        Two further edges learned in M2:
+        **The process exit status is not the command's.** `flyctl machine exec`
+        exits `0` after running a command that failed, and prints `Exit code: 3`
+        on stdout instead. Reading `returncode` would call every failure a
+        success — the fail-open shape that has been written into this codebase
+        three times now. So this asks for `--json` and reads `exit_code` out of
+        it, and a reply that cannot be parsed is reported as a failure rather
+        than assumed to be fine.
 
-        - Multi-line input (a heredoc) is still mangled in transit, so anything
-          substantial should be base64-transported by the caller rather than
-          embedded literally.
-        - A backgrounded process does **not** survive the ssh session; the exit
-          status comes back as a large sentinel rather than an error. `exec` is
-          for foreground work — long-lived services are M3's job, via the
-          entrypoint, not via a detached `&`.
+        Two properties inherited from the old ssh path, still true:
+
+        - `-C` does not run a shell, so the command is wrapped in `/bin/sh -c`
+          and callers get the semantics the signature promises.
+        - Anything substantial should still be **base64-transported** by the
+          caller rather than embedded literally: this is a JSON round trip
+          through a shell, and a person's prose is full of both.
         """
-        app, mid = self._addr(box_id)
+        app, machine_id = self._addr(box_id)
         self.start(box_id)
         result = self._flyctl(
-            "ssh",
-            "console",
-            "-C",
+            "machine",
+            "exec",
+            machine_id,
+            "--json",
             f"/bin/sh -c {shlex.quote(command)}",
             app=app,
             timeout=timeout_s,
             check=False,
         )
+        if result.returncode != 0:
+            # flyctl itself failed — no machine, no credentials, a timeout.
+            # Distinct from the command failing, and reported as a refusal
+            # rather than as an exit status the command never produced.
+            raise BackendError(
+                f"machine exec failed on {app}: {_reason(result.stderr) or 'no detail'}"
+            )
+        try:
+            answer = json.loads(result.stdout or "")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise BackendError(
+                f"machine exec on {app} answered something that is not JSON: "
+                f"{(result.stdout or '')[:200]!r}"
+            ) from exc
         return ExecResult(
-            exit_code=result.returncode, stdout=result.stdout or "", stderr=result.stderr or ""
+            exit_code=int(answer.get("exit_code", 1)),
+            stdout=str(answer.get("stdout") or ""),
+            stderr=str(answer.get("stderr") or ""),
         )
 
     # -- internals ---------------------------------------------------------
