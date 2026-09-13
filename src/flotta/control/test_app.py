@@ -34,9 +34,31 @@ def fleet(tmp_path):
     return path
 
 
+def _unchecked(repo, *, token):
+    """The reachability check, answering "could not ask".
+
+    Injected into every fixture so the suite cannot reach GitHub even if
+    `$FLOTTA_GITHUB_TOKEN` is set in an environment a test inherits — `just
+    check` loads `.env`, and a hermetic suite that depends on a variable being
+    absent is one export away from making real HTTPS calls.
+
+    "Unknown" rather than "reachable" because it is the honest stand-in: these
+    tests are not about the check, and unknown is what the endpoint does when
+    nothing can be asked.
+    """
+    from flotta.github import Reach
+
+    return Reach("unknown", "not checked in tests")
+
+
 @pytest.fixture
 def client(fleet):
-    app = create_app(store_factory=lambda: FleetStore(fleet), run_loop=False, background=False)
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        reachable=_unchecked,
+    )
     with TestClient(app) as c:
         yield c
 
@@ -424,6 +446,7 @@ def secured(fleet):
         run_loop=False,
         background=False,
         signing_key=AUTH_KEY,
+        reachable=_unchecked,
     )
     with TestClient(app) as c:
         yield c
@@ -2083,9 +2106,9 @@ def test_the_answer_carries_when_in_the_units_the_app_compares(client, monkeypat
     written = "2026-09-12T21:00:00+00:00"
     _writes_instructions(monkeypatch, changed_at=written)
 
-    changed = client.put(
-        "/api/boxes/eng-a/instructions", json={"instructions": "x"}
-    ).json()["changed_at"]
+    changed = client.put("/api/boxes/eng-a/instructions", json={"instructions": "x"}).json()[
+        "changed_at"
+    ]
 
     assert isinstance(changed, float)
     assert changed == datetime.fromisoformat(written).timestamp()
@@ -2137,9 +2160,7 @@ def test_reading_one_agent_says_when_its_instructions_last_changed(client, fleet
 
     with FleetStore(fleet) as store:
         box = store.get_box_by_name("eng-a")
-        set_instructions(
-            box.id, "Review backend PRs.", store=store, backend=_ExecOnly()
-        )
+        set_instructions(box.id, "Review backend PRs.", store=store, backend=_ExecOnly())
 
     after = client.get("/api/boxes/eng-a").json()["box"]
     assert isinstance(after["instructions_changed_at"], float)
@@ -2162,3 +2183,85 @@ class _ExecOnly:
         from flotta.backend import ExecResult
 
         return ExecResult(0, "", "")
+
+
+# -- granting a repository the fleet token cannot reach ---------------------
+#
+# FLOTTA-59, found by using FLOTTA-55 the day it merged. A Flotta grant can
+# only *narrow* what the fleet token reaches, never widen it — so a grant
+# naming a repository that token cannot see looks correct in the app and fails
+# later on a machine, as GitHub's `Write access to repository not granted`.
+
+
+def _client_that(verdict, fleet, detail="nope"):
+    from flotta.github import Reach
+
+    asked: list[str] = []
+
+    def check(repo, *, token):
+        asked.append(repo)
+        return Reach(verdict, detail)
+
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        reachable=check,
+    )
+    with TestClient(app) as c:
+        yield c, asked
+
+
+@pytest.fixture
+def denied(fleet):
+    yield from _client_that("denied", fleet, detail="the fleet's GitHub token has no access")
+
+
+@pytest.fixture
+def allowed(fleet):
+    yield from _client_that("reachable", fleet)
+
+
+def test_a_repository_the_fleet_token_cannot_reach_is_refused(denied, fleet):
+    client, _ = denied
+    response = client.post("/api/boxes/eng-a/repos", json={"repo": "rockflow-org/scoutloom"})
+
+    assert response.status_code == 422
+    assert "no access" in response.json()["detail"]
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name("eng-a")
+        assert store.repos_for_box(box.id) == [], "a grant that cannot work was stored"
+
+
+def test_a_reachable_repository_is_granted_as_before(allowed):
+    client, asked = allowed
+    body = client.post("/api/boxes/eng-a/repos", json={"repo": "joaoh82/flotta"}).json()
+
+    assert body["repos"] == ["joaoh82/flotta"]
+    assert asked == ["joaoh82/flotta"]
+
+
+def test_github_being_unreachable_does_not_block_granting(client, fleet):
+    """The shared fixture answers "unknown". A GitHub outage must not become
+    "you cannot configure your fleet" — the check removes a surprise, it is not
+    a gate."""
+    body = client.post("/api/boxes/eng-a/repos", json={"repo": "joaoh82/flotta"}).json()
+    assert body["repos"] == ["joaoh82/flotta"]
+
+
+def test_the_check_is_asked_about_the_normalised_form(allowed):
+    """It asks GitHub about a *path*. Sending what was typed would ask about
+    `https://github.com/joaoh82/flotta.git` under `/repos/`, get a 404, and
+    refuse every pasted URL."""
+    client, asked = allowed
+    client.post("/api/boxes/eng-a/repos", json={"repo": "https://github.com/joaoh82/flotta.git"})
+
+    assert asked == ["joaoh82/flotta"]
+
+
+def test_something_that_is_not_a_repository_is_refused_before_github_is_asked(denied):
+    client, asked = denied
+    response = client.post("/api/boxes/eng-a/repos", json={"repo": "not-a-repo"})
+
+    assert response.status_code == 422
+    assert asked == [], "asked GitHub about something that does not name a repository"

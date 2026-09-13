@@ -111,14 +111,24 @@ Paste a slug, an https URL or an ssh URL — the control plane decides what it
 meant, and the list comes back normalised, so what is displayed is what was
 granted rather than what was typed.
 
-**The panel says the boundary is Flotta's, not GitHub's, and that sentence is
-load-bearing.** The source is one fleet token, so a box that extracted a
+**The boundary runs in both directions, and the panel says so.**
+
+*Flotta narrows.* The source is one fleet token, so a box that extracted a
 credential could reach repositories it was never granted. Flotta refuses to
 hand one over for an ungranted repository; GitHub does not enforce the
 narrowing. A tidy list of granted repositories reads like enforcement, and a
-soft boundary that reads as a hard one is worse than no boundary. FLOTTA-22
-closes it with GitHub App installation tokens scoped to `repository_ids`, and
-that is the day this sentence gets to change.
+soft boundary that reads as a hard one is worse than no boundary.
+
+*Flotta cannot widen.* Granting a repository the fleet token has no access to
+used to be accepted and then failed on the agent, as GitHub's `Write access to
+repository not granted` — which reads as a write problem during a clone and
+sends you to the wrong settings page. The control plane now asks GitHub before
+storing the grant and refuses with the reason that is actually true. It refuses
+only on a definite no: a GitHub outage still lets you configure your fleet,
+because the check removes a surprise rather than acting as a gate.
+
+FLOTTA-22 closes the first half properly, with GitHub App installation tokens
+scoped to `repository_ids`, and that is the day this section gets to shrink.
 
 Verified live on a private repository, on one running machine with no restart:
 ungranted clones fail with a 403 from the credential helper, granting makes the
