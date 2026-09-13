@@ -119,14 +119,18 @@ export function AgentRepos({ boxId }: { boxId: string }) {
       {error && <p className="mt-1 text-[11px] text-red-700">{error}</p>}
 
       {/* The sentence that stops this panel promising more than the system
-          keeps. The first two lines are the capability; the last is the limit,
-          and it is there because a tidy list of granted repositories *reads*
-          like enforcement. When FLOTTA-22 lands, this line is what changes. */}
+          keeps. The first half is the capability; the second is the limit, and
+          it runs in **both** directions — which the first version of this said
+          only half of. Flotta narrows what its token reaches and cannot widen
+          it, so a repository that token has no access to is refused above
+          rather than stored and left to fail on a machine (FLOTTA-59). When
+          FLOTTA-22 lands, this is the paragraph that changes. */}
       <p className="mt-2 text-[11px] leading-relaxed text-neutral-400">
         This agent can clone, commit and push to these repositories. It holds
         no GitHub credential — it asks the control plane for one per
-        repository, per use, and revoking takes effect on its next fetch. The
-        boundary is Flotta&rsquo;s, not GitHub&rsquo;s.
+        repository, per use, and revoking takes effect on its next fetch.
+        Flotta narrows what its own GitHub token can reach and cannot widen it,
+        so a repository that token has no access to is refused here.
       </p>
     </section>
   );

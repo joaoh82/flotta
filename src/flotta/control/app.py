@@ -102,6 +102,17 @@ INTERVAL_ENV = "FLOTTA_RECONCILE_INTERVAL_S"
 GITHUB_TOKEN_ENV = "FLOTTA_GITHUB_TOKEN"
 
 
+def _default_reachable(repo: str, *, token: str | None) -> Any:
+    """The real GitHub check, behind a function so `create_app` can replace it.
+
+    Imported lazily: `flotta.github` pulls in `httpx` only when it actually
+    asks, and the CLI imports this module for `flotta serve`.
+    """
+    from flotta.github import repo_reachable
+
+    return repo_reachable(repo, token=token)
+
+
 class InsecureBindError(RuntimeError):
     """Refused to expose the fleet without authentication."""
 
@@ -253,6 +264,12 @@ def create_app(
     interval_s: float | None = None,
     loop_runner: Any = None,
     signing_key: str | None = None,
+    #: Asks GitHub whether the fleet token can reach a repository, before a
+    #: grant is stored. Injected for the same reason every Fly touchpoint is:
+    #: the suite must stay hermetic and $0, and the default here would make a
+    #: real HTTPS call the moment `$FLOTTA_GITHUB_TOKEN` was set in the
+    #: environment a test happened to inherit.
+    reachable: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -1093,14 +1110,41 @@ def create_app(
         `fleet:write` rather than `git:credential`: granting is an operator's
         act, minting is the box's. A box holding its own credential scope must
         not be able to widen its own access.
+
+        **Checked against GitHub before it is stored.** A grant can only narrow
+        what the fleet token reaches, never widen it, and a grant naming a
+        repository that token cannot see is a booby trap: it looks correct in
+        the app and fails later on a machine, as GitHub's
+        `Write access to repository not granted` — which reads as a write
+        problem during a clone and sends the reader to the wrong page.
+
+        Refused on a definite no, **allowed on an uncertain one**. A GitHub
+        outage must not stop somebody configuring their fleet, and the check is
+        a point-in-time answer regardless: a token's scope can change after the
+        grant, so this removes a surprise rather than a possibility.
         """
+        from flotta.store import normalise_repo
+
         store = store_factory()
         try:
             box = store.get_box(box_id) or store.get_box_by_name(box_id)
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            # Normalised first, because the check asks GitHub about a path: a
+            # pasted URL or a `.git` suffix would ask about a repository that
+            # does not exist and read as a denial.
             try:
-                repo = store.grant_repo(box.id, str(body.get("repo") or ""))
+                wanted = normalise_repo(str(body.get("repo") or ""))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            check = reachable or _default_reachable
+            reach = check(wanted, token=(os.environ.get(GITHUB_TOKEN_ENV) or "").strip())
+            if reach.refuses:
+                raise HTTPException(status_code=422, detail=reach.detail)
+
+            try:
+                repo = store.grant_repo(box.id, wanted)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             store.add_event("box", box.id, "repo_granted", {"repo": repo})
