@@ -35,6 +35,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from flotta import db
@@ -219,6 +220,26 @@ def _box_dict(box: Any, meta: Any = None) -> dict[str, Any]:
 
 def _with_meta(store: Any, box: Any) -> dict[str, Any]:
     return _box_dict(box, store.meta_for_box(box.id))
+
+
+def _epoch(iso: str | None) -> float | None:
+    """A store timestamp as seconds since the Unix epoch, or None.
+
+    **Epoch rather than the ISO string the store keeps**, because the only
+    consumer compares it against a Hermes session's `started_at`, which is a
+    float. Handing the app two formats to reconcile would put a date parser in
+    the window for a comparison that is a subtraction.
+
+    A timestamp that will not parse returns None rather than raising: this
+    decides whether to reuse a conversation, and a malformed row must not take
+    down the read of an agent that is otherwise fine.
+    """
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return None
 
 
 def create_app(
@@ -642,11 +663,7 @@ def create_app(
                     "cost_estimate": sum(costs) if costs else None,
                 }
             metas = store.meta_for_boxes([b.id for b in boxes])
-            return {
-                "boxes": [
-                    {**_box_dict(b, metas.get(b.id)), **summaries[b.id]} for b in boxes
-                ]
-            }
+            return {"boxes": [{**_box_dict(b, metas.get(b.id)), **summaries[b.id]} for b in boxes]}
         finally:
             store.close()
 
@@ -878,8 +895,15 @@ def create_app(
             box = store.get_box(box_id) or store.get_box_by_name(box_id)
             if box is None:
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            # Only on the single-box read, never the list: it is one query per
+            # box, and the list is the hot path that renders the sidebar on a
+            # timer. The one consumer — deciding whether to resume a
+            # conversation or start a fresh one — is opening a single agent.
             return {
-                "box": _with_meta(store, box),
+                "box": {
+                    **_with_meta(store, box),
+                    "instructions_changed_at": _epoch(store.instructions_changed_at(box.id)),
+                },
                 "tasks": [_task_dict(t) for t in store.list_tasks(box_id=box.id)],
             }
         finally:
@@ -921,6 +945,45 @@ def create_app(
             except InvalidBoxMetaError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return {"box": _box_dict(box, meta)}
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/instructions")
+    def set_instructions(box_id: str, body: dict[str, Any], _: Token | None = needs_write) -> Any:
+        """Rewrite what an agent *is*, on the volume it reads.
+
+        Separate from `PUT …/meta` because it is a different kind of act. A
+        display name is a label the fleet keeps; standing instructions are a
+        file on a machine, so this one wakes a box, writes to its disk, and can
+        fail in ways renaming cannot.
+
+        **It does not take effect until the conversation restarts.** Hermes
+        renders a system prompt once per session, so the app starts a fresh one
+        after saving — `changed_at` is what lets it decide, by comparing
+        against the session it was about to resume.
+        """
+        from flotta.provision import ProvisionError
+        from flotta.provision import set_instructions as write_soul
+        from flotta.store import InvalidBoxMetaError
+
+        store = store_factory()
+        try:
+            # Resolved here as well as inside, so an unknown agent is a 404
+            # rather than the 409 every other refusal uses.
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            try:
+                written = write_soul(box.id, body.get("instructions"), store=store)
+                # Same shape and the same units as the single-box read, so the
+                # window can use the answer without a second fetch.
+                return {**written, "changed_at": _epoch(written["changed_at"])}
+            except InvalidBoxMetaError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except ProvisionError as exc:
+                # 409, not 500: the fleet is fine and the request was
+                # well-formed — this box could not be written to right now.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
 

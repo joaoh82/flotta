@@ -21,9 +21,13 @@ export type BoxRow = {
   display_name?: string | null;
   description?: string | null;
   /**
-   * The standing instructions the agent was *seeded* with. The copy it reads
-   * is `SOUL.md` on its own volume; this is the record, and it is not
-   * editable from here for that reason.
+   * The standing instructions Flotta last wrote to the agent's volume. The
+   * copy it reads is `SOUL.md` there, which the agent may have changed since,
+   * so this is the record rather than a claim about the live prompt.
+   *
+   * Editable from the Info panel — but only through a verb that reaches the
+   * volume *and* restarts the conversation, because a session keeps the system
+   * prompt it was born with.
    */
   instructions?: string | null;
 };

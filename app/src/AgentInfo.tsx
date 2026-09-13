@@ -37,18 +37,23 @@ import {
 export function AgentInfo({
   box,
   onClose,
-  onRenamed,
+  onChanged,
 }: {
   box: BoxRow;
   onClose: () => void;
   /** The list holds the row; a rename has to reach it or the sidebar lies. */
-  onRenamed: (box: BoxRow) => void;
+  onChanged: (box: BoxRow) => void;
 }) {
   const [view, setView] = useState<MachineView | null>(null);
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [draftDescription, setDraftDescription] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [editingSoul, setEditingSoul] = useState(false);
+  const [draftSoul, setDraftSoul] = useState("");
+  const [soulError, setSoulError] = useState<string | null>(null);
+  /** Saving reaches a machine and can wake it, so it is not instant. */
+  const [savingSoul, setSavingSoul] = useState(false);
   const [versions, setVersions] = useState<HermesVersions | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -94,7 +99,7 @@ export function AgentInfo({
   // `row` is the machine endpoint's snapshot of the box, read at the same
   // instant as the machine, and it is what the drift comparison needs:
   // status against state, both true together. `box` is the list's row, kept
-  // fresh by the poll and patched by `onRenamed`. Identity — name,
+  // fresh by the poll and patched by `onChanged`. Identity — name,
   // description, the seed — has to come from `box`, or a Rename updates the
   // sidebar and leaves this panel showing the old name until Recheck. Both
   // reviewers caught exactly that.
@@ -122,10 +127,38 @@ export function AgentInfo({
         displayName: draftName,
         description: draftDescription,
       });
-      onRenamed(updated);
+      onChanged(updated);
       setEditing(false);
     } catch (e) {
       setRenameError(isFleetError(e) ? e.detail : String(e));
+    }
+  };
+
+  const beginSoulEdit = () => {
+    setDraftSoul(identity.instructions ?? "");
+    setSoulError(null);
+    setEditingSoul(true);
+  };
+  const saveInstructions = async () => {
+    setSoulError(null);
+    setSavingSoul(true);
+    try {
+      // `boxName` as well as `id`: the control plane is addressed by id, and
+      // the live conversation this restarts is keyed by the agent's address.
+      const written = await invoke<{ instructions: string | null }>("set_instructions", {
+        id: box.id,
+        boxName: box.name,
+        instructions: draftSoul,
+      });
+      // Patch the list's row, which is where this panel reads identity from.
+      // Without it the textarea closes onto the value it just replaced, and
+      // the panel looks like the save did nothing.
+      onChanged({ ...box, instructions: written.instructions });
+      setEditingSoul(false);
+    } catch (e) {
+      setSoulError(isFleetError(e) ? e.detail : String(e));
+    } finally {
+      setSavingSoul(false);
     }
   };
 
@@ -413,24 +446,78 @@ export function AgentInfo({
           </dl>
         </section>
 
-        {/* The seed, labelled as the seed. The agent reads SOUL.md on its own
-            volume, which it may have changed since; this is the record of
-            what it started with, and saying otherwise would be the panel
-            claiming to know what the agent thinks. */}
-        {identity.instructions && (
-          <section>
+        {/* Always rendered, including when there are none: an agent with no
+            standing instructions is the case you most want to be able to fix,
+            and hiding the editor behind having used it already is the window
+            offering a control only to people who do not need it. */}
+        <section>
+          <div className="flex items-baseline justify-between">
             <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">
-              Standing instructions (as seeded)
+              Standing instructions
             </h3>
-            <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-neutral-200 bg-neutral-50 p-2.5 font-mono text-[11px] text-neutral-800">
-              {identity.instructions}
-            </pre>
-            <p className="mt-1 text-[11px] text-neutral-400">
-              Written to the agent&rsquo;s SOUL.md at creation. It&rsquo;s the agent&rsquo;s own
-              since, and may have moved on from this.
+            {!editingSoul && (
+              <button
+                onClick={beginSoulEdit}
+                className="text-[11px] text-neutral-500 hover:text-neutral-900"
+              >
+                Edit
+              </button>
+            )}
+          </div>
+
+          {editingSoul ? (
+            <>
+              <textarea
+                value={draftSoul}
+                onChange={(e) => setDraftSoul(e.target.value)}
+                rows={8}
+                placeholder="Who it is, what it works on, how it should behave."
+                className="mt-1.5 w-full rounded border border-neutral-300 p-2.5 font-mono text-[11px] focus:border-neutral-500 focus:outline-none"
+              />
+              <p className="text-[11px] text-neutral-500">
+                Saving writes this to the agent&rsquo;s disk and starts a fresh
+                conversation, which is the only way it takes effect. The agent
+                keeps its memory.
+              </p>
+              {soulError && (
+                <p className="mt-1 text-[11px] text-red-700">{soulError}</p>
+              )}
+              <div className="mt-2 flex gap-2">
+                <button
+                  onClick={() => void saveInstructions()}
+                  disabled={savingSoul}
+                  className="rounded bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40"
+                >
+                  {savingSoul ? "Saving…" : "Save and restart conversation"}
+                </button>
+                <button
+                  onClick={() => setEditingSoul(false)}
+                  disabled={savingSoul}
+                  className="rounded border border-neutral-300 px-3 py-1.5 text-xs hover:bg-neutral-50 disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : identity.instructions ? (
+            <>
+              <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-neutral-200 bg-neutral-50 p-2.5 font-mono text-[11px] text-neutral-800">
+                {identity.instructions}
+              </pre>
+              {/* Still hedged, and still honestly: this is what Flotta last
+                  wrote to SOUL.md, and the file is the agent's to change. The
+                  panel cannot claim to know what the agent thinks now. */}
+              <p className="mt-1 text-[11px] text-neutral-400">
+                What Flotta last wrote to the agent&rsquo;s SOUL.md. The file is the
+                agent&rsquo;s own, so it may have moved on from this.
+              </p>
+            </>
+          ) : (
+            <p className="mt-1.5 text-[11px] text-neutral-500">
+              None set. {identity.name} is running whatever Hermes starts with.
             </p>
-          </section>
-        )}
+          )}
+        </section>
       </div>
     </div>
   );

@@ -77,6 +77,23 @@ Found the hard way: an agent created before instruction-seeding shipped kept
 introducing itself as stock Hermes through a re-image and two fleet updates
 (FLOTTA-58).
 
+### Editing standing instructions
+
+The Info panel's **Standing instructions** section is editable, and saving does
+two things that have to happen together: it writes `SOUL.md` on the agent's
+volume, and it starts a fresh conversation. Saving without the restart would
+change nothing the agent says, so the window does not offer that half on its
+own — the button says what it does.
+
+If the conversation is not open when you save, nothing extra is needed.
+`attach` compares when the instructions were last written against the session
+it was about to resume, and starts a fresh one instead when the instructions
+are newer. Both timestamps are epoch seconds: the box's own `started_at`, and
+the control plane's, from the `instructions_changed` event.
+
+Clearing the field removes the file rather than leaving an empty one, so the
+agent falls back to Hermes's own default identity instead of having none.
+
 ## Info: the store's belief, and the substrate's answer
 
 Every read in this window comes from the fleet store, which is a *belief* — a

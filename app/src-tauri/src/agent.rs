@@ -195,6 +195,7 @@ async fn connect(
     settings: &Settings,
     box_name: &str,
     token: &str,
+    instructions_at: Option<f64>,
 ) -> Result<
     (
         tokio_tungstenite::WebSocketStream<
@@ -302,7 +303,7 @@ async fn connect(
     // The server speaks first.
     expect_event(&mut socket, "gateway.ready").await?;
 
-    let (session_id, resumed) = attach(&mut socket).await?;
+    let (session_id, resumed) = attach(&mut socket, instructions_at).await?;
     Ok((socket, session_id, resumed))
 }
 
@@ -315,7 +316,10 @@ async fn connect(
 /// The transcript is *asked for*, never cached. The agent's memory is the
 /// source of truth; a client holding its own copy would keep showing it after
 /// the agent had moved on.
-async fn attach(socket: &mut Socket) -> Result<(String, Vec<HistoryLine>), FleetError> {
+async fn attach(
+    socket: &mut Socket,
+    instructions_at: Option<f64>,
+) -> Result<(String, Vec<HistoryLine>), FleetError> {
     // `session.most_recent` skips tool-source sessions, so it returns the
     // conversational one rather than whatever a background task last touched.
     let recent = call(socket, "session.most_recent", serde_json::json!({})).await?;
@@ -323,6 +327,17 @@ async fn attach(socket: &mut Socket) -> Result<(String, Vec<HistoryLine>), Fleet
         .get("session_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+
+    // Instructions changed since this conversation began, so resuming it would
+    // put the agent back in the persona it was told to stop having. A session
+    // renders its system prompt once and keeps it, so the only way the new
+    // SOUL.md is read is a new session.
+    if stale_identity(
+        instructions_at,
+        recent.get("started_at").and_then(|v| v.as_f64()),
+    ) {
+        return Ok((create_session(socket).await?, Vec::new()));
+    }
 
     if let Some(session_id) = existing {
         let resumed = call(
@@ -335,6 +350,28 @@ async fn attach(socket: &mut Socket) -> Result<(String, Vec<HistoryLine>), Fleet
     }
 
     Ok((create_session(socket).await?, Vec::new()))
+}
+
+/// Whether the conversation we were about to resume predates the agent's
+/// current instructions.
+///
+/// Both arguments are seconds since the Unix epoch: `changed` from the control
+/// plane, `started` from the box's own `session.most_recent`. They come from
+/// two different clocks, which is why this is a plain comparison with no
+/// tolerance window — a fudge factor would be guessing at skew we cannot
+/// measure, and being wrong in the safe direction (a needless fresh
+/// conversation) costs a transcript nobody asked to keep, while being wrong
+/// the other way is the bug this whole ticket is about.
+///
+/// Missing either side means **resume**. `changed` is `None` for every agent
+/// whose instructions have never been rewritten, which is most of them;
+/// `started` is `None` when there is no session to resume, and creating one is
+/// what `attach` does next anyway.
+fn stale_identity(changed: Option<f64>, started: Option<f64>) -> bool {
+    match (changed, started) {
+        (Some(changed), Some(started)) => changed > started,
+        _ => false,
+    }
 }
 
 /// Open a brand-new conversation on a socket that is already connected.
@@ -646,13 +683,25 @@ pub async fn run(
     }
     .emit(&app);
 
-    let (mut socket, mut session_id, resumed) = match connect(&settings, &box_name, &token).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            finish(&app, &box_name, Some(err.detail().to_string()));
-            return;
-        }
-    };
+    // Read once, before the socket, and reused for the resync below: the only
+    // thing that changes it mid-conversation is a save from this window, and
+    // that starts a fresh conversation itself. A failure here is **not** fatal
+    // — the fleet list is already open, so this read is a refinement, and an
+    // agent you cannot talk to because a metadata call timed out would be a
+    // worse bug than the one it guards against.
+    let instructions_at = crate::fleet::get_box(&settings, &box_name)
+        .await
+        .ok()
+        .and_then(|row| row.instructions_changed_at);
+
+    let (mut socket, mut session_id, resumed) =
+        match connect(&settings, &box_name, &token, instructions_at).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                finish(&app, &box_name, Some(err.detail().to_string()));
+                return;
+            }
+        };
 
     AgentEvent::Ready {
         box_name: box_name.clone(),
@@ -688,7 +737,7 @@ pub async fn run(
                         // for both mistakes under different codes (4001 and
                         // 4007). Re-running `attach` keeps exactly one path
                         // that knows which id is which.
-                        match attach(&mut socket).await {
+                        match attach(&mut socket, instructions_at).await {
                             Ok((live, resumed)) => {
                                 session_id = live;
                                 AgentEvent::Ready {
@@ -933,6 +982,43 @@ mod tests {
     }
 
     #[test]
+    fn instructions_newer_than_the_conversation_mean_a_fresh_one() {
+        // The whole ticket in one line: the session was born before the
+        // persona it is supposed to have, so resuming it would keep the old
+        // one forever.
+        assert!(stale_identity(Some(200.0), Some(100.0)));
+    }
+
+    #[test]
+    fn a_conversation_started_after_the_instructions_is_resumed() {
+        assert!(!stale_identity(Some(100.0), Some(200.0)));
+    }
+
+    #[test]
+    fn instructions_that_never_changed_never_throw_away_a_transcript() {
+        // `None` is most of the fleet: an agent seeded at creation and never
+        // edited. Treating an absent timestamp as "infinitely old" would start
+        // a fresh conversation with every agent on every open.
+        assert!(!stale_identity(None, Some(100.0)));
+    }
+
+    #[test]
+    fn no_conversation_to_resume_is_not_a_stale_one() {
+        // `attach` creates one immediately after, so answering true here would
+        // be a second create racing the first.
+        assert!(!stale_identity(Some(200.0), None));
+        assert!(!stale_identity(None, None));
+    }
+
+    #[test]
+    fn a_dead_heat_resumes() {
+        // Equal is not newer. Two clocks that agree to the microsecond is
+        // vanishingly unlikely, and the tie-break that costs a transcript is
+        // the wrong one to pick for free.
+        assert!(!stale_identity(Some(100.0), Some(100.0)));
+    }
+
+    #[test]
     fn a_created_session_names_the_id_prompts_are_sent_against() {
         // Unlike `session.resume`, `session.create` answers with the live id
         // directly — there is no second id to keep in step.
@@ -985,7 +1071,7 @@ mod tests {
 
         runtime.block_on(async {
             // First connection: say something distinctive.
-            let (mut socket, session, resumed) = connect(&settings, &box_name, &token)
+            let (mut socket, session, resumed) = connect(&settings, &box_name, &token, None)
                 .await
                 .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
             println!(
@@ -1010,7 +1096,7 @@ mod tests {
             // Second connection: the transcript must come back **from the box**.
             // This is the acceptance criterion for reattachment, and the only
             // honest way to test it is to reconnect.
-            let (_socket, resumed_session, history) = connect(&settings, &box_name, &token)
+            let (_socket, resumed_session, history) = connect(&settings, &box_name, &token, None)
                 .await
                 .unwrap_or_else(|e| panic!("reconnect failed: {}", e.detail()));
             println!(
@@ -1040,7 +1126,10 @@ mod tests {
 
             // Exactly what `Command::Resync` runs when you switch back to an
             // agent whose socket is still open.
-            let (live, again) = attach(&mut socket)
+            // `None`: this box's instructions have not been rewritten mid-test,
+            // so the resync must resume rather than start fresh — which is the
+            // property the assertion below is checking.
+            let (live, again) = attach(&mut socket, None)
                 .await
                 .unwrap_or_else(|e| panic!("resync failed: {}", e.detail()));
             println!("resync -> session {live}, {} turns", again.len());

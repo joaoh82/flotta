@@ -123,13 +123,26 @@ class FakeBackend:
 
     scheme = "fake"
 
-    def __init__(self, *, can_suspend=True, can_reimage=True, reimage_fails=False, image=None):
+    def __init__(
+        self,
+        *,
+        can_suspend=True,
+        can_reimage=True,
+        reimage_fails=False,
+        image=None,
+        exec_result=None,
+    ):
         self.calls: list[str] = []
         self.can_suspend = can_suspend
         self.can_reimage = can_reimage
         self.reimage_fails = reimage_fails
         self.image = image
         self.machine_state = "started"
+        #: Every command `exec` was asked to run, in order. The tests that
+        #: matter here are about *what* was sent to the machine, not that
+        #: something was.
+        self.commands: list[str] = []
+        self.exec_result = exec_result
 
     def suspend(self, box_id):
         self.calls.append("suspend")
@@ -182,7 +195,11 @@ class FakeBackend:
         self.applied = dict(secrets)
 
     def exec(self, box_id, command, *, timeout_s=300):
-        raise NotSupported("not used in these tests")
+        from flotta.backend import ExecResult
+
+        self.calls.append("exec")
+        self.commands.append(command)
+        return self.exec_result or ExecResult(0, "", "")
 
 
 def idle_box(store, **kwargs):
@@ -2906,9 +2923,167 @@ def test_the_202_path_reads_instructions_from_the_store(store):
     from flotta.provision import reserve_box
 
     impl = _Recording()
-    reserved = reserve_box(
-        "eng-r", store=store, backend=impl, instructions="From the form."
-    )
+    reserved = reserve_box("eng-r", store=store, backend=impl, instructions="From the form.")
     create_box("eng-r", store=store, backend=impl, box=reserved)
 
     assert impl.spec.env["FLOTTA_INSTRUCTIONS"] == "From the form."
+
+
+# --- set_instructions: changing what an agent is, on its own volume ---------
+#
+# The verb FLOTTA-58 needed. The bug was not that instructions were missing —
+# they were on the volume and Hermes read them — but that a *session* keeps the
+# system prompt it was born with, so a change after the first conversation
+# reached nothing. These tests cover the half that writes the file; the half
+# that starts a fresh conversation lives in the app.
+
+
+def _running_box(store, name="eng-r"):
+    box = store.create_box(name)
+    store.update_box_status(box.id, "running", endpoint="fake://m-1")
+    return box
+
+
+def test_instructions_are_written_to_the_volume_not_just_the_store(store):
+    """The store row is a record. The file is what the agent reads, so a save
+    that only touched the row would make the window describe a persona the
+    agent is not running."""
+    import base64
+
+    from flotta.provision import SOUL_PATH, set_instructions
+
+    box = _running_box(store)
+    impl = FakeBackend()
+
+    set_instructions(box.id, "You review backend PRs.", store=store, backend=impl)
+
+    assert impl.commands, "nothing reached the machine"
+    command = impl.commands[0]
+    assert SOUL_PATH in command
+    blob = base64.b64encode(b"You review backend PRs.").decode()
+    assert blob in command, "the content should travel base64-encoded"
+
+
+def test_the_content_is_never_interpolated_into_the_shell(store):
+    """`exec` runs through `flyctl ssh`, and this text is a person's prose on a
+    machine whose agent has root. Base64 is alphabet-only, so quotes, newlines
+    and `$(…)` cannot change the shape of the command."""
+    from flotta.provision import set_instructions
+
+    box = _running_box(store)
+    impl = FakeBackend()
+    nasty = "you are $(whoami); `id`; \"quoted\" & 'single'\nsecond line"
+
+    set_instructions(box.id, nasty, store=store, backend=impl)
+
+    command = impl.commands[0]
+    for fragment in ("$(whoami)", "`id`", "second line", '"quoted"'):
+        assert fragment not in command, f"{fragment!r} reached the shell verbatim"
+
+
+def test_the_store_records_what_was_written(store):
+    from flotta.provision import set_instructions
+
+    box = _running_box(store)
+    set_instructions(box.id, "  You review backend PRs.  ", store=store, backend=FakeBackend())
+
+    assert store.meta_for_box(box.id).instructions == "You review backend PRs."
+
+
+def test_a_rename_does_not_look_like_an_instruction_change(store):
+    """The app starts a fresh conversation when instructions are newer than the
+    session. `box_meta.updated_at` moves on a rename too, so reading the
+    timestamp from there would throw away a transcript over a typo fix."""
+    from flotta.provision import set_instructions
+
+    box = _running_box(store)
+    set_instructions(box.id, "Review backend PRs.", store=store, backend=FakeBackend())
+    changed = store.instructions_changed_at(box.id)
+
+    store.set_box_meta(box.id, display_name="Reviewer", instructions="Review backend PRs.")
+
+    assert store.instructions_changed_at(box.id) == changed
+
+
+def test_instructions_that_never_changed_have_no_timestamp(store):
+    """Most of the fleet: seeded at creation and never edited. `None` is what
+    tells the app to resume rather than start over."""
+    box = _running_box(store)
+    assert store.instructions_changed_at(box.id) is None
+
+
+def test_clearing_removes_the_file_rather_than_emptying_it(store):
+    """Hermes writes its own default when SOUL.md is absent. An empty file
+    would leave the agent with no identity at all, which is not what clearing
+    a field should mean."""
+    from flotta.provision import SOUL_PATH, set_instructions
+
+    box = _running_box(store)
+    impl = FakeBackend()
+
+    result = set_instructions(box.id, "   ", store=store, backend=impl)
+
+    assert impl.commands[0] == f"rm -f {SOUL_PATH}"
+    assert result["instructions"] is None
+    assert store.meta_for_box(box.id).instructions is None
+
+
+def test_a_failed_write_raises_and_records_nothing_as_changed(store):
+    """The event is the audit trail. Saying the persona changed on a box where
+    the write failed is a lie that outlives the traceback — and it would make
+    the app throw away a conversation for a change that never landed."""
+    from flotta.backend import ExecResult
+    from flotta.provision import ProvisionError, set_instructions
+
+    box = _running_box(store)
+    impl = FakeBackend(exec_result=ExecResult(1, "", "no space left on device"))
+
+    with pytest.raises(ProvisionError, match="no space left on device"):
+        set_instructions(box.id, "Review backend PRs.", store=store, backend=impl)
+
+    assert store.instructions_changed_at(box.id) is None
+    assert store.meta_for_box(box.id) is None
+
+
+def test_a_sleeping_agent_is_written_to_rather_than_refused(store):
+    """An agent is asleep most of the time — that is the cost model working,
+    not an error state. `exec` starts the machine itself."""
+    from flotta.provision import set_instructions
+
+    box = _running_box(store)
+    store.update_box_status(box.id, "stopped")
+    impl = FakeBackend()
+
+    set_instructions(box.id, "Review backend PRs.", store=store, backend=impl)
+
+    assert impl.commands
+
+
+def test_a_torn_down_agent_has_no_volume_to_write_to(store):
+    from flotta.provision import ProvisionError, set_instructions
+
+    box = _running_box(store)
+    store.update_box_status(box.id, "torn_down")
+
+    with pytest.raises(ProvisionError, match="torn_down"):
+        set_instructions(box.id, "Review backend PRs.", store=store, backend=FakeBackend())
+
+
+def test_instructions_too_long_are_refused_before_the_machine_is_touched(store):
+    from flotta.provision import set_instructions
+    from flotta.store import INSTRUCTIONS_MAX, InvalidBoxMetaError
+
+    box = _running_box(store)
+    impl = FakeBackend()
+
+    with pytest.raises(InvalidBoxMetaError):
+        set_instructions(box.id, "x" * (INSTRUCTIONS_MAX + 1), store=store, backend=impl)
+
+    assert not impl.commands, "a refused value must not reach the volume"
+
+
+def test_an_unknown_agent_is_a_refusal_not_a_crash(store):
+    from flotta.provision import ProvisionError, set_instructions
+
+    with pytest.raises(ProvisionError, match="no box"):
+        set_instructions("nope", "hello", store=store, backend=FakeBackend())

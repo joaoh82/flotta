@@ -1562,7 +1562,7 @@ def test_an_unknown_side_is_not_reported_as_behind(client, monkeypatch):
 
 
 def test_the_version_endpoint_says_where_the_fleet_image_came_from(client, monkeypatch):
-    """"Why is my fleet not using the image I just built" is otherwise
+    """ "Why is my fleet not using the image I just built" is otherwise
     unanswerable from a window."""
     import flotta.provision as provision
 
@@ -1763,9 +1763,7 @@ def test_a_second_update_while_one_is_running_is_refused(async_client, fleet, mo
     assert "already running" in response.json()["detail"]
 
 
-def test_no_build_app_is_recorded_rather_than_crashing_the_thread(
-    async_client, fleet, monkeypatch
-):
+def test_no_build_app_is_recorded_rather_than_crashing_the_thread(async_client, fleet, monkeypatch):
     """The thread is where nobody is looking. A build that cannot start must
     leave a row saying why, not a log line."""
     monkeypatch.delenv("FLOTTA_FLY_APP", raising=False)
@@ -2032,3 +2030,135 @@ def test_renaming_never_touches_the_address(client):
 
 def test_renaming_a_missing_agent_is_404(client):
     assert client.put("/api/boxes/nope/meta", json={"display_name": "x"}).status_code == 404
+
+
+# -- PUT /api/boxes/{id}/instructions --------------------------------------
+#
+# The verb that changes what an agent *is*. Separate from `/meta` because it
+# reaches a machine: it wakes a box, writes to its disk, and fails in ways
+# renaming cannot.
+
+
+def _writes_instructions(monkeypatch, **overrides):
+    """Stand in for the provision verb, which would otherwise shell out to
+    `flyctl`. The endpoint's job is routing and status codes; what gets written
+    to the volume is `test_provision`'s."""
+    from flotta import provision
+
+    seen: dict[str, object] = {}
+
+    def fake(box_id, instructions, *, store, **kwargs):
+        seen["box_id"] = box_id
+        seen["instructions"] = instructions
+        if "raises" in overrides:
+            raise overrides["raises"]
+        return {
+            "box_id": box_id,
+            "instructions": instructions,
+            "changed_at": overrides.get("changed_at", "2026-09-12T21:00:00+00:00"),
+        }
+
+    monkeypatch.setattr(provision, "set_instructions", fake)
+    return seen
+
+
+def test_instructions_can_be_rewritten_after_creation(client, monkeypatch):
+    seen = _writes_instructions(monkeypatch)
+
+    body = client.put(
+        "/api/boxes/eng-a/instructions", json={"instructions": "Review backend PRs."}
+    ).json()
+
+    assert seen["instructions"] == "Review backend PRs."
+    assert body["instructions"] == "Review backend PRs."
+
+
+def test_the_answer_carries_when_in_the_units_the_app_compares(client, monkeypatch):
+    """The app decides whether to resume a conversation by comparing this
+    against a Hermes session's `started_at`, which is epoch seconds. Handing
+    back an ISO string would put a date parser in the window for a
+    subtraction."""
+    from datetime import datetime
+
+    written = "2026-09-12T21:00:00+00:00"
+    _writes_instructions(monkeypatch, changed_at=written)
+
+    changed = client.put(
+        "/api/boxes/eng-a/instructions", json={"instructions": "x"}
+    ).json()["changed_at"]
+
+    assert isinstance(changed, float)
+    assert changed == datetime.fromisoformat(written).timestamp()
+
+
+def test_an_unwritable_box_is_409_not_500(client, monkeypatch):
+    """The fleet is fine and the request was well-formed; this box could not be
+    written to. A 500 would send someone to the control plane's logs for a
+    machine problem."""
+    from flotta.provision import ProvisionError
+
+    _writes_instructions(monkeypatch, raises=ProvisionError("box eng-a is torn_down"))
+
+    response = client.put("/api/boxes/eng-a/instructions", json={"instructions": "x"})
+
+    assert response.status_code == 409
+    assert "torn_down" in response.json()["detail"]
+
+
+def test_instructions_that_cannot_be_stored_are_422(client, monkeypatch):
+    from flotta.store import InvalidBoxMetaError
+
+    _writes_instructions(monkeypatch, raises=InvalidBoxMetaError("instructions is too long"))
+
+    response = client.put("/api/boxes/eng-a/instructions", json={"instructions": "x"})
+
+    assert response.status_code == 422
+    assert "too long" in response.json()["detail"]
+
+
+def test_instructing_a_missing_agent_is_404(client, monkeypatch):
+    """404 rather than the 409 every other refusal uses: an unknown name is a
+    different mistake from a box that cannot be written to."""
+    seen = _writes_instructions(monkeypatch)
+
+    response = client.put("/api/boxes/nope/instructions", json={"instructions": "x"})
+
+    assert response.status_code == 404
+    assert seen == {}, "the volume was reached for a box that does not exist"
+
+
+def test_reading_one_agent_says_when_its_instructions_last_changed(client, fleet):
+    """The single-box read, and only that one: it is a query per box, and the
+    list redraws the sidebar on a timer."""
+    from flotta.provision import set_instructions
+
+    before = client.get("/api/boxes/eng-a").json()["box"]
+    assert before["instructions_changed_at"] is None, "never changed is None, not 0"
+
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name("eng-a")
+        set_instructions(
+            box.id, "Review backend PRs.", store=store, backend=_ExecOnly()
+        )
+
+    after = client.get("/api/boxes/eng-a").json()["box"]
+    assert isinstance(after["instructions_changed_at"], float)
+    assert after["instructions"] == "Review backend PRs."
+
+
+def test_the_fleet_list_does_not_pay_for_that_query(client):
+    rows = client.get("/api/boxes").json()["boxes"]
+    assert "instructions_changed_at" not in rows[0]
+
+
+class _ExecOnly:
+    """The one verb `set_instructions` uses, and nothing else — so a change
+    that starts calling the substrate for something else fails here loudly
+    rather than reaching Fly."""
+
+    scheme = "fly"
+
+    def exec(self, box_id, command, *, timeout_s=300):
+        from flotta.backend import ExecResult
+
+        return ExecResult(0, "", "")
