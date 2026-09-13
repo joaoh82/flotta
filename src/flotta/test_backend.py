@@ -939,9 +939,35 @@ def test_an_unparseable_answer_fails_closed():
         backend.exec("fly://app-1/m-1", "true")
 
 
-def test_a_json_answer_missing_its_exit_code_is_a_failure():
-    """Absent is not zero."""
-    runner, _ = _exec_runner('{"stdout": "", "stderr": ""}')
+def test_an_absent_exit_code_is_success():
+    """**flyctl omits every empty field.** A command that succeeds silently
+    answers `{}` — and writing a file is exactly that, since a redirect
+    produces no stdout.
+
+    Measured against `eng-r`: `echo hi` answers `{"stdout": "hi\n"}` with no
+    `exit_code`, `echo hi > /tmp/x` answers `{}` and the file is there, and
+    `exit 3` answers `{"exit_code": 3}`. So a failure carries the field and a
+    success does not.
+
+    The first version defaulted to 1 here, reasoning that absent is not zero.
+    That is the right instinct against the wrong API: it reported every
+    successful write as a refusal while the file was on the volume."""
+    runner, _ = _exec_runner("{}")
     backend = FlyBackend(config=_offline_config(), runner=runner)
 
-    assert backend.exec("fly://app-1/m-1", "true").exit_code == 1
+    result = backend.exec("fly://app-1/m-1", "echo hi > /tmp/x")
+
+    assert result.exit_code == 0
+    assert result.ok, "a silent success was reported as a failure"
+
+
+def test_a_reply_that_is_not_an_object_is_still_a_refusal():
+    """The fail-closed guards above are what make "absent means zero" safe:
+    reaching the exit-code read at all means flyctl ran and reported."""
+    from flotta.backend import BackendError
+
+    runner, _ = _exec_runner("not json at all")
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+
+    with pytest.raises(BackendError, match="not JSON"):
+        backend.exec("fly://app-1/m-1", "true")

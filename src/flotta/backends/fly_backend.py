@@ -537,8 +537,21 @@ class FlyBackend:
                 f"machine exec on {app} answered something that is not JSON: "
                 f"{(result.stdout or '')[:200]!r}"
             ) from exc
+        # **An absent `exit_code` is zero, not a failure.** flyctl omits every
+        # empty field: a command that succeeds silently answers `{}`, and one
+        # that writes a file answers `{}` too because the write produces no
+        # stdout. The first version defaulted to 1 on the reasoning that
+        # "absent is not zero", which is the right instinct against the wrong
+        # API — it turned every successful write into a refusal, measured live
+        # against `eng-r` (the file was on the volume; the caller was told it
+        # had failed). A failure does carry the field: `exit 3` answers
+        # `{"exit_code": 3}`.
+        #
+        # This is not the fail-open shape it resembles. flyctl exiting non-zero
+        # and a body that will not parse are both refusals above, so reaching
+        # here means flyctl ran the command and reported on it.
         return ExecResult(
-            exit_code=int(answer.get("exit_code", 1)),
+            exit_code=int(answer.get("exit_code", 0)),
             stdout=str(answer.get("stdout") or ""),
             stderr=str(answer.get("stderr") or ""),
         )
