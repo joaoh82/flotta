@@ -83,6 +83,20 @@ if [ -n "${FLOTTA_INSTRUCTIONS:-}" ] && [ ! -f "$HERMES_HOME/SOUL.md" ]; then
   echo "[flotta-box] seeded SOUL.md from FLOTTA_INSTRUCTIONS ($(wc -c < "$HERMES_HOME/SOUL.md") bytes)"
 fi
 
+# How long a risky command waits for a person before it is denied (FLOTTA-60).
+#
+# Hermes asks the connected client and waits `approvals.timeout` seconds —
+# 300 by default — then denies. The app shows that question in the
+# conversation now, so a person watching answers in seconds; this shortens the
+# wait for an agent nobody is watching, from five minutes to one. Unanswered
+# is still deny.
+#
+# In Python rather than here because it merges into a YAML file the agent may
+# have written, and leaves any timeout somebody chose alone — neither of which
+# is safe to do with sed. `|| true` because a box that cannot tune a timeout
+# must still boot; the module never raises, and this is belt and braces.
+"${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.approvals "$HERMES_HOME" || true
+
 echo "[flotta-box] HERMES_HOME=$HERMES_HOME"
 echo "[flotta-box] workdir=$FLOTTA_WORKDIR"
 echo "[flotta-box] mount:"

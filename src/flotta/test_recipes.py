@@ -197,7 +197,7 @@ def test_the_entrypoint_seeds_soul_md_only_when_absent(tmp_path):
     import subprocess
 
     body = _ENTRYPOINT.read_text(encoding="utf-8")
-    start = body.index("if [ -n \"${FLOTTA_INSTRUCTIONS:-}\" ]")
+    start = body.index('if [ -n "${FLOTTA_INSTRUCTIONS:-}" ]')
     end = body.index("fi\n", start) + 3
     snippet = body[start:end]
 
@@ -223,3 +223,62 @@ def test_the_entrypoint_seeds_soul_md_only_when_absent(tmp_path):
     soul.write_text("I have evolved.\n")
     run({"FLOTTA_INSTRUCTIONS": "You review backend PRs."})
     assert soul.read_text() == "I have evolved.\n", "the seed overwrote the agent's own persona"
+
+
+def _approvals_line() -> str:
+    body = _ENTRYPOINT.read_text(encoding="utf-8")
+    return next(
+        line
+        for line in body.splitlines()
+        if "flotta.box.approvals" in line and not line.lstrip().startswith("#")
+    )
+
+
+def test_the_entrypoint_sets_the_approval_timeout_for_real(tmp_path):
+    """Run the entrypoint's approvals line itself, under the same `set -euo
+    pipefail` the box uses, against a temp HERMES_HOME (FLOTTA-60).
+
+    Not the module in isolation — `test_approvals.py` covers that. This is
+    the seam: the right interpreter, the right module path, the right argument,
+    as the line is actually written in the script."""
+    import subprocess
+    import sys
+
+    import yaml
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    venv = pathlib.Path(sys.executable).parent.parent
+
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", _approvals_line()],
+        env={"HERMES_HOME": str(home), "HERMES_VENV": str(venv), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "approvals.timeout set to" in result.stdout, result.stdout + result.stderr
+    written = yaml.safe_load((home / "config.yaml").read_text())
+    assert written["approvals"]["timeout"] < 300
+
+
+def test_a_box_without_the_venv_still_boots_past_the_approvals_line(tmp_path):
+    """`set -u` is on in the entrypoint, so an unset `$HERMES_VENV` would
+    abort the boot outright — and `|| true` does not catch that, because an
+    unbound variable exits the shell before the command runs. A default is
+    what makes the line safe; this proves it, with no venv anywhere."""
+    import subprocess
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", _approvals_line() + "\necho still-booting"],
+        env={"HERMES_HOME": str(home), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "still-booting" in result.stdout, "a missing venv stopped the box booting"

@@ -151,6 +151,17 @@ conventions, and the sharp edges below.
   tested against an image built the day before, and did nothing — the env
   reached the machine and no entrypoint read it. Say "needs a build" in the
   PR, and build before asking anyone to test.
+- **Flotta boxes deny an unanswered approval after 60s, not Hermes's 300s.**
+  `box_entrypoint.sh` runs `python -m flotta.box.approvals` before `hermes
+  serve`, which writes `approvals.timeout` into `$HERMES_HOME/config.yaml`
+  only where nobody has set one — absent, or still at Hermes's default of 300
+  — so a value somebody chose survives every boot. A partial `approvals:` block
+  is safe: measured on a box, Hermes deep-merges `config.yaml` over its
+  defaults and `mode` stays `smart`. **The `${HERMES_VENV:-…}` default on that
+  line is load-bearing**: the entrypoint runs `set -u`, and an unbound variable
+  exits the shell before `|| true` is ever reached — a missing venv would have
+  stopped the agent booting. `test_recipes.py` runs the line under `set -euo
+  pipefail` with no venv to prove it (FLOTTA-60).
 - **The deployed control plane is `pip install`ed, not run from `src/`.** A
   path resolved relative to a module (`Path(__file__).parents[n]`) is the
   repo root in a checkout and somewhere under site-packages on Railway.

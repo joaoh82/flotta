@@ -85,6 +85,13 @@ dev = [
     # The `postgres` extra stays for *runtime*: someone pointing
     # $FLOTTA_DATABASE_URL at a real server still opts in.
     "psycopg[binary]>=3.1",
+    # `flotta.box.approvals` reads and writes Hermes's config.yaml on a box.
+    # PyYAML is not a runtime dependency here because it does not need to be:
+    # the module runs inside Hermes's own venv, which already has it. It is
+    # in `dev` so its tests run everywhere — and deliberately not behind an
+    # `importorskip`, which is exactly how sixteen tests once vanished from CI
+    # while it stayed green (see the note above).
+    "pyyaml>=6",
 ]
 
 [build-system]
