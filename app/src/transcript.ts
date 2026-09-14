@@ -85,13 +85,14 @@ export function approvalAfter(
 }
 
 /**
- * What each of Hermes's answers means, in words a person can decide on.
+ * What each answer means, in words a person can decide on.
  *
- * The raw choices are protocol vocabulary: "session" and "always" do not say
- * what they grant or for how long, and those are exactly the two a person
- * should read before clicking. An unknown choice is shown as itself rather
- * than hidden — the Rust side has already filtered to answers the gateway
- * accepts, so reaching the default means the two drifted.
+ * `always` has no label because the window never offers it (FLOTTA-62): Hermes
+ * records it by pattern, permanently, on the agent's volume, so one click
+ * beside one command allowed a whole category forever with no way to see or
+ * undo it. If it ever arrives anyway it is shown as its raw name rather than
+ * dressed up as something reassuring — the Rust side filters it, so reaching
+ * the default means the two halves drifted.
  */
 export function choiceLabel(choice: string): string {
   switch (choice) {
@@ -99,13 +100,30 @@ export function choiceLabel(choice: string): string {
       return "Allow once";
     case "session":
       return "Allow for this conversation";
-    case "always":
-      return "Always allow";
     case "deny":
       return "Deny";
     default:
       return choice;
   }
+}
+
+/**
+ * What "Allow for this conversation" will actually cover, or null when the
+ * card does not offer it.
+ *
+ * The button's label is about *time*; this sentence is about *breadth*, and it
+ * is the part a person would get wrong. Hermes grants the pattern, not the
+ * command, so allowing one temp-directory delete for the conversation allows
+ * every command it classifies as a delete in a root path until the
+ * conversation ends. Saying so before the click is FLOTTA-62's acceptance: no
+ * button grants more than the card says.
+ */
+export function sessionScope(request: ApprovalRequest): string | null {
+  if (!request.choices.includes("session")) return null;
+  const covers = request.pattern
+    ? `every command Hermes classifies as “${request.pattern}”`
+    : "every command Hermes puts in the same category as this one";
+  return `“Allow for this conversation” allows ${covers}, not just this one, until the conversation ends.`;
 }
 
 /**

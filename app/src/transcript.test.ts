@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { approvalAfter, choiceLabel, isBusy, statusAfter, turnsAfter } from "./transcript";
+import {
+  approvalAfter,
+  choiceLabel,
+  isBusy,
+  sessionScope,
+  statusAfter,
+  turnsAfter,
+} from "./transcript";
 import type { AgentEvent, ApprovalRequest, Turn } from "./types";
 
 const said: Turn[] = [
@@ -109,6 +116,7 @@ const asked: ApprovalRequest = {
   request_id: "r-1",
   command: "rm -rf /workspace/old",
   description: "recursive delete",
+  pattern: "delete in root path",
   choices: ["once", "deny"],
 };
 
@@ -148,11 +156,16 @@ describe("approvalAfter", () => {
 });
 
 describe("choiceLabel", () => {
-  it("says what the two open-ended answers actually grant", () => {
+  it("labels the three answers the window offers", () => {
     expect(choiceLabel("session")).toBe("Allow for this conversation");
-    expect(choiceLabel("always")).toBe("Always allow");
     expect(choiceLabel("once")).toBe("Allow once");
     expect(choiceLabel("deny")).toBe("Deny");
+  });
+
+  it("gives always no reassuring label, because it should never reach the card", () => {
+    // FLOTTA-62. If it arrives, the two halves drifted — show the raw word
+    // rather than dress a permanent, pattern-wide grant up as a friendly button.
+    expect(choiceLabel("always")).toBe("always");
   });
 
   it("shows an unexpected choice as itself rather than hiding it", () => {
@@ -172,5 +185,28 @@ describe("isBusy", () => {
     for (const status of ["ready", "reply", "failed", "closed"] as const) {
       expect(isBusy(status), status).toBe(false);
     }
+  });
+});
+
+describe("sessionScope", () => {
+  const session: ApprovalRequest = { ...asked, choices: ["once", "session", "deny"] };
+
+  it("names the pattern a conversation-wide allow would cover", () => {
+    // The breadth is the part a person gets wrong: the label says how long,
+    // this says how much.
+    const text = sessionScope(session);
+    expect(text).toContain("delete in root path");
+    expect(text).toContain("not just this one");
+  });
+
+  it("still warns about breadth when Hermes sent no pattern", () => {
+    const text = sessionScope({ ...session, pattern: null });
+    expect(text).toContain("same category");
+  });
+
+  it("says nothing when the card does not offer a conversation-wide allow", () => {
+    // A smart-denied command gets once and deny only; a warning about a
+    // button that is not there would just be noise.
+    expect(sessionScope({ ...asked, choices: ["once", "deny"] })).toBeNull();
   });
 });
