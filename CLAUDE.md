@@ -247,6 +247,28 @@ conventions, and the sharp edges below.
   `just fly-secrets` sets both vocabularies — `OPENROUTER_API_KEY` for
   OpenRouter, `OPENAI_*` otherwise. Found by sending a real turn; no test
   could have caught it.
+- **A turn can stop and wait for a person: `approval.request`.** Hermes gates
+  terminal commands it considers risky. The box runs `approvals.mode = smart`
+  (the default with no `config.yaml`): a second model judges the command, and
+  when it escalates the gateway emits an `approval.request` **event** mid-turn
+  — payload `request_id`, `command` (already redacted), `description`,
+  `pattern_key`, `choices` from `once` / `session` / `always` / `deny` — and
+  blocks until the client sends the **RPC** `approval.respond`
+  `{session_id, request_id, choice}`. Unanswered, it denies after
+  `approvals.timeout` (default **300s**, fail-closed — "silence is not
+  consent"). Until FLOTTA-60 the app ignored the event, so a turn sat on
+  "thinking…" for five minutes blocked on a question nobody was shown. An
+  unrecognised `choice` is silently treated as `deny`, which is why the app
+  validates it. The resume payload carries `pending_approval` when one is
+  outstanding.
+- **To trigger an approval on purpose, ask for a routine command, not a scary
+  one.** A model asked to `curl … | sh` refuses on its own before the tool is
+  ever called, so the gate never fires — three fresh sessions in a row did
+  exactly that. `rm -rf /tmp/flotta-approval-probe` reads as ordinary cleanup
+  to the model and is still flagged ("delete in root path"), escalating on
+  three runs out of three. The path does not exist, so a wrong answer removes
+  nothing. `FLOTTA_BOX=eng-g just app-live` runs this through the app's own
+  turn loop.
 - **A provider failure arrives as a normal `message.complete`** whose text is
   an error string, with `status != "complete"`. Returning it as the reply would
   print "No inference provider configured" as though the agent had said it.

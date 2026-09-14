@@ -259,10 +259,32 @@ export type AgentEvent =
    * different instructions.
    */
   | { kind: "reset"; box_name: string }
+  /**
+   * The agent wants to run something Hermes considers risky and is waiting for
+   * a person to decide. Ignored until FLOTTA-60, which meant a turn could sit
+   * on "thinking…" for minutes, blocked on a question the window never asked.
+   */
+  | { kind: "approval"; box_name: string; request: ApprovalRequest }
   | { kind: "thinking"; box_name: string }
   | { kind: "reply"; box_name: string; text: string }
   | { kind: "failed"; box_name: string; detail: string }
   | { kind: "closed"; box_name: string };
+
+/**
+ * What Hermes asked permission for. Mirrors `ApprovalRequest` in
+ * `src-tauri/src/agent.rs`.
+ *
+ * `command` is already redacted on the box: a credential-shaped value is
+ * masked before it leaves. `choices` are Hermes's own — a command its
+ * classifier judged dangerous is offered fewer of them, and the window must
+ * not offer them back.
+ */
+export type ApprovalRequest = {
+  request_id: string | null;
+  command: string;
+  description: string;
+  choices: string[];
+};
 
 /** One line of a conversation the box already had. */
 export type HistoryLine = { role: string; text: string };

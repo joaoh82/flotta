@@ -412,6 +412,35 @@ async fn set_instructions(
     Ok(written)
 }
 
+/// Answer the approval an agent is waiting on.
+///
+/// The choice is checked against Hermes's four answers before it is sent.
+/// `approval.respond` treats anything it does not recognise as `deny` — safe,
+/// but silent, so a malformed click would read on the box as the person
+/// refusing, and nothing in the window would say so.
+#[tauri::command]
+async fn respond_approval(
+    state: tauri::State<'_, Conversations>,
+    box_name: String,
+    request_id: Option<String>,
+    choice: String,
+) -> Result<(), FleetError> {
+    if !agent::valid_choice(&choice) {
+        return Err(FleetError::Unexpected(format!(
+            "{choice:?} is not an answer the agent accepts"
+        )));
+    }
+    let Some(sender) = state.live(&box_name) else {
+        return Err(FleetError::Unreachable(format!(
+            "the conversation with {box_name} has ended, so there is nothing waiting on an answer"
+        )));
+    };
+    sender
+        .send(agent::Command::Approve { request_id, choice })
+        .await
+        .map_err(|_| FleetError::Unreachable(format!("the conversation with {box_name} has ended")))
+}
+
 /// Start this agent's conversation over.
 ///
 /// Only meaningful against a *live* conversation, so this does not open one:
@@ -452,6 +481,7 @@ pub fn run() {
             list_boxes,
             open_conversation,
             send_prompt,
+            respond_approval,
             agent_repos,
             grant_repo,
             revoke_repo,

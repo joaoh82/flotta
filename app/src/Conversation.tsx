@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { isFleetError, type AgentEvent, type Turn } from "./types";
-import { statusAfter, turnsAfter } from "./transcript";
+import { isFleetError, type AgentEvent, type ApprovalRequest, type Turn } from "./types";
+import { approvalAfter, choiceLabel, isBusy, statusAfter, turnsAfter } from "./transcript";
 
 /** An error from the Rust side, as a sentence rather than an object. */
 function describe(err: unknown): string {
@@ -21,6 +21,9 @@ export function Conversation({ boxName }: { boxName: string }) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [status, setStatus] = useState<AgentEvent["kind"]>("waking");
   const [draft, setDraft] = useState("");
+  /** The question the agent is blocked on, if any. */
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  const [answering, setAnswering] = useState(false);
   // Bumped to re-run the effect and reconnect. A failed conversation is
   // forgotten on the Rust side, so opening again really does reconnect rather
   // than returning success against a dead sender.
@@ -32,6 +35,7 @@ export function Conversation({ boxName }: { boxName: string }) {
   useEffect(() => {
     setTurns([]);
     setStatus("waking");
+    setApproval(null);
 
     let alive = true;
     let off: (() => void) | undefined;
@@ -51,6 +55,7 @@ export function Conversation({ boxName }: { boxName: string }) {
 
         setStatus(statusAfter(payload));
         setTurns((t) => turnsAfter(t, payload));
+        setApproval((a) => approvalAfter(a, payload));
       });
       if (!alive) {
         off();
@@ -81,7 +86,32 @@ export function Conversation({ boxName }: { boxName: string }) {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
   }, [turns, status]);
 
-  const busy = status === "waking" || status === "thinking";
+  const busy = isBusy(status);
+
+  /**
+   * Send the person's decision to the agent that is waiting on it.
+   *
+   * The card is taken down **after** the answer is accepted, not before: an
+   * answer that failed to send must leave the question on screen, or the agent
+   * sits blocked with nothing left to click.
+   */
+  async function answer(choice: string) {
+    if (!approval || answering) return;
+    setAnswering(true);
+    try {
+      await invoke("respond_approval", {
+        boxName,
+        requestId: approval.request_id,
+        choice,
+      });
+      setApproval(null);
+      setStatus("thinking");
+    } catch (err) {
+      setTurns((t) => [...t, { from: "system", text: describe(err) }]);
+    } finally {
+      setAnswering(false);
+    }
+  }
 
   async function send(event: React.FormEvent) {
     event.preventDefault();
@@ -136,6 +166,44 @@ export function Conversation({ boxName }: { boxName: string }) {
         )}
         {status === "thinking" && (
           <p className="text-xs text-neutral-500">{boxName} is thinking…</p>
+        )}
+
+        {/* The agent is blocked on this. Shown in the flow of the
+            conversation, where the person is already looking, rather than as a
+            modal that could open over another agent's pane. */}
+        {approval && (
+          <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm">
+            <div className="mb-1 font-medium text-amber-900">
+              {boxName} is waiting for your approval
+            </div>
+            {approval.description && (
+              <div className="mb-2 text-xs text-amber-900">{approval.description}</div>
+            )}
+            {approval.command && (
+              <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-neutral-900">
+                {approval.command}
+              </pre>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {approval.choices.map((choice) => (
+                <button
+                  key={choice}
+                  onClick={() => void answer(choice)}
+                  disabled={answering}
+                  className={
+                    choice === "deny"
+                      ? "rounded border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium hover:bg-neutral-50 disabled:opacity-40"
+                      : "rounded bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40"
+                  }
+                >
+                  {choiceLabel(choice)}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] text-amber-800">
+              Unanswered, it is denied automatically — silence is not consent.
+            </p>
+          </div>
         )}
         {(status === "failed" || status === "closed") && (
           <button
