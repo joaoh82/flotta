@@ -51,6 +51,30 @@ token goes in the keychain. On macOS you can confirm that:
 security find-generic-password -s dev.flotta.app -a control-plane-token
 ```
 
+## Watching an agent work
+
+A turn is rarely one model call. Asked what it can reach, an agent once ran
+seven shell commands over forty seconds, and the window said "thinking…" for
+all of it — a turn doing real work looked exactly like one that had hung.
+
+Hermes reports every step as it goes, and the conversation now shows them:
+
+- **Each tool as it runs**, with what it was asked to do (`terminal  ls
+  /workspace`), then a tick or a cross and how long it took. A command that
+  ran and exited non-zero is a cross — that eng-r turn had three, and each one
+  used to look like progress.
+- **What the agent said before using a tool** ("Checking the machine now.") as
+  its own line. The final reply does not repeat it — measured on a live box —
+  so it would otherwise vanish.
+- **The answer as it is written**, replaced by the finished reply.
+- **The tail of its reasoning**, faint, while there is nothing else to show,
+  and one line saying what it is doing now: preparing a tool, running one,
+  writing, or reasoning.
+
+Switching to another agent and back mid-turn shows the turn so far again
+rather than a blank pane. The steps are the window's, not the agent's memory:
+reopening a finished conversation shows what was said, not which commands ran.
+
 ## Start over, and why a conversation has a boundary at all
 
 Hermes renders an agent's system prompt **once, when a session starts**, and

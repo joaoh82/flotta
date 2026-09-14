@@ -1,4 +1,4 @@
-import type { AgentEvent, ApprovalRequest, Turn } from "./types";
+import type { AgentEvent, ApprovalRequest, Live, Step, Turn, WorkStep } from "./types";
 
 /**
  * What an event does to the transcript on screen.
@@ -33,9 +33,150 @@ export function turnsAfter(current: Turn[], event: AgentEvent): Turn[] {
       // Failures read in place, in order, rather than replacing the
       // conversation they interrupted — what was already said still happened.
       return [...current, { from: "system", text: event.detail }];
+    case "progress":
+      return withStep(current, event.step);
     default:
       return current;
   }
+}
+
+/** The transcript after one step: only the steps that are lines of it. */
+function withStep(current: Turn[], step: Step): Turn[] {
+  switch (step.kind) {
+    case "said":
+      return [...current, { from: "agent", text: step.text }];
+    case "tool_started": {
+      if (hasStep(current, step.id)) {
+        // A step seen twice — replayed after a remount — is not two steps.
+        return current;
+      }
+      return withWork(current, {
+        id: step.id,
+        tool: step.tool,
+        detail: step.detail,
+        state: "running",
+        seconds: null,
+      });
+    }
+    case "tool_finished": {
+      const state: WorkStep["state"] = step.failed ? "failed" : "done";
+      for (let i = current.length - 1; i >= 0; i--) {
+        const turn = current[i];
+        if (turn.from !== "work" || !turn.steps.some((s) => s.id === step.id)) continue;
+        const steps = turn.steps.map((s) =>
+          s.id === step.id ? { ...s, state, seconds: step.seconds } : s,
+        );
+        return [...current.slice(0, i), { from: "work", steps }, ...current.slice(i + 1)];
+      }
+      // Finished without ever being seen starting — a pane that mounted in
+      // between. Shown anyway: a step that happened is not dropped for
+      // arriving out of order.
+      return withWork(current, {
+        id: step.id,
+        tool: step.tool,
+        detail: "",
+        state,
+        seconds: step.seconds,
+      });
+    }
+    default:
+      return current;
+  }
+}
+
+function hasStep(turns: Turn[], id: string): boolean {
+  return turns.some((t) => t.from === "work" && t.steps.some((s) => s.id === id));
+}
+
+/**
+ * Add a step to the work block at the end, or start one.
+ *
+ * Consecutive tools share a block, so seven commands read as one piece of work
+ * rather than seven interruptions.
+ */
+function withWork(current: Turn[], step: WorkStep): Turn[] {
+  const last = current[current.length - 1];
+  return last?.from === "work"
+    ? [...current.slice(0, -1), { from: "work", steps: [...last.steps, step] }]
+    : [...current, { from: "work", steps: [step] }];
+}
+
+export const NOTHING_LIVE: Live = { text: "", reasoning: "", preparing: null };
+
+/**
+ * What is streaming, after an event.
+ *
+ * **Cleared by anything that ends the turn**, like the approval card: the reply
+ * replaces the streamed text with the finished one, and leaving the stream on
+ * screen as well would show the answer twice.
+ *
+ * Cleared too when a tool starts or narration is finished. What streamed
+ * before that is now a line of its own (`said`) or led to the step on screen,
+ * and the next piece of the answer starts from nothing.
+ */
+export function liveAfter(current: Live, event: AgentEvent): Live {
+  switch (event.kind) {
+    case "progress":
+      switch (event.step.kind) {
+        case "text":
+          return { ...current, text: current.text + event.step.text, preparing: null };
+        case "reasoning":
+          return { ...current, reasoning: current.reasoning + event.step.text };
+        case "preparing":
+          return { ...current, preparing: event.step.tool };
+        case "said":
+        case "tool_started":
+          return NOTHING_LIVE;
+        case "tool_finished":
+          return { ...current, preparing: null };
+        default:
+          return current;
+      }
+    case "reply":
+    case "failed":
+    case "closed":
+    case "reset":
+    case "ready":
+    case "waking":
+      return NOTHING_LIVE;
+    default:
+      return current;
+  }
+}
+
+/**
+ * One short phrase for what the agent is doing now.
+ *
+ * FLOTTA-61's acceptance is that nothing sits on a bare "thinking…" without
+ * saying what it is doing, and this is where that is decided. Most specific
+ * first: a tool being written, one running, the answer, then reasoning.
+ */
+export function doingNow(turns: Turn[], live: Live): string {
+  if (live.preparing) return `preparing ${live.preparing}…`;
+  const last = turns[turns.length - 1];
+  const running =
+    last?.from === "work" ? last.steps.find((s) => s.state === "running") : undefined;
+  if (running) return `running ${running.tool}…`;
+  if (live.text) return "writing…";
+  if (live.reasoning) return "reasoning…";
+  return "thinking…";
+}
+
+/**
+ * The end of the reasoning, as one line: the agent's train of thought without
+ * a wall of it.
+ */
+export function reasoningTail(reasoning: string, chars = 240): string {
+  const flat = reasoning.replace(/\s+/g, " ").trim();
+  return flat.length <= chars ? flat : `…${flat.slice(flat.length - (chars - 1))}`;
+}
+
+/** A tool's duration in the words a person reads it in. */
+export function duration(seconds: number | null): string {
+  if (seconds === null) return "";
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
 }
 
 /**
@@ -46,9 +187,22 @@ export function turnsAfter(current: Turn[], event: AgentEvent): Turn[] {
  * a status would add a value that every other branch — busy, reconnect, the
  * composer's disabled state — has to remember to ignore.
  */
-export function statusAfter(event: AgentEvent): AgentEvent["kind"] {
-  return event.kind === "reset" ? "ready" : event.kind;
+export function statusAfter(current: Status, event: AgentEvent): Status {
+  switch (event.kind) {
+    case "reset":
+      return "ready";
+    case "progress":
+      // Progress is the agent working, which is `thinking` — except while a
+      // card is up. Reasoning can keep streaming around an approval, and
+      // flipping to `thinking` would read as the question having been answered.
+      return current === "approval" ? "approval" : "thinking";
+    default:
+      return event.kind;
+  }
 }
+
+/** The states the pane can be in. `reset` and `progress` are events, not states. */
+export type Status = Exclude<AgentEvent["kind"], "reset" | "progress">;
 
 /**
  * The approval waiting on a person, after an event.
@@ -133,6 +287,6 @@ export function sessionScope(request: ApprovalRequest): string | null {
  * now would be deferred behind the very turn it seems to be answering, which
  * reads as the app eating it.
  */
-export function isBusy(status: AgentEvent["kind"]): boolean {
+export function isBusy(status: Status): boolean {
   return status === "waking" || status === "thinking" || status === "approval";
 }

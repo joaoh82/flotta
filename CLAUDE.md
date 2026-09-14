@@ -272,6 +272,19 @@ conventions, and the sharp edges below.
   unrecognised `choice` is silently treated as `deny`, which is why the app
   validates it. The resume payload carries `pending_approval` when one is
   outstanding.
+- **A turn reports its steps as events, and their payloads are measured, not
+  read from `vendor/`.** Captured on `eng-g` at v2026.9.11: `tool.generating`
+  `{name}`, `tool.start` `{tool_id, name, context, args}`, `tool.complete`
+  `{tool_id, name, duration_s, result: {error, exit_code, output}, args}`,
+  `reasoning.delta` / `message.delta` `{text}` (empty deltas arrive between
+  phases). **`thinking.delta` is Hermes's terminal spinner** (`"◉_◉
+  processing..."`), not the agent — never show it. A terminal command that
+  fails has `error: null` and a non-zero `exit_code`, so reading only `error`
+  calls it a success. **`message.complete`'s text is only the final segment**:
+  whatever the agent said before a tool is *not* repeated, so the app turns
+  that narration into its own line (`Step::Said`) when the tool starts.
+  `a_turn_shows_its_steps_as_they_happen` (`just app-live`) re-checks both on
+  the next Hermes bump (FLOTTA-61).
 - **Approvals are granted by pattern, not by command — so the app never offers
   `always`.** Hermes records `session` and `always` against the command's
   `pattern_key` (e.g. `delete in root path`), not the command itself. Measured

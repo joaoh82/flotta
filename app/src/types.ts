@@ -266,6 +266,12 @@ export type AgentEvent =
    */
   | { kind: "approval"; box_name: string; request: ApprovalRequest }
   | { kind: "thinking"; box_name: string }
+  /**
+   * What the agent is doing, while it does it (FLOTTA-61). Before this the
+   * window showed "thinking…" from submit to reply, and a turn that ran seven
+   * commands looked identical to one that had hung.
+   */
+  | { kind: "progress"; box_name: string; step: Step }
   | { kind: "reply"; box_name: string; text: string }
   | { kind: "failed"; box_name: string; detail: string }
   | { kind: "closed"; box_name: string };
@@ -296,8 +302,58 @@ export type ApprovalRequest = {
 /** One line of a conversation the box already had. */
 export type HistoryLine = { role: string; text: string };
 
+/**
+ * One step of a turn in progress. Mirrors `Step` in `src-tauri/src/agent.rs`,
+ * whose payload shapes were captured off a live gateway.
+ */
+export type Step =
+  /** The next piece of the model's reasoning. */
+  | { kind: "reasoning"; text: string }
+  /** The model is writing a call to this tool. */
+  | { kind: "preparing"; tool: string }
+  /** The next piece of what the agent is saying. */
+  | { kind: "text"; text: string }
+  /**
+   * Something the agent said before using a tool, now finished. The final
+   * reply does not repeat it — measured — so it is a transcript line of its own.
+   */
+  | { kind: "said"; text: string }
+  | { kind: "tool_started"; id: string; tool: string; detail: string }
+  | {
+      kind: "tool_finished";
+      id: string;
+      tool: string;
+      seconds: number | null;
+      failed: boolean;
+    };
+
+/** A tool the agent used, as the transcript shows it. */
+export type WorkStep = {
+  id: string;
+  tool: string;
+  /** One bounded line: what the tool was asked to do. */
+  detail: string;
+  state: "running" | "done" | "failed";
+  seconds: number | null;
+};
+
 /** One line of a transcript. */
-export type Turn = {
-  from: "you" | "agent" | "system";
+export type Turn =
+  | { from: "you" | "agent" | "system"; text: string }
+  /**
+   * The tools used between two things said. Shown while the turn runs and
+   * kept after it — but not on a resumed conversation, whose history comes
+   * from the box and carries only what was said.
+   */
+  | { from: "work"; steps: WorkStep[] };
+
+/**
+ * What is streaming right now and not yet a line of the transcript: the reply
+ * as it is written, the reasoning behind the next step, the tool being
+ * prepared.
+ */
+export type Live = {
   text: string;
+  reasoning: string;
+  preparing: string | null;
 };

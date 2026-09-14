@@ -97,6 +97,13 @@ pub enum AgentEvent {
     },
     /// A turn is in flight.
     Thinking { box_name: String },
+    /// What the agent is doing, while it does it (FLOTTA-61).
+    ///
+    /// Before this the window showed "thinking…" from submit to reply, so a
+    /// nine-step turn that ran seven shell commands looked identical to one
+    /// that had hung. Hermes was reporting every step the whole time; the app
+    /// was throwing it away and waiting for `message.complete`.
+    Progress { box_name: String, step: Step },
     /// The agent answered.
     Reply { box_name: String, text: String },
     /// Something went wrong. Ends the conversation.
@@ -194,6 +201,191 @@ pub struct ApprovalRequest {
     /// way. Carried so the window can say that before the click (FLOTTA-62).
     pub pattern: Option<String>,
     pub choices: Vec<String>,
+}
+
+/// One step of a turn in progress.
+///
+/// The payload shapes these are read from were captured off a live gateway
+/// (v2026.9.11) rather than taken from `vendor/`, the same way the approval
+/// payload was — field names are only trustworthy once seen on the wire:
+///
+/// ```text
+/// tool.generating  {"name":"terminal"}
+/// tool.start       {"tool_id":"call_…","name":"terminal","context":"ls /workspace","args":{…}}
+/// tool.complete    {"tool_id":"call_…","name":"terminal","duration_s":0.24,
+///                   "result":{"error":null,"exit_code":0,"output":"…"},"args":{…}}
+/// reasoning.delta  {"text":" user wants me to"}
+/// message.delta    {"text":"` is empty,"}
+/// ```
+///
+/// Not carried: `thinking.delta`, which is Hermes's terminal spinner
+/// (`"◉_◉ processing..."`) rather than anything the agent said, and a tool's
+/// output, which can be megabytes and is the agent's to summarise.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Step {
+    /// The model is reasoning; `text` is the next piece of it.
+    Reasoning { text: String },
+    /// The model is writing a call to this tool. Precedes `ToolStarted`, often
+    /// by the longest silence in a step.
+    Preparing { tool: String },
+    /// The next piece of what the agent is saying.
+    Text { text: String },
+    /// Something the agent said **before** using a tool — "let me check" — now
+    /// finished. The final reply does not repeat it, so it is a line of the
+    /// transcript in its own right rather than part of the streaming answer.
+    Said { text: String },
+    ToolStarted {
+        id: String,
+        tool: String,
+        /// One line, bounded: what the tool was asked to do.
+        detail: String,
+    },
+    ToolFinished {
+        id: String,
+        tool: String,
+        seconds: Option<f64>,
+        failed: bool,
+    },
+}
+
+/// Longest `detail` sent to the window. A tool's context can be a whole file
+/// being written; the step is a label, not a viewer.
+const DETAIL_CHARS: usize = 160;
+
+/// A tool's context as one bounded line.
+fn one_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= DETAIL_CHARS {
+        flat
+    } else {
+        let cut: String = flat.chars().take(DETAIL_CHARS - 1).collect();
+        format!("{cut}…")
+    }
+}
+
+/// A progress event's payload, as a step — or nothing, for events that are
+/// not progress or carry nothing worth showing.
+///
+/// Tolerant like `read_approval`: a missing field degrades the label, it never
+/// drops the frame into an error. A step the window cannot fully describe is
+/// still better than a return to a bare "thinking…".
+fn read_step(kind: &str, payload: &serde_json::Value) -> Option<Step> {
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    match kind {
+        "reasoning.delta" => Some(text("text"))
+            .filter(|t| !t.is_empty())
+            .map(|text| Step::Reasoning { text }),
+        "message.delta" => Some(text("text"))
+            .filter(|t| !t.is_empty())
+            .map(|text| Step::Text { text }),
+        "tool.generating" => Some(Step::Preparing { tool: text("name") }),
+        "tool.start" => Some(Step::ToolStarted {
+            id: text("tool_id"),
+            tool: text("name"),
+            detail: one_line(&text("context")),
+        }),
+        "tool.complete" => {
+            let result = payload.get("result");
+            // A tool reports failure two ways: an `error` string (the tool
+            // itself broke) or a non-zero `exit_code` (the command ran and
+            // failed). eng-r's slow turn was three of the second kind, each
+            // indistinguishable from success on screen.
+            let errored = result
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.as_str())
+                .is_some_and(|e| !e.is_empty());
+            let exited = result
+                .and_then(|r| r.get("exit_code"))
+                .and_then(|c| c.as_i64())
+                .is_some_and(|c| c != 0);
+            Some(Step::ToolFinished {
+                id: text("tool_id"),
+                tool: text("name"),
+                seconds: payload.get("duration_s").and_then(|d| d.as_f64()),
+                failed: errored || exited,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// What a turn has shown so far, so a pane that remounts mid-turn can be shown
+/// it again.
+///
+/// Also where narration becomes a line of its own. Text streams as `Text`, but
+/// when a tool starts, whatever was said before it is finished and will not be
+/// in the final reply — so it is re-issued as `Said`, and the streaming text
+/// starts again from nothing.
+#[derive(Debug, Default)]
+struct Activity {
+    /// Finished lines and tool steps, in order.
+    log: Vec<Step>,
+    /// Reasoning since the last tool.
+    reasoning: String,
+    /// Text since the last tool.
+    narration: String,
+}
+
+impl Activity {
+    /// Record a step and return what the window should be told.
+    fn observe(&mut self, step: Step) -> Vec<Step> {
+        match step {
+            Step::Reasoning { ref text } => {
+                self.reasoning.push_str(text);
+                vec![step]
+            }
+            Step::Text { ref text } => {
+                self.narration.push_str(text);
+                vec![step]
+            }
+            Step::ToolStarted { .. } => {
+                let mut out = Vec::new();
+                let said = self.narration.trim();
+                if !said.is_empty() {
+                    let said = Step::Said {
+                        text: said.to_string(),
+                    };
+                    self.log.push(said.clone());
+                    out.push(said);
+                }
+                self.narration.clear();
+                self.reasoning.clear();
+                self.log.push(step.clone());
+                out.push(step);
+                out
+            }
+            Step::ToolFinished { .. } => {
+                self.log.push(step.clone());
+                vec![step]
+            }
+            // Transient: by the time anyone replays, the tool has started or
+            // the preparation was abandoned.
+            Step::Preparing { .. } | Step::Said { .. } => vec![step],
+        }
+    }
+
+    /// Everything shown so far, as the steps that would show it again.
+    fn replay(&self) -> Vec<Step> {
+        let mut steps = self.log.clone();
+        if !self.reasoning.is_empty() {
+            steps.push(Step::Reasoning {
+                text: self.reasoning.clone(),
+            });
+        }
+        if !self.narration.is_empty() {
+            steps.push(Step::Text {
+                text: self.narration.clone(),
+            });
+        }
+        steps
+    }
 }
 
 /// The answers the window will send, and nothing else.
@@ -694,6 +886,8 @@ async fn call(
 enum TurnNote<'a> {
     /// Hermes stopped to ask permission.
     Approval(&'a ApprovalRequest),
+    /// The agent did something the window can show.
+    Progress(Step),
     /// The transcript pane remounted mid-turn and needs telling again that
     /// work is in flight — otherwise it sits on "waking" until the reply.
     StillThinking,
@@ -733,6 +927,7 @@ async fn one_turn(
 
     let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
     let mut pending: Option<ApprovalRequest> = None;
+    let mut activity = Activity::default();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -748,6 +943,11 @@ async fn one_turn(
                     Verdict::Approval(request) => {
                         note(TurnNote::Approval(&request));
                         pending = Some(request);
+                    }
+                    Verdict::Progress(step) => {
+                        for step in activity.observe(step) {
+                            note(TurnNote::Progress(step));
+                        }
                     }
                     Verdict::Reply(text) => return Ok(text),
                     Verdict::Failed(err) => return Err(err),
@@ -776,6 +976,12 @@ async fn one_turn(
                     // question back in front of the person — an approval that
                     // vanished on a tab switch is the original bug again.
                     note(TurnNote::StillThinking);
+                    // And what it has done so far. A remount clears the pane,
+                    // and a turn that had run four commands would otherwise
+                    // come back reading as one that had only just begun.
+                    for step in activity.replay() {
+                        note(TurnNote::Progress(step));
+                    }
                     if let Some(request) = &pending {
                         note(TurnNote::Approval(request));
                     }
@@ -809,6 +1015,8 @@ enum Verdict {
     Ignore,
     /// The agent stopped to ask. The turn is still in flight.
     Approval(ApprovalRequest),
+    /// The agent did something. The turn is still in flight.
+    Progress(Step),
     Reply(String),
     Failed(FleetError),
 }
@@ -837,7 +1045,14 @@ fn interpret(frame: &serde_json::Value, id: u64) -> Verdict {
             let payload = params.get("payload").cloned().unwrap_or_default();
             return Verdict::Approval(read_approval(&payload));
         }
-        _ => return Verdict::Ignore,
+        Some(kind) => {
+            let payload = params.get("payload").cloned().unwrap_or_default();
+            return match read_step(kind, &payload) {
+                Some(step) => Verdict::Progress(step),
+                None => Verdict::Ignore,
+            };
+        }
+        None => return Verdict::Ignore,
     }
 
     let payload = params.get("payload").cloned().unwrap_or_default();
@@ -1005,6 +1220,11 @@ pub async fn run(
                             box_name: box_name.clone(),
                         }
                         .emit(&app),
+                        TurnNote::Progress(step) => AgentEvent::Progress {
+                            box_name: box_name.clone(),
+                            step,
+                        }
+                        .emit(&app),
                     },
                 )
                 .await;
@@ -1155,10 +1375,262 @@ mod tests {
 
     #[test]
     fn interleaved_events_are_ignored() {
-        for kind in ["message.delta", "gateway.ready", "session.updated"] {
+        // `thinking.delta` is Hermes's terminal spinner, not the agent: a
+        // window that showed it would print "◉_◉ processing..." mid-transcript.
+        for kind in [
+            "gateway.ready",
+            "session.updated",
+            "thinking.delta",
+            "session.usage",
+        ] {
             let v = interpret(&serde_json::json!({"params": {"type": kind}}), 7);
             assert!(matches!(v, Verdict::Ignore), "{kind} should be ignored");
         }
+    }
+
+    /// A frame as the gateway sends it, for a progress event.
+    fn event(kind: &str, payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"type": kind, "seq": 19, "session_id": "4c0c1e22", "payload": payload},
+        })
+    }
+
+    fn step_of(frame: serde_json::Value) -> Step {
+        match interpret(&frame, 7) {
+            Verdict::Progress(step) => step,
+            other => panic!("expected a step, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_starting_is_shown_with_what_it_was_asked_to_do() {
+        // Captured from eng-g, v2026.9.11.
+        let step = step_of(event(
+            "tool.start",
+            serde_json::json!({"args": {"command": "ls /workspace"}, "context": "ls /workspace",
+                               "name": "terminal", "tool_id": "call_a58e614a5dbe4cceb84a0125"}),
+        ));
+        assert_eq!(
+            step,
+            Step::ToolStarted {
+                id: "call_a58e614a5dbe4cceb84a0125".into(),
+                tool: "terminal".into(),
+                detail: "ls /workspace".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tool_finishing_carries_its_duration_and_not_its_output() {
+        let step = step_of(event(
+            "tool.complete",
+            serde_json::json!({"args": {"command": "uname -a"}, "duration_s": 0.1347668170928955,
+                               "name": "terminal",
+                               "result": {"error": null, "exit_code": 0, "output": "Linux 815990c9246728 6.12.105-fly"},
+                               "tool_id": "call_3edca261bef64a5895988675"}),
+        ));
+        assert_eq!(
+            step,
+            Step::ToolFinished {
+                id: "call_3edca261bef64a5895988675".into(),
+                tool: "terminal".into(),
+                seconds: Some(0.1347668170928955),
+                failed: false,
+            }
+        );
+        // The output can be megabytes; the window is told the step, not the data.
+        assert!(!serde_json::to_string(&step).unwrap().contains("Linux"));
+    }
+
+    #[test]
+    fn a_command_that_ran_and_failed_is_shown_as_failed() {
+        // eng-r's slow turn: three commands failed and every one looked like
+        // progress. A non-zero exit is a failure even with no `error`.
+        let exited = step_of(event(
+            "tool.complete",
+            serde_json::json!({"tool_id": "t", "name": "terminal",
+                               "result": {"error": null, "exit_code": 2, "output": "usage: flotta repo"}}),
+        ));
+        assert!(matches!(exited, Step::ToolFinished { failed: true, .. }));
+
+        let broke = step_of(event(
+            "tool.complete",
+            serde_json::json!({"tool_id": "t", "name": "read_file",
+                               "result": {"error": "no such file"}}),
+        ));
+        assert!(matches!(broke, Step::ToolFinished { failed: true, .. }));
+    }
+
+    #[test]
+    fn a_tool_whose_result_is_not_an_object_still_finishes() {
+        // Not every tool returns the terminal's shape. A result the window
+        // cannot read must not leave the step spinning forever.
+        let step = step_of(event(
+            "tool.complete",
+            serde_json::json!({"tool_id": "t", "name": "web_search", "result": "three hits"}),
+        ));
+        assert!(matches!(
+            step,
+            Step::ToolFinished {
+                failed: false,
+                seconds: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_long_or_multi_line_context_becomes_one_bounded_line() {
+        let long = format!("cat <<'EOF' > notes.md\n{}\nEOF", "word ".repeat(200));
+        let Step::ToolStarted { detail, .. } = step_of(event(
+            "tool.start",
+            serde_json::json!({"tool_id": "t", "name": "terminal", "context": long}),
+        )) else {
+            panic!("not a tool start");
+        };
+        assert!(!detail.contains('\n'), "{detail}");
+        assert_eq!(detail.chars().count(), DETAIL_CHARS);
+        assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn streaming_text_and_reasoning_are_steps_and_empty_pieces_are_not() {
+        assert_eq!(
+            step_of(event(
+                "message.delta",
+                serde_json::json!({"text": "` is empty,"})
+            )),
+            Step::Text {
+                text: "` is empty,".into()
+            }
+        );
+        assert_eq!(
+            step_of(event(
+                "reasoning.delta",
+                serde_json::json!({"text": " run two"})
+            )),
+            Step::Reasoning {
+                text: " run two".into()
+            }
+        );
+        // The gateway sends empty deltas between phases.
+        for kind in ["message.delta", "reasoning.delta"] {
+            let v = interpret(&event(kind, serde_json::json!({"text": ""})), 7);
+            assert!(matches!(v, Verdict::Ignore), "{kind} with no text");
+        }
+    }
+
+    #[test]
+    fn preparing_a_tool_names_it() {
+        assert_eq!(
+            step_of(event(
+                "tool.generating",
+                serde_json::json!({"name": "terminal"})
+            )),
+            Step::Preparing {
+                tool: "terminal".into()
+            }
+        );
+    }
+
+    fn started(id: &str) -> Step {
+        Step::ToolStarted {
+            id: id.into(),
+            tool: "terminal".into(),
+            detail: "ls".into(),
+        }
+    }
+
+    fn text(t: &str) -> Step {
+        Step::Text { text: t.into() }
+    }
+
+    #[test]
+    fn narration_before_a_tool_becomes_a_line_of_its_own() {
+        // The final reply does not repeat it, so left as streaming text it
+        // would be replaced by the reply and vanish.
+        let mut activity = Activity::default();
+        activity.observe(text("Let me "));
+        activity.observe(text("check.\n"));
+        let out = activity.observe(started("a"));
+        assert_eq!(
+            out,
+            vec![
+                Step::Said {
+                    text: "Let me check.".into()
+                },
+                started("a")
+            ]
+        );
+        // And the streaming text starts again from nothing.
+        assert!(activity.narration.is_empty());
+    }
+
+    #[test]
+    fn a_tool_with_nothing_said_before_it_adds_no_empty_line() {
+        let mut activity = Activity::default();
+        activity.observe(text("\n\n"));
+        assert_eq!(activity.observe(started("a")), vec![started("a")]);
+    }
+
+    #[test]
+    fn a_remounted_pane_is_shown_the_turn_so_far() {
+        let mut activity = Activity::default();
+        activity.observe(Step::Reasoning {
+            text: "old thought".into(),
+        });
+        activity.observe(started("a"));
+        let finished = Step::ToolFinished {
+            id: "a".into(),
+            tool: "terminal".into(),
+            seconds: Some(0.2),
+            failed: false,
+        };
+        activity.observe(finished.clone());
+        activity.observe(Step::Reasoning {
+            text: "new ".into(),
+        });
+        activity.observe(Step::Reasoning {
+            text: "thought".into(),
+        });
+        activity.observe(Step::Preparing {
+            tool: "terminal".into(),
+        });
+        activity.observe(text("It is "));
+        activity.observe(text("empty"));
+
+        assert_eq!(
+            activity.replay(),
+            vec![
+                started("a"),
+                finished,
+                // Only reasoning since the last tool: the old thought led to a
+                // step that is already on screen.
+                Step::Reasoning {
+                    text: "new thought".into()
+                },
+                // Coalesced: one piece rather than every delta again.
+                text("It is empty"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_progress_event_reaches_the_window_tagged_by_kind() {
+        // The frontend switches on these names; renaming a variant here
+        // without it would silently drop every step.
+        let json = serde_json::to_value(AgentEvent::Progress {
+            box_name: "eng-g".into(),
+            step: started("a"),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "progress", "box_name": "eng-g",
+                               "step": {"kind": "tool_started", "id": "a", "tool": "terminal", "detail": "ls"}})
+        );
     }
 
     fn approval_frame(payload: serde_json::Value) -> serde_json::Value {
@@ -1769,6 +2241,121 @@ mod tests {
                 answer.to_lowercase().contains(&word),
                 "the agent is still running the old instructions: {answer:?}"
             );
+        });
+    }
+
+    /// FLOTTA-61's acceptance, against a real box: a turn that uses tools
+    /// reports each one while it runs, before the reply — and the reply is
+    /// still the reply.
+    ///
+    /// Also settles the one question the captured frames could not: whether
+    /// `message.complete` repeats what the agent said *before* a tool. If it
+    /// did, `Said` would print that sentence twice.
+    #[test]
+    #[ignore = "talks to a real box: costs a wake and model calls"]
+    fn a_turn_shows_its_steps_as_they_happen() {
+        let Ok(token) = std::env::var("FLOTTA_TOKEN") else {
+            panic!("set FLOTTA_TOKEN to a box:chat token");
+        };
+        let settings = Settings {
+            control_url: std::env::var("FLOTTA_CONTROL_URL").unwrap_or_default(),
+            domain: std::env::var("FLOTTA_DOMAIN").unwrap_or_else(|_| "flotta.dev".into()),
+        };
+        let box_name = std::env::var("FLOTTA_BOX").unwrap_or_else(|_| "eng-a".into());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (mut socket, _, _) = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
+            let session = create_session(&mut socket)
+                .await
+                .unwrap_or_else(|e| panic!("session.create failed: {}", e.detail()));
+
+            let (_tx, mut rx) = mpsc::channel(1);
+            let mut deferred = VecDeque::new();
+            let mut ping = tokio::time::interval(PING_EVERY);
+            ping.tick().await;
+
+            let steps: std::sync::Arc<std::sync::Mutex<Vec<(Duration, Step)>>> = Default::default();
+            let record = steps.clone();
+            let started = tokio::time::Instant::now();
+
+            let reply = one_turn(
+                &mut socket,
+                &session,
+                "First say the sentence 'Checking the machine now.' Then use your terminal \
+                 tool to run `uname -s`, and then run `false`. Finally answer in one \
+                 short sentence.",
+                &mut rx,
+                &mut deferred,
+                &mut ping,
+                |note| {
+                    if let TurnNote::Progress(step) = note {
+                        record.lock().unwrap().push((started.elapsed(), step));
+                    }
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the turn failed: {}", e.detail()));
+            let replied = started.elapsed();
+
+            let steps = steps.lock().unwrap().clone();
+            for (at, step) in &steps {
+                match step {
+                    Step::Text { .. } | Step::Reasoning { .. } => {}
+                    other => println!("{:>6.2}s {other:?}", at.as_secs_f64()),
+                }
+            }
+            println!("{:>6.2}s reply {reply:?}", replied.as_secs_f64());
+
+            let tools: Vec<_> = steps
+                .iter()
+                .filter_map(|(at, s)| match s {
+                    Step::ToolFinished { failed, .. } => Some((*at, *failed)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !tools.is_empty(),
+                "no tool step was reported before the reply"
+            );
+            assert!(
+                tools.iter().all(|(at, _)| *at < replied),
+                "tool steps must arrive while the turn runs, not after it"
+            );
+            assert!(
+                steps
+                    .iter()
+                    .any(|(_, s)| matches!(s, Step::ToolStarted { .. })),
+                "a finished tool was never shown starting"
+            );
+            // `false` exits 1. If the model ran it, the window must say it failed.
+            let ran_false = steps.iter().any(
+                |(_, s)| matches!(s, Step::ToolStarted { detail, .. } if detail.trim() == "false"),
+            );
+            if ran_false {
+                assert!(
+                    tools.iter().any(|(_, failed)| *failed),
+                    "`false` ran and nothing was shown as failed"
+                );
+            }
+            assert!(
+                steps.iter().any(|(_, s)| matches!(s, Step::Text { .. })),
+                "the answer did not stream"
+            );
+            for (_, step) in &steps {
+                if let Step::Said { text } = step {
+                    assert!(
+                        !reply.contains(text.as_str()),
+                        "the reply repeats narration already shown as its own line: {text:?}"
+                    );
+                }
+            }
         });
     }
 }
