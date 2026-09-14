@@ -272,6 +272,18 @@ conventions, and the sharp edges below.
   unrecognised `choice` is silently treated as `deny`, which is why the app
   validates it. The resume payload carries `pending_approval` when one is
   outstanding.
+- **Approvals are granted by pattern, not by command — so the app never offers
+  `always`.** Hermes records `session` and `always` against the command's
+  `pattern_key` (e.g. `delete in root path`), not the command itself. Measured
+  on `eng-g`: answering `session` for `rm -rf /tmp/…-a` let `rm -rf /tmp/…-b`
+  run with **no approval asked**. `always` does the same **permanently**,
+  writing the pattern to `command_allowlist` in `$HERMES_HOME/config.yaml` on
+  the volume — surviving restarts, re-images and updates, invisible in the app.
+  A button beside one command must not grant a category forever, so
+  `APPROVAL_CHOICES` in `agent.rs` omits `always`: `read_approval` drops it from
+  the card and `valid_choice` refuses to send it. The card names the pattern
+  that "Allow for this conversation" would cover (FLOTTA-62). `session` is not
+  persisted — `config.yaml` is unchanged after one.
 - **To trigger an approval on purpose, ask for a routine command, not a scary
   one.** A model asked to `curl … | sh` refuses on its own before the tool is
   ever called, so the gate never fires — three fresh sessions in a row did

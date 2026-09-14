@@ -283,6 +283,13 @@ export type ApprovalRequest = {
   request_id: string | null;
   command: string;
   description: string;
+  /**
+   * The category Hermes matched, e.g. `delete in root path`. **This, not the
+   * command, is what "Allow for this conversation" grants** — Hermes records
+   * approvals by pattern — so the card names it before the click (FLOTTA-62).
+   */
+  pattern: string | null;
+  /** Never contains `always`: the Rust side drops it on purpose. */
   choices: string[];
 };
 

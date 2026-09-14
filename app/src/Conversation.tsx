@@ -2,7 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isFleetError, type AgentEvent, type ApprovalRequest, type Turn } from "./types";
-import { approvalAfter, choiceLabel, isBusy, statusAfter, turnsAfter } from "./transcript";
+import {
+  approvalAfter,
+  choiceLabel,
+  isBusy,
+  sessionScope,
+  statusAfter,
+  turnsAfter,
+} from "./transcript";
 
 /** An error from the Rust side, as a sentence rather than an object. */
 function describe(err: unknown): string {
@@ -200,6 +207,9 @@ export function Conversation({ boxName }: { boxName: string }) {
                 </button>
               ))}
             </div>
+            {sessionScope(approval) && (
+              <p className="mt-2 text-[11px] text-amber-900">{sessionScope(approval)}</p>
+            )}
             <p className="mt-2 text-[11px] text-amber-800">
               Unanswered, it is denied automatically — silence is not consent.
             </p>

@@ -186,15 +186,34 @@ pub struct ApprovalRequest {
     pub command: String,
     /// Hermes's own one-line reason it stopped to ask.
     pub description: String,
+    /// The category Hermes matched, e.g. `delete in root path`.
+    ///
+    /// **This, not the command, is what an allow beyond "once" grants.**
+    /// Hermes records approvals by pattern, so allowing one temp-directory
+    /// delete for the conversation allows every command it classifies the same
+    /// way. Carried so the window can say that before the click (FLOTTA-62).
+    pub pattern: Option<String>,
     pub choices: Vec<String>,
 }
 
-/// The four answers Hermes accepts, and nothing else.
+/// The answers the window will send, and nothing else.
 ///
-/// Checked here rather than forwarded blind: `approval.respond` defaults an
-/// unrecognised choice to `deny`, which is safe but silent — a typo in the
-/// window would read as the person refusing.
-pub const APPROVAL_CHOICES: [&str; 4] = ["once", "session", "always", "deny"];
+/// **`always` is deliberately absent (FLOTTA-62).** Hermes accepts it, and
+/// what it does is not what a button beside one command implies: it records
+/// the command's *pattern* in `command_allowlist` in the agent's
+/// `config.yaml`, on its volume, so one click on a card about a single
+/// temp-directory delete permanently let that agent run any "delete in root
+/// path" command without asking — surviving restarts, re-images and Hermes
+/// updates, with no way to see or undo it from the app. A permanent grant
+/// should be a deliberate act, not a button next to Deny.
+///
+/// Filtered twice on purpose: `read_approval` drops it from what the window is
+/// shown, and `valid_choice` refuses to send it, so a crafted call from the
+/// webview cannot reach the gateway with it either.
+///
+/// Also checked because `approval.respond` defaults an unrecognised choice to
+/// `deny` — safe, but silent, so a typo would read as the person refusing.
+pub const APPROVAL_CHOICES: [&str; 3] = ["once", "session", "deny"];
 
 pub fn valid_choice(choice: &str) -> bool {
     APPROVAL_CHOICES.contains(&choice)
@@ -235,6 +254,12 @@ fn read_approval(payload: &serde_json::Value) -> ApprovalRequest {
             .map(str::to_string),
         command: text("command"),
         description: text("description"),
+        pattern: payload
+            .get("pattern_key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string),
         choices,
     }
 }
@@ -1164,7 +1189,8 @@ mod tests {
         assert_eq!(request.request_id.as_deref(), Some("r-1"));
         assert_eq!(request.command, "rm -rf /workspace/old");
         assert_eq!(request.description, "recursive delete");
-        assert_eq!(request.choices, ["once", "session", "always", "deny"]);
+        // `always` is offered by Hermes and deliberately not by the window.
+        assert_eq!(request.choices, ["once", "session", "deny"]);
     }
 
     #[test]
@@ -1216,8 +1242,46 @@ mod tests {
     }
 
     #[test]
-    fn only_the_four_answers_hermes_accepts_are_valid() {
-        for choice in ["once", "session", "always", "deny"] {
+    fn always_is_never_offered_even_when_hermes_offers_it() {
+        // FLOTTA-62. Hermes records `always` by *pattern*, permanently, on the
+        // agent's volume — so one click beside one command allowed a whole
+        // category of commands forever, invisibly. The window shows it no more.
+        let request = read_approval(&serde_json::json!({
+            "command": "rm -rf /tmp/x",
+            "pattern_key": "delete in root path",
+            "choices": ["once", "session", "always", "deny"],
+        }));
+        assert!(!request.choices.iter().any(|c| c == "always"));
+    }
+
+    #[test]
+    fn always_cannot_be_sent_even_by_a_crafted_call() {
+        // Dropping it from the card is not enough on its own: the webview can
+        // invoke `respond_approval` with any string it likes.
+        assert!(!valid_choice("always"));
+    }
+
+    #[test]
+    fn a_card_that_offered_only_always_still_has_something_to_click() {
+        // Filtering must not leave an unanswerable prompt — the original bug.
+        let request = read_approval(&serde_json::json!({"choices": ["always"]}));
+        assert_eq!(request.choices, ["once", "deny"]);
+    }
+
+    #[test]
+    fn the_pattern_a_grant_would_cover_is_carried_to_the_window() {
+        let request = read_approval(&serde_json::json!({"pattern_key": " delete in root path "}));
+        assert_eq!(request.pattern.as_deref(), Some("delete in root path"));
+        assert_eq!(
+            read_approval(&serde_json::json!({"pattern_key": ""})).pattern,
+            None
+        );
+        assert_eq!(read_approval(&serde_json::json!({})).pattern, None);
+    }
+
+    #[test]
+    fn only_the_answers_the_window_offers_are_valid() {
+        for choice in ["once", "session", "deny"] {
             assert!(valid_choice(choice), "{choice} was refused");
         }
         // `approval.respond` defaults an unknown choice to deny — safe, but
