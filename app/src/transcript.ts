@@ -1,4 +1,4 @@
-import type { AgentEvent, Turn } from "./types";
+import type { AgentEvent, ApprovalRequest, Turn } from "./types";
 
 /**
  * What an event does to the transcript on screen.
@@ -48,4 +48,73 @@ export function turnsAfter(current: Turn[], event: AgentEvent): Turn[] {
  */
 export function statusAfter(event: AgentEvent): AgentEvent["kind"] {
   return event.kind === "reset" ? "ready" : event.kind;
+}
+
+/**
+ * The approval waiting on a person, after an event.
+ *
+ * **Cleared by anything that ends the turn**, not only by an answer. Hermes's
+ * gate times out on its own and denies, and the turn then finishes with a
+ * reply or a failure; a card left on screen after that would offer buttons for
+ * a question that was already decided — and a click would land on nothing, or
+ * worse, on the next turn's approval.
+ *
+ * A second `approval` replaces the first rather than stacking. The turn loop
+ * answers one at a time, and two cards would invite answering the wrong one.
+ */
+export function approvalAfter(
+  current: ApprovalRequest | null,
+  event: AgentEvent,
+): ApprovalRequest | null {
+  switch (event.kind) {
+    case "approval":
+      return event.request;
+    case "reply":
+    case "failed":
+    case "closed":
+    case "reset":
+    case "ready":
+    case "waking":
+      return null;
+    default:
+      // `thinking` arrives again when the pane remounts mid-turn, *before* the
+      // pending approval is re-sent. Clearing on it would flash the card away
+      // and back; keeping it is what a remount needs.
+      return current;
+  }
+}
+
+/**
+ * What each of Hermes's answers means, in words a person can decide on.
+ *
+ * The raw choices are protocol vocabulary: "session" and "always" do not say
+ * what they grant or for how long, and those are exactly the two a person
+ * should read before clicking. An unknown choice is shown as itself rather
+ * than hidden — the Rust side has already filtered to answers the gateway
+ * accepts, so reaching the default means the two drifted.
+ */
+export function choiceLabel(choice: string): string {
+  switch (choice) {
+    case "once":
+      return "Allow once";
+    case "session":
+      return "Allow for this conversation";
+    case "always":
+      return "Always allow";
+    case "deny":
+      return "Deny";
+    default:
+      return choice;
+  }
+}
+
+/**
+ * Whether the composer is busy — no sending while this is true.
+ *
+ * Waiting on an approval counts. The agent is mid-turn, and a message typed
+ * now would be deferred behind the very turn it seems to be answering, which
+ * reads as the app eating it.
+ */
+export function isBusy(status: AgentEvent["kind"]): boolean {
+  return status === "waking" || status === "thinking" || status === "approval";
 }

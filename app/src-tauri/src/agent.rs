@@ -24,7 +24,7 @@
 use crate::fleet::{FleetError, Settings};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -83,6 +83,18 @@ pub enum AgentEvent {
     /// nothing to show yet", the other means "there is nothing any more", and
     /// they are not the same instruction.
     Reset { box_name: String },
+    /// The agent wants to run something Hermes considers risky, and is
+    /// **waiting for a person to decide**.
+    ///
+    /// Before this existed the app ignored `approval.request` entirely, so a
+    /// turn that tripped Hermes's approval gate sat on "thinking…" until the
+    /// gate's own timeout denied it — an agent blocked on a question the
+    /// window never asked. `choices` are Hermes's, not ours: a command its
+    /// smart classifier already judged dangerous is offered fewer of them.
+    Approval {
+        box_name: String,
+        request: ApprovalRequest,
+    },
     /// A turn is in flight.
     Thinking { box_name: String },
     /// The agent answered.
@@ -150,6 +162,81 @@ pub enum Command {
     /// deliberately not used: forgetting a conversation is not what "start
     /// over" should mean.
     Reset,
+    /// Answer a pending approval.
+    ///
+    /// Only meaningful **during** a turn — that is the only time Hermes is
+    /// waiting on one — so it is read inside `one_turn` rather than the idle
+    /// loop. Arriving between turns it is dropped: whatever it answered has
+    /// already been decided, by the gate's timeout if nothing else.
+    Approve {
+        request_id: Option<String>,
+        choice: String,
+    },
+}
+
+/// What Hermes asked permission for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ApprovalRequest {
+    /// Absent on older gateways, which resolve the oldest pending approval
+    /// instead. Sent back when present so two approvals in one turn cannot
+    /// be answered in the wrong order.
+    pub request_id: Option<String>,
+    /// Already redacted by the gateway: a credential-shaped value in the
+    /// command is masked before it leaves the box.
+    pub command: String,
+    /// Hermes's own one-line reason it stopped to ask.
+    pub description: String,
+    pub choices: Vec<String>,
+}
+
+/// The four answers Hermes accepts, and nothing else.
+///
+/// Checked here rather than forwarded blind: `approval.respond` defaults an
+/// unrecognised choice to `deny`, which is safe but silent — a typo in the
+/// window would read as the person refusing.
+pub const APPROVAL_CHOICES: [&str; 4] = ["once", "session", "always", "deny"];
+
+pub fn valid_choice(choice: &str) -> bool {
+    APPROVAL_CHOICES.contains(&choice)
+}
+
+/// An `approval.request` payload, read field by field.
+///
+/// Tolerant for the same reason `read_resume` is: an approval the window
+/// cannot fully parse must still be *shown*, because the alternative is the
+/// original bug — an agent waiting on a prompt nobody sees. Missing `choices`
+/// falls back to the two answers every gateway accepts.
+fn read_approval(payload: &serde_json::Value) -> ApprovalRequest {
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let choices: Vec<String> = payload
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|c| c.as_str())
+                .filter(|c| valid_choice(c))
+                .map(str::to_string)
+                .collect()
+        })
+        .filter(|c: &Vec<String>| !c.is_empty())
+        .unwrap_or_else(|| vec!["once".into(), "deny".into()]);
+    ApprovalRequest {
+        request_id: payload
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        command: text("command"),
+        description: text("description"),
+        choices,
+    }
 }
 
 impl Conversations {
@@ -578,7 +665,40 @@ async fn call(
 }
 
 /// Submit one prompt and wait for the agent's answer.
-async fn one_turn(socket: &mut Socket, session_id: &str, text: &str) -> Result<String, FleetError> {
+/// Something a turn needs the window to know while it is still running.
+enum TurnNote<'a> {
+    /// Hermes stopped to ask permission.
+    Approval(&'a ApprovalRequest),
+    /// The transcript pane remounted mid-turn and needs telling again that
+    /// work is in flight — otherwise it sits on "waking" until the reply.
+    StillThinking,
+}
+
+/// One prompt, from submit to reply.
+///
+/// **It listens for the person as well as the agent.** The first version
+/// awaited socket frames and nothing else, so a turn that tripped Hermes's
+/// approval gate could not have been answered even if the window had shown
+/// the prompt: the click would have queued behind the very turn it was meant
+/// to unblock. So this selects over three things — the agent's frames, the
+/// window's commands, and the keep-alive — for the whole turn.
+///
+/// The keep-alive matters more here than it did. A turn used to be a model
+/// call with frames flowing; a turn waiting on a person is silence, and
+/// Cloudflare closes an idle proxied socket at around a hundred seconds
+/// without telling either end.
+///
+/// Commands that are not answers — a resync, a reset, another prompt — are
+/// **deferred** rather than dropped, and run in order once the turn ends.
+async fn one_turn(
+    socket: &mut Socket,
+    session_id: &str,
+    text: &str,
+    commands: &mut mpsc::Receiver<Command>,
+    deferred: &mut VecDeque<Command>,
+    ping: &mut tokio::time::Interval,
+    mut note: impl FnMut(TurnNote),
+) -> Result<String, FleetError> {
     let id = rpc(
         socket,
         "prompt.submit",
@@ -587,6 +707,7 @@ async fn one_turn(socket: &mut Socket, session_id: &str, text: &str) -> Result<S
     .await?;
 
     let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
+    let mut pending: Option<ApprovalRequest> = None;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -594,12 +715,60 @@ async fn one_turn(socket: &mut Socket, session_id: &str, text: &str) -> Result<S
                 "the agent did not answer in time".into(),
             ));
         }
-        let frame = next_frame(socket, remaining).await?;
 
-        match interpret(&frame, id) {
-            Verdict::Ignore => continue,
-            Verdict::Reply(text) => return Ok(text),
-            Verdict::Failed(err) => return Err(err),
+        tokio::select! {
+            frame = next_frame(socket, remaining) => {
+                match interpret(&frame?, id) {
+                    Verdict::Ignore => {}
+                    Verdict::Approval(request) => {
+                        note(TurnNote::Approval(&request));
+                        pending = Some(request);
+                    }
+                    Verdict::Reply(text) => return Ok(text),
+                    Verdict::Failed(err) => return Err(err),
+                }
+            }
+            command = commands.recv() => match command {
+                Some(Command::Approve { request_id, choice }) => {
+                    // The window's id wins; the pending one is the fallback for
+                    // a click that arrived without one. With neither, the
+                    // gateway resolves the oldest approval in the session.
+                    let request_id = request_id
+                        .or_else(|| pending.as_ref().and_then(|p| p.request_id.clone()));
+                    let mut params = serde_json::json!({
+                        "session_id": session_id,
+                        "choice": choice,
+                    });
+                    if let Some(request_id) = request_id {
+                        params["request_id"] = serde_json::json!(request_id);
+                    }
+                    rpc(socket, "approval.respond", params).await?;
+                    pending = None;
+                }
+                Some(Command::Resync) => {
+                    // Switching away and back mid-turn remounts the pane with
+                    // nothing in it. Say work is in flight, and put a pending
+                    // question back in front of the person — an approval that
+                    // vanished on a tab switch is the original bug again.
+                    note(TurnNote::StillThinking);
+                    if let Some(request) = &pending {
+                        note(TurnNote::Approval(request));
+                    }
+                    deferred.push_back(Command::Resync);
+                }
+                Some(other) => deferred.push_back(other),
+                None => {
+                    return Err(FleetError::Unreachable(
+                        "the conversation was closed".into(),
+                    ))
+                }
+            },
+            _ = ping.tick() => {
+                socket
+                    .send(Message::Ping(Vec::new()))
+                    .await
+                    .map_err(|_| FleetError::Unreachable("the connection to the agent dropped".into()))?;
+            }
         }
     }
 }
@@ -613,6 +782,8 @@ async fn one_turn(socket: &mut Socket, session_id: &str, text: &str) -> Result<S
 enum Verdict {
     /// Not about this turn. Events interleave with responses constantly.
     Ignore,
+    /// The agent stopped to ask. The turn is still in flight.
+    Approval(ApprovalRequest),
     Reply(String),
     Failed(FleetError),
 }
@@ -635,8 +806,13 @@ fn interpret(frame: &serde_json::Value, id: u64) -> Verdict {
     let Some(params) = frame.get("params") else {
         return Verdict::Ignore;
     };
-    if params.get("type").and_then(|t| t.as_str()) != Some("message.complete") {
-        return Verdict::Ignore;
+    match params.get("type").and_then(|t| t.as_str()) {
+        Some("message.complete") => {}
+        Some("approval.request") => {
+            let payload = params.get("payload").cloned().unwrap_or_default();
+            return Verdict::Approval(read_approval(&payload));
+        }
+        _ => return Verdict::Ignore,
     }
 
     let payload = params.get("payload").cloned().unwrap_or_default();
@@ -715,83 +891,115 @@ pub async fn run(
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await; // the first tick is immediate
 
+    // Commands that arrived during a turn, in the order they arrived.
+    let mut deferred: VecDeque<Command> = VecDeque::new();
+
     loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    finish(&app, &box_name, None);
-                    return;
-                };
-                match command {
-                    Command::Resync => {
-                        // The same read `attach` does at connect, deliberately.
-                        //
-                        // The first version resumed `session_id` directly and
-                        // failed against a real box with
-                        // `{"code":4007,"message":"session not found"}` —
-                        // because **there are two ids**. `session.resume` looks
-                        // its argument up in the *database*; the id it hands
-                        // back is the live in-memory key that `prompt.submit`
-                        // needs. Resuming the live one asks the database for a
-                        // row that was never in it.
-                        //
-                        // Two ids to keep in step is two chances to use the
-                        // wrong one — and the same words, `session not found`,
-                        // for both mistakes under different codes (4001 and
-                        // 4007). Re-running `attach` keeps exactly one path
-                        // that knows which id is which.
-                        match attach(&mut socket, &settings, &box_name).await {
-                            Ok((live, resumed)) => {
-                                session_id = live;
-                                AgentEvent::Ready {
-                                    box_name: box_name.clone(),
-                                    resumed,
-                                }
-                                .emit(&app);
-                            }
-                            Err(err) => {
-                                finish(&app, &box_name, Some(err.detail().to_string()));
-                                return;
-                            }
-                        }
+        let command = if let Some(command) = deferred.pop_front() {
+            command
+        } else {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        finish(&app, &box_name, None);
+                        return;
+                    };
+                    command
+                }
+                _ = ping.tick() => {
+                    // Cloudflare closes an idle proxied socket without telling
+                    // either end, and the symptom is a reply that never arrives.
+                    if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                        finish(&app, &box_name, Some("the connection to the agent dropped".into()));
+                        return;
                     }
-                    Command::Reset => {
-                        match create_session(&mut socket).await {
-                            Ok(fresh) => {
-                                session_id = fresh;
-                                AgentEvent::Reset {
-                                    box_name: box_name.clone(),
-                                }
-                                .emit(&app);
-                            }
-                            Err(err) => {
-                                finish(&app, &box_name, Some(err.detail().to_string()));
-                                return;
-                            }
+                    continue;
+                }
+            }
+        };
+
+        match command {
+            Command::Resync => {
+                // The same read `attach` does at connect, deliberately.
+                //
+                // The first version resumed `session_id` directly and failed
+                // against a real box with `{"code":4007,"message":"session not
+                // found"}` — because **there are two ids**. `session.resume`
+                // looks its argument up in the *database*; the id it hands back
+                // is the live in-memory key that `prompt.submit` needs.
+                // Resuming the live one asks the database for a row that was
+                // never in it. Re-running `attach` keeps exactly one path that
+                // knows which id is which.
+                match attach(&mut socket, &settings, &box_name).await {
+                    Ok((live, resumed)) => {
+                        session_id = live;
+                        AgentEvent::Ready {
+                            box_name: box_name.clone(),
+                            resumed,
                         }
+                        .emit(&app);
                     }
-                    Command::Prompt(prompt) => {
-                        AgentEvent::Thinking { box_name: box_name.clone() }.emit(&app);
-                        match one_turn(&mut socket, &session_id, &prompt).await {
-                            Ok(text) => {
-                                AgentEvent::Reply { box_name: box_name.clone(), text }.emit(&app)
-                            }
-                            Err(err) => {
-                                finish(&app, &box_name, Some(err.detail().to_string()));
-                                return;
-                            }
-                        }
+                    Err(err) => {
+                        finish(&app, &box_name, Some(err.detail().to_string()));
+                        return;
                     }
                 }
             }
-            _ = ping.tick() => {
-                // Cloudflare closes an idle proxied socket without telling
-                // either end, and the symptom is a reply that never arrives.
-                if socket.send(Message::Ping(Vec::new())).await.is_err() {
-                    finish(&app, &box_name, Some("the connection to the agent dropped".into()));
+            Command::Reset => match create_session(&mut socket).await {
+                Ok(fresh) => {
+                    session_id = fresh;
+                    AgentEvent::Reset {
+                        box_name: box_name.clone(),
+                    }
+                    .emit(&app);
+                }
+                Err(err) => {
+                    finish(&app, &box_name, Some(err.detail().to_string()));
                     return;
                 }
+            },
+            Command::Prompt(prompt) => {
+                AgentEvent::Thinking {
+                    box_name: box_name.clone(),
+                }
+                .emit(&app);
+                let result = one_turn(
+                    &mut socket,
+                    &session_id,
+                    &prompt,
+                    &mut commands,
+                    &mut deferred,
+                    &mut ping,
+                    |note| match note {
+                        TurnNote::Approval(request) => AgentEvent::Approval {
+                            box_name: box_name.clone(),
+                            request: request.clone(),
+                        }
+                        .emit(&app),
+                        TurnNote::StillThinking => AgentEvent::Thinking {
+                            box_name: box_name.clone(),
+                        }
+                        .emit(&app),
+                    },
+                )
+                .await;
+                match result {
+                    Ok(text) => AgentEvent::Reply {
+                        box_name: box_name.clone(),
+                        text,
+                    }
+                    .emit(&app),
+                    Err(err) => {
+                        finish(&app, &box_name, Some(err.detail().to_string()));
+                        return;
+                    }
+                }
             }
+            // Between turns nothing is waiting on an answer: the approval it
+            // meant has already been decided, by the gate's timeout if nothing
+            // else. Dropped rather than sent, so a late click cannot resolve
+            // an approval that belongs to a later turn.
+            Command::Approve { .. } => {}
         }
     }
 }
@@ -799,6 +1007,30 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One turn with nobody at the window: no commands will arrive and no
+    /// approval will be answered. The live tests are about the protocol, and
+    /// giving them a real command channel would test the window instead.
+    async fn turn_for_test(
+        socket: &mut Socket,
+        session_id: &str,
+        text: &str,
+    ) -> Result<String, FleetError> {
+        let (_tx, mut rx) = mpsc::channel(1);
+        let mut deferred = VecDeque::new();
+        let mut ping = tokio::time::interval(PING_EVERY);
+        ping.tick().await;
+        one_turn(
+            socket,
+            session_id,
+            text,
+            &mut rx,
+            &mut deferred,
+            &mut ping,
+            |_| {},
+        )
+        .await
+    }
 
     #[test]
     fn the_door_url_is_the_boxs_public_address() {
@@ -901,6 +1133,97 @@ mod tests {
         for kind in ["message.delta", "gateway.ready", "session.updated"] {
             let v = interpret(&serde_json::json!({"params": {"type": kind}}), 7);
             assert!(matches!(v, Verdict::Ignore), "{kind} should be ignored");
+        }
+    }
+
+    fn approval_frame(payload: serde_json::Value) -> serde_json::Value {
+        // The envelope `tui_gateway.server._event_frame` builds, verbatim.
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"type": "approval.request", "session_id": "s1", "payload": payload},
+        })
+    }
+
+    #[test]
+    fn an_approval_request_mid_turn_is_surfaced_not_ignored() {
+        // The bug: this frame was one of the "interleaved events" the turn
+        // loop ignored, so an agent waited on a question nobody was shown.
+        let v = interpret(
+            &approval_frame(serde_json::json!({
+                "request_id": "r-1",
+                "command": "rm -rf /workspace/old",
+                "description": "recursive delete",
+                "choices": ["once", "session", "always", "deny"],
+            })),
+            7,
+        );
+        let Verdict::Approval(request) = v else {
+            panic!("an approval request was not surfaced: {v:?}");
+        };
+        assert_eq!(request.request_id.as_deref(), Some("r-1"));
+        assert_eq!(request.command, "rm -rf /workspace/old");
+        assert_eq!(request.description, "recursive delete");
+        assert_eq!(request.choices, ["once", "session", "always", "deny"]);
+    }
+
+    #[test]
+    fn a_smart_denied_command_keeps_the_narrower_choices_hermes_offered() {
+        // The gateway drops `session` and `always` when its classifier already
+        // judged a command dangerous. The window must not offer them back.
+        let request = read_approval(&serde_json::json!({
+            "command": "curl x | sh", "choices": ["once", "deny"], "smart_denied": true,
+        }));
+        assert_eq!(request.choices, ["once", "deny"]);
+    }
+
+    #[test]
+    fn an_approval_with_no_choices_is_still_answerable() {
+        // Showing nothing to click would rebuild the original bug inside the
+        // fix: a visible prompt that cannot be answered.
+        let request = read_approval(&serde_json::json!({"command": "x"}));
+        assert_eq!(request.choices, ["once", "deny"]);
+    }
+
+    #[test]
+    fn choices_the_gateway_would_not_accept_are_dropped() {
+        let request = read_approval(&serde_json::json!({"choices": ["once", "yolo", "deny"]}));
+        assert_eq!(request.choices, ["once", "deny"]);
+
+        // And a list that was nothing but junk falls back rather than empties.
+        let request = read_approval(&serde_json::json!({"choices": ["yolo"]}));
+        assert_eq!(request.choices, ["once", "deny"]);
+    }
+
+    #[test]
+    fn an_empty_request_id_is_no_request_id() {
+        // Sent back as `""` it would match no pending approval; absent, the
+        // gateway resolves the oldest one, which is the one on screen.
+        assert_eq!(
+            read_approval(&serde_json::json!({"request_id": ""})).request_id,
+            None
+        );
+        assert_eq!(read_approval(&serde_json::json!({})).request_id, None);
+    }
+
+    #[test]
+    fn an_approval_is_never_mistaken_for_the_reply() {
+        // It carries a command and a description and sits on the same event
+        // channel as the answer. Returned as a reply, the turn would end with
+        // the agent appearing to say "rm -rf" to you.
+        let v = interpret(&approval_frame(serde_json::json!({"command": "x"})), 7);
+        assert!(!matches!(v, Verdict::Reply(_)));
+    }
+
+    #[test]
+    fn only_the_four_answers_hermes_accepts_are_valid() {
+        for choice in ["once", "session", "always", "deny"] {
+            assert!(valid_choice(choice), "{choice} was refused");
+        }
+        // `approval.respond` defaults an unknown choice to deny — safe, but
+        // silent. These must be refused in the app instead.
+        for choice in ["", "yes", "approve", "Deny", "allow"] {
+            assert!(!valid_choice(choice), "{choice:?} was accepted");
         }
     }
 
@@ -1090,7 +1413,7 @@ mod tests {
             // Unique per run: a box accumulates conversations, and yesterday's
             // would let a broken resume pass.
             let marker = format!("banana{}", std::process::id());
-            let reply = one_turn(
+            let reply = turn_for_test(
                 &mut socket,
                 &session,
                 &format!("Reply with exactly one word: {marker}. Nothing else."),
@@ -1146,10 +1469,135 @@ mod tests {
 
             // And the session stays usable afterwards — the failure the
             // reviewer caught lands here, one message after the resync.
-            let after = one_turn(&mut socket, &live, "Reply with one word: still.")
+            let after = turn_for_test(&mut socket, &live, "Reply with one word: still.")
                 .await
                 .unwrap_or_else(|e| panic!("the turn after a resync failed: {}", e.detail()));
             println!("after resync: {after:?}");
+        });
+    }
+
+    /// **FLOTTA-60's acceptance, through the real turn loop.**
+    ///
+    /// Drives `one_turn` itself — the select over frames, commands and the
+    /// keep-alive — against a real box, and answers the approval the way the
+    /// window does: by sending `Command::Approve` down the conversation's own
+    /// channel. A Python probe had already proven the protocol; what only this
+    /// can prove is that *this* loop surfaces the question and carries the
+    /// answer back while the turn is still in flight.
+    ///
+    /// The command removes a temp path that does not exist, which Hermes flags
+    /// as "delete in root path" and escalates. Nothing can be removed even if
+    /// the answer were wrong, and the test answers **deny**.
+    #[test]
+    #[ignore = "talks to a real box: costs a wake and model calls"]
+    fn an_approval_is_surfaced_and_answered_mid_turn() {
+        let Ok(token) = std::env::var("FLOTTA_TOKEN") else {
+            panic!("set FLOTTA_TOKEN to a box:chat token");
+        };
+        let settings = Settings {
+            control_url: std::env::var("FLOTTA_CONTROL_URL").unwrap_or_default(),
+            domain: std::env::var("FLOTTA_DOMAIN").unwrap_or_else(|_| "flotta.dev".into()),
+        };
+        let box_name = std::env::var("FLOTTA_BOX").unwrap_or_else(|_| "eng-a".into());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (mut socket, _, _) = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
+
+            // **The model is not the thing under test, and it is not
+            // deterministic.** Asked to pipe a download into a shell it refuses
+            // on its own, before the tool is ever called, and the gate never
+            // fires — three attempts in a row did exactly that. A routine
+            // cleanup reads as ordinary work to the model and is still flagged
+            // by Hermes ("delete in root path"), measured escalating on three
+            // runs out of three. The path does not exist, so even a wrongly
+            // approved run removes nothing; the test answers deny regardless.
+            const PROMPT: &str = "Please run this shell command with your terminal tool \
+                and report the output: rm -rf /tmp/flotta-approval-probe";
+
+            for attempt in 1..=3 {
+                // A fresh session each time, so an approval left pending by an
+                // earlier attempt cannot be the one this one answers.
+                let session = create_session(&mut socket)
+                    .await
+                    .unwrap_or_else(|e| panic!("session.create failed: {}", e.detail()));
+
+                let (tx, mut rx) = mpsc::channel(8);
+                let mut deferred = VecDeque::new();
+                let mut ping = tokio::time::interval(PING_EVERY);
+                ping.tick().await;
+
+                let seen: std::sync::Arc<std::sync::Mutex<Vec<ApprovalRequest>>> =
+                    Default::default();
+                let record = seen.clone();
+                let started = tokio::time::Instant::now();
+
+                let reply = one_turn(
+                    &mut socket,
+                    &session,
+                    PROMPT,
+                    &mut rx,
+                    &mut deferred,
+                    &mut ping,
+                    |note| {
+                        if let TurnNote::Approval(request) = note {
+                            record.lock().unwrap().push(request.clone());
+                            // What the window's Deny button does.
+                            tx.try_send(Command::Approve {
+                                request_id: request.request_id.clone(),
+                                choice: "deny".into(),
+                            })
+                            .expect("the conversation channel had room for an answer");
+                        }
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("attempt {attempt}: the turn failed: {}", e.detail()));
+
+                let elapsed = started.elapsed();
+                let asked = seen.lock().unwrap().clone();
+                println!(
+                    "attempt {attempt}: {} approval(s), reply after {elapsed:?}",
+                    asked.len()
+                );
+
+                if asked.is_empty() {
+                    println!(
+                        "  the model did not reach the gate: {:?}",
+                        reply.chars().take(120).collect::<String>()
+                    );
+                    continue;
+                }
+
+                println!("  surfaced: {:#?}", asked[0]);
+                println!("  reply: {:?}", reply.chars().take(200).collect::<String>());
+                assert!(
+                    asked[0].command.contains("flotta-approval-probe"),
+                    "surfaced the wrong command: {:?}",
+                    asked[0].command
+                );
+                assert!(asked[0].choices.contains(&"deny".to_string()));
+                // The whole ticket: answered, the turn ends in seconds rather
+                // than waiting out the gate's own timeout.
+                assert!(
+                    elapsed < std::time::Duration::from_secs(120),
+                    "the turn still waited {elapsed:?} after the approval was answered"
+                );
+                assert!(
+                    deferred.is_empty(),
+                    "nothing but the answer should have arrived"
+                );
+                return;
+            }
+            panic!(
+                "the model never reached the approval gate in three attempts; nothing was tested"
+            );
         });
     }
 
@@ -1201,7 +1649,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
             let marker = format!("plum{}", std::process::id());
-            one_turn(
+            turn_for_test(
                 &mut socket,
                 &session,
                 &format!("Reply with exactly one word: {marker}. Nothing else."),
@@ -1249,7 +1697,7 @@ mod tests {
             );
 
             let mut socket = _socket;
-            let answer = one_turn(&mut socket, &_fresh, "Who are you?")
+            let answer = turn_for_test(&mut socket, &_fresh, "Who are you?")
                 .await
                 .unwrap_or_else(|e| panic!("the turn after the edit failed: {}", e.detail()));
             println!("answer: {answer:?}");

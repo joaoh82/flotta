@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { statusAfter, turnsAfter } from "./transcript";
-import type { Turn } from "./types";
+import { approvalAfter, choiceLabel, isBusy, statusAfter, turnsAfter } from "./transcript";
+import type { AgentEvent, ApprovalRequest, Turn } from "./types";
 
 const said: Turn[] = [
   { from: "you", text: "who are you?" },
@@ -101,5 +101,76 @@ describe("statusAfter", () => {
     expect(
       statusAfter({ kind: "failed", box_name: "eng-r", detail: "x" }),
     ).toBe("failed");
+  });
+});
+
+
+const asked: ApprovalRequest = {
+  request_id: "r-1",
+  command: "rm -rf /workspace/old",
+  description: "recursive delete",
+  choices: ["once", "deny"],
+};
+
+describe("approvalAfter", () => {
+  it("shows the approval the agent is waiting on", () => {
+    expect(
+      approvalAfter(null, { kind: "approval", box_name: "eng-r", request: asked }),
+    ).toEqual(asked);
+  });
+
+  it("clears it when the turn ends, however it ends", () => {
+    // Hermes's gate times out on its own and denies. A card left up after
+    // that offers buttons for a question already decided.
+    const endings: AgentEvent[] = [
+      { kind: "reply", box_name: "eng-r", text: "done" },
+      { kind: "failed", box_name: "eng-r", detail: "x" },
+      { kind: "closed", box_name: "eng-r" },
+      { kind: "reset", box_name: "eng-r" },
+      { kind: "ready", box_name: "eng-r", resumed: [] },
+      { kind: "waking", box_name: "eng-r" },
+    ];
+    for (const event of endings) {
+      expect(approvalAfter(asked, event), event.kind).toBeNull();
+    }
+  });
+
+  it("keeps it through a remount's thinking, which arrives before the re-sent approval", () => {
+    expect(approvalAfter(asked, { kind: "thinking", box_name: "eng-r" })).toEqual(asked);
+  });
+
+  it("replaces rather than stacks a second approval", () => {
+    const second = { ...asked, request_id: "r-2", command: "git push --force" };
+    expect(
+      approvalAfter(asked, { kind: "approval", box_name: "eng-r", request: second }),
+    ).toEqual(second);
+  });
+});
+
+describe("choiceLabel", () => {
+  it("says what the two open-ended answers actually grant", () => {
+    expect(choiceLabel("session")).toBe("Allow for this conversation");
+    expect(choiceLabel("always")).toBe("Always allow");
+    expect(choiceLabel("once")).toBe("Allow once");
+    expect(choiceLabel("deny")).toBe("Deny");
+  });
+
+  it("shows an unexpected choice as itself rather than hiding it", () => {
+    expect(choiceLabel("mystery")).toBe("mystery");
+  });
+});
+
+describe("isBusy", () => {
+  it("counts waiting on an approval as busy", () => {
+    // A message typed now would queue behind the turn it seems to answer.
+    expect(isBusy("approval")).toBe(true);
+    expect(isBusy("thinking")).toBe(true);
+    expect(isBusy("waking")).toBe(true);
+  });
+
+  it("is free once the agent has answered or the conversation is idle", () => {
+    for (const status of ["ready", "reply", "failed", "closed"] as const) {
+      expect(isBusy(status), status).toBe(false);
+    }
   });
 });
