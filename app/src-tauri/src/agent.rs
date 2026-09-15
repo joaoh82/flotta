@@ -2358,4 +2358,98 @@ mod tests {
             }
         });
     }
+
+    /// FLOTTA-61, part 2, against a real box: asked which repositories it can
+    /// use, an agent answers from `flotta-repos` in at most two tool calls —
+    /// loading the skill, then running the command — and names what the
+    /// control plane says it is granted.
+    ///
+    /// Before, eng-r took nine model calls and seven shell commands, three of
+    /// which failed. **Needs a fleet built from this branch** — the skill and
+    /// the command ship in the box image.
+    #[test]
+    #[ignore = "talks to a real box: costs a wake and model calls"]
+    fn an_agent_knows_which_repositories_it_may_use() {
+        let Ok(token) = std::env::var("FLOTTA_TOKEN") else {
+            panic!("set FLOTTA_TOKEN to a box:chat + fleet:read token");
+        };
+        let settings = Settings {
+            control_url: std::env::var("FLOTTA_CONTROL_URL").unwrap_or_default(),
+            domain: std::env::var("FLOTTA_DOMAIN").unwrap_or_else(|_| "flotta.dev".into()),
+        };
+        let box_name = std::env::var("FLOTTA_BOX").unwrap_or_else(|_| "eng-a".into());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let granted = crate::fleet::list_repos(&settings, &box_name)
+                .await
+                .unwrap_or_else(|e| panic!("could not read the grants: {}", e.detail()));
+            println!("control plane says {box_name} is granted {granted:?}");
+
+            let (mut socket, _, _) = connect(&settings, &box_name, &token)
+                .await
+                .unwrap_or_else(|e| panic!("connect failed: {}", e.detail()));
+            // A fresh session: the skill index is rendered when a session starts.
+            let session = create_session(&mut socket)
+                .await
+                .unwrap_or_else(|e| panic!("session.create failed: {}", e.detail()));
+
+            let (_tx, mut rx) = mpsc::channel(1);
+            let mut deferred = VecDeque::new();
+            let mut ping = tokio::time::interval(PING_EVERY);
+            ping.tick().await;
+            let steps: std::sync::Arc<std::sync::Mutex<Vec<Step>>> = Default::default();
+            let record = steps.clone();
+            let started = tokio::time::Instant::now();
+
+            let reply = one_turn(
+                &mut socket,
+                &session,
+                "Which GitHub repositories do you have access to?",
+                &mut rx,
+                &mut deferred,
+                &mut ping,
+                |note| {
+                    if let TurnNote::Progress(step @ Step::ToolStarted { .. }) = note {
+                        record.lock().unwrap().push(step);
+                    }
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the turn failed: {}", e.detail()));
+
+            let tools = steps.lock().unwrap().clone();
+            println!("{:.1}s, tools: {tools:#?}", started.elapsed().as_secs_f64());
+            println!("reply: {reply}");
+
+            assert!(
+                tools.iter().any(
+                    |s| matches!(s, Step::ToolStarted { detail, .. } if detail.contains("flotta-repos"))
+                ),
+                "the agent never ran flotta-repos"
+            );
+            assert!(
+                tools.len() <= 2,
+                "{} tool calls to answer a question one command answers",
+                tools.len()
+            );
+            for repo in &granted {
+                assert!(
+                    reply.to_lowercase().contains(&repo.to_lowercase()),
+                    "the reply leaves out {repo}, which is granted"
+                );
+            }
+            if granted.is_empty() {
+                let lower = reply.to_lowercase();
+                assert!(
+                    lower.contains("no") || lower.contains("none"),
+                    "no grants, and the reply does not say so: {reply}"
+                );
+            }
+        });
+    }
 }

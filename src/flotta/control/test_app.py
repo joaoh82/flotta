@@ -951,6 +951,82 @@ def test_an_operator_token_is_not_restricted_to_one_box(two_boxes, secured, monk
     assert ok.status_code == 200
 
 
+def test_a_box_can_list_its_own_grants_with_the_token_it_already_holds(two_boxes, secured):
+    """FLOTTA-61: asked what it could reach, an agent ran seven commands and
+    three failed, because nothing told it. It holds `git:credential` and no
+    more, so that is the scope the answer lives behind."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    ok = secured.get(
+        "/api/boxes/eng-b/git-credential/repos",
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(two_boxes["eng-b"])),
+    )
+    assert ok.status_code == 200
+    assert ok.json() == {"box_id": two_boxes["eng-b"], "name": "eng-b", "repos": ["someone/secret"]}
+
+
+def test_a_box_cannot_list_another_boxs_grants(two_boxes, secured):
+    """The same containment as minting: which repositories another agent can
+    push to is not this agent's business."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    denied = secured.get(
+        "/api/boxes/eng-b/git-credential/repos",
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(two_boxes["eng-a"])),
+    )
+    assert denied.status_code == 403
+    assert "someone/secret" not in denied.text
+
+
+def test_listing_grants_needs_the_credential_scope_not_chat(two_boxes, secured):
+    """`box:chat` is what the app holds; it is not a key to anyone's code, and
+    not a map of it either."""
+    from flotta.auth import SCOPE_BOX_CHAT, box_subject
+
+    denied = secured.get(
+        "/api/boxes/eng-b/git-credential/repos",
+        headers=_bearer(SCOPE_BOX_CHAT, subject=box_subject(two_boxes["eng-b"])),
+    )
+    assert denied.status_code == 403
+
+
+def test_listing_grants_hands_over_no_credential(two_boxes, secured, monkeypatch):
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    ok = secured.get(
+        "/api/boxes/eng-b/git-credential/repos",
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject("eng-b")),
+    )
+    assert ok.status_code == 200
+    assert GH_SOURCE not in ok.text
+
+
+def test_a_box_with_no_grants_lists_none_rather_than_failing(two_boxes, secured):
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    ok = secured.get(
+        "/api/boxes/eng-a/git-credential/repos",
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject("eng-a")),
+    )
+    assert ok.status_code == 200
+    assert ok.json()["repos"] == []
+
+
+def test_the_credential_refusal_still_names_both_boxes(two_boxes, secured, monkeypatch):
+    """The confinement check moved into a shared helper; its message must not
+    have lost the part that says which box asked."""
+    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject
+
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", GH_SOURCE)
+    denied = secured.post(
+        "/api/boxes/eng-b/git-credential",
+        json={"repo": "someone/secret"},
+        headers=_bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(two_boxes["eng-a"])),
+    )
+    assert "cannot mint credentials for box 'eng-b'" in denied.json()["detail"]
+
+
 def test_the_refusal_names_a_command_that_exists(secured, monkeypatch):
     """The 403 is the only guidance anyone gets — it is what the box's helper
     passes through to git's stderr, and the agent reads that and nothing else.
