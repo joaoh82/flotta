@@ -191,6 +191,20 @@ app-live:
     cd app/src-tauri
     cargo test -- --ignored --nocapture
 
+# COSTS MONEY: a wake and a few dozen model calls. Where an agent's turns
+# spend their time — client-side timings plus each model call's latency, cache
+# and upstream from Hermes's own log — as a Markdown report (FLOTTA-61).
+# Fresh conversations each round, so it does not disturb one in progress, but
+# the app will open on the measurement's conversation afterwards.
+latency box="eng-g" rounds="3":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env}"
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env}"
+    export FLOTTA_TOKEN="${FLOTTA_TOKEN:-$(uv run flotta token mint latency --scope box:chat --days 1)}"
+    export FLOTTA_READ_TOKEN="${FLOTTA_READ_TOKEN:-$(uv run flotta token mint latency-read --scope fleet:read --days 1)}"
+    uv run python scripts/latency_probe.py "{{box}}" "{{rounds}}"
+
 # Type-check and lint the app — both halves. `just check` covers neither.
 check-app:
     #!/usr/bin/env bash
