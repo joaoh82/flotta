@@ -191,6 +191,9 @@ export function statusAfter(current: Status, event: AgentEvent): Status {
   switch (event.kind) {
     case "reset":
       return "ready";
+    case "approval_withdrawn":
+      // The agent carries on without the answer it asked for.
+      return "thinking";
     case "progress":
       // Progress is the agent working, which is `thinking` — except while a
       // card is up. Reasoning can keep streaming around an approval, and
@@ -202,7 +205,7 @@ export function statusAfter(current: Status, event: AgentEvent): Status {
 }
 
 /** The states the pane can be in. `reset` and `progress` are events, not states. */
-export type Status = Exclude<AgentEvent["kind"], "reset" | "progress">;
+export type Status = Exclude<AgentEvent["kind"], "reset" | "progress" | "approval_withdrawn">;
 
 /**
  * The approval waiting on a person, after an event.
@@ -223,6 +226,10 @@ export function approvalAfter(
   switch (event.kind) {
     case "approval":
       return event.request;
+    case "approval_withdrawn":
+      // Hermes stopped waiting. A card left up would offer buttons for a
+      // question already decided — by its timeout, as a denial.
+      return null;
     case "reply":
     case "failed":
     case "closed":
