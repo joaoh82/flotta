@@ -95,6 +95,9 @@ pub enum AgentEvent {
         box_name: String,
         request: ApprovalRequest,
     },
+    /// The question is no longer open — Hermes's timeout denied it, or the
+    /// turn was interrupted — and its card must come down. The turn goes on.
+    ApprovalWithdrawn { box_name: String },
     /// A turn is in flight.
     Thinking { box_name: String },
     /// What the agent is doing, while it does it (FLOTTA-61).
@@ -201,6 +204,21 @@ pub struct ApprovalRequest {
     /// way. Carried so the window can say that before the click (FLOTTA-62).
     pub pattern: Option<String>,
     pub choices: Vec<String>,
+    /// The JSON-RPC id to answer, when Hermes *asked* rather than announced.
+    ///
+    /// **Hermes v2026.9.14 moved approvals from an event to a server→client
+    /// request** (`tui_gateway/server_requests.py`): the question arrives as
+    /// `{"id":"srq-…","method":"approval","params":{…}}` and is answered by a
+    /// response frame carrying that id. v2026.9.11 sent an `approval.request`
+    /// event answered by the `approval.respond` RPC. Rolled to the newer
+    /// version, the app saw nothing at all — no card, and every approval
+    /// denied by the gate's timeout a minute later (FLOTTA-64).
+    ///
+    /// `None` for the older event, which is still read so a fleet mid-roll,
+    /// or one pinned back, keeps working. Never sent to the window: it is
+    /// the conversation task's business how an answer travels.
+    #[serde(skip)]
+    pub reply_to: Option<String>,
 }
 
 /// One step of a turn in progress.
@@ -453,6 +471,7 @@ fn read_approval(payload: &serde_json::Value) -> ApprovalRequest {
             .filter(|k| !k.is_empty())
             .map(str::to_string),
         choices,
+        reply_to: None,
     }
 }
 
@@ -886,6 +905,9 @@ async fn call(
 enum TurnNote<'a> {
     /// Hermes stopped to ask permission.
     Approval(&'a ApprovalRequest),
+    /// Hermes withdrew the question — its timeout denied it, or the turn was
+    /// interrupted. The card must come down: an answer now lands on nothing.
+    ApprovalWithdrawn,
     /// The agent did something the window can show.
     Progress(Step),
     /// The transcript pane remounted mid-turn and needs telling again that
@@ -944,6 +966,12 @@ async fn one_turn(
                         note(TurnNote::Approval(&request));
                         pending = Some(request);
                     }
+                    Verdict::Withdrawn(id) => {
+                        if pending.as_ref().and_then(|p| p.reply_to.as_deref()) == Some(id.as_str()) {
+                            pending = None;
+                            note(TurnNote::ApprovalWithdrawn);
+                        }
+                    }
                     Verdict::Progress(step) => {
                         for step in activity.observe(step) {
                             note(TurnNote::Progress(step));
@@ -955,19 +983,15 @@ async fn one_turn(
             }
             command = commands.recv() => match command {
                 Some(Command::Approve { request_id, choice }) => {
-                    // The window's id wins; the pending one is the fallback for
-                    // a click that arrived without one. With neither, the
-                    // gateway resolves the oldest approval in the session.
-                    let request_id = request_id
-                        .or_else(|| pending.as_ref().and_then(|p| p.request_id.clone()));
-                    let mut params = serde_json::json!({
-                        "session_id": session_id,
-                        "choice": choice,
-                    });
-                    if let Some(request_id) = request_id {
-                        params["request_id"] = serde_json::json!(request_id);
+                    match answer_for(pending.as_ref(), request_id, &choice, session_id) {
+                        Answer::Response(frame) => socket
+                            .send(Message::Text(frame.to_string()))
+                            .await
+                            .map_err(|e| FleetError::Unreachable(format!("could not send the answer: {e}")))?,
+                        Answer::Rpc(params) => {
+                            rpc(socket, "approval.respond", params).await?;
+                        }
                     }
-                    rpc(socket, "approval.respond", params).await?;
                     pending = None;
                 }
                 Some(Command::Resync) => {
@@ -1004,6 +1028,56 @@ async fn one_turn(
     }
 }
 
+/// How an answer to an approval travels.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    /// A JSON-RPC response to the gateway's own request (v2026.9.14+).
+    Response(serde_json::Value),
+    /// The `approval.respond` RPC (v2026.9.11 and earlier).
+    Rpc(serde_json::Value),
+}
+
+/// The frame that answers `pending` with `choice`.
+///
+/// Split out so both wire formats are pinned by tests: a live gateway only
+/// ever speaks one of them, and the other would otherwise go unexercised until
+/// a fleet rolled back onto it.
+///
+/// A response frame is used whenever the question came as a request. On the
+/// newer gateway `approval.respond` still exists, but as a fallback for a
+/// client that never received the request — the response frame is the path
+/// the request is waiting on.
+fn answer_for(
+    pending: Option<&ApprovalRequest>,
+    request_id: Option<String>,
+    choice: &str,
+    session_id: &str,
+) -> Answer {
+    // The window's id wins; the pending one is the fallback for a click that
+    // arrived without one. With neither, the gateway resolves the oldest
+    // approval in the session.
+    let request_id = request_id.or_else(|| pending.and_then(|p| p.request_id.clone()));
+
+    // Only answer the request the window's id names. A click on a card for an
+    // older request must not resolve the newer one by accident.
+    let reply_to = pending
+        .filter(|p| request_id.is_none() || p.request_id == request_id)
+        .and_then(|p| p.reply_to.clone());
+    if let Some(reply_to) = reply_to {
+        return Answer::Response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": reply_to,
+            "result": {"choice": choice},
+        }));
+    }
+
+    let mut params = serde_json::json!({"session_id": session_id, "choice": choice});
+    if let Some(request_id) = request_id {
+        params["request_id"] = serde_json::json!(request_id);
+    }
+    Answer::Rpc(params)
+}
+
 /// What one frame means, mid-turn.
 ///
 /// Split out of the loop so the three traps can be tested without a socket.
@@ -1015,6 +1089,8 @@ enum Verdict {
     Ignore,
     /// The agent stopped to ask. The turn is still in flight.
     Approval(ApprovalRequest),
+    /// A question Hermes asked is no longer open. Carries its request id.
+    Withdrawn(String),
     /// The agent did something. The turn is still in flight.
     Progress(Step),
     Reply(String),
@@ -1039,11 +1115,36 @@ fn interpret(frame: &serde_json::Value, id: u64) -> Verdict {
     let Some(params) = frame.get("params") else {
         return Verdict::Ignore;
     };
+
+    // v2026.9.14 and later: the gateway *asks*. A server→client request has a
+    // string id (`srq-…`, so it can never collide with ours) and a method,
+    // and its params are the approval itself rather than an event envelope.
+    if frame.get("method").and_then(|m| m.as_str()) == Some("approval") {
+        if let Some(reply_to) = frame.get("id").and_then(|v| v.as_str()) {
+            let mut request = read_approval(params);
+            request.reply_to = Some(reply_to.to_string());
+            return Verdict::Approval(request);
+        }
+    }
+
     match params.get("type").and_then(|t| t.as_str()) {
         Some("message.complete") => {}
+        // v2026.9.11 and earlier: the same question as an event.
         Some("approval.request") => {
             let payload = params.get("payload").cloned().unwrap_or_default();
             return Verdict::Approval(read_approval(&payload));
+        }
+        // The gateway's one withdrawal notice for any request it stopped
+        // waiting on. Only approvals are ours to take down.
+        Some("request.cancel") => {
+            let payload = params.get("payload").cloned().unwrap_or_default();
+            if payload.get("method").and_then(|m| m.as_str()) != Some("approval") {
+                return Verdict::Ignore;
+            }
+            return match payload.get("id").and_then(|i| i.as_str()) {
+                Some(id) if !id.is_empty() => Verdict::Withdrawn(id.to_string()),
+                _ => Verdict::Ignore,
+            };
         }
         Some(kind) => {
             let payload = params.get("payload").cloned().unwrap_or_default();
@@ -1217,6 +1318,10 @@ pub async fn run(
                         }
                         .emit(&app),
                         TurnNote::StillThinking => AgentEvent::Thinking {
+                            box_name: box_name.clone(),
+                        }
+                        .emit(&app),
+                        TurnNote::ApprovalWithdrawn => AgentEvent::ApprovalWithdrawn {
                             box_name: box_name.clone(),
                         }
                         .emit(&app),
@@ -1630,6 +1735,127 @@ mod tests {
             json,
             serde_json::json!({"kind": "progress", "box_name": "eng-g",
                                "step": {"kind": "tool_started", "id": "a", "tool": "terminal", "detail": "ls"}})
+        );
+    }
+
+    /// The approval frame v2026.9.14 sends, captured off eng-g verbatim.
+    fn server_request_frame() -> serde_json::Value {
+        serde_json::json!({
+            "id": "srq-a223514c5c19", "jsonrpc": "2.0", "method": "approval",
+            "params": {
+                "allow_permanent": true, "allow_session": true,
+                "choices": ["once", "session", "always", "deny"],
+                "command": "rm -rf /tmp/flotta-approval-probe",
+                "description": "delete in root path",
+                "pattern_key": "delete in root path",
+                "pattern_keys": ["delete in root path"],
+                "request_id": "ecbba5a1cf5845909cb4398bad552359",
+                "session_id": "6d3a398e"
+            }
+        })
+    }
+
+    #[test]
+    fn an_approval_asked_as_a_server_request_is_surfaced() {
+        // FLOTTA-64: this frame was ignored, so the card never appeared and
+        // the gate denied every approval a minute later.
+        let Verdict::Approval(request) = interpret(&server_request_frame(), 7) else {
+            panic!("a v2026.9.14 approval was not surfaced");
+        };
+        assert_eq!(request.reply_to.as_deref(), Some("srq-a223514c5c19"));
+        assert_eq!(
+            request.request_id.as_deref(),
+            Some("ecbba5a1cf5845909cb4398bad552359")
+        );
+        assert_eq!(request.command, "rm -rf /tmp/flotta-approval-probe");
+        assert_eq!(request.pattern.as_deref(), Some("delete in root path"));
+        // The newer gateway offers `always` too, and the window still does not.
+        assert_eq!(request.choices, ["once", "session", "deny"]);
+    }
+
+    #[test]
+    fn the_reply_address_never_reaches_the_window() {
+        let Verdict::Approval(request) = interpret(&server_request_frame(), 7) else {
+            panic!("not surfaced");
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("srq-"), "{json}");
+        assert!(!json.contains("reply_to"), "{json}");
+    }
+
+    #[test]
+    fn a_server_request_is_answered_with_a_response_frame_to_its_id() {
+        let Verdict::Approval(pending) = interpret(&server_request_frame(), 7) else {
+            panic!("not surfaced");
+        };
+        let answer = answer_for(
+            Some(&pending),
+            Some("ecbba5a1cf5845909cb4398bad552359".into()),
+            "once",
+            "6d3a398e",
+        );
+        // `resolve_response` in server_requests.py reads exactly this.
+        assert_eq!(
+            answer,
+            Answer::Response(serde_json::json!({
+                "jsonrpc": "2.0", "id": "srq-a223514c5c19", "result": {"choice": "once"}
+            }))
+        );
+    }
+
+    #[test]
+    fn an_event_approval_is_still_answered_with_the_rpc() {
+        // A fleet mid-roll, or pinned back, still speaks v2026.9.11.
+        let pending = read_approval(&serde_json::json!({
+            "request_id": "r-1", "command": "x", "choices": ["once", "deny"]
+        }));
+        match answer_for(Some(&pending), None, "deny", "s1") {
+            Answer::Rpc(params) => assert_eq!(
+                params,
+                serde_json::json!({"session_id": "s1", "choice": "deny", "request_id": "r-1"})
+            ),
+            other => panic!("expected the RPC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_click_for_a_different_request_does_not_answer_the_pending_one() {
+        // Two approvals in one turn: a late click on the first card must not
+        // resolve the second request through its reply address.
+        let Verdict::Approval(pending) = interpret(&server_request_frame(), 7) else {
+            panic!("not surfaced");
+        };
+        match answer_for(Some(&pending), Some("an-older-one".into()), "once", "s1") {
+            Answer::Rpc(params) => assert_eq!(params["request_id"], "an-older-one"),
+            other => panic!("answered the wrong request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_approval_is_recognised_and_other_cancels_are_not() {
+        let cancel = |method: &str| {
+            serde_json::json!({"jsonrpc": "2.0", "method": "event", "params": {
+                "type": "request.cancel", "session_id": "6d3a398e", "seq": 15,
+                "payload": {"id": "srq-a223514c5c19", "method": method, "reason": "timeout"}
+            }})
+        };
+        assert!(matches!(
+            interpret(&cancel("approval"), 7),
+            Verdict::Withdrawn(id) if id == "srq-a223514c5c19"
+        ));
+        // A clarify or a secret prompt being withdrawn is not our card.
+        assert!(matches!(interpret(&cancel("clarify"), 7), Verdict::Ignore));
+    }
+
+    #[test]
+    fn a_withdrawal_reaches_the_window_as_its_own_kind() {
+        let json = serde_json::to_value(AgentEvent::ApprovalWithdrawn {
+            box_name: "eng-g".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "approval_withdrawn", "box_name": "eng-g"})
         );
     }
 

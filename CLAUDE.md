@@ -299,6 +299,21 @@ conventions, and the sharp edges below.
   that narration into its own line (`Step::Said`) when the tool starts.
   `a_turn_shows_its_steps_as_they_happen` (`just app-live`) re-checks both on
   the next Hermes bump (FLOTTA-61).
+- **Hermes v2026.9.14 asks for approvals instead of announcing them.** The
+  question used to be an `approval.request` *event* answered by the
+  `approval.respond` RPC. From v2026.9.14 it is a **server→client JSON-RPC
+  request** (`tui_gateway/server_requests.py`):
+  `{"id":"srq-…","method":"approval","params":{request_id, command,
+  description, pattern_key, choices, …}}`, answered by a **response frame**
+  `{"jsonrpc":"2.0","id":"srq-…","result":{"choice":"once"}}`. A request that
+  times out or is interrupted is withdrawn with a `request.cancel`
+  `{id, method, reason}` event. The same mechanism carries clarify, sudo and
+  secret prompts. Rolled onto it, the app ignored the frame: no card, and
+  every approval denied by the 60s timeout, with the live test reporting "the
+  model never reached the gate" while each turn took 65s (FLOTTA-64). The app
+  now reads both forms and answers each on its own path (`answer_for`). **A
+  Hermes bump is a protocol change until the live tests say otherwise** —
+  run `just app-live` against one agent before calling it done.
 - **Approvals are granted by pattern, not by command — so the app never offers
   `always`.** Hermes records `session` and `always` against the command's
   `pattern_key` (e.g. `delete in root path`), not the command itself. Measured
