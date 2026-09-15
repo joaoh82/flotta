@@ -1,14 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { isFleetError, type AgentEvent, type ApprovalRequest, type Turn } from "./types";
+import {
+  isFleetError,
+  type AgentEvent,
+  type ApprovalRequest,
+  type Live,
+  type Turn,
+  type WorkStep,
+} from "./types";
 import {
   approvalAfter,
   choiceLabel,
+  doingNow,
+  duration,
   isBusy,
+  liveAfter,
+  NOTHING_LIVE,
+  reasoningTail,
   sessionScope,
   statusAfter,
   turnsAfter,
+  type Status,
 } from "./transcript";
 
 /** An error from the Rust side, as a sentence rather than an object. */
@@ -26,7 +39,9 @@ function describe(err: unknown): string {
  */
 export function Conversation({ boxName }: { boxName: string }) {
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [status, setStatus] = useState<AgentEvent["kind"]>("waking");
+  const [status, setStatus] = useState<Status>("waking");
+  /** What is streaming and not yet a line of the transcript. */
+  const [live, setLive] = useState<Live>(NOTHING_LIVE);
   const [draft, setDraft] = useState("");
   /** The question the agent is blocked on, if any. */
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
@@ -43,6 +58,7 @@ export function Conversation({ boxName }: { boxName: string }) {
     setTurns([]);
     setStatus("waking");
     setApproval(null);
+    setLive(NOTHING_LIVE);
 
     let alive = true;
     let off: (() => void) | undefined;
@@ -60,8 +76,9 @@ export function Conversation({ boxName }: { boxName: string }) {
         // another's transcript.
         if (!alive || payload.box_name !== boxName) return;
 
-        setStatus(statusAfter(payload));
+        setStatus((s) => statusAfter(s, payload));
         setTurns((t) => turnsAfter(t, payload));
+        setLive((l) => liveAfter(l, payload));
         setApproval((a) => approvalAfter(a, payload));
       });
       if (!alive) {
@@ -91,7 +108,7 @@ export function Conversation({ boxName }: { boxName: string }) {
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
-  }, [turns, status]);
+  }, [turns, status, live]);
 
   const busy = isBusy(status);
 
@@ -125,6 +142,7 @@ export function Conversation({ boxName }: { boxName: string }) {
     const text = draft.trim();
     if (!text || busy) return;
     setDraft("");
+    setLive(NOTHING_LIVE);
     setTurns((t) => [...t, { from: "you", text }]);
     setStatus("thinking");
     try {
@@ -145,22 +163,38 @@ export function Conversation({ boxName }: { boxName: string }) {
           </p>
         )}
 
-        {turns.map((turn, i) => (
-          <div key={i} className="text-sm">
-            <div className="mb-0.5 font-mono text-[11px] text-neutral-400">
-              {turn.from === "you" ? "you" : turn.from === "agent" ? boxName : "flotta"}
+        {turns.map((turn, i) =>
+          turn.from === "work" ? (
+            <Work key={i} steps={turn.steps} busy={busy} />
+          ) : (
+            <div key={i} className="text-sm">
+              <div className="mb-0.5 font-mono text-[11px] text-neutral-400">
+                {turn.from === "you" ? "you" : turn.from === "agent" ? boxName : "flotta"}
+              </div>
+              <div
+                className={
+                  turn.from === "system"
+                    ? "whitespace-pre-wrap rounded bg-red-50 px-3 py-2 text-red-800"
+                    : "whitespace-pre-wrap text-neutral-900"
+                }
+              >
+                {turn.text}
+              </div>
             </div>
-            <div
-              className={
-                turn.from === "system"
-                  ? "whitespace-pre-wrap rounded bg-red-50 px-3 py-2 text-red-800"
-                  : "whitespace-pre-wrap text-neutral-900"
-              }
-            >
-              {turn.text}
+          ),
+        )}
+
+        {/* The answer as it is written. Replaced by the finished reply, which
+            is why it is not a line of the transcript. */}
+        {busy && live.text.trim() && (
+          <div className="text-sm">
+            <div className="mb-0.5 font-mono text-[11px] text-neutral-400">{boxName}</div>
+            <div className="whitespace-pre-wrap text-neutral-900">
+              {live.text.trimStart()}
+              <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-neutral-400 align-middle" />
             </div>
           </div>
-        ))}
+        )}
 
         {/* Waking is not a hang, and saying so is the difference between a
             slow app and a broken one. A box is asleep most of the time —
@@ -172,7 +206,18 @@ export function Conversation({ boxName }: { boxName: string }) {
           </p>
         )}
         {status === "thinking" && (
-          <p className="text-xs text-neutral-500">{boxName} is thinking…</p>
+          <div className="space-y-1">
+            {/* The agent's train of thought, while there is nothing else to
+                show. Its tail, on one line: enough to see it is getting
+                somewhere, not a wall to read. */}
+            {live.reasoning && !live.text.trim() && (
+              <p className="text-xs italic text-neutral-400">{reasoningTail(live.reasoning)}</p>
+            )}
+            <p className="flex items-center gap-1.5 text-xs text-neutral-500">
+              <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-neutral-400" />
+              {boxName} is {doingNow(turns, live)}
+            </p>
+          </div>
         )}
 
         {/* The agent is blocked on this. Shown in the flow of the
@@ -245,5 +290,48 @@ export function Conversation({ boxName }: { boxName: string }) {
         </div>
       </form>
     </div>
+  );
+}
+
+/**
+ * The tools an agent used between two things it said.
+ *
+ * A running step only pulses while the turn is live. After a failure or a
+ * closed socket nothing will ever finish it, and a spinner there would claim
+ * work that is not happening.
+ */
+function Work({ steps, busy }: { steps: WorkStep[]; busy: boolean }) {
+  return (
+    <ul className="space-y-0.5 border-l-2 border-neutral-200 pl-3">
+      {steps.map((step) => (
+        <li key={step.id} className="flex items-baseline gap-2 text-xs">
+          <span
+            className={
+              step.state === "failed"
+                ? "w-3 text-red-600"
+                : step.state === "done"
+                  ? "w-3 text-emerald-600"
+                  : busy
+                    ? "w-3 animate-pulse text-neutral-400"
+                    : "w-3 text-neutral-300"
+            }
+            aria-label={step.state}
+          >
+            {step.state === "failed" ? "✕" : step.state === "done" ? "✓" : "•"}
+          </span>
+          <span className="shrink-0 text-neutral-500">{step.tool}</span>
+          {step.detail && (
+            <code className="min-w-0 truncate font-mono text-[11px] text-neutral-700" title={step.detail}>
+              {step.detail}
+            </code>
+          )}
+          {step.seconds !== null && (
+            <span className="ml-auto shrink-0 font-mono text-[10px] text-neutral-400">
+              {duration(step.seconds)}
+            </span>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
