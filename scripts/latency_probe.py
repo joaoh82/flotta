@@ -110,16 +110,22 @@ def box_endpoint(box: str) -> tuple[str, str]:
         headers={"Authorization": f"Bearer {os.environ['FLOTTA_READ_TOKEN']}"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
-        endpoint = json.loads(response.read())["endpoint"]
+        # The single-box read wraps the row: `{"box": {...}, "tasks": [...]}`.
+        endpoint = json.loads(response.read())["box"]["endpoint"]
     app, machine = endpoint.removeprefix("fly://").split("/", 1)
     return app, machine
 
 
 def read_log(box: str) -> list[str]:
-    """The model-call lines from the box's agent.log. Read-only."""
+    """The model-call lines from the box's agent.log. Read-only.
+
+    `grep -a`: agent.log carries stray binary bytes, and without it grep prints
+    "binary file matches" at the first one and stops — the first run of this
+    matched nothing newer than the day before and reported zero calls.
+    """
     app, machine = box_endpoint(box)
     command = "/bin/sh -c " + shlex.quote(
-        "grep -h 'agent.conversation_loop: API call #' /data/hermes/logs/agent.log | tail -n 400"
+        "grep -ah 'agent.conversation_loop: API call #' /data/hermes/logs/agent.log | tail -n 1000"
     )
     result = subprocess.run(
         ["flyctl", "machine", "exec", machine, "-a", app, "--json", command],
@@ -131,9 +137,31 @@ def read_log(box: str) -> list[str]:
 
 
 def main() -> int:
+    # `latency_probe.py latency-<box>-<stamp>.json` re-reads the log for a run
+    # already made, without paying for its model calls again.
+    if len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
+        with open(sys.argv[1], encoding="utf-8") as saved_run:
+            run = json.load(saved_run)
+        box, start, end = run["box"], run["start"], run["end"]
+        turns = [TurnTiming(**t) for t in run["turns"]]
+        calls = calls_between(read_log(box), start - 5, end + 5)
+        stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(start))
+        print(report(turns, calls, title=f"{box}, {len(turns)} turns, {stamp}"))
+        return 0
+
     box = sys.argv[1] if len(sys.argv) > 1 else "eng-g"
     rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     turns, start, end = asyncio.run(run_rounds(box, rounds))
+    # Saved before the log is read: the turns cost model calls, and a failure
+    # reading the log should not throw them away.
+    saved = f"latency-{box}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(start))}.json"
+    with open(saved, "w", encoding="utf-8") as out:
+        json.dump(
+            {"box": box, "start": start, "end": end, "turns": [t.__dict__ for t in turns]},
+            out,
+            indent=2,
+        )
+    print(f"turn timings saved to {saved}", file=sys.stderr)
     # A few seconds either side: the log line is written as the call returns,
     # and the box's clock is not this laptop's.
     calls = calls_between(read_log(box), start - 5, end + 5)
