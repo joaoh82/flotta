@@ -75,6 +75,24 @@ Switching to another agent and back mid-turn shows the turn so far again
 rather than a blank pane. The steps are the window's, not the agent's memory:
 reopening a finished conversation shows what was said, not which commands ran.
 
+## Replies are Markdown, with three things refused
+
+Agents answer in Markdown nearly every turn, so their words render as it:
+tables, code blocks, lists, headings. Your own messages and Flotta's errors
+stay plain text.
+
+What an agent writes is untrusted — it reads repositories, pages and command
+output, and any of them can put text in a reply — so three things Markdown
+would normally do are refused:
+
+- **HTML is shown as text**, never turned into elements.
+- **Images are not loaded.** Loading one would mean the window fetching a URL
+  an agent chose, which is the one thing the app is built never to do. The
+  alt text is shown instead.
+- **Links do not open.** The window has no permission to open a browser, on
+  purpose, so a clickable link would replace the app itself with the page. A
+  link shows its text and address, so you can copy it.
+
 ## Start over, and why a conversation has a boundary at all
 
 Hermes renders an agent's system prompt **once, when a session starts**, and

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Markdown } from "./Markdown";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -171,15 +172,21 @@ export function Conversation({ boxName }: { boxName: string }) {
               <div className="mb-0.5 font-mono text-[11px] text-neutral-400">
                 {turn.from === "you" ? "you" : turn.from === "agent" ? boxName : "flotta"}
               </div>
-              <div
-                className={
-                  turn.from === "system"
-                    ? "whitespace-pre-wrap rounded bg-red-50 px-3 py-2 text-red-800"
-                    : "whitespace-pre-wrap text-neutral-900"
-                }
-              >
-                {turn.text}
-              </div>
+              {/* Only the agent's words are Markdown. What the person typed
+                  is shown as typed, and an error is Flotta's, not prose. */}
+              {turn.from === "agent" ? (
+                <Markdown text={turn.text} />
+              ) : (
+                <div
+                  className={
+                    turn.from === "system"
+                      ? "whitespace-pre-wrap rounded bg-red-50 px-3 py-2 text-red-800"
+                      : "whitespace-pre-wrap text-neutral-900"
+                  }
+                >
+                  {turn.text}
+                </div>
+              )}
             </div>
           ),
         )}
@@ -189,10 +196,10 @@ export function Conversation({ boxName }: { boxName: string }) {
         {busy && live.text.trim() && (
           <div className="text-sm">
             <div className="mb-0.5 font-mono text-[11px] text-neutral-400">{boxName}</div>
-            <div className="whitespace-pre-wrap text-neutral-900">
-              {live.text.trimStart()}
-              <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-neutral-400 align-middle" />
-            </div>
+            {/* Rendered as it streams: half a table is still easier to read
+                as a table than as pipes, and the finished reply replaces it. */}
+            <Markdown text={live.text.trimStart()} />
+            <span className="mt-1 inline-block h-3.5 w-1.5 animate-pulse bg-neutral-400" />
           </div>
         )}
 
