@@ -1298,6 +1298,48 @@ def create_app(
             status_code=202,
         )
 
+    def confine_to_box(token: Token | None, box: Any, action: str) -> None:
+        """Refuse a box token acting on any box but its own.
+
+        Scopes say what a token may do, never to which box. A `box:` subject
+        lives on a machine whose agent has root, so without this one box's
+        token would reach every other box's grants. Any other subject — an
+        operator — is unrestricted.
+        """
+        claimed = subject_box(token.subject) if token else None
+        if claimed is not None and claimed not in {box.id, box.name}:
+            raise HTTPException(
+                status_code=403,
+                detail=f"token for box {claimed!r} cannot {action} box {box.name!r}",
+            )
+
+    @app.get("/api/boxes/{box_id}/git-credential/repos")
+    def git_credential_repos(box_id: str, token: Token | None = needs_git) -> Any:
+        """The repositories this box may get a git credential for (FLOTTA-61).
+
+        **For the agent, asked with its own token.** Asked which repositories
+        it could reach, eng-r ran seven shell commands and three failed: the
+        box has no fleet store and no signing key, correctly, and nothing told
+        it the answer. `GET /repos` has it, but behind `fleet:read`, and a box
+        holds only `git:credential`.
+
+        So this is the same list under the scope the box already has, confined
+        the same way minting is. Not `fleet:read` added to box tokens: that
+        would let an agent read every box in the fleet to learn its own grants.
+        Read-only, and names nothing the credential endpoint would not already
+        refuse or allow — a box that can mint for a repository can learn that
+        it can by trying.
+        """
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            confine_to_box(token, box, "list the repositories of")
+            return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/git-credential")
     def git_credential(box_id: str, body: dict[str, Any], token: Token | None = needs_git) -> Any:
         """Mint a git credential for a repository this box is granted.
@@ -1341,13 +1383,7 @@ def create_app(
             # Before anything else: is this token allowed to speak for this
             # box? A non-box subject (an operator) is unrestricted — see
             # `auth.BOX_SUBJECT_PREFIX`.
-            claimed = subject_box(token.subject) if token else None
-            if claimed is not None and claimed not in {box.id, box.name}:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"token for box {claimed!r} cannot mint credentials for "
-                    f"box {box.name!r}",
-                )
+            confine_to_box(token, box, "mint credentials for")
 
             repo = str(body.get("repo") or "").strip()
             if not repo:

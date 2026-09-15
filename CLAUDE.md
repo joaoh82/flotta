@@ -162,6 +162,20 @@ conventions, and the sharp edges below.
   exits the shell before `|| true` is ever reached — a missing venv would have
   stopped the agent booting. `test_recipes.py` runs the line under `set -euo
   pipefail` with no venv to prove it (FLOTTA-60).
+- **An agent learns what Flotta gives it from a skill in the image, not from
+  its volume or its working directory.** `flotta-repos` (FLOTTA-61) lists the
+  repositories a box may use, via `GET /api/boxes/{id}/git-credential/repos`,
+  under the `git:credential` scope the box already holds and confined to its
+  own box like minting is. The agent finds it through the
+  `flotta-github-access` skill in `src/flotta/box/hermes_skills/`, which
+  `python -m flotta.box.skills` registers as `skills.external_dirs` in
+  `config.yaml` at boot: read-only, indexed in every session's prompt, moving
+  with the image. **Not `AGENTS.md`**: Hermes reads it from the session cwd,
+  resolved from three settings, and on `eng-g` the process ran in
+  `/workspace` while its sessions reported `/root`. Hermes truncates a skill
+  description in the index at **60 characters**, and demotes some categories
+  to names-only in coding sessions — `test_skills.py` pins both. The directory
+  is `hermes_skills`, not `skills`, because `.dockerignore` excludes `skills/`.
 - **The deployed control plane is `pip install`ed, not run from `src/`.** A
   path resolved relative to a module (`Path(__file__).parents[n]`) is the
   repo root in a checkout and somewhere under site-packages on Railway.

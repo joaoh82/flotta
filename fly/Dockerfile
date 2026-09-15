@@ -145,10 +145,17 @@ RUN chmod +x /usr/local/bin/box_entrypoint.sh
 # The `gh` shim shadows /usr/bin/gh because `gh` has no credential-helper hook
 # and the alternative is a long-lived token in its hosts.yml. Read the header
 # of gh_shim.sh before changing it; it is deliberately transparent.
+#
+# `flotta-repos` and the `flotta-github-access` skill are how an agent learns
+# which repositories it may use (FLOTTA-61). Both are checked here because a
+# skill that names a missing command, or a command no skill mentions, fails
+# quietly: the agent just goes back to guessing with a shell.
 COPY fly/gh_shim.sh /usr/local/bin/gh
 RUN chmod +x /usr/local/bin/gh \
     && test -x /usr/bin/gh \
-    && test -x "$HERMES_VENV/bin/git-credential-flotta"
+    && test -x "$HERMES_VENV/bin/git-credential-flotta" \
+    && test -x "$HERMES_VENV/bin/flotta-repos" \
+    && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-github-access/SKILL.md
 
 # tini as PID 1 so a process the agent spawns and abandons is reaped rather
 # than accumulating as a zombie. An agent that runs `npm test` in a loop for a

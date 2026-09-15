@@ -282,3 +282,46 @@ def test_a_box_without_the_venv_still_boots_past_the_approvals_line(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "still-booting" in result.stdout, "a missing venv stopped the box booting"
+
+
+def test_the_entrypoint_registers_flottas_skills_for_real(tmp_path):
+    """The skills line as written in the entrypoint, under `set -euo pipefail`,
+    after the approvals line — both write config.yaml (FLOTTA-61)."""
+    import subprocess
+    import sys
+
+    import yaml
+
+    body = _ENTRYPOINT.read_text(encoding="utf-8")
+    lines = [
+        line
+        for line in body.splitlines()
+        if ("flotta.box.approvals" in line or "flotta.box.skills" in line)
+        and not line.lstrip().startswith("#")
+    ]
+    assert len(lines) == 2, lines
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    venv = pathlib.Path(sys.executable).parent.parent
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", "\n".join(lines) + "\necho still-booting"],
+        env={"HERMES_HOME": str(home), "HERMES_VENV": str(venv), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "still-booting" in result.stdout
+    written = yaml.safe_load((home / "config.yaml").read_text())
+    assert written["approvals"]["timeout"] < 300
+    (registered,) = written["skills"]["external_dirs"]
+    assert pathlib.Path(registered, "flotta", "flotta-github-access", "SKILL.md").is_file()
+
+    # And with no venv at all, the box still boots past both lines.
+    bare = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", "\n".join(lines) + "\necho still-booting"],
+        env={"HERMES_HOME": str(home), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert bare.returncode == 0 and "still-booting" in bare.stdout, bare.stderr

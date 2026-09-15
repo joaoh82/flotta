@@ -97,6 +97,12 @@ fi
 # must still boot; the module never raises, and this is belt and braces.
 "${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.approvals "$HERMES_HOME" || true
 
+# Flotta's own skills — today, how an agent learns which repositories it may
+# use (FLOTTA-61). Registered as a read-only external directory, so the skill
+# ships in the image and never lands on the agent's volume. Same `${…:-}`
+# default as the line above, for the same `set -u` reason.
+"${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.skills "$HERMES_HOME" || true
+
 echo "[flotta-box] HERMES_HOME=$HERMES_HOME"
 echo "[flotta-box] workdir=$FLOTTA_WORKDIR"
 echo "[flotta-box] mount:"
