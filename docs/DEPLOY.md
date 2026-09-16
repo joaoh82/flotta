@@ -413,6 +413,36 @@ any other box's repositories. A box can hold several grants: a
 task that fixes a bug in one repo and updates the client in another is one
 task, not two.
 
+### 7b-bis. Let agents message each other (M7)
+
+An agent's token now carries `box:peer` as well as `git:credential`, which is
+what lets it ask the control plane to carry a message to a colleague.
+
+**A box that predates M7 has a token without that scope**, and will be refused
+with a 403 naming the missing scope. Re-issue its identity:
+
+```bash
+just box-identity eng-a          # re-mints the token, restarts the machine
+```
+
+Then grant the colleagues. Grants are **directed** — this lets eng-a ask eng-b,
+not the reverse:
+
+```bash
+uv run flotta peer grant eng-a eng-b
+uv run flotta peer list eng-a
+```
+
+Agents cannot grant themselves; `peer grant` needs `fleet:write`, which no box
+holds. There is no store-first path for these commands: the grant is
+meaningless without a control plane, because the control plane is what carries
+the message.
+
+> **`box:chat` must never end up on a box.** The front door checks a token's
+> scope and not its subject, so a box holding `box:chat` could reach every
+> agent on the fleet regardless of any grant. That is the whole reason
+> delegation is relayed rather than dialled direct.
+
 ### 7c. Prove it
 
 Ask the agent to clone the private repo, make a commit and push a branch. The

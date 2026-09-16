@@ -190,6 +190,26 @@ CREATE TABLE IF NOT EXISTS box_repos (
     PRIMARY KEY (box_id, repo)
 );
 
+-- Which agents an agent may talk to (M7). The same shape as `box_repos` and
+-- for the same reasons: a side table arrives on an existing fleet by itself,
+-- and a grant is revocable without restarting anything.
+--
+-- **Directed on purpose.** A grant is "A may message B", not "A and B are
+-- colleagues". A triage agent that may ask the specialist is not the same as
+-- a specialist that may interrupt triage, and collapsing the two would make
+-- every grant two grants.
+--
+-- The peer is stored as an **id**, unlike `box_repos` which stores a slug: a
+-- name is an address and an address can be released and reused once its box
+-- is destroyed (FLOTTA-30), so a grant recorded by name could silently come
+-- to mean a different agent. The id cannot be recycled.
+CREATE TABLE IF NOT EXISTS box_peers (
+    box_id      TEXT NOT NULL REFERENCES boxes(id),
+    peer_id     TEXT NOT NULL REFERENCES boxes(id),
+    granted_at  TEXT NOT NULL,
+    PRIMARY KEY (box_id, peer_id)
+);
+
 -- Fleet configuration a person set, as opposed to what the process was
 -- started with. Flotta is used through the desktop app, so the app has to be
 -- able to change how the fleet behaves — and an environment variable on
@@ -1070,6 +1090,52 @@ class FleetStore:
         `https://github.com/o/n.git` and `o/n` are the same grant.
         """
         return normalise_repo(repo) in self.repos_for_box(box_id)
+
+    # -- peer grants ---------------------------------------------------
+
+    def grant_peer(self, box_id: str, peer_id: str) -> None:
+        """Let a box message another agent. Idempotent, and directed.
+
+        Both ids are checked to exist: a grant naming a box that was never
+        created is a typo that would otherwise sit in the table looking
+        authoritative until someone tried to use it.
+        """
+        self._require("box", box_id)
+        self._require("box", peer_id)
+        if box_id == peer_id:
+            raise ValueError("a box cannot be granted itself as a peer")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO box_peers (box_id, peer_id, granted_at) VALUES (?, ?, ?)"
+            if not self.is_postgres
+            else "INSERT INTO box_peers (box_id, peer_id, granted_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (box_id, peer_id) DO UPDATE SET granted_at = EXCLUDED.granted_at",
+            (box_id, peer_id, _utcnow()),
+        )
+
+    def revoke_peer(self, box_id: str, peer_id: str) -> bool:
+        """Withdraw a grant. Returns whether there was one."""
+        had = peer_id in self.peers_for_box(box_id)
+        self._conn.execute(
+            "DELETE FROM box_peers WHERE box_id = ? AND peer_id = ?", (box_id, peer_id)
+        )
+        return had
+
+    def peers_for_box(self, box_id: str) -> list[str]:
+        """Every agent this box may message, as ids, sorted.
+
+        Torn-down agents are left out: a grant outlives the machine, but an
+        agent that no longer exists is not someone to be told about.
+        """
+        rows = self._conn.execute(
+            "SELECT p.peer_id FROM box_peers p JOIN boxes b ON b.id = p.peer_id "
+            "WHERE p.box_id = ? AND b.destroyed_at IS NULL ORDER BY b.name",
+            (box_id,),
+        )
+        return [str(r["peer_id"]) for r in rows]
+
+    def may_message(self, box_id: str, peer_id: str) -> bool:
+        """Whether a box has been granted an agent. The question the relay asks."""
+        return peer_id in self.peers_for_box(box_id)
 
     def count_live_workspaces(self) -> int:
         """How many workspaces are in a non-terminal state."""

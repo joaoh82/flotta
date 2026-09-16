@@ -1483,6 +1483,118 @@ def repo_list(
         )
 
 
+# -- peer grants (M7) -------------------------------------------------------
+
+peer_app = typer.Typer(
+    name="peer",
+    help="Which agents an agent may message.",
+    no_args_is_help=True,
+)
+app.add_typer(peer_app)
+
+
+def _peer_lines(peers: list[dict[str, Any]]) -> str:
+    def one(peer: dict[str, Any]) -> str:
+        said = " — ".join(
+            part for part in (peer.get("display_name") or "", peer.get("description") or "") if part
+        )
+        return f"  {peer['name']}" + (f"  ({said})" if said else "")
+
+    return "\n".join(one(p) for p in peers) or "  (none)"
+
+
+@peer_app.command("grant")
+def peer_grant(
+    box_id: str = typer.Argument(..., help="Box name or id — the one doing the asking"),
+    peer: str = typer.Argument(..., help="Box name or id it may message"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Let one agent message another.
+
+    **Directed**: granting `eng-a eng-b` lets eng-a ask eng-b, not the other
+    way round. Two agents that should interrupt each other freely are two
+    grants, said out loud.
+
+    Through the control plane only — unlike `repo grant`, there is no
+    store-first path. The grant is meaningless without a control plane to
+    enforce it, since the control plane is what carries the message.
+    """
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if not control_url():
+        raise _fail(
+            ControlPlaneError(
+                "agents message each other through the control plane, so this needs "
+                "$FLOTTA_CONTROL_URL set."
+            ),
+            code=2,
+        )
+    try:
+        box = _remote_box(box_id)
+        other = _remote_box(peer)
+        body = control_request(
+            "POST",
+            f"/api/boxes/{box['id']}/peers",
+            scopes=(SCOPE_FLEET_WRITE,),
+            body={"peer": other["id"]},
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    emit(
+        {"box_id": box["id"], "name": box["name"], "peers": body["peers"]},
+        f"{box['name']} may now message {other['name']}",
+        as_json=as_json,
+    )
+
+
+@peer_app.command("revoke")
+def peer_revoke(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    peer: str = typer.Argument(..., help="Box name or id it may no longer message"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Withdraw a grant. Takes effect on the next message, with no restart."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if not control_url():
+        raise _fail(ControlPlaneError("this needs $FLOTTA_CONTROL_URL set."), code=2)
+    try:
+        box = _remote_box(box_id)
+        body = control_request(
+            "DELETE", f"/api/boxes/{box['id']}/peers/{peer}", scopes=(SCOPE_FLEET_WRITE,)
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    emit(
+        {"box_id": box["id"], "revoked": body["revoked"], "peers": body["peers"]},
+        f"{box['name']} {'may no longer message' if body['revoked'] else 'was not messaging'} "
+        f"{peer}",
+        as_json=as_json,
+    )
+
+
+@peer_app.command("list")
+def peer_list(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Every agent this agent may message."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    if not control_url():
+        raise _fail(ControlPlaneError("this needs $FLOTTA_CONTROL_URL set."), code=2)
+    try:
+        box = _remote_box(box_id)
+        body = control_request("GET", f"/api/boxes/{box['id']}/peers", scopes=(SCOPE_FLEET_READ,))
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    emit(
+        {"box_id": box["id"], "name": box["name"], "peers": body["peers"]},
+        _peer_lines(body["peers"]),
+        as_json=as_json,
+    )
+
+
 # -- tokens (M5) ------------------------------------------------------------
 
 token_app = typer.Typer(
@@ -1588,11 +1700,16 @@ def token_box(
     to know which box it is (`FLOTTA_BOX_ID` — it is in the credential URL, not
     in the token) and what to sign commits as (`FLOTTA_BOX_NAME`).
 
-    The token carries `git:credential` and nothing else, and its subject is
+    The token carries `git:credential` and `box:peer`, and its subject is
     `box:<id>` — which the control plane checks against the box in the request
-    path, so this token cannot mint credentials for anyone else's repositories.
-    That check is the reason it is safe to put a Flotta token on a machine
-    whose agent has root.
+    path, so this token cannot mint credentials for anyone else's repositories
+    or send messages as another agent. That check is the reason it is safe to
+    put a Flotta token on a machine whose agent has root.
+
+    Neither scope reaches anything directly: one asks the control plane to
+    trade for a GitHub credential, the other asks it to carry a message to an
+    agent this box has been granted. Notably **not** `box:chat`, which the
+    front door accepts for any box — see `auth`'s scope table.
     """
     from flotta.auth import AuthError
     from flotta.provision import build_identity

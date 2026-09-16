@@ -51,6 +51,8 @@ flotta = "flotta.cli:app"
 git-credential-flotta = "flotta.box.git_credential:main"
 # What an agent runs to learn which repositories it may use (FLOTTA-61).
 flotta-repos = "flotta.box.repos:main"
+# What an agent runs to ask a colleague a question (M7, FLOTTA-54).
+flotta-ask = "flotta.box.ask:main"
 
 [dependency-groups]
 dev = [

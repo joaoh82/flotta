@@ -879,7 +879,7 @@ def test_an_agent_can_have_a_name_that_is_not_its_address(store):
 
 
 def test_meta_is_absent_until_set_and_empty_becomes_none(store):
-    """"No description" is a state, not an empty string that renders as a
+    """ "No description" is a state, not an empty string that renders as a
     blank line."""
     b = store.create_box("eng-f")
     assert store.meta_for_box(b.id) is None
@@ -946,3 +946,73 @@ def test_the_meta_table_appears_on_a_store_that_predates_it(tmp_path):
         assert store.meta_for_box("b-old") is None
         store.set_box_meta("b-old", display_name="Survivor")
         assert store.meta_for_box("b-old").display_name == "Survivor"
+
+
+# -- peer grants (M7, FLOTTA-54) --------------------------------------------
+
+
+def test_an_agent_may_message_one_it_was_granted(store, box):
+    other = store.create_box("eng-c")
+    store.grant_peer(box.id, other.id)
+    assert store.peers_for_box(box.id) == [other.id]
+    assert store.may_message(box.id, other.id)
+
+
+def test_a_grant_is_one_way(store, box):
+    """Directed on purpose. A triage agent that may ask the specialist is not
+    a specialist that may interrupt triage."""
+    other = store.create_box("eng-c")
+    store.grant_peer(box.id, other.id)
+    assert not store.may_message(other.id, box.id)
+    assert store.peers_for_box(other.id) == []
+
+
+def test_granting_twice_is_one_grant(store, box):
+    other = store.create_box("eng-c")
+    store.grant_peer(box.id, other.id)
+    store.grant_peer(box.id, other.id)
+    assert store.peers_for_box(box.id) == [other.id]
+
+
+def test_an_agent_cannot_be_its_own_colleague(store, box):
+    """Nothing good is downstream of it, and the relay's cycle check would
+    refuse the message anyway — better to refuse the grant that looks valid in
+    the app for as long as nobody uses it."""
+    with pytest.raises(ValueError, match="itself"):
+        store.grant_peer(box.id, box.id)
+
+
+def test_a_grant_naming_an_agent_that_does_not_exist_is_refused(store, box):
+    """Otherwise the typo sits in the table looking authoritative until
+    somebody tries to use it."""
+    with pytest.raises(UnknownEntityError):
+        store.grant_peer(box.id, "nope")
+
+
+def test_revoking_says_whether_there_was_a_grant(store, box):
+    other = store.create_box("eng-c")
+    store.grant_peer(box.id, other.id)
+    assert store.revoke_peer(box.id, other.id) is True
+    assert store.revoke_peer(box.id, other.id) is False
+    assert not store.may_message(box.id, other.id)
+
+
+def test_a_destroyed_agent_drops_off_the_roster(store, box):
+    """The grant outlives the machine, but an agent that no longer exists is
+    not somebody to be told about — and its name can be reused (FLOTTA-30),
+    so naming it would eventually mean somebody else."""
+    other = store.create_box("eng-c")
+    store.grant_peer(box.id, other.id)
+    store.update_box_status(other.id, "torn_down")
+    assert store.peers_for_box(box.id) == []
+    assert not store.may_message(box.id, other.id)
+
+
+def test_the_roster_is_ordered_by_name_not_by_when_it_was_granted(store, box):
+    """The app and the agent both read this as a list of colleagues; grant
+    order is not a thing either of them knows about."""
+    late = store.create_box("eng-a")
+    early = store.create_box("eng-z")
+    store.grant_peer(box.id, early.id)
+    store.grant_peer(box.id, late.id)
+    assert store.peers_for_box(box.id) == [late.id, early.id]

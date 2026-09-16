@@ -2341,3 +2341,303 @@ def test_something_that_is_not_a_repository_is_refused_before_github_is_asked(de
 
     assert response.status_code == 422
     assert asked == [], "asked GitHub about something that does not name a repository"
+
+
+# -- agents talking to each other (M7, FLOTTA-54) ---------------------------
+
+
+@pytest.fixture
+def colleagues(fleet):
+    """A control plane whose deliveries are recorded instead of made.
+
+    The default delivery opens a WebSocket to a live box through the front
+    door and spends a model call. Injected here for the same reason every Fly
+    touchpoint is: the suite is hermetic and $0.
+    """
+    delivered: list[tuple[str, str]] = []
+    replies: dict[str, object] = {"answer": "the door wakes it."}
+
+    async def deliver(peer_name, text, *, title):
+        delivered.append((peer_name, text))
+        if isinstance(replies["answer"], Exception):
+            raise replies["answer"]
+        return replies["answer"]
+
+    from flotta.store import FleetStore as _Store
+
+    store = _Store(fleet)
+    other = store.create_box("eng-b")
+    store.update_box_status(other.id, "running", endpoint="fly://app/m2")
+    store.close()
+
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        signing_key=AUTH_KEY,
+        reachable=_unchecked,
+        deliver=deliver,
+    )
+    with TestClient(app) as c:
+        yield c, delivered, replies
+
+
+def _as_box(client, name, scope):
+    from flotta.auth import box_subject
+
+    return _bearer(scope, subject=box_subject(_box_ids(client)[name]))
+
+
+def _grant_peer(client, box, peer):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    return client.post(
+        f"/api/boxes/{box}/peers", json={"peer": peer}, headers=_bearer(SCOPE_FLEET_WRITE)
+    )
+
+
+def test_an_operator_grants_a_colleague_and_it_is_listed(colleagues):
+    from flotta.auth import SCOPE_FLEET_READ
+
+    client, _, _ = colleagues
+    granted = _grant_peer(client, "eng-a", "eng-b")
+    assert granted.status_code == 200
+    assert [p["name"] for p in granted.json()["peers"]] == ["eng-b"]
+
+    listed = client.get("/api/boxes/eng-a/peers", headers=_bearer(SCOPE_FLEET_READ))
+    assert [p["name"] for p in listed.json()["peers"]] == ["eng-b"]
+
+
+def test_a_grant_is_one_way(colleagues):
+    """A triage agent that may ask the specialist is not a specialist that may
+    interrupt triage. Collapsing the two would make every grant two grants."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    client, _, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    back = client.get("/api/boxes/eng-b/peers", headers=_bearer(SCOPE_FLEET_READ))
+    assert back.json()["peers"] == []
+
+
+def test_a_box_cannot_grant_itself_a_colleague(colleagues):
+    """The rule that makes the grant table mean anything. A box carries
+    `box:peer`, which buys the right to *use* a grant — if it could write one,
+    a prompt-injected agent could talk its way to the whole fleet."""
+    from flotta.auth import SCOPE_BOX_PEER
+
+    client, _, _ = colleagues
+    refused = client.post(
+        "/api/boxes/eng-a/peers",
+        json={"peer": "eng-b"},
+        headers=_as_box(client, "eng-a", SCOPE_BOX_PEER),
+    )
+    assert refused.status_code == 403
+    assert "fleet:write" in refused.json()["detail"]
+
+
+def test_an_agent_cannot_be_granted_itself(colleagues):
+    client, _, _ = colleagues
+    assert _grant_peer(client, "eng-a", "eng-a").status_code == 422
+
+
+def test_granting_an_agent_that_does_not_exist_is_404(colleagues):
+    client, _, _ = colleagues
+    assert _grant_peer(client, "eng-a", "nobody").status_code == 404
+
+
+def test_an_agent_asks_a_colleague_and_gets_the_answer(colleagues):
+    """The product ask, with the model call faked: A asks B, B answers, and
+    the answer comes back to A."""
+    from flotta.auth import SCOPE_BOX_PEER
+
+    client, delivered, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+
+    answered = client.post(
+        "/api/boxes/eng-a/peer/ask",
+        json={"peer": "eng-b", "message": "what wakes a sleeping box?"},
+        headers=_as_box(client, "eng-a", SCOPE_BOX_PEER),
+    )
+    assert answered.status_code == 200
+    assert answered.json()["reply"] == "the door wakes it."
+    assert answered.json()["peer"] == "eng-b"
+
+    # Delivered to the right agent, and the message says who is asking —
+    # the door strips that, so nothing else could tell it.
+    ((peer_name, text),) = delivered
+    assert peer_name == "eng-b"
+    assert "eng-a" in text and "what wakes a sleeping box?" in text
+
+
+def test_both_agents_timelines_show_the_exchange(colleagues):
+    """Written from both sides. An event saying only "a message happened"
+    leaves the app unable to say who asked whom."""
+    from flotta.auth import SCOPE_BOX_PEER, SCOPE_FLEET_READ
+
+    client, _, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    client.post(
+        "/api/boxes/eng-a/peer/ask",
+        json={"peer": "eng-b", "message": "ping"},
+        headers=_as_box(client, "eng-a", SCOPE_BOX_PEER),
+    )
+
+    def kinds(box):
+        events = client.get(f"/api/boxes/{box}/events", headers=_bearer(SCOPE_FLEET_READ)).json()
+        return [e["type"] for e in events["events"]]
+
+    assert "peer_asked" in kinds("eng-a") and "peer_answered" in kinds("eng-a")
+    assert "peer_asked_by" in kinds("eng-b") and "peer_replied" in kinds("eng-b")
+
+
+def test_an_ungranted_colleague_is_refused_with_what_to_do_about_it(colleagues):
+    """An agent told only "403" tries again, differently, three times."""
+    from flotta.auth import SCOPE_BOX_PEER
+
+    client, delivered, _ = colleagues
+    refused = client.post(
+        "/api/boxes/eng-a/peer/ask",
+        json={"peer": "eng-b", "message": "hello?"},
+        headers=_as_box(client, "eng-a", SCOPE_BOX_PEER),
+    )
+    assert refused.status_code == 403
+    detail = refused.json()["detail"]
+    assert "Flotta app" in detail and "cannot grant it yourself" in detail
+    assert delivered == [], "asked a colleague it was not granted"
+
+
+def test_revoking_takes_effect_on_the_next_message_with_no_restart(colleagues):
+    from flotta.auth import SCOPE_BOX_PEER, SCOPE_FLEET_WRITE
+
+    client, _, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    body = {"peer": "eng-b", "message": "still there?"}
+    headers = _as_box(client, "eng-a", SCOPE_BOX_PEER)
+    assert client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers).status_code == 200
+
+    revoked = client.delete("/api/boxes/eng-a/peers/eng-b", headers=_bearer(SCOPE_FLEET_WRITE))
+    assert revoked.json()["revoked"] is True
+    assert client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers).status_code == 403
+
+
+def test_a_box_cannot_send_messages_as_another_box(colleagues):
+    """The same confinement as minting a credential: scopes say what a token
+    may do, never for which box."""
+    from flotta.auth import SCOPE_BOX_PEER
+
+    client, delivered, _ = colleagues
+    _grant_peer(client, "eng-b", "eng-a")
+    refused = client.post(
+        "/api/boxes/eng-b/peer/ask",
+        json={"peer": "eng-a", "message": "pretending to be eng-b"},
+        headers=_as_box(client, "eng-a", SCOPE_BOX_PEER),
+    )
+    assert refused.status_code == 403
+    assert delivered == []
+
+
+def test_an_agent_reads_its_own_roster_with_the_token_it_holds(colleagues, fleet):
+    """An agent that cannot see the fleet cannot know who its colleagues are,
+    and one that guesses a name spends a wake finding out it was wrong.
+
+    The roster carries the description as well as the address, which is where
+    FLOTTA-40 starts paying for itself: "ask whoever handles backend PRs" is
+    only answerable if somebody wrote down what each agent is for.
+    """
+    from flotta.auth import SCOPE_BOX_PEER
+    from flotta.store import FleetStore as _Store
+
+    client, _, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+
+    store = _Store(fleet)
+    store.set_box_meta(
+        _box_ids(client)["eng-b"], display_name="Reviewer", description="backend PRs"
+    )
+    store.close()
+
+    roster = client.get(
+        "/api/boxes/eng-a/peer/roster", headers=_as_box(client, "eng-a", SCOPE_BOX_PEER)
+    )
+    assert roster.status_code == 200
+    assert roster.json()["peers"] == [
+        {
+            "id": _box_ids(client)["eng-b"],
+            "name": "eng-b",
+            "display_name": "Reviewer",
+            "description": "backend PRs",
+        }
+    ]
+
+
+def test_a_box_cannot_read_another_boxs_roster(colleagues):
+    from flotta.auth import SCOPE_BOX_PEER
+
+    client, _, _ = colleagues
+    refused = client.get(
+        "/api/boxes/eng-b/peer/roster", headers=_as_box(client, "eng-a", SCOPE_BOX_PEER)
+    )
+    assert refused.status_code == 403
+
+
+def test_an_agent_that_cannot_answer_is_a_502_and_says_so_on_the_timeline(colleagues):
+    """Not a 500: the failure is the other agent's or the path to it, and the
+    asking agent should say that rather than reporting Flotta as broken."""
+    from flotta.auth import SCOPE_BOX_PEER, SCOPE_FLEET_READ
+
+    client, _, replies = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    replies["answer"] = RuntimeError("no reply within 240s")
+
+    failed = client.post(
+        "/api/boxes/eng-a/peer/ask",
+        json={"peer": "eng-b", "message": "are you there?"},
+        headers=_as_box(client, "eng-a", SCOPE_BOX_PEER),
+    )
+    assert failed.status_code == 502
+    assert "no reply within 240s" in failed.json()["detail"]
+
+    events = client.get("/api/boxes/eng-a/events", headers=_bearer(SCOPE_FLEET_READ)).json()
+    assert "peer_failed" in [e["type"] for e in events["events"]]
+
+
+def test_two_agents_told_to_keep_talking_stop(colleagues):
+    """The runaway, through the real route. Each round trip wakes a machine
+    and spends a model call, so it has to stop with nobody watching.
+
+    `relay`'s own tests cover which rule catches which shape of loop; this one
+    is here to prove the route is wired to them at all — a limit that exists
+    in a module nothing calls is not a limit.
+    """
+    from flotta.auth import SCOPE_BOX_PEER
+    from flotta.relay import BUDGET
+
+    client, delivered, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    headers = _as_box(client, "eng-a", SCOPE_BOX_PEER)
+    body = {"peer": "eng-b", "message": "keep going"}
+
+    codes = [
+        client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers).status_code
+        for _ in range(BUDGET + 2)
+    ]
+    assert codes[:BUDGET] == [200] * BUDGET
+    assert codes[BUDGET:] == [429, 429]
+    assert len(delivered) == BUDGET, "kept spending model calls after the limit"
+
+
+def test_the_refusal_tells_the_agent_what_to_do_instead(colleagues):
+    """An agent that is only refused tries again. One told to answer with what
+    it has, does."""
+    from flotta.auth import SCOPE_BOX_PEER
+    from flotta.relay import BUDGET
+
+    client, _, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    headers = _as_box(client, "eng-a", SCOPE_BOX_PEER)
+    body = {"peer": "eng-b", "message": "keep going"}
+    for _ in range(BUDGET):
+        client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers)
+
+    refused = client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers)
+    assert "Answer with what you have" in refused.json()["detail"]
