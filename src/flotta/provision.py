@@ -1314,6 +1314,98 @@ def upgrade_box(
     }
 
 
+#: The event a rotation writes. The token is never in it — only when it ends
+#: and what it may do.
+IDENTITY_ROTATED = "identity_rotated"
+
+
+def rotate_identity(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    ttl_s: int = BOX_TOKEN_TTL_S,
+    reason: str = "requested",
+) -> dict[str, Any]:
+    """Give an existing agent a fresh identity token, on **its own** machine.
+
+    For an identity that is expiring, a signing key that was rotated, or a
+    token that predates a scope the agent now needs — M7's `box:peer` was the
+    first, and every agent made before it had to be re-minted by hand.
+
+    **The target is the box's endpoint, never configuration.** The recipe this
+    replaces took the app from `$FLOTTA_FLY_APP`, which predates one app per
+    agent: on the live fleet that is the image-build app, so it would have put
+    eng-g's token on the wrong app and left eng-g unchanged. The endpoint is
+    the one place that says where an agent actually lives.
+
+    **Only the token.** `build_identity` also produces the machine's id, name,
+    control-plane URL and commit-email domain, but those were set when the
+    machine was created and have not changed — re-writing them from whatever
+    this process happens to have would be a way to change them by accident.
+
+    **A sleeping agent stays asleep.** `apply_secrets` deploys without
+    `--stage`, which flyctl runs as a restart-only update; its
+    `shouldSkipLaunch` skips starting any machine that was not already
+    started (flyctl v0.4.102, `internal/command/deploy/machines_launchinput.go`).
+    A running agent restarts, which is inherent: the entrypoint reads its
+    environment once, at boot.
+
+    The old token stays valid until it expires. Tokens are revoked only by
+    rotating the signing key; this does not pretend otherwise.
+    """
+    from flotta.auth import AuthError, verify
+
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to update.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(
+            f"box {box_id} is still being created and receives its identity as part of "
+            "that; wait for it to settle."
+        )
+
+    _, secrets = build_identity(box.id, box.name, ttl_s=ttl_s)
+    token = secrets.get("FLOTTA_BOX_TOKEN")
+    if not token:
+        raise ProvisionError(
+            "no signing key is configured, so there is no identity to issue. Set "
+            "$FLOTTA_SIGNING_KEY where the control plane runs."
+        )
+    try:
+        claims = verify(token)
+    except AuthError as exc:  # pragma: no cover - we just minted it with this key
+        raise ProvisionError(f"the new token does not verify: {exc}") from exc
+
+    impl = _resolve_backend(box, backend)
+    try:
+        impl.apply_secrets(box.endpoint, {"FLOTTA_BOX_TOKEN": token})
+    except BackendError as exc:
+        store.add_event(
+            "box",
+            box.id,
+            "identity_rotation_failed",
+            {"reason": reason, "error": str(exc)[:400]},
+        )
+        raise UpgradeFailed(
+            f"could not give box {box.name} a new identity: {exc}. Its current one is unchanged."
+        ) from exc
+
+    result = {
+        "box_id": box.id,
+        "name": box.name,
+        "expires_at": claims.expires_at,
+        "scopes": sorted(claims.scopes),
+    }
+    store.add_event(
+        "box",
+        box.id,
+        IDENTITY_ROTATED,
+        {"reason": reason, "expires_at": claims.expires_at, "scopes": result["scopes"]},
+    )
+    return result
+
+
 #: How long a resolved release image is reused. The lookup is a `flyctl`
 #: subprocess and the answer changes only when somebody builds, so a minute of
 #: staleness costs nothing and saves a subprocess per Info panel opened.

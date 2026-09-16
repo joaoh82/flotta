@@ -405,8 +405,21 @@ uv run flotta repo grant eng-a joaoh82/flotta
 uv run flotta repo list eng-a
 ```
 
-For a box that predates it, or an identity that is expiring, `just box-identity
-eng-a` re-issues one and restarts the machine.
+For a box that predates it, or an identity that is expiring, renew it from the
+app (the agent's **Info** panel, **Identity → Renew**) or:
+
+```bash
+uv run flotta token rotate eng-a     # or: just box-identity eng-a
+```
+
+The control plane writes the new token to **that agent's own Fly app** — the
+endpoint says where it lives. A sleeping agent stays asleep and picks the
+token up when it next wakes; a running one restarts. Only the token changes.
+
+> The recipe used to mint locally and import into the one app `.env` names.
+> On a per-agent fleet that is the image-build app, so it put the token on the
+> wrong app and renewed nothing. If you ran it before this changed, check
+> `flyctl secrets list --app <your images app>` for a stray `FLOTTA_BOX_TOKEN`.
 
 Either way the token's subject is that box, so it cannot mint credentials for
 any other box's repositories. A box can hold several grants: a
@@ -419,10 +432,11 @@ An agent's token now carries `box:peer` as well as `git:credential`, which is
 what lets it ask the control plane to carry a message to a colleague.
 
 **A box that predates M7 has a token without that scope**, and will be refused
-with a 403 naming the missing scope. Re-issue its identity:
+with a 403 naming the missing scope. Renew its identity — **Info → Identity →
+Renew** in the app, or:
 
 ```bash
-just box-identity eng-a          # re-mints the token, restarts the machine
+uv run flotta token rotate eng-a
 ```
 
 **Every agent may ask every other by default** (FLOTTA-65) — a new agent is
@@ -450,13 +464,14 @@ carries the message.
 
 Ask the agent to clone the private repo, make a commit and push a branch. The
 commit will be authored by `eng-a <eng-a@$FLOTTA_DOMAIN>` — **provided
-`FLOTTA_DOMAIN` was set in `.env` when you ran `just box-identity`**, which is
-the only channel that carries it to the machine. Otherwise the box falls back
-to `eng-a@boxes.invalid`.
+`FLOTTA_DOMAIN` (or `FLOTTA_GIT_EMAIL_DOMAIN`) was set on the control plane
+when the agent was created**, which is when it is written to the machine.
+Otherwise the box falls back to `eng-a@boxes.invalid`.
 
 Set `FLOTTA_GIT_EMAIL_DOMAIN` instead to put agent commits on a different
-domain you own. Either way, changing it means re-running `box-identity` — the
-box reads the value at boot, from its secrets.
+domain you own. **Changing it for an existing agent is not supported yet**:
+renewing an identity deliberately rewrites only the token, so it cannot move
+an agent's commit address by accident.
 
 > **Not a `users.noreply.github.com` address, and this is deliberate.** The
 > legacy noreply format is `<login>@users.noreply.github.com` and GitHub still

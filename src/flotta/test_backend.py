@@ -971,3 +971,48 @@ def test_a_reply_that_is_not_an_object_is_still_a_refusal():
 
     with pytest.raises(BackendError, match="not JSON"):
         backend.exec("fly://app-1/m-1", "true")
+
+
+def test_a_rotated_secret_goes_to_the_app_the_endpoint_names():
+    """The bug this pins: `just box-identity` took the app from configuration,
+    which on a per-agent fleet is the image-build app. The endpoint is the only
+    place that says where an agent lives."""
+    import subprocess
+
+    from flotta.fly import FlyConfig
+
+    issued: list[tuple[list[str], str | None]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append((cmd, stdin))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    config = FlyConfig.from_env({"FLOTTA_FLY_APP": "joaoh82-flotta-images"}, dotenv="/nonexistent")
+    backend = FlyBackend(config=config, runner=runner)
+    backend.apply_secrets("fly://joaoh82-flotta-eng-g/815990c9246728", {"FLOTTA_BOX_TOKEN": "t"})
+
+    ((cmd, stdin),) = issued
+    assert cmd[cmd.index("--app") + 1] == "joaoh82-flotta-eng-g"
+    assert "joaoh82-flotta-images" not in cmd
+    assert stdin == "FLOTTA_BOX_TOKEN=t\n"
+    # The value travels on stdin, never argv, where `ps` would show it.
+    assert not any("FLOTTA_BOX_TOKEN" in part for part in cmd)
+
+
+def test_a_rotation_is_deployed_rather_than_merely_staged():
+    """`--stage` writes the value and leaves the machine on the old one until
+    something else updates it — a rotation that is recorded and not applied.
+    Unstaged, flyctl leaves a stopped machine stopped (`shouldSkipLaunch`)."""
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    FlyBackend(config=_offline_config(), runner=runner).apply_secrets(
+        "fly://joaoh82-flotta-eng-g/m1", {"FLOTTA_BOX_TOKEN": "t"}
+    )
+    assert "--stage" not in issued[0]
+    assert issued[0][:3] == ["flyctl", "secrets", "import"]

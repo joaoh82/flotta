@@ -79,8 +79,13 @@ conventions, and the sharp edges below.
   may not (`FLOTTA_BOX_TOKEN` alone). On Fly the secrets must be written
   **before** `machine run`, because a machine takes the app's secrets when it
   is created — which is why they travel in the spec rather than through a
-  `set_secrets()` verb the caller would have to sequence. `just box-identity`
-  is now rotation only.
+  `set_secrets()` verb the caller would have to sequence. Rotation is
+  `provision.rotate_identity` (`POST /api/boxes/{id}/identity`, `flotta token
+  rotate`, Info → Identity → Renew), which writes **only the token** to the
+  app **the box's endpoint names**. `just box-identity` is a caller of it; it
+  used to import into `FlyConfig.from_env().app`, which on a per-agent fleet
+  is the image-build app. `apply_secrets` deploys unstaged, and flyctl leaves
+  a stopped machine stopped (`shouldSkipLaunch`, v0.4.102).
 - **`--wait` or the row strands.** The *local* process records a task's
   outcome, not the container. Without `--wait` (and without a later `flotta
   watch`), the container finishes and the row sits at `running` forever.

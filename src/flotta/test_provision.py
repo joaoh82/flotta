@@ -3134,3 +3134,120 @@ def test_a_box_that_was_never_launched_has_no_machine_to_write_to(store):
         set_instructions(box.id, "Review backend PRs.", store=store, backend=impl)
 
     assert not impl.commands
+
+
+# -- rotating an agent's identity (the box-identity fix) ---------------------
+
+
+class Rotating(FakeBackend):
+    """Keeps where the secrets were sent, which is what the fix is about."""
+
+    def apply_secrets(self, box_id, secrets):
+        super().apply_secrets(box_id, secrets)
+        self.target = box_id
+
+
+def test_a_rotation_writes_a_fresh_token_to_the_agents_own_machine(store, monkeypatch):
+    from flotta.auth import box_subject, verify
+    from flotta.provision import rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    box = _running(store, endpoint="fly://joaoh82-flotta-eng-a/m1")
+    backend = Rotating()
+    result = rotate_identity(box.id, store=store, backend=backend)
+
+    assert backend.target == "fly://joaoh82-flotta-eng-a/m1"
+    claims = verify(backend.applied["FLOTTA_BOX_TOKEN"], key="k" * 32)
+    assert claims.subject == box_subject(box.id)
+    assert claims.scopes == frozenset({"git:credential", "box:peer"})
+    assert result["scopes"] == ["box:peer", "git:credential"]
+    assert result["expires_at"] == claims.expires_at
+
+
+def test_only_the_token_is_rewritten(store, monkeypatch):
+    """The machine's id, name, control URL and commit domain were set when it
+    was created. Re-writing them from this process's environment is how a
+    rotation would quietly change what an agent commits as."""
+    from flotta.provision import rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_GIT_EMAIL_DOMAIN", "somewhere-else.example")
+    backend = Rotating()
+    rotate_identity(_running(store).id, store=store, backend=backend)
+    assert list(backend.applied) == ["FLOTTA_BOX_TOKEN"]
+
+
+def test_a_rotation_is_recorded_without_the_token(store, monkeypatch):
+    from flotta.provision import IDENTITY_ROTATED, rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    box = _running(store)
+    backend = Rotating()
+    rotate_identity(box.id, store=store, backend=backend)
+
+    (event,) = [e for e in store.get_box_timeline(box.id) if e.type == IDENTITY_ROTATED]
+    assert set(event.payload) == {"reason", "expires_at", "scopes"}
+    assert backend.applied["FLOTTA_BOX_TOKEN"] not in str(event.payload)
+
+
+def test_a_sleeping_agent_can_be_given_an_identity(store, monkeypatch):
+    """Most of the fleet is asleep. Refusing those would make the verb useless;
+    `apply_secrets` leaves them asleep."""
+    from flotta.provision import rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    box = _running(store)
+    store.update_box_status(box.id, "stopped")
+    backend = Rotating()
+    rotate_identity(box.id, store=store, backend=backend)
+    assert "apply_secrets" in backend.calls
+    assert store.get_box(box.id).status == "stopped"
+
+
+def test_no_signing_key_is_a_refusal_not_an_empty_write(store, monkeypatch):
+    from flotta.provision import ProvisionError, rotate_identity
+
+    monkeypatch.delenv("FLOTTA_SIGNING_KEY", raising=False)
+    monkeypatch.setattr("flotta.auth.read_dotenv_value", lambda *a, **k: None, raising=False)
+    backend = Rotating()
+    with pytest.raises(ProvisionError, match="signing key"):
+        rotate_identity(_running(store).id, store=store, backend=backend)
+    assert "apply_secrets" not in backend.calls
+
+
+def test_an_agent_still_being_created_is_refused(store, monkeypatch):
+    """It gets its identity as part of creation; a second writer would race it."""
+    from flotta.provision import ProvisionError, rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    box = store.create_box("eng-new")
+    with pytest.raises(ProvisionError, match="still being created"):
+        rotate_identity(box.id, store=store, backend=Rotating())
+
+
+def test_a_destroyed_agent_is_refused(store, monkeypatch):
+    from flotta.provision import ProvisionError, rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    box = _running(store)
+    store.update_box_status(box.id, "torn_down")
+    with pytest.raises(ProvisionError, match="torn_down"):
+        rotate_identity(box.id, store=store, backend=Rotating())
+
+
+def test_a_failed_rotation_says_the_old_identity_still_holds(store, monkeypatch):
+    from flotta.backend import BackendError
+    from flotta.provision import UpgradeFailed, rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+
+    class Broken(FakeBackend):
+        def apply_secrets(self, box_id, secrets):
+            raise BackendError("flyctl exploded")
+
+    box = _running(store)
+    with pytest.raises(UpgradeFailed, match="current one is unchanged"):
+        rotate_identity(box.id, store=store, backend=Broken())
+    kinds = [e.type for e in store.get_box_timeline(box.id)]
+    assert "identity_rotation_failed" in kinds
+    assert "identity_rotated" not in kinds

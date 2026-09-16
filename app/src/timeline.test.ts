@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import fixture from "../src-tauri/tests/timeline.json";
-import { endingOf, missingOf, ownEvents, reasonOf, warningsIn } from "./timeline";
+import {
+  credentialOf,
+  endingOf,
+  missingOf,
+  ownEvents,
+  reasonOf,
+  renewalReason,
+  warningsIn,
+} from "./timeline";
 import type { BoxEvent } from "./types";
 
 /**
@@ -160,5 +168,55 @@ describe("what a missing-secrets event actually says", () => {
   it("does not warn about another tier's event", () => {
     const workspace = event({ id: 9, entity_kind: "workspace", type: "identity_skipped" });
     expect(warningsIn([workspace])).toEqual([]);
+  });
+});
+
+describe("an agent's identity token", () => {
+  const minted = event({
+    type: "identity_minted",
+    ts: "2026-09-01T00:00:00+00:00",
+    payload: { expires_at: 2_000_000_000 },
+  });
+  const rotated = event({
+    type: "identity_rotated",
+    ts: "2026-09-16T00:00:00+00:00",
+    payload: { expires_at: 2_100_000_000, scopes: ["box:peer", "git:credential"] },
+  });
+
+  it("is the newest one issued", () => {
+    expect(credentialOf([minted, rotated])).toEqual({
+      expiresAt: 2_100_000_000,
+      scopes: ["box:peer", "git:credential"],
+      issuedAt: "2026-09-16T00:00:00+00:00",
+    });
+  });
+
+  it("does not know the scopes of a token whose event did not record them", () => {
+    expect(credentialOf([minted])?.scopes).toBeNull();
+  });
+
+  it("is unknown for an agent with no identity events", () => {
+    expect(credentialOf(REAL.filter((e) => !e.type.startsWith("identity_")))).toBeNull();
+  });
+
+  it("ignores a task or workspace event that happens to look like one", () => {
+    expect(credentialOf([{ ...rotated, entity_kind: "task" }])).toBeNull();
+  });
+
+  it("wants renewing when expired or close to it, and says which", () => {
+    const now = 2_000_000_000;
+    expect(renewalReason({ expiresAt: now - 1, scopes: null, issuedAt: "" }, now)).toMatch(/expired/);
+    expect(renewalReason({ expiresAt: now + 3 * 86400, scopes: null, issuedAt: "" }, now)).toBe(
+      "expires in 3 days",
+    );
+    expect(renewalReason({ expiresAt: now + 60 * 86400, scopes: null, issuedAt: "" }, now)).toBeNull();
+  });
+
+  it("flags a token that cannot ask colleagues only when it knows the scopes", () => {
+    const later = 2_000_000_000 + 60 * 86400;
+    expect(
+      renewalReason({ expiresAt: later, scopes: ["git:credential"], issuedAt: "" }, 2_000_000_000),
+    ).toMatch(/cannot ask other agents/);
+    expect(renewalReason({ expiresAt: later, scopes: null, issuedAt: "" }, 2_000_000_000)).toBeNull();
   });
 });
