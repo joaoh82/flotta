@@ -265,6 +265,11 @@ export type AgentEvent =
    * on "thinking…" for minutes, blocked on a question the window never asked.
    */
   | { kind: "approval"; box_name: string; request: ApprovalRequest }
+  /**
+   * The question is no longer open: Hermes's timeout denied it, or the turn
+   * was interrupted. The card comes down; the turn goes on (FLOTTA-64).
+   */
+  | { kind: "approval_withdrawn"; box_name: string }
   | { kind: "thinking"; box_name: string }
   /**
    * What the agent is doing, while it does it (FLOTTA-61). Before this the

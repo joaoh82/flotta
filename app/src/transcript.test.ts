@@ -371,6 +371,24 @@ describe("approvalAfter", () => {
   });
 });
 
+describe("a withdrawn approval", () => {
+  it("takes the card down", () => {
+    // FLOTTA-64: Hermes v2026.9.14 withdraws a question it stopped waiting on.
+    // A card left up would offer buttons for something already denied.
+    expect(approvalAfter(asked, { kind: "approval_withdrawn", box_name: "eng-g" })).toBeNull();
+  });
+
+  it("leaves the agent working rather than waiting on a person", () => {
+    expect(statusAfter("approval", { kind: "approval_withdrawn", box_name: "eng-g" })).toBe(
+      "thinking",
+    );
+  });
+
+  it("does not touch the transcript", () => {
+    expect(turnsAfter(said, { kind: "approval_withdrawn", box_name: "eng-g" })).toEqual(said);
+  });
+});
+
 describe("choiceLabel", () => {
   it("labels the three answers the window offers", () => {
     expect(choiceLabel("session")).toBe("Allow for this conversation");
