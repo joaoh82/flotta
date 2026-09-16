@@ -718,9 +718,10 @@ def test_token_box_signs_the_remote_id_not_the_local_one(tmp_path, monkeypatch):
 
 
 def test_token_box_reports_a_control_plane_failure_instead_of_printing_half(tmp_path, monkeypatch):
-    """`just box-identity` pipes this into `flyctl secrets import`. A command
-    that prints part of an env block and exits 0 would load a broken identity
-    onto a machine."""
+    """An operator may pipe this into `flyctl secrets import` by hand (it is
+    what `just box-identity` did before `token rotate`). A command that prints
+    part of an env block and exits 0 would load a broken identity onto a
+    machine."""
     monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
     _remote(monkeypatch, fail="GET /api/boxes/eng-a -> 404: no box 'eng-a'")
     _, result = _token_box(tmp_path, monkeypatch)
@@ -731,9 +732,9 @@ def test_token_box_reports_a_control_plane_failure_instead_of_printing_half(tmp_
 
 
 def test_token_box_reads_the_control_url_from_a_dotenv(tmp_path, monkeypatch):
-    """Deliberate, not incidental: `just box-identity` runs this in a checkout
-    where `FLOTTA_CONTROL_URL` lives in `.env` and nowhere else, so reading the
-    file is the feature. Pinned here because the same behaviour is what makes
+    """Deliberate, not incidental: this runs in a checkout where
+    `FLOTTA_CONTROL_URL` lives in `.env` and nowhere else, so reading the file
+    is the feature. Pinned here because the same behaviour is what makes
     the tests above need `chdir` — one of the two had to be written down."""
     (tmp_path / ".env").write_text("FLOTTA_CONTROL_URL=https://from-dotenv.example\n")
     monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)

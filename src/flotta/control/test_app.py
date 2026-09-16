@@ -2690,3 +2690,62 @@ def test_a_refused_message_is_on_the_asking_agents_timeline(colleagues):
     assert refused[0]["reason"] == "blocked"
     assert f"{BUDGET} messages" in refused[1]["reason"]
     assert all(r["peer"] == "eng-b" and r["message"] == "hello?" for r in refused)
+
+
+# -- rotating an agent's identity -------------------------------------------
+
+
+def test_rotating_an_identity_answers_with_its_expiry_and_scopes(client, monkeypatch):
+    from flotta import provision
+
+    called = {}
+
+    def fake_rotate(box_id, *, store, **kwargs):
+        called["box_id"] = box_id
+        return {"box_id": box_id, "name": "eng-a", "expires_at": 123, "scopes": ["box:peer"]}
+
+    monkeypatch.setattr(provision, "rotate_identity", fake_rotate)
+    response = client.post("/api/boxes/eng-a/identity")
+    assert response.status_code == 200
+    assert response.json()["scopes"] == ["box:peer"]
+    # Resolved by name to the id the store uses, never passed through as typed.
+    assert called["box_id"].startswith("b-")
+
+
+def test_rotation_is_an_operators_act(secured):
+    """It restarts a running agent. A box token must not be able to do it."""
+    from flotta.auth import SCOPE_BOX_PEER, SCOPE_GIT_CREDENTIAL, box_subject
+
+    box_id = _box_ids(secured)["eng-a"]
+    refused = secured.post(
+        "/api/boxes/eng-a/identity",
+        headers=_bearer(SCOPE_BOX_PEER, SCOPE_GIT_CREDENTIAL, subject=box_subject(box_id)),
+    )
+    assert refused.status_code == 403
+    assert "fleet:write" in refused.json()["detail"]
+
+
+def test_a_rotation_the_substrate_refused_is_a_502(client, monkeypatch):
+    from flotta import provision
+
+    def broken(box_id, *, store, **kwargs):
+        raise provision.UpgradeFailed("could not give box eng-a a new identity: flyctl exploded")
+
+    monkeypatch.setattr(provision, "rotate_identity", broken)
+    response = client.post("/api/boxes/eng-a/identity")
+    assert response.status_code == 502
+    assert "flyctl exploded" in response.json()["detail"]
+
+
+def test_a_rotation_this_agent_cannot_have_is_a_409(client, monkeypatch):
+    from flotta import provision
+
+    def refused(box_id, *, store, **kwargs):
+        raise provision.ProvisionError("box is still being created")
+
+    monkeypatch.setattr(provision, "rotate_identity", refused)
+    assert client.post("/api/boxes/eng-a/identity").status_code == 409
+
+
+def test_rotating_an_unknown_agent_is_404(client):
+    assert client.post("/api/boxes/nobody/identity").status_code == 404

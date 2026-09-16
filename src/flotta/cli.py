@@ -1672,6 +1672,51 @@ def token_mint(
     )
 
 
+@token_app.command("rotate")
+def token_rotate(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Give an agent a fresh identity token, on its own machine.
+
+    Asks the control plane, which knows where each agent lives. This replaced
+    a recipe that wrote the token to whichever Fly app `.env` named — the
+    image-build app, on a per-agent fleet — so it silently rotated nothing.
+
+    A sleeping agent stays asleep; a running one restarts to pick the token
+    up. The previous token stays valid until it expires.
+    """
+    from datetime import UTC, datetime
+
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if not control_url():
+        raise _fail(
+            ControlPlaneError(
+                "rotating an identity writes to the agent's own machine, which only the "
+                "control plane can reach. Set $FLOTTA_CONTROL_URL."
+            ),
+            code=2,
+        )
+    try:
+        box = _remote_box(box_id)
+        body = control_request(
+            "POST",
+            f"/api/boxes/{box['id']}/identity",
+            scopes=(SCOPE_FLEET_WRITE,),
+            # A running agent restarts before this answers.
+            timeout_s=180.0,
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    expires = datetime.fromtimestamp(body["expires_at"], UTC).strftime("%Y-%m-%d")
+    emit(
+        body,
+        f"{body['name']} has a new identity ({', '.join(body['scopes'])}), valid until {expires}",
+        as_json=as_json,
+    )
+
+
 @token_app.command("box")
 def token_box(
     box_id: str = typer.Argument(..., help="Box name or id"),

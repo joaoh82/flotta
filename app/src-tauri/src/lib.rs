@@ -381,6 +381,15 @@ async fn revoke_repo(
     fleet::revoke_repo(&read_settings(&app), &id, &repo).await
 }
 
+/// Give an agent a fresh identity token on its own machine.
+#[tauri::command]
+async fn rotate_identity(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<fleet::RotatedIdentity, FleetError> {
+    fleet::rotate_identity(&read_settings(&app), &id).await
+}
+
 /// Who this agent may ask, and who it has been stopped from asking (M7).
 #[tauri::command]
 async fn agent_colleagues(
@@ -515,6 +524,7 @@ pub fn run() {
             grant_repo,
             revoke_repo,
             agent_colleagues,
+            rotate_identity,
             block_peer,
             allow_peer,
             set_instructions,

@@ -103,3 +103,61 @@ export function endingOf(events: readonly BoxEvent[], status: string | null): En
   const lived = own.some((event) => event.type === "running" || event.type === "stopped");
   return lived ? { kind: "gone", reason } : { kind: "never-created", reason };
 }
+
+/** An agent's current identity token, as far as its timeline says. */
+export type Credential = {
+  /** Seconds since the Unix epoch. */
+  expiresAt: number;
+  /** `null` when the event that issued it did not record them. */
+  scopes: string[] | null;
+  issuedAt: string;
+};
+
+const ISSUES_A_TOKEN = new Set(["identity_minted", "identity_rotated"]);
+
+/**
+ * The newest token the control plane recorded issuing, or null.
+ *
+ * **What was recorded, not what the machine holds.** A token loaded onto a
+ * machine by hand writes no event, so this can be older than the truth — the
+ * panel says "last issued by Flotta", and renewing from the window is what
+ * brings the two back together.
+ */
+export function credentialOf(events: readonly BoxEvent[]): Credential | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.entity_kind !== "box" || !ISSUES_A_TOKEN.has(event.type)) continue;
+    const expires = event.payload?.expires_at;
+    if (typeof expires !== "number") continue;
+    const scopes = event.payload?.scopes;
+    return {
+      expiresAt: expires,
+      scopes: Array.isArray(scopes) ? scopes.filter((s): s is string => typeof s === "string") : null,
+      issuedAt: event.ts,
+    };
+  }
+  return null;
+}
+
+/** Fourteen days: long enough to notice, short enough to still be true. */
+const RENEW_WITHIN_S = 14 * 24 * 3600;
+
+/**
+ * Why an identity wants renewing, in words, or null.
+ *
+ * Only claims what it knows. Scopes are checked only when the event recorded
+ * them — an older `identity_minted` did not, and guessing would put a warning
+ * on every agent created before rotation existed.
+ */
+export function renewalReason(credential: Credential | null, nowS: number): string | null {
+  if (!credential) return null;
+  if (credential.expiresAt <= nowS) return "expired — the agent can no longer reach GitHub or its colleagues";
+  if (credential.expiresAt - nowS < RENEW_WITHIN_S) {
+    const days = Math.ceil((credential.expiresAt - nowS) / 86400);
+    return `expires in ${days} day${days === 1 ? "" : "s"}`;
+  }
+  if (credential.scopes && !credential.scopes.includes("box:peer")) {
+    return "cannot ask other agents — it predates that permission";
+  }
+  return null;
+}

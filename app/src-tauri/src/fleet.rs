@@ -1048,6 +1048,37 @@ fn colleagues_from(body: &str) -> Result<Colleagues, FleetError> {
         .map_err(|e| FleetError::Unexpected(format!("unreadable list of colleagues: {e}")))
 }
 
+/// A fresh identity, as the control plane reports it. Never the token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RotatedIdentity {
+    pub box_id: String,
+    pub name: String,
+    /// Seconds since the Unix epoch.
+    pub expires_at: f64,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// Longer than `MACHINE_TIMEOUT`: a running agent restarts, *and passes its
+/// health checks*, before the control plane answers. Cutting that short would
+/// report a rotation that succeeded as a failure.
+const ROTATE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Give an agent a fresh identity token, written by the control plane to the
+/// agent's own machine. A sleeping agent stays asleep.
+pub async fn rotate_identity(settings: &Settings, id: &str) -> Result<RotatedIdentity, FleetError> {
+    let body = send_within(
+        settings,
+        reqwest::Method::POST,
+        &format!("/api/boxes/{}/identity", encode_segment(id)),
+        None,
+        Some(ROTATE_TIMEOUT),
+    )
+    .await?;
+    serde_json::from_str(&body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable identity answer: {e}")))
+}
+
 /// What was written to the agent's volume, and when.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrittenInstructions {
@@ -1193,6 +1224,16 @@ mod tests {
         );
         assert_eq!(lists.blocked[0].name, "eng-d");
         assert_eq!(lists.blocked[0].description, None);
+    }
+
+    #[test]
+    fn a_rotated_identity_is_read_without_a_token_in_it() {
+        let body = r#"{"box_id":"b-1","name":"eng-g","expires_at":1797000000,
+                       "scopes":["box:peer","git:credential"]}"#;
+        let rotated: RotatedIdentity = serde_json::from_str(body).unwrap();
+        assert_eq!(rotated.name, "eng-g");
+        assert_eq!(rotated.expires_at, 1797000000.0);
+        assert_eq!(rotated.scopes, vec!["box:peer", "git:credential"]);
     }
 
     #[test]

@@ -677,27 +677,15 @@ fly-cycle: fly-whoami
 # Setting secrets restarts the machine, which is how a new identity takes
 # effect: the entrypoint writes ~/.gitconfig at boot, from exactly these.
 # FLOTTA-20: load a box's GitHub identity onto its machine (this is how you rotate)
-box-identity NAME: fly-whoami
+box-identity NAME:
     #!/usr/bin/env bash
     set -euo pipefail
-    APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
-    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the helper has nowhere to ask without it}"
-    # Minted into a variable FIRST, then piped. Straight into the pipe, a
-    # failure to mint still ran `flyctl secrets import` — on empty stdin, which
-    # merely errored, but the same shape with *partial* output would load half
-    # an identity onto the machine. `set -e` catches the assignment; the emptiness
-    # check catches a command that fails by printing nothing and exiting 0.
-    #
-    # A variable rather than arguments, like door-secrets: a token in argv is a
-    # token in `ps` and in your shell history.
-    IDENTITY=$(uv run flotta token box {{NAME}})
-    if [ -z "$IDENTITY" ]; then
-      echo "no identity was minted for {{NAME}} — nothing sent to Fly" >&2
-      exit 1
-    fi
-    printf '%s\n' "$IDENTITY" | flyctl secrets import --app "$APP"
-    echo "loaded {{NAME}}'s identity onto $APP (values not echoed)"
-    echo "grant it a repository next: uv run flotta repo grant {{NAME}} owner/name"
+    # Asks the control plane, which writes to the agent's OWN Fly app. This
+    # recipe used to mint locally and import into `FlyConfig.from_env().app` —
+    # one app from .env, which on a per-agent fleet is the image-build app, so
+    # it put the token on the wrong app and rotated nothing.
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the control plane does the writing}"
+    uv run flotta token rotate {{NAME}}
 
 # M3: mint and push the box's dashboard credentials (this is how you rotate)
 fly-auth: fly-whoami

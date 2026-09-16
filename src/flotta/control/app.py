@@ -1309,6 +1309,35 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/boxes/{box_id}/identity")
+    def rotate_identity_endpoint(box_id: str, _: Token | None = needs_write) -> Any:
+        """Give an agent a fresh identity token, written to its own machine.
+
+        Replaces a recipe that wrote the token to whichever Fly app `.env`
+        named — the image-build app, on the live fleet — so a rotation run from
+        a laptop silently did nothing to the agent it named. The control plane
+        knows where each agent lives, which is why the verb belongs here and
+        the recipe is now a caller of it.
+
+        `fleet:write`, like upgrading: it restarts a running agent. A sleeping
+        one stays asleep. Synchronous, because a sleeping agent — most of them —
+        answers in seconds, and a running one in about the time it takes to
+        restart, which the app waits for.
+        """
+        from flotta.provision import ProvisionError, UpgradeFailed, rotate_identity
+
+        store = store_factory()
+        try:
+            box = _resolve(store, box_id)
+            try:
+                return rotate_identity(box.id, store=store)
+            except UpgradeFailed as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/upgrade")
     def upgrade_box_endpoint(
         box_id: str, body: dict[str, Any] | None = None, _: Token | None = needs_write
