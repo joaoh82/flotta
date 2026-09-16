@@ -2503,6 +2503,9 @@ def test_an_ungranted_colleague_is_refused_with_what_to_do_about_it(colleagues):
     assert refused.status_code == 403
     detail = refused.json()["detail"]
     assert "Flotta app" in detail and "cannot grant it yourself" in detail
+    # Names the screen that exists, on the agent that has to change. The first
+    # version said only "the Flotta app", before there was anywhere in it to go.
+    assert "eng-a's Info panel, Colleagues" in detail
     assert delivered == [], "asked a colleague it was not granted"
 
 
@@ -2641,3 +2644,42 @@ def test_the_refusal_tells_the_agent_what_to_do_instead(colleagues):
 
     refused = client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers)
     assert "Answer with what you have" in refused.json()["detail"]
+
+
+def test_a_refused_message_is_on_the_asking_agents_timeline(colleagues):
+    """The first live loop refusal left no trace anywhere: the relay refused
+    before it wrote anything. "The runaway was stopped" is exactly what a
+    person needs to be able to see, so a refusal is an event too."""
+    from flotta.auth import SCOPE_BOX_PEER, SCOPE_FLEET_READ
+    from flotta.relay import BUDGET
+
+    client, _, _ = colleagues
+    headers = _as_box(client, "eng-a", SCOPE_BOX_PEER)
+    body = {"peer": "eng-b", "message": "hello?"}
+
+    # Not granted.
+    client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers)
+    # Over budget.
+    _grant_peer(client, "eng-a", "eng-b")
+    for _ in range(BUDGET + 1):
+        client.post("/api/boxes/eng-a/peer/ask", json=body, headers=headers)
+
+    events = client.get("/api/boxes/eng-a/events", headers=_bearer(SCOPE_FLEET_READ)).json()
+    refused = [e["payload"] for e in events["events"] if e["type"] == "peer_refused"]
+    assert [r["reason"] for r in refused][0] == "not granted"
+    assert f"{BUDGET} messages" in refused[1]["reason"]
+    assert all(r["peer"] == "eng-b" and r["message"] == "hello?" for r in refused)
+
+
+def test_revoking_by_id_still_records_the_name(colleagues):
+    """The app revokes by id. The timeline is read by a person."""
+    from flotta.auth import SCOPE_FLEET_READ, SCOPE_FLEET_WRITE
+
+    client, _, _ = colleagues
+    _grant_peer(client, "eng-a", "eng-b")
+    peer_id = _box_ids(client)["eng-b"]
+    client.delete(f"/api/boxes/eng-a/peers/{peer_id}", headers=_bearer(SCOPE_FLEET_WRITE))
+
+    events = client.get("/api/boxes/eng-a/events", headers=_bearer(SCOPE_FLEET_READ)).json()
+    revoked = [e["payload"] for e in events["events"] if e["type"] == "peer_revoked"]
+    assert revoked == [{"peer": "eng-b"}]

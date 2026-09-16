@@ -167,3 +167,16 @@ def test_the_envelope_says_who_is_asking_and_that_there_is_no_reply():
     assert "eng-a" in text
     assert "what does the door do when a box is asleep?" in text
     assert "cannot reply again" in text
+
+
+def test_a_loop_refusal_names_agents_the_way_a_person_does():
+    """The first live loop refusal read `b-79c6ca696e62 → b-e0d678cb4684 →
+    b-79c6ca696e62`. The model worked it out; the person reading the
+    transcript could not."""
+    names = {"b-1": "eng-g", "b-2": "eng-r"}
+    chains = Chains()
+    chains.begin("b-1", "b-2", name=names.get)
+    with pytest.raises(RelayRefused) as refused:
+        chains.begin("b-2", "b-1", name=names.get)
+    assert "eng-g → eng-r → eng-g" in str(refused.value)
+    assert "b-1" not in str(refused.value)

@@ -1,0 +1,153 @@
+{
+  "_source": "GET /api/boxes/{eng-g,eng-r}/events on the live fleet, 2026-09-16, filtered to peer_* — the first real agent-to-agent exchanges (FLOTTA-54)",
+  "eng-g": [
+    {
+      "id": 326,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:42:07.985765+00:00",
+      "type": "peer_granted",
+      "payload": {
+        "peer": "eng-r"
+      }
+    },
+    {
+      "id": 328,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:42:52.653164+00:00",
+      "type": "peer_asked",
+      "payload": {
+        "peer": "eng-r",
+        "message": "In one or two sentences, what should a reviewer check first in a PR that adds a new API endpoint? Please keep your answer to one or two sentences.",
+        "hop": 1
+      }
+    },
+    {
+      "id": 331,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:43:44.926767+00:00",
+      "type": "peer_answered",
+      "payload": {
+        "peer": "eng-r",
+        "reply": "A reviewer should first verify the endpoint's input validation and error handling — confirming all request inputs are validated and that error responses are well-structured. They should also confirm authentication and authorization checks are applied to the new route before reviewing business logic.",
+        "seconds": 52.3
+      }
+    },
+    {
+      "id": 334,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:44:14.004875+00:00",
+      "type": "peer_asked",
+      "payload": {
+        "peer": "eng-r",
+        "message": "Please use flotta-ask to ask eng-g what 2+2 is, and reply with whatever happens when you try.",
+        "hop": 1
+      }
+    },
+    {
+      "id": 336,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:45:01.161273+00:00",
+      "type": "peer_answered",
+      "payload": {
+        "peer": "eng-r",
+        "reply": "I tried, but `flotta-ask` refused. The error:\n\n> flotta-ask: that would send this conversation back to an agent already in it (b-79c6ca696e62 → b-e0d678cb4684 → b-79c6ca696e62). Answer with what you have.\n\nThe chain is eng-g (b-79c6ca696e62) → me (b-e0d678cb4684) → back to eng-g (b-79c6ca696e62), which is a loop. Flotta won't relay a question to an agent who's already in the conversation path, so ",
+        "seconds": 47.1
+      }
+    },
+    {
+      "id": 338,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:45:20.664250+00:00",
+      "type": "peer_revoked",
+      "payload": {
+        "peer": "eng-r"
+      }
+    },
+    {
+      "id": 339,
+      "entity_kind": "box",
+      "entity_id": "b-79c6ca696e62",
+      "ts": "2026-09-16T08:45:29.590891+00:00",
+      "type": "peer_granted",
+      "payload": {
+        "peer": "eng-r"
+      }
+    }
+  ],
+  "eng-r": [
+    {
+      "id": 329,
+      "entity_kind": "box",
+      "entity_id": "b-e0d678cb4684",
+      "ts": "2026-09-16T08:42:52.656097+00:00",
+      "type": "peer_asked_by",
+      "payload": {
+        "peer": "eng-g",
+        "message": "In one or two sentences, what should a reviewer check first in a PR that adds a new API endpoint? Please keep your answer to one or two sentences.",
+        "hop": 1
+      }
+    },
+    {
+      "id": 332,
+      "entity_kind": "box",
+      "entity_id": "b-e0d678cb4684",
+      "ts": "2026-09-16T08:43:44.930208+00:00",
+      "type": "peer_replied",
+      "payload": {
+        "peer": "eng-g",
+        "reply": "A reviewer should first verify the endpoint's input validation and error handling — confirming all request inputs are validated and that error responses are well-structured. They should also confirm authentication and authorization checks are applied to the new route before reviewing business logic.",
+        "seconds": 52.3
+      }
+    },
+    {
+      "id": 333,
+      "entity_kind": "box",
+      "entity_id": "b-e0d678cb4684",
+      "ts": "2026-09-16T08:44:05.957879+00:00",
+      "type": "peer_granted",
+      "payload": {
+        "peer": "eng-g"
+      }
+    },
+    {
+      "id": 335,
+      "entity_kind": "box",
+      "entity_id": "b-e0d678cb4684",
+      "ts": "2026-09-16T08:44:14.010509+00:00",
+      "type": "peer_asked_by",
+      "payload": {
+        "peer": "eng-g",
+        "message": "Please use flotta-ask to ask eng-g what 2+2 is, and reply with whatever happens when you try.",
+        "hop": 1
+      }
+    },
+    {
+      "id": 337,
+      "entity_kind": "box",
+      "entity_id": "b-e0d678cb4684",
+      "ts": "2026-09-16T08:45:01.164949+00:00",
+      "type": "peer_replied",
+      "payload": {
+        "peer": "eng-g",
+        "reply": "I tried, but `flotta-ask` refused. The error:\n\n> flotta-ask: that would send this conversation back to an agent already in it (b-79c6ca696e62 → b-e0d678cb4684 → b-79c6ca696e62). Answer with what you have.\n\nThe chain is eng-g (b-79c6ca696e62) → me (b-e0d678cb4684) → back to eng-g (b-79c6ca696e62), which is a loop. Flotta won't relay a question to an agent who's already in the conversation path, so ",
+        "seconds": 47.1
+      }
+    },
+    {
+      "id": 340,
+      "entity_kind": "box",
+      "entity_id": "b-e0d678cb4684",
+      "ts": "2026-09-16T08:45:29.842112+00:00",
+      "type": "peer_revoked",
+      "payload": {
+        "peer": "eng-g"
+      }
+    }
+  ]
+}

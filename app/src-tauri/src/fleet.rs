@@ -970,6 +970,83 @@ fn repos_from(body: &str) -> Result<Vec<String>, FleetError> {
     Ok(value.repos)
 }
 
+/// An agent this agent may message (M7).
+///
+/// The address and what the agent is for, together: a person granting a
+/// colleague picks by the second, and the agent then has to type the first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Peer {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Same contract as `RepoList`: every peer endpoint answers with the whole
+/// list after the change, so the window shows what the fleet now says rather
+/// than patching what it showed before.
+#[derive(Debug, Clone, Deserialize)]
+struct PeerList {
+    #[serde(default)]
+    peers: Vec<Peer>,
+}
+
+/// Which agents this agent may message.
+pub async fn list_peers(settings: &Settings, id: &str) -> Result<Vec<Peer>, FleetError> {
+    let body = get(
+        settings,
+        &format!("/api/boxes/{}/peers", encode_segment(id)),
+    )
+    .await?;
+    peers_from(&body)
+}
+
+/// Let this agent message `peer`. **Directed**: it does not let `peer` message
+/// back, which is a separate grant made from the other agent's panel.
+pub async fn grant_peer(
+    settings: &Settings,
+    id: &str,
+    peer: &str,
+) -> Result<Vec<Peer>, FleetError> {
+    let body = send(
+        settings,
+        reqwest::Method::POST,
+        &format!("/api/boxes/{}/peers", encode_segment(id)),
+        Some(serde_json::json!({ "peer": peer })),
+    )
+    .await?;
+    peers_from(&body)
+}
+
+/// Withdraw one. Takes effect on the next message, with no restart — the box
+/// never held a way to reach the other agent, only permission to ask.
+pub async fn revoke_peer(
+    settings: &Settings,
+    id: &str,
+    peer: &str,
+) -> Result<Vec<Peer>, FleetError> {
+    let body = send(
+        settings,
+        reqwest::Method::DELETE,
+        &format!(
+            "/api/boxes/{}/peers/{}",
+            encode_segment(id),
+            encode_segment(peer)
+        ),
+        None,
+    )
+    .await?;
+    peers_from(&body)
+}
+
+fn peers_from(body: &str) -> Result<Vec<Peer>, FleetError> {
+    let value: PeerList = serde_json::from_str(body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable list of colleagues: {e}")))?;
+    Ok(value.peers)
+}
+
 /// What was written to the agent's volume, and when.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrittenInstructions {
@@ -1095,6 +1172,31 @@ mod tests {
         assert_eq!(list.boxes[0].name, "eng-a");
         assert_eq!(list.boxes[0].status, "stopped");
         assert!(list.boxes[0].endpoint.is_some());
+    }
+
+    #[test]
+    fn the_colleague_list_is_read_as_the_control_plane_sends_it() {
+        // Captured from `GET /api/boxes/eng-g/peers` on the live fleet,
+        // 2026-09-16, the day M7 shipped. A description can be absent, and an
+        // agent with none must still be listed rather than failing the parse
+        // for every colleague.
+        let body = r#"{"box_id":"b-79c6ca696e62","name":"eng-g","peers":[
+            {"id":"b-e0d678cb4684","name":"eng-r","display_name":"Reviewer - backend PRs",
+             "description":"Reviews backend pull requests"},
+            {"id":"b-1","name":"eng-d","display_name":null,"description":null}]}"#;
+        let peers = peers_from(body).expect("real response must parse");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].name, "eng-r");
+        assert_eq!(
+            peers[0].display_name.as_deref(),
+            Some("Reviewer - backend PRs")
+        );
+        assert_eq!(peers[1].description, None);
+    }
+
+    #[test]
+    fn no_colleagues_is_an_empty_list_not_an_error() {
+        assert_eq!(peers_from(r#"{"peers":[]}"#).unwrap(), vec![]);
     }
 
     #[test]

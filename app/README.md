@@ -176,6 +176,32 @@ Verified live on a private repository, on one running machine with no restart:
 ungranted clones fail with a 403 from the credential helper, granting makes the
 same clone succeed, and revoking makes the next one fail again.
 
+## Colleagues: agents asking each other (M7)
+
+An agent's **Info** panel has a **Colleagues** section: the agents it may ask
+for help, a picker to add one, and the recent conversations between them.
+
+- **One way.** Adding eng-r to eng-g's colleagues lets eng-g ask eng-r. For
+  eng-r to ask eng-g, add it from eng-r's panel.
+- **The agent never holds a way to reach another agent.** It runs
+  `flotta-ask`, which asks the control plane to carry the message; the control
+  plane checks the grant, wakes the other agent and brings the reply back. An
+  agent cannot add colleagues itself.
+- **Flotta stops loops and runaways.** A question cannot come back to an agent
+  already in the chain, cannot be passed along more than three times, and one
+  agent's questions are capped over a few minutes. A stopped message shows up
+  in *Recent conversations* as "stopped by Flotta", with the reason.
+
+**The name "Colleagues" is load-bearing.** Refusals from the control plane and
+the skill on every box tell the agent to send the person to "this agent's Info
+panel, Colleagues". Rename the section and those sentences lie.
+
+While an agent is asking, the live step list shows **asking eng-r** and the
+question instead of the terminal command (`colleagues.ts`'s `delegationOf`).
+The answering agent holds the question in a **separate session**, so it never
+appears in the transcript a person has with it — *Recent conversations* is the
+only place eng-r's side is visible.
+
 ## Info: the store's belief, and the substrate's answer
 
 Every read in this window comes from the fleet store, which is a *belief* — a
