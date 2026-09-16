@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { AgentColleagues } from "./AgentColleagues";
 import { AgentRepos } from "./AgentRepos";
 import { StatusBadge } from "./StatusBadge";
 import {
@@ -37,10 +38,13 @@ import {
  */
 export function AgentInfo({
   box,
+  fleet,
   onClose,
   onChanged,
 }: {
   box: BoxRow;
+  /** Every agent, so a colleague can be picked from the ones that exist. */
+  fleet: BoxRow[];
   onClose: () => void;
   /** The list holds the row; a rename has to reach it or the sidebar lies. */
   onChanged: (box: BoxRow) => void;
@@ -450,6 +454,8 @@ export function AgentInfo({
         {/* Keyed by id so switching agents refetches rather than showing one
             agent's grants under another's name. */}
         <AgentRepos key={box.id} boxId={box.id} />
+
+        <AgentColleagues key={`peers-${box.id}`} boxId={box.id} boxName={box.name} fleet={fleet} />
 
         {/* Always rendered, including when there are none: an agent with no
             standing instructions is the case you most want to be able to fix,

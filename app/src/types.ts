@@ -7,6 +7,19 @@
  * optional here rather than assumed present.
  */
 
+/**
+ * An agent another agent may message (M7). Mirrors `Peer` in `fleet.rs`.
+ *
+ * `id` is what the grant is recorded against — a name can be reused once its
+ * agent is destroyed — and `name` is what the asking agent has to type.
+ */
+export type Peer = {
+  id: string;
+  name: string;
+  display_name?: string | null;
+  description?: string | null;
+};
+
 export type BoxRow = {
   id: string;
   /** The ADDRESS — a DNS label, immutable. Not what a person calls it. */

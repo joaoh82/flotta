@@ -78,6 +78,11 @@ PEER_ASKED_BY = "peer_asked_by"  # on the answerer: they asked me
 PEER_ANSWERED = "peer_answered"  # on the caller: they answered me
 PEER_REPLIED = "peer_replied"  # on the answerer: I answered them
 PEER_FAILED = "peer_failed"  # on the caller: no answer came back
+#: On the caller: the relay would not carry it — not granted, a loop, or over
+#: budget. Recorded because the first live loop refusal left no trace on
+#: either timeline, and "the runaway was stopped" is exactly what a person
+#: needs to be able to see.
+PEER_REFUSED = "peer_refused"
 
 
 class RelayRefused(Exception):
@@ -153,8 +158,14 @@ class Chains:
                 del self.recent[who]
         return self.recent.get(origin, [])
 
-    def begin(self, caller: str, peer: str) -> Hop:
-        """Register a delivery about to be attempted, or refuse it."""
+    def begin(self, caller: str, peer: str, *, name: Callable[[str], str] = str) -> Hop:
+        """Register a delivery about to be attempted, or refuse it.
+
+        `name` turns an id into what a person calls the agent. The chain is
+        kept in ids because names can be reused; the refusal is shown in
+        names, because it is read by a model and then by a person, and the
+        first live loop refusal said `b-79c6ca696e62 → b-e0d678cb4684`.
+        """
         parent = self.executing.get(caller)
         if parent is None:
             hop = Hop(chain=uuid.uuid4().hex[:12], depth=1, path=(caller, peer))
@@ -170,7 +181,7 @@ class Chains:
             # the same question twice in one chain will answer it the same way.
             raise RelayRefused(
                 f"that would send this conversation back to an agent already in it "
-                f"({' → '.join(hop.path)}). Answer with what you have."
+                f"({' → '.join(name(i) for i in hop.path)}). Answer with what you have."
             )
         if hop.depth > MAX_DEPTH:
             raise RelayRefused(

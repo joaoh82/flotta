@@ -65,6 +65,7 @@ from flotta.relay import (
     PEER_ASKED,
     PEER_ASKED_BY,
     PEER_FAILED,
+    PEER_REFUSED,
     PEER_REPLIED,
     Chains,
     RelayRefused,
@@ -1296,7 +1297,10 @@ def create_app(
             target = store.get_box(peer) or store.get_box_by_name(peer)
             had = store.revoke_peer(box.id, target.id) if target else False
             if had:
-                store.add_event("box", box.id, "peer_revoked", {"peer": peer})
+                # The name, whichever of name or id was sent: the app revokes
+                # by id, and a timeline reading `peer=b-e0d6…` is one nobody
+                # can read.
+                store.add_event("box", box.id, "peer_revoked", {"peer": target.name})
             return {"box_id": box.id, "revoked": had, "peers": _peer_list(store, box.id)}
         finally:
             store.close()
@@ -1545,16 +1549,40 @@ def create_app(
                     f"Your colleagues are listed by `flotta-ask --list`.",
                 )
             if not store.may_message(box.id, peer.id):
+                store.add_event(
+                    "box",
+                    box.id,
+                    PEER_REFUSED,
+                    {
+                        "peer": peer.name,
+                        "message": message[:EVENT_TEXT_CHARS],
+                        "reason": "not granted",
+                    },
+                )
                 raise HTTPException(
                     status_code=403,
                     detail=f"you have not been granted {peer.name!r}. Ask the person you "
-                    f"are working with to grant it in the Flotta app; you cannot "
-                    f"grant it yourself.",
+                    f"are working with to grant it in the Flotta app, under "
+                    f"{box.name}'s Info panel, Colleagues. You cannot grant it yourself.",
                 )
 
+            def name_of(box_id: str) -> str:
+                found = store.get_box(box_id)
+                return found.name if found else box_id
+
             try:
-                hop = chains.begin(box.id, peer.id)
+                hop = chains.begin(box.id, peer.id, name=name_of)
             except RelayRefused as exc:
+                store.add_event(
+                    "box",
+                    box.id,
+                    PEER_REFUSED,
+                    {
+                        "peer": peer.name,
+                        "message": message[:EVENT_TEXT_CHARS],
+                        "reason": str(exc)[:EVENT_TEXT_CHARS],
+                    },
+                )
                 raise HTTPException(status_code=429, detail=str(exc)) from exc
 
             store.add_event(

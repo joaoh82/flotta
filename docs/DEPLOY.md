@@ -425,8 +425,9 @@ with a 403 naming the missing scope. Re-issue its identity:
 just box-identity eng-a          # re-mints the token, restarts the machine
 ```
 
-Then grant the colleagues. Grants are **directed** — this lets eng-a ask eng-b,
-not the reverse:
+Then grant the colleagues — from the app (the agent's **Info** panel,
+**Colleagues**) or the CLI. Grants are **directed** — this lets eng-a ask
+eng-b, not the reverse:
 
 ```bash
 uv run flotta peer grant eng-a eng-b

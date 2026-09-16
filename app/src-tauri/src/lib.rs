@@ -381,6 +381,32 @@ async fn revoke_repo(
     fleet::revoke_repo(&read_settings(&app), &id, &repo).await
 }
 
+/// Which agents this agent may message (M7).
+#[tauri::command]
+async fn agent_peers(app: tauri::AppHandle, id: String) -> Result<Vec<fleet::Peer>, FleetError> {
+    fleet::list_peers(&read_settings(&app), &id).await
+}
+
+/// Let this agent message another. One direction only.
+#[tauri::command]
+async fn grant_peer(
+    app: tauri::AppHandle,
+    id: String,
+    peer: String,
+) -> Result<Vec<fleet::Peer>, FleetError> {
+    fleet::grant_peer(&read_settings(&app), &id, &peer).await
+}
+
+/// Withdraw one. Takes effect on the next message.
+#[tauri::command]
+async fn revoke_peer(
+    app: tauri::AppHandle,
+    id: String,
+    peer: String,
+) -> Result<Vec<fleet::Peer>, FleetError> {
+    fleet::revoke_peer(&read_settings(&app), &id, &peer).await
+}
+
 /// Rewrite an agent's standing instructions, then start its conversation over
 /// so they take effect.
 ///
@@ -485,6 +511,9 @@ pub fn run() {
             agent_repos,
             grant_repo,
             revoke_repo,
+            agent_peers,
+            grant_peer,
+            revoke_peer,
             set_instructions,
             reset_conversation,
             close_conversation,

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { delegationOf } from "./colleagues";
 import { Markdown } from "./Markdown";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -307,6 +308,57 @@ export function Conversation({ boxName }: { boxName: string }) {
  * closed socket nothing will ever finish it, and a spinner there would claim
  * work that is not happening.
  */
+/**
+ * What a step did, in words.
+ *
+ * A `flotta-ask` call is a terminal command to Hermes and a conversation with
+ * a colleague to the person watching, so it is shown as the second: "asking
+ * eng-r" with the question, rather than a shell line. Everything else is the
+ * tool and what it was asked to do. The command is still one hover away.
+ */
+function StepLabel({ step, busy }: { step: WorkStep; busy: boolean }) {
+  const delegation = step.tool === "terminal" ? delegationOf(step.detail) : null;
+  if (delegation?.kind === "ask") {
+    const verb =
+      step.state === "running"
+        ? busy
+          ? "asking"
+          : "asked"
+        : step.state === "failed"
+          ? "could not ask"
+          : "asked";
+    return (
+      <span className="flex min-w-0 items-baseline gap-2" title={step.detail}>
+        <span className="shrink-0 text-violet-700">
+          {verb} <span className="font-medium">{delegation.peer}</span>
+        </span>
+        {delegation.question && (
+          <span className="min-w-0 truncate text-[11px] text-neutral-600">
+            {delegation.question}
+          </span>
+        )}
+      </span>
+    );
+  }
+  if (delegation?.kind === "list") {
+    return (
+      <span className="shrink-0 text-violet-700" title={step.detail}>
+        checked who it can ask
+      </span>
+    );
+  }
+  return (
+    <>
+      <span className="shrink-0 text-neutral-500">{step.tool}</span>
+      {step.detail && (
+        <code className="min-w-0 truncate font-mono text-[11px] text-neutral-700" title={step.detail}>
+          {step.detail}
+        </code>
+      )}
+    </>
+  );
+}
+
 function Work({ steps, busy }: { steps: WorkStep[]; busy: boolean }) {
   return (
     <ul className="space-y-0.5 border-l-2 border-neutral-200 pl-3">
@@ -326,12 +378,7 @@ function Work({ steps, busy }: { steps: WorkStep[]; busy: boolean }) {
           >
             {step.state === "failed" ? "✕" : step.state === "done" ? "✓" : "•"}
           </span>
-          <span className="shrink-0 text-neutral-500">{step.tool}</span>
-          {step.detail && (
-            <code className="min-w-0 truncate font-mono text-[11px] text-neutral-700" title={step.detail}>
-              {step.detail}
-            </code>
-          )}
+          <StepLabel step={step} busy={busy} />
           {step.seconds !== null && (
             <span className="ml-auto shrink-0 font-mono text-[10px] text-neutral-400">
               {duration(step.seconds)}
