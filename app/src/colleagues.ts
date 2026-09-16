@@ -1,4 +1,4 @@
-import type { BoxEvent, BoxRow, Peer } from "./types";
+import type { BoxEvent, Peer } from "./types";
 
 /**
  * Agents talking to each other (M7, FLOTTA-54), as the window shows it.
@@ -179,19 +179,4 @@ function unquote(text: string): string {
 /** "Reviewer — backend PRs (eng-r)", or just the address when nothing else is known. */
 export function peerLabel(peer: Pick<Peer, "name" | "display_name">): string {
   return peer.display_name ? `${peer.display_name} (${peer.name})` : peer.name;
-}
-
-/**
- * Who could be granted: every other agent that is not already.
- *
- * Not the agent itself (the control plane refuses that anyway, and offering a
- * control that can only fail is the window lying), and not an agent that is
- * still being built — its address does not answer yet, so a message to it
- * would spend the asking agent's time on a certain failure.
- */
-export function grantable(fleet: BoxRow[], self: string, granted: Peer[]): BoxRow[] {
-  const have = new Set(granted.map((p) => p.id));
-  return fleet
-    .filter((b) => b.id !== self && !have.has(b.id) && b.status !== "provisioning")
-    .sort((a, b) => a.name.localeCompare(b.name));
 }

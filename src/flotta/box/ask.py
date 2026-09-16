@@ -15,11 +15,12 @@ It asks the control plane to carry the message. That is not indirection for its
 own sake: the front door checks a token's *scope* and not its subject, so any
 credential good enough to reach one agent reaches every agent. The box's token
 carries `box:peer`, which buys the right to ask and nothing else — the control
-plane checks the grant and makes the call itself.
+plane checks whether it may and makes the call itself.
 
-So an agent cannot widen its own reach, and a prompt-injected one cannot talk
-its way to the fleet. The same shape as the git credential helper, and for the
-same reason: this machine's agent has root on it.
+Every agent may ask every other by default (FLOTTA-65); a person can stop one
+agent asking another. An agent cannot change that list itself — the same
+shape as the git credential helper, and for the same reason: this machine's
+agent has root on it.
 
 ## Failures are worth reading
 
@@ -140,9 +141,10 @@ def describe_roster(answer: dict[str, Any]) -> str:
     peers = answer.get("peers") or []
     if not peers:
         return (
-            "You have not been granted any colleagues to message.\n"
-            "Ask the person you are working with to grant one in the Flotta app "
-            "(this agent's Info panel, Colleagues). You cannot grant yourself.\n"
+            "There is no other agent you can ask right now. Either you are the only "
+            "agent on this fleet, or a person has stopped you asking the others — "
+            "they can change that in the Flotta app (this agent's Info panel, "
+            "Colleagues). You cannot change it yourself.\n"
         )
     lines = ["You can send a message to these agents:"]
     for peer in peers:

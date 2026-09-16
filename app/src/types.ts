@@ -20,6 +20,12 @@ export type Peer = {
   description?: string | null;
 };
 
+/** Mirrors `Colleagues` in `fleet.rs`. Everyone is a colleague unless blocked. */
+export type Colleagues = {
+  peers: Peer[];
+  blocked: Peer[];
+};
+
 export type BoxRow = {
   id: string;
   /** The ADDRESS — a DNS label, immutable. Not what a person calls it. */

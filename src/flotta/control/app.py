@@ -1210,23 +1210,21 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"no box {ref!r}")
         return box
 
-    def _peer_list(store: Any, box_id: str) -> list[dict[str, Any]]:
-        """Who a box may message, named the way a person and a model both need.
+    def _described(store: Any, ids: list[str]) -> list[dict[str, Any]]:
+        """Agents named the way a person and a model both need.
 
         The address and the description together: an agent choosing whom to
         ask needs "Reviewer — backend PRs", and the thing it must then type is
-        the name. FLOTTA-40 put the first on the fleet; this is where it starts
-        paying for itself.
+        the name. FLOTTA-40 put the first on the fleet; this is where it pays.
         """
-        peer_ids = store.peers_for_box(box_id)
-        meta = store.meta_for_boxes(peer_ids)
-        peers = []
-        for pid in peer_ids:
+        meta = store.meta_for_boxes(ids)
+        out = []
+        for pid in ids:
             box = store.get_box(pid)
-            if box is None:  # pragma: no cover - the join already excludes these
+            if box is None:  # pragma: no cover - the queries already exclude these
                 continue
             info = meta.get(pid)
-            peers.append(
+            out.append(
                 {
                     "id": box.id,
                     "name": box.name,
@@ -1234,74 +1232,80 @@ def create_app(
                     "description": info.description if info else None,
                 }
             )
-        return peers
+        return out
+
+    def _colleagues(store: Any, box: Any) -> dict[str, Any]:
+        """Everything the Colleagues panel shows, in one answer."""
+        return {
+            "box_id": box.id,
+            "name": box.name,
+            "peers": _described(store, store.peers_for_box(box.id)),
+            "blocked": _described(store, store.blocked_peers_for_box(box.id)),
+        }
+
+    def _peer_target(store: Any, box: Any, ref: str) -> Any:
+        ref = ref.strip()
+        if not ref:
+            raise HTTPException(status_code=422, detail="which agent?")
+        peer = store.get_box(ref) or store.get_box_by_name(ref)
+        if peer is None or is_terminal("box", peer.status):
+            raise HTTPException(status_code=404, detail=f"no agent {ref!r}")
+        if peer.id == box.id:
+            raise HTTPException(
+                status_code=422, detail="an agent never asks itself, so there is nothing to change"
+            )
+        return peer
 
     @app.get("/api/boxes/{box_id}/peers")
     def list_peers(box_id: str, _: Token | None = needs_read) -> Any:
-        """Which agents this agent may message."""
+        """Who this agent may ask, and who it has been stopped from asking.
+
+        **Everyone, by default** (FLOTTA-65). A new agent is on every list the
+        moment it can be reached, with nothing written anywhere.
+        """
         store = store_factory()
         try:
-            box = _resolve(store, box_id)
-            return {"box_id": box.id, "name": box.name, "peers": _peer_list(store, box.id)}
+            return _colleagues(store, _resolve(store, box_id))
         finally:
             store.close()
 
-    @app.post("/api/boxes/{box_id}/peers")
-    def grant_peer_endpoint(
+    @app.post("/api/boxes/{box_id}/peer-blocks")
+    def block_peer_endpoint(
         box_id: str, body: dict[str, Any], _: Token | None = needs_write
     ) -> Any:
-        """Let this agent message another one. Idempotent.
+        """Stop this agent asking one other agent. Idempotent, directed.
 
-        **`fleet:write`, the same rule as repository grants**: widening an
-        agent's reach is an operator's act. A box carries `box:peer`, which
-        buys the right to *use* a grant and nothing else — if a box could grant
-        itself a peer, the grant table would be a suggestion and a
-        prompt-injected agent could talk its way to the whole fleet.
+        **Its own route rather than a changed meaning for `POST /peers`**,
+        which under FLOTTA-54 *granted*. A client from before this change
+        calling the old route gets an error, not the opposite of what it asked.
 
-        **Directed.** Granting A→B does not grant B→A. Two agents that should
-        interrupt each other freely are two grants, said out loud.
+        `fleet:write`: changing who an agent may reach is an operator's act in
+        both directions. A box carries `box:peer`, which can only use the list.
         """
         store = store_factory()
         try:
             box = _resolve(store, box_id)
-            wanted = str(body.get("peer") or "").strip()
-            if not wanted:
-                raise HTTPException(status_code=422, detail="which agent?")
-            peer = store.get_box(wanted) or store.get_box_by_name(wanted)
-            if peer is None:
-                raise HTTPException(status_code=404, detail=f"no box {wanted!r}")
-            if is_terminal("box", peer.status):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"agent {peer.name!r} has been destroyed",
-                )
-            try:
-                store.grant_peer(box.id, peer.id)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            store.add_event("box", box.id, "peer_granted", {"peer": peer.name})
-            return {"box_id": box.id, "peers": _peer_list(store, box.id)}
+            peer = _peer_target(store, box, str(body.get("peer") or ""))
+            if store.block_peer(box.id, peer.id):
+                store.add_event("box", box.id, "peer_blocked", {"peer": peer.name})
+            return _colleagues(store, box)
         finally:
             store.close()
 
-    @app.delete("/api/boxes/{box_id}/peers/{peer}")
-    def revoke_peer_endpoint(box_id: str, peer: str, _: Token | None = needs_write) -> Any:
-        """Withdraw a grant. Takes effect on the next message, with no restart.
-
-        The box holds nothing to invalidate — it never held a way to reach the
-        other agent, only permission to ask for one.
-        """
+    @app.delete("/api/boxes/{box_id}/peer-blocks/{peer}")
+    def allow_peer_endpoint(box_id: str, peer: str, _: Token | None = needs_write) -> Any:
+        """Lift a block. Takes effect on the next message, with no restart —
+        the box never held a way to reach the other agent, only permission to
+        ask the control plane for one."""
         store = store_factory()
         try:
             box = _resolve(store, box_id)
-            target = store.get_box(peer) or store.get_box_by_name(peer)
-            had = store.revoke_peer(box.id, target.id) if target else False
-            if had:
-                # The name, whichever of name or id was sent: the app revokes
-                # by id, and a timeline reading `peer=b-e0d6…` is one nobody
-                # can read.
-                store.add_event("box", box.id, "peer_revoked", {"peer": target.name})
-            return {"box_id": box.id, "revoked": had, "peers": _peer_list(store, box.id)}
+            target = _peer_target(store, box, peer)
+            if store.allow_peer(box.id, target.id):
+                # The name, whichever was sent: the app sends ids, and a
+                # timeline reading `peer=b-e0d6…` is one nobody can read.
+                store.add_event("box", box.id, "peer_allowed", {"peer": target.name})
+            return _colleagues(store, box)
         finally:
             store.close()
 
@@ -1511,7 +1515,11 @@ def create_app(
         try:
             box = _resolve(store, box_id)
             confine_to_box(token, box, "list the colleagues of")
-            return {"box_id": box.id, "name": box.name, "peers": _peer_list(store, box.id)}
+            return {
+                "box_id": box.id,
+                "name": box.name,
+                "peers": _described(store, store.peers_for_box(box.id)),
+            }
         finally:
             store.close()
 
@@ -1549,22 +1557,33 @@ def create_app(
                     f"Your colleagues are listed by `flotta-ask --list`.",
                 )
             if not store.may_message(box.id, peer.id):
+                # Three reasons, three different things to do about them — an
+                # agent told only "refused" tries again differently.
+                if peer.id == box.id:
+                    why, detail = (
+                        "itself",
+                        "that is you. Answer it yourself.",
+                    )
+                elif peer.id in store.blocked_peers_for_box(box.id):
+                    why, detail = (
+                        "blocked",
+                        f"a person has stopped {box.name} from asking {peer.name!r}. They "
+                        f"can allow it again in the Flotta app, under {box.name}'s Info "
+                        f"panel, Colleagues. You cannot change it yourself.",
+                    )
+                else:
+                    why, detail = (
+                        "not ready",
+                        f"{peer.name!r} is still being set up and cannot answer yet. "
+                        f"Try again in a few minutes, or answer with what you have.",
+                    )
                 store.add_event(
                     "box",
                     box.id,
                     PEER_REFUSED,
-                    {
-                        "peer": peer.name,
-                        "message": message[:EVENT_TEXT_CHARS],
-                        "reason": "not granted",
-                    },
+                    {"peer": peer.name, "message": message[:EVENT_TEXT_CHARS], "reason": why},
                 )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"you have not been granted {peer.name!r}. Ask the person you "
-                    f"are working with to grant it in the Flotta app, under "
-                    f"{box.name}'s Info panel, Colleagues. You cannot grant it yourself.",
-                )
+                raise HTTPException(status_code=403 if why == "blocked" else 409, detail=detail)
 
             def name_of(box_id: str) -> str:
                 found = store.get_box(box_id)

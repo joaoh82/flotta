@@ -46,8 +46,8 @@ def test_the_roster_says_what_each_colleague_is_for():
 def test_no_colleagues_is_an_answer_not_an_error():
     code, out, err = _run(["--list"], roster=lambda env: {"name": "eng-a", "peers": []})
     assert code == 0
-    assert "not been granted any colleagues" in out
-    assert "cannot grant yourself" in out
+    assert "no other agent you can ask" in out
+    assert "cannot change it yourself" in out
     assert err == ""
 
 
@@ -57,7 +57,7 @@ def test_a_bare_invocation_answers_the_question_it_was_about_to_ask():
     code, out, err = _run([])
     assert code == 0
     assert "usage:" in err
-    assert "not been granted any colleagues" in out
+    assert "no other agent you can ask" in out
 
 
 def test_a_question_reaches_the_colleague_whole():
@@ -130,7 +130,7 @@ def test_it_asks_about_the_box_its_token_names_not_its_environment(monkeypatch):
 def test_the_control_planes_refusal_is_passed_through_word_for_word(monkeypatch):
     """Every refusal names what to do instead. Replacing it with our own
     wording here would throw away the only part an agent can act on."""
-    detail = "you have not been granted 'eng-b'. Ask the person you are working with"
+    detail = "a person has stopped eng-a from asking 'eng-b'. They can allow it again"
 
     def refused(url, *, token, timeout, payload=None):
         raise AskError(detail)
