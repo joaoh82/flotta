@@ -461,6 +461,27 @@ conventions, and the sharp edges below.
   in its root callback. A suite that is green in a fresh worktree and red for
   anyone who has deployed has now happened twice: fifteen control-plane tests
   returning 401, and later the `token box` tests.
+- **The front door checks a token's scope and never its subject.** `authorize`
+  requires `box:chat` and returns a `Token` that both call sites discard, so
+  **any** token carrying `box:chat` reaches **every** box's hostname. That is
+  why a box's own token carries `git:credential` and `box:peer` and not
+  `box:chat`: both of those ask the *control plane* to act on the box's behalf,
+  where `confine_to_box` checks whose token it is. A short-lived token minted
+  "for eng-b" would be confined by the clock and nothing else. Anything that
+  puts `box:chat` on a machine has handed that machine the whole fleet.
+- **The door also strips the caller's `Authorization` before proxying** and
+  substitutes the fleet's basic auth, so the answering box learns nothing about
+  who is calling it. "Who is asking" has to travel in the message body —
+  `relay.envelope` is the only reason a delegated question names its sender.
+- **The pivot doc is wrong about M7's transport, and the decision log is
+  right.** §M7 says "Hermes's messaging gateway is the transport"; `hermes
+  gateway` is the chat-platform dispatcher (Telegram, Discord, Slack) and our
+  boxes run `hermes serve`. Its `a2a` and `api_server` adapters *are* real
+  agent-to-agent transports — which is where the doc's intuition came from —
+  but both serve their inbound half from the gateway process, so using them
+  would mean a second Hermes process and a second config surface per box, and
+  delegation traffic Flotta cannot see, bill or show in the app. FLOTTA-54
+  relays through the control plane instead.
 - **The suite pins decisions; running things finds bugs.** Nearly every real
   defect in M5b and after was found by executing something, not by a test: the
   door bracketing hostnames as IPv6 (every proxied request would have failed),

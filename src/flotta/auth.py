@@ -40,13 +40,20 @@ parties — an M10 concern, not a today concern.
 
 ## Scopes are flat, and the dangerous ones are their own
 
-Four, no wildcards, no hierarchy:
+Six, no wildcards, no hierarchy:
 
     fleet:read     list and inspect boxes, read their events
     fleet:write    create boxes
     box:destroy    tear a box down
     box:chat       talk to the agent on a box — and wake it to do so
     git:credential mint a git credential for a repository a box is granted
+    box:peer       ask the control plane to relay a message to a granted agent
+
+`box:peer` is deliberately not `box:chat`. A box holding `box:chat` could
+reach *every* agent, because the front door checks the scope and not the
+subject — so the scope a box carries must be one that cannot address a box
+directly at all. `box:peer` buys one thing: the right to ask the control
+plane to carry a message, which it does only after checking the grant.
 
 `box:destroy` is separated from `fleet:write` on purpose. It is the verb that
 deletes an agent's entire memory, it is the reason the control plane refused to
@@ -92,6 +99,7 @@ SCOPE_FLEET_WRITE = "fleet:write"
 SCOPE_BOX_DESTROY = "box:destroy"
 SCOPE_BOX_CHAT = "box:chat"
 SCOPE_GIT_CREDENTIAL = "git:credential"
+SCOPE_BOX_PEER = "box:peer"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -99,6 +107,7 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_BOX_DESTROY,
         SCOPE_BOX_CHAT,
         SCOPE_GIT_CREDENTIAL,
+        SCOPE_BOX_PEER,
     }
 )
 

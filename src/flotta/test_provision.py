@@ -1924,7 +1924,10 @@ def test_the_token_speaks_only_for_this_box(store, monkeypatch):
     spec, box = _created(store, monkeypatch)
     claims = verify(spec.secrets["FLOTTA_BOX_TOKEN"], key="k" * 32)
     assert claims.subject == box_subject(box.id)
-    assert claims.scopes == frozenset({"git:credential"})
+    assert claims.scopes == frozenset({"git:credential", "box:peer"})
+    # The scope that would make the subject check moot: the front door accepts
+    # `box:chat` for any hostname without looking at whose token it is.
+    assert "box:chat" not in claims.scopes
 
 
 def test_the_control_url_and_email_domain_travel_with_it(store, monkeypatch):

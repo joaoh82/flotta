@@ -34,6 +34,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -42,17 +43,34 @@ from flotta import db
 from flotta.auth import (
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
+    SCOPE_BOX_PEER,
     SCOPE_FLEET_READ,
     SCOPE_FLEET_WRITE,
     SCOPE_GIT_CREDENTIAL,
     SIGNING_KEY_ENV,
     AuthError,
     Token,
+    mint,
     resolve_signing_key,
     subject_box,
     verify,
 )
 from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loop
+from flotta.relay import (
+    DEFAULT_TIMEOUT_S as RELAY_TIMEOUT_S,
+)
+from flotta.relay import (
+    EVENT_TEXT_CHARS,
+    PEER_ANSWERED,
+    PEER_ASKED,
+    PEER_ASKED_BY,
+    PEER_FAILED,
+    PEER_REPLIED,
+    Chains,
+    RelayRefused,
+    deliver_through_door,
+    envelope,
+)
 from flotta.store import FleetStore, UnknownEntityError, is_terminal
 
 _log = logging.getLogger("flotta.control")
@@ -270,6 +288,11 @@ def create_app(
     #: real HTTPS call the moment `$FLOTTA_GITHUB_TOKEN` was set in the
     #: environment a test happened to inherit.
     reachable: Any = None,
+    #: Carries one message to another agent and returns its reply. Injected
+    #: for the same reason as `reachable`, and with more at stake: the default
+    #: opens a WebSocket to a live box through the front door and spends a
+    #: model call. An `async (peer_name, text, *, title) -> str`.
+    deliver: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -358,6 +381,12 @@ def create_app(
     needs_destroy = Depends(require(SCOPE_BOX_DESTROY))
     needs_chat = Depends(require(SCOPE_BOX_CHAT))
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
+    needs_peer = Depends(require(SCOPE_BOX_PEER))
+
+    #: Delegations in flight, so a chain can be recognised as one. Per app
+    #: rather than per module: two tests building two apps must not share a
+    #: hop counter, and neither must two fleets in one process.
+    chains = Chains()
 
     @asynccontextmanager
     async def lifespan(app: Any):
@@ -1173,6 +1202,105 @@ def create_app(
         finally:
             store.close()
 
+    def _resolve(store: Any, ref: str) -> Any:
+        """A box by id or name, or 404. The lookup every route starts with."""
+        box = store.get_box(ref) or store.get_box_by_name(ref)
+        if box is None:
+            raise HTTPException(status_code=404, detail=f"no box {ref!r}")
+        return box
+
+    def _peer_list(store: Any, box_id: str) -> list[dict[str, Any]]:
+        """Who a box may message, named the way a person and a model both need.
+
+        The address and the description together: an agent choosing whom to
+        ask needs "Reviewer — backend PRs", and the thing it must then type is
+        the name. FLOTTA-40 put the first on the fleet; this is where it starts
+        paying for itself.
+        """
+        peer_ids = store.peers_for_box(box_id)
+        meta = store.meta_for_boxes(peer_ids)
+        peers = []
+        for pid in peer_ids:
+            box = store.get_box(pid)
+            if box is None:  # pragma: no cover - the join already excludes these
+                continue
+            info = meta.get(pid)
+            peers.append(
+                {
+                    "id": box.id,
+                    "name": box.name,
+                    "display_name": info.display_name if info else None,
+                    "description": info.description if info else None,
+                }
+            )
+        return peers
+
+    @app.get("/api/boxes/{box_id}/peers")
+    def list_peers(box_id: str, _: Token | None = needs_read) -> Any:
+        """Which agents this agent may message."""
+        store = store_factory()
+        try:
+            box = _resolve(store, box_id)
+            return {"box_id": box.id, "name": box.name, "peers": _peer_list(store, box.id)}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/peers")
+    def grant_peer_endpoint(
+        box_id: str, body: dict[str, Any], _: Token | None = needs_write
+    ) -> Any:
+        """Let this agent message another one. Idempotent.
+
+        **`fleet:write`, the same rule as repository grants**: widening an
+        agent's reach is an operator's act. A box carries `box:peer`, which
+        buys the right to *use* a grant and nothing else — if a box could grant
+        itself a peer, the grant table would be a suggestion and a
+        prompt-injected agent could talk its way to the whole fleet.
+
+        **Directed.** Granting A→B does not grant B→A. Two agents that should
+        interrupt each other freely are two grants, said out loud.
+        """
+        store = store_factory()
+        try:
+            box = _resolve(store, box_id)
+            wanted = str(body.get("peer") or "").strip()
+            if not wanted:
+                raise HTTPException(status_code=422, detail="which agent?")
+            peer = store.get_box(wanted) or store.get_box_by_name(wanted)
+            if peer is None:
+                raise HTTPException(status_code=404, detail=f"no box {wanted!r}")
+            if is_terminal("box", peer.status):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"agent {peer.name!r} has been destroyed",
+                )
+            try:
+                store.grant_peer(box.id, peer.id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            store.add_event("box", box.id, "peer_granted", {"peer": peer.name})
+            return {"box_id": box.id, "peers": _peer_list(store, box.id)}
+        finally:
+            store.close()
+
+    @app.delete("/api/boxes/{box_id}/peers/{peer}")
+    def revoke_peer_endpoint(box_id: str, peer: str, _: Token | None = needs_write) -> Any:
+        """Withdraw a grant. Takes effect on the next message, with no restart.
+
+        The box holds nothing to invalidate — it never held a way to reach the
+        other agent, only permission to ask for one.
+        """
+        store = store_factory()
+        try:
+            box = _resolve(store, box_id)
+            target = store.get_box(peer) or store.get_box_by_name(peer)
+            had = store.revoke_peer(box.id, target.id) if target else False
+            if had:
+                store.add_event("box", box.id, "peer_revoked", {"peer": peer})
+            return {"box_id": box.id, "revoked": had, "peers": _peer_list(store, box.id)}
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/upgrade")
     def upgrade_box_endpoint(
         box_id: str, body: dict[str, Any] | None = None, _: Token | None = needs_write
@@ -1338,6 +1466,152 @@ def create_app(
             confine_to_box(token, box, "list the repositories of")
             return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
         finally:
+            store.close()
+
+    async def _deliver(peer_name: str, text: str, *, title: str) -> str:
+        """The default delivery: through the front door, as the app would.
+
+        Mints its own short-lived `box:chat` token. This is the one credential
+        in the system that can address any agent, and it exists for seconds
+        inside this process — never on a box, which is the entire point of
+        relaying rather than handing one out.
+        """
+        if not key:
+            raise HTTPException(
+                status_code=503,
+                detail=f"no ${SIGNING_KEY_ENV} configured on the control plane; "
+                f"agents cannot message each other without one",
+            )
+        token = mint(
+            subject="relay",
+            scopes={SCOPE_BOX_CHAT},
+            ttl_s=int(RELAY_TIMEOUT_S) + 60,
+            key=key,
+        )
+        return await deliver_through_door(
+            peer_name, text, token=token, title=title, timeout_s=RELAY_TIMEOUT_S
+        )
+
+    carry = deliver if deliver is not None else _deliver
+
+    @app.get("/api/boxes/{box_id}/peer/roster")
+    def peer_roster(box_id: str, token: Token | None = needs_peer) -> Any:
+        """Who this agent may message, asked with its own token.
+
+        The twin of `git-credential/repos`, and for the same reason: an agent
+        that cannot see the fleet cannot know who its colleagues are, and one
+        that guesses a name spends a wake finding out it was wrong. Confined
+        the same way — a box may ask about itself and no other.
+        """
+        store = store_factory()
+        try:
+            box = _resolve(store, box_id)
+            confine_to_box(token, box, "list the colleagues of")
+            return {"box_id": box.id, "name": box.name, "peers": _peer_list(store, box.id)}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/peer/ask")
+    async def peer_ask(box_id: str, body: dict[str, Any], token: Token | None = needs_peer) -> Any:
+        """Carry a message to another agent and bring back its reply (M7).
+
+        The request is held open while the other agent thinks — it wakes,
+        answers, and the reply comes back in this response. That is slow by
+        nature and honest: the asking agent is blocked on a colleague exactly
+        as a person would be, and its own tool deadline is longer than ours.
+
+        **Every refusal names what to do instead.** An agent told only "403"
+        will try again, differently, several times; one told "you were not
+        granted eng-b, ask the person in the app" stops.
+        """
+        store = store_factory()
+        hop = None
+        try:
+            box = _resolve(store, box_id)
+            confine_to_box(token, box, "send messages as")
+
+            wanted = str(body.get("peer") or "").strip()
+            message = str(body.get("message") or "").strip()
+            if not wanted:
+                raise HTTPException(status_code=422, detail="which agent?")
+            if not message:
+                raise HTTPException(status_code=422, detail="what should they be told?")
+
+            peer = store.get_box(wanted) or store.get_box_by_name(wanted)
+            if peer is None or is_terminal("box", peer.status):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"there is no agent called {wanted!r} on this fleet. "
+                    f"Your colleagues are listed by `flotta-ask --list`.",
+                )
+            if not store.may_message(box.id, peer.id):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"you have not been granted {peer.name!r}. Ask the person you "
+                    f"are working with to grant it in the Flotta app; you cannot "
+                    f"grant it yourself.",
+                )
+
+            try:
+                hop = chains.begin(box.id, peer.id)
+            except RelayRefused as exc:
+                raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+            store.add_event(
+                "box",
+                box.id,
+                PEER_ASKED,
+                {"peer": peer.name, "message": message[:EVENT_TEXT_CHARS], "hop": hop.depth},
+            )
+            store.add_event(
+                "box",
+                peer.id,
+                PEER_ASKED_BY,
+                {"peer": box.name, "message": message[:EVENT_TEXT_CHARS], "hop": hop.depth},
+            )
+
+            started = time.monotonic()
+            try:
+                reply = await carry(
+                    peer.name,
+                    envelope(box.name, message),
+                    title=f"{box.name} asked",
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                seconds = round(time.monotonic() - started, 1)
+                store.add_event(
+                    "box",
+                    box.id,
+                    PEER_FAILED,
+                    {"peer": peer.name, "reason": str(exc)[:EVENT_TEXT_CHARS], "seconds": seconds},
+                )
+                # 502, not 500: the failure is the other agent's or the path
+                # to it, and the asking agent should say so rather than
+                # reporting that Flotta is broken.
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"could not get an answer from {peer.name!r}: {exc}",
+                ) from exc
+
+            seconds = round(time.monotonic() - started, 1)
+            store.add_event(
+                "box",
+                box.id,
+                PEER_ANSWERED,
+                {"peer": peer.name, "reply": reply[:EVENT_TEXT_CHARS], "seconds": seconds},
+            )
+            store.add_event(
+                "box",
+                peer.id,
+                PEER_REPLIED,
+                {"peer": box.name, "reply": reply[:EVENT_TEXT_CHARS], "seconds": seconds},
+            )
+            return {"peer": peer.name, "reply": reply, "seconds": seconds, "hop": hop.depth}
+        finally:
+            if hop is not None:
+                chains.end(hop)
             store.close()
 
     @app.post("/api/boxes/{box_id}/git-credential")

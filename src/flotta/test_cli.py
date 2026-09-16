@@ -622,10 +622,23 @@ def test_token_box_prints_the_identity_the_entrypoint_reads(tmp_path, monkeypatc
     assert printed["FLOTTA_BOX_TOKEN"].startswith("flotta_")
 
 
-def test_token_box_mints_git_credential_and_nothing_else(tmp_path, monkeypatch):
-    """This token sits on a machine whose agent has root. A second scope here
-    would be a second thing that agent can do with it."""
-    from flotta.auth import SCOPE_GIT_CREDENTIAL, box_subject, verify
+def test_token_box_mints_only_the_scopes_that_reach_nothing(tmp_path, monkeypatch):
+    """This token sits on a machine whose agent has root, so every scope on it
+    is a thing that agent can do.
+
+    Both of these ask the control plane to act on the box's behalf and neither
+    addresses anything directly — `git:credential` trades for a credential the
+    box was granted, `box:peer` asks for a message to be carried to an agent it
+    was granted. `box:chat` is the one that must never appear here: the door
+    checks the scope and not the subject, so it would reach the whole fleet.
+    """
+    from flotta.auth import (
+        SCOPE_BOX_CHAT,
+        SCOPE_BOX_PEER,
+        SCOPE_GIT_CREDENTIAL,
+        box_subject,
+        verify,
+    )
 
     box, result = _token_box(tmp_path, monkeypatch)
     value = next(
@@ -634,7 +647,8 @@ def test_token_box_mints_git_credential_and_nothing_else(tmp_path, monkeypatch):
         if line.startswith("FLOTTA_BOX_TOKEN=")
     )
     claims = verify(value, key="k" * 32)
-    assert claims.scopes == frozenset({SCOPE_GIT_CREDENTIAL})
+    assert claims.scopes == frozenset({SCOPE_GIT_CREDENTIAL, SCOPE_BOX_PEER})
+    assert SCOPE_BOX_CHAT not in claims.scopes
     assert claims.subject == box_subject(box.id)
 
 

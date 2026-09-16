@@ -470,7 +470,7 @@ def build_identity(
     invisible until a rotated identity behaved differently from a fresh one.
     """
     source = os.environ if env is None else env
-    from flotta.auth import SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
+    from flotta.auth import SCOPE_BOX_PEER, SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
 
     box_env = {"FLOTTA_BOX_ID": box_id, "FLOTTA_BOX_NAME": box_name}
 
@@ -495,7 +495,7 @@ def build_identity(
     try:
         token = mint(
             subject=box_subject(box_id),
-            scopes={SCOPE_GIT_CREDENTIAL},
+            scopes={SCOPE_GIT_CREDENTIAL, SCOPE_BOX_PEER},
             ttl_s=ttl_s,
             env=source,
         )
@@ -1173,9 +1173,7 @@ def set_instructions(
     # appear, then a 500. The fake backend ignores this argument, so the whole
     # suite was green while the live call could not work.
     if not box.endpoint:
-        raise ProvisionError(
-            f"box {box.name} has no endpoint, so there is no machine to write to"
-        )
+        raise ProvisionError(f"box {box.name} has no endpoint, so there is no machine to write to")
     result = impl.exec(box.endpoint, command)
     if result.exit_code != 0:
         detail = (result.stderr or result.stdout or "").strip() or "no output"
