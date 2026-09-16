@@ -295,6 +295,20 @@ CREATE TABLE IF NOT EXISTS box_meta (
     updated_at    TEXT NOT NULL
 );
 
+-- Which model an agent runs, when it is not the fleet's (FLOTTA-39).
+--
+-- A side table rather than a column, for the reason `box_meta` gives; and a
+-- table rather than an event at creation, because a model is *changed* — the
+-- current value has to be answerable without replaying history. An agent with
+-- no row runs the fleet default. Only the model: the endpoint and key stay
+-- fleet-wide, since a per-agent endpoint with the fleet's key would send that
+-- key to a host it was never issued for.
+CREATE TABLE IF NOT EXISTS box_models (
+    box_id      TEXT PRIMARY KEY REFERENCES boxes(id),
+    model       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           {events_id},
     entity_kind  TEXT NOT NULL CHECK (entity_kind IN ('box', 'workspace', 'task')),
@@ -915,6 +929,48 @@ class FleetStore:
             tuple(box_ids),
         ).fetchall()
         return {str(r["box_id"]): _meta_from_row(r) for r in rows}
+
+    # -- per-agent model ---------------------------------------------------
+
+    def set_box_model(self, box_id: str, model: str | None) -> None:
+        """Record the model an agent runs; None goes back to the fleet default.
+
+        Validated here as well as at the edge, so no caller can store a value
+        that is not a model id — the same rule as a box name.
+        """
+        from flotta.inference import validate_model
+
+        self._require("box", box_id)
+        if model is None:
+            self._conn.execute("DELETE FROM box_models WHERE box_id = ?", (box_id,))
+            return
+        value = validate_model(model)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO box_models (box_id, model, updated_at) VALUES (?, ?, ?)"
+            if not self.is_postgres
+            else "INSERT INTO box_models (box_id, model, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (box_id) DO UPDATE SET model = EXCLUDED.model, "
+            "updated_at = EXCLUDED.updated_at",
+            (box_id, value, _utcnow()),
+        )
+
+    def model_for_box(self, box_id: str) -> str | None:
+        """This agent's own model, or None when it runs the fleet default."""
+        row = self._conn.execute(
+            "SELECT model FROM box_models WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        return str(row["model"]) if row else None
+
+    def models_for_boxes(self, box_ids: list[str]) -> dict[str, str]:
+        """One query for the fleet list, not one per row."""
+        if not box_ids:
+            return {}
+        marks = ", ".join("?" for _ in box_ids)
+        rows = self._conn.execute(
+            f"SELECT box_id, model FROM box_models WHERE box_id IN ({marks})",
+            tuple(box_ids),
+        ).fetchall()
+        return {str(r["box_id"]): str(r["model"]) for r in rows}
 
     # -- builds -------------------------------------------------------------
 

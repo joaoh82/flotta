@@ -2122,15 +2122,18 @@ def test_the_provider_is_set_in_both_vocabularies():
     assert secrets["OPENROUTER_API_KEY"] == "sk-abc", "the native name is what serve reads"
 
 
-def test_the_native_provider_name_is_derived_from_the_endpoint():
-    """OpenRouter has its own variable; everything OpenAI-compatible shares
-    OPENAI_*. Guessing one would silently configure the wrong provider."""
+def test_a_non_openrouter_endpoint_is_not_given_openai_env_names():
+    """FLOTTA-39. This used to set `OPENAI_API_KEY` + `OPENAI_BASE_URL`, and
+    with `provider: auto` Hermes resolves either key to OpenRouter and ignores
+    that base URL — so the key would have gone to openrouter.ai. A custom
+    endpoint is configured by the box's boot step, in `config.yaml`, from the
+    `FLOTTA_*` values; those are the only names it needs."""
     from flotta.provision import fleet_secrets
 
     secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL="https://api.together.xyz/v1"))
-    assert secrets["OPENAI_API_KEY"] == "sk-abc"
-    assert secrets["OPENAI_BASE_URL"] == "https://api.together.xyz/v1"
-    assert "OPENROUTER_API_KEY" not in secrets
+    assert secrets["FLOTTA_API_KEY"] == "sk-abc"
+    assert secrets["FLOTTA_MODEL_BASE_URL"] == "https://api.together.xyz/v1"
+    assert not {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY"} & set(secrets)
 
 
 def test_what_is_missing_is_named_rather_than_guessed():
@@ -2214,7 +2217,7 @@ def test_a_proxy_url_mentioning_openrouter_is_not_openrouter():
         _fleet_env(FLOTTA_MODEL_BASE_URL="https://proxy.internal/openrouter/v1")
     )
     assert "OPENROUTER_API_KEY" not in secrets
-    assert secrets["OPENAI_BASE_URL"] == "https://proxy.internal/openrouter/v1"
+    assert secrets["FLOTTA_MODEL_BASE_URL"] == "https://proxy.internal/openrouter/v1"
 
 
 def test_openrouter_itself_still_uses_its_own_variable():
@@ -3251,3 +3254,146 @@ def test_a_failed_rotation_says_the_old_identity_still_holds(store, monkeypatch)
     kinds = [e.type for e in store.get_box_timeline(box.id)]
     assert "identity_rotation_failed" in kinds
     assert "identity_rotated" not in kinds
+
+
+# -- a model per agent (FLOTTA-39) -------------------------------------------
+
+
+def test_an_agent_created_with_a_model_boots_with_it(store, monkeypatch):
+    for key, value in _fleet_env().items():
+        monkeypatch.setenv(key, value)
+    impl = Recording()
+    out = create_box("eng-b", store=store, backend=impl, model="anthropic/claude-sonnet-4.5")
+
+    assert impl.spec.secrets["FLOTTA_MODEL"] == "anthropic/claude-sonnet-4.5"
+    # Only the model: the endpoint and key are still the fleet's.
+    assert impl.spec.secrets["FLOTTA_MODEL_BASE_URL"] == _fleet_env()["FLOTTA_MODEL_BASE_URL"]
+    assert store.model_for_box(out["box_id"]) == "anthropic/claude-sonnet-4.5"
+    (event,) = [e for e in store.get_box_timeline(out["box_id"]) if e.type == "model_set"]
+    assert event.payload == {
+        "model": "anthropic/claude-sonnet-4.5",
+        "source": "agent",
+        "reason": "created",
+    }
+
+
+def test_an_agent_created_without_a_model_is_unchanged(store, monkeypatch):
+    """The acceptance criterion that protects every existing workflow."""
+    for key, value in _fleet_env().items():
+        monkeypatch.setenv(key, value)
+    impl = Recording()
+    out = create_box("eng-b", store=store, backend=impl)
+
+    assert impl.spec.secrets["FLOTTA_MODEL"] == _fleet_env()["FLOTTA_MODEL"]
+    assert store.model_for_box(out["box_id"]) is None
+    (event,) = [e for e in store.get_box_timeline(out["box_id"]) if e.type == "model_set"]
+    assert event.payload["source"] == "fleet"
+
+
+def test_a_model_reserved_by_the_api_reaches_the_machine_later(store, monkeypatch):
+    """The 202 path: the row is reserved in the request, provisioned on a
+    thread with no model argument. The store carries it across."""
+    from flotta.provision import reserve_box
+
+    for key, value in _fleet_env().items():
+        monkeypatch.setenv(key, value)
+    impl = Recording()
+    box = reserve_box("eng-b", store=store, backend=impl, model="z-ai/glm-5.2-air")
+    create_box("eng-b", store=store, backend=impl, box=box)
+    assert impl.spec.secrets["FLOTTA_MODEL"] == "z-ai/glm-5.2-air"
+
+
+def test_a_malformed_model_is_refused_before_the_name_is_spent(store):
+    from flotta.inference import InvalidModel
+
+    with pytest.raises(InvalidModel):
+        create_box("eng-b", store=store, backend=Recording(), model="claude sonnet")
+    assert store.get_box_by_name("eng-b") is None
+
+
+def _live_agent(store, status="running"):
+    box = _running(store, endpoint="fly://joaoh82-flotta-eng-a/m1")
+    if status != "running":
+        store.update_box_status(box.id, status)
+    return box
+
+
+def test_changing_a_model_writes_only_the_model_to_the_agents_machine(store, monkeypatch):
+    from flotta.provision import set_model
+
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    box = _live_agent(store)
+    backend = Rotating()
+    result = set_model(box.id, "anthropic/claude-sonnet-4.5", store=store, backend=backend)
+
+    assert backend.target == "fly://joaoh82-flotta-eng-a/m1"
+    assert backend.applied == {"FLOTTA_MODEL": "anthropic/claude-sonnet-4.5"}
+    assert result == {
+        "box_id": box.id,
+        "name": "eng-a",
+        "model": "anthropic/claude-sonnet-4.5",
+        "source": "agent",
+    }
+    assert store.model_for_box(box.id) == "anthropic/claude-sonnet-4.5"
+
+
+def test_resetting_puts_the_fleets_model_on_the_machine(store, monkeypatch):
+    from flotta.provision import set_model
+
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    box = _live_agent(store)
+    store.set_box_model(box.id, "anthropic/claude-sonnet-4.5")
+    backend = Rotating()
+    result = set_model(box.id, None, store=store, backend=backend)
+
+    assert backend.applied == {"FLOTTA_MODEL": "z-ai/glm-5.2"}
+    assert result["source"] == "fleet"
+    assert store.model_for_box(box.id) is None
+
+
+def test_a_sleeping_agents_model_can_be_changed(store, monkeypatch):
+    from flotta.provision import set_model
+
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    box = _live_agent(store, status="stopped")
+    backend = Rotating()
+    set_model(box.id, "anthropic/claude-sonnet-4.5", store=store, backend=backend)
+    assert "apply_secrets" in backend.calls
+    assert store.get_box(box.id).status == "stopped"
+
+
+def test_a_failed_change_leaves_the_record_saying_what_it_really_runs(store, monkeypatch):
+    """Substrate first, row second."""
+    from flotta.backend import BackendError
+    from flotta.provision import UpgradeFailed, set_model
+
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+
+    class Broken(FakeBackend):
+        def apply_secrets(self, box_id, secrets):
+            raise BackendError("flyctl exploded")
+
+    box = _live_agent(store)
+    with pytest.raises(UpgradeFailed, match="still runs z-ai/glm-5.2"):
+        set_model(box.id, "anthropic/claude-sonnet-4.5", store=store, backend=Broken())
+    assert store.model_for_box(box.id) is None
+    assert not [e for e in store.get_box_timeline(box.id) if e.type == "model_set"]
+
+
+def test_there_is_nothing_to_reset_to_without_a_fleet_model(store, monkeypatch):
+    from flotta.provision import ProvisionError, set_model
+
+    monkeypatch.delenv("FLOTTA_MODEL", raising=False)
+    backend = Rotating()
+    with pytest.raises(ProvisionError, match="no model configured"):
+        set_model(_live_agent(store).id, None, store=store, backend=backend)
+    assert "apply_secrets" not in backend.calls
+
+
+def test_an_agent_still_being_created_cannot_have_its_model_changed(store, monkeypatch):
+    from flotta.provision import ProvisionError, set_model
+
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    box = store.create_box("eng-new")
+    with pytest.raises(ProvisionError, match="still being created"):
+        set_model(box.id, "z-ai/glm-5.2", store=store, backend=Rotating())

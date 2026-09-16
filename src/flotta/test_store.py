@@ -1044,3 +1044,50 @@ def test_both_lists_are_ordered_by_name(store):
     store.block_peer(a.id, z.id)
     store.block_peer(a.id, c.id)
     assert store.blocked_peers_for_box(a.id) == [c.id, z.id]
+
+
+# -- per-agent model (FLOTTA-39) ---------------------------------------------
+
+
+def test_an_agent_with_no_model_of_its_own_runs_the_fleets(store, box):
+    assert store.model_for_box(box.id) is None
+
+
+def test_an_agents_model_is_recorded_and_can_be_changed(store, box):
+    store.set_box_model(box.id, "z-ai/glm-5.2")
+    store.set_box_model(box.id, "anthropic/claude-sonnet-4.5")
+    assert store.model_for_box(box.id) == "anthropic/claude-sonnet-4.5"
+
+
+def test_clearing_an_agents_model_puts_it_back_on_the_fleets(store, box):
+    store.set_box_model(box.id, "z-ai/glm-5.2")
+    store.set_box_model(box.id, None)
+    assert store.model_for_box(box.id) is None
+    assert store.models_for_boxes([box.id]) == {}
+
+
+def test_a_model_that_is_not_one_is_refused_by_the_store(store, box):
+    from flotta.inference import InvalidModel
+
+    with pytest.raises(InvalidModel):
+        store.set_box_model(box.id, "claude sonnet")
+
+
+def test_models_are_read_for_the_whole_fleet_at_once(store, box):
+    other = store.create_box("eng-c")
+    store.set_box_model(other.id, "z-ai/glm-5.2")
+    assert store.models_for_boxes([box.id, other.id]) == {other.id: "z-ai/glm-5.2"}
+    assert store.models_for_boxes([]) == {}
+
+
+def test_the_model_table_appears_on_a_store_that_predates_it(tmp_path):
+    """A new table, not a column, because only a table arrives by itself."""
+    path = tmp_path / "old.db"
+    old = FleetStore(path)
+    box = old.create_box("eng-a")
+    old._conn.execute("DROP TABLE box_models")
+    old.close()
+
+    reopened = FleetStore(path)
+    reopened.set_box_model(box.id, "z-ai/glm-5.2")
+    assert reopened.model_for_box(box.id) == "z-ai/glm-5.2"

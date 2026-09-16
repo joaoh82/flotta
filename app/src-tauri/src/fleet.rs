@@ -135,6 +135,12 @@ pub struct BoxRow {
     /// sidebar on a timer.
     #[serde(default)]
     pub instructions_changed_at: Option<f64>,
+    /// The model the agent runs (FLOTTA-39): its own, or the fleet's.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `agent` or `fleet`; `None` when the fleet has no model configured.
+    #[serde(default)]
+    pub model_source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -608,59 +614,70 @@ async fn send_within(
     }
 }
 
+/// Everything the Create form can say about a new agent.
+///
+/// One struct rather than one argument per field: the form grew a field per
+/// milestone (size, region, identity, instructions, and now a model), and a
+/// command with eight positional arguments is one where two `Option<String>`s
+/// can be swapped without the compiler noticing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAgent {
+    pub name: String,
+    #[serde(default)]
+    pub volume_gb: Option<u32>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// A model id, when not the fleet's (FLOTTA-39).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// The body `POST /api/boxes` is sent.
+///
+/// Omitted, not nulled, when the agent takes the fleet default — which is the
+/// common case. A body carrying `"volume_gb": null` would work, but "this
+/// field is absent" and "this field is deliberately nothing" are worth keeping
+/// distinct on a wire somebody will read in a log one day.
+fn create_body(agent: &NewAgent) -> Result<serde_json::Value, FleetError> {
+    let name = agent.name.trim();
+    if name.is_empty() {
+        return Err(FleetError::Unexpected("an agent needs a name".into()));
+    }
+    let mut body = serde_json::Map::new();
+    body.insert("name".into(), serde_json::Value::from(name));
+    // Only a value that was actually typed goes on the wire.
+    for (key, value) in [
+        ("display_name", &agent.display_name),
+        ("description", &agent.description),
+        ("instructions", &agent.instructions),
+        ("region", &agent.region),
+        ("model", &agent.model),
+    ] {
+        if let Some(v) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            body.insert(key.into(), serde_json::Value::from(v));
+        }
+    }
+    if let Some(gb) = agent.volume_gb {
+        body.insert("volume_gb".into(), serde_json::Value::from(gb));
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
 /// Create an agent.
 ///
 /// One request, and the box comes back with its identity already on it —
 /// FLOTTA-21 injects it at creation, which is why this is a button and not a
 /// button followed by a terminal.
-pub async fn create_box(
-    settings: &Settings,
-    name: &str,
-    volume_gb: Option<u32>,
-    region: Option<String>,
-    display_name: Option<String>,
-    description: Option<String>,
-    instructions: Option<String>,
-) -> Result<BoxRow, FleetError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(FleetError::Unexpected("an agent needs a name".into()));
-    }
-
-    // Omitted, not nulled, when the agent takes the fleet default — which is
-    // the common case. A body carrying `"volume_gb": null` would work, but
-    // "this field is absent" and "this field is deliberately nothing" are
-    // worth keeping distinct on a wire somebody will read in a log one day.
-    let mut body = serde_json::Map::new();
-    body.insert("name".into(), serde_json::Value::from(name));
-    // Who it is. Absent means "not set", same rule as the size and region:
-    // only a value that was actually typed goes on the wire.
-    for (key, value) in [
-        ("display_name", display_name),
-        ("description", description),
-        ("instructions", instructions),
-    ] {
-        if let Some(v) = value
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            body.insert(key.into(), serde_json::Value::from(v));
-        }
-    }
-    if let Some(gb) = volume_gb {
-        body.insert("volume_gb".into(), serde_json::Value::from(gb));
-    }
-    if let Some(region) = region.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
-        body.insert("region".into(), serde_json::Value::from(region));
-    }
-
-    let body = send(
-        settings,
-        reqwest::Method::POST,
-        "/api/boxes",
-        Some(serde_json::Value::Object(body)),
-    )
-    .await?;
+pub async fn create_box(settings: &Settings, agent: &NewAgent) -> Result<BoxRow, FleetError> {
+    let body = create_body(agent)?;
+    let body = send(settings, reqwest::Method::POST, "/api/boxes", Some(body)).await?;
 
     // Since FLOTTA-27 the usual answer is `202` with a box that is still
     // `provisioning` — a machine appears a minute or two later. `classify`
@@ -668,6 +685,31 @@ pub async fn create_box(
     // machine that was made but is not running) and `202` all mean something
     // real was created and is billing, and none of them is a failure.
     box_from(&body, "created, but could not read it back")
+}
+
+/// Change the model an agent runs; `None` puts it back on the fleet's.
+///
+/// Waits as long as renewing an identity does, for the same reason: a
+/// running agent restarts before the control plane answers.
+pub async fn set_model(
+    settings: &Settings,
+    id: &str,
+    model: Option<String>,
+) -> Result<BoxRow, FleetError> {
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let body = send_within(
+        settings,
+        reqwest::Method::PUT,
+        &format!("/api/boxes/{}/model", encode_segment(id)),
+        // `null`, not absent: the route refuses a body with no `model` key,
+        // because an empty body is more likely a bug than a reset.
+        Some(serde_json::json!({ "model": model })),
+        Some(ROTATE_TIMEOUT),
+    )
+    .await?;
+    box_from(&body, "changed, but could not read the agent back")
 }
 
 /// A `BoxRow` out of a body that may or may not wrap it.
@@ -1224,6 +1266,41 @@ mod tests {
         );
         assert_eq!(lists.blocked[0].name, "eng-d");
         assert_eq!(lists.blocked[0].description, None);
+    }
+
+    #[test]
+    fn a_new_agent_sends_only_what_was_typed() {
+        let agent = NewAgent {
+            name: "  eng-z ".into(),
+            model: Some(" anthropic/claude-sonnet-4.5 ".into()),
+            region: Some("   ".into()),
+            ..Default::default()
+        };
+        let body = create_body(&agent).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "eng-z", "model": "anthropic/claude-sonnet-4.5"})
+        );
+    }
+
+    #[test]
+    fn a_new_agent_is_read_from_the_form_as_the_webview_sends_it() {
+        let agent: NewAgent = serde_json::from_value(serde_json::json!({
+            "name": "eng-z", "volumeGb": 3, "displayName": "Z", "model": "z-ai/glm-5.2"
+        }))
+        .unwrap();
+        assert_eq!(agent.volume_gb, Some(3));
+        assert_eq!(agent.display_name.as_deref(), Some("Z"));
+        assert_eq!(agent.model.as_deref(), Some("z-ai/glm-5.2"));
+    }
+
+    #[test]
+    fn a_new_agent_needs_a_name() {
+        assert!(create_body(&NewAgent {
+            name: "  ".into(),
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]

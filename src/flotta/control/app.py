@@ -229,7 +229,9 @@ def _build_region() -> str:
     return FlyConfig.from_env().resolved_region()
 
 
-def _box_dict(box: Any, meta: Any = None) -> dict[str, Any]:
+def _box_dict(
+    box: Any, meta: Any = None, *, model: str | None = None, fleet_model: str | None = None
+) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
     `display_name` / `description` / `instructions` are always present so the
@@ -245,11 +247,23 @@ def _box_dict(box: Any, meta: Any = None) -> dict[str, Any]:
     out["display_name"] = meta.display_name if meta else None
     out["description"] = meta.description if meta else None
     out["instructions"] = meta.instructions if meta else None
+    # What model the agent runs (FLOTTA-39), and whose choice that is: its
+    # own, or the fleet's. `None` for both means the fleet has no model at
+    # all, which the window should say rather than guess.
+    out["model"] = model or fleet_model
+    out["model_source"] = "agent" if model else ("fleet" if fleet_model else None)
     return out
 
 
 def _with_meta(store: Any, box: Any) -> dict[str, Any]:
-    return _box_dict(box, store.meta_for_box(box.id))
+    from flotta.provision import fleet_model
+
+    return _box_dict(
+        box,
+        store.meta_for_box(box.id),
+        model=store.model_for_box(box.id),
+        fleet_model=fleet_model(store),
+    )
 
 
 def _epoch(iso: str | None) -> float | None:
@@ -294,6 +308,10 @@ def create_app(
     #: opens a WebSocket to a live box through the front door and spends a
     #: model call. An `async (peer_name, text, *, title) -> str`.
     deliver: Any = None,
+    #: Whether a model id exists before an agent is pointed at it. Injected
+    #: for the reason `reachable` is: the default asks OpenRouter over HTTPS.
+    #: A `(model, base_url) -> model_catalog.Known`.
+    known_model: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -709,8 +727,23 @@ def create_app(
                     # "no rate configured", a zero claims the box ran for free.
                     "cost_estimate": sum(costs) if costs else None,
                 }
-            metas = store.meta_for_boxes([b.id for b in boxes])
-            return {"boxes": [{**_box_dict(b, metas.get(b.id)), **summaries[b.id]} for b in boxes]}
+            from flotta.provision import fleet_model
+
+            ids = [b.id for b in boxes]
+            metas = store.meta_for_boxes(ids)
+            models = store.models_for_boxes(ids)
+            default = fleet_model(store)
+            return {
+                "boxes": [
+                    {
+                        **_box_dict(
+                            b, metas.get(b.id), model=models.get(b.id), fleet_model=default
+                        ),
+                        **summaries[b.id],
+                    }
+                    for b in boxes
+                ]
+            }
         finally:
             store.close()
 
@@ -778,6 +811,10 @@ def create_app(
         except InvalidBoxMetaError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # Which model, if not the fleet's. Checked before a name is spent: a
+        # typo here is an agent that answers every turn with "model not found".
+        model = _checked_model(body.get("model"))
+
         if background:
             return _create_in_background(
                 name,
@@ -786,6 +823,7 @@ def create_app(
                 display_name=display_name,
                 description=description,
                 instructions=instructions,
+                model=model,
             )
 
         store = store_factory()
@@ -799,6 +837,7 @@ def create_app(
                     display_name=display_name,
                     description=description,
                     instructions=instructions,
+                    model=model,
                 )
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
@@ -847,6 +886,7 @@ def create_app(
         display_name: str | None = None,
         description: str | None = None,
         instructions: str | None = None,
+        model: str | None = None,
     ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
@@ -890,6 +930,7 @@ def create_app(
                     display_name=display_name,
                     description=description,
                     instructions=instructions,
+                    model=model,
                 )
             except DuplicateBoxError as exc:
                 # A *live* box holds the name — a destroyed one no longer does,
@@ -991,7 +1032,13 @@ def create_app(
                 )
             except InvalidBoxMetaError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-            return {"box": _box_dict(box, meta)}
+            from flotta.provision import fleet_model
+
+            return {
+                "box": _box_dict(
+                    box, meta, model=store.model_for_box(box.id), fleet_model=fleet_model(store)
+                )
+            }
         finally:
             store.close()
 
@@ -1306,6 +1353,62 @@ def create_app(
                 # timeline reading `peer=b-e0d6…` is one nobody can read.
                 store.add_event("box", box.id, "peer_allowed", {"peer": target.name})
             return _colleagues(store, box)
+        finally:
+            store.close()
+
+    def _checked_model(raw: Any) -> str | None:
+        """A model id from a request, validated and looked up — or None.
+
+        None and "" both mean "the fleet default": the common case, and a
+        cleared field in the app. Refused on a malformed id and on a definite
+        "no such model"; allowed when the catalogue cannot be asked.
+        """
+        from flotta.inference import InvalidModel, validate_model
+
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        try:
+            model = validate_model(str(raw))
+        except InvalidModel as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # The endpoint is the control plane's own configuration, not a stored
+        # setting: it travels with the fleet's key, which never leaves the env.
+        base_url = (os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip()
+        if base_url:
+            if known_model is not None:
+                check = known_model
+            else:
+                from flotta.model_catalog import known_model as check
+            verdict = check(model, base_url)
+            if verdict.refuses:
+                raise HTTPException(status_code=422, detail=verdict.detail)
+        return model
+
+    @app.put("/api/boxes/{box_id}/model")
+    def set_model_endpoint(box_id: str, body: dict[str, Any], _: Token | None = needs_write) -> Any:
+        """Change the model an agent runs; `{"model": null}` means the fleet's.
+
+        Like renewing an identity: the value is written to the agent's own
+        machine, a running agent restarts to take it, and a sleeping one stays
+        asleep and takes it when it wakes. `fleet:write`, for the restart.
+        """
+        from flotta.provision import ProvisionError, UpgradeFailed, set_model
+
+        if "model" not in body:
+            raise HTTPException(
+                status_code=422, detail='which model? Send {"model": null} for the fleet default.'
+            )
+        model = _checked_model(body.get("model"))
+        store = store_factory()
+        try:
+            box = _resolve(store, box_id)
+            try:
+                result = set_model(box.id, model, store=store)
+            except UpgradeFailed as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {**result, "box": _with_meta(store, store.get_box(box.id))}
         finally:
             store.close()
 

@@ -325,3 +325,58 @@ def test_the_entrypoint_registers_flottas_skills_for_real(tmp_path):
         text=True,
     )
     assert bare.returncode == 0 and "still-booting" in bare.stdout, bare.stderr
+
+
+def test_the_entrypoint_tells_hermes_its_model_for_real(tmp_path):
+    """FLOTTA-39. Hermes never read FLOTTA_MODEL; this line is what makes the
+    model an agent was given the model it runs. Run as written, after the other
+    two config.yaml writers, none of which may undo another."""
+    import subprocess
+    import sys
+
+    import yaml
+
+    body = _ENTRYPOINT.read_text(encoding="utf-8")
+    lines = [
+        line
+        for line in body.splitlines()
+        if any(f"flotta.box.{m}" in line for m in ("approvals", "skills", "inference"))
+        and not line.lstrip().startswith("#")
+    ]
+    assert len(lines) == 3, lines
+    assert "flotta.box.inference" in lines[-1]
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    venv = pathlib.Path(sys.executable).parent.parent
+    env = {
+        "HERMES_HOME": str(home),
+        "HERMES_VENV": str(venv),
+        "PATH": "/usr/bin:/bin",
+        "FLOTTA_MODEL": "anthropic/claude-sonnet-4.5",
+        "FLOTTA_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "FLOTTA_API_KEY": "sk-test",
+    }
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", "\n".join(lines) + "\necho still-booting"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "still-booting" in result.stdout
+    assert "sk-test" not in result.stdout + result.stderr
+    written = yaml.safe_load((home / "config.yaml").read_text())
+    assert written["model"]["default"] == "anthropic/claude-sonnet-4.5"
+    assert written["model"]["provider"] == "openrouter"
+    assert written["approvals"]["timeout"] < 300
+    assert written["skills"]["external_dirs"]
+
+    # With no venv at all, the box still boots past all three.
+    bare = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", "\n".join(lines) + "\necho still-booting"],
+        env={"HERMES_HOME": str(home), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert bare.returncode == 0 and "still-booting" in bare.stdout, bare.stderr

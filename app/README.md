@@ -223,6 +223,22 @@ still attached (`mentions.ts`'s `withoutNote`). Anything from the note's
 opening marker to the end of a message is hidden, which is why the marker is
 one nobody types.
 
+## A model per agent (FLOTTA-39)
+
+**Info → Model** shows what an agent runs and whose choice that is — its own,
+or the fleet's — with **Change**. The Create form has a *Model* field under
+"Give it a different model, size or region", with the fleet's model as the
+placeholder.
+
+- Changing a model restarts a running agent (about a minute) and leaves a
+  sleeping one asleep until it wakes. Memory and conversations are kept.
+- A model id is checked against OpenRouter's catalogue first, so a typo is
+  refused in the form rather than surfacing as "model not found" on every turn.
+- Only the model is per agent. The endpoint and key stay the fleet's.
+
+**Identity → Renew** sits on the row below, and the two behave the same way:
+both write one value to the agent's own machine through the control plane.
+
 ## Info: the store's belief, and the substrate's answer
 
 Every read in this window comes from the fleet store, which is a *belief* — a

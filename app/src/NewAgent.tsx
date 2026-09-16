@@ -44,7 +44,14 @@ function nameProblem(name: string): string | null {
   const hint = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(suggestion) ? ` — try ${suggestion}` : "";
   return `lowercase letters, digits and dashes, not starting or ending with a dash${hint}`;
 }
-export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
+export function NewAgent({
+  onCreated,
+  fleetModel,
+}: {
+  onCreated: (box: BoxRow) => void;
+  /** What an agent runs when nobody chooses, shown as the placeholder. */
+  fleetModel?: string | null;
+}) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -54,6 +61,7 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
   const [showOptions, setShowOptions] = useState(false);
   const [volumeGb, setVolumeGb] = useState("");
   const [region, setRegion] = useState("");
+  const [model, setModel] = useState("");
   // Who it is (FLOTTA-40). The address is `name`; these are what a person
   // calls it, what it is for, and what it is told. Instructions become the
   // agent's SOUL.md on its own volume and are its to evolve from then on.
@@ -72,18 +80,22 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
     try {
       const parsed = Number.parseInt(volumeGb.trim(), 10);
       const box = await invoke<BoxRow>("create_agent", {
-        name: trimmed,
-        // undefined, not null: absent means "the fleet decides", and that is
-        // the answer for almost every agent.
-        volumeGb: volumeGb.trim() === "" || Number.isNaN(parsed) ? undefined : parsed,
-        region: region.trim() === "" ? undefined : region.trim(),
-        displayName: displayName.trim() === "" ? undefined : displayName.trim(),
-        description: description.trim() === "" ? undefined : description.trim(),
-        instructions: instructions.trim() === "" ? undefined : instructions.trim(),
+        agent: {
+          name: trimmed,
+          // undefined, not null: absent means "the fleet decides", and that
+          // is the answer for almost every agent.
+          volumeGb: volumeGb.trim() === "" || Number.isNaN(parsed) ? undefined : parsed,
+          region: region.trim() === "" ? undefined : region.trim(),
+          displayName: displayName.trim() === "" ? undefined : displayName.trim(),
+          description: description.trim() === "" ? undefined : description.trim(),
+          instructions: instructions.trim() === "" ? undefined : instructions.trim(),
+          model: model.trim() === "" ? undefined : model.trim(),
+        },
       });
       setName("");
       setVolumeGb("");
       setRegion("");
+      setModel("");
       setDisplayName("");
       setDescription("");
       setInstructions("");
@@ -119,7 +131,7 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
         onClick={() => setShowOptions((open) => !open)}
         className="mt-2 text-[11px] text-neutral-500 underline hover:text-neutral-700"
       >
-        {showOptions ? "Use the fleet's defaults" : "Give it a different size or region"}
+        {showOptions ? "Use the fleet's defaults" : "Give it a different model, size or region"}
       </button>
 
       {/* Who it is. Visible without expanding anything, because an agent with
@@ -174,6 +186,22 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
       {showOptions && (
         <div className="mt-2 space-y-2">
           <label className="block">
+            <span className="text-[11px] text-neutral-600">Model</span>
+            <input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder={fleetModel ? `${fleetModel} (the fleet's)` : "the fleet's default"}
+              spellCheck={false}
+              className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 font-mono text-xs focus:border-neutral-500 focus:outline-none"
+            />
+            {/* Unlike the two below, this one can be changed later — which is
+                worth saying, or people agonise over a choice that is cheap. */}
+            <span className="text-[11px] text-neutral-400">
+              A model id, like anthropic/claude-sonnet-4.5. Checked before the
+              agent is made, and changeable later from its Info panel.
+            </span>
+          </label>
+          <label className="block">
             <span className="text-[11px] text-neutral-600">Disk (GB)</span>
             <input
               value={volumeGb}
@@ -195,8 +223,8 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
           {/* Said here because it is the one thing about this that cannot be
               undone: a volume cannot be resized afterwards. */}
           <p className="text-[11px] text-neutral-400">
-            Both are fixed once the agent exists — a volume cannot be resized
-            later.
+            Disk and region are fixed once the agent exists — a volume cannot
+            be resized later.
           </p>
         </div>
       )}

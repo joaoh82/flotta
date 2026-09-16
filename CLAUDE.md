@@ -487,6 +487,20 @@ conventions, and the sharp edges below.
   would mean a second Hermes process and a second config surface per box, and
   delegation traffic Flotta cannot see, bill or show in the app. FLOTTA-54
   relays through the control plane instead.
+- **Hermes never read `FLOTTA_MODEL`.** `hermes serve` takes its model from a
+  per-session override, then `HERMES_MODEL`, then `config.yaml`'s
+  `model.default`, then a built-in silent default — `z-ai/glm-5.2`, which was
+  also the fleet's configured model, so every agent ran "the configured model"
+  by coincidence. Since FLOTTA-39 the boot step `flotta.box.inference` writes
+  the `model:` block from the `FLOTTA_*` values every boot. Verified by reading
+  v2026.9.14, not the local checkout (which was three weeks older).
+- **`OPENAI_BASE_URL` is ignored on Hermes's auto path**, and either
+  `OPENAI_API_KEY` or `OPENROUTER_API_KEY` resolves to OpenRouter — so the old
+  "non-OpenRouter gets `OPENAI_*`" derivation would have sent a self-hosted
+  proxy's key to openrouter.ai. For a non-OpenRouter host Hermes also refuses
+  `OPENAI_API_KEY` outright (a leak guard matched on host). The working
+  arrangement is `provider: custom` + `base_url` + `api_key` in `config.yaml`.
+  `flotta.inference` is the one derivation; do not add a second.
 - **The suite pins decisions; running things finds bugs.** Nearly every real
   defect in M5b and after was found by executing something, not by a test: the
   door bracketing hostnames as IPv6 (every proxied request would have failed),

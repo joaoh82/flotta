@@ -263,6 +263,9 @@ export default function App() {
   }, [boxes, watching]);
 
   const selectedBox = boxes.find((b) => b.name === selected) ?? null;
+  // Any agent on the fleet's model says what that model is. None may be —
+  // then the form says "the fleet's default" rather than inventing one.
+  const fleetModel = boxes.find((b) => b.model_source === "fleet")?.model ?? null;
   // A selected agent that has left the list. Not "nothing selected" — that
   // renders as the neutral "pick an agent", which is how a failed creation
   // used to disappear without ever saying so.
@@ -345,7 +348,7 @@ export default function App() {
                 screen where a person has no agent to fall back on. */}
             {!loading && !error && (
               <div className="w-72">
-                <NewAgent onCreated={created} />
+                <NewAgent onCreated={created} fleetModel={fleetModel} />
               </div>
             )}
           </div>
@@ -467,7 +470,7 @@ export default function App() {
                 </li>
               ))}
               </ul>
-              <NewAgent onCreated={created} />
+              <NewAgent onCreated={created} fleetModel={fleetModel} />
             </div>
 
             <div className="flex min-w-0 flex-1 flex-col">
