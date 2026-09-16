@@ -425,19 +425,21 @@ with a 403 naming the missing scope. Re-issue its identity:
 just box-identity eng-a          # re-mints the token, restarts the machine
 ```
 
-Then grant the colleagues — from the app (the agent's **Info** panel,
-**Colleagues**) or the CLI. Grants are **directed** — this lets eng-a ask
-eng-b, not the reverse:
+**Every agent may ask every other by default** (FLOTTA-65) — a new agent is
+on everyone's list as soon as it is running. Stop one agent asking another
+from the app (the agent's **Info** panel, **Colleagues**) or the CLI. Blocks
+are **one way**:
 
 ```bash
-uv run flotta peer grant eng-a eng-b
 uv run flotta peer list eng-a
+uv run flotta peer block eng-a eng-b     # eng-a may no longer ask eng-b
+uv run flotta peer allow eng-a eng-b
 ```
 
-Agents cannot grant themselves; `peer grant` needs `fleet:write`, which no box
-holds. There is no store-first path for these commands: the grant is
-meaningless without a control plane, because the control plane is what carries
-the message.
+Agents cannot change their own list; `block` and `allow` need `fleet:write`,
+which no box holds. There is no store-first path for these commands: the list
+means nothing without a control plane, because the control plane is what
+carries the message.
 
 > **`box:chat` must never end up on a box.** The front door checks a token's
 > scope and not its subject, so a box holding `box:chat` could reach every

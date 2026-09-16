@@ -984,67 +984,68 @@ pub struct Peer {
     pub description: Option<String>,
 }
 
-/// Same contract as `RepoList`: every peer endpoint answers with the whole
-/// list after the change, so the window shows what the fleet now says rather
-/// than patching what it showed before.
-#[derive(Debug, Clone, Deserialize)]
-struct PeerList {
+/// Who an agent may ask, and who it has been stopped from asking (M7).
+///
+/// **Everyone is a colleague by default** (FLOTTA-65); `blocked` is the list
+/// of exceptions. Every endpoint answers with both after a change, so the
+/// window shows what the fleet now says rather than patching what it showed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Colleagues {
     #[serde(default)]
-    peers: Vec<Peer>,
+    pub peers: Vec<Peer>,
+    #[serde(default)]
+    pub blocked: Vec<Peer>,
 }
 
-/// Which agents this agent may message.
-pub async fn list_peers(settings: &Settings, id: &str) -> Result<Vec<Peer>, FleetError> {
+/// Both lists for one agent.
+pub async fn colleagues(settings: &Settings, id: &str) -> Result<Colleagues, FleetError> {
     let body = get(
         settings,
         &format!("/api/boxes/{}/peers", encode_segment(id)),
     )
     .await?;
-    peers_from(&body)
+    colleagues_from(&body)
 }
 
-/// Let this agent message `peer`. **Directed**: it does not let `peer` message
-/// back, which is a separate grant made from the other agent's panel.
-pub async fn grant_peer(
+/// Stop this agent asking `peer`. **One way**: `peer` may still ask it.
+pub async fn block_peer(
     settings: &Settings,
     id: &str,
     peer: &str,
-) -> Result<Vec<Peer>, FleetError> {
+) -> Result<Colleagues, FleetError> {
     let body = send(
         settings,
         reqwest::Method::POST,
-        &format!("/api/boxes/{}/peers", encode_segment(id)),
+        &format!("/api/boxes/{}/peer-blocks", encode_segment(id)),
         Some(serde_json::json!({ "peer": peer })),
     )
     .await?;
-    peers_from(&body)
+    colleagues_from(&body)
 }
 
-/// Withdraw one. Takes effect on the next message, with no restart — the box
-/// never held a way to reach the other agent, only permission to ask.
-pub async fn revoke_peer(
+/// Lift a block. Takes effect on the next message, with no restart.
+pub async fn allow_peer(
     settings: &Settings,
     id: &str,
     peer: &str,
-) -> Result<Vec<Peer>, FleetError> {
+) -> Result<Colleagues, FleetError> {
     let body = send(
         settings,
         reqwest::Method::DELETE,
         &format!(
-            "/api/boxes/{}/peers/{}",
+            "/api/boxes/{}/peer-blocks/{}",
             encode_segment(id),
             encode_segment(peer)
         ),
         None,
     )
     .await?;
-    peers_from(&body)
+    colleagues_from(&body)
 }
 
-fn peers_from(body: &str) -> Result<Vec<Peer>, FleetError> {
-    let value: PeerList = serde_json::from_str(body)
-        .map_err(|e| FleetError::Unexpected(format!("unreadable list of colleagues: {e}")))?;
-    Ok(value.peers)
+fn colleagues_from(body: &str) -> Result<Colleagues, FleetError> {
+    serde_json::from_str(body)
+        .map_err(|e| FleetError::Unexpected(format!("unreadable list of colleagues: {e}")))
 }
 
 /// What was written to the agent's volume, and when.
@@ -1175,28 +1176,30 @@ mod tests {
     }
 
     #[test]
-    fn the_colleague_list_is_read_as_the_control_plane_sends_it() {
-        // Captured from `GET /api/boxes/eng-g/peers` on the live fleet,
-        // 2026-09-16, the day M7 shipped. A description can be absent, and an
-        // agent with none must still be listed rather than failing the parse
-        // for every colleague.
-        let body = r#"{"box_id":"b-79c6ca696e62","name":"eng-g","peers":[
-            {"id":"b-e0d678cb4684","name":"eng-r","display_name":"Reviewer - backend PRs",
-             "description":"Reviews backend pull requests"},
-            {"id":"b-1","name":"eng-d","display_name":null,"description":null}]}"#;
-        let peers = peers_from(body).expect("real response must parse");
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].name, "eng-r");
+    fn the_colleague_lists_are_read_as_the_control_plane_sends_them() {
+        // The shape of `GET /api/boxes/{id}/peers` since FLOTTA-65. A
+        // description can be absent, and an agent with none must still be
+        // listed rather than failing the parse for every colleague.
+        let body = r#"{"box_id":"b-79c6ca696e62","name":"eng-g",
+            "peers":[{"id":"b-e0d678cb4684","name":"eng-r","display_name":"Reviewer - backend PRs",
+                      "description":"Reviews backend pull requests"}],
+            "blocked":[{"id":"b-1","name":"eng-d","display_name":null,"description":null}]}"#;
+        let lists = colleagues_from(body).expect("real response must parse");
+        assert_eq!(lists.peers.len(), 1);
+        assert_eq!(lists.peers[0].name, "eng-r");
         assert_eq!(
-            peers[0].display_name.as_deref(),
+            lists.peers[0].display_name.as_deref(),
             Some("Reviewer - backend PRs")
         );
-        assert_eq!(peers[1].description, None);
+        assert_eq!(lists.blocked[0].name, "eng-d");
+        assert_eq!(lists.blocked[0].description, None);
     }
 
     #[test]
-    fn no_colleagues_is_an_empty_list_not_an_error() {
-        assert_eq!(peers_from(r#"{"peers":[]}"#).unwrap(), vec![]);
+    fn nothing_blocked_is_an_empty_list_not_an_error() {
+        // A control plane that omits `blocked` entirely is still readable.
+        let lists = colleagues_from(r#"{"peers":[]}"#).unwrap();
+        assert!(lists.peers.is_empty() && lists.blocked.is_empty());
     }
 
     #[test]

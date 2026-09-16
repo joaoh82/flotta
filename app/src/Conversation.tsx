@@ -1,13 +1,24 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { delegationOf } from "./colleagues";
 import { Markdown } from "./Markdown";
+import {
+  complete,
+  mentionAt,
+  segments,
+  suggest,
+  withNote,
+  withoutNote,
+  type MentionQuery,
+} from "./mentions";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   isFleetError,
   type AgentEvent,
   type ApprovalRequest,
+  type Colleagues,
   type Live,
+  type Peer,
   type Turn,
   type WorkStep,
 } from "./types";
@@ -53,6 +64,75 @@ export function Conversation({ boxName }: { boxName: string }) {
   // than returning success against a dead sender.
   const [attempt, setAttempt] = useState(0);
   const bottom = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  /**
+   * Who this agent may ask — what an `@` offers, and what a mention in a sent
+   * message is checked against. The control plane's list rather than the
+   * fleet's, so a blocked agent or one still being built is never suggested.
+   */
+  const [peers, setPeers] = useState<Peer[]>([]);
+  const [caret, setCaret] = useState(0);
+  /** Which suggestion the arrow keys are on. */
+  const [pick, setPick] = useState(0);
+  /** Escape closes the list until the mention being typed changes. */
+  const [dismissed, setDismissed] = useState<number | null>(null);
+
+  const loadPeers = useCallback(async () => {
+    try {
+      const lists = await invoke<Colleagues>("agent_colleagues", { id: boxName });
+      setPeers(lists.peers);
+    } catch {
+      // Mentions are a convenience. Without the list the message still sends;
+      // it just goes without a note, which is what it would have been anyway.
+    }
+  }, [boxName]);
+
+  useEffect(() => {
+    void loadPeers();
+  }, [loadPeers]);
+
+  const at: MentionQuery | null = mentionAt(draft, caret);
+  const open = at !== null && at.start !== dismissed;
+  const offered = open ? suggest(peers, at.query) : [];
+
+  // A new `@` refreshes the list, so an agent created a minute ago is offered.
+  const atStart = at?.start ?? null;
+  useEffect(() => {
+    if (atStart !== null) void loadPeers();
+    else setDismissed(null);
+    setPick(0);
+  }, [atStart, loadPeers]);
+
+  function choose(peer: Peer) {
+    if (!at) return;
+    const next = complete(draft, at, caret, peer.name);
+    setDraft(next.text);
+    setCaret(next.caret);
+    // After React has put the new value in, so the caret lands after the name.
+    requestAnimationFrame(() => {
+      input.current?.focus();
+      input.current?.setSelectionRange(next.caret, next.caret);
+    });
+  }
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (offered.length === 0) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      setPick((i) => (i + step + offered.length) % offered.length);
+    } else if (event.key === "Enter" || event.key === "Tab") {
+      // Choosing, not sending: an Enter with the list open that sent the
+      // message would send "@en" to the agent.
+      event.preventDefault();
+      choose(offered[Math.min(pick, offered.length - 1)]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      setDismissed(at?.start ?? null);
+    }
+  }
+
+  const peerNames = new Set(peers.map((p) => p.name));
 
   // Keyed by box so switching agents starts a clean transcript rather than
   // showing one agent's words under another's name.
@@ -144,11 +224,15 @@ export function Conversation({ boxName }: { boxName: string }) {
     const text = draft.trim();
     if (!text || busy) return;
     setDraft("");
+    setCaret(0);
+    setDismissed(null);
     setLive(NOTHING_LIVE);
     setTurns((t) => [...t, { from: "you", text }]);
     setStatus("thinking");
     try {
-      await invoke("send_prompt", { boxName, text });
+      // The agent gets a note about anyone mentioned; the transcript shows
+      // what was typed. See `mentions.ts`.
+      await invoke("send_prompt", { boxName, text: withNote(text, peers) });
     } catch (err) {
       setStatus("failed");
       setTurns((t) => [...t, { from: "system", text: String(err) }]);
@@ -185,7 +269,13 @@ export function Conversation({ boxName }: { boxName: string }) {
                       : "whitespace-pre-wrap text-neutral-900"
                   }
                 >
-                  {turn.text}
+                  {turn.from === "you" ? (
+                    // Without the note: a resumed conversation's history comes
+                    // back from Hermes with it still attached.
+                    <Mentioned text={withoutNote(turn.text)} names={peerNames} />
+                  ) : (
+                    turn.text
+                  )}
                 </div>
               )}
             </div>
@@ -279,12 +369,49 @@ export function Conversation({ boxName }: { boxName: string }) {
         <div ref={bottom} />
       </div>
 
-      <form onSubmit={send} className="border-t border-neutral-200 p-3">
+      <form onSubmit={send} className="relative border-t border-neutral-200 p-3">
+        {offered.length > 0 && (
+          <ul
+            role="listbox"
+            className="absolute bottom-full left-3 z-20 mb-1 w-80 overflow-hidden rounded border border-neutral-200 bg-white py-1 shadow-lg"
+          >
+            {offered.map((peer, i) => (
+              <li key={peer.id} role="option" aria-selected={i === pick}>
+                <button
+                  type="button"
+                  // mousedown, not click: a click blurs the input first, and
+                  // the caret it was tracking goes with it.
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    choose(peer);
+                  }}
+                  onMouseEnter={() => setPick(i)}
+                  className={`block w-full px-3 py-1.5 text-left ${
+                    i === pick ? "bg-neutral-100" : ""
+                  }`}
+                >
+                  <span className="font-mono text-xs text-violet-700">@{peer.name}</span>
+                  {(peer.display_name || peer.description) && (
+                    <span className="ml-2 truncate text-[11px] text-neutral-500">
+                      {peer.display_name ?? peer.description}
+                    </span>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="flex gap-2">
           <input
+            ref={input}
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder={busy ? "…" : `Message ${boxName}`}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setCaret(e.target.selectionStart ?? e.target.value.length);
+            }}
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+            onKeyDown={onKeyDown}
+            placeholder={busy ? "…" : `Message ${boxName} — @ to mention another agent`}
             disabled={busy}
             className="flex-1 rounded border border-neutral-300 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none disabled:bg-neutral-50"
           />
@@ -308,6 +435,23 @@ export function Conversation({ boxName }: { boxName: string }) {
  * closed socket nothing will ever finish it, and a spinner there would claim
  * work that is not happening.
  */
+/** A person's message with the colleagues it names picked out. */
+function Mentioned({ text, names }: { text: string; names: Set<string> }) {
+  return (
+    <>
+      {segments(text, names).map((part, i) =>
+        part.mention ? (
+          <span key={i} className="rounded bg-violet-50 px-0.5 font-medium text-violet-700">
+            {part.text}
+          </span>
+        ) : (
+          <span key={i}>{part.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 /**
  * What a step did, in words.
  *

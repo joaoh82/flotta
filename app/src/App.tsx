@@ -494,7 +494,6 @@ export default function App() {
                   // while the list polls does not keep showing the status the
                   // agent had when it was opened.
                   box={boxes.find((b) => b.id === info.id) ?? info}
-                  fleet={boxes}
                   onClose={() => setInfo(null)}
                   onChanged={(updated) =>
                     setBoxes((rows) => rows.map((r) => (r.id === updated.id ? updated : r)))

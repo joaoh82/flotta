@@ -381,30 +381,33 @@ async fn revoke_repo(
     fleet::revoke_repo(&read_settings(&app), &id, &repo).await
 }
 
-/// Which agents this agent may message (M7).
+/// Who this agent may ask, and who it has been stopped from asking (M7).
 #[tauri::command]
-async fn agent_peers(app: tauri::AppHandle, id: String) -> Result<Vec<fleet::Peer>, FleetError> {
-    fleet::list_peers(&read_settings(&app), &id).await
+async fn agent_colleagues(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<fleet::Colleagues, FleetError> {
+    fleet::colleagues(&read_settings(&app), &id).await
 }
 
-/// Let this agent message another. One direction only.
+/// Stop this agent asking one other. One way.
 #[tauri::command]
-async fn grant_peer(
+async fn block_peer(
     app: tauri::AppHandle,
     id: String,
     peer: String,
-) -> Result<Vec<fleet::Peer>, FleetError> {
-    fleet::grant_peer(&read_settings(&app), &id, &peer).await
+) -> Result<fleet::Colleagues, FleetError> {
+    fleet::block_peer(&read_settings(&app), &id, &peer).await
 }
 
-/// Withdraw one. Takes effect on the next message.
+/// Lift a block. Takes effect on the next message.
 #[tauri::command]
-async fn revoke_peer(
+async fn allow_peer(
     app: tauri::AppHandle,
     id: String,
     peer: String,
-) -> Result<Vec<fleet::Peer>, FleetError> {
-    fleet::revoke_peer(&read_settings(&app), &id, &peer).await
+) -> Result<fleet::Colleagues, FleetError> {
+    fleet::allow_peer(&read_settings(&app), &id, &peer).await
 }
 
 /// Rewrite an agent's standing instructions, then start its conversation over
@@ -511,9 +514,9 @@ pub fn run() {
             agent_repos,
             grant_repo,
             revoke_repo,
-            agent_peers,
-            grant_peer,
-            revoke_peer,
+            agent_colleagues,
+            block_peer,
+            allow_peer,
             set_instructions,
             reset_conversation,
             close_conversation,

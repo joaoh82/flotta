@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { exchangesIn, grantable, peerLabel, type Exchange } from "./colleagues";
+import { exchangesIn, peerLabel, type Exchange } from "./colleagues";
 import { POLL_MS } from "./poll";
-import { isFleetError, type BoxEvent, type BoxRow, type Peer } from "./types";
+import { isFleetError, type BoxEvent, type Colleagues, type Peer } from "./types";
 
 /**
  * Which agents this one may ask, and what they have said to each other (M7).
+ *
+ * **Everyone, unless blocked** (FLOTTA-65). FLOTTA-54 made this a list you
+ * added to, and a new agent was nobody's colleague until someone went round
+ * every panel. Now the list is the fleet, and the control here is Block.
  *
  * **Named "Colleagues" because the agents are told to look for it.** A refusal
  * from the control plane and the skill on every box both send the person to
@@ -19,28 +23,20 @@ import { isFleetError, type BoxEvent, type BoxRow, type Peer } from "./types";
  * question is not part of the thread a person was having with it. So this is
  * the only place eng-r's side of an exchange is visible at all.
  */
-export function AgentColleagues({
-  boxId,
-  boxName,
-  fleet,
-}: {
-  boxId: string;
-  boxName: string;
-  fleet: BoxRow[];
-}) {
-  const [peers, setPeers] = useState<Peer[] | null>(null);
-  const [choice, setChoice] = useState("");
-  const [busy, setBusy] = useState(false);
+export function AgentColleagues({ boxId, boxName }: { boxId: string; boxName: string }) {
+  const [lists, setLists] = useState<Colleagues | null>(null);
+  /** Which row's button is in flight, so only that one greys out. */
+  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [exchanges, setExchanges] = useState<Exchange[] | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setPeers(await invoke<Peer[]>("agent_peers", { id: boxId }));
+      setLists(await invoke<Colleagues>("agent_colleagues", { id: boxId }));
       setError(null);
     } catch (e) {
       // Unknown is not "none": the same rule as the repository list.
-      setPeers(null);
+      setLists(null);
       setError(isFleetError(e) ? e.detail : String(e));
     }
   }, [boxId]);
@@ -71,88 +67,56 @@ export function AgentColleagues({
     };
   }, [boxId]);
 
-  async function change(command: "grant_peer" | "revoke_peer", peer: string) {
-    setBusy(true);
+  async function change(command: "block_peer" | "allow_peer", peer: string) {
+    setBusy(peer);
     setError(null);
     try {
-      setPeers(await invoke<Peer[]>(command, { id: boxId, peer }));
-      if (command === "grant_peer") setChoice("");
+      setLists(await invoke<Colleagues>(command, { id: boxId, peer }));
     } catch (e) {
       setError(isFleetError(e) ? e.detail : String(e));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
-
-  const offered = peers ? grantable(fleet, boxId, peers) : [];
 
   return (
     <section>
       <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">Colleagues</h3>
 
-      {peers === null && !error && (
+      {lists === null && !error && (
         <p className="mt-1.5 text-[11px] text-neutral-500">Loading…</p>
       )}
 
-      {peers !== null && peers.length === 0 && (
+      {lists !== null && lists.peers.length === 0 && (
         <p className="mt-1.5 text-[11px] text-neutral-500">
-          None yet. {boxName} cannot ask any other agent for help.
+          {lists.blocked.length === 0
+            ? `No other agents yet. Every agent you create can be asked by ${boxName}.`
+            : `${boxName} is blocked from asking every other agent.`}
         </p>
       )}
 
-      {peers !== null && peers.length > 0 && (
-        <ul className="mt-1.5 divide-y divide-neutral-100 rounded border border-neutral-200">
-          {peers.map((peer) => (
-            <li key={peer.id} className="flex items-center justify-between gap-3 px-2.5 py-1.5">
-              <div className="min-w-0">
-                <div className="truncate text-[12px] text-neutral-800">{peerLabel(peer)}</div>
-                {peer.description && (
-                  <div className="truncate text-[11px] text-neutral-500">{peer.description}</div>
-                )}
-              </div>
-              <button
-                onClick={() => void change("revoke_peer", peer.id)}
-                disabled={busy}
-                className="shrink-0 text-[11px] text-neutral-500 hover:text-red-700 disabled:opacity-40"
-              >
-                Revoke
-              </button>
-            </li>
-          ))}
-        </ul>
+      {lists !== null && lists.peers.length > 0 && (
+        <PeerList
+          peers={lists.peers}
+          action="Block"
+          danger
+          busy={busy}
+          onAction={(peer) => void change("block_peer", peer.id)}
+        />
       )}
 
-      {peers !== null && (
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (choice && !busy) void change("grant_peer", choice);
-          }}
-          className="mt-2 flex gap-2"
-        >
-          <select
-            value={choice}
-            onChange={(e) => setChoice(e.target.value)}
-            disabled={offered.length === 0}
-            className="flex-1 rounded border border-neutral-300 bg-white px-2 py-1.5 text-[12px] focus:border-neutral-500 focus:outline-none disabled:text-neutral-400"
-          >
-            <option value="">
-              {offered.length === 0 ? "No other agents to add" : "Choose an agent…"}
-            </option>
-            {offered.map((box) => (
-              <option key={box.id} value={box.id}>
-                {peerLabel(box)}
-              </option>
-            ))}
-          </select>
-          <button
-            type="submit"
-            disabled={busy || choice === ""}
-            className="rounded bg-neutral-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40"
-          >
-            Let it ask
-          </button>
-        </form>
+      {lists !== null && lists.blocked.length > 0 && (
+        <>
+          <h4 className="mt-3 text-[11px] uppercase tracking-wide text-neutral-400">
+            Blocked — {boxName} may not ask
+          </h4>
+          <PeerList
+            peers={lists.blocked}
+            action="Allow"
+            busy={busy}
+            onAction={(peer) => void change("allow_peer", peer.id)}
+          />
+        </>
       )}
 
       {error && <p className="mt-1 text-[11px] text-red-700">{error}</p>}
@@ -160,10 +124,12 @@ export function AgentColleagues({
       {/* The two limits a person will otherwise discover by surprise: grants
           are one-way, and there is a brake. */}
       <p className="mt-2 text-[11px] leading-relaxed text-neutral-400">
-        {boxName} can send these agents a question and gets their reply back.
-        It is one way: for them to ask {boxName}, add it from their own panel.
-        Flotta carries every message and stops loops and runaway back-and-forth
-        on its own. {boxName} cannot add colleagues itself.
+        {boxName} can ask any agent on this fleet and gets the reply back —
+        including agents created later. Blocking is one way: it stops {boxName}
+        asking that agent, not the other way round. Flotta carries every
+        message and stops loops and runaway back-and-forth on its own.{" "}
+        {boxName} cannot change this list itself. Mention an agent with @ in a
+        chat to suggest asking it.
       </p>
 
       {exchanges !== null && exchanges.length > 0 && (
@@ -179,6 +145,44 @@ export function AgentColleagues({
         </>
       )}
     </section>
+  );
+}
+
+function PeerList({
+  peers,
+  action,
+  danger,
+  busy,
+  onAction,
+}: {
+  peers: Peer[];
+  action: string;
+  danger?: boolean;
+  busy: string | null;
+  onAction: (peer: Peer) => void;
+}) {
+  return (
+    <ul className="mt-1.5 divide-y divide-neutral-100 rounded border border-neutral-200">
+      {peers.map((peer) => (
+        <li key={peer.id} className="flex items-center justify-between gap-3 px-2.5 py-1.5">
+          <div className="min-w-0">
+            <div className="truncate text-[12px] text-neutral-800">{peerLabel(peer)}</div>
+            {peer.description && (
+              <div className="truncate text-[11px] text-neutral-500">{peer.description}</div>
+            )}
+          </div>
+          <button
+            onClick={() => onAction(peer)}
+            disabled={busy !== null}
+            className={`shrink-0 text-[11px] text-neutral-500 disabled:opacity-40 ${
+              danger ? "hover:text-red-700" : "hover:text-neutral-900"
+            }`}
+          >
+            {busy === peer.id ? "…" : action}
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 

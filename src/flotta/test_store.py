@@ -948,71 +948,99 @@ def test_the_meta_table_appears_on_a_store_that_predates_it(tmp_path):
         assert store.meta_for_box("b-old").display_name == "Survivor"
 
 
-# -- peer grants (M7, FLOTTA-54) --------------------------------------------
+# -- colleagues (M7: FLOTTA-54, default-allow since FLOTTA-65) ---------------
 
 
-def test_an_agent_may_message_one_it_was_granted(store, box):
-    other = store.create_box("eng-c")
-    store.grant_peer(box.id, other.id)
-    assert store.peers_for_box(box.id) == [other.id]
-    assert store.may_message(box.id, other.id)
+def _live(store, name):
+    box = store.create_box(name)
+    store.update_box_status(box.id, "running", endpoint=f"fly://app/{name}")
+    return box
 
 
-def test_a_grant_is_one_way(store, box):
-    """Directed on purpose. A triage agent that may ask the specialist is not
-    a specialist that may interrupt triage."""
-    other = store.create_box("eng-c")
-    store.grant_peer(box.id, other.id)
-    assert not store.may_message(other.id, box.id)
-    assert store.peers_for_box(other.id) == []
+def test_every_agent_may_ask_every_other_with_nothing_granted(store):
+    """FLOTTA-65: the allowlist made a new agent nobody's colleague until
+    someone granted it to each of the others by hand."""
+    a, b, c = _live(store, "eng-a"), _live(store, "eng-b"), _live(store, "eng-c")
+    assert store.peers_for_box(a.id) == [b.id, c.id]
+    assert store.may_message(c.id, a.id)
 
 
-def test_granting_twice_is_one_grant(store, box):
-    other = store.create_box("eng-c")
-    store.grant_peer(box.id, other.id)
-    store.grant_peer(box.id, other.id)
-    assert store.peers_for_box(box.id) == [other.id]
+def test_a_new_agent_is_everyones_colleague_the_moment_it_can_answer(store):
+    a = _live(store, "eng-a")
+    new = store.create_box("eng-new")
+    # Still being built: no machine to answer, so not offered yet.
+    assert new.id not in store.peers_for_box(a.id)
+    store.update_box_status(new.id, "running", endpoint="fly://app/new")
+    assert store.peers_for_box(a.id) == [new.id]
 
 
-def test_an_agent_cannot_be_its_own_colleague(store, box):
-    """Nothing good is downstream of it, and the relay's cycle check would
-    refuse the message anyway — better to refuse the grant that looks valid in
-    the app for as long as nobody uses it."""
+def test_a_sleeping_agent_is_still_a_colleague(store):
+    """The door wakes it. Most of the fleet is asleep most of the time."""
+    a, b = _live(store, "eng-a"), _live(store, "eng-b")
+    store.update_box_status(b.id, "stopped")
+    assert store.may_message(a.id, b.id)
+
+
+def test_an_agent_is_not_its_own_colleague(store):
+    a = _live(store, "eng-a")
+    assert store.peers_for_box(a.id) == []
+    assert not store.may_message(a.id, a.id)
     with pytest.raises(ValueError, match="itself"):
-        store.grant_peer(box.id, box.id)
+        store.block_peer(a.id, a.id)
 
 
-def test_a_grant_naming_an_agent_that_does_not_exist_is_refused(store, box):
-    """Otherwise the typo sits in the table looking authoritative until
-    somebody tries to use it."""
+def test_a_block_stops_one_direction_only(store):
+    a, b = _live(store, "eng-a"), _live(store, "eng-b")
+    assert store.block_peer(a.id, b.id) is True
+    assert not store.may_message(a.id, b.id)
+    assert store.blocked_peers_for_box(a.id) == [b.id]
+    assert store.may_message(b.id, a.id)
+
+
+def test_blocking_twice_is_one_block(store):
+    a, b = _live(store, "eng-a"), _live(store, "eng-b")
+    store.block_peer(a.id, b.id)
+    assert store.block_peer(a.id, b.id) is False
+    assert store.blocked_peers_for_box(a.id) == [b.id]
+
+
+def test_allowing_says_whether_there_was_a_block(store):
+    a, b = _live(store, "eng-a"), _live(store, "eng-b")
+    store.block_peer(a.id, b.id)
+    assert store.allow_peer(a.id, b.id) is True
+    assert store.allow_peer(a.id, b.id) is False
+    assert store.may_message(a.id, b.id)
+
+
+def test_a_block_naming_an_agent_that_does_not_exist_is_refused(store):
+    a = _live(store, "eng-a")
     with pytest.raises(UnknownEntityError):
-        store.grant_peer(box.id, "nope")
+        store.block_peer(a.id, "nope")
 
 
-def test_revoking_says_whether_there_was_a_grant(store, box):
-    other = store.create_box("eng-c")
-    store.grant_peer(box.id, other.id)
-    assert store.revoke_peer(box.id, other.id) is True
-    assert store.revoke_peer(box.id, other.id) is False
-    assert not store.may_message(box.id, other.id)
+def test_a_destroyed_agent_is_on_neither_list(store):
+    """A block outlives the machine; neither list should name a ghost — and
+    the name can be reused (FLOTTA-30), which is why blocks are by id."""
+    a, b = _live(store, "eng-a"), _live(store, "eng-b")
+    store.block_peer(a.id, b.id)
+    store.update_box_status(b.id, "torn_down")
+    assert store.peers_for_box(a.id) == []
+    assert store.blocked_peers_for_box(a.id) == []
 
 
-def test_a_destroyed_agent_drops_off_the_roster(store, box):
-    """The grant outlives the machine, but an agent that no longer exists is
-    not somebody to be told about — and its name can be reused (FLOTTA-30),
-    so naming it would eventually mean somebody else."""
-    other = store.create_box("eng-c")
-    store.grant_peer(box.id, other.id)
-    store.update_box_status(other.id, "torn_down")
-    assert store.peers_for_box(box.id) == []
-    assert not store.may_message(box.id, other.id)
+def test_a_reused_name_is_not_blocked_by_its_predecessors_block(store):
+    a, old = _live(store, "eng-a"), _live(store, "eng-b")
+    store.block_peer(a.id, old.id)
+    store.update_box_status(old.id, "torn_down")
+    store.release_name(old.id)
+    new = _live(store, "eng-b")
+    assert store.may_message(a.id, new.id)
 
 
-def test_the_roster_is_ordered_by_name_not_by_when_it_was_granted(store, box):
-    """The app and the agent both read this as a list of colleagues; grant
-    order is not a thing either of them knows about."""
-    late = store.create_box("eng-a")
-    early = store.create_box("eng-z")
-    store.grant_peer(box.id, early.id)
-    store.grant_peer(box.id, late.id)
-    assert store.peers_for_box(box.id) == [late.id, early.id]
+def test_both_lists_are_ordered_by_name(store):
+    a = _live(store, "eng-a")
+    z, m, c = _live(store, "eng-z"), _live(store, "eng-m"), _live(store, "eng-c")
+    assert store.peers_for_box(a.id) == [c.id, m.id, z.id]
+    store.block_peer(a.id, z.id)
+    store.block_peer(a.id, c.id)
+    assert store.blocked_peers_for_box(a.id) == [c.id, z.id]

@@ -38,13 +38,10 @@ import {
  */
 export function AgentInfo({
   box,
-  fleet,
   onClose,
   onChanged,
 }: {
   box: BoxRow;
-  /** Every agent, so a colleague can be picked from the ones that exist. */
-  fleet: BoxRow[];
   onClose: () => void;
   /** The list holds the row; a rename has to reach it or the sidebar lies. */
   onChanged: (box: BoxRow) => void;
@@ -455,7 +452,7 @@ export function AgentInfo({
             agent's grants under another's name. */}
         <AgentRepos key={box.id} boxId={box.id} />
 
-        <AgentColleagues key={`peers-${box.id}`} boxId={box.id} boxName={box.name} fleet={fleet} />
+        <AgentColleagues key={`peers-${box.id}`} boxId={box.id} boxName={box.name} />
 
         {/* Always rendered, including when there are none: an agent with no
             standing instructions is the case you most want to be able to fix,

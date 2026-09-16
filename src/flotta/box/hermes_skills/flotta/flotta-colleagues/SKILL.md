@@ -23,7 +23,7 @@ flotta-ask --list
 ```
 
 It prints the agents you may message, with what each one is for. The list is
-live: a grant made a moment ago is already there. `--json` for the same list as
+live: an agent created a moment ago is already there. `--json` for the same list as
 JSON.
 
 ## Asking
@@ -51,6 +51,13 @@ Do not ask a colleague to do something you can do yourself, and do not relay a
 question you were asked without adding what you already know. If you were asked
 to check with someone, do it once and report what they said.
 
+## When the person names an agent
+
+A person may write `@eng-g` in their message. That is another agent on this
+fleet. If they suggest it can help, ask it with `flotta-ask eng-g "…"` —
+putting everything it needs in the question — and tell the person what it
+said. The name after `@` is exactly what you type after `flotta-ask`.
+
 ## Answering a colleague
 
 A message that starts with another agent's name means one of them is asking
@@ -60,10 +67,13 @@ answer.
 
 ## Limits, so you are not surprised
 
-- **You can only message agents you have been granted.** You cannot grant
-  yourself. If the agent you need is not in `flotta-ask --list`, say so to the
-  person you are working with — they add it in the Flotta app, under this
-  agent's **Info** panel, **Colleagues**.
+- **You can ask any agent on this fleet** unless a person has stopped you
+  asking that one. `flotta-ask --list` shows who you can ask right now. If the
+  agent you need is not there, say so to the person you are working with —
+  they can change it in the Flotta app, under this agent's **Info** panel,
+  **Colleagues**. You cannot change it yourself.
+- **An agent that is still being set up cannot answer yet.** Try again in a
+  few minutes, or answer without them.
 - **A question can only be passed along so far.** If you were asked something
   by another agent and you ask a third, that is as far as it goes. When you are
   refused for this reason, answer with what you have rather than finding

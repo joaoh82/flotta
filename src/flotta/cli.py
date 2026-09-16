@@ -1483,11 +1483,11 @@ def repo_list(
         )
 
 
-# -- peer grants (M7) -------------------------------------------------------
+# -- colleagues (M7) -------------------------------------------------------
 
 peer_app = typer.Typer(
     name="peer",
-    help="Which agents an agent may message.",
+    help="Which agents an agent may ask. Everyone, unless you block one.",
     no_args_is_help=True,
 )
 app.add_typer(peer_app)
@@ -1503,24 +1503,9 @@ def _peer_lines(peers: list[dict[str, Any]]) -> str:
     return "\n".join(one(p) for p in peers) or "  (none)"
 
 
-@peer_app.command("grant")
-def peer_grant(
-    box_id: str = typer.Argument(..., help="Box name or id — the one doing the asking"),
-    peer: str = typer.Argument(..., help="Box name or id it may message"),
-    as_json: bool = JsonOpt,
-) -> None:
-    """Let one agent message another.
-
-    **Directed**: granting `eng-a eng-b` lets eng-a ask eng-b, not the other
-    way round. Two agents that should interrupt each other freely are two
-    grants, said out loud.
-
-    Through the control plane only — unlike `repo grant`, there is no
-    store-first path. The grant is meaningless without a control plane to
-    enforce it, since the control plane is what carries the message.
-    """
-    from flotta.auth import SCOPE_FLEET_WRITE
-
+def _needs_control_plane() -> None:
+    # No store-first path: the list means nothing without the control plane
+    # that carries the messages and enforces it.
     if not control_url():
         raise _fail(
             ControlPlaneError(
@@ -1529,48 +1514,61 @@ def peer_grant(
             ),
             code=2,
         )
-    try:
-        box = _remote_box(box_id)
-        other = _remote_box(peer)
-        body = control_request(
-            "POST",
-            f"/api/boxes/{box['id']}/peers",
-            scopes=(SCOPE_FLEET_WRITE,),
-            body={"peer": other["id"]},
-        )
-    except ControlPlaneError as exc:
-        raise _fail(exc) from exc
-    emit(
-        {"box_id": box["id"], "name": box["name"], "peers": body["peers"]},
-        f"{box['name']} may now message {other['name']}",
-        as_json=as_json,
-    )
 
 
-@peer_app.command("revoke")
-def peer_revoke(
-    box_id: str = typer.Argument(..., help="Box name or id"),
-    peer: str = typer.Argument(..., help="Box name or id it may no longer message"),
+def _colleagues_text(body: dict[str, Any]) -> str:
+    text = "may ask:\n" + _peer_lines(body["peers"])
+    if body.get("blocked"):
+        text += "\nblocked:\n" + _peer_lines(body["blocked"])
+    return text
+
+
+@peer_app.command("block")
+def peer_block(
+    box_id: str = typer.Argument(..., help="Box name or id — the one that would ask"),
+    peer: str = typer.Argument(..., help="Box name or id it may no longer ask"),
     as_json: bool = JsonOpt,
 ) -> None:
-    """Withdraw a grant. Takes effect on the next message, with no restart."""
+    """Stop one agent asking another.
+
+    Every agent may ask every other by default. This is the exception, and it
+    is **one way**: `block eng-a eng-b` stops eng-a asking eng-b and nothing
+    else. Takes effect on the next message, with no restart.
+    """
     from flotta.auth import SCOPE_FLEET_WRITE
 
-    if not control_url():
-        raise _fail(ControlPlaneError("this needs $FLOTTA_CONTROL_URL set."), code=2)
+    _needs_control_plane()
     try:
         box = _remote_box(box_id)
         body = control_request(
-            "DELETE", f"/api/boxes/{box['id']}/peers/{peer}", scopes=(SCOPE_FLEET_WRITE,)
+            "POST",
+            f"/api/boxes/{box['id']}/peer-blocks",
+            scopes=(SCOPE_FLEET_WRITE,),
+            body={"peer": peer},
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
-    emit(
-        {"box_id": box["id"], "revoked": body["revoked"], "peers": body["peers"]},
-        f"{box['name']} {'may no longer message' if body['revoked'] else 'was not messaging'} "
-        f"{peer}",
-        as_json=as_json,
-    )
+    emit(body, f"{box['name']} may no longer ask {peer}", as_json=as_json)
+
+
+@peer_app.command("allow")
+def peer_allow(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    peer: str = typer.Argument(..., help="Box name or id it may ask again"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Lift a block. Takes effect on the next message."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    _needs_control_plane()
+    try:
+        box = _remote_box(box_id)
+        body = control_request(
+            "DELETE", f"/api/boxes/{box['id']}/peer-blocks/{peer}", scopes=(SCOPE_FLEET_WRITE,)
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    emit(body, f"{box['name']} may ask {peer} again", as_json=as_json)
 
 
 @peer_app.command("list")
@@ -1578,21 +1576,16 @@ def peer_list(
     box_id: str = typer.Argument(..., help="Box name or id"),
     as_json: bool = JsonOpt,
 ) -> None:
-    """Every agent this agent may message."""
+    """Who this agent may ask, and who it has been stopped from asking."""
     from flotta.auth import SCOPE_FLEET_READ
 
-    if not control_url():
-        raise _fail(ControlPlaneError("this needs $FLOTTA_CONTROL_URL set."), code=2)
+    _needs_control_plane()
     try:
         box = _remote_box(box_id)
         body = control_request("GET", f"/api/boxes/{box['id']}/peers", scopes=(SCOPE_FLEET_READ,))
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
-    emit(
-        {"box_id": box["id"], "name": box["name"], "peers": body["peers"]},
-        _peer_lines(body["peers"]),
-        as_json=as_json,
-    )
+    emit(body, _colleagues_text(body), as_json=as_json)
 
 
 # -- tokens (M5) ------------------------------------------------------------

@@ -178,15 +178,19 @@ same clone succeed, and revoking makes the next one fail again.
 
 ## Colleagues: agents asking each other (M7)
 
-An agent's **Info** panel has a **Colleagues** section: the agents it may ask
-for help, a picker to add one, and the recent conversations between them.
+**Every agent may ask every other agent** (FLOTTA-65). A new agent is on
+everyone's list the moment it is running; nothing has to be granted.
 
-- **One way.** Adding eng-r to eng-g's colleagues lets eng-g ask eng-r. For
-  eng-r to ask eng-g, add it from eng-r's panel.
+An agent's **Info** panel has a **Colleagues** section: everyone it may ask,
+each with **Block**, the agents it has been blocked from asking, each with
+**Allow**, and the recent conversations between them.
+
+- **Blocks are one way.** Blocking eng-g in eng-r's panel stops eng-r asking
+  eng-g; eng-g may still ask eng-r.
 - **The agent never holds a way to reach another agent.** It runs
   `flotta-ask`, which asks the control plane to carry the message; the control
-  plane checks the grant, wakes the other agent and brings the reply back. An
-  agent cannot add colleagues itself.
+  plane checks the list, wakes the other agent and brings the reply back. An
+  agent cannot change its own list.
 - **Flotta stops loops and runaways.** A question cannot come back to an agent
   already in the chain, cannot be passed along more than three times, and one
   agent's questions are capped over a few minutes. A stopped message shows up
@@ -201,6 +205,23 @@ question instead of the terminal command (`colleagues.ts`'s `delegationOf`).
 The answering agent holds the question in a **separate session**, so it never
 appears in the transcript a person has with it — *Recent conversations* is the
 only place eng-r's side is visible.
+
+### `@` in a chat
+
+Typing `@` in any agent's chat offers its colleagues — by address, or by what
+they are called (`@rev` finds the reviewer). The list is the control plane's,
+so a blocked agent or one still being built is never offered.
+
+`@eng-g` means nothing to a model on its own, so a message that names
+colleagues is sent with a short **Flotta note** after it: who each one is, and
+the `flotta-ask` command. The note says nothing about *whether* to ask — the
+person's words do that.
+
+**The note is hidden wherever a person's message is shown**, not only when it
+is sent: a resumed conversation's history comes back from Hermes with the note
+still attached (`mentions.ts`'s `withoutNote`). Anything from the note's
+opening marker to the end of a message is hidden, which is why the marker is
+one nobody types.
 
 ## Info: the store's belief, and the substrate's answer
 

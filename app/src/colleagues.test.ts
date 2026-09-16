@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import fixture from "../src-tauri/tests/peer_timelines.json";
-import { delegationOf, exchangesIn, grantable, peerLabel } from "./colleagues";
-import type { BoxEvent, BoxRow } from "./types";
+import { delegationOf, exchangesIn, peerLabel } from "./colleagues";
+import type { BoxEvent } from "./types";
 
 /**
  * The first real agent-to-agent exchanges, captured off the live fleet the
@@ -175,26 +175,8 @@ describe("reading a step as a colleague being asked", () => {
   });
 });
 
-describe("granting", () => {
-  const fleet: BoxRow[] = [
-    { id: "b-g", name: "eng-g", status: "stopped" },
-    { id: "b-r", name: "eng-r", status: "running" },
-    { id: "b-d", name: "eng-d", status: "stopped" },
-    { id: "b-n", name: "eng-new", status: "provisioning" },
-  ];
-
-  it("offers every other agent not already granted, by name", () => {
-    const offered = grantable(fleet, "b-g", [{ id: "b-r", name: "eng-r" }]);
-    expect(offered.map((b) => b.name)).toEqual(["eng-d"]);
-  });
-
-  it("never offers the agent itself, or one that is still being built", () => {
-    const offered = grantable(fleet, "b-g", []).map((b) => b.name);
-    expect(offered).not.toContain("eng-g");
-    expect(offered).not.toContain("eng-new");
-  });
-
-  it("labels a colleague by what it is for, with the address it answers to", () => {
+describe("labels", () => {
+  it("names a colleague by what it is for, with the address it answers to", () => {
     expect(peerLabel({ name: "eng-r", display_name: "Reviewer" })).toBe("Reviewer (eng-r)");
     expect(peerLabel({ name: "eng-d", display_name: null })).toBe("eng-d");
   });

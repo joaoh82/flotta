@@ -190,23 +190,27 @@ CREATE TABLE IF NOT EXISTS box_repos (
     PRIMARY KEY (box_id, repo)
 );
 
--- Which agents an agent may talk to (M7). The same shape as `box_repos` and
--- for the same reasons: a side table arrives on an existing fleet by itself,
--- and a grant is revocable without restarting anything.
+-- Which agents an agent may NOT ask (M7, FLOTTA-65).
 --
--- **Directed on purpose.** A grant is "A may message B", not "A and B are
--- colleagues". A triage agent that may ask the specialist is not the same as
--- a specialist that may interrupt triage, and collapsing the two would make
--- every grant two grants.
+-- **Every agent may ask every other agent unless a person says otherwise.**
+-- FLOTTA-54 shipped the opposite — an allowlist, `box_peers` — and using it
+-- showed the cost: a new agent was nobody's colleague until someone granted it
+-- to each of the others by hand. So the table records the exceptions, and a
+-- newly created agent is everyone's colleague with nothing written anywhere.
 --
--- The peer is stored as an **id**, unlike `box_repos` which stores a slug: a
--- name is an address and an address can be released and reused once its box
--- is destroyed (FLOTTA-30), so a grant recorded by name could silently come
--- to mean a different agent. The id cannot be recycled.
-CREATE TABLE IF NOT EXISTS box_peers (
+-- `box_peers` may still exist on a fleet that ran FLOTTA-54. Nothing reads it;
+-- there is no migration path to drop it, and an unused table is harmless.
+--
+-- **Directed on purpose.** "eng-r may not ask eng-g" says nothing about
+-- whether eng-g may ask eng-r.
+--
+-- The peer is stored as an **id**, not a name: a name is an address, and an
+-- address can be released and reused once its box is destroyed (FLOTTA-30),
+-- so a block recorded by name could silently come to apply to a stranger.
+CREATE TABLE IF NOT EXISTS box_peer_blocks (
     box_id      TEXT NOT NULL REFERENCES boxes(id),
     peer_id     TEXT NOT NULL REFERENCES boxes(id),
-    granted_at  TEXT NOT NULL,
+    blocked_at  TEXT NOT NULL,
     PRIMARY KEY (box_id, peer_id)
 );
 
@@ -1091,50 +1095,69 @@ class FleetStore:
         """
         return normalise_repo(repo) in self.repos_for_box(box_id)
 
-    # -- peer grants ---------------------------------------------------
+    # -- colleagues ------------------------------------------------------
 
-    def grant_peer(self, box_id: str, peer_id: str) -> None:
-        """Let a box message another agent. Idempotent, and directed.
+    def block_peer(self, box_id: str, peer_id: str) -> bool:
+        """Stop a box asking one agent. Idempotent, directed.
 
-        Both ids are checked to exist: a grant naming a box that was never
-        created is a typo that would otherwise sit in the table looking
-        authoritative until someone tried to use it.
+        Returns whether this changed anything. Both ids are checked to exist:
+        a block naming a box that was never created is a typo that would sit
+        in the table looking authoritative.
         """
         self._require("box", box_id)
         self._require("box", peer_id)
         if box_id == peer_id:
-            raise ValueError("a box cannot be granted itself as a peer")
+            raise ValueError("an agent never asks itself, so there is nothing to block")
+        had = peer_id in self.blocked_peers_for_box(box_id)
         self._conn.execute(
-            "INSERT OR REPLACE INTO box_peers (box_id, peer_id, granted_at) VALUES (?, ?, ?)"
+            "INSERT OR REPLACE INTO box_peer_blocks (box_id, peer_id, blocked_at) VALUES (?, ?, ?)"
             if not self.is_postgres
-            else "INSERT INTO box_peers (box_id, peer_id, granted_at) VALUES (?, ?, ?) "
-            "ON CONFLICT (box_id, peer_id) DO UPDATE SET granted_at = EXCLUDED.granted_at",
+            else "INSERT INTO box_peer_blocks (box_id, peer_id, blocked_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (box_id, peer_id) DO UPDATE SET blocked_at = EXCLUDED.blocked_at",
             (box_id, peer_id, _utcnow()),
         )
+        return not had
 
-    def revoke_peer(self, box_id: str, peer_id: str) -> bool:
-        """Withdraw a grant. Returns whether there was one."""
-        had = peer_id in self.peers_for_box(box_id)
+    def allow_peer(self, box_id: str, peer_id: str) -> bool:
+        """Lift a block. Returns whether there was one."""
+        had = peer_id in self.blocked_peers_for_box(box_id)
         self._conn.execute(
-            "DELETE FROM box_peers WHERE box_id = ? AND peer_id = ?", (box_id, peer_id)
+            "DELETE FROM box_peer_blocks WHERE box_id = ? AND peer_id = ?", (box_id, peer_id)
         )
         return had
 
-    def peers_for_box(self, box_id: str) -> list[str]:
-        """Every agent this box may message, as ids, sorted.
+    def blocked_peers_for_box(self, box_id: str) -> list[str]:
+        """The agents this box may not ask, as ids, by name.
 
-        Torn-down agents are left out: a grant outlives the machine, but an
-        agent that no longer exists is not someone to be told about.
+        Destroyed agents are left out. The block outlives the machine, but an
+        agent that no longer exists is not somebody to list.
         """
         rows = self._conn.execute(
-            "SELECT p.peer_id FROM box_peers p JOIN boxes b ON b.id = p.peer_id "
-            "WHERE p.box_id = ? AND b.destroyed_at IS NULL ORDER BY b.name",
+            "SELECT k.peer_id FROM box_peer_blocks k JOIN boxes b ON b.id = k.peer_id "
+            "WHERE k.box_id = ? AND b.destroyed_at IS NULL ORDER BY b.name",
             (box_id,),
         )
         return [str(r["peer_id"]) for r in rows]
 
+    def peers_for_box(self, box_id: str) -> list[str]:
+        """Every agent this box may ask, as ids, by name.
+
+        Everyone who can be reached, minus itself and minus the blocks. "Can be
+        reached" is `running` or `stopped` — the door wakes a sleeping agent,
+        which is most of them most of the time. An agent still being built has
+        no machine to answer, and a destroyed one has nothing at all.
+        """
+        rows = self._conn.execute(
+            "SELECT b.id FROM boxes b "
+            "WHERE b.id <> ? AND b.status IN ('running', 'stopped') "
+            "AND b.id NOT IN (SELECT peer_id FROM box_peer_blocks WHERE box_id = ?) "
+            "ORDER BY b.name",
+            (box_id, box_id),
+        )
+        return [str(r["id"]) for r in rows]
+
     def may_message(self, box_id: str, peer_id: str) -> bool:
-        """Whether a box has been granted an agent. The question the relay asks."""
+        """Whether a box may ask an agent. The question the relay asks."""
         return peer_id in self.peers_for_box(box_id)
 
     def count_live_workspaces(self) -> int:
