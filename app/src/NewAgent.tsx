@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { isFleetError, type BoxRow } from "./types";
+import { isFleetError, type BoxRow, type FleetSetting } from "./types";
 
 /**
  * Create an agent.
@@ -44,14 +44,7 @@ function nameProblem(name: string): string | null {
   const hint = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(suggestion) ? ` — try ${suggestion}` : "";
   return `lowercase letters, digits and dashes, not starting or ending with a dash${hint}`;
 }
-export function NewAgent({
-  onCreated,
-  fleetModel,
-}: {
-  onCreated: (box: BoxRow) => void;
-  /** What an agent runs when nobody chooses, shown as the placeholder. */
-  fleetModel?: string | null;
-}) {
+export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -59,6 +52,12 @@ export function NewAgent({
   // form asking three questions to answer one makes the common case worse to
   // serve the rare one.
   const [showOptions, setShowOptions] = useState(false);
+  /**
+   * The fleet's model, for the placeholder — read from fleet settings rather
+   * than from another agent's row, because the moment you most want to know
+   * what the default is is the first create, when there are no rows.
+   */
+  const [fleetModel, setFleetModel] = useState<string | null>(null);
   const [volumeGb, setVolumeGb] = useState("");
   const [region, setRegion] = useState("");
   const [model, setModel] = useState("");
@@ -70,6 +69,28 @@ export function NewAgent({
   const [instructions, setInstructions] = useState("");
 
   const problem = nameProblem(name);
+
+  /** Close the extra fields **and forget them**: a value typed and then put
+   * away must not be sent, which is what made the old toggle a trap. */
+  function useFleetDefaults() {
+    setShowOptions(false);
+    setModel("");
+    setVolumeGb("");
+    setRegion("");
+  }
+
+  async function openOptions() {
+    setShowOptions(true);
+    if (fleetModel === null) {
+      try {
+        const settings = await invoke<FleetSetting[]>("fleet_settings");
+        setFleetModel(settings.find((s) => s.key === "FLOTTA_MODEL")?.value ?? "");
+      } catch {
+        // The placeholder is a convenience; the form works without it.
+        setFleetModel("");
+      }
+    }
+  }
 
   async function create(event: React.FormEvent) {
     event.preventDefault();
@@ -126,13 +147,19 @@ export function NewAgent({
           {busy ? "…" : "Create"}
         </button>
       </div>
-      <button
-        type="button"
-        onClick={() => setShowOptions((open) => !open)}
-        className="mt-2 text-[11px] text-neutral-500 underline hover:text-neutral-700"
-      >
-        {showOptions ? "Use the fleet's defaults" : "Give it a different model, size or region"}
-      </button>
+      {/* Only ever opens. Closing lives *with* the fields it closes — this
+          button sits above the identity fields while the options render below
+          them, so as the only way back it was a link nowhere near the thing it
+          undid. */}
+      {!showOptions && (
+        <button
+          type="button"
+          onClick={() => void openOptions()}
+          className="mt-2 text-[11px] text-neutral-500 underline hover:text-neutral-700"
+        >
+          Give it a different model, size or region
+        </button>
+      )}
 
       {/* Who it is. Visible without expanding anything, because an agent with
           no description is one nobody can pick by role — and because the
@@ -184,21 +211,40 @@ export function NewAgent({
       </div>
 
       {showOptions && (
-        <div className="mt-2 space-y-2">
+        <div className="mt-2 space-y-2 rounded border border-neutral-200 bg-neutral-50 p-2.5">
+          <div className="flex items-baseline justify-between">
+            <span className="text-[11px] font-medium text-neutral-700">
+              Different from the fleet
+            </span>
+            <button
+              type="button"
+              onClick={useFleetDefaults}
+              className="text-[11px] text-neutral-500 underline hover:text-neutral-700"
+            >
+              Use the fleet&rsquo;s defaults
+            </button>
+          </div>
           <label className="block">
             <span className="text-[11px] text-neutral-600">Model</span>
             <input
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              placeholder={fleetModel ? `${fleetModel} (the fleet's)` : "the fleet's default"}
+              placeholder={
+                fleetModel === null
+                  ? "the fleet's default"
+                  : fleetModel || "unset — Hermes decides"
+              }
               spellCheck={false}
               className="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 font-mono text-xs focus:border-neutral-500 focus:outline-none"
             />
             {/* Unlike the two below, this one can be changed later — which is
                 worth saying, or people agonise over a choice that is cheap. */}
             <span className="text-[11px] text-neutral-400">
-              A model id, like anthropic/claude-sonnet-4.5. Checked before the
-              agent is made, and changeable later from its Info panel.
+              {fleetModel
+                ? `Empty means the fleet's: ${fleetModel}.`
+                : "A model id, like anthropic/claude-sonnet-4.5."}{" "}
+              Checked before the agent is made, and changeable later from its
+              Info panel.
             </span>
           </label>
           <label className="block">
