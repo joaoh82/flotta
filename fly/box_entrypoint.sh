@@ -103,6 +103,12 @@ fi
 # default as the line above, for the same `set -u` reason.
 "${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.skills "$HERMES_HOME" || true
 
+# Which model this agent runs (FLOTTA-39). Hermes never read FLOTTA_MODEL; it
+# reads config.yaml's `model:` block, so this writes it from the values the
+# control plane set for this agent — every boot, because changing an agent's
+# model is a secret change and a restart.
+"${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.inference "$HERMES_HOME" || true
+
 echo "[flotta-box] HERMES_HOME=$HERMES_HOME"
 echo "[flotta-box] workdir=$FLOTTA_WORKDIR"
 echo "[flotta-box] mount:"

@@ -51,6 +51,17 @@ def _unchecked(repo, *, token):
     return Reach("unknown", "not checked in tests")
 
 
+def _uncatalogued(model, base_url):
+    """The model check, answering "could not ask" — `_unchecked`'s twin.
+
+    `just check` loads `.env`, where `FLOTTA_MODEL_BASE_URL` names OpenRouter,
+    so without this any test that sends a model would ask openrouter.ai.
+    """
+    from flotta.model_catalog import Known
+
+    return Known("unknown", "not checked in tests")
+
+
 @pytest.fixture
 def client(fleet):
     app = create_app(
@@ -58,6 +69,7 @@ def client(fleet):
         run_loop=False,
         background=False,
         reachable=_unchecked,
+        known_model=_uncatalogued,
     )
     with TestClient(app) as c:
         yield c
@@ -447,6 +459,7 @@ def secured(fleet):
         background=False,
         signing_key=AUTH_KEY,
         reachable=_unchecked,
+        known_model=_uncatalogued,
     )
     with TestClient(app) as c:
         yield c
@@ -2376,6 +2389,7 @@ def colleagues(fleet):
         background=False,
         signing_key=AUTH_KEY,
         reachable=_unchecked,
+        known_model=_uncatalogued,
         deliver=deliver,
     )
     with TestClient(app) as c:
@@ -2749,3 +2763,143 @@ def test_a_rotation_this_agent_cannot_have_is_a_409(client, monkeypatch):
 
 def test_rotating_an_unknown_agent_is_404(client):
     assert client.post("/api/boxes/nobody/identity").status_code == 404
+
+
+# -- a model per agent (FLOTTA-39) -------------------------------------------
+
+
+def test_create_passes_the_model_on(client, monkeypatch):
+    from flotta import provision
+
+    seen = {}
+
+    def fake_create(name, **kwargs):
+        seen.update(kwargs)
+        raise provision.ProvisionError("stop here")
+
+    monkeypatch.setattr(provision, "create_box", fake_create)
+    monkeypatch.setattr("flotta.control.app._peek_for", lambda impl, name: None, raising=False)
+    client.post("/api/boxes", json={"name": "eng-z", "model": " z-ai/glm-5.2 "})
+    assert seen.get("model") == "z-ai/glm-5.2"
+
+
+def test_no_model_means_the_fleet_default(client, monkeypatch):
+    from flotta import provision
+
+    seen = {}
+
+    def fake_create(name, **kwargs):
+        seen.update(kwargs)
+        raise provision.ProvisionError("stop here")
+
+    monkeypatch.setattr(provision, "create_box", fake_create)
+    for model in ("absent", "", None):
+        body = {"name": "eng-z"} if model == "absent" else {"name": "eng-z", "model": model}
+        seen.clear()
+        client.post("/api/boxes", json=body)
+        assert seen.get("model") is None
+
+
+def test_a_malformed_model_is_422_before_anything_is_created(client, fleet):
+    response = client.post("/api/boxes", json={"name": "eng-z", "model": "claude sonnet"})
+    assert response.status_code == 422
+    assert FleetStore(fleet).get_box_by_name("eng-z") is None
+
+
+def test_a_model_the_catalogue_does_not_have_is_422(fleet, monkeypatch):
+    """A typo here is an agent that answers every turn with "model not found"."""
+    from flotta.model_catalog import Known
+
+    monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        reachable=_unchecked,
+        known_model=lambda model, base_url: Known("no", f"OpenRouter has no model {model!r}."),
+    )
+    with TestClient(app) as c:
+        response = c.post("/api/boxes", json={"name": "eng-z", "model": "anthropic/claude-sonet"})
+    assert response.status_code == 422
+    assert "no model 'anthropic/claude-sonet'" in response.json()["detail"]
+    assert FleetStore(fleet).get_box_by_name("eng-z") is None
+
+
+def test_the_fleet_list_says_what_each_agent_runs_and_whose_it_is(client, fleet, monkeypatch):
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    store = FleetStore(fleet)
+    other = store.create_box("eng-b")
+    store.set_box_model(other.id, "anthropic/claude-sonnet-4.5")
+    store.close()
+
+    rows = {b["name"]: b for b in client.get("/api/boxes").json()["boxes"]}
+    assert (rows["eng-a"]["model"], rows["eng-a"]["model_source"]) == ("z-ai/glm-5.2", "fleet")
+    assert (rows["eng-b"]["model"], rows["eng-b"]["model_source"]) == (
+        "anthropic/claude-sonnet-4.5",
+        "agent",
+    )
+
+
+def test_a_fleet_with_no_model_says_so_rather_than_guessing(client, monkeypatch):
+    monkeypatch.delenv("FLOTTA_MODEL", raising=False)
+    monkeypatch.setattr("flotta.settings.read_dotenv_value", lambda *a, **k: None, raising=False)
+    row = client.get("/api/boxes/eng-a").json()["box"]
+    assert row["model"] is None and row["model_source"] is None
+
+
+def test_changing_a_model_goes_through_the_provision_verb(client, monkeypatch):
+    from flotta import provision
+
+    called = {}
+
+    def fake_set(box_id, model, *, store, **kwargs):
+        called.update(box_id=box_id, model=model)
+        return {"box_id": box_id, "name": "eng-a", "model": model, "source": "agent"}
+
+    monkeypatch.setattr(provision, "set_model", fake_set)
+    response = client.put("/api/boxes/eng-a/model", json={"model": "anthropic/claude-sonnet-4.5"})
+    assert response.status_code == 200
+    assert called["model"] == "anthropic/claude-sonnet-4.5"
+    assert called["box_id"].startswith("b-")
+    assert response.json()["box"]["name"] == "eng-a"
+
+
+def test_a_null_model_resets_to_the_fleet_default(client, monkeypatch):
+    from flotta import provision
+
+    called = {}
+
+    def fake_set(box_id, model, *, store, **kwargs):
+        called["model"] = model
+        return {"box_id": box_id, "name": "eng-a", "model": "z-ai/glm-5.2", "source": "fleet"}
+
+    monkeypatch.setattr(provision, "set_model", fake_set)
+    assert client.put("/api/boxes/eng-a/model", json={"model": None}).status_code == 200
+    assert called["model"] is None
+
+
+def test_a_body_without_a_model_is_refused_rather_than_read_as_a_reset(client):
+    """An empty body is far more likely a bug than a request to reset."""
+    assert client.put("/api/boxes/eng-a/model", json={}).status_code == 422
+
+
+def test_changing_a_model_is_an_operators_act(secured):
+    from flotta.auth import SCOPE_BOX_PEER, box_subject
+
+    box_id = _box_ids(secured)["eng-a"]
+    refused = secured.put(
+        "/api/boxes/eng-a/model",
+        json={"model": "z-ai/glm-5.2"},
+        headers=_bearer(SCOPE_BOX_PEER, subject=box_subject(box_id)),
+    )
+    assert refused.status_code == 403
+
+
+def test_a_model_change_the_substrate_refused_is_a_502(client, monkeypatch):
+    from flotta import provision
+
+    def broken(box_id, model, *, store, **kwargs):
+        raise provision.UpgradeFailed("could not change eng-a's model: flyctl exploded")
+
+    monkeypatch.setattr(provision, "set_model", broken)
+    assert client.put("/api/boxes/eng-a/model", json={"model": "z-ai/glm-5.2"}).status_code == 502

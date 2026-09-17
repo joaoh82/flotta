@@ -269,6 +269,22 @@ FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
 FLOTTA_DOMAIN=flotta.dev
 ```
 
+**`FLOTTA_MODEL` is the fleet's default model, not every agent's.** An agent
+can be given its own — at creation (the Create form's *Model* field, or
+`flotta create --model`) or afterwards (**Info → Model**, or `flotta model set`).
+The endpoint and key stay fleet-wide: a per-agent endpoint with this key would
+send the key to a host it was not issued for. A model id is checked against
+OpenRouter's catalogue before an agent is pointed at it; other endpoints are
+not checked.
+
+**The model reaches Hermes through `config.yaml`, not the environment.** Hermes
+never read `FLOTTA_MODEL`; the box's boot step (`flotta.box.inference`) writes
+`model.default`, `provider` and `base_url` from it at every boot. For an
+endpoint that is not OpenRouter it writes `provider: custom` and the key too —
+the only arrangement in which Hermes sends a key to a non-OpenRouter host. An
+image built before FLOTTA-39 has no such step, so its agents run Hermes's own
+default model whatever this says.
+
 **`FLOTTA_BOX_PASSWORD` must match the door's.** The door logs into every box
 on the caller's behalf using its copy; a different value locks it out of the
 agent that was just created. That is also why creation does not generate one

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AgentColleagues } from "./AgentColleagues";
 import { AgentIdentity } from "./AgentIdentity";
+import { AgentModel } from "./AgentModel";
 import { AgentRepos } from "./AgentRepos";
 import { StatusBadge } from "./StatusBadge";
 import {
@@ -446,6 +447,7 @@ export function AgentInfo({
             <Line label="Address" value={`${row.name}.flotta.dev`} mono />
             {row.endpoint && <Line label="Endpoint" value={row.endpoint} mono />}
             {row.created_at && <Line label="Agent created" value={row.created_at} />}
+            <AgentModel box={box} onChanged={onChanged} />
             <AgentIdentity
               key={`identity-${box.id}`}
               boxId={box.id}

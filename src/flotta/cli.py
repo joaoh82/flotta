@@ -934,6 +934,11 @@ def create(
     region: str | None = typer.Option(
         None, "--region", help="Where to create it. Default: the fleet's"
     ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Model id this agent runs, e.g. anthropic/claude-sonnet-4.5. Default: the fleet's",
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -947,6 +952,8 @@ def create(
     The machine it lands on keeps `/data/hermes` on a volume, so what the agent
     learns survives a stop/start.
     """
+    from flotta.inference import InvalidModel
+
     provision = _provision()
 
     # The one command that may create the store: creating an agent is how a
@@ -990,8 +997,9 @@ def create(
                 display_name=display_name,
                 description=description,
                 instructions=instructions,
+                model=model,
             )
-        except (InvalidBoxNameError, InvalidBoxMetaError, DuplicateBoxError) as exc:
+        except (InvalidBoxNameError, InvalidBoxMetaError, DuplicateBoxError, InvalidModel) as exc:
             # Exit 2: the caller asked for something impossible, which is a
             # refusal rather than a failure (see the exit-code convention).
             # `DuplicateBoxError` reached here uncaught before this — a name
@@ -1586,6 +1594,66 @@ def peer_list(
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     emit(body, _colleagues_text(body), as_json=as_json)
+
+
+# -- models (FLOTTA-39) -----------------------------------------------------
+
+model_app = typer.Typer(
+    name="model",
+    help="Which model an agent runs. The fleet's, unless you set its own.",
+    no_args_is_help=True,
+)
+app.add_typer(model_app)
+
+
+def _set_model(box_id: str, model: str | None, as_json: bool) -> None:
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if not control_url():
+        raise _fail(
+            ControlPlaneError(
+                "changing a model writes to the agent's own machine, which only the "
+                "control plane can reach. Set $FLOTTA_CONTROL_URL."
+            ),
+            code=2,
+        )
+    try:
+        box = _remote_box(box_id)
+        body = control_request(
+            "PUT",
+            f"/api/boxes/{box['id']}/model",
+            scopes=(SCOPE_FLEET_WRITE,),
+            body={"model": model},
+            # A running agent restarts before this answers.
+            timeout_s=180.0,
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    whose = "its own" if body["source"] == "agent" else "the fleet default"
+    emit(body, f"{body['name']} now runs {body['model']} ({whose})", as_json=as_json)
+
+
+@model_app.command("set")
+def model_set(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    model: str = typer.Argument(..., help="Model id, e.g. anthropic/claude-sonnet-4.5"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Give an agent its own model.
+
+    A running agent restarts to take it; a sleeping one stays asleep and takes
+    it when it next wakes. Its memory is not touched.
+    """
+    _set_model(box_id, model, as_json)
+
+
+@model_app.command("reset")
+def model_reset(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Put an agent back on the fleet's model."""
+    _set_model(box_id, None, as_json)
 
 
 # -- tokens (M5) ------------------------------------------------------------

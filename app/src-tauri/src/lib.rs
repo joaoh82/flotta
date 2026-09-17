@@ -153,25 +153,18 @@ async fn list_boxes(app: tauri::AppHandle) -> Result<Vec<BoxRow>, FleetError> {
 /// Create an agent. `volume_gb` and `region` are per-agent overrides; leaving
 /// them out means the fleet's own defaults decide, which is the usual case.
 #[tauri::command]
-async fn create_agent(
+async fn create_agent(app: tauri::AppHandle, agent: fleet::NewAgent) -> Result<BoxRow, FleetError> {
+    fleet::create_box(&read_settings(&app), &agent).await
+}
+
+/// Change the model an agent runs; nothing means the fleet's (FLOTTA-39).
+#[tauri::command]
+async fn set_agent_model(
     app: tauri::AppHandle,
-    name: String,
-    volume_gb: Option<u32>,
-    region: Option<String>,
-    display_name: Option<String>,
-    description: Option<String>,
-    instructions: Option<String>,
+    id: String,
+    model: Option<String>,
 ) -> Result<BoxRow, FleetError> {
-    fleet::create_box(
-        &read_settings(&app),
-        &name,
-        volume_gb,
-        region,
-        display_name,
-        description,
-        instructions,
-    )
-    .await
+    fleet::set_model(&read_settings(&app), &id, model).await
 }
 
 /// Rename or re-describe an agent. Never the address, never the instructions.
@@ -525,6 +518,7 @@ pub fn run() {
             revoke_repo,
             agent_colleagues,
             rotate_identity,
+            set_agent_model,
             block_peer,
             allow_peer,
             set_instructions,

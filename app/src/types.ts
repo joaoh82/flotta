@@ -49,6 +49,10 @@ export type BoxRow = {
    * prompt it was born with.
    */
   instructions?: string | null;
+  /** The model the agent runs (FLOTTA-39) — its own, or the fleet's. */
+  model?: string | null;
+  /** `agent` or `fleet`; null when the fleet has no model configured. */
+  model_source?: "agent" | "fleet" | null;
 };
 
 /**

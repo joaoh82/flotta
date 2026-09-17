@@ -63,7 +63,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
 
 from flotta.backend import (
     Backend,
@@ -417,26 +416,20 @@ def fleet_secrets(env: dict[str, str] | None = None) -> tuple[dict[str, str], li
     base_url = (source.get("FLOTTA_MODEL_BASE_URL") or "").strip()
     api_key = (source.get("FLOTTA_API_KEY") or "").strip()
     if model and base_url and api_key:
-        secrets["FLOTTA_MODEL"] = model
-        secrets["FLOTTA_MODEL_BASE_URL"] = base_url
-        secrets["FLOTTA_API_KEY"] = api_key
-
         # **Two consumers, two vocabularies.** `flotta.box.run` reads the
-        # FLOTTA_* names; `hermes serve` — the surface the app actually talks
-        # to — resolves a provider through Hermes's own config and ignores
-        # them, so a box with only FLOTTA_* answers every turn with "No
-        # inference provider configured". The native name depends on the
-        # endpoint, so it is derived rather than guessed.
-        # The **host**, not a substring of the URL: a self-hosted proxy at
-        # `https://proxy.internal/openrouter/v1` would otherwise be handed to
-        # Hermes as OpenRouter, and its traffic would leave for openrouter.ai
-        # with no base URL to redirect it.
-        host = urlparse(base_url).hostname or ""
-        if host == "openrouter.ai" or host.endswith(".openrouter.ai"):
-            secrets["OPENROUTER_API_KEY"] = api_key
-        else:
-            secrets["OPENAI_API_KEY"] = api_key
-            secrets["OPENAI_BASE_URL"] = base_url
+        # FLOTTA_* names; `hermes serve` — the surface the app talks to —
+        # reads neither them nor, on this path, `OPENAI_BASE_URL`. It reads
+        # `config.yaml`, which the box's boot step (`flotta.box.inference`)
+        # writes from these values. A box with only FLOTTA_* and no boot step
+        # runs Hermes's own default model, which is how every agent ran
+        # "the configured model" by coincidence until FLOTTA-39.
+        #
+        # One derivation for every path — create, a model change, the boot
+        # step. See `flotta.inference`, including the key leak the old
+        # `OPENAI_*` arrangement allowed.
+        from flotta.inference import provider_secrets
+
+        secrets.update(provider_secrets(model, base_url, api_key))
     else:
         missing.append("FLOTTA_MODEL / FLOTTA_MODEL_BASE_URL / FLOTTA_API_KEY")
 
@@ -628,6 +621,7 @@ def reserve_box(
     display_name: str | None = None,
     description: str | None = None,
     instructions: str | None = None,
+    model: str | None = None,
 ) -> Box:
     """Write the row, and nothing else. Returns immediately.
 
@@ -645,6 +639,10 @@ def reserve_box(
     # refuses without spending the name — the same reason the name itself is
     # checked at the top of `store.create_box`.
     validate_box_meta(display_name, description, instructions)
+    if model is not None:
+        from flotta.inference import validate_model
+
+        model = validate_model(model)
     box = store.create_box(name)
     store.add_event("box", box.id, "provisioning", {"name": name, "backend": backend.scheme})
     if display_name or description or instructions:
@@ -654,6 +652,11 @@ def reserve_box(
             description=description,
             instructions=instructions,
         )
+    if model is not None:
+        # In the store rather than carried in memory: on the 202 path this row
+        # is provisioned later, on a thread, and `create_box` reads it back —
+        # the same reason instructions live in `box_meta`.
+        store.set_box_model(box.id, model)
     return box
 
 
@@ -716,6 +719,7 @@ def create_box(
     display_name: str | None = None,
     description: str | None = None,
     instructions: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
 
@@ -738,6 +742,12 @@ def create_box(
     #
     # The store validates again. That is the guarantee; this is the shortcut.
     name = validate_box_name(name)
+    if model is not None:
+        # Same reasoning as the name: a model id that can never work is refused
+        # before a substrate round trip, not after a machine exists.
+        from flotta.inference import validate_model
+
+        model = validate_model(model)
 
     impl = backend or _backend_for("fly://")  # default substrate for persistent boxes
 
@@ -768,6 +778,7 @@ def create_box(
             display_name=display_name,
             description=description,
             instructions=instructions,
+            model=model,
         )
 
     # Identity travels with the machine rather than arriving afterwards. The
@@ -815,6 +826,23 @@ def create_box(
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
     fleet, missing_fleet = fleet_secrets()
+    # This agent's own model, if it has one — from the store for the reason
+    # `meta` is. Only the model is overridden: the endpoint and key stay the
+    # fleet's (see the `box_models` table).
+    own_model = store.model_for_box(box.id)
+    if own_model and "FLOTTA_MODEL" in fleet:
+        fleet["FLOTTA_MODEL"] = own_model
+    if "FLOTTA_MODEL" in fleet:
+        store.add_event(
+            "box",
+            box.id,
+            MODEL_SET,
+            {
+                "model": fleet["FLOTTA_MODEL"],
+                "source": "agent" if own_model else "fleet",
+                "reason": "created",
+            },
+        )
     # A caller's own spec wins over both, which is the escape hatch a test or a
     # one-off create needs — and the reason `base` is merged last rather than
     # first.
@@ -1404,6 +1432,72 @@ def rotate_identity(
         {"reason": reason, "expires_at": claims.expires_at, "scopes": result["scopes"]},
     )
     return result
+
+
+#: The event a model change writes.
+MODEL_SET = "model_set"
+
+
+def fleet_model(store: FleetStore | None = None) -> str | None:
+    """The model an agent without its own runs, or None if the fleet has none."""
+    from flotta.settings import layered
+
+    env = layered(store) if store is not None else os.environ
+    return (env.get("FLOTTA_MODEL") or "").strip() or None
+
+
+def set_model(
+    box_id: str,
+    model: str | None,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Change the model an agent runs. None means "the fleet default".
+
+    Writes `FLOTTA_MODEL` to the agent's own machine, the same way
+    `rotate_identity` writes its token: a running agent restarts and its boot
+    step rewrites Hermes's `config.yaml`; a sleeping one stays asleep and does
+    so when it next wakes. The endpoint and key are untouched — they were set
+    at creation and stay the fleet's.
+
+    **Substrate first, row second.** If the machine cannot be updated, the
+    store still says what the agent really runs.
+    """
+    from flotta.inference import validate_model
+
+    wanted = None if model is None else validate_model(model)
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to change.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(
+            f"box {box_id} is still being created. Its model is set as part of that; "
+            "wait for it to settle."
+        )
+    default = fleet_model(store)
+    effective = wanted or default
+    if not effective:
+        raise ProvisionError(
+            "this fleet has no model configured (FLOTTA_MODEL on the control plane), "
+            "so there is no default to fall back to."
+        )
+
+    impl = _resolve_backend(box, backend)
+    try:
+        impl.apply_secrets(box.endpoint, {"FLOTTA_MODEL": effective})
+    except BackendError as exc:
+        raise UpgradeFailed(
+            f"could not change {box.name}'s model: {exc}. It still runs "
+            f"{store.model_for_box(box.id) or default}."
+        ) from exc
+
+    store.set_box_model(box.id, wanted)
+    source = "agent" if wanted else "fleet"
+    store.add_event(
+        "box", box.id, MODEL_SET, {"model": effective, "source": source, "reason": "changed"}
+    )
+    return {"box_id": box.id, "name": box.name, "model": effective, "source": source}
 
 
 #: How long a resolved release image is reused. The lookup is a `flyctl`
