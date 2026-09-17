@@ -101,16 +101,33 @@ export function FleetSettings() {
 
       {settings.map((setting) => {
         const current = edits[setting.key] ?? setting.value;
+        // Shown rather than settable. Rendered as a field so it reads as part
+        // of the same configuration, disabled so it cannot be typed into, and
+        // the help says where it is set instead.
+        const readOnly = setting.editable === false;
         return (
           <label key={setting.key} className="block">
-            <span className="text-xs font-medium text-neutral-700">{setting.label}</span>
+            <span className="text-xs font-medium text-neutral-700">
+              {setting.label}
+              {readOnly && (
+                <span className="ml-1.5 font-normal text-neutral-400">
+                  set on the control plane
+                </span>
+              )}
+            </span>
             <input
               value={current}
               onChange={(e) =>
                 setEdits((prev) => ({ ...prev, [setting.key]: e.target.value }))
               }
               placeholder={setting.default || "unset"}
-              className="mt-1 w-full rounded border border-neutral-300 px-2 py-1.5 font-mono text-xs focus:border-neutral-500 focus:outline-none"
+              disabled={readOnly}
+              readOnly={readOnly}
+              className={`mt-1 w-full rounded border px-2 py-1.5 font-mono text-xs focus:outline-none ${
+                readOnly
+                  ? "border-neutral-200 bg-neutral-50 text-neutral-500"
+                  : "border-neutral-300 focus:border-neutral-500"
+              }`}
             />
             <span className="mt-1 block text-xs text-neutral-500">
               {setting.help}

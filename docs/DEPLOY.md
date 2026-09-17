@@ -269,6 +269,12 @@ FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
 FLOTTA_DOMAIN=flotta.dev
 ```
 
+**`FLOTTA_MODEL` is also settable in the app** (Settings → Fleet), which is
+where to look when you want to know what the default even is; a value stored
+there wins over this variable for agents created afterwards. The endpoint and
+key stay here — the app shows the endpoint read-only, because it decides where
+the key is sent.
+
 **`FLOTTA_MODEL` is the fleet's default model, not every agent's.** An agent
 can be given its own — at creation (the Create form's *Model* field, or
 `flotta create --model`) or afterwards (**Info → Model**, or `flotta model set`).

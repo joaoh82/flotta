@@ -75,6 +75,16 @@ def test_every_catalogued_setting_actually_changes_something():
         # eligible, rather than the other way round.
         "FLOTTA_FLY_VOLUME_GB",
         "FLOTTA_FLY_REGION",
+        # Read by `provision.fleet_secrets`, through `layered`, on the create
+        # path — so a model set here is what a new agent boots with. Checking
+        # that is what this test is for: `fleet_secrets` read `os.environ`
+        # directly when the setting was added, which would have made the field
+        # change what a *reset* falls back to and not what a create uses.
+        "FLOTTA_MODEL",
+        # Shown, never stored: `editable=False`, so `layered` has nothing to
+        # shadow and the API refuses it. It is in the catalogue to be *read* —
+        # "which provider is this fleet on" had no answer in the window.
+        "FLOTTA_MODEL_BASE_URL",
     }, (
         "a setting was added or removed — confirm the new one is read by "
         "something that runs, the way idle sleep and the sweep interval are"
@@ -225,3 +235,41 @@ def test_a_good_value_comes_back_clean():
 def test_an_empty_value_is_a_clear_not_a_refusal():
     assert validate("FLOTTA_IDLE_AFTER_S", "") == ""
     assert validate("FLOTTA_IDLE_AFTER_S", "   ") == ""
+
+
+def test_a_setting_that_is_only_shown_cannot_be_written():
+    """The endpoint decides where the fleet's API key is sent. Editable, it
+    would turn `fleet:write` into a way to have that key delivered elsewhere."""
+    with pytest.raises(UnknownSettingError, match="shown but not settable"):
+        validate("FLOTTA_MODEL_BASE_URL", "https://attacker.example/v1")
+
+
+def test_the_model_is_validated_like_every_other_model_id():
+    assert validate("FLOTTA_MODEL", "  anthropic/claude-sonnet-4.5 ") == (
+        "anthropic/claude-sonnet-4.5"
+    )
+    with pytest.raises(ValueError, match="not a model id"):
+        validate("FLOTTA_MODEL", "claude sonnet")
+
+
+def test_clearing_the_model_is_allowed_because_empty_means_no_override():
+    assert validate("FLOTTA_MODEL", "  ") == ""
+
+
+def test_the_catalogue_says_which_entries_the_app_may_edit(store):
+    entries = {e["key"]: e for e in describe(store)}
+    assert entries["FLOTTA_MODEL"]["editable"] is True
+    assert entries["FLOTTA_MODEL_BASE_URL"]["editable"] is False
+
+
+def test_a_model_set_in_the_app_is_what_a_new_agent_is_created_with(store, monkeypatch):
+    """The wiring the catalogue test exists to make somebody check."""
+    from flotta.provision import fleet_secrets
+
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("FLOTTA_API_KEY", "sk-abc")
+    store.set_setting("FLOTTA_MODEL", "anthropic/claude-sonnet-4.5")
+
+    secrets, _ = fleet_secrets(layered(store))
+    assert secrets["FLOTTA_MODEL"] == "anthropic/claude-sonnet-4.5"

@@ -60,6 +60,12 @@ class Setting:
     #: What happens with nothing stored and nothing in the environment. Rendered
     #: as the placeholder, so an empty field is never a mystery.
     default: str
+    #: Whether the app may change it. `False` is shown and refused on write —
+    #: for a value a person needs to *see* but that cannot safely be set over
+    #: the API. The endpoint is the case: it decides where the fleet's key is
+    #: sent, so an editable one would turn `fleet:write` into a way to have
+    #: that key delivered to a host of the caller's choosing.
+    editable: bool = True
 
     def __post_init__(self) -> None:
         """Refuse to catalogue anything that looks like a credential.
@@ -103,6 +109,31 @@ SETTINGS: tuple[Setting, ...] = (
         ),
         kind="seconds",
         default="60",
+    ),
+    Setting(
+        key="FLOTTA_MODEL",
+        label="Model for new agents",
+        help=(
+            "The model an agent is created with, unless it is given its own. "
+            "Changing this does not move agents that already exist — each one "
+            "runs what it was created with until you change it in its Info "
+            "panel."
+        ),
+        kind="text",
+        default="",
+    ),
+    Setting(
+        key="FLOTTA_MODEL_BASE_URL",
+        label="Provider endpoint",
+        help=(
+            "Where models are called, and what the fleet's API key is sent to. "
+            "Set on the control plane and shown here rather than edited: the "
+            "key travels with it, so changing the endpoint from the app would "
+            "be a way to have that key delivered somewhere else."
+        ),
+        kind="text",
+        default="",
+        editable=False,
     ),
     Setting(
         key="FLOTTA_FLY_VOLUME_GB",
@@ -180,6 +211,15 @@ def validate(key: str, value: str) -> str:
             f"{key!r} is not a fleet setting. Settable: {', '.join(sorted(BY_KEY))}"
         )
 
+    if not setting.editable:
+        # Refused here rather than only in the route, for the reason the
+        # credential guard is in `__post_init__`: the store and the API are two
+        # doors to the same table, and a check on one of them is a check.
+        raise UnknownSettingError(
+            f"{setting.label} is shown but not settable here. It is configured "
+            f"where the control plane runs ({key})."
+        )
+
     text = (value or "").strip()
     if not text:
         # Empty means "no override" everywhere, which is how a field is
@@ -202,6 +242,13 @@ def validate(key: str, value: str) -> str:
             raise ValueError(f"{setting.label} must be a real number, got {text!r}")
         if number < 0:
             raise ValueError(f"{setting.label} cannot be negative, got {text!r}")
+    elif key == "FLOTTA_MODEL":
+        from flotta.inference import InvalidModel, validate_model
+
+        try:
+            return validate_model(text)
+        except InvalidModel as exc:
+            raise ValueError(str(exc)) from exc
     elif setting.kind == "int":
         try:
             number = int(text)
@@ -287,6 +334,7 @@ def describe(store: Any, env: Mapping[str, str] | None = None) -> list[dict[str,
                 "default": setting.default,
                 "value": value,
                 "source": source,
+                "editable": setting.editable,
             }
         )
     return out

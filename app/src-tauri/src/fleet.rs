@@ -201,6 +201,12 @@ pub struct BoxEvent {
 /// **Nothing in here is ever a credential.** The control plane's catalogue is
 /// an allowlist of configuration, so the settings API has no secret to return
 /// and this struct has nowhere to put one.
+/// Defaults to settable, so a control plane that predates `editable` renders
+/// exactly as it does today rather than showing every field greyed out.
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FleetSetting {
     pub key: String,
@@ -210,6 +216,11 @@ pub struct FleetSetting {
     pub default: String,
     pub value: String,
     pub source: String,
+    /// Whether the app may change it. A shown-but-not-settable value is one
+    /// a person needs to see and that cannot safely be written over the API —
+    /// the provider endpoint, which decides where the fleet's key is sent.
+    #[serde(default = "yes")]
+    pub editable: bool,
 }
 
 /// What the substrate says about a box's machine, right now.

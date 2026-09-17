@@ -237,6 +237,12 @@ export type FleetSetting = {
   default: string;
   value: string;
   source: string;
+  /**
+   * Whether the app may change it. A shown-but-not-settable value is one a
+   * person needs to *see* — the provider endpoint, which decides where the
+   * fleet's API key is sent and so cannot be written over the API.
+   */
+  editable?: boolean;
 };
 
 export type SettingsView = {

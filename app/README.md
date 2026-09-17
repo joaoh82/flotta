@@ -228,7 +228,14 @@ one nobody types.
 **Info → Model** shows what an agent runs and whose choice that is — its own,
 or the fleet's — with **Change**. The Create form has a *Model* field under
 "Give it a different model, size or region", with the fleet's model as the
-placeholder.
+placeholder — read from **Settings → Fleet**, not from another agent's row, so
+it is right on the first create when there are no rows to read.
+
+**Settings → Fleet** carries *Model for new agents* and *Provider endpoint*.
+The endpoint is shown and **not editable**: it decides where the fleet's API
+key is sent, so a settable one would turn `fleet:write` into a way to have that
+key delivered somewhere else. Changing the model there affects agents created
+afterwards; existing ones keep what they were made with (FLOTTA-66).
 
 - Changing a model restarts a running agent (about a minute) and leaves a
   sleeping one asleep until it wakes. Memory and conversations are kept.

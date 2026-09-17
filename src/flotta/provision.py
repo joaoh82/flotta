@@ -825,7 +825,14 @@ def create_box(
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
-    fleet, missing_fleet = fleet_secrets()
+    # Through the settings layer, not the raw environment: a model set in the
+    # app's Fleet settings has to reach the machine being created, or the field
+    # decides nothing. Everything else in here is environment-only (the key and
+    # the endpoint are credentials-adjacent and not catalogued), so `layered`
+    # changes nothing for them.
+    from flotta.settings import layered
+
+    fleet, missing_fleet = fleet_secrets(layered(store))
     # This agent's own model, if it has one — from the store for the reason
     # `meta` is. Only the model is overridden: the endpoint and key stay the
     # fleet's (see the `box_models` table).
