@@ -351,6 +351,13 @@ class FlyBackend:
             guest = config.get("guest") or {}
             mounts = config.get("mounts") or []
             mount = mounts[0] if mounts and isinstance(mounts[0], dict) else {}
+            env = config.get("env") or {}
+            raw_workdir = env.get("FLOTTA_WORKDIR") if isinstance(env, dict) else None
+            workdir = (
+                raw_workdir.strip()
+                if isinstance(raw_workdir, str) and raw_workdir.strip()
+                else None
+            )
             return MachineInfo(
                 state=str(machine.get("state") or "unknown"),
                 machine_id=machine_id,
@@ -370,6 +377,7 @@ class FlyBackend:
                 created_at=machine.get("created_at"),
                 updated_at=machine.get("updated_at"),
                 host_status=machine.get("host_status"),
+                workdir=workdir,
             )
         return MachineInfo(state="gone", machine_id=machine_id, app=app)
 

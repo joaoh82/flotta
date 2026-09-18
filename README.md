@@ -70,8 +70,10 @@ machine. That one rule shapes most of the design.
   a volume at `/data/hermes`, so an agent's memory survives a stop/start.
 - **A box can do engineering work.** The image is Ubuntu with a real toolchain — `git`, `gh`,
   `ripgrep`, `fd`, `jq`, a compiler, Python, Node, `uv`, `sqlite3` — so an agent can clone a repo,
-  install its dependencies, build a C extension and run its tests. Work happens in `/workspace` on
-  the rootfs; `/data` is the memory volume and stays out of it.
+  install its dependencies, build a C extension and run its tests. Work happens in the projects
+  folder (`/workspace` by default, settable in the app) on the rootfs; `/data` is the memory
+  volume and stays out of it. An image update replaces the rootfs, so clones are lost and the
+  agent re-clones on the next task.
 - **Every transition recorded.** A local SQLite store is the single source of truth, split into
   `boxes` / `workspaces` / `tasks`, each with its own validated transition table. A box cannot be
   `done` and a task cannot be `stopped`; the store refuses both.

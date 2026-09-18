@@ -231,11 +231,19 @@ or the fleet's — with **Change**. The Create form has a *Model* field under
 placeholder — read from **Settings → Fleet**, not from another agent's row, so
 it is right on the first create when there are no rows to read.
 
-**Settings → Fleet** carries *Model for new agents* and *Provider endpoint*.
-The endpoint is shown and **not editable**: it decides where the fleet's API
-key is sent, so a settable one would turn `fleet:write` into a way to have that
-key delivered somewhere else. Changing the model there affects agents created
-afterwards; existing ones keep what they were made with (FLOTTA-66).
+**Settings → Fleet** carries *Model for new agents*, *Provider endpoint*, and
+*Projects folder* (`FLOTTA_WORKDIR`, default `/workspace`). The endpoint is
+shown and **not editable**: it decides where the fleet's API key is sent, so a
+settable one would turn `fleet:write` into a way to have that key delivered
+somewhere else. Changing the model or the projects folder there affects agents
+created afterwards; existing ones keep what they were made with (FLOTTA-66,
+FLOTTA-56).
+
+The projects folder is on the machine's disk, not the memory volume. **An image
+update replaces that disk**, so clones are lost; the Info panel says so, and
+the agent is told to re-clone if the folder is empty. A second volume for
+projects is deferred until agents do multi-day work with uncommitted state
+(M6).
 
 - Changing a model restarts a running agent (about a minute) and leaves a
   sleeping one asleep until it wakes. Memory and conversations are kept.
@@ -263,6 +271,14 @@ them into one status would mean silently picking a winner.
 It is fetched on open and on Recheck, **never on a timer**: it is a `flyctl`
 subprocess on the control plane. The list keeps polling the store, which is
 what makes a status change show up without anyone pressing Refresh.
+
+**Projects folder** is on this panel because a folder that silently vanishes
+is worse than one that is not configurable. The path is what the machine has
+(`FLOTTA_WORKDIR` in its env), falling back to `/workspace` for agents created
+before the setting existed. The lifetime is stated in the same breath: clones
+do not survive an update. The **Update agents** confirmation says the same
+thing, because a button that wipes checkouts without saying so is the window
+telling a lie by omission.
 
 Which Hermes version an image carries is still recorded nowhere — the image tag
 is the closest thing until FLOTTA-43.

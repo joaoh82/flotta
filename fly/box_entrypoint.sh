@@ -59,11 +59,14 @@ set -euo pipefail
 # container start, so anything the build wrote there is invisible afterwards.
 mkdir -p "$HERMES_HOME"
 
-# The working directory (§6a). On the rootfs, not the volume, and the split is
-# load-bearing: /data is ~1GB and holds the agent's memory, so one `npm
-# install` there would fill it and take the memory with it. /workspace has the
-# machine's whole rootfs (~7GB) and the right lifetime — a clone survives a
-# nap, and is lost when the machine is replaced.
+# The working directory (§6a, FLOTTA-56). On the rootfs, not the volume, and
+# the split is load-bearing: /data is ~1GB and holds the agent's memory, so
+# one `npm install` there would fill it and take the memory with it. The
+# projects folder has the machine's whole rootfs (~7GB) and the right
+# lifetime for a nap — a clone survives stop/start, and is lost when the
+# machine is replaced. "Replaced" includes every Hermes update: `machine
+# update --image` swaps the rootfs, so pressing "Update agents" wipes every
+# checkout. That is accepted (D15): the agent is told to clone if absent.
 : "${FLOTTA_WORKDIR:=/workspace}"
 mkdir -p "$FLOTTA_WORKDIR"
 
@@ -97,10 +100,10 @@ fi
 # must still boot; the module never raises, and this is belt and braces.
 "${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.approvals "$HERMES_HOME" || true
 
-# Flotta's own skills — today, how an agent learns which repositories it may
-# use (FLOTTA-61). Registered as a read-only external directory, so the skill
-# ships in the image and never lands on the agent's volume. Same `${…:-}`
-# default as the line above, for the same `set -u` reason.
+# Flotta's own skills — repositories (FLOTTA-61), colleagues (FLOTTA-54),
+# and the projects folder (FLOTTA-56). Registered as a read-only external
+# directory, so they ship in the image and never land on the agent's volume.
+# Same `${…:-}` default as the line above, for the same `set -u` reason.
 "${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.skills "$HERMES_HOME" || true
 
 # Which model this agent runs (FLOTTA-39). Hermes never read FLOTTA_MODEL; it

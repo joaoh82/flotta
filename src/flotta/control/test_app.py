@@ -1216,6 +1216,27 @@ def test_an_emptied_field_clears_the_override(client):
     assert rows["FLOTTA_IDLE_AFTER_S"]["source"] != "store"
 
 
+def test_the_projects_folder_is_a_fleet_setting_and_refuses_the_memory_volume(client):
+    """FLOTTA-56: settable from the app, and `/data` is not a legal value.
+
+    A setting that accepted the memory volume would be a way to point every
+    new agent's `node_modules` at the disk that holds its memories.
+    """
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert "FLOTTA_WORKDIR" in rows
+    assert rows["FLOTTA_WORKDIR"]["default"] == "/workspace"
+
+    ok = client.put("/api/settings", json={"values": {"FLOTTA_WORKDIR": "/mnt/src"}})
+    assert ok.status_code == 200
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert rows["FLOTTA_WORKDIR"]["value"] == "/mnt/src"
+
+    refused = client.put("/api/settings", json={"values": {"FLOTTA_WORKDIR": "/data/src"}})
+    assert refused.status_code == 422
+    rows = {row["key"]: row for row in client.get("/api/settings").json()["settings"]}
+    assert rows["FLOTTA_WORKDIR"]["value"] == "/mnt/src", "the refused value was stored"
+
+
 def test_a_credential_cannot_be_set_through_the_settings_api(client):
     """The security boundary, stated as a test.
 
@@ -2083,7 +2104,11 @@ def test_the_202_row_already_carries_the_display_name(async_client, fleet, monke
     assert response.json()["box"]["display_name"] == "Reviewer"
     with FleetStore(fleet) as store:
         meta = store.meta_for_box(response.json()["box_id"])
-        assert meta.instructions == "Be kind.", "the thread reads instructions from the store"
+        assert meta.instructions is not None
+        assert meta.instructions.startswith("Be kind.")
+        assert "/workspace" in meta.instructions, (
+            "the projects convention is part of the seed the thread will write"
+        )
 
 
 def test_the_fleet_list_carries_identity_in_one_query(client, fleet):

@@ -157,6 +157,20 @@ SETTINGS: tuple[Setting, ...] = (
         kind="text",
         default="",
     ),
+    Setting(
+        key="FLOTTA_WORKDIR",
+        label="Projects folder",
+        help=(
+            "Where a new agent clones repositories. On the machine's disk, not "
+            "its memory volume — a node_modules on /data would fill the volume "
+            "and take the agent's memory with it. Lost when the agent is "
+            "updated (the image replaces that disk); the agent is told to "
+            "re-clone if the folder is empty. Applies to agents created from "
+            "now on."
+        ),
+        kind="text",
+        default="/workspace",
+    ),
 )
 
 # Deliberately **not** catalogued yet, and both for the same reason:
@@ -248,6 +262,13 @@ def validate(key: str, value: str) -> str:
         try:
             return validate_model(text)
         except InvalidModel as exc:
+            raise ValueError(str(exc)) from exc
+    elif key == "FLOTTA_WORKDIR":
+        from flotta.workdir import validate_workdir
+
+        try:
+            return validate_workdir(text)
+        except ValueError as exc:
             raise ValueError(str(exc)) from exc
     elif setting.kind == "int":
         try:

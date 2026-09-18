@@ -121,9 +121,11 @@ ENV HERMES_HOME=/data/hermes
 # a `node_modules` there would fill it and take the memory with it.
 #
 # `/workspace` is on the rootfs (~7GB free), which survives a stop/start of the
-# same machine and is lost on redeploy. That is the correct lifetime for
-# working state: a clone is worth keeping across a nap and worth losing when
-# the machine is replaced.
+# same machine and is lost on redeploy *and* on every image update (`machine
+# update --image`, which is what "Update agents" does). That is the correct
+# lifetime for working state: a clone is worth keeping across a nap and worth
+# losing when the machine is replaced (FLOTTA-56 / D15). The path is
+# overridable as `$FLOTTA_WORKDIR` from Fleet settings; it must not be `/data`.
 ENV FLOTTA_WORKDIR=/workspace
 RUN mkdir -p /workspace
 WORKDIR /workspace

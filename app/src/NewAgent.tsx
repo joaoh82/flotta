@@ -205,7 +205,9 @@ export function NewAgent({ onCreated }: { onCreated: (box: BoxRow) => void }) {
               agent's, on its volume, and this form never touches it again. */}
           <span className="text-[11px] text-neutral-400">
             Written to the agent&rsquo;s SOUL.md once, at creation. From then on it&rsquo;s
-            the agent&rsquo;s own to keep or change.
+            the agent&rsquo;s own to keep or change. The projects folder (Fleet settings)
+            is appended so the agent knows where to clone, and that clones do not
+            survive an update.
           </span>
         </label>
       </div>

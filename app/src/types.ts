@@ -86,6 +86,12 @@ export type Machine = {
   created_at?: string | null;
   updated_at?: string | null;
   host_status?: string | null;
+  /**
+   * Where this agent clones projects (`FLOTTA_WORKDIR` on the machine).
+   * Absent on agents created before the setting was wired; they still use
+   * `/workspace`, which is the entrypoint default.
+   */
+  workdir?: string | null;
 };
 
 /**

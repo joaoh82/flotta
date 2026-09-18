@@ -275,6 +275,12 @@ there wins over this variable for agents created afterwards. The endpoint and
 key stay here — the app shows the endpoint read-only, because it decides where
 the key is sent.
 
+**`FLOTTA_WORKDIR` is the same kind of setting** — Fleet → Projects folder,
+default `/workspace`. It is where a new agent clones repositories, on the
+machine's disk rather than the memory volume. An image update replaces that
+disk, so clones are lost and the agent re-clones on the next task. Existing
+agents keep the path they were created with.
+
 **`FLOTTA_MODEL` is the fleet's default model, not every agent's.** An agent
 can be given its own — at creation (the Create form's *Model* field, or
 `flotta create --model`) or afterwards (**Info → Model**, or `flotta model set`).
