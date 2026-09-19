@@ -53,6 +53,10 @@ git-credential-flotta = "flotta.box.git_credential:main"
 flotta-repos = "flotta.box.repos:main"
 # What an agent runs to ask a colleague a question (M7, FLOTTA-54).
 flotta-ask = "flotta.box.ask:main"
+# Where this agent clones projects (FLOTTA-56). The path is in the
+# environment; the command exists so the agent does not have to guess it,
+# and so it is told the folder does not survive an image update.
+flotta-workdir = "flotta.box.workdir:main"
 
 [dependency-groups]
 dev = [

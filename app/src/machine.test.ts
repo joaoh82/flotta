@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   asStoreStatus,
+  DEFAULT_WORKDIR,
   drift,
   fieldsOf,
   fleetImageNote,
@@ -8,6 +9,7 @@ import {
   hermesStanding,
   imageParts,
   imageStanding,
+  projectsOf,
 } from "./machine";
 import type { Machine } from "./types";
 
@@ -149,6 +151,31 @@ describe("the lines of the panel", () => {
     expect(find(fieldsOf({ ...full, cpus: 0, memory_mb: 0 }), "Size")).toBe(
       "0 shared vCPU, 0 MB RAM",
     );
+  });
+});
+
+describe("the projects folder", () => {
+  it("reads the path the machine reported", () => {
+    const folder = projectsOf({ workdir: "/mnt/src" });
+    expect(folder.path).toBe("/mnt/src");
+    expect(folder.source).toBe("machine");
+    expect(folder.survivesUpdate).toBe(false);
+    expect(folder.detail).toContain("/mnt/src");
+    expect(folder.detail).toContain("lost");
+  });
+
+  it("falls back to the entrypoint default when the machine has no env var", () => {
+    // Agents created before FLOTTA-56. Inventing the fleet's current setting
+    // here would show a folder this agent does not use.
+    expect(projectsOf({ workdir: null }).path).toBe(DEFAULT_WORKDIR);
+    expect(projectsOf({ workdir: null }).source).toBe("default");
+    expect(projectsOf(null).path).toBe(DEFAULT_WORKDIR);
+    expect(projectsOf({ workdir: "  " }).source).toBe("default");
+  });
+
+  it("says the folder does not survive an update, which is the lifetime", () => {
+    expect(projectsOf(null).survivesUpdate).toBe(false);
+    expect(projectsOf(null).detail).toContain("re-clone");
   });
 });
 

@@ -103,6 +103,44 @@ function splitOnce(value: string, sep: string): [string, string | null] {
   return at === -1 ? [value, null] : [value.slice(0, at), value.slice(at + sep.length)];
 }
 
+/**
+ * The entrypoint's default, and what every agent uses when the machine has
+ * no `FLOTTA_WORKDIR`. Must match `flotta.workdir.DEFAULT_WORKDIR`.
+ */
+export const DEFAULT_WORKDIR = "/workspace";
+
+/** Where this agent clones, and whether that folder survives an update. */
+export type ProjectsFolder = {
+  path: string;
+  /** `machine` when the substrate reported it; `default` when we fell back. */
+  source: "machine" | "default";
+  /** Always false today (D15): the folder is on the rootfs, which an image update replaces. */
+  survivesUpdate: false;
+  detail: string;
+};
+
+/**
+ * The projects folder this panel should show.
+ *
+ * The path is what the machine has, falling back to the entrypoint default
+ * rather than to the fleet setting: an existing agent keeps `/workspace`
+ * after the setting changes, and showing the new value here would be the
+ * window telling a lie about a folder this agent does not use.
+ */
+export function projectsOf(machine: { workdir?: string | null } | null): ProjectsFolder {
+  const raw = machine?.workdir?.trim();
+  const path = raw || DEFAULT_WORKDIR;
+  return {
+    path,
+    source: raw ? "machine" : "default",
+    survivesUpdate: false,
+    detail:
+      `${path} is on this machine's disk, not its memory volume. ` +
+      "An image update replaces that disk, so clones are lost. " +
+      "The agent is told to re-clone if the folder is empty.",
+  };
+}
+
 /** One line of the panel. */
 export type Field = { label: string; value: string; mono?: boolean };
 

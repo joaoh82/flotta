@@ -1,4 +1,4 @@
-"""Register the skills Flotta ships with the box image (FLOTTA-61).
+"""Register the skills Flotta ships with the box image (FLOTTA-61, FLOTTA-54, FLOTTA-56).
 
 Runs on the box, from `box_entrypoint.sh`, before `hermes serve` starts.
 

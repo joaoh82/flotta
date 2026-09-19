@@ -89,6 +89,7 @@ def test_main_reports_one_boot_log_line(tmp_path, capsys):
 SHIPPED = {
     "flotta-github-access": ("flotta-repos", "flotta.box.repos:main"),
     "flotta-colleagues": ("flotta-ask", "flotta.box.ask:main"),
+    "flotta-projects": ("flotta-workdir", "flotta.box.workdir:main"),
 }
 
 
@@ -167,3 +168,15 @@ def test_the_skill_steers_away_from_the_commands_that_failed():
     _, body = _skill("flotta-github-access")
     assert "flotta repo list" in body
     assert "There is none to find" in body
+
+
+def test_the_projects_skill_says_the_folder_does_not_survive_an_update():
+    """The claim this skill exists to stop anyone building on: a checkout
+    reported as surviving a re-image. The instruction is clone-if-absent,
+    including after Update agents."""
+    _, body = _skill("flotta-projects")
+    assert "flotta-workdir" in body
+    assert "/data" in body
+    assert "sync `main`" in body
+    assert "re-clone" in body.lower() or "clone it" in body.lower()
+    assert "update" in body.lower()

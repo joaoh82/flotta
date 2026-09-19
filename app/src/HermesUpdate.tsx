@@ -114,7 +114,9 @@ export function HermesUpdate({
     <Bar tone="offer">
       <span>
         This builds a new box image on Hermes {offer.ref}, then moves every agent onto it.
-        Disks are kept — memories, skills and history all survive. Each agent{" "}
+        Memory disks are kept — memories, skills and history all survive.{" "}
+        <strong>Project checkouts are not</strong>: they live on the machine&rsquo;s disk,
+        which the new image replaces. Agents re-clone on the next task. Each agent{" "}
         <strong>restarts</strong>, and if one fails to come up the rest are left alone.
       </span>
       <button onClick={() => void start()} className={BUTTON}>

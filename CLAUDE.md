@@ -167,6 +167,17 @@ conventions, and the sharp edges below.
   exits the shell before `|| true` is ever reached — a missing venv would have
   stopped the agent booting. `test_recipes.py` runs the line under `set -euo
   pipefail` with no venv to prove it (FLOTTA-60).
+- **The projects folder is on the rootfs and is lost on every image update.**
+  `$FLOTTA_WORKDIR` (default `/workspace`) is created by the entrypoint on the
+  machine's disk, not on `/data`, because a `node_modules` on the 1 GB memory
+  volume would take the agent with it. `machine update --image` — which is
+  what "Update agents" does — swaps that disk. FLOTTA-56 / D15 accepts the
+  loss: the agent is told to clone if absent (standing instructions at
+  create, and the `flotta-projects` skill after the next image build). The
+  Info panel and the Update confirmation say so. A second volume is M6's
+  workspace tier, not this. The setting is a fleet default for **new**
+  agents; existing ones keep the path they were created with. **Needs a
+  build** for the skill to be on a box — the env var and the seed do not.
 - **An agent learns what Flotta gives it from a skill in the image, not from
   its volume or its working directory.** `flotta-repos` (FLOTTA-61) lists the
   repositories a box may use, via `GET /api/boxes/{id}/git-credential/repos`,

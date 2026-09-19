@@ -270,6 +270,11 @@ pub struct Machine {
     pub updated_at: Option<String>,
     #[serde(default)]
     pub host_status: Option<String>,
+    /// Where this agent clones projects (`FLOTTA_WORKDIR` on the machine).
+    /// `None` when the substrate did not report it — agents created before
+    /// the setting was wired still use the entrypoint default `/workspace`.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 /// The row and the machine together, plus why the machine is missing when it

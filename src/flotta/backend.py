@@ -186,6 +186,10 @@ class MachineInfo:
     created_at: str | None = None
     updated_at: str | None = None
     host_status: str | None = None
+    #: Where this agent clones projects (`FLOTTA_WORKDIR` on the machine).
+    #: `None` when the substrate did not report it — agents created before
+    #: the setting was wired still use the entrypoint default `/workspace`.
+    workdir: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

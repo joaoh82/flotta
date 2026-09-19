@@ -2892,12 +2892,14 @@ def test_reserve_box_records_who_the_agent_is(store):
         description="Reviews PRs",
         instructions="Be thorough.",
     )
+    from flotta.workdir import projects_convention
+
     meta = store.meta_for_box(box.id)
-    assert (meta.display_name, meta.description, meta.instructions) == (
-        "Reviewer",
-        "Reviews PRs",
-        "Be thorough.",
-    )
+    assert meta.display_name == "Reviewer"
+    assert meta.description == "Reviews PRs"
+    assert meta.instructions is not None
+    assert meta.instructions.startswith("Be thorough.")
+    assert projects_convention("/workspace") in meta.instructions
 
 
 def test_a_bad_description_refuses_before_the_name_is_spent(store):
@@ -2915,16 +2917,22 @@ def test_instructions_reach_the_box_as_the_seed(store):
     """The entrypoint writes `$FLOTTA_INSTRUCTIONS` to `$HERMES_HOME/SOUL.md`
     once. If this stopped travelling, every agent would be born with no
     persona and nothing would say so."""
+    from flotta.workdir import projects_convention
+
     impl = _Recording()
     create_box("eng-r", store=store, backend=impl, instructions="You review backend PRs.")
 
-    assert impl.spec.env["FLOTTA_INSTRUCTIONS"] == "You review backend PRs."
+    seeded = impl.spec.env["FLOTTA_INSTRUCTIONS"]
+    assert seeded.startswith("You review backend PRs.")
+    assert projects_convention("/workspace") in seeded
     assert "FLOTTA_INSTRUCTIONS" not in impl.spec.secrets, (
         "instructions are meant to be read by the agent; they are not a secret"
     )
 
 
 def test_no_instructions_means_no_env_key(store):
+    """An empty field is Hermes's default identity, not a projects paragraph
+    standing in for one. The skill tells an agent that has no SOUL.md."""
     impl = _Recording()
     create_box("eng-r", store=store, backend=impl)
     assert "FLOTTA_INSTRUCTIONS" not in impl.spec.env
@@ -2935,12 +2943,46 @@ def test_the_202_path_reads_instructions_from_the_store(store):
     passes `box=` and no instructions. One source, both paths — otherwise the
     button's agents would be born without the persona the form set."""
     from flotta.provision import reserve_box
+    from flotta.workdir import projects_convention
 
     impl = _Recording()
     reserved = reserve_box("eng-r", store=store, backend=impl, instructions="From the form.")
     create_box("eng-r", store=store, backend=impl, box=reserved)
 
-    assert impl.spec.env["FLOTTA_INSTRUCTIONS"] == "From the form."
+    seeded = impl.spec.env["FLOTTA_INSTRUCTIONS"]
+    assert seeded.startswith("From the form.")
+    assert projects_convention("/workspace") in seeded
+
+
+def test_a_projects_folder_set_in_the_app_reaches_the_machine(store):
+    """The wiring the catalogue requires. `$FLOTTA_WORKDIR` was already what
+    the entrypoint mkdir'd; it was just never set from anywhere a person
+    could reach."""
+    from flotta.workdir import ENV_KEY
+
+    store.set_setting(ENV_KEY, "/mnt/src")
+    impl = _Recording()
+    create_box("eng-r", store=store, backend=impl)
+    assert impl.spec.env[ENV_KEY] == "/mnt/src"
+
+
+def test_a_projects_folder_is_always_on_the_machine_even_at_the_default(store):
+    """So the Info panel can read it back rather than guessing `/workspace`."""
+    from flotta.workdir import DEFAULT_WORKDIR, ENV_KEY
+
+    impl = _Recording()
+    create_box("eng-r", store=store, backend=impl)
+    assert impl.spec.env[ENV_KEY] == DEFAULT_WORKDIR
+
+
+def test_the_projects_convention_uses_the_folder_that_was_set(store):
+    from flotta.workdir import ENV_KEY, projects_convention
+
+    store.set_setting(ENV_KEY, "/mnt/src")
+    impl = _Recording()
+    create_box("eng-r", store=store, backend=impl, instructions="You review backend PRs.")
+    assert projects_convention("/mnt/src") in impl.spec.env["FLOTTA_INSTRUCTIONS"]
+    assert "/workspace" not in impl.spec.env["FLOTTA_INSTRUCTIONS"]
 
 
 # --- set_instructions: changing what an agent is, on its own volume ---------

@@ -13,6 +13,7 @@ import {
   hermesStanding,
   imageParts,
   imageStanding,
+  projectsOf,
 } from "./machine";
 import {
   isFleetError,
@@ -115,6 +116,7 @@ export function AgentInfo({
   const hermes = hermesOf(machine);
   const upstream = versions ? hermesStanding(versions) : null;
   const fleetNote = versions ? fleetImageNote(versions) : null;
+  const projects = projectsOf(machine);
 
   const beginEdit = () => {
     // From `identity`, the same source the panel shows — so a second Rename
@@ -324,10 +326,13 @@ export function AgentInfo({
             {upgrade === "confirm" && (
               <div className="mt-2 rounded border border-neutral-200 p-2.5">
                 <p className="text-[11px] text-neutral-700">
-                  {box.name} will be re-imaged onto the fleet&rsquo;s current image. Its disk
-                  — memories, skills, conversation history — is kept; that is what makes this
-                  an upgrade rather than a rebuild. <strong>The machine restarts</strong>, so
-                  an open conversation ends.
+                  {box.name} will be re-imaged onto the fleet&rsquo;s current image. Its
+                  memory disk — memories, skills, conversation history — is kept; that is
+                  what makes this an upgrade rather than a rebuild.{" "}
+                  <strong>Clones in {projects.path} are not</strong>: that folder is on the
+                  machine&rsquo;s disk, which the new image replaces. The agent re-clones on
+                  the next task. <strong>The machine restarts</strong>, so an open
+                  conversation ends.
                 </p>
                 <div className="mt-2 flex gap-2">
                   <button
@@ -377,6 +382,17 @@ export function AgentInfo({
             </dl>
           </section>
         )}
+
+        <section>
+          <h3 className="text-[11px] uppercase tracking-wide text-neutral-400">
+            Projects folder
+          </h3>
+          <dl className="mt-1.5 space-y-1">
+            <Line label="Clones live in" value={projects.path} mono />
+            <Line label="Survives an update" value="No" />
+          </dl>
+          <p className="mt-1.5 text-[11px] text-neutral-500">{projects.detail}</p>
+        </section>
 
         {machine && (
           <section>

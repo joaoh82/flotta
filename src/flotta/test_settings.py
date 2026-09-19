@@ -85,6 +85,11 @@ def test_every_catalogued_setting_actually_changes_something():
         # shadow and the API refuses it. It is in the catalogue to be *read* —
         # "which provider is this fleet on" had no answer in the window.
         "FLOTTA_MODEL_BASE_URL",
+        # Read by `provision.create_box` into `BoxSpec.env` as `FLOTTA_WORKDIR`,
+        # which the entrypoint already mkdir's. The catalogue test exists to
+        # make somebody check that wiring; a setting nobody reads is a field
+        # that decides nothing.
+        "FLOTTA_WORKDIR",
     }, (
         "a setting was added or removed — confirm the new one is read by "
         "something that runs, the way idle sleep and the sweep interval are"

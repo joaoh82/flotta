@@ -670,6 +670,24 @@ def _inspecting(machines):
     )
 
 
+def test_inspect_reports_the_projects_folder_from_the_machine_env():
+    """The Info panel has to read what this agent actually has, not the
+    fleet default — an existing agent keeps `/workspace` after the setting
+    changes."""
+    machine = {
+        **_LIVE_MACHINE,
+        "config": {**_LIVE_MACHINE["config"], "env": {"FLOTTA_WORKDIR": "/mnt/src"}},
+    }
+    assert _inspecting([machine]).workdir == "/mnt/src"
+
+
+def test_inspect_blanks_a_missing_workdir_rather_than_guessing():
+    """Agents created before the setting was wired have no such env var.
+    The panel falls back to the entrypoint default; inventing it here would
+    make a missing key indistinguishable from a reported `/workspace`."""
+    assert _inspecting([_LIVE_MACHINE]).workdir is None
+
+
 def test_inspect_reports_what_the_substrate_says():
     """The whole panel, from one call — that is the point of the verb."""
     info = _inspecting([_LIVE_MACHINE])

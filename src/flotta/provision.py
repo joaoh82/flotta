@@ -464,6 +464,8 @@ def build_identity(
     """
     source = os.environ if env is None else env
     from flotta.auth import SCOPE_BOX_PEER, SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
+    from flotta.workdir import DEFAULT_WORKDIR
+    from flotta.workdir import ENV_KEY as WORKDIR_ENV
 
     box_env = {"FLOTTA_BOX_ID": box_id, "FLOTTA_BOX_NAME": box_name}
 
@@ -474,6 +476,15 @@ def build_identity(
     # after that — so this is the seed, and the store row is its record.
     if instructions:
         box_env["FLOTTA_INSTRUCTIONS"] = instructions
+
+    # Projects folder. Always set, including the default: the entrypoint
+    # already falls back to `/workspace`, but a missing key makes the Info
+    # panel guess, and a guessed path is the same class of lie as a field
+    # that decides nothing. `create_box` overwrites this with the fleet
+    # setting; this default is for callers of `build_identity` that are not
+    # that path (`flotta token box`).
+    workdir = (source.get(WORKDIR_ENV) or "").strip() or DEFAULT_WORKDIR
+    box_env[WORKDIR_ENV] = workdir
 
     control_url = (source.get("FLOTTA_CONTROL_URL") or "").strip()
     if control_url:
@@ -635,6 +646,17 @@ def reserve_box(
     anyway. Reserving the row separately lets the API answer at once with
     something real to poll.
     """
+    # The projects convention is part of what the agent is told, not a
+    # separate file: a path it does not know about is not a projects folder.
+    # Appended here so the store record matches the seed, on both the
+    # synchronous create and the 202 path that provisions later.
+    from flotta.store import INSTRUCTIONS_MAX
+    from flotta.workdir import resolve_workdir, with_projects_convention
+
+    instructions = with_projects_convention(
+        instructions, resolve_workdir(store), max_len=INSTRUCTIONS_MAX
+    )
+
     # Validated before the row exists, so a description that cannot be stored
     # refuses without spending the name — the same reason the name itself is
     # checked at the top of `store.create_box`.
@@ -810,9 +832,23 @@ def create_box(
     # meta) was reserved by the API before this ran on a thread, and the
     # argument is None. One source, both paths.
     meta = store.meta_for_box(box.id)
+
+    # Through the settings layer, not the raw environment: a projects folder
+    # (or a model) set in the app's Fleet settings has to reach the machine
+    # being created, or the field decides nothing.
+    from flotta.settings import layered
+    from flotta.workdir import ENV_KEY as WORKDIR_ENV
+    from flotta.workdir import resolve_workdir
+
+    source = layered(store)
     identity_env, identity_secrets = build_identity(
-        box.id, name, instructions=meta.instructions if meta else None
+        box.id, name, instructions=meta.instructions if meta else None, env=source
     )
+    # Always, including the default. `build_identity` already puts a value
+    # in, but it does not validate; this is the cleaned path the setting
+    # actually means, and the one the Info panel will read back off the
+    # machine.
+    identity_env = {**identity_env, WORKDIR_ENV: resolve_workdir(store, source)}
 
     # What this agent gets, as opposed to what every agent gets. Travels in the
     # spec because that is what the portable fields are for — see
@@ -825,14 +861,7 @@ def create_box(
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
-    # Through the settings layer, not the raw environment: a model set in the
-    # app's Fleet settings has to reach the machine being created, or the field
-    # decides nothing. Everything else in here is environment-only (the key and
-    # the endpoint are credentials-adjacent and not catalogued), so `layered`
-    # changes nothing for them.
-    from flotta.settings import layered
-
-    fleet, missing_fleet = fleet_secrets(layered(store))
+    fleet, missing_fleet = fleet_secrets(source)
     # This agent's own model, if it has one — from the store for the reason
     # `meta` is. Only the model is overridden: the endpoint and key stay the
     # fleet's (see the `box_models` table).
