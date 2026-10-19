@@ -86,13 +86,22 @@ fleet (M9). Nothing here is authenticated — localhost only.
 
 ## Requirements
 
-| | |
-|---|---|
-| Python | 3.11+ |
-| [uv](https://docs.astral.sh/uv/) | for install and dev |
-| [Fly.io](https://fly.io) account | boxes and volumes bill while they exist |
-| Node 20+ | only for the dashboard |
-| An OpenAI-compatible API key | only to run real tasks; the dry-run path needs none |
+| | | |
+|---|---|---|
+| Python | 3.11+ | |
+| [uv](https://docs.astral.sh/uv/) | for install and dev | |
+| [just](https://github.com/casey/just) | every command in this README is a recipe | |
+| [Fly.io](https://fly.io) account | boxes and volumes bill while they exist | |
+| An OpenAI-compatible API key | only to run real tasks; the dry-run path needs none | |
+| Node 20+ | the dashboard and the app's frontend | optional |
+| Rust (stable) | the app's Tauri half — `cargo` must be on PATH | optional |
+| [`gh`](https://cli.github.com) | `just hermes-check` reads the upstream release tag | optional |
+
+The three optional rows are only optional in the sense that `just check` — the
+whole hermetic suite — passes without them. `just ci` does not: it is
+`check` + `check-dashboard` + `check-app`, so Node and Rust are both required
+to run what CI runs. See [Setting up another machine](#setting-up-another-machine)
+for a known-good set of versions.
 
 ## Quickstart
 
@@ -483,10 +492,17 @@ and renaming it to match the box vocabulary would be wrong in the other directio
 ```bash
 just                     # list every recipe
 just check               # lint + tests — run before committing
-just check-dashboard     # tsc + eslint
-just ci                  # both of the above — everything CI runs
+just check-dashboard     # tsc + eslint for dashboard/
+just check-app           # tsc + vitest + rustfmt + clippy + cargo test for app/
+just ci                  # all three of the above — everything CI runs
 just test-one <keyword>  # a single test
 ```
+
+`just check` does not cover `dashboard/` or `app/`, which is why there are three
+recipes and not one. The app's own split matters for the same reason: its Rust
+half and its frontend are separate test suites, and for a while only the Rust
+half had one — four of the five findings in one review were in `.tsx` and every
+one of them typechecked cleanly.
 
 The test suite is hermetic and free: every Fly touchpoint is injected, never called for real.
 
@@ -495,6 +511,136 @@ That is also why it can run on every pull request:
 `tsc`/`eslint` as two separate jobs on each PR and each push to `main`. It needs no secrets and
 touches no billed infrastructure — the recipes that spend money (`smoke`, `deploy`, `e2e`,
 `e2e-live`, anything `fly-*`) are deliberately not part of it and stay a local, deliberate act.
+
+## Setting up another machine
+
+Everything needed to build and test Flotta is in git. Two things are not, and
+exactly one of them has to be carried by hand.
+
+### 1. The one file you must bring: `.env`
+
+`.env` is gitignored and holds your fleet's address and its secrets. Nothing
+regenerates it. Copy it over a channel that is not a chat window — `scp`, or an
+encrypted blob, or retype it out of a password manager:
+
+```bash
+scp path/to/flotta/.env you@newmachine:path/to/flotta/.env
+```
+
+These are the values a working development machine needs. `.env.example`
+documents all of them at length except `FLOTTA_BOX_PASSWORD`, which is not a
+value you choose — `just fly-auth` generates it and appends it to `.env` itself:
+
+| | |
+|---|---|
+| `FLOTTA_MODEL` · `FLOTTA_MODEL_BASE_URL` · `FLOTTA_API_KEY` | the model a box talks to |
+| `FLOTTA_FLY_ORG` · `FLOTTA_FLY_APP` | which Fly org and build app every `fly-*` recipe acts on |
+| `FLOTTA_BOX_PASSWORD` | the box's own credential, appended to `.env` by `just fly-auth` |
+| `FLOTTA_SIGNING_KEY` | mints every scoped token, including the app's |
+| `FLOTTA_CONTROL_URL` | your deployed control plane |
+| `FLOTTA_DOMAIN` | the front door's apex, e.g. `flotta.dev` |
+
+If you lose `.env`, most of it is recoverable rather than gone: the model trio,
+the signing key and the control URL are also Railway variables, the Fly values
+come back from `flyctl apps list`, and `FLOTTA_BOX_PASSWORD` is in Fly secrets.
+Check that last one before wiping the old machine — it is the one with no second
+home on your laptop.
+
+> `.env` belongs to the **main checkout**, not a worktree. A worktree copy is
+> gitignored and dies with its branch; `FLOTTA_FLY_APP` has been lost that way
+> once and `FLOTTA_BOX_PASSWORD` twice. For the same reason, run `just check` in
+> the main checkout at least once before trusting a green worktree — the suite
+> loads `.env`, and code under test may re-read it at run time.
+
+### 2. Tools
+
+```bash
+brew install uv just flyctl node rust gh      # or your platform's equivalent
+```
+
+Known-good versions, in case something behaves oddly:
+
+| | |
+|---|---|
+| uv | 0.8.0 |
+| just | 1.58.0 |
+| flyctl | 0.4.104 |
+| node | 24.13.0 |
+| cargo | 1.94.0 |
+| gh | 2.101.0 |
+
+The Railway CLI is **not** needed — no recipe calls it. The control plane is
+deployed from Railway's own git integration, and `FLOTTA_CONTROL_URL` is all
+this repo wants to know about it.
+
+### 3. Account auth
+
+Credentials, not files — log in freshly rather than copying `~/.fly` or
+`~/.config/gh` across:
+
+```bash
+flyctl auth login        # required for every fly-* recipe
+gh auth login            # for pull requests, and `just hermes-check`
+```
+
+Then confirm `flyctl` is pointed where you think it is:
+
+```bash
+just fly-whoami          # prints the org, app and volume every recipe will act on
+```
+
+That recipe exists because an ambient, globally-active flyctl profile was once
+found pointing at an unrelated project. The org is pinned in `.env` precisely so
+that the wrong one cannot provision into someone else's account silently.
+
+### 4. What you should *not* copy
+
+All of it is gitignored and all of it rebuilds. Copying it wastes time at best
+and moves a stale artifact at worst:
+
+| | |
+|---|---|
+| `.venv/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/` | `uv sync` |
+| `app/node_modules/`, `dashboard/node_modules/` | `npm ci` |
+| `dashboard/.next/`, `app/dist/`, `app/src-tauri/target/`, `app/src-tauri/gen/` | the first build |
+| `vendor/hermes/` (~220 MB) | `git clone https://github.com/NousResearch/Hermes-Agent vendor/hermes` |
+| `fleet.db*`, `e2e_fleet.db*`, `latency-*.json` | local scratch; the real fleet state is in Postgres |
+
+`vendor/hermes/` is a read-only reference clone — never modified, and it may lag
+the Hermes actually installed on a box. It is worth having locally and not worth
+rsyncing.
+
+### 5. The app's token
+
+The app reads its control-plane token from the keychain, and in **debug builds
+only** from `$FLOTTA_TOKEN` first. That fallback is not a shortcut: an unsigned
+binary's keychain ACL is tied to that exact binary, so every `cargo` rebuild is
+denied the item its predecessor wrote. Until the app is signed (M8.4),
+development means a token in the environment.
+
+`just app` handles it — with `FLOTTA_SIGNING_KEY` set it mints a one-day token
+carrying the four scopes the window uses and launches the app. So there is no
+keychain entry to migrate; a new machine with a correct `.env` has everything it
+needs.
+
+### 6. Prove it, in order
+
+Each step fails loudly if the step before it was incomplete:
+
+```bash
+git clone https://github.com/joaoh82/flotta && cd flotta
+cp .env.example .env     # then fill in the real values from step 1
+uv sync
+just check               # hermetic, offline, free — proves the Python toolchain
+just ci                  # adds the dashboard and the app — proves Node and Rust
+uv run flotta ps --json  # proves FLOTTA_CONTROL_URL and FLOTTA_SIGNING_KEY
+just fly-doctor          # proves flyctl auth and FLOTTA_FLY_APP
+just app                 # proves the whole token path, end to end
+```
+
+The first four cost nothing. `just fly-doctor` and `just app` touch real
+infrastructure; `just app` will also wake a box and make a model call once you
+talk to an agent.
 
 ## License
 
