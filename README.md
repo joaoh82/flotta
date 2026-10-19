@@ -633,7 +633,7 @@ cp .env.example .env     # then fill in the real values from step 1
 uv sync
 just check               # hermetic, offline, free — proves the Python toolchain
 just ci                  # adds the dashboard and the app — proves Node and Rust
-uv run flotta ps --json  # proves FLOTTA_CONTROL_URL and FLOTTA_SIGNING_KEY
+uv run flotta repo list eng-a  # proves FLOTTA_CONTROL_URL and FLOTTA_SIGNING_KEY
 just fly-doctor          # proves flyctl auth and FLOTTA_FLY_APP
 just app                 # proves the whole token path, end to end
 ```
