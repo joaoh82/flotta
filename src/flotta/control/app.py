@@ -90,10 +90,11 @@ def _build() -> str:
     an hour of misdiagnosis — the bug was hunted in Railway's variables, which
     were correct all along.
 
-    Railway sets `RAILWAY_GIT_COMMIT_SHA`; `$FLOTTA_BUILD` is the override for
-    anywhere else. Unknown is reported as unknown rather than guessed.
+    Render sets `RENDER_GIT_COMMIT` and Railway `RAILWAY_GIT_COMMIT_SHA`;
+    `$FLOTTA_BUILD` is the override for anywhere else. Unknown is reported as
+    unknown rather than guessed.
     """
-    for name in ("FLOTTA_BUILD", "RAILWAY_GIT_COMMIT_SHA"):
+    for name in ("FLOTTA_BUILD", "RENDER_GIT_COMMIT", "RAILWAY_GIT_COMMIT_SHA"):
         value = (os.environ.get(name) or "").strip()
         if value:
             return value[:12]

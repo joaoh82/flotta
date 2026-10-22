@@ -68,7 +68,7 @@ door-secrets: fly-whoami
     set -euo pipefail
     APP="${FLOTTA_DOOR_APP:-flotta-door}"
     : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
-    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env, e.g. https://<app>.up.railway.app}"
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env, e.g. https://<app>.onrender.com}"
     : "${FLOTTA_BOX_PASSWORD:?set FLOTTA_BOX_PASSWORD in .env — run just fly-auth}"
     DOMAIN="${FLOTTA_DOMAIN:-flotta.dev}"
 

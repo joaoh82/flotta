@@ -9,7 +9,7 @@ dependency you cannot skip:**
 
 | | What | Where | Depends on |
 |---|---|---|---|
-| 1 | **Control plane** — the fleet API and the reconcile loop | Railway | Postgres |
+| 1 | **Control plane** — the fleet API and the reconcile loop | Render | Postgres |
 | 2 | **Front door** — public TLS access to a box | Fly | the control plane's URL |
 | 3 | **DNS** — `*.flotta.dev` | Cloudflare | the door's IP address |
 
@@ -17,8 +17,8 @@ The instinct is to do DNS first. You cannot: the record points at the door's
 address, and the door does not have one until it is deployed. The door in turn
 needs a control-plane URL to ask "which machine is this box?".
 
-**Running cost:** roughly $2–4/month for the always-on door, plus Railway's
-Postgres, plus whatever the boxes cost. A box suspends itself after 30 minutes
+**Running cost:** roughly $2–4/month for the always-on door, plus Render's
+web service and Postgres (about $7 + $6/month on their smallest paid plans), plus whatever the boxes cost. A box suspends itself after 30 minutes
 idle and its volume keeps billing while it sleeps — cheap, not free.
 
 ---
@@ -39,31 +39,56 @@ mismatch. This script exists mostly to stop that happening.
 
 ---
 
+## Steps 1 and 2 on Render — apply the Blueprint
+
+[`render.yaml`](../render.yaml) declares both: a project `flotta` with a
+Postgres `flotta-db` and a web service `flotta-control` built from the root
+`Dockerfile`. In the Render dashboard, **New → Blueprint**, point it at this
+repo, and paste the values step 0 printed when it asks for each `sync: false`
+variable. `FLOTTA_DATABASE_URL` is wired to the database for you.
+
+`FLOTTA_CONTROL_URL` is the service's own address, which does not exist until
+the first deploy: give it `https://flotta-control.onrender.com` (or whatever
+name Render assigns) and correct it afterwards if that guess was wrong.
+
+**Both plans in the Blueprint are paid, on purpose.** A free Render web service
+sleeps when idle, which stops the reconcile loop (see below). A free Render
+Postgres **expires after 30 days**, and the fleet's records go with it.
+
+The two steps below say what each piece is and why, for anyone deploying
+somewhere other than Render — the image runs on anything that builds a
+Dockerfile and injects `PORT`.
+
+**Why not Railway, which this runbook used to name.** The first deployment ran
+there. On 2026-10-13 its project was deleted — by whom is not known — and the
+fleet's Postgres with it. Every agent's memory survived, because it lives on
+its Fly volume rather than in the control plane; see *Recovering a lost control
+plane* below.
+
 ## Step 1 — Postgres
 
-In a new Railway project, add a **PostgreSQL** service. Nothing else to do; the
-control plane creates its own schema on first boot.
+Any Postgres. Nothing else to do; the control plane creates its own schema on
+first boot.
 
 ---
 
 ## Step 2 — The control plane
 
-Same Railway project, a second service, deployed from this repo's root
-`Dockerfile`.
+A service deployed from this repo's root `Dockerfile`, beside the database.
 
 Variables:
 
 ```
 FLOTTA_SIGNING_KEY=<from step 0>
-FLOTTA_DATABASE_URL=${{Postgres.DATABASE_URL}}
+FLOTTA_DATABASE_URL=<the database's internal connection string>
 FLY_API_TOKEN=<flyctl tokens create org>
 FLOTTA_FLY_APP=<the app `just fly-up` deploys the image into>
 FLOTTA_FLY_ORG=personal
 ```
 
-`FLOTTA_DATABASE_URL` is a **Railway variable reference**, not a literal — it
-resolves to whatever the Postgres service is currently using, so it survives a
-database rotation.
+Wire `FLOTTA_DATABASE_URL` **by reference** where the host allows it (the
+Blueprint's `fromDatabase` does) rather than pasting a literal, so it survives
+a credential rotation.
 
 **The last three are why this is not a read-only service.** D10 says fleet
 state is written only by code that can reach the substrate, and the control
@@ -85,13 +110,13 @@ flyctl tokens create org --name flotta-control-plane
 An **org-scoped** token, because the control plane creates apps and machines
 rather than deploying to one that exists.
 
-Do not set `PORT`. Railway injects it and the image honours it.
+Do not set `PORT`. Render injects it and the image honours it.
 
 **Expect it to refuse to boot if the signing key is missing.** It binds
 `0.0.0.0` and the guard fails closed: an unauthenticated fleet API is a kill
 switch for every agent you own. That is the guard working.
 
-**Do not enable Railway's serverless/sleep on this service.** The reconcile
+**Do not put this service on a plan or setting that sleeps it.** The reconcile
 loop is continuous background work, and sleeping it reintroduces the exact bug
 it exists to fix — a task that strands with nothing watching. `/health` reports
 `503` when the loop stops sweeping, so if you do sleep it, you will find out
@@ -100,7 +125,7 @@ from a health check rather than from a stranded row a week later.
 Verify:
 
 ```bash
-curl -s https://<your-app>.up.railway.app/health | python3 -m json.tool
+curl -s https://<your-app>.onrender.com/health | python3 -m json.tool
 ```
 
 `reconcile_loop.sweeps` should be climbing and `failing` should be `false`.
@@ -129,7 +154,7 @@ Put these in `.env`:
 
 ```
 FLOTTA_SIGNING_KEY=<the SAME value the control plane has>
-FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
+FLOTTA_CONTROL_URL=https://<your-app>.onrender.com
 FLOTTA_DOMAIN=flotta.dev
 # FLOTTA_BOX_PASSWORD is already there, written by `just fly-auth`
 ```
@@ -201,7 +226,7 @@ certificate issued. This is usually a couple of minutes and occasionally longer.
 ## Step 6 — Prove it end to end
 
 ```bash
-export FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
+export FLOTTA_CONTROL_URL=https://<your-app>.onrender.com
 export FLOTTA_CONTROL_TOKEN='<the operator token from step 0>'
 
 flotta create eng-a                       # an agent, on Fly, with durable memory
@@ -230,7 +255,7 @@ then provisions on a background thread. Poll `GET /api/boxes/{id}` until it
 reaches `running`.
 
 It used to hold the request open for the whole thing — an app, a volume, a
-machine and a boot — and Railway's proxy gave up first:
+machine and a boot — and the host's proxy (Railway's, then) gave up first:
 
 ```
 HTTP 502 — Application failed to respond
@@ -265,7 +290,7 @@ FLOTTA_BOX_PASSWORD=<the same value the door has>
 FLOTTA_MODEL=<e.g. z-ai/glm-5.2>
 FLOTTA_MODEL_BASE_URL=<e.g. https://openrouter.ai/api/v1>
 FLOTTA_API_KEY=<your provider key>
-FLOTTA_CONTROL_URL=https://<your-app>.up.railway.app
+FLOTTA_CONTROL_URL=https://<your-app>.onrender.com
 FLOTTA_DOMAIN=flotta.dev
 ```
 
@@ -405,7 +430,7 @@ revoking a grant takes effect on the next fetch — no redeploy, no restart.
 
 Mint a **fine-grained** GitHub PAT over the repositories you want agents to
 reach. Contents read/write and pull requests; **not** administration and not
-`delete_repo`. Set it on Railway:
+`delete_repo`. Set it on the control plane:
 
 ```
 FLOTTA_GITHUB_TOKEN=github_pat_...
@@ -519,11 +544,31 @@ them.
 Everything above should be a recipe. In rough order of how much each would
 save:
 
-- **`just deploy-control`** — Railway has a CLI and a template format (§8.6's
-  M5.5). The template must default to requiring a signing key, or it ships the
-  unauthenticated fleet API the bind guard exists to prevent.
+- **`just deploy-control`** — `render.yaml` is the template (§8.6's M5.5);
+  what is left is applying it without the dashboard. It already requires a
+  signing key — a template that did not would ship the unauthenticated fleet
+  API the bind guard exists to prevent.
 - **`just deploy-all`** — the ordering above, with the waits.
 - **DNS** — Cloudflare has an API, so `just door-dns` could apply the records
   rather than print them. Deliberately not done: a script that edits your DNS
   is a script that can take your domain offline, and the first time through you
   should see what is being asked for.
+
+---
+
+## Recovering a lost control plane
+
+The control plane holds the fleet's *records*; the agents hold their own
+*memory*, on Fly volumes. Losing the first loses names, grants and history,
+not what any agent knows.
+
+1. Deploy a new control plane (steps 1–2) with the **same** `FLOTTA_SIGNING_KEY`,
+   so the door and every token already issued keep working.
+2. Point the door at it: `flyctl secrets set --app flotta-door
+   FLOTTA_CONTROL_URL=https://<new-url>`, and update your `.env`.
+3. Re-register each agent by creating it again **under its old name**, with
+   `FLOTTA_FLY_APP_PREFIX` matching the old apps. `create` adopts the machine it
+   finds in `<prefix>-<name>` rather than making a new one, so the volume — and
+   the memory — come back with it. Try the least important agent first.
+4. Re-grant repositories (`flotta repo grant`) and peers; they lived in the
+   lost database.
