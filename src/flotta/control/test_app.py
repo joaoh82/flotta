@@ -2928,3 +2928,15 @@ def test_a_model_change_the_substrate_refused_is_a_502(client, monkeypatch):
 
     monkeypatch.setattr(provision, "set_model", broken)
     assert client.put("/api/boxes/eng-a/model", json={"model": "z-ai/glm-5.2"}).status_code == 502
+
+
+def test_the_build_is_read_from_whichever_host_set_it(monkeypatch):
+    from flotta.control.app import _build
+
+    for name in ("FLOTTA_BUILD", "RENDER_GIT_COMMIT", "RAILWAY_GIT_COMMIT_SHA"):
+        monkeypatch.delenv(name, raising=False)
+    assert _build() == "unknown"
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "0123456789abcdef")
+    assert _build() == "0123456789ab"
+    monkeypatch.setenv("FLOTTA_BUILD", "override")
+    assert _build() == "override"

@@ -1,0 +1,81 @@
+# The control plane on Render — the fleet API, the reconcile loop, and the
+# Postgres that holds fleet state. See docs/DEPLOY.md, steps 1 and 2.
+#
+# Apply it from the Render dashboard (New → Blueprint, pointing at this repo).
+# Every `sync: false` variable is asked for once, when the Blueprint is first
+# applied, and never written here: `uv run python scripts/deploy_config.py`
+# prints the values. Render does not ask again for a variable added later —
+# set that one on the service by hand.
+#
+# Two choices here are load-bearing:
+#
+# - **A paid plan for the web service.** Render's free web services sleep when
+#   idle, and the reconcile loop is continuous background work: asleep, it
+#   strands tasks and never puts an idle agent to sleep. `/health` answers 503
+#   when the loop stops sweeping, which is what `healthCheckPath` watches.
+# - **A paid plan for the database.** A free Render Postgres expires after 30
+#   days, and the fleet's records go with it.
+#
+# The region is next to the door (Fly `iad`), because every wake the door asks
+# for is a round trip to here.
+
+projects:
+  - name: flotta
+    environments:
+      - name: production
+        services:
+          - type: web
+            name: flotta-control
+            runtime: docker
+            dockerfilePath: ./Dockerfile
+            region: virginia
+            plan: starter
+            healthCheckPath: /health
+            autoDeploy: true
+            envVars:
+              # The image honours Render's injected PORT; do not set one.
+              - key: FLOTTA_DATABASE_URL
+                fromDatabase:
+                  name: flotta-db
+                  property: connectionString
+              # Must equal the door's — a mismatch rejects every token with
+              # `bad signature`.
+              - key: FLOTTA_SIGNING_KEY
+                sync: false
+              # Reaching the substrate: `flyctl tokens create org`.
+              - key: FLY_API_TOKEN
+                sync: false
+              - key: FLOTTA_FLY_ORG
+                sync: false
+              - key: FLOTTA_FLY_APP
+                sync: false
+              # One Fly app per agent, named <prefix>-<box> (step 6b).
+              - key: FLOTTA_FLY_APP_PREFIX
+                sync: false
+              - key: FLOTTA_FLY_IMAGE
+                sync: false
+              # What a created agent needs to boot (step 6a).
+              - key: FLOTTA_BOX_PASSWORD
+                sync: false
+              - key: FLOTTA_MODEL
+                sync: false
+              - key: FLOTTA_MODEL_BASE_URL
+                sync: false
+              - key: FLOTTA_API_KEY
+                sync: false
+              # This service's own public URL — it cannot infer it, and stamps
+              # it onto every agent. Known only after the first deploy.
+              - key: FLOTTA_CONTROL_URL
+                sync: false
+              - key: FLOTTA_DOMAIN
+                sync: false
+              # Optional: GitHub identity for agents (step 7a).
+              - key: FLOTTA_GITHUB_TOKEN
+                sync: false
+        databases:
+          - name: flotta-db
+            region: virginia
+            plan: basic-256mb
+            postgresMajorVersion: "17"
+            # Only the control plane connects, over Render's private network.
+            ipAllowList: []

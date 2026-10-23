@@ -357,7 +357,7 @@ it exists to fix, one layer down.
 ## Deploying
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md) is the runbook for the first deployment:
-control plane on Railway, front door on Fly, DNS on Cloudflare — **in that
+control plane on Render, front door on Fly, DNS on Cloudflare — **in that
 order**, because each step needs an address the previous one produces.
 
 ```bash
@@ -541,7 +541,7 @@ value you choose — `just fly-auth` generates it and appends it to `.env` itsel
 | `FLOTTA_DOMAIN` | the front door's apex, e.g. `flotta.dev` |
 
 If you lose `.env`, most of it is recoverable rather than gone: the model trio,
-the signing key and the control URL are also Railway variables, the Fly values
+the signing key and the control URL are also variables on the Render service, the Fly values
 come back from `flyctl apps list`, and `FLOTTA_BOX_PASSWORD` is in Fly secrets.
 Check that last one before wiping the old machine — it is the one with no second
 home on your laptop.
@@ -569,9 +569,9 @@ Known-good versions, in case something behaves oddly:
 | cargo | 1.94.0 |
 | gh | 2.101.0 |
 
-The Railway CLI is **not** needed — no recipe calls it. The control plane is
-deployed from Railway's own git integration, and `FLOTTA_CONTROL_URL` is all
-this repo wants to know about it.
+No hosting CLI is needed — no recipe calls one. The control plane is deployed
+from [`render.yaml`](render.yaml) through Render's git integration, and
+`FLOTTA_CONTROL_URL` is all this repo wants to know about it.
 
 ### 3. Account auth
 
