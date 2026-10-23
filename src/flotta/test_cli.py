@@ -1049,3 +1049,45 @@ def test_a_bad_description_is_a_refusal_not_a_failure(tmp_path):
     )
     assert result.exit_code == 2, result.output
     assert "too long" in result.output
+
+
+def test_ps_lists_the_deployed_fleet_when_a_control_url_is_set(tmp_path, monkeypatch):
+    """`ps` on a laptop that has only talked to a control plane answered "no
+    fleet-state store" — there is no fleet.db there to find."""
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    calls = _remote(
+        monkeypatch,
+        box={
+            "boxes": [
+                {
+                    "id": "b-1",
+                    "name": "eng-d",
+                    "status": "stopped",
+                    "display_name": None,
+                    "latest_task": None,
+                    "created_at": "2026-10-22T10:00:00+00:00",
+                }
+            ]
+        },
+    )
+    result = CliRunner().invoke(app, ["ps"])
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][:3] == ("GET", "/api/boxes", ["fleet:read"])
+    assert "eng-d" in result.stdout and "stopped" in result.stdout
+
+
+def test_ps_with_an_explicit_store_stays_local(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    calls = _remote(monkeypatch, box={"boxes": []})
+    CliRunner().invoke(app, ["ps", "--store", str(tmp_path / "fleet.db")])
+    assert calls == []

@@ -122,6 +122,45 @@ door-dns:
     echo "  sends a heartbeat, and use Full (Strict) when you do."
 
 
+# Everything the CLI needs to reach the deployed fleet from this laptop, then
+# proof that it can. Safe to re-run: it only adds what is missing.
+#
+# It does not invent the fleet's values. FLOTTA_CONTROL_URL and the signing key
+# come from whoever deployed it (the vault's `dot env.md` copy, for this one);
+# a key generated here would mint tokens the control plane rejects as
+# `bad signature`. What it can derive, it does: the chat token is minted from
+# that key and written to .env, so `flotta chat` works without a pasted token.
+# CLI: install deps, add a chat token to .env, and check the fleet answers
+cli-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f .env ] || { echo "no .env here — copy the fleet's (vault: wiki/dot env.md) or .env.example"; exit 1; }
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the deployed control plane}"
+    : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
+    uv sync --quiet
+    if ! grep -q '^FLOTTA_TOKEN=.' .env; then
+      # A year of box:chat only. Read and write through the fleet API mint
+      # their own five-minute tokens from the signing key per command.
+      TOKEN=$(uv run flotta token mint "$USER" --scope box:chat --days 365 --json \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+      printf 'FLOTTA_TOKEN=%s\n' "$TOKEN" >> .env
+      echo "added a 1-year chat token to .env (value not echoed)"
+    fi
+    echo "fleet at $FLOTTA_CONTROL_URL:"
+    uv run flotta ps
+    echo
+    echo "ready: just fleet  ·  just chat <agent>"
+
+# CLI: list the deployed fleet
+fleet:
+    uv run flotta ps
+
+# One argument only, so just's re-splitting cannot mangle a quoted message;
+# with no message `flotta chat` is a conversation you type into.
+# CLI: talk to an agent through the door (waking it takes 10-60s)
+chat agent:
+    uv run flotta chat {{agent}}
+
 # Prints a signing key and every token a deployment needs, once. Nothing is
 # written to disk — see docs/DEPLOY.md for where each value goes.
 # M5b: generate all deployment secrets (run this before deploying anything)

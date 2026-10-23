@@ -607,6 +607,14 @@ def ps(
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum rows"),
 ) -> None:
     """List the fleet: boxes by default, tasks with --tasks."""
+    # Through the fleet API when there is one, like `repo`: a laptop that only
+    # talks to a deployed control plane has no fleet.db, and `ps` said so as
+    # "no fleet-state store" on the first command anyone ran. `--store` still
+    # wins, so a local store stays reachable on purpose. Tasks have no list
+    # endpoint yet, so `--tasks` stays local.
+    if control_url() and store is None and not tasks:
+        _ps_remote(as_json=as_json, status=status, all_=all_, limit=limit)
+        return
     with _open_store(store) as fleet:
         try:
             rows = fleet.list_tasks(status=status) if tasks else fleet.list_boxes(status)
@@ -649,6 +657,46 @@ def ps(
             typer.secho(
                 f"(store: {describe_store(store_target(store))})", fg=typer.colors.BRIGHT_BLACK
             )
+
+
+def _ps_remote(*, as_json: bool, status: str | None, all_: bool, limit: int) -> None:
+    from flotta.auth import SCOPE_FLEET_READ
+
+    show_all = all_ or status is not None
+    try:
+        body = control_request(
+            "GET",
+            "/api/boxes?all_=true" if show_all else "/api/boxes",
+            scopes=(SCOPE_FLEET_READ,),
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    rows = body.get("boxes", []) if isinstance(body, dict) else []
+    if status is not None:
+        rows = [r for r in rows if r.get("status") == status]
+    rows = rows[:limit]
+
+    if as_json:
+        emit(rows, "", as_json=True)
+        return
+    typer.echo(
+        render_table(
+            ["id", "name", "label", "status", "latest task", "created"],
+            [
+                [
+                    r.get("id") or "",
+                    r.get("name") or "",
+                    truncate(r.get("display_name"), 28),
+                    r.get("status") or "",
+                    truncate(r.get("latest_task"), 40),
+                    fmt_age(r.get("created_at")),
+                ]
+                for r in rows
+            ],
+        )
+    )
+    if not rows:
+        typer.secho(f"(fleet: {control_url()})", fg=typer.colors.BRIGHT_BLACK)
 
 
 async def _chat_via_door(
