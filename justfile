@@ -75,7 +75,13 @@ door-secrets: fly-whoami
     # Minted here rather than pasted, so the door's token cannot drift from the
     # key that has to verify it. A mismatch surfaces as `bad signature`, which
     # reads like a broken token rather than two different keys.
-    TOKEN=$(uv run flotta token mint door --scope fleet:read --scope box:chat)
+    #
+    # A year, not the CLI's 30-day default. The door is a service, not a person:
+    # nobody is watching when its token lapses, and the failure ("the door is not
+    # authorised to reach the fleet") took every agent offline on 2026-10-22.
+    # Rotate by re-running this recipe; rotating the signing key revokes it.
+    DAYS="${FLOTTA_DOOR_TOKEN_DAYS:-365}"
+    TOKEN=$(uv run flotta token mint door --scope fleet:read --scope box:chat --days "$DAYS")
 
     # --stage, deliberately. Without it `flyctl secrets set` waits for the app
     # to become healthy, and the door CANNOT become healthy until it has these
@@ -92,8 +98,8 @@ door-secrets: fly-whoami
       printf 'FLOTTA_BOX_PASSWORD=%s\n' "$FLOTTA_BOX_PASSWORD"
     } | flyctl secrets import --stage --app "$APP"
 
-    echo "staged 5 secrets on $APP (values not echoed)"
-    echo "now run: just door-deploy"
+    echo "staged 5 secrets on $APP (values not echoed); door token expires $(date -d "+$DAYS days" +%F 2>/dev/null || date -v+"$DAYS"d +%F)"
+    echo "now run: just door-deploy  (or, for a running door: flyctl secrets deploy --app $APP)"
 
 # Prints the exact Cloudflare records to add. Run after `just door-deploy`,
 # because the AAAA target is the door app's address and does not exist before.
