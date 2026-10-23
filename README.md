@@ -105,6 +105,15 @@ for a known-good set of versions.
 
 ## Quickstart
 
+> **Talking to a fleet that is already deployed?** Put its `.env` in this
+> directory (it needs `FLOTTA_CONTROL_URL` and `FLOTTA_SIGNING_KEY`), then:
+>
+> ```bash
+> just cli-setup      # deps, a chat token in .env, and the fleet listed as proof
+> just fleet          # list the agents
+> just chat eng-d     # talk to one (waking it takes 10-60s)
+> ```
+
 ### 1. Install
 
 ```bash
