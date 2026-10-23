@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -238,6 +238,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "pyyaml" },
     { name = "typer" },
 ]
 
@@ -269,7 +270,6 @@ dev = [
     { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pytest" },
-    { name = "pyyaml" },
     { name = "ruff" },
     { name = "websockets" },
 ]
@@ -283,6 +283,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'control'", specifier = ">=0.28.1" },
     { name = "httpx", marker = "extra == 'door'", specifier = ">=0.28.1" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", marker = "extra == 'control'", specifier = ">=0.34" },
     { name = "uvicorn", marker = "extra == 'door'", specifier = ">=0.34" },
@@ -296,7 +297,6 @@ dev = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "websockets", specifier = ">=13" },
 ]

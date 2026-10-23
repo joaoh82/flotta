@@ -81,7 +81,14 @@ RUN curl -fsSL https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin s
 # the entire point of this image — from being able to break the agent itself.
 ENV HERMES_VENV=/opt/hermes-venv
 ENV PATH="${HERMES_VENV}/bin:${PATH}"
-RUN python3 -m venv "$HERMES_VENV"
+#
+# The venv is built from **Hermes's own `uv.lock` and `.python-version`**, not
+# from Ubuntu's Python and pip. From v0.22.x every core dependency carries
+# `; python_version >= '3.14'`, so `pip install -e` on Ubuntu's 3.12 succeeded,
+# installed none of them, and every box boot-looped on `No module named
+# 'ruamel'`; on 3.14 pip cannot resolve the pins at all. The lock is what
+# upstream tests, and older tags (`.python-version` 3.11) take the same path.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
 ARG HERMES_REF
 ARG HERMES_REPO=https://github.com/NousResearch/Hermes-Agent
@@ -91,9 +98,15 @@ RUN test -n "$HERMES_REF" || (echo "HERMES_REF build-arg is required" >&2; exit 
 # builds, so `pip install 'hermes-agent @ git+...'` fails for anything after
 # v2026.7.20. Both commands embed HERMES_REF so the layer key changes when the
 # pin does.
+#
+# The trailing import fails the build when a dependency silently did not
+# install, instead of on every agent that takes the image.
 ENV HERMES_SRC=/opt/hermes
 RUN git clone --depth 1 --branch "$HERMES_REF" "$HERMES_REPO" "$HERMES_SRC" \
-    && "$HERMES_VENV/bin/pip" install --no-cache-dir -e "$HERMES_SRC"
+    && cd "$HERMES_SRC" \
+    && UV_PROJECT_ENVIRONMENT="$HERMES_VENV" uv sync --frozen --no-dev --no-cache \
+       --python-preference only-managed \
+    && "$HERMES_VENV/bin/python" -c "import hermes_cli.main"
 
 # Which Hermes this image carries, recorded **in the image**.
 #
@@ -133,7 +146,8 @@ WORKDIR /workspace
 # Flotta's own package, for `flotta.box.run` and the doctor.
 COPY pyproject.toml README.md /app/
 COPY src/ /app/src/
-RUN "$HERMES_VENV/bin/pip" install --no-cache-dir -e /app
+RUN uv pip install --no-cache --python "$HERMES_VENV" -e /app \
+    && "$HERMES_VENV/bin/python" -c "import yaml, flotta.box.inference"
 
 COPY fly/box_entrypoint.sh /usr/local/bin/box_entrypoint.sh
 RUN chmod +x /usr/local/bin/box_entrypoint.sh
