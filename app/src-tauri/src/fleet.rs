@@ -378,6 +378,43 @@ fn token_from_env() -> Option<String> {
     None
 }
 
+/// Fill whatever the settings file leaves unset from `.env`'s values.
+///
+/// `just app` exports `.env`, which already names the deployed control plane,
+/// and the window still opened "not configured" with an empty URL field until
+/// someone typed the same URL in again. A stored value always wins, so a URL
+/// set in the window is never overridden by the environment.
+pub fn fill_unset(mut settings: Settings, url: Option<String>, domain: Option<String>) -> Settings {
+    let given = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    if settings.control_url.trim().is_empty() {
+        if let Some(url) = given(url) {
+            settings.control_url = url;
+        }
+    }
+    if settings.domain.trim().is_empty() {
+        if let Some(domain) = given(domain) {
+            settings.domain = domain;
+        }
+    }
+    settings
+}
+
+/// Debug builds only, like `token_from_env` and for the same reason: no
+/// shipped binary should be steerable to another fleet by its environment.
+#[cfg(debug_assertions)]
+pub fn settings_from_env(settings: Settings) -> Settings {
+    fill_unset(
+        settings,
+        std::env::var("FLOTTA_CONTROL_URL").ok(),
+        std::env::var("FLOTTA_DOMAIN").ok(),
+    )
+}
+
+#[cfg(not(debug_assertions))]
+pub fn settings_from_env(settings: Settings) -> Settings {
+    settings
+}
+
 pub fn read_token() -> Result<Option<String>, FleetError> {
     // Before the keychain, so a developer whose item has been orphaned by a
     // rebuild is not blocked by it.
@@ -1731,5 +1768,26 @@ mod tests {
             named.name, "eng-a",
             "the address is untouched by a display name"
         );
+    }
+
+    #[test]
+    fn env_fills_an_unset_control_url_but_never_a_stored_one() {
+        let url = || Some("https://fleet.onrender.com".to_string());
+        let empty = Settings::default();
+        assert_eq!(
+            fill_unset(empty, url(), None).control_url,
+            "https://fleet.onrender.com"
+        );
+
+        let stored = Settings {
+            control_url: "https://mine.example".into(),
+            domain: "example.dev".into(),
+        };
+        let kept = fill_unset(stored, url(), Some("flotta.dev".into()));
+        assert_eq!(kept.control_url, "https://mine.example");
+        assert_eq!(kept.domain, "example.dev");
+
+        let blank = fill_unset(Settings::default(), Some("  ".into()), None);
+        assert_eq!(blank.control_url, "", "a blank variable is not a URL");
     }
 }

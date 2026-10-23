@@ -195,10 +195,13 @@ app:
     # their timelines (fleet:read), create one (fleet:write), destroy one
     # (box:destroy), and talk to one through the door (box:chat).
     #
-    # Nothing is minted when you already have a token, and nothing is required:
-    # with no signing key here the app falls through to the keychain, which is
-    # what a release build does in any case.
-    if [ -z "${FLOTTA_TOKEN:-}" ] && [ -n "${FLOTTA_SIGNING_KEY:-}" ]; then
+    # Nothing is required: with no signing key here the app falls through to
+    # the keychain, which is what a release build does in any case.
+    #
+    # Minted even when .env has a FLOTTA_TOKEN: that one is for `flotta chat`
+    # (box:chat only, which `just cli-setup` writes), and handing it to the
+    # window lists no agents — it cannot read the fleet.
+    if [ -n "${FLOTTA_SIGNING_KEY:-}" ]; then
       export FLOTTA_TOKEN="$(uv run flotta token mint app \
           --scope fleet:read --scope fleet:write \
           --scope box:chat --scope box:destroy --days 1)"
