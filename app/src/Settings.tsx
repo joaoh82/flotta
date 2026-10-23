@@ -62,6 +62,13 @@ export function Settings({
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
+    // An empty URL is a valid stored state ("not configured yet"), so the
+    // Rust side accepts it — and Save used to do exactly that, silently,
+    // leaving the header saying "not configured" with no reason given.
+    if (controlUrl.trim() === "") {
+      setError("Enter your control plane's URL — e.g. https://your-fleet.onrender.com");
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -98,7 +105,7 @@ export function Settings({
         <input
           value={controlUrl}
           onChange={(e) => setControlUrl(e.target.value)}
-          placeholder="https://your-fleet.up.railway.app"
+          placeholder="https://your-fleet.onrender.com"
           className="mt-1 w-full rounded border border-neutral-300 px-2 py-1.5 font-mono text-xs focus:border-neutral-500 focus:outline-none"
         />
       </label>

@@ -35,7 +35,8 @@ fn read_settings(app: &tauri::AppHandle) -> Settings {
         .ok()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .map(fleet::settings_from_env)
+        .unwrap_or_else(|| fleet::settings_from_env(Settings::default()))
 }
 
 /// What the settings screen shows. **Never the token** — the app can say
