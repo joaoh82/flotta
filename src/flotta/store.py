@@ -54,7 +54,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
-from flotta import db
+from flotta import db, migrations
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -178,11 +178,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- legitimately span several — fixing a bug in one repo and updating the client
 -- in another is one task, not two.
 --
--- A new TABLE rather than a column on `boxes`, and that is load-bearing: the
+-- A new TABLE rather than a column on `boxes`, and that was load-bearing: the
 -- schema is re-executed with CREATE TABLE IF NOT EXISTS on every open, so a
 -- new table appears on an existing fleet by itself. A new *column* would not,
--- and there is no migration machinery — the problem that pushed idle-sleep's
--- activity signal into the event log.
+-- and until M11 there was no migration machinery — the problem that pushed
+-- idle-sleep's activity signal into the event log. There is now
+-- (`flotta.migrations`); this script is the baseline it builds on.
 CREATE TABLE IF NOT EXISTS box_repos (
     box_id      TEXT NOT NULL REFERENCES boxes(id),
     repo        TEXT NOT NULL,
@@ -198,8 +199,8 @@ CREATE TABLE IF NOT EXISTS box_repos (
 -- to each of the others by hand. So the table records the exceptions, and a
 -- newly created agent is everyone's colleague with nothing written anywhere.
 --
--- `box_peers` may still exist on a fleet that ran FLOTTA-54. Nothing reads it;
--- there is no migration path to drop it, and an unused table is harmless.
+-- `box_peers` may still exist on a fleet that ran FLOTTA-54. Nothing reads it,
+-- and an unused table is harmless; dropping it would now be a migration.
 --
 -- **Directed on purpose.** "eng-r may not ask eng-g" says nothing about
 -- whether eng-g may ask eng-r.
@@ -279,8 +280,8 @@ CREATE TABLE IF NOT EXISTS builds (
 -- `CREATE TABLE IF NOT EXISTS`, so a new table appears on every existing
 -- store and a new column on `boxes` silently does not. `box_repos` and
 -- `builds` got in the same way. Building a migration framework to add two
--- columns would be machinery for one feature; if a real column change ever
--- becomes unavoidable, that is the moment to build it.
+-- columns would have been machinery for one feature; tenancy (M11) was the
+-- column change that could not be avoided, and `flotta.migrations` is it.
 --
 -- `instructions` is here as the RECORD of what the agent was seeded with —
 -- the app shows it, and a re-created machine can be seeded again. The copy
@@ -316,6 +317,15 @@ CREATE TABLE IF NOT EXISTS events (
     ts           TEXT NOT NULL,
     type         TEXT NOT NULL,
     payload_json TEXT
+);
+
+-- Which numbered migrations (`flotta.migrations`) this store has applied.
+-- Part of the baseline so that every store, however old, has it before the
+-- runner asks.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    applied_at  TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_boxes_status ON boxes(status);
@@ -563,7 +573,16 @@ class FleetStore:
             # Postgres cannot be in that state: there is no legacy deployment.
             self._check_not_legacy(db_path if db_path is not None else DEFAULT_DB_PATH)
         dialect = "postgres" if self.is_postgres else "sqlite"
+        # The baseline, then the numbered steps on top of it. The baseline is
+        # frozen for the tables it has: a column change to one of them is a
+        # migration, or a fresh store and an upgraded one would disagree.
         self._conn.executescript(_SCHEMA_TEMPLATE.format(events_id=_EVENTS_ID[dialect]))
+        try:
+            #: What opening this store applied — `flotta db migrate` reports it.
+            self.migrations_applied: list[int] = migrations.apply(self._conn, dialect=dialect)
+        except BaseException:
+            self._conn.close()
+            raise
 
     def _check_not_legacy(self, db_path: str | Path) -> None:
         """Refuse a pre-M0 store instead of rendering it as an empty fleet.

@@ -11,6 +11,7 @@ default-hidden set is per-tier: a torn-down box and a finished task, but *not*
 a stopped box — hiding your idle fleet would hide the point of the fleet.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -33,7 +34,7 @@ from flotta.cli import (
     task_row,
     truncate,
 )
-from flotta.store import Box, Event, Task, is_terminal
+from flotta.store import Box, Event, FleetStore, Task, is_terminal
 
 NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
 
@@ -1091,3 +1092,87 @@ def test_ps_with_an_explicit_store_stays_local(tmp_path, monkeypatch):
     calls = _remote(monkeypatch, box={"boxes": []})
     CliRunner().invoke(app, ["ps", "--store", str(tmp_path / "fleet.db")])
     assert calls == []
+
+
+# -- M11: `flotta db` ----------------------------------------------------------
+
+
+def _db(tmp_path, monkeypatch, *args, steps=()):
+    """`flotta db ...` against a store in tmp_path, with `steps` as this build's."""
+    from typer.testing import CliRunner
+
+    from flotta import migrations
+    from flotta.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(steps))
+    return CliRunner().invoke(app, ["db", *args, "--store", str(tmp_path / "fleet.db"), "--json"])
+
+
+def _probe():
+    from flotta.migrations import Migration
+
+    return Migration(1, "boxes gain a probe", ("ALTER TABLE boxes ADD COLUMN probe TEXT",))
+
+
+def test_db_status_lists_a_pending_migration_without_applying_it(tmp_path, monkeypatch):
+    """A status that applied what it reports could only ever say "none pending"."""
+    FleetStore(tmp_path / "fleet.db").close()
+
+    for _ in range(2):
+        result = _db(tmp_path, monkeypatch, "status", steps=[_probe()])
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["pending"] == [1]
+        assert body["ledger"] is True
+
+
+def test_db_migrate_applies_and_says_which(tmp_path, monkeypatch):
+    FleetStore(tmp_path / "fleet.db").close()
+
+    result = _db(tmp_path, monkeypatch, "migrate", steps=[_probe()])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["applied"] == [1]
+
+    again = _db(tmp_path, monkeypatch, "migrate", steps=[_probe()])
+    assert json.loads(again.output)["applied"] == []
+    status = _db(tmp_path, monkeypatch, "status", steps=[_probe()])
+    assert json.loads(status.output)["pending"] == []
+
+
+def test_db_status_reads_a_store_from_before_migrations(tmp_path, monkeypatch):
+    """Every store deployed before M11 has no ledger; say so, and change nothing."""
+    fleet = FleetStore(tmp_path / "fleet.db")
+    fleet._conn.execute("DROP TABLE schema_migrations")
+    fleet.close()
+
+    body = json.loads(_db(tmp_path, monkeypatch, "status", steps=[_probe()]).output)
+    assert (body["ledger"], body["pending"]) == (False, [1])
+    body = json.loads(_db(tmp_path, monkeypatch, "status", steps=[_probe()]).output)
+    assert body["ledger"] is False, "status must not have created the ledger"
+
+
+def test_db_status_refuses_a_store_that_is_not_there(tmp_path, monkeypatch):
+    assert _db(tmp_path, monkeypatch, "status").exit_code == 2
+    assert not (tmp_path / "fleet.db").exists()
+
+
+def test_a_migration_number_taken_twice_is_a_message_not_a_traceback(tmp_path, monkeypatch):
+    from flotta.migrations import Migration
+
+    FleetStore(tmp_path / "fleet.db").close()
+    assert _db(tmp_path, monkeypatch, "migrate", steps=[_probe()]).exit_code == 0
+    other = Migration(1, "someone else's step", ("SELECT 1",))
+    result = _db(tmp_path, monkeypatch, "migrate", steps=[other])
+    assert result.exit_code == 2
+    assert "same number" in result.output
+
+
+def test_db_status_says_when_it_is_not_reading_the_deployed_fleet(tmp_path, monkeypatch):
+    """An "up to date" about a laptop's fleet.db must not read as production's."""
+    FleetStore(tmp_path / "fleet.db").close()
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+
+    result = _db(tmp_path, monkeypatch, "status")
+    assert result.exit_code == 0
+    assert "not the fleet at https://control.example" in result.output

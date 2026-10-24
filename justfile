@@ -167,6 +167,16 @@ chat agent:
 deploy-config domain="flotta.dev":
     uv run python scripts/deploy_config.py --domain {{domain}}
 
+# M11 — which schema migrations the store has, and which are pending (changes
+# nothing). Reads $FLOTTA_DATABASE_URL, else $FLOTTA_STORE / ./fleet.db.
+db-status:
+    uv run flotta db status
+
+# M11 — apply pending schema migrations now. Opening the store does this
+# anyway; this is for doing it on purpose, e.g. before a deploy.
+db-migrate:
+    uv run flotta db migrate
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key
