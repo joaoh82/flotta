@@ -489,6 +489,15 @@ conventions, and the sharp edges below.
   ask the *control plane* to act, where hop limits and events live. **Deploy
   the door and control plane before minting any token with an `org` claim** —
   an older door ignores claims it does not know.
+- **The fleet API itself is not tenant-scoped yet, and a test says so (M11).**
+  The door guard covers the path through the door; the control plane is also
+  reachable directly, and its routes take their token as `_` and look boxes up
+  with `store.get_box`. `control/test_route_scope.py` reads `app.py` and lists
+  every route that does not bind its token or that reaches a fleet-wide read
+  (`get_box`, `get_box_by_name`, `list_boxes`, `peers_for_box`, `may_message`),
+  through helpers included. **`UNSCOPED_ROUTES` is a ratchet**: a new route
+  that is not scoped fails, and so does a scoped one left on the list. Do not
+  add a route to it — scope the route. M11.6a/b empty it.
 - **The door also strips the caller's `Authorization` before proxying** and
   substitutes the fleet's basic auth, so the answering box learns nothing about
   who is calling it. "Who is asking" has to travel in the message body —
