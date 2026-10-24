@@ -89,7 +89,52 @@ UNSCOPED_ROUTES = frozenset(
     }
 )
 
-_ROUTE_DECORATORS = frozenset({"get", "post", "put", "patch", "delete", "api_route", "websocket"})
+#: Every `FastAPI` method that registers the function it decorates.
+_ROUTE_DECORATORS = frozenset(
+    {
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+        "trace",
+        "api_route",
+        "websocket",
+        "websocket_route",
+    }
+)
+
+#: Every other way to put a route on the app — none of them a decorator, so
+#: none of them seen by this reader. `app.py` may not use them.
+_UNREAD_REGISTRATIONS = frozenset(
+    {
+        "add_api_route",
+        "add_api_websocket_route",
+        "add_route",
+        "include_router",
+        "mount",
+        "host",
+        "frontend",
+    }
+)
+
+#: `FastAPI`'s remaining public names, none of which adds a route.
+_NOT_ROUTES = frozenset(
+    {
+        "add_exception_handler",
+        "add_middleware",
+        "build_middleware_stack",
+        "exception_handler",
+        "middleware",
+        "on_event",
+        "openapi",
+        "routes",
+        "setup",
+        "url_path_for",
+    }
+)
 
 _Function = ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -130,13 +175,14 @@ def _names_read(node: _Function) -> set[str]:
     }
 
 
-def _unscoped_calls(node: _Function) -> set[str]:
+def _unscoped_reads(node: _Function) -> set[str]:
+    """Every fleet-wide read `node` names — called, aliased or handed on.
+
+    A reference, not only a call: `lookup = store.get_box` and
+    `Thread(target=store.get_box)` read the fleet just as a call does.
+    """
     return {
-        n.func.attr
-        for n in ast.walk(node)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr in UNSCOPED_READS
+        n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute) and n.attr in UNSCOPED_READS
     }
 
 
@@ -148,27 +194,36 @@ def _unscoped_routes(
 ) -> dict[str, list[str]]:
     """Every route that is not scoped, with why. Empty means all of them are.
 
-    A helper counts if it is *referenced* at all, not only called: a function
-    handed to a thread does its lookups on the route's behalf just the same.
+    A function counts if it is *referenced* at all, not only called: one handed
+    to a thread does its lookups on the route's behalf just the same. Routes
+    are functions too — a new route calling an old unscoped one inherits its
+    reads, or the list would let it in on the old one's entry.
     """
     functions = _functions(ast.parse(source))
     routes = [f for f in functions if _is_route(f)]
-    route_ids = {id(f) for f in routes}
-    helpers = {
-        f.name: f for f in functions if id(f) not in route_ids and f.name not in scope_functions
-    }
 
-    # What each helper reaches, to a fixpoint: helpers call helpers.
-    reach = {name: {(read, name) for read in _unscoped_calls(f)} for name, f in helpers.items()}
+    # Keyed by name, as references are; same-named functions are merged, which
+    # can only over-report.
+    graph: dict[str, list[_Function]] = {}
+    for f in functions:
+        if f.name not in scope_functions:
+            graph.setdefault(f.name, []).append(f)
+
+    # What each function reaches, to a fixpoint: functions call functions.
+    reach = {
+        name: {(read, name) for f in fs for read in _unscoped_reads(f)}
+        for name, fs in graph.items()
+    }
     changed = True
     while changed:
         changed = False
-        for name, f in helpers.items():
-            for callee in _names_read(f) & helpers.keys():
-                new = reach[callee] - reach[name]
-                if new:
-                    reach[name] |= new
-                    changed = True
+        for name, fs in graph.items():
+            for f in fs:
+                for callee in _names_read(f) & graph.keys():
+                    new = reach[callee] - reach[name]
+                    if new:
+                        reach[name] |= new
+                        changed = True
 
     unscoped: dict[str, list[str]] = {}
     seen: set[str] = set()
@@ -187,8 +242,8 @@ def _unscoped_routes(
         elif principal not in _names_read(route):
             reasons.append(f"never reads its token `{principal}`")
 
-        found = {(read, None) for read in _unscoped_calls(route)}
-        for callee in _names_read(route) & helpers.keys():
+        found = {(read, None) for read in _unscoped_reads(route)}
+        for callee in _names_read(route) & graph.keys():
             found |= reach[callee]
         for read, via in sorted(found, key=lambda pair: (pair[0], pair[1] or "")):
             reasons.append(f"calls `{read}`" + (f" via `{via}`" if via else ""))
@@ -247,7 +302,59 @@ def test_the_unscoped_allowlist_names_real_routes():
         assert any("Token" in a for a in annotations), f"{name} takes no token"
 
 
+def test_every_route_is_registered_where_the_reader_looks():
+    """Only decorators are read, so only decorators may register a route.
+
+    `app.include_router(...)` or `app.add_api_route("/x", leak)` would put an
+    endpoint on the fleet API that the test above never sees.
+    """
+    tree = ast.parse(_app_source())
+    used = {
+        n.func.attr
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in _UNREAD_REGISTRATIONS
+    }
+    assert not used, f"app.py registers routes the reader cannot see: {sorted(used)}"
+
+
+def test_every_way_fastapi_adds_a_route_is_accounted_for():
+    """A FastAPI upgrade that adds one fails here, rather than going unread."""
+    from fastapi import FastAPI
+
+    public = {name for name in dir(FastAPI) if not name.startswith("_")}
+    known = _ROUTE_DECORATORS | _UNREAD_REGISTRATIONS | _NOT_ROUTES
+    assert not public - known, f"unclassified FastAPI method(s): {sorted(public - known)}"
+
+
 # -- the reader itself, against source written to break it ---------------------
+
+
+# Spelled out, not `sorted(_ROUTE_DECORATORS)`: a case list drawn from the set
+# under test loses the case along with the entry, and passes.
+@pytest.mark.parametrize(
+    "method",
+    [
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+        "trace",
+        "api_route",
+        "websocket",
+        "websocket_route",
+    ],
+)
+def test_the_reader_finds_every_kind_of_route(method):
+    route = f"@app.{method}('/boxes')\ndef leak():\n    return store.list_boxes()"
+    assert _unscoped_routes(route, open_routes=frozenset()) == {
+        "leak": ["takes no principal", "calls `list_boxes`"]
+    }
+
 
 _HEADER = """
 needs_read = object()
@@ -293,8 +400,38 @@ def _scoped_box(store, token: Token, ref):
             "    threading.Thread(target=_later, args=(token,)).start()",
             "calls `list_boxes` via `_later`",
         ),
+        (
+            "def r(box_id: str, token: Token | None = needs_read):\n"
+            "    lookup = store.get_box\n"
+            "    return token and lookup(box_id)",
+            "calls `get_box`",
+        ),
+        (
+            "def r(box_id: str, token: Token | None = needs_read):\n"
+            "    threading.Thread(target=store.get_box, args=(token,)).start()",
+            "calls `get_box`",
+        ),
+        (
+            "@app.get('/legacy')\n"
+            "def legacy(box_id: str, _: Token | None = needs_read):\n"
+            "    return store.get_box(box_id)\n"
+            "@app.get('/x')\n"
+            "def r(box_id: str, token: Token | None = needs_read):\n"
+            "    return token.subject and legacy(box_id, token)",
+            "calls `get_box` via `legacy`",
+        ),
     ],
-    ids=["discarded", "unread", "no-principal", "direct", "through-helpers", "handed-to-a-thread"],
+    ids=[
+        "discarded",
+        "unread",
+        "no-principal",
+        "direct",
+        "through-helpers",
+        "handed-to-a-thread",
+        "bound-method-alias",
+        "bound-method-thread-target",
+        "through-another-route",
+    ],
 )
 def test_the_reader_catches(route, reason):
     """Each way a route can skip the scope, written out and caught.
