@@ -1588,6 +1588,8 @@ def _migration_lines(lines: list[Any]) -> str:
     for line in lines:
         state = line.applied_at or "pending"
         note = "" if line.known else "  (not in this build — a newer one applied it)"
+        if line.conflict:
+            note = f"  CONFLICT: this store applied {line.version} as {line.recorded_as!r}"
         out.append(f"  {line.version:>3}  {line.name:<44}  {state}{note}")
     return "\n".join(out)
 
@@ -1634,12 +1636,21 @@ def db_status(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
         conn.close()
 
     pending = [line.version for line in lines if line.applied_at is None]
+    conflicts = [line.version for line in lines if line.conflict]
     label = _store_label(target)
-    summary = (
-        f"{len(pending)} pending — applied at the next open, or now with `flotta db migrate`"
-        if pending
-        else "up to date"
-    )
+    if conflicts:
+        # Not "up to date": every ordinary open of this store refuses it.
+        summary = (
+            f"conflict at {', '.join(map(str, conflicts))}: two changes took the same "
+            "migration number, and this build will refuse to open the store. Renumber "
+            "the one that has not been released."
+        )
+    elif pending:
+        summary = (
+            f"{len(pending)} pending — applied at the next open, or now with `flotta db migrate`"
+        )
+    else:
+        summary = "up to date"
     if not ledger:
         summary += " (no ledger yet: this store predates migrations; the next open adds one)"
     emit(
@@ -1648,10 +1659,13 @@ def db_status(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
             "ledger": ledger,
             "migrations": [line.as_dict() for line in lines],
             "pending": pending,
+            "conflicts": conflicts,
         },
         f"store: {label}\n{_migration_lines(lines)}\n{summary}",
         as_json=as_json,
     )
+    if conflicts:
+        raise typer.Exit(code=2)
 
 
 @db_app.command("migrate")

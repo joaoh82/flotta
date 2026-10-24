@@ -125,6 +125,19 @@ def test_a_number_taken_twice_is_refused(target, monkeypatch):
         _open(target, monkeypatch, other)
 
 
+def test_status_shows_a_number_taken_twice_as_a_conflict(target, monkeypatch):
+    _open(target, monkeypatch, PROBE).close()
+    other = Migration(1, "something else entirely", ("SELECT 1",))
+    monkeypatch.setattr(migrations, "MIGRATIONS", ())
+    with FleetStore(target) as store:
+        [line] = migrations.status(store._conn, (other,))
+    assert (line.name, line.recorded_as, line.conflict) == (
+        "something else entirely",
+        "boxes gain a probe",
+        True,
+    )
+
+
 def test_a_newer_store_opens_with_a_warning(target, monkeypatch, caplog):
     """A rollback runs the old build against the new schema. Refusing is an outage."""
     second = Migration(2, "boxes gain a second probe", ("ALTER TABLE boxes ADD COLUMN p2 TEXT",))
@@ -180,6 +193,43 @@ def test_two_stores_opening_at_once_apply_a_migration_once(target, monkeypatch):
         t.start()
     for t in threads:
         t.join(timeout=30)
+
+    assert errors == [], errors
+    with FleetStore(target) as store:
+        assert [s.version for s in migrations.status(store._conn, (PROBE,))] == [1]
+
+
+@pytest.mark.parametrize("start", ["before-the-runner", "empty"])
+def test_stores_opening_at_once_lay_the_baseline_together(target, monkeypatch, start):
+    """The first deploy of this change: every worker opens a store with no ledger.
+
+    Postgres's `CREATE TABLE IF NOT EXISTS` is not safe against another session
+    creating the same missing table — the loser fails on `pg_type`'s unique
+    index rather than finding it there. Upgrading is the case that matters (only
+    `schema_migrations` is missing), and an empty database is the same race
+    across every table.
+    """
+    monkeypatch.setattr(migrations, "MIGRATIONS", (PROBE,))
+    if start == "before-the-runner":
+        with FleetStore(target) as store:
+            store._conn.execute("DROP TABLE schema_migrations")
+            store._conn.execute("ALTER TABLE boxes DROP COLUMN probe")
+
+    start_together = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def opener() -> None:
+        try:
+            start_together.wait()
+            FleetStore(target).close()
+        except BaseException as exc:  # pragma: no cover - the assertion reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=opener) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
 
     assert errors == [], errors
     with FleetStore(target) as store:

@@ -1176,3 +1176,18 @@ def test_db_status_says_when_it_is_not_reading_the_deployed_fleet(tmp_path, monk
     result = _db(tmp_path, monkeypatch, "status")
     assert result.exit_code == 0
     assert "not the fleet at https://control.example" in result.output
+
+
+def test_db_status_reports_a_number_taken_twice_instead_of_up_to_date(tmp_path, monkeypatch):
+    """Status must not call ready a store that `migrate` and every open refuse."""
+    from flotta.migrations import Migration
+
+    FleetStore(tmp_path / "fleet.db").close()
+    assert _db(tmp_path, monkeypatch, "migrate", steps=[_probe()]).exit_code == 0
+
+    other = Migration(1, "someone else's step", ("SELECT 1",))
+    result = _db(tmp_path, monkeypatch, "status", steps=[other])
+    assert result.exit_code == 2
+    body = json.loads(result.output)
+    assert body["conflicts"] == [1]
+    assert body["migrations"][0]["recorded_as"] == "boxes gain a probe"

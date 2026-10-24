@@ -194,6 +194,13 @@ class Status:
     name: str
     applied_at: str | None
     known: bool = True
+    #: The name the store recorded, when it is not this build's — two changes
+    #: took one number, and every ordinary open of this store refuses it.
+    recorded_as: str | None = None
+
+    @property
+    def conflict(self) -> bool:
+        return self.recorded_as is not None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -201,17 +208,28 @@ class Status:
             "name": self.name,
             "applied_at": self.applied_at,
             "known": self.known,
+            "recorded_as": self.recorded_as,
         }
 
 
 def status(conn: Any, migrations: Sequence[Migration] | None = None) -> list[Status]:
-    """Every migration this build knows, applied or not, plus any it does not."""
+    """Every migration this build knows, applied or not, plus any it does not.
+
+    A version recorded under another name is reported as a conflict rather
+    than matched on number alone: `apply` refuses that store, and a status
+    that called it applied would say "ready" about a store nothing can open.
+    """
     migrations = MIGRATIONS if migrations is None else migrations
     done = recorded(conn)
-    lines = [
-        Status(m.version, m.name, done[m.version][1] if m.version in done else None)
-        for m in migrations
-    ]
+    lines = []
+    for m in migrations:
+        if m.version not in done:
+            lines.append(Status(m.version, m.name, None))
+            continue
+        name, applied_at = done[m.version]
+        lines.append(
+            Status(m.version, m.name, applied_at, recorded_as=None if name == m.name else name)
+        )
     known = {m.version for m in migrations}
     lines += [
         Status(version, name, applied_at, known=False)
