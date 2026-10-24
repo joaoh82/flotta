@@ -686,8 +686,27 @@ def test_the_address_says_whose_box_it_is(secured):
     assert response.status_code == 200
     box = response.json()["box"]
     assert box["name"] == "eng-a" and box["id"].startswith("b-")
-    # Every box is the default org's until the tenancy schema lands.
+    # A box made before any org but the default existed is the operator's.
     assert (box["org"], box["client"]) == ("default", "default")
+
+
+def test_the_address_reads_the_tenancy_off_the_box(secured, fleet):
+    """Not a constant: the door's subject check is only as good as this answer.
+
+    No path creates a box in another org until M11.5, so the row is moved by
+    hand — what is under test is that the route reports the row.
+    """
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    with FleetStore(fleet) as store:
+        store.create_org("agency-x", "Agency X")
+        store.create_client("agency-x", "acme", "Acme")
+        store._conn.execute(
+            "UPDATE boxes SET org_id = 'agency-x', client_id = 'acme' WHERE name = 'eng-a'"
+        )
+
+    box = secured.get("/api/boxes/eng-a/address", headers=_bearer(SCOPE_BOX_CHAT)).json()["box"]
+    assert (box["org"], box["client"]) == ("agency-x", "acme")
 
 
 def test_resolving_a_box_never_wakes_it(secured, monkeypatch):

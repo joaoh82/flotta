@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from flotta import migrations as _migrations
 from flotta.cli import (
     DEFAULT_STORE,
     STORE_ENV_VAR,
@@ -1097,22 +1098,27 @@ def test_ps_with_an_explicit_store_stays_local(tmp_path, monkeypatch):
 # -- M11: `flotta db` ----------------------------------------------------------
 
 
+#: This build's migrations, before any test appends to them; the stand-ins
+#: below are numbered after them.
+_BUILT = _migrations.MIGRATIONS
+_NEXT = len(_BUILT) + 1
+
+
 def _db(tmp_path, monkeypatch, *args, steps=()):
-    """`flotta db ...` against a store in tmp_path, with `steps` as this build's."""
+    """`flotta db ...` against a store in tmp_path, with `steps` after this build's."""
     from typer.testing import CliRunner
 
-    from flotta import migrations
     from flotta.cli import app
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(steps))
+    monkeypatch.setattr(_migrations, "MIGRATIONS", _BUILT + tuple(steps))
     return CliRunner().invoke(app, ["db", *args, "--store", str(tmp_path / "fleet.db"), "--json"])
 
 
 def _probe():
     from flotta.migrations import Migration
 
-    return Migration(1, "boxes gain a probe", ("ALTER TABLE boxes ADD COLUMN probe TEXT",))
+    return Migration(_NEXT, "boxes gain a probe", ("ALTER TABLE boxes ADD COLUMN probe TEXT",))
 
 
 def test_db_status_lists_a_pending_migration_without_applying_it(tmp_path, monkeypatch):
@@ -1123,7 +1129,7 @@ def test_db_status_lists_a_pending_migration_without_applying_it(tmp_path, monke
         result = _db(tmp_path, monkeypatch, "status", steps=[_probe()])
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
-        assert body["pending"] == [1]
+        assert body["pending"] == [_NEXT]
         assert body["ledger"] is True
 
 
@@ -1132,7 +1138,7 @@ def test_db_migrate_applies_and_says_which(tmp_path, monkeypatch):
 
     result = _db(tmp_path, monkeypatch, "migrate", steps=[_probe()])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["applied"] == [1]
+    assert json.loads(result.output)["applied"] == [_NEXT]
 
     again = _db(tmp_path, monkeypatch, "migrate", steps=[_probe()])
     assert json.loads(again.output)["applied"] == []
@@ -1142,12 +1148,14 @@ def test_db_migrate_applies_and_says_which(tmp_path, monkeypatch):
 
 def test_db_status_reads_a_store_from_before_migrations(tmp_path, monkeypatch):
     """Every store deployed before M11 has no ledger; say so, and change nothing."""
+    monkeypatch.setattr(_migrations, "MIGRATIONS", ())
     fleet = FleetStore(tmp_path / "fleet.db")
     fleet._conn.execute("DROP TABLE schema_migrations")
     fleet.close()
 
     body = json.loads(_db(tmp_path, monkeypatch, "status", steps=[_probe()]).output)
-    assert (body["ledger"], body["pending"]) == (False, [1])
+    every = [m.version for m in _BUILT] + [_NEXT]
+    assert (body["ledger"], body["pending"]) == (False, every)
     body = json.loads(_db(tmp_path, monkeypatch, "status", steps=[_probe()]).output)
     assert body["ledger"] is False, "status must not have created the ledger"
 
@@ -1162,7 +1170,7 @@ def test_a_migration_number_taken_twice_is_a_message_not_a_traceback(tmp_path, m
 
     FleetStore(tmp_path / "fleet.db").close()
     assert _db(tmp_path, monkeypatch, "migrate", steps=[_probe()]).exit_code == 0
-    other = Migration(1, "someone else's step", ("SELECT 1",))
+    other = Migration(_NEXT, "someone else's step", ("SELECT 1",))
     result = _db(tmp_path, monkeypatch, "migrate", steps=[other])
     assert result.exit_code == 2
     assert "same number" in result.output
@@ -1185,9 +1193,9 @@ def test_db_status_reports_a_number_taken_twice_instead_of_up_to_date(tmp_path, 
     FleetStore(tmp_path / "fleet.db").close()
     assert _db(tmp_path, monkeypatch, "migrate", steps=[_probe()]).exit_code == 0
 
-    other = Migration(1, "someone else's step", ("SELECT 1",))
+    other = Migration(_NEXT, "someone else's step", ("SELECT 1",))
     result = _db(tmp_path, monkeypatch, "status", steps=[other])
     assert result.exit_code == 2
     body = json.loads(result.output)
-    assert body["conflicts"] == [1]
-    assert body["migrations"][0]["recorded_as"] == "boxes gain a probe"
+    assert body["conflicts"] == [_NEXT]
+    assert body["migrations"][-1]["recorded_as"] == "boxes gain a probe"

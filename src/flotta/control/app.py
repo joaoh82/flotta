@@ -41,8 +41,6 @@ from typing import Any
 
 from flotta import db
 from flotta.auth import (
-    DEFAULT_CLIENT,
-    DEFAULT_ORG,
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_BOX_PEER,
@@ -1876,9 +1874,9 @@ def create_app(
         Guarded by `box:chat`, like `wake`: it is the first half of the same
         operation, and the door holds exactly that scope for it.
 
-        Every box belongs to the default org and its default client until the
-        tenancy schema lands, which is the truth today rather than a
-        placeholder — and it is what a token with no `org` claim may reach.
+        The tenancy is the box's own row (M11.4). Every box made before it
+        belongs to the default org's default client, which is what a token
+        with no `org` claim may reach.
         """
         store = store_factory()
         try:
@@ -1890,8 +1888,8 @@ def create_app(
                     "id": box.id,
                     "name": box.name,
                     "status": box.status,
-                    "org": DEFAULT_ORG,
-                    "client": DEFAULT_CLIENT,
+                    "org": box.org,
+                    "client": box.client,
                 }
             }
         finally:
