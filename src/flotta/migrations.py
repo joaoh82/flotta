@@ -90,8 +90,67 @@ class Migration:
         return self.steps
 
 
+def _tenancy(now: str) -> tuple[str, ...]:
+    """Orgs, the clients inside them, and which client every box belongs to.
+
+    An org is an agency and a client is one of its customers; a box belongs to
+    exactly one client. Org and client ids become part of a box's address in
+    M11.5 (`<box>--<client>--<org>.flotta.dev`), so they are immutable DNS
+    labels, which `store.validate_tenant_id` enforces before any insert.
+
+    Every box that exists already belongs to the default org's default client,
+    which is the operator's own fleet. The column default says so for every
+    row at once, and the two rows it points at are created here, in the same
+    transaction, so no store ever has a box whose client does not exist.
+
+    `boxes` gains plain columns, not a foreign key: SQLite refuses `ADD COLUMN
+    … REFERENCES` with a non-NULL default while foreign keys are on, and they
+    are. The store writes a box's tenancy, as it already validates the name.
+
+    Deliberately not here: soft deletion, branding, keys, users. Each is a
+    later migration when something reads it. A column with nothing at the
+    other end is a window telling a lie, and adding one is cheap now.
+    """
+    return (
+        """
+        CREATE TABLE orgs (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE clients (
+            org_id      TEXT NOT NULL REFERENCES orgs(id),
+            id          TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (org_id, id)
+        )
+        """,
+        f"INSERT INTO orgs (id, name, created_at) VALUES ('default', 'Default', {now})",
+        "INSERT INTO clients (org_id, id, name, created_at) "
+        f"VALUES ('default', 'default', 'Default', {now})",
+        "ALTER TABLE boxes ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default'",
+        "ALTER TABLE boxes ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default'",
+        "CREATE INDEX idx_boxes_tenant ON boxes(org_id, client_id)",
+    )
+
+
+# The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
+# dialect, so a timestamp written here reads like every other one.
+_NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
+_NOW_POSTGRES = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00'"
+
 #: Every migration, in order. Append only.
-MIGRATIONS: tuple[Migration, ...] = ()
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(
+        1,
+        "tenancy: orgs, clients, and the client each box belongs to",
+        _tenancy(_NOW_SQLITE),
+        postgres=_tenancy(_NOW_POSTGRES),
+    ),
+)
 
 
 def check_sequence(migrations: Sequence[Migration]) -> None:

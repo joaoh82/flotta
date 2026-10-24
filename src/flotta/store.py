@@ -27,6 +27,11 @@ Turso would have meant migrating the same schema twice.
   doing it). They differ whenever a task waits on a stopped box, which is
   exactly what ``pending`` exists to name.
 
+**Tenancy** (M11): a box belongs to one client of one org — ``orgs``,
+``clients`` and ``boxes.org_id`` / ``client_id``, laid by migration 1 rather
+than the baseline. Every box made before it belongs to the default org's
+default client, which is the operator's own fleet.
+
 Shards deliberately get no table. They are Modal function calls owned by a
 workspace; the aggregate lands on ``tasks.result_json`` and Modal owns the
 individuals.
@@ -55,6 +60,7 @@ from types import TracebackType
 from typing import Any, Literal
 
 from flotta import db, migrations
+from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -365,6 +371,15 @@ class DuplicateBoxError(StoreError):
     """
 
 
+class DuplicateTenantError(StoreError):
+    """Raised when creating an org or client whose id is already taken."""
+
+
+class InvalidTenantError(StoreError):
+    """Raised when an org or client id could not be part of an address, or a
+    name is missing."""
+
+
 class InvalidBoxNameError(StoreError):
     """Raised when a box name could not be an address.
 
@@ -403,6 +418,29 @@ class Box:
     endpoint: str | None
     created_at: str
     destroyed_at: str | None
+    #: Whose agent this is (M11). Defaulted so the store is the only place
+    #: that has to know: every row it reads sets both.
+    org: str = DEFAULT_ORG
+    client: str = DEFAULT_CLIENT
+
+
+@dataclass(frozen=True, slots=True)
+class Org:
+    """An agency: the customer that owns clients (M11)."""
+
+    id: str
+    name: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class Client:
+    """One of an org's customers. Owns boxes."""
+
+    org: str
+    id: str
+    name: str
+    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +781,69 @@ class FleetStore:
             tuple(sorted(BOX_ACTIVE)),
         ).fetchone()
         return int(row["n"])
+
+    # -- tenancy (M11) -----------------------------------------------------
+
+    def create_org(self, org_id: str, name: str) -> Org:
+        """Insert an org. Its id is part of every address in it, so it never changes."""
+        org_id = validate_tenant_id(org_id, kind="org")
+        name = _tenant_name(name, kind="org")
+        try:
+            self._conn.execute(
+                "INSERT INTO orgs (id, name, created_at) VALUES (?, ?, ?)",
+                (org_id, name, _utcnow()),
+            )
+        except db.UniqueViolation as exc:
+            raise DuplicateTenantError(f"an org {org_id!r} already exists") from exc
+        org = self.get_org(org_id)
+        assert org is not None
+        return org
+
+    def get_org(self, org_id: str) -> Org | None:
+        row = self._conn.execute("SELECT * FROM orgs WHERE id = ?", (org_id,)).fetchone()
+        return _org_from_row(row) if row else None
+
+    def list_orgs(self) -> list[Org]:
+        """Every org, oldest first — so the default one leads."""
+        rows = self._conn.execute("SELECT * FROM orgs ORDER BY created_at, id").fetchall()
+        return [_org_from_row(r) for r in rows]
+
+    def create_client(self, org_id: str, client_id: str, name: str) -> Client:
+        """Insert a client of `org_id`. Its id is unique within the org only.
+
+        No transaction for the existence check: orgs are never deleted, so the
+        org cannot disappear between the read and the insert, and the foreign
+        key refuses the insert on both engines if it somehow did.
+        """
+        client_id = validate_tenant_id(client_id, kind="client")
+        name = _tenant_name(name, kind="client")
+        if self.get_org(org_id) is None:
+            raise UnknownEntityError(f"no org with id {org_id!r}")
+        try:
+            self._conn.execute(
+                "INSERT INTO clients (org_id, id, name, created_at) VALUES (?, ?, ?, ?)",
+                (org_id, client_id, name, _utcnow()),
+            )
+        except db.UniqueViolation as exc:
+            raise DuplicateTenantError(
+                f"org {org_id!r} already has a client {client_id!r}"
+            ) from exc
+        client = self.get_client(org_id, client_id)
+        assert client is not None
+        return client
+
+    def get_client(self, org_id: str, client_id: str) -> Client | None:
+        row = self._conn.execute(
+            "SELECT * FROM clients WHERE org_id = ? AND id = ?", (org_id, client_id)
+        ).fetchone()
+        return _client_from_row(row) if row else None
+
+    def list_clients(self, org_id: str) -> list[Client]:
+        """One org's clients, oldest first. Empty for an org that does not exist."""
+        rows = self._conn.execute(
+            "SELECT * FROM clients WHERE org_id = ? ORDER BY created_at, id", (org_id,)
+        ).fetchall()
+        return [_client_from_row(r) for r in rows]
 
     # -- workspaces --------------------------------------------------------
 
@@ -1504,7 +1605,17 @@ def _box_from_row(row: db.Row) -> Box:
         endpoint=row["endpoint"],
         created_at=row["created_at"],
         destroyed_at=row["destroyed_at"],
+        org=row["org_id"],
+        client=row["client_id"],
     )
+
+
+def _org_from_row(row: db.Row) -> Org:
+    return Org(id=row["id"], name=row["name"], created_at=row["created_at"])
+
+
+def _client_from_row(row: db.Row) -> Client:
+    return Client(org=row["org_id"], id=row["id"], name=row["name"], created_at=row["created_at"])
 
 
 #: A box name is a DNS label, and 63 is that standard's limit for one.
@@ -1512,6 +1623,54 @@ BOX_NAME_MAX = 63
 
 #: Lowercase letters, digits and hyphens; a hyphen may not start or end it.
 _BOX_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+#: An org or client id is a DNS label too — and it shares the box's: from
+#: M11.5 a box is reached at `<box>--<client>--<org>`, which has to fit in one
+#: 63-character label, and on Fly in an app name after this fleet's prefix.
+#: Sixteen each leaves a box about twenty. Ids are immutable, so this is the
+#: one moment the budget can be set.
+TENANT_ID_MAX = 16
+
+#: What a person calls an org or a client. Not an address, so any text.
+TENANT_NAME_MAX = 100
+
+
+def validate_tenant_id(value: str, *, kind: Literal["org", "client"]) -> str:
+    """An org or client id, or a refusal explaining why it could not be one.
+
+    The same label rule as a box name, minus `--`, which joins the parts of an
+    address, and with a tighter length for the same reason.
+    """
+    a_kind = "an org" if kind == "org" else "a client"
+    v = (value or "").strip()
+    if not v:
+        raise InvalidTenantError(f"{a_kind} needs an id")
+    if len(v) > TENANT_ID_MAX:
+        raise InvalidTenantError(
+            f"{v!r} is {len(v)} characters; {a_kind} id is part of every address "
+            f"under it, so it has at most {TENANT_ID_MAX}"
+        )
+    if not _BOX_NAME.match(v):
+        raise InvalidTenantError(
+            f"{v!r} cannot be {a_kind} id: it is part of an address, so lowercase "
+            "letters, digits and dashes, not starting or ending with a dash"
+        )
+    if "--" in v:
+        raise InvalidTenantError(
+            f"{v!r} cannot be {a_kind} id: `--` separates the parts of an address"
+        )
+    return v
+
+
+def _tenant_name(value: str, *, kind: Literal["org", "client"]) -> str:
+    a_kind = "an org" if kind == "org" else "a client"
+    v = (value or "").strip()
+    if not v:
+        raise InvalidTenantError(f"{a_kind} needs a name")
+    if len(v) > TENANT_NAME_MAX:
+        raise InvalidTenantError(f"{a_kind} name has at most {TENANT_NAME_MAX} characters")
+    return v
 
 
 def validate_box_name(name: str) -> str:
@@ -1547,6 +1706,15 @@ def validate_box_name(name: str) -> str:
         )
 
     if _BOX_NAME.match(value):
+        if "--" in value:
+            # Free until M11.5, and refused before then on purpose: a box
+            # called `support--acme--agency` in the default org would hold the
+            # address of `support` in another org's client.
+            raise InvalidBoxNameError(
+                f"{value!r} cannot be an address: `--` separates an agent from "
+                "its client and org in an address (`support--acme--agency`), so "
+                f"a name cannot contain it — try {re.sub('-{2,}', '-', value)!r}"
+            )
         return value
 
     # The overwhelmingly common miss is case, and it is worth naming the fix

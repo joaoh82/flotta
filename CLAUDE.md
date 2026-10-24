@@ -148,6 +148,18 @@ conventions, and the sharp edges below.
   creating the same missing table there: the first deploy of the runner had
   every worker racing to create `schema_migrations`, and all but one failed on
   `pg_type`'s unique index.
+- **Every box belongs to one client of one org (M11.4).** Migration 1 adds
+  `orgs`, `clients` (keyed `(org_id, id)`) and `boxes.org_id` / `client_id`,
+  both defaulting to `'default'`, and creates the default org and client in
+  the same transaction, so every box made before it is the operator's. **Org
+  and client ids are immutable DNS labels of at most 16 characters with no
+  `--`** (`validate_tenant_id`): from M11.5 a box is reached at
+  `<box>--<client>--<org>`, one label of at most 63, so the id length is the
+  box name's budget. For the same reason **a box name may no longer contain
+  `--`**. The box columns have no foreign key — SQLite refuses `ADD COLUMN …
+  REFERENCES` with a non-NULL default while foreign keys are on — so the store
+  is what writes them. No `users` table yet: nothing would read it until
+  invitations exist, and a migration adds it when something does.
 - **A headless `run_conversation` does NOT populate `state.db`.** SEAM_NOTES Q3
   describes a rich schema (sessions, messages, FTS); measured on a live box,
   after a completed turn `state.db` holds exactly one table
