@@ -329,12 +329,14 @@ def test_an_empty_tenancy_claim_is_refused_at_mint(claim):
 
 
 @pytest.mark.parametrize("claim", ["org", "client"])
-@pytest.mark.parametrize("value", [7, "", ["agency"], {"id": "agency"}, True])
+@pytest.mark.parametrize("value", [None, 7, "", ["agency"], {"id": "agency"}, True])
 def test_a_tenancy_claim_that_is_not_a_name_is_malformed(claim, value):
     """Refused, not ignored.
 
     Ignoring a junk `org` would read the token as the default org's — failing
-    open into the one tenant every legacy token can already reach.
+    open into the one tenant every legacy token can already reach. `None` is
+    here on purpose: an explicit `null` is present, and `claims.get` cannot
+    tell it from absent.
     """
     token = _signed(
         {"v": 1, "sub": "s", "scopes": ["box:chat"], "iat": 0, "exp": 9_999_999_999, claim: value}

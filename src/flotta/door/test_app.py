@@ -266,36 +266,46 @@ def _door_for(
     box_org="default",
     box_client="default",
     woken_id=None,
+    name_now_holds=None,
+    torn_down=(),
     **kwargs,
 ):
     """A door in front of a fake control plane and the stub box.
 
     `box_org` / `box_client` are whose the box is, as the control plane answers
-    `resolve`. `woken_id` lets the wake report a different box than the one
-    resolved — a name released and reused between the two calls.
+    `resolve`. `name_now_holds` is the box the name belongs to by the time of
+    the wake — a name released and reused between the two calls — and
+    `torn_down` the ids a wake refuses, as the real one does. `woken_id` makes
+    the wake answer with some other box whatever it was asked for.
     """
-    from flotta.door.app import Address, create_door
+    from flotta.door.app import Address, BoxUnavailable, create_door
 
     class FakePlane:
         def __init__(self):
             self.resolved = []
             self.woken = []
+            self.woken_ids = []
 
         async def resolve(self, name):
             self.resolved.append(name)
             return Address(box_id=box_id, name=name, org=box_org, client=box_client)
 
-        async def wake(self, name):
+        async def wake(self, name, *, box_id=None):
             self.woken.append(name)
+            started = box_id or name_now_holds or _resolved_id
+            self.woken_ids.append(started)
+            if started in torn_down:
+                raise BoxUnavailable(f"box {name!r} is torn down", status=409)
             # The Target's port is the stub's; override the dataclass default.
             return Target(
-                box_id=woken_id or box_id,
+                box_id=woken_id or started,
                 name=name,
                 endpoint="fly://app/m1",
                 host="127.0.0.1",
                 port=port,
             )
 
+    _resolved_id = box_id
     plane = FakePlane()
     app = create_door(control=plane, signing_key=KEY, domain="flotta.dev", **kwargs)
     return app, plane
@@ -499,7 +509,24 @@ def test_a_box_token_reaches_only_its_own_box(stub_box):
     assert _get(app, subject="box:b-1").status_code == 200
 
 
-def test_a_name_reused_between_resolve_and_wake_is_not_proxied_to(stub_box):
+def test_a_name_reused_between_resolve_and_wake_never_wakes_the_replacement(stub_box):
+    """The box checked is the box woken, so a reused name costs nothing.
+
+    Waking by name would start whatever holds it now — the replacement, on the
+    account of a token that was only ever checked against the original.
+    """
+    port, seen = stub_box
+    app, plane = _door_for(
+        port, box_id="b-original", name_now_holds="b-replacement", torn_down={"b-original"}
+    )
+
+    assert _get(app, subject="box:b-original").status_code == 409
+    assert plane.woken_ids == ["b-original"]
+    assert "b-replacement" not in plane.woken_ids
+    assert seen == []
+
+
+def test_a_wake_that_answers_with_another_box_is_not_proxied_to(stub_box):
     """What was woken is not what was checked, so it is not what we talk to."""
     port, seen = stub_box
     app, _ = _door_for(port, box_id="b-1", woken_id="b-9")
@@ -517,9 +544,13 @@ def test_the_websocket_path_applies_the_same_subject_check(stub_box):
     app, plane = _door_for(port, box_org="org-b")
     raw = mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY, org="org-a")
 
-    with TestClient(app) as client, client.websocket_connect(
-        f"/api/ws?access_token={raw}", headers={"Host": "eng-a.flotta.dev"}
-    ) as ws, pytest.raises(WebSocketDisconnect) as closed:
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            f"/api/ws?access_token={raw}", headers={"Host": "eng-a.flotta.dev"}
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as closed,
+    ):
         ws.receive_text()
 
     assert closed.value.code == 4404
@@ -749,6 +780,18 @@ def stub_plane():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_waking_by_id_asks_for_the_id_not_the_name(stub_plane):
+    import asyncio
+
+    plane, replies, calls = stub_plane
+    replies["/api/boxes/b-1/wake"] = (200, {"box": {"id": "b-1", "endpoint": "fly://app/m1"}})
+
+    target = asyncio.run(plane.wake("eng-a", box_id="b-1"))
+
+    assert calls == [("POST", "/api/boxes/b-1/wake")]
+    assert (target.box_id, target.name) == ("b-1", "eng-a")
 
 
 def test_resolve_reads_whose_box_it_is(stub_plane):

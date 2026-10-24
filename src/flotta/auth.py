@@ -411,11 +411,16 @@ def verify(
 
     # A tenancy claim that is present but not a name is refused, not ignored.
     # Ignoring it would read the token as the default org's — failing *open*
-    # into the one tenant every legacy token can already reach.
+    # into the one tenant every legacy token can already reach. Presence is the
+    # key, not the value: an explicit `"org": null` is a claim that is not a
+    # name, and reading it as absent would hand out exactly that default.
     tenancy: dict[str, str | None] = {}
     for claim in ("org", "client"):
-        value = claims.get(claim)
-        if value is not None and (not isinstance(value, str) or not value.strip()):
+        if claim not in claims:
+            tenancy[claim] = None
+            continue
+        value = claims[claim]
+        if not isinstance(value, str) or not value.strip():
             raise AuthError(f"malformed token: {claim} is not a name")
         tenancy[claim] = value
 

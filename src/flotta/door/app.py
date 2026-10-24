@@ -231,8 +231,11 @@ class ControlPlane:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
-    async def touch(self, name: str) -> None:
+    async def touch(self, box: str) -> None:
         """Tell the control plane this box is still in use. Best effort.
+
+        `box` is the id the conversation was opened against, not the name: a
+        heartbeat must never wake a different box that has since taken it.
 
         Waking is idempotent and the control plane rate-limits the event it
         writes, so calling this on a timer is cheap. It exists because idle
@@ -244,20 +247,27 @@ class ControlPlane:
         later; raising here would drop a live conversation over bookkeeping.
         """
         with contextlib.suppress(Exception):
-            await self.wake(name)
+            await self.wake(box, box_id=box)
 
-    async def wake(self, name: str) -> Target:
+    async def wake(self, name: str, *, box_id: str | None = None) -> Target:
         """Resolve `name` and ensure it is running. Returns where to proxy.
+
+        `box_id`, when the caller has one, is what gets woken; `name` is then
+        only for messages. The door always has one by now, because the subject
+        check ran against an id — and waking by name would start whatever holds
+        the name *now*, which after a release and reuse is a box nobody checked.
 
         Wake rather than get-then-maybe-wake: `wake_box` is idempotent and
         cheap on a box that is already up, and asking two questions would
         leave a race between them — a box can be stopped by Fly during a host
         drain between the read and the connect.
         """
-        response = await self._call("POST", f"/api/boxes/{name}/wake", name=name, verb="wake")
+        response = await self._call(
+            "POST", f"/api/boxes/{box_id or name}/wake", name=name, verb="wake"
+        )
         body = response.json()
         endpoint = (body.get("box") or {}).get("endpoint")
-        box_id = (body.get("box") or {}).get("id") or name
+        box_id = (body.get("box") or {}).get("id") or box_id or name
         if not endpoint:
             raise BoxUnavailable(f"box {name!r} has no endpoint to proxy to", status=502)
         return Target(box_id=box_id, name=name, endpoint=endpoint, host=internal_host(endpoint))
@@ -450,10 +460,13 @@ def create_door(
             # agents. A box you may not address is a box that is not there.
             _log.info("refused %r for %r: %s", name, token.subject, refusal)
             raise BoxUnavailable(f"no box named {name!r}", status=404)
-        target = await plane.wake(name)
+        # By id: the name can be released and reused between resolve and here,
+        # and waking by name would start the replacement on this token's
+        # account — the cost the check above exists to refuse.
+        target = await plane.wake(name, box_id=address.box_id)
         if target.box_id != address.box_id:
-            # The name was released and reused between the two calls. Whatever
-            # was just woken is not what was checked, so it is not proxied to.
+            # Should be unreachable now; kept because proxying to a box other
+            # than the one checked is the failure, however it comes about.
             raise BoxUnavailable(f"box {name!r} changed while it was being addressed", status=409)
         await wait_until_ready(
             f"http://{authority(target.host, target.port)}", timeout_s=ready_timeout_s
@@ -564,7 +577,7 @@ def create_door(
             """
             while True:
                 await asyncio.sleep(HEARTBEAT_S)
-                await plane.touch(target.name)
+                await plane.touch(target.box_id)
 
         heartbeat = asyncio.create_task(keep_awake())
 
