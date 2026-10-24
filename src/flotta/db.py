@@ -57,6 +57,13 @@ DATABASE_URL_ENV = "FLOTTA_DATABASE_URL"
 #: Schemes we recognise as "this is Postgres".
 _POSTGRES_SCHEMES = ("postgres://", "postgresql://")
 
+#: The Postgres advisory lock the schema is laid under: "flotta", then 1.
+#: Advisory locks are per database, so this one key is every store's in it.
+SCHEMA_LOCK_KEY = 0x666C6F7474610001
+
+#: How long a fresh SQLite file's switch to WAL is retried before giving up.
+_WAL_RETRY_S = 5.0
+
 
 class DatabaseError(Exception):
     """Base error for the database seam."""
@@ -141,6 +148,14 @@ class Connection(Protocol):
         """Run multi-statement DDL."""
         ...
 
+    def schema_lock(self) -> Any:
+        """Serialise laying the schema against every other connection.
+
+        For the `CREATE TABLE IF NOT EXISTS` baseline, which runs on every
+        open and is not safe against itself on Postgres. A context manager.
+        """
+        ...
+
     def close(self) -> None: ...
 
 
@@ -195,7 +210,28 @@ class SqliteConnection:
         self._conn = sqlite3.connect(str(db_path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._enable_wal()
+
+    def _enable_wal(self) -> None:
+        """Switch to WAL, retrying while another connection is doing the same.
+
+        Changing the journal mode needs the file to itself, and SQLite answers
+        "database is locked" at once rather than waiting through the busy
+        timeout — so several connections opening a *fresh* file together
+        (a control plane's first requests) all but one failed. Once the file is
+        WAL the pragma is a read, and this returns first time.
+        """
+        import time
+
+        deadline = time.monotonic() + _WAL_RETRY_S
+        while True:
+            try:
+                self._conn.execute("PRAGMA journal_mode = WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Result:
         try:
@@ -227,6 +263,13 @@ class SqliteConnection:
 
     def executescript(self, sql: str) -> None:
         self._conn.executescript(sql)
+
+    @contextmanager
+    def schema_lock(self) -> Iterator[None]:
+        # Nothing to do: SQLite takes its write lock for each DDL statement and
+        # checks IF NOT EXISTS under it, so two connections cannot both create
+        # a table. And a BEGIN here would be committed by executescript anyway.
+        yield
 
     def close(self) -> None:
         self._conn.close()
@@ -330,6 +373,24 @@ class PostgresConnection:
 
     def executescript(self, sql: str) -> None:
         self._conn.execute(to_postgres_sql(sql))
+
+    @contextmanager
+    def schema_lock(self) -> Iterator[None]:
+        # `CREATE TABLE IF NOT EXISTS` is not safe against a concurrent session
+        # creating the same missing table: both pass the check, and the loser
+        # fails on `pg_type`'s unique index. Every worker opening a store whose
+        # schema just grew a table does exactly that. An advisory lock rather
+        # than a table lock, because the tables are what is being created.
+        # Transaction-scoped, so it is released on COMMIT or ROLLBACK.
+        cursor = self._conn.cursor()
+        cursor.execute("BEGIN")
+        try:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_KEY,))
+            yield
+        except BaseException:
+            cursor.execute("ROLLBACK")
+            raise
+        cursor.execute("COMMIT")
 
     def close(self) -> None:
         self._conn.close()

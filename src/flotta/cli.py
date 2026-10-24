@@ -56,6 +56,7 @@ from typing import Any
 
 import typer
 
+from .migrations import MigrationError
 from .store import (
     Box,
     DuplicateBoxError,
@@ -351,7 +352,7 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
         # guess about whether someone has spawned yet.
         try:
             return FleetStore(target)
-        except _db.DatabaseError as exc:
+        except (_db.DatabaseError, MigrationError) as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
 
@@ -374,6 +375,11 @@ def _open_store(store: str | None, *, must_exist: bool = True) -> FleetStore:
         # A pre-M0 store. Same class of confusion as a missing one — say which
         # file and what to do, rather than raising from the SQLite layer.
         typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=2) from exc
+    except MigrationError as exc:
+        # Two changes took one migration number. Say so plainly; a traceback
+        # from inside the store reads as corruption.
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
 
@@ -1537,6 +1543,156 @@ def repo_list(
             "\n".join(f"  {r}" for r in repos) or "  (none — public repositories only)",
             as_json=as_json,
         )
+
+
+# -- schema migrations (M11) -----------------------------------------------
+
+db_app = typer.Typer(
+    name="db",
+    help="The fleet store's schema: which migrations it has.",
+    no_args_is_help=True,
+)
+app.add_typer(db_app)
+
+
+def _store_label(target: str) -> str:
+    """Where the store is, for a human — never a Postgres password."""
+    from flotta import db as _db
+
+    return _db.describe_url(target) if _db.is_postgres_url(target) else str(Path(target).resolve())
+
+
+def _warn_if_local(target: str) -> None:
+    """Say so when a deployed fleet exists and this is not its store.
+
+    `flotta db` reads the store directly — the fleet API has no migrations
+    endpoint, and should not: applying them is the control plane's own open.
+    With `$FLOTTA_CONTROL_URL` set, "up to date" about a laptop's `fleet.db`
+    reads as a statement about production.
+    """
+    from flotta import db as _db
+
+    if control_url() and not _db.is_postgres_url(target):
+        typer.secho(
+            f"note: this is the local store, not the fleet at {control_url()}. "
+            "Set FLOTTA_DATABASE_URL to read that one.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
+def _migration_lines(lines: list[Any]) -> str:
+    if not lines:
+        return "  (this build has no migrations)"
+    out = []
+    for line in lines:
+        state = line.applied_at or "pending"
+        note = "" if line.known else "  (not in this build — a newer one applied it)"
+        if line.conflict:
+            note = f"  CONFLICT: this store applied {line.version} as {line.recorded_as!r}"
+        out.append(f"  {line.version:>3}  {line.name:<44}  {state}{note}")
+    return "\n".join(out)
+
+
+@db_app.command("status")
+def db_status(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
+    """Which migrations the store has applied and which are pending. Changes nothing.
+
+    Reads the ledger directly rather than opening the store the usual way,
+    because opening it *applies* whatever is pending — a status that ran the
+    migrations it was asked about could only ever say "none pending".
+    """
+    from flotta import db as _db
+    from flotta import migrations
+
+    target = store_target(store)
+    _warn_if_local(target)
+    postgres = _db.is_postgres_url(target)
+    if not postgres and not Path(target).exists():
+        missing = f"no fleet-state store at {Path(target).resolve()}"
+        typer.secho(missing, fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    try:
+        conn = _db.connect(target)
+    except _db.DatabaseError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    try:
+        exists = (
+            "SELECT to_regclass('schema_migrations') AS name"
+            if postgres
+            else "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_migrations'"
+        )
+        row = conn.execute(exists).fetchone()
+        ledger = bool(row and row["name"])
+        if ledger:
+            lines = migrations.status(conn)
+        else:
+            # A store from before M11: nothing recorded, and every migration
+            # this build has is pending.
+            lines = [migrations.Status(m.version, m.name, None) for m in migrations.MIGRATIONS]
+    finally:
+        conn.close()
+
+    pending = [line.version for line in lines if line.applied_at is None]
+    conflicts = [line.version for line in lines if line.conflict]
+    label = _store_label(target)
+    if conflicts:
+        # Not "up to date": every ordinary open of this store refuses it.
+        summary = (
+            f"conflict at {', '.join(map(str, conflicts))}: two changes took the same "
+            "migration number, and this build will refuse to open the store. Renumber "
+            "the one that has not been released."
+        )
+    elif pending:
+        summary = (
+            f"{len(pending)} pending — applied at the next open, or now with `flotta db migrate`"
+        )
+    else:
+        summary = "up to date"
+    if not ledger:
+        summary += " (no ledger yet: this store predates migrations; the next open adds one)"
+    emit(
+        {
+            "store": label,
+            "ledger": ledger,
+            "migrations": [line.as_dict() for line in lines],
+            "pending": pending,
+            "conflicts": conflicts,
+        },
+        f"store: {label}\n{_migration_lines(lines)}\n{summary}",
+        as_json=as_json,
+    )
+    if conflicts:
+        raise typer.Exit(code=2)
+
+
+@db_app.command("migrate")
+def db_migrate(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
+    """Apply pending migrations now, and say which.
+
+    Opening the store applies them anyway — every command and every control-
+    plane request does — so this is for doing it on purpose: against the
+    production database before a deploy, or to see it happen.
+    """
+    from flotta import migrations
+
+    _warn_if_local(store_target(store))
+    with _open_store(store) as fleet:
+        applied = fleet.migrations_applied
+        lines = migrations.status(fleet._conn)
+    label = _store_label(store_target(store))
+    summary = f"applied {', '.join(str(v) for v in applied)}" if applied else "nothing to apply"
+    emit(
+        {
+            "store": label,
+            "applied": applied,
+            "migrations": [line.as_dict() for line in lines],
+        },
+        f"store: {label}\n{_migration_lines(lines)}\n{summary}",
+        as_json=as_json,
+    )
 
 
 # -- colleagues (M7) -------------------------------------------------------

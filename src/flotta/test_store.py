@@ -719,11 +719,14 @@ def test_the_guard_names_a_real_table():
     import inspect
     import re
 
+    from flotta import migrations as migrations_module
     from flotta import store as store_module
 
     source = inspect.getsource(store_module)
     tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", source))
+    # The migration runner takes a guard too, on a table the baseline creates.
     named = set(re.findall(r'transaction\(guard="(\w+)"\)', source))
+    named |= set(re.findall(r'transaction\(guard="(\w+)"\)', inspect.getsource(migrations_module)))
 
     assert tables, "no tables found — has the schema moved?"
     assert named, "expected guarded transactions"
