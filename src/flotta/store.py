@@ -1703,8 +1703,11 @@ def box_label(name: str, *, org: str, client: str) -> str:
     the sum too long. Before any row or substrate call, like the name check.
     """
     name = validate_box_name(name)
-    validate_tenant_id(org, kind="org")
-    validate_tenant_id(client, kind="client")
+    # The cleaned values, not the arguments: an id is stripped of surrounding
+    # whitespace, and a label composed from the raw one would name a Fly app
+    # `support--acme-- agency-x ` while the row says `support--acme--agency-x`.
+    org = validate_tenant_id(org, kind="org")
+    client = validate_tenant_id(client, kind="client")
     label = address.compose(name, org=org, client=client)
     if len(label) > address.LABEL_MAX:
         raise InvalidBoxNameError(

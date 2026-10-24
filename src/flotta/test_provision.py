@@ -3527,3 +3527,28 @@ def test_a_box_in_a_client_that_does_not_exist_is_refused_before_a_machine(store
 
     assert backend.specs == []
     assert store.list_boxes() == []
+
+
+def test_padded_tenant_ids_name_the_row_the_probe_the_spec_and_the_token_alike(store, monkeypatch):
+    """The store strips an id's surrounding whitespace; so must everything
+    named before the row exists, or the Fly app is `support--acme-- agency-x `
+    and a failed provision holds the canonical name."""
+    import flotta.provision as provision
+    from flotta.auth import verify
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 43)
+    _two_agencies(store)
+    probed: list[str] = []
+    monkeypatch.setattr(provision, "_peek_endpoint", lambda impl, name: probed.append(name))
+    backend = _AdoptingByName()
+
+    out = create_box("support", store=store, backend=backend, org=" agency-x ", client=" acme ")
+
+    label = "support--acme--agency-x"
+    box = store.get_box(out["box_id"])
+    assert (box.name, box.org, box.client) == (label, "agency-x", "acme")
+    assert probed == [label]
+    assert backend.specs[0].name == label
+    assert backend.specs[0].env["FLOTTA_BOX_NAME"] == label
+    token = verify(backend.specs[0].secrets["FLOTTA_BOX_TOKEN"])
+    assert (token.org, token.client) == ("agency-x", "acme")

@@ -912,7 +912,9 @@ def test_create_puts_the_agent_in_the_client_it_is_told(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(provision, "_backend_for", lambda _scheme: backend)
 
-    args = ["create", "support", "--org", "agency-x", "--client", "acme"]
+    # Padded on purpose: the store strips ids, and the Fly app named before
+    # the row exists must be named after the same, stripped, address.
+    args = ["create", "support", "--org", " agency-x ", "--client", "acme "]
     result = CliRunner().invoke(app, [*args, "--store", str(db), "--json"])
 
     assert result.exit_code == 0, result.output
@@ -922,6 +924,7 @@ def test_create_puts_the_agent_in_the_client_it_is_told(tmp_path, monkeypatch):
         "agency-x",
         "acme",
     )
+    assert [s.name for s in backend.specs] == ["support--acme--agency-x"], "Fly saw another name"
 
 
 def test_create_in_a_client_that_does_not_exist_is_a_refusal(tmp_path, monkeypatch):

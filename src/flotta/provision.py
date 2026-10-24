@@ -84,6 +84,7 @@ from flotta.store import (
     is_terminal,
     validate_box_meta,
     validate_box_name,
+    validate_tenant_id,
 )
 
 # How long a task may run before it is considered overdue. Lived in
@@ -794,6 +795,10 @@ def create_box(
         name = box.name
     else:
         short = validate_box_name(name)
+        # Cleaned once, here, and passed on cleaned: the store strips the ids
+        # too, and everything named before the row exists has to agree with it.
+        org = validate_tenant_id(org, kind="org")
+        client = validate_tenant_id(client, kind="client")
         name = box_label(short, org=org, client=client)
     if model is not None:
         # Same reasoning as the name: a model id that can never work is refused
