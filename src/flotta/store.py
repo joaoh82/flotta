@@ -576,7 +576,8 @@ class FleetStore:
         # The baseline, then the numbered steps on top of it. The baseline is
         # frozen for the tables it has: a column change to one of them is a
         # migration, or a fresh store and an upgraded one would disagree.
-        self._conn.executescript(_SCHEMA_TEMPLATE.format(events_id=_EVENTS_ID[dialect]))
+        with self._conn.schema_lock():
+            self._conn.executescript(_SCHEMA_TEMPLATE.format(events_id=_EVENTS_ID[dialect]))
         try:
             #: What opening this store applied — `flotta db migrate` reports it.
             self.migrations_applied: list[int] = migrations.apply(self._conn, dialect=dialect)

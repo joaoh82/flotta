@@ -17,7 +17,10 @@ comment said to build "if a real column change ever becomes unavoidable".
 **The `CREATE TABLE IF NOT EXISTS` script stays, as the baseline.** Every store
 in existence — a fresh file, the live Postgres on Render, a laptop that last ran
 months ago with half the tables — converges on it at open, exactly as before.
-Migrations are numbered steps *on top of* that baseline, each recorded in
+On Postgres it runs under an advisory lock (`Connection.schema_lock`): `CREATE
+TABLE IF NOT EXISTS` is not safe there against a session creating the same
+missing table, which is exactly what every worker does on the first open after
+a table is added. Migrations are numbered steps *on top of* that baseline, each recorded in
 `schema_migrations` when it is applied. So the baseline is frozen for the
 tables it has: a column change to one of them is a migration from now on, or a
 fresh store and an upgraded one would disagree.

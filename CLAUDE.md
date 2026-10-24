@@ -142,7 +142,12 @@ conventions, and the sharp edges below.
   once merged — a recorded version whose name differs is refused at open —
   and are a tuple of single statements, because `sqlite3.executescript`
   commits the open transaction. `flotta db status` reads the ledger without
-  applying anything; `flotta db migrate` applies on purpose.
+  applying anything; `flotta db migrate` applies on purpose. **The baseline
+  itself runs under `Connection.schema_lock()`** — a Postgres advisory lock —
+  because `CREATE TABLE IF NOT EXISTS` is not safe against another session
+  creating the same missing table there: the first deploy of the runner had
+  every worker racing to create `schema_migrations`, and all but one failed on
+  `pg_type`'s unique index.
 - **A headless `run_conversation` does NOT populate `state.db`.** SEAM_NOTES Q3
   describes a rich schema (sessions, messages, FTS); measured on a live box,
   after a completed turn `state.db` holds exactly one table
