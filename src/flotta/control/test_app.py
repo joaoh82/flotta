@@ -675,6 +675,66 @@ def test_a_substrate_failure_waking_is_502(secured, monkeypatch):
     assert secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 502
 
 
+# -- resolving a box for the front door, without waking it (M11) ------------
+
+
+def test_the_address_says_whose_box_it_is(secured):
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    response = secured.get("/api/boxes/eng-a/address", headers=_bearer(SCOPE_BOX_CHAT))
+
+    assert response.status_code == 200
+    box = response.json()["box"]
+    assert box["name"] == "eng-a" and box["id"].startswith("b-")
+    # Every box is the default org's until the tenancy schema lands.
+    assert (box["org"], box["client"]) == ("default", "default")
+
+
+def test_resolving_a_box_never_wakes_it(secured, monkeypatch):
+    """The door checks whose box it is *between* resolve and wake.
+
+    A resolve that woke would start the machine before the check ran — the
+    denial-of-wallet the ordering exists to prevent.
+    """
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    monkeypatch.setattr(
+        provision, "wake_box", lambda *a, **k: pytest.fail("resolving a box woke it")
+    )
+    monkeypatch.setattr(
+        provision, "start_box", lambda *a, **k: pytest.fail("resolving a box started it")
+    )
+
+    assert (
+        secured.get("/api/boxes/eng-a/address", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 200
+    )
+
+
+def test_the_address_carries_no_endpoint(secured):
+    """The smallest answer that decides. An endpoint is the next call's job."""
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    box = secured.get("/api/boxes/eng-a/address", headers=_bearer(SCOPE_BOX_CHAT)).json()["box"]
+    assert "endpoint" not in box
+
+
+def test_resolving_requires_box_chat(secured):
+    """The first half of the same operation as `wake`, under the same scope."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    denied = secured.get("/api/boxes/eng-a/address", headers=_bearer(SCOPE_FLEET_WRITE))
+    assert denied.status_code == 403
+
+
+def test_resolving_an_unknown_box_is_404(secured):
+    from flotta.auth import SCOPE_BOX_CHAT
+
+    assert (
+        secured.get("/api/boxes/nope/address", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 404
+    )
+
+
 # -- activity, for idle sleep -----------------------------------------------
 
 

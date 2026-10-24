@@ -41,6 +41,8 @@ from typing import Any
 
 from flotta import db
 from flotta.auth import (
+    DEFAULT_CLIENT,
+    DEFAULT_ORG,
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_BOX_PEER,
@@ -1856,6 +1858,42 @@ def create_app(
             # The username is ignored by GitHub when the password is a token;
             # `x-access-token` is the convention its own docs use.
             return {"username": "x-access-token", "password": source, "repo": repo}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/address")
+    def box_address(box_id: str, _: Token | None = needs_chat) -> Any:
+        """Which box this is and whose, without waking it (M11).
+
+        For the front door, which has to know a box's tenant *before* it wakes
+        it: the subject check sits between this and `wake`, so a token for
+        another org is refused without a machine starting on its account.
+
+        Deliberately the smallest answer that decides: no endpoint (an asleep
+        box has none worth having), no tasks, no metadata. `GET /api/boxes/{id}`
+        returns all of those and is one query per task.
+
+        Guarded by `box:chat`, like `wake`: it is the first half of the same
+        operation, and the door holds exactly that scope for it.
+
+        Every box belongs to the default org and its default client until the
+        tenancy schema lands, which is the truth today rather than a
+        placeholder — and it is what a token with no `org` claim may reach.
+        """
+        store = store_factory()
+        try:
+            box = store.get_box(box_id) or store.get_box_by_name(box_id)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            return {
+                "box": {
+                    "id": box.id,
+                    "name": box.name,
+                    "status": box.status,
+                    "org": DEFAULT_ORG,
+                    "client": DEFAULT_CLIENT,
+                }
+            }
         finally:
             store.close()
 

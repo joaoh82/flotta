@@ -283,3 +283,124 @@ def test_a_box_token_carries_the_subject_a_verifier_will_check():
     )
     assert subject_box(token.subject) == "b-9"
     assert token.scopes == frozenset({SCOPE_GIT_CREDENTIAL})
+
+
+# -- whose token it is (M11) --------------------------------------------------
+#
+# Scopes say what a token may do; tenancy says to whom. These pin the claims
+# and the one rule — `admits` — that the door and the control plane share.
+
+
+def _signed(claims):
+    """A token with exactly these claims, signed with the test key."""
+    import json
+
+    from flotta.auth import _b64, _sign
+
+    payload = _b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    return f"flotta_{payload}.{_sign(payload, KEY)}"
+
+
+def test_tenancy_claims_round_trip():
+    claims = verify(
+        mint(subject="u-1", scopes={SCOPE_BOX_CHAT}, key=KEY, org="agency", client="acme"),
+        key=KEY,
+    )
+    assert (claims.org, claims.client) == ("agency", "acme")
+
+
+def test_a_token_minted_without_tenancy_is_unchanged():
+    """Every token already deployed must verify exactly as it did."""
+    import base64
+    import json
+
+    token = mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY, now=0)
+    payload = token.removeprefix("flotta_").split(".")[0]
+    decoded = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    assert set(decoded) == {"v", "sub", "scopes", "iat", "exp"}
+    claims = verify(token, key=KEY, now=1)
+    assert claims.org is None and claims.client is None
+
+
+@pytest.mark.parametrize("claim", ["org", "client"])
+def test_an_empty_tenancy_claim_is_refused_at_mint(claim):
+    with pytest.raises(AuthError):
+        mint(subject="s", scopes={SCOPE_BOX_CHAT}, key=KEY, **{claim: "  "})
+
+
+@pytest.mark.parametrize("claim", ["org", "client"])
+@pytest.mark.parametrize("value", [None, 7, "", ["agency"], {"id": "agency"}, True])
+def test_a_tenancy_claim_that_is_not_a_name_is_malformed(claim, value):
+    """Refused, not ignored.
+
+    Ignoring a junk `org` would read the token as the default org's — failing
+    open into the one tenant every legacy token can already reach. `None` is
+    here on purpose: an explicit `null` is present, and `claims.get` cannot
+    tell it from absent.
+    """
+    token = _signed(
+        {"v": 1, "sub": "s", "scopes": ["box:chat"], "iat": 0, "exp": 9_999_999_999, claim: value}
+    )
+    with pytest.raises(AuthError, match="malformed"):
+        verify(token, key=KEY)
+
+
+def _tok(subject="app", org=None, client=None):
+    from flotta.auth import Token
+
+    return Token(
+        subject=subject,
+        scopes=frozenset({SCOPE_BOX_CHAT}),
+        issued_at=0,
+        expires_at=1,
+        org=org,
+        client=client,
+    )
+
+
+@pytest.mark.parametrize(
+    ("token", "box", "admitted"),
+    [
+        # no tenancy on either side: the single-operator fleet, unchanged
+        (_tok(), ("b-1", "default", "default"), True),
+        # an untagged token is the default org's, never any org's
+        (_tok(), ("b-1", "agency", "acme"), False),
+        (_tok(org="default"), ("b-1", "default", "default"), True),
+        # an org token reaches every client in its org, and no other org
+        (_tok(org="agency"), ("b-1", "agency", "acme"), True),
+        (_tok(org="agency"), ("b-1", "agency", "globex"), True),
+        (_tok(org="agency"), ("b-1", "rival", "acme"), False),
+        # a client token reaches only its client
+        (_tok(org="agency", client="acme"), ("b-1", "agency", "acme"), True),
+        (_tok(org="agency", client="acme"), ("b-1", "agency", "globex"), False),
+        # the same client name in another org is another client
+        (_tok(org="agency", client="acme"), ("b-1", "rival", "acme"), False),
+        # a box reaches only itself, and only within its own tenancy
+        (_tok(subject="box:b-1"), ("b-1", "default", "default"), True),
+        (_tok(subject="box:b-1"), ("b-2", "default", "default"), False),
+        (_tok(subject="box:b-1", org="agency", client="acme"), ("b-1", "agency", "acme"), True),
+        (_tok(subject="box:b-1", org="agency", client="acme"), ("b-1", "rival", "acme"), False),
+    ],
+)
+def test_admits(token, box, admitted):
+    from flotta.auth import admits
+
+    box_id, org, client = box
+    refusal = admits(token, box_id=box_id, org=org, client=client)
+    assert (refusal is None) is admitted, refusal
+
+
+def test_a_box_subject_may_name_its_box_by_name():
+    """`confine_to_box` accepted either; the shared rule must too."""
+    from flotta.auth import admits
+
+    assert (
+        admits(
+            _tok(subject="box:eng-a"),
+            box_id="b-1",
+            box_name="eng-a",
+            org="default",
+            client="default",
+        )
+        is None
+    )

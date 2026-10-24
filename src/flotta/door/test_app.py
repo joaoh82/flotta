@@ -88,8 +88,9 @@ def test_a_box_is_addressed_by_machine_not_by_app():
 # -- who gets through -------------------------------------------------------
 
 
-def _bearer(*scopes, subject="app"):
-    return f"Bearer {mint(subject=subject, scopes=set(scopes), key=KEY)}"
+def _bearer(*scopes, subject="app", org=None, client=None):
+    token = mint(subject=subject, scopes=set(scopes), key=KEY, org=org, client=client)
+    return f"Bearer {token}"
 
 
 def test_a_valid_chat_token_is_admitted():
@@ -258,32 +259,54 @@ def stub_box():
         thread.join(timeout=5)
 
 
-def _door_for(port, **kwargs):
-    from flotta.door.app import create_door
+def _door_for(
+    port,
+    *,
+    box_id="b-1",
+    box_org="default",
+    box_client="default",
+    woken_id=None,
+    name_now_holds=None,
+    torn_down=(),
+    **kwargs,
+):
+    """A door in front of a fake control plane and the stub box.
+
+    `box_org` / `box_client` are whose the box is, as the control plane answers
+    `resolve`. `name_now_holds` is the box the name belongs to by the time of
+    the wake — a name released and reused between the two calls — and
+    `torn_down` the ids a wake refuses, as the real one does. `woken_id` makes
+    the wake answer with some other box whatever it was asked for.
+    """
+    from flotta.door.app import Address, BoxUnavailable, create_door
 
     class FakePlane:
         def __init__(self):
+            self.resolved = []
             self.woken = []
+            self.woken_ids = []
 
-        async def wake(self, name):
+        async def resolve(self, name):
+            self.resolved.append(name)
+            return Address(box_id=box_id, name=name, org=box_org, client=box_client)
+
+        async def wake(self, name, *, box_id=None):
             self.woken.append(name)
-            return Target(box_id="b-1", name=name, endpoint="fly://app/m1", host="127.0.0.1")
+            started = box_id or name_now_holds or _resolved_id
+            self.woken_ids.append(started)
+            if started in torn_down:
+                raise BoxUnavailable(f"box {name!r} is torn down", status=409)
+            # The Target's port is the stub's; override the dataclass default.
+            return Target(
+                box_id=woken_id or started,
+                name=name,
+                endpoint="fly://app/m1",
+                host="127.0.0.1",
+                port=port,
+            )
 
+    _resolved_id = box_id
     plane = FakePlane()
-    # The Target's port is the stub's; override the dataclass default.
-    original = plane.wake
-
-    async def wake(name):
-        target = await original(name)
-        return Target(
-            box_id=target.box_id,
-            name=target.name,
-            endpoint=target.endpoint,
-            host=target.host,
-            port=port,
-        )
-
-    plane.wake = wake
     app = create_door(control=plane, signing_key=KEY, domain="flotta.dev", **kwargs)
     return app, plane
 
@@ -380,6 +403,168 @@ def test_an_unknown_hostname_never_reaches_the_control_plane(stub_box):
 
     assert response.status_code == 404
     assert plane.woken == []
+
+
+# -- whose box it is (M11) ----------------------------------------------------
+#
+# The door checked a token's scope and never its subject, so any token carrying
+# `box:chat` reached every box. These are the guard that closes that, written
+# before the tenancy they protect: every refusal below must happen **before the
+# wake**, or a stranger's token still starts someone else's machine.
+
+
+def _get(app, host="eng-a.flotta.dev", **bearer):
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        return client.get(
+            "/", headers={"Host": host, "Authorization": _bearer(SCOPE_BOX_CHAT, **bearer)}
+        )
+
+
+def test_a_token_for_one_org_cannot_reach_another_orgs_box(stub_box):
+    port, seen = stub_box
+    app, plane = _door_for(port, box_org="org-b", box_client="ops")
+
+    response = _get(app, org="org-a")
+
+    assert response.status_code == 404
+    assert plane.woken == [], "a cross-org token woke another org's box"
+    assert seen == []
+
+
+def test_a_refusal_looks_exactly_like_a_box_that_does_not_exist(stub_box):
+    """No existence oracle.
+
+    "That box exists, but not for you" would turn every hostname into a probe
+    for another org's agents. The refusal must be indistinguishable from the
+    404 the control plane gives for a name nobody has.
+    """
+    port, _ = stub_box
+    app, _ = _door_for(port, box_org="org-b")
+
+    response = _get(app, org="org-a")
+
+    assert response.json() == {"detail": "no box named 'eng-a'"}
+    assert "org" not in response.text
+
+
+def test_a_client_token_cannot_reach_a_sibling_clients_box(stub_box):
+    port, seen = stub_box
+    app, plane = _door_for(port, box_org="agency", box_client="acme")
+
+    response = _get(app, org="agency", client="globex")
+
+    assert response.status_code == 404
+    assert plane.woken == []
+    assert seen == []
+
+
+def test_a_client_token_reaches_its_own_clients_box(stub_box):
+    port, seen = stub_box
+    app, plane = _door_for(port, box_org="agency", box_client="acme")
+
+    assert _get(app, org="agency", client="acme").status_code == 200
+    assert plane.woken == ["eng-a"]
+
+
+def test_an_org_token_without_a_client_reaches_every_client_in_its_org(stub_box):
+    """An agency member works across their clients; only a viewer is confined."""
+    port, _ = stub_box
+    app, _ = _door_for(port, box_org="agency", box_client="acme")
+
+    assert _get(app, org="agency").status_code == 200
+
+
+def test_an_orgless_token_reaches_the_default_org(stub_box):
+    """Every token minted before tenancy carries no `org`. They keep working."""
+    port, _ = stub_box
+    app, _ = _door_for(port)
+
+    assert _get(app).status_code == 200
+
+
+def test_an_orgless_token_reaches_only_the_default_org(stub_box):
+    """Absent means the default org — never "any org".
+
+    This is what makes a second org safe without a mode switch: the tokens
+    nobody tagged reach only the boxes nobody tagged.
+    """
+    port, seen = stub_box
+    app, plane = _door_for(port, box_org="org-b")
+
+    assert _get(app).status_code == 404
+    assert plane.woken == []
+    assert seen == []
+
+
+def test_a_box_token_reaches_only_its_own_box(stub_box):
+    """A box's token lives on a machine whose agent has root."""
+    port, seen = stub_box
+    app, plane = _door_for(port, box_id="b-1")
+
+    assert _get(app, subject="box:b-2").status_code == 404
+    assert plane.woken == []
+
+    assert _get(app, subject="box:b-1").status_code == 200
+
+
+def test_a_name_reused_between_resolve_and_wake_never_wakes_the_replacement(stub_box):
+    """The box checked is the box woken, so a reused name costs nothing.
+
+    Waking by name would start whatever holds it now — the replacement, on the
+    account of a token that was only ever checked against the original.
+    """
+    port, seen = stub_box
+    app, plane = _door_for(
+        port, box_id="b-original", name_now_holds="b-replacement", torn_down={"b-original"}
+    )
+
+    assert _get(app, subject="box:b-original").status_code == 409
+    assert plane.woken_ids == ["b-original"]
+    assert "b-replacement" not in plane.woken_ids
+    assert seen == []
+
+
+def test_a_wake_that_answers_with_another_box_is_not_proxied_to(stub_box):
+    """What was woken is not what was checked, so it is not what we talk to."""
+    port, seen = stub_box
+    app, _ = _door_for(port, box_id="b-1", woken_id="b-9")
+
+    assert _get(app).status_code == 409
+    assert seen == []
+
+
+def test_the_websocket_path_applies_the_same_subject_check(stub_box):
+    """The route the door exists for gets the same guard, before any wake."""
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    port, _ = stub_box
+    app, plane = _door_for(port, box_org="org-b")
+    raw = mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY, org="org-a")
+
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            f"/api/ws?access_token={raw}", headers={"Host": "eng-a.flotta.dev"}
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as closed,
+    ):
+        ws.receive_text()
+
+    assert closed.value.code == 4404
+    assert plane.woken == []
+
+
+def test_the_door_resolves_the_box_before_it_wakes_it(stub_box):
+    port, _ = stub_box
+    app, plane = _door_for(port)
+
+    _get(app)
+
+    assert plane.resolved == ["eng-a"]
+    assert plane.woken == ["eng-a"]
 
 
 def test_the_doors_health_says_nothing_about_the_fleet(stub_box):
@@ -555,3 +740,92 @@ def stub_box_login():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# -- the real control-plane client, against a stub fleet API ----------------
+
+
+@pytest.fixture
+def stub_plane():
+    """A fleet API that answers `address` with whatever the test sets."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    replies: dict[str, tuple[int, dict]] = {}
+    calls: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _answer(self):
+            calls.append((self.command, self.path))
+            status, body = replies.get(self.path, (404, {"detail": "no box"}))
+            raw = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        do_GET = _answer  # noqa: N815
+        do_POST = _answer  # noqa: N815
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield ControlPlane(base_url=f"http://127.0.0.1:{server.server_address[1]}"), replies, calls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_waking_by_id_asks_for_the_id_not_the_name(stub_plane):
+    import asyncio
+
+    plane, replies, calls = stub_plane
+    replies["/api/boxes/b-1/wake"] = (200, {"box": {"id": "b-1", "endpoint": "fly://app/m1"}})
+
+    target = asyncio.run(plane.wake("eng-a", box_id="b-1"))
+
+    assert calls == [("POST", "/api/boxes/b-1/wake")]
+    assert (target.box_id, target.name) == ("b-1", "eng-a")
+
+
+def test_resolve_reads_whose_box_it_is(stub_plane):
+    import asyncio
+
+    plane, replies, calls = stub_plane
+    replies["/api/boxes/eng-a/address"] = (
+        200,
+        {"box": {"id": "b-1", "name": "eng-a", "org": "agency", "client": "acme"}},
+    )
+
+    address = asyncio.run(plane.resolve("eng-a"))
+
+    assert (address.box_id, address.org, address.client) == ("b-1", "agency", "acme")
+    assert calls == [("GET", "/api/boxes/eng-a/address")], "resolving must not wake"
+
+
+def test_a_control_plane_that_predates_tenancy_means_the_default_org(stub_plane):
+    """No `org` in the answer is one org, exactly as no `org` on a token is."""
+    import asyncio
+
+    plane, replies, _ = stub_plane
+    replies["/api/boxes/eng-a/address"] = (200, {"box": {"id": "b-1", "name": "eng-a"}})
+
+    address = asyncio.run(plane.resolve("eng-a"))
+
+    assert (address.org, address.client) == ("default", "default")
+
+
+def test_resolving_an_unknown_box_is_the_same_404_as_waking_one(stub_plane):
+    import asyncio
+
+    plane, _, _ = stub_plane
+    with pytest.raises(BoxUnavailable) as exc:
+        asyncio.run(plane.resolve("nope"))
+    assert exc.value.status == 404
+    assert str(exc.value) == "no box named 'nope'"

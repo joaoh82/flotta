@@ -22,7 +22,9 @@ is Flotta code with a proxy inside it, not a proxy with a configuration file.
 
 ## It does not touch the store
 
-The door asks the **control plane** to resolve and wake. D10 says fleet state is
+The door asks the **control plane** to resolve and wake — two questions, and
+the door checks *whose* box it is between them (M11): a token for another org,
+another client or another box gets a 404 before anything is woken. D10 says fleet state is
 written only by code that can reach the substrate; the door is a data-path
 component that should be restartable, replaceable and — eventually — horizontally
 scaled, and giving it a database handle would make it a second writer.
@@ -66,7 +68,15 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
-from flotta.auth import SCOPE_BOX_CHAT, AuthError, Token, verify
+from flotta.auth import (
+    DEFAULT_CLIENT,
+    DEFAULT_ORG,
+    SCOPE_BOX_CHAT,
+    AuthError,
+    Token,
+    admits,
+    verify,
+)
 
 # Imported at module level, not lazily inside `create_door`, and the reason is
 # a bug rather than a preference: `from __future__ import annotations` turns
@@ -104,6 +114,22 @@ class BoxUnavailable(Exception):
     def __init__(self, message: str, *, status: int = 502) -> None:
         super().__init__(message)
         self.status = status
+
+
+@dataclass(frozen=True, slots=True)
+class Address:
+    """Whose a box is, learned **without waking it** (M11).
+
+    The tenant has to be known before the wake, not after: waking first would
+    let a token from another org start a machine it was never going to be
+    allowed to talk to — a denial-of-wallet, the same reason auth is checked
+    before the wake at all.
+    """
+
+    box_id: str
+    name: str
+    org: str = DEFAULT_ORG
+    client: str = DEFAULT_CLIENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,8 +218,8 @@ def authorize(
 class ControlPlane:
     """The door's client for the fleet API.
 
-    Small on purpose. The door needs exactly two questions answered — *which
-    machine is this box* and *please wake it* — and giving it a broader client
+    Small on purpose. The door needs exactly two questions answered — *whose
+    box is this* and *please wake it* — and giving it a broader client
     would invite it to grow opinions about fleet state, which is the control
     plane's job.
     """
@@ -205,8 +231,11 @@ class ControlPlane:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
-    async def touch(self, name: str) -> None:
+    async def touch(self, box: str) -> None:
         """Tell the control plane this box is still in use. Best effort.
+
+        `box` is the id the conversation was opened against, not the name: a
+        heartbeat must never wake a different box that has since taken it.
 
         Waking is idempotent and the control plane rate-limits the event it
         writes, so calling this on a timer is cheap. It exists because idle
@@ -218,22 +247,59 @@ class ControlPlane:
         later; raising here would drop a live conversation over bookkeeping.
         """
         with contextlib.suppress(Exception):
-            await self.wake(name)
+            await self.wake(box, box_id=box)
 
-    async def wake(self, name: str) -> Target:
+    async def wake(self, name: str, *, box_id: str | None = None) -> Target:
         """Resolve `name` and ensure it is running. Returns where to proxy.
+
+        `box_id`, when the caller has one, is what gets woken; `name` is then
+        only for messages. The door always has one by now, because the subject
+        check ran against an id — and waking by name would start whatever holds
+        the name *now*, which after a release and reuse is a box nobody checked.
 
         Wake rather than get-then-maybe-wake: `wake_box` is idempotent and
         cheap on a box that is already up, and asking two questions would
         leave a race between them — a box can be stopped by Fly during a host
         drain between the read and the connect.
         """
+        response = await self._call(
+            "POST", f"/api/boxes/{box_id or name}/wake", name=name, verb="wake"
+        )
+        body = response.json()
+        endpoint = (body.get("box") or {}).get("endpoint")
+        box_id = (body.get("box") or {}).get("id") or box_id or name
+        if not endpoint:
+            raise BoxUnavailable(f"box {name!r} has no endpoint to proxy to", status=502)
+        return Target(box_id=box_id, name=name, endpoint=endpoint, host=internal_host(endpoint))
+
+    async def resolve(self, name: str) -> Address:
+        """Which box `name` is, and whose. Never wakes it.
+
+        A separate question from `wake` on purpose, and the cost is one more
+        round trip per request: the answer decides whether the wake may happen
+        at all, so it cannot arrive with the wake.
+        """
+        response = await self._call("GET", f"/api/boxes/{name}/address", name=name, verb="resolve")
+        box = response.json().get("box") or {}
+        if not box.get("id"):
+            raise BoxUnavailable(f"the control plane did not say which box {name!r} is", status=502)
+        return Address(
+            box_id=box["id"],
+            name=box.get("name") or name,
+            # Absent means the default, exactly as an absent claim does on a
+            # token: a control plane that predates tenancy has one org.
+            org=box.get("org") or DEFAULT_ORG,
+            client=box.get("client") or DEFAULT_CLIENT,
+        )
+
+    async def _call(self, method: str, path: str, *, name: str, verb: str) -> Any:
+        """One request to the fleet API, with the door's errors mapped once."""
         import httpx
 
-        url = f"{self.base_url.rstrip('/')}/api/boxes/{name}/wake"
+        url = f"{self.base_url.rstrip('/')}{path}"
         try:
             async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                response = await client.post(url, headers=self._headers())
+                response = await client.request(method, url, headers=self._headers())
         except Exception as exc:
             # The control plane being unreachable is the door's own outage, not
             # the box's. Say which one is down.
@@ -253,14 +319,8 @@ class ControlPlane:
             )
             raise BoxUnavailable("the door is not authorised to reach the fleet", status=500)
         if response.status_code >= 400:
-            raise BoxUnavailable(f"could not wake {name!r}: {response.text[:200]}", status=502)
-
-        body = response.json()
-        endpoint = (body.get("box") or {}).get("endpoint")
-        box_id = (body.get("box") or {}).get("id") or name
-        if not endpoint:
-            raise BoxUnavailable(f"box {name!r} has no endpoint to proxy to", status=502)
-        return Target(box_id=box_id, name=name, endpoint=endpoint, host=internal_host(endpoint))
+            raise BoxUnavailable(f"could not {verb} {name!r}: {response.text[:200]}", status=502)
+        return response
 
 
 def authority(host: str, port: int) -> str:
@@ -378,9 +438,36 @@ def create_door(
 
     app = FastAPI(title="Flotta front door")
 
-    async def _target(request_host: str | None) -> Target:
+    async def _target(token: Token, request_host: str | None) -> Target:
+        """Resolve, check whose it is, wake, wait. In that order, and only that.
+
+        The subject check sits between resolve and wake: after resolve because
+        the box's tenant is not known before it, and before wake because a
+        token that may not talk to a box has no business starting it.
+        """
         name = host_to_box_name(request_host, domain=domain)
-        target = await plane.wake(name)
+        address = await plane.resolve(name)
+        refusal = admits(
+            token,
+            box_id=address.box_id,
+            box_name=address.name,
+            org=address.org,
+            client=address.client,
+        )
+        if refusal is not None:
+            # Logged for the operator, never said to the caller: "exists, but
+            # not yours" would make every hostname a probe for another org's
+            # agents. A box you may not address is a box that is not there.
+            _log.info("refused %r for %r: %s", name, token.subject, refusal)
+            raise BoxUnavailable(f"no box named {name!r}", status=404)
+        # By id: the name can be released and reused between resolve and here,
+        # and waking by name would start the replacement on this token's
+        # account — the cost the check above exists to refuse.
+        target = await plane.wake(name, box_id=address.box_id)
+        if target.box_id != address.box_id:
+            # Should be unreachable now; kept because proxying to a box other
+            # than the one checked is the failure, however it comes about.
+            raise BoxUnavailable(f"box {name!r} changed while it was being addressed", status=409)
         await wait_until_ready(
             f"http://{authority(target.host, target.port)}", timeout_s=ready_timeout_s
         )
@@ -397,8 +484,8 @@ def create_door(
     )
     async def proxy(path: str, request: Request) -> Response:
         try:
-            authorize(header=request.headers.get("authorization"), key=key)
-            target = await _target(request.headers.get("host"))
+            token = authorize(header=request.headers.get("authorization"), key=key)
+            target = await _target(token, request.headers.get("host"))
         except BoxUnavailable as exc:
             return JSONResponse({"detail": str(exc)}, status_code=exc.status)
 
@@ -463,13 +550,13 @@ def create_door(
         browser cannot set headers on a WS handshake. See `authorize`.
         """
         try:
-            authorize(
+            token = authorize(
                 header=websocket.headers.get("authorization"),
                 query_token=websocket.query_params.get("access_token"),
                 key=key,
                 allow_query=True,
             )
-            target = await _target(websocket.headers.get("host"))
+            target = await _target(token, websocket.headers.get("host"))
         except BoxUnavailable as exc:
             # The handshake has to be accepted before a close code carries a
             # reason a client can read; rejecting outright gives the browser an
@@ -490,7 +577,7 @@ def create_door(
             """
             while True:
                 await asyncio.sleep(HEARTBEAT_S)
-                await plane.touch(target.name)
+                await plane.touch(target.box_id)
 
         heartbeat = asyncio.create_task(keep_awake())
 

@@ -49,11 +49,13 @@ Six, no wildcards, no hierarchy:
     git:credential mint a git credential for a repository a box is granted
     box:peer       ask the control plane to relay a message to a granted agent
 
-`box:peer` is deliberately not `box:chat`. A box holding `box:chat` could
-reach *every* agent, because the front door checks the scope and not the
-subject — so the scope a box carries must be one that cannot address a box
-directly at all. `box:peer` buys one thing: the right to ask the control
-plane to carry a message, which it does only after checking the grant.
+`box:peer` is deliberately not `box:chat`. When it was chosen, a box holding
+`box:chat` could reach *every* agent, because the front door checked the scope
+and not the subject. The door now checks both (`admits`, M11), so a box's
+`box:chat` would reach only itself — but the scope a box carries is still one
+that cannot address a box directly at all: `box:peer` buys the right to ask
+the control plane to carry a message, which it does only after checking the
+grant, counting the hops and writing both sides' events.
 
 `box:destroy` is separated from `fleet:write` on purpose. It is the verb that
 deletes an agent's entire memory, it is the reason the control plane refused to
@@ -130,6 +132,17 @@ DEFAULT_TTL_S = 30 * 24 * 3600
 #: impersonate a box to use it.
 BOX_SUBJECT_PREFIX = "box:"
 
+#: The tenant a token belongs to when it names none (M11).
+#:
+#: Every token minted before tenancy carries no `org` claim, and every box that
+#: existed before tenancy belongs to the default org and its default client. So
+#: an absent claim means **the default org — never "any org"**. That is what
+#: keeps the single-operator path working unchanged and, at the same time,
+#: makes a second org safe by construction: a token nobody tagged can reach
+#: only the boxes nobody tagged.
+DEFAULT_ORG = "default"
+DEFAULT_CLIENT = "default"
+
 
 def peek_subject(token: str) -> str | None:
     """The subject a token *claims*, without verifying anything.
@@ -182,9 +195,53 @@ class Token:
     scopes: frozenset[str]
     issued_at: int
     expires_at: int
+    #: The org this token acts within. `None` is the default org.
+    org: str | None = None
+    #: The one client this token is confined to, or `None` for every client in
+    #: its org. A box's token and a client viewer's carry one; an agency
+    #: member's does not.
+    client: str | None = None
 
     def allows(self, scope: str) -> bool:
         return scope in self.scopes
+
+
+def admits(
+    token: Token,
+    *,
+    box_id: str,
+    org: str,
+    client: str,
+    box_name: str | None = None,
+) -> str | None:
+    """Why `token` may not address this box, or `None` if it may.
+
+    Scopes say what a token may do; this says **to whom**. The front door
+    checked only the first, so any token carrying `box:chat` reached every
+    box's hostname — tolerable with one operator, and the whole of the
+    tenancy problem once there are two.
+
+    Three rules, all of which must hold:
+
+    - a `box:` subject addresses its own box and no other — it lives on a
+      machine whose agent has root;
+    - the token's org is the box's org, an absent claim meaning the default
+      org (see `DEFAULT_ORG`);
+    - a token confined to a client reaches only that client's boxes.
+
+    Returns the reason rather than raising so each caller can choose how much
+    to say. The door says nothing: telling a stranger "that box exists, but
+    not for you" would turn the hostname into a directory of other people's
+    agents.
+    """
+    claimed = subject_box(token.subject)
+    if claimed is not None and claimed not in {box_id, box_name}:
+        return f"token for box {claimed!r} cannot address another box"
+    if (token.org or DEFAULT_ORG) != org:
+        return f"token for org {token.org or DEFAULT_ORG!r} cannot address a box in another org"
+    if token.client is not None and token.client != client:
+        return f"token for client {token.client!r} cannot address another client's box"
+    return None
 
 
 def generate_signing_key() -> str:
@@ -259,6 +316,8 @@ def mint(
     key: str | None = None,
     env: dict[str, str] | None = None,
     now: int | None = None,
+    org: str | None = None,
+    client: str | None = None,
 ) -> str:
     """Issue a token. Refuses an unknown scope rather than carrying it.
 
@@ -278,17 +337,27 @@ def mint(
         )
     if ttl_s <= 0:
         raise AuthError("ttl must be positive; a token that is already expired is not useful")
+    for claim, value in (("org", org), ("client", client)):
+        if value is not None and not value.strip():
+            raise AuthError(f"an empty {claim} names nothing; omit it for the default")
 
     issued = int(time.time()) if now is None else now
+    claims: dict[str, Any] = {
+        "v": 1,
+        "sub": subject,
+        "scopes": sorted(wanted),
+        "iat": issued,
+        "exp": issued + ttl_s,
+    }
+    # Written only when set, so a token minted without tenancy is byte-for-byte
+    # the token it always was.
+    if org is not None:
+        claims["org"] = org.strip()
+    if client is not None:
+        claims["client"] = client.strip()
     payload = _b64(
         json.dumps(
-            {
-                "v": 1,
-                "sub": subject,
-                "scopes": sorted(wanted),
-                "iat": issued,
-                "exp": issued + ttl_s,
-            },
+            claims,
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
@@ -340,6 +409,21 @@ def verify(
     if not isinstance(raw_scopes, list):
         raise AuthError("malformed token: no scopes")
 
+    # A tenancy claim that is present but not a name is refused, not ignored.
+    # Ignoring it would read the token as the default org's — failing *open*
+    # into the one tenant every legacy token can already reach. Presence is the
+    # key, not the value: an explicit `"org": null` is a claim that is not a
+    # name, and reading it as absent would hand out exactly that default.
+    tenancy: dict[str, str | None] = {}
+    for claim in ("org", "client"):
+        if claim not in claims:
+            tenancy[claim] = None
+            continue
+        value = claims[claim]
+        if not isinstance(value, str) or not value.strip():
+            raise AuthError(f"malformed token: {claim} is not a name")
+        tenancy[claim] = value
+
     return Token(
         subject=str(claims.get("sub") or "unknown"),
         # Intersected with what this build knows: a token minted by a newer
@@ -348,4 +432,6 @@ def verify(
         scopes=frozenset(str(s) for s in raw_scopes) & SCOPES,
         issued_at=int(claims.get("iat") or 0),
         expires_at=expires,
+        org=tenancy["org"],
+        client=tenancy["client"],
     )

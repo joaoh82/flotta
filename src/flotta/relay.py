@@ -6,13 +6,12 @@ asking box never gets a token that can reach another box.
 
 ## Why the control plane carries it rather than the box
 
-The front door checks that a token has `box:chat` and **does not look at whose
-token it is** — `authorize()` returns a `Token` and both call sites discard it.
-So any credential good enough to reach one agent is good enough to reach every
-agent. Handing a box a short-lived token "for eng-b" would confine it by the
-clock and nothing else.
-
-Relaying closes that: the check and the call happen in the same place, with no
+When this was written the front door checked that a token had `box:chat` and
+**did not look at whose token it was**, so any credential good enough to reach
+one agent was good enough to reach every agent, and a short-lived token "for
+eng-b" would have been confined by the clock and nothing else. The door now
+checks the subject too (`auth.admits`, M11) — but relaying was never only
+about that gap: the check and the call happen in the same place, with no
 window in between, and the only thing on the box is permission to *ask*.
 
 It buys three more things, which is why it is not merely the safe option:

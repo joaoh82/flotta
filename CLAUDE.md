@@ -477,14 +477,18 @@ conventions, and the sharp edges below.
   in its root callback. A suite that is green in a fresh worktree and red for
   anyone who has deployed has now happened twice: fifteen control-plane tests
   returning 401, and later the `token box` tests.
-- **The front door checks a token's scope and never its subject.** `authorize`
-  requires `box:chat` and returns a `Token` that both call sites discard, so
-  **any** token carrying `box:chat` reaches **every** box's hostname. That is
-  why a box's own token carries `git:credential` and `box:peer` and not
-  `box:chat`: both of those ask the *control plane* to act on the box's behalf,
-  where `confine_to_box` checks whose token it is. A short-lived token minted
-  "for eng-b" would be confined by the clock and nothing else. Anything that
-  puts `box:chat` on a machine has handed that machine the whole fleet.
+- **The front door checks whose token it is, between resolve and wake (M11).**
+  It used to check only the scope — `authorize` returned a `Token` both call
+  sites discarded, so any `box:chat` token reached every box. Now the door asks
+  the control plane `GET /api/boxes/{name}/address` (never wakes), runs
+  `auth.admits` (a `box:` subject reaches only its box; the token's `org` must
+  be the box's, **an absent `org` meaning the default org, never "any org"**;
+  a `client` claim confines to that client), and only then wakes. A refusal is
+  the same 404 as a box that does not exist — no existence oracle. A box's own
+  token still carries `git:credential` and `box:peer`, not `box:chat`: those
+  ask the *control plane* to act, where hop limits and events live. **Deploy
+  the door and control plane before minting any token with an `org` claim** —
+  an older door ignores claims it does not know.
 - **The door also strips the caller's `Authorization` before proxying** and
   substitutes the fleet's basic auth, so the answering box learns nothing about
   who is calling it. "Who is asking" has to travel in the message body —
