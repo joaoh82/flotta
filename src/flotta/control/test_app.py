@@ -465,10 +465,12 @@ def secured(fleet):
         yield c
 
 
-def _token(*scopes, subject="test", ttl_s=300):
+def _token(*scopes, subject="test", ttl_s=300, org=None, client=None):
     from flotta.auth import mint
 
-    return mint(subject=subject, scopes=set(scopes), key=AUTH_KEY, ttl_s=ttl_s)
+    return mint(
+        subject=subject, scopes=set(scopes), key=AUTH_KEY, ttl_s=ttl_s, org=org, client=client
+    )
 
 
 def _bearer(*scopes, **kw):
@@ -3019,3 +3021,125 @@ def test_the_build_is_read_from_whichever_host_set_it(monkeypatch):
     assert _build() == "0123456789ab"
     monkeypatch.setenv("FLOTTA_BUILD", "override")
     assert _build() == "override"
+
+
+# -- M11.5: creating an agent in a client -------------------------------------
+
+
+@pytest.fixture
+def agencies(fleet):
+    with FleetStore(fleet) as store:
+        for org in ("agency-x", "agency-y"):
+            store.create_org(org, org)
+            store.create_client(org, "acme", "Acme")
+
+
+@pytest.fixture
+def substrate(monkeypatch):
+    """The real `provision.create_box`, on a backend that adopts by app name."""
+    import flotta.provision as provision
+    from flotta.test_provision import _AdoptingByName
+
+    backend = _AdoptingByName()
+    monkeypatch.setattr(provision, "_backend_for", lambda scheme: backend)
+    return backend
+
+
+def test_a_client_token_creates_in_its_client_without_saying_so(secured, agencies, substrate):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    response = secured.post(
+        "/api/boxes",
+        json={"name": "support"},
+        headers=_bearer(SCOPE_FLEET_WRITE, org="agency-x", client="acme"),
+    )
+
+    assert response.status_code == 201, response.text
+    box = response.json()["box"]
+    assert (box["name"], box["org"], box["client"]) == (
+        "support--acme--agency-x",
+        "agency-x",
+        "acme",
+    )
+    assert [s.name for s in substrate.specs] == ["support--acme--agency-x"]
+
+
+def test_two_orgs_may_both_create_a_support_agent(secured, agencies, substrate):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    for org in ("agency-x", "agency-y"):
+        response = secured.post(
+            "/api/boxes",
+            json={"name": "support", "client": "acme"},
+            headers=_bearer(SCOPE_FLEET_WRITE, org=org),
+        )
+        assert response.status_code == 201, response.text
+
+    assert len(substrate.machines) == 2, "the second org adopted the first's machine"
+
+
+@pytest.mark.parametrize(
+    ("claims", "body"),
+    [
+        ({"org": "agency-y"}, {"org": "agency-x", "client": "acme"}),
+        ({"org": "agency-x", "client": "globex"}, {"client": "acme"}),
+        ({}, {"org": "agency-x", "client": "acme"}),
+        ({"org": "agency-x"}, {"client": "globex"}),
+    ],
+    ids=["another-org", "another-client", "orgless-token", "no-such-client"],
+)
+def test_creating_where_a_token_may_not_act_is_the_404_of_a_missing_client(
+    secured, agencies, substrate, claims, body
+):
+    """Creation is not a way to learn which clients another org has."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    response = secured.post(
+        "/api/boxes", json={"name": "support", **body}, headers=_bearer(SCOPE_FLEET_WRITE, **claims)
+    )
+
+    assert response.status_code == 404
+    org = body.get("org") or claims.get("org") or "default"
+    client = body.get("client") or claims.get("client")
+    assert response.json() == {"detail": f"org {org!r} has no client {client!r}"}
+    assert substrate.specs == [], "a refused create reached the substrate"
+
+
+def test_a_name_too_long_for_its_client_is_422_before_the_substrate(secured, agencies, substrate):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    response = secured.post(
+        "/api/boxes",
+        json={"name": "s" * 50, "client": "acme"},
+        headers=_bearer(SCOPE_FLEET_WRITE, org="agency-x"),
+    )
+
+    assert response.status_code == 422
+    assert "too long for client 'acme'" in response.json()["detail"]
+    assert substrate.specs == []
+
+
+def test_the_202_path_writes_the_tenancy_and_probes_the_address(fleet, agencies, monkeypatch):
+    """The production path: the row is reserved here and provisioned on a thread."""
+    import flotta.control.app as app_module
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_FLEET_WRITE
+    from flotta.test_provision import _AdoptingByName
+
+    probed: list[str] = []
+    monkeypatch.setattr(app_module, "_peek_for", lambda impl, name: probed.append(name))
+    monkeypatch.setattr(provision, "_backend_for", lambda scheme: _AdoptingByName())
+    monkeypatch.setattr(provision, "create_box", lambda name, **kw: {"box_id": "x"})
+
+    with TestClient(_async_client(fleet, [])) as client:
+        response = client.post(
+            "/api/boxes",
+            json={"name": "support"},
+            headers=_bearer(SCOPE_FLEET_WRITE, org="agency-x", client="acme"),
+        )
+
+    assert response.status_code == 202, response.text
+    assert probed == ["support--acme--agency-x"], "the probe looked in the wrong Fly app"
+    with FleetStore(fleet) as store:
+        box = store.get_box(response.json()["box_id"])
+    assert (box.name, box.org, box.client) == ("support--acme--agency-x", "agency-x", "acme")

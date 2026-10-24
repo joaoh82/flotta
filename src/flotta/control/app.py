@@ -41,6 +41,8 @@ from typing import Any
 
 from flotta import db
 from flotta.auth import (
+    DEFAULT_CLIENT,
+    DEFAULT_ORG,
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_BOX_PEER,
@@ -50,6 +52,7 @@ from flotta.auth import (
     SIGNING_KEY_ENV,
     AuthError,
     Token,
+    admits_tenant,
     mint,
     resolve_signing_key,
     subject_box,
@@ -749,7 +752,7 @@ def create_app(
             store.close()
 
     @app.post("/api/boxes", status_code=201)
-    def create_box_endpoint(body: dict[str, Any], _: Token | None = needs_write) -> Any:
+    def create_box_endpoint(body: dict[str, Any], token: Token | None = needs_write) -> Any:
         """Create a box. The API half of "create Agent B" being a button.
 
         Goes through `provision.create_box` rather than writing a row, for the
@@ -757,6 +760,14 @@ def create_app(
         claim a machine that was not provisioned. `create_box` also refuses to
         mint a second row for a machine another box already occupies — a guard
         that was unreachable until this endpoint existed to reach it.
+
+        **Whose box (M11.5).** `org` and `client` in the body, each defaulting
+        to the token's claim and then to the default org's default client — so
+        a token minted for a client creates there without saying so, and every
+        request that worked before still creates where it did. A token may
+        create only where `admits_tenant` lets it act; anywhere else is the
+        same 404 as a client that does not exist, so creation is not a way to
+        learn another org's clients.
         """
         from fastapi.responses import JSONResponse
 
@@ -766,7 +777,13 @@ def create_app(
             ProvisionError,
             create_box,
         )
-        from flotta.store import DuplicateBoxError, InvalidBoxNameError, validate_box_name
+        from flotta.store import (
+            DuplicateBoxError,
+            InvalidBoxNameError,
+            InvalidTenantError,
+            box_label,
+            validate_box_name,
+        )
 
         name = str(body.get("name") or "").strip()
         if not name:
@@ -777,10 +794,28 @@ def create_app(
         # is the early exit. Without it a name that cannot work still costs a
         # `flyctl` probe (`_peek_for` runs before the row is reserved) and
         # comes back as a 409 about a duplicate, which is the wrong fix.
+        org = str(body.get("org") or "").strip() or (token.org if token else None) or DEFAULT_ORG
+        client = (
+            str(body.get("client") or "").strip()
+            or (token.client if token else None)
+            or DEFAULT_CLIENT
+        )
         try:
             name = validate_box_name(name)
-        except InvalidBoxNameError as exc:
+            # The whole address, so a name too long for its client is a 422
+            # here rather than after a probe.
+            label = box_label(name, org=org, client=client)
+        except (InvalidBoxNameError, InvalidTenantError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        nowhere = HTTPException(status_code=404, detail=f"org {org!r} has no client {client!r}")
+        if token is not None and admits_tenant(token, org=org, client=client) is not None:
+            raise nowhere
+        tenant_store = store_factory()
+        try:
+            if tenant_store.get_client(org, client) is None:
+                raise nowhere
+        finally:
+            tenant_store.close()
 
         # What makes this agent different from the fleet default. Absent means
         # "the fleet decides", which is the common case and stays a one-field
@@ -819,6 +854,9 @@ def create_app(
         if background:
             return _create_in_background(
                 name,
+                org=org,
+                client=client,
+                label=label,
                 volume_gb=volume_gb,
                 region=region,
                 display_name=display_name,
@@ -833,6 +871,8 @@ def create_app(
                 result = create_box(
                     name,
                     store=store,
+                    org=org,
+                    client=client,
                     volume_gb=volume_gb,
                     region=region,
                     display_name=display_name,
@@ -882,6 +922,9 @@ def create_app(
     def _create_in_background(
         name: str,
         *,
+        org: str,
+        client: str,
+        label: str,
         volume_gb: int | None = None,
         region: str | None = None,
         display_name: str | None = None,
@@ -913,7 +956,8 @@ def create_app(
         store = store_factory()
         try:
             impl = _backend_for("fly://")
-            probe = _peek_for(impl, name)
+            # By address: that is what the Fly app is named after.
+            probe = _peek_for(impl, label)
             if probe:
                 for existing in store.list_boxes():
                     if existing.endpoint == probe and not is_terminal("box", existing.status):
@@ -928,6 +972,8 @@ def create_app(
                     name,
                     store=store,
                     backend=impl,
+                    org=org,
+                    client=client,
                     display_name=display_name,
                     description=description,
                     instructions=instructions,
@@ -971,7 +1017,7 @@ def create_app(
         # If the process dies mid-provision the row is left at `provisioning`
         # with a machine possibly created. That is not ignored: `reconcile_boxes`
         # sweeps exactly that, which is why it was built alongside this.
-        worker = threading.Thread(target=provision, name=f"provision-{name}", daemon=True)
+        worker = threading.Thread(target=provision, name=f"provision-{label}", daemon=True)
         _provisioning.add(worker)
         worker.start()
 

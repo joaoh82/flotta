@@ -460,12 +460,15 @@ def test_a_client_token_cannot_reach_a_sibling_clients_box(stub_box):
     assert seen == []
 
 
+ACME = "eng-a--acme--agency.flotta.dev"
+
+
 def test_a_client_token_reaches_its_own_clients_box(stub_box):
     port, seen = stub_box
     app, plane = _door_for(port, box_org="agency", box_client="acme")
 
-    assert _get(app, org="agency", client="acme").status_code == 200
-    assert plane.woken == ["eng-a"]
+    assert _get(app, host=ACME, org="agency", client="acme").status_code == 200
+    assert plane.woken == ["eng-a--acme--agency"]
 
 
 def test_an_org_token_without_a_client_reaches_every_client_in_its_org(stub_box):
@@ -473,7 +476,65 @@ def test_an_org_token_without_a_client_reaches_every_client_in_its_org(stub_box)
     port, _ = stub_box
     app, _ = _door_for(port, box_org="agency", box_client="acme")
 
-    assert _get(app, org="agency").status_code == 200
+    assert _get(app, host=ACME, org="agency").status_code == 200
+
+
+# -- the hostname names the tenant (M11.5) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "claims"),
+    [
+        ("eng-a--acme--org-b.flotta.dev", {"org": "org-a"}),
+        ("eng-a--globex--agency.flotta.dev", {"org": "agency", "client": "acme"}),
+        ("eng-a.flotta.dev", {"org": "agency"}),
+        ("eng-a--acme--agency.flotta.dev", {}),
+    ],
+    ids=["another-org", "another-client", "bare-is-the-default-org", "orgless-token"],
+)
+def test_a_host_whose_tenant_disagrees_with_the_token_never_reaches_the_control_plane(
+    stub_box, host, claims
+):
+    """Refused off the hostname alone: no resolve to time, nothing logged there."""
+    port, seen = stub_box
+    app, plane = _door_for(port, box_org="agency", box_client="acme")
+
+    response = _get(app, host=host, **claims)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": f"no box named {host.split('.')[0]!r}"}
+    assert plane.resolved == [], "the control plane was asked about a box the token cannot reach"
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "label", ["eng-a--acme", "eng-a--acme--agency--x", "eng-a----agency", "eng-a--default--default"]
+)
+def test_a_hostname_that_is_not_an_address_is_404_without_resolving(stub_box, label):
+    """Including the default's long spelling: one address per box."""
+    port, _ = stub_box
+    app, plane = _door_for(port)
+
+    assert _get(app, host=f"{label}.flotta.dev").status_code == 404
+    assert plane.resolved == []
+
+
+def test_the_row_decides_even_when_the_hostname_agrees_with_the_token(stub_box):
+    """The hostname check is the early exit; the row is the guarantee.
+
+    The control plane resolves ids as well as names, and an id carries no
+    tenant — so a label that parses as the default org's can still be another
+    org's box, and only the row knows.
+    """
+    port, seen = stub_box
+    app, plane = _door_for(port, box_org="org-b", box_client="ops")
+
+    response = _get(app, host="b-1.flotta.dev")
+
+    assert response.status_code == 404
+    assert plane.resolved == ["b-1"]
+    assert plane.woken == []
+    assert seen == []
 
 
 def test_an_orgless_token_reaches_the_default_org(stub_box):

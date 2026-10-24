@@ -160,6 +160,23 @@ conventions, and the sharp edges below.
   REFERENCES` with a non-NULL default while foreign keys are on — so the store
   is what writes them. No `users` table yet: nothing would read it until
   invitations exist, and a migration adds it when something does.
+- **A box's name is its address, and the address names its tenant (M11.5).**
+  `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
+  `boxes.name` (`flotta.address`); the default org's default client keeps
+  bare names, so every live address is unchanged, and the long spelling of a
+  default box is refused rather than accepted as an alias. The whole label
+  being the name is load-bearing: **the Fly app is named after it and
+  `FlyBackend.create` adopts whatever machine is already in that app**, so
+  per-client name uniqueness would have let one org's `support` take over
+  another's. `provision.create_box` therefore names everything after the
+  label — the probe, the spec (even a caller's), the identity — and a tenant
+  box's own token carries its `org`/`client` claims (a default box's token is
+  byte-identical to before). `POST /api/boxes` takes `org`/`client`,
+  defaulting to the token's claims, and answers creating where the token may
+  not act with the same 404 as a client that does not exist. **The door reads
+  the tenant off the hostname and refuses a mismatched token before calling
+  the control plane at all**; the check against the resolved row still runs,
+  because the control plane resolves ids too and an id carries no tenant.
 - **A headless `run_conversation` does NOT populate `state.db`.** SEAM_NOTES Q3
   describes a rich schema (sessions, messages, FTS); measured on a live box,
   after a completed turn `state.db` holds exactly one table
