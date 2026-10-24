@@ -56,6 +56,7 @@ from typing import Any
 
 import typer
 
+from .auth import DEFAULT_CLIENT, DEFAULT_ORG
 from .migrations import MigrationError
 from .store import (
     Box,
@@ -64,6 +65,7 @@ from .store import (
     FleetStore,
     InvalidBoxMetaError,
     InvalidBoxNameError,
+    InvalidTenantError,
     LegacyStoreError,
     Task,
     UnknownEntityError,
@@ -993,6 +995,10 @@ def create(
         "--model",
         help="Model id this agent runs, e.g. anthropic/claude-sonnet-4.5. Default: the fleet's",
     ),
+    org: str = typer.Option(DEFAULT_ORG, "--org", help="Which org it belongs to"),
+    client: str = typer.Option(
+        DEFAULT_CLIENT, "--client", help="Which of the org's clients it belongs to"
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -1046,6 +1052,8 @@ def create(
                 name,
                 store=fleet,
                 spec=BoxSpec(name=name, image=image) if image else None,
+                org=org,
+                client=client,
                 volume_gb=volume_gb,
                 region=region,
                 display_name=display_name,
@@ -1053,7 +1061,14 @@ def create(
                 instructions=instructions,
                 model=model,
             )
-        except (InvalidBoxNameError, InvalidBoxMetaError, DuplicateBoxError, InvalidModel) as exc:
+        except (
+            InvalidBoxNameError,
+            InvalidBoxMetaError,
+            InvalidTenantError,
+            UnknownEntityError,
+            DuplicateBoxError,
+            InvalidModel,
+        ) as exc:
             # Exit 2: the caller asked for something impossible, which is a
             # refusal rather than a failure (see the exit-code convention).
             # `DuplicateBoxError` reached here uncaught before this — a name
@@ -2035,16 +2050,20 @@ def token_box(
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
         box_identity, box_name = found["id"], found["name"]
+        org, client = found.get("org"), found.get("client")
     else:
         with _open_store(store) as fleet:
             row = _require_box(fleet, box_id)
             box_identity, box_name = row.id, row.name
+            org, client = row.org, row.client
 
     # The same builder `provision.create_box` uses, so this block is exactly
     # what a freshly created box receives. Two builders would drift, and the
     # drift would show up as a rotated identity behaving differently from a new
     # one — which is the hardest kind of difference to notice.
-    box_env, box_secrets = build_identity(box_identity, box_name, ttl_s=days * 24 * 3600)
+    box_env, box_secrets = build_identity(
+        box_identity, box_name, org=org, client=client, ttl_s=days * 24 * 3600
+    )
     if not box_secrets:
         raise _fail(
             AuthError(

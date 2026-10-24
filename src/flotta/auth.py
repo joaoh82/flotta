@@ -237,6 +237,17 @@ def admits(
     claimed = subject_box(token.subject)
     if claimed is not None and claimed not in {box_id, box_name}:
         return f"token for box {claimed!r} cannot address another box"
+    return admits_tenant(token, org=org, client=client)
+
+
+def admits_tenant(token: Token, *, org: str, client: str) -> str | None:
+    """Why `token` may not act in `org`'s `client`, or `None` if it may.
+
+    The tenant half of `admits`, for callers that know whose a box would be
+    before there is a box: the door reads it off the hostname (M11.5) and
+    refuses without asking the control plane anything, and creation checks it
+    before a row exists.
+    """
     if (token.org or DEFAULT_ORG) != org:
         return f"token for org {token.org or DEFAULT_ORG!r} cannot address a box in another org"
     if token.client is not None and token.client != client:

@@ -64,6 +64,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
+from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG
 from flotta.backend import (
     Backend,
     BackendError,
@@ -79,6 +80,7 @@ from flotta.store import (
     FleetStore,
     Task,
     UnknownEntityError,
+    box_label,
     is_terminal,
     validate_box_meta,
     validate_box_name,
@@ -440,6 +442,8 @@ def build_identity(
     box_id: str,
     box_name: str,
     *,
+    org: str | None = None,
+    client: str | None = None,
     instructions: str | None = None,
     ttl_s: int = BOX_TOKEN_TTL_S,
     env: dict[str, str] | None = None,
@@ -461,6 +465,11 @@ def build_identity(
     Shared with `flotta token box` so the block that command prints is exactly
     what creation injects. Two builders would drift, and the drift would be
     invisible until a rotated identity behaved differently from a fresh one.
+
+    The token carries the box's tenancy (M11.5) when it is not the default
+    org's default client, so every check that compares a token's org with a
+    box's sees this box as its own. A default box's token is unchanged, byte
+    for byte: an absent claim already means the default org.
     """
     source = os.environ if env is None else env
     from flotta.auth import SCOPE_BOX_PEER, SCOPE_GIT_CREDENTIAL, AuthError, box_subject, mint
@@ -496,12 +505,16 @@ def build_identity(
     if email_domain:
         box_env["FLOTTA_GIT_EMAIL_DOMAIN"] = email_domain
 
+    tenant: dict[str, str] = {}
+    if (org or DEFAULT_ORG, client or DEFAULT_CLIENT) != (DEFAULT_ORG, DEFAULT_CLIENT):
+        tenant = {"org": org or DEFAULT_ORG, "client": client or DEFAULT_CLIENT}
     try:
         token = mint(
             subject=box_subject(box_id),
             scopes={SCOPE_GIT_CREDENTIAL, SCOPE_BOX_PEER},
             ttl_s=ttl_s,
             env=source,
+            **tenant,
         )
     except AuthError:
         # No signing key is a legitimate state — it is the whole loopback
@@ -629,6 +642,8 @@ def reserve_box(
     *,
     store: FleetStore,
     backend: Backend,
+    org: str = DEFAULT_ORG,
+    client: str = DEFAULT_CLIENT,
     display_name: str | None = None,
     description: str | None = None,
     instructions: str | None = None,
@@ -645,6 +660,9 @@ def reserve_box(
     while the work carries on. The caller is told it failed; a machine appears
     anyway. Reserving the row separately lets the API answer at once with
     something real to poll.
+
+    `name` is what the agent is called in its client; the row gets its
+    address (`flotta.address`), which is what everything after this uses.
     """
     # The projects convention is part of what the agent is told, not a
     # separate file: a path it does not know about is not a projects folder.
@@ -665,8 +683,8 @@ def reserve_box(
         from flotta.inference import validate_model
 
         model = validate_model(model)
-    box = store.create_box(name)
-    store.add_event("box", box.id, "provisioning", {"name": name, "backend": backend.scheme})
+    box = store.create_box(name, org=org, client=client)
+    store.add_event("box", box.id, "provisioning", {"name": box.name, "backend": backend.scheme})
     if display_name or description or instructions:
         store.set_box_meta(
             box.id,
@@ -736,6 +754,8 @@ def create_box(
     backend: Backend | None = None,
     spec: BoxSpec | None = None,
     box: Box | None = None,
+    org: str = DEFAULT_ORG,
+    client: str = DEFAULT_CLIENT,
     volume_gb: int | None = None,
     region: str | None = None,
     display_name: str | None = None,
@@ -744,6 +764,11 @@ def create_box(
     model: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
+
+    `name` is what the agent is called in `org`'s `client`. From the moment it
+    is validated the box is known by its **address** instead — the row's name,
+    the Fly app, the occupancy probe and the identity all use it — because the
+    address is what is unique: two orgs' `support` agents are two apps.
 
     The verb v0.1 had no use for. `spawn_box` creates a machine *for a task* and
     throws it away; this creates a machine you **have**, which tasks then visit.
@@ -763,7 +788,13 @@ def create_box(
     # "that name has a capital letter in it".
     #
     # The store validates again. That is the guarantee; this is the shortcut.
-    name = validate_box_name(name)
+    # A reserved row already has its address; anything else is composed here,
+    # before the probe below names a Fly app after it.
+    if box is not None:
+        name = box.name
+    else:
+        short = validate_box_name(name)
+        name = box_label(short, org=org, client=client)
     if model is not None:
         # Same reasoning as the name: a model id that can never work is refused
         # before a substrate round trip, not after a machine exists.
@@ -794,9 +825,11 @@ def create_box(
     # created twice or the name being taken between the two halves.
     if box is None:
         box = reserve_box(
-            name,
+            short,
             store=store,
             backend=impl,
+            org=org,
+            client=client,
             display_name=display_name,
             description=description,
             instructions=instructions,
@@ -809,7 +842,10 @@ def create_box(
     # a second command — which is what `just box-identity` was — is wrong for a
     # caller that has no shell: `POST /api/boxes` is one request, and M8's
     # "create Agent B" is one button.
-    base = spec or BoxSpec(name=name)
+    # Named by address whatever the caller's spec said: the Fly app is named
+    # after it, and a tenant box's spec carrying its short name would put it
+    # in another org's app.
+    base = replace(spec, name=name) if spec else BoxSpec(name=name)
 
     # The image every agent is born on, resolved the same way an upgrade
     # resolves it — `$FLOTTA_FLY_IMAGE`, else the newest release on the build
@@ -842,7 +878,12 @@ def create_box(
 
     source = layered(store)
     identity_env, identity_secrets = build_identity(
-        box.id, name, instructions=meta.instructions if meta else None, env=source
+        box.id,
+        name,
+        org=box.org,
+        client=box.client,
+        instructions=meta.instructions if meta else None,
+        env=source,
     )
     # Always, including the default. `build_identity` already puts a value
     # in, but it does not validate; this is the cleaned path the setting
@@ -1429,7 +1470,7 @@ def rotate_identity(
             "that; wait for it to settle."
         )
 
-    _, secrets = build_identity(box.id, box.name, ttl_s=ttl_s)
+    _, secrets = build_identity(box.id, box.name, org=box.org, client=box.client, ttl_s=ttl_s)
     token = secrets.get("FLOTTA_BOX_TOKEN")
     if not token:
         raise ProvisionError(

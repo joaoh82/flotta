@@ -14,6 +14,7 @@ import pytest
 
 from flotta.store import (
     TENANT_ID_MAX,
+    DuplicateBoxError,
     DuplicateTenantError,
     FleetStore,
     InvalidBoxNameError,
@@ -158,3 +159,72 @@ def test_a_bare_box_name_cannot_contain_a_double_dash(target):  # noqa: F811
             store.create_box("support--acme--agency")
         assert store.list_boxes() == [], "a refusal writes nothing"
         assert store.create_box("support-acme").name == "support-acme", "one dash is fine"
+
+
+# -- M11.5: boxes in a client ---------------------------------------------------
+
+
+def test_two_orgs_may_both_have_a_support_agent(target):  # noqa: F811
+    with FleetStore(target) as store:
+        for org in ("agency-x", "agency-y"):
+            store.create_org(org, org)
+            store.create_client(org, "acme", "Acme")
+        mine = store.create_box("support")
+        x = store.create_box("support", org="agency-x", client="acme")
+        y = store.create_box("support", org="agency-y", client="acme")
+
+        assert [b.name for b in (mine, x, y)] == [
+            "support",
+            "support--acme--agency-x",
+            "support--acme--agency-y",
+        ]
+        assert [(b.org, b.client) for b in (mine, x, y)] == [
+            ("default", "default"),
+            ("agency-x", "acme"),
+            ("agency-y", "acme"),
+        ]
+        assert store.get_box_by_name("support--acme--agency-y").id == y.id
+
+
+def test_one_client_may_not_have_two_agents_of_one_name(target):  # noqa: F811
+    with FleetStore(target) as store:
+        store.create_org("agency-x", "X")
+        store.create_client("agency-x", "acme", "Acme")
+        store.create_box("support", org="agency-x", client="acme")
+
+        with pytest.raises(DuplicateBoxError, match="'support--acme--agency-x' already exists"):
+            store.create_box("support", org="agency-x", client="acme")
+
+
+def test_a_box_in_a_client_that_does_not_exist_writes_nothing(target):  # noqa: F811
+    with FleetStore(target) as store:
+        store.create_org("agency-x", "X")
+        with pytest.raises(UnknownEntityError, match="has no client 'acme'"):
+            store.create_box("support", org="agency-x", client="acme")
+        assert store.list_boxes() == []
+
+
+def test_a_name_too_long_for_its_client_is_refused_with_what_is_left(target):  # noqa: F811
+    """Every part legal, the sum not one label."""
+    org, client = "a" * TENANT_ID_MAX, "b" * TENANT_ID_MAX
+    with FleetStore(target) as store:
+        store.create_org(org, "A")
+        store.create_client(org, client, "B")
+        left = 63 - 2 * TENANT_ID_MAX - 4
+        store.create_box("c" * left, org=org, client=client)
+
+        with pytest.raises(InvalidBoxNameError, match=f"leaves {left} for the name"):
+            store.create_box("d" * (left + 1), org=org, client=client)
+
+
+def test_a_destroyed_tenant_agents_name_comes_back(target):  # noqa: F811
+    """FLOTTA-28's release, on an address rather than a bare name."""
+    with FleetStore(target) as store:
+        store.create_org("agency-x", "X")
+        store.create_client("agency-x", "acme", "Acme")
+        first = store.create_box("support", org="agency-x", client="acme")
+        store.update_box_status(first.id, "torn_down")
+        store.release_name(first.id)
+
+        again = store.create_box("support", org="agency-x", client="acme")
+        assert again.name == "support--acme--agency-x"

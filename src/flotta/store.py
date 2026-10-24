@@ -59,7 +59,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
-from flotta import db, migrations
+from flotta import address, db, migrations
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG
 
 EntityKind = Literal["box", "workspace", "task"]
@@ -688,7 +688,14 @@ class FleetStore:
             self._conn.execute("UPDATE boxes SET name = ? WHERE id = ?", (released, box.id))
         return released
 
-    def create_box(self, name: str, *, box_id: str | None = None) -> Box:
+    def create_box(
+        self,
+        name: str,
+        *,
+        org: str = DEFAULT_ORG,
+        client: str = DEFAULT_CLIENT,
+        box_id: str | None = None,
+    ) -> Box:
         """Insert a new box in status ``provisioning`` and return it.
 
         Deliberately uncapped. v0.1 capped worker creation at one because a
@@ -703,13 +710,28 @@ class FleetStore:
         goes terminal keeps its name forever (`release_name` runs only in
         `teardown_box`), so a refusal that wrote first would cost the caller
         the name they were about to correct.
+
+        **`name` is what the agent is called in its client; the row stores its
+        address** (`flotta.address`): `support` in the default org, and
+        `support--acme--agency-x` in agency-x's client acme. So two orgs may
+        both have a `support`, and neither row nor Fly app collides. The
+        tenancy is written in the same statement as the name — there is no
+        moment at which a box exists without an owner.
+
+        No transaction around the client check: clients are never deleted, and
+        the insert cannot make one disappear.
         """
-        name = validate_box_name(name)
+        org = validate_tenant_id(org, kind="org")
+        client = validate_tenant_id(client, kind="client")
+        label = box_label(name, org=org, client=client)
+        if self.get_client(org, client) is None:
+            raise UnknownEntityError(f"org {org!r} has no client {client!r}")
         bid = box_id or f"b-{uuid.uuid4().hex[:12]}"
         try:
             self._conn.execute(
-                "INSERT INTO boxes (id, name, status, created_at) VALUES (?, ?, ?, ?)",
-                (bid, name, "provisioning", _utcnow()),
+                "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (bid, label, "provisioning", _utcnow(), org, client),
             )
         except db.UniqueViolation as exc:
             # Two different collisions land here. Reporting a duplicate *id* as
@@ -717,7 +739,7 @@ class FleetStore:
             # they would rename and hit the same wall.
             if self.get_box(bid) is not None:
                 raise DuplicateBoxError(f"a box with id {bid!r} already exists") from exc
-            raise DuplicateBoxError(f"a box named {name!r} already exists") from exc
+            raise DuplicateBoxError(f"a box named {label!r} already exists") from exc
         return self._get_box_or_raise(bid)
 
     def update_box_status(self, box_id: str, status: str, *, endpoint: str | None = None) -> Box:
@@ -1673,6 +1695,26 @@ def _tenant_name(value: str, *, kind: Literal["org", "client"]) -> str:
     return v
 
 
+def box_label(name: str, *, org: str, client: str) -> str:
+    """The address a box called `name` in `org`'s `client` would have.
+
+    Validated whole: the name as a box name, the ids as tenant ids, and the
+    joined label against the one-label limit — the parts can each be legal and
+    the sum too long. Before any row or substrate call, like the name check.
+    """
+    name = validate_box_name(name)
+    validate_tenant_id(org, kind="org")
+    validate_tenant_id(client, kind="client")
+    label = address.compose(name, org=org, client=client)
+    if len(label) > address.LABEL_MAX:
+        raise InvalidBoxNameError(
+            f"{name!r} is too long for client {client!r} of org {org!r}: its address "
+            f"would be {label!r} ({len(label)} characters, max {address.LABEL_MAX}), "
+            f"which leaves {address.LABEL_MAX - len(label) + len(name)} for the name"
+        )
+    return label
+
+
 def validate_box_name(name: str) -> str:
     """A box name, or a refusal explaining why it could not be one.
 
@@ -1707,9 +1749,9 @@ def validate_box_name(name: str) -> str:
 
     if _BOX_NAME.match(value):
         if "--" in value:
-            # Free until M11.5, and refused before then on purpose: a box
-            # called `support--acme--agency` in the default org would hold the
-            # address of `support` in another org's client.
+            # `--` joins an address's parts (`flotta.address`): a box called
+            # `support--acme--agency` in the default org would hold the address
+            # of `support` in another org's client.
             raise InvalidBoxNameError(
                 f"{value!r} cannot be an address: `--` separates an agent from "
                 "its client and org in an address (`support--acme--agency`), so "

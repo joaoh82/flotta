@@ -68,6 +68,7 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
+from flotta.address import parse as parse_address
 from flotta.auth import (
     DEFAULT_CLIENT,
     DEFAULT_ORG,
@@ -75,6 +76,7 @@ from flotta.auth import (
     AuthError,
     Token,
     admits,
+    admits_tenant,
     verify,
 )
 
@@ -446,6 +448,18 @@ def create_door(
         token that may not talk to a box has no business starting it.
         """
         name = host_to_box_name(request_host, domain=domain)
+        # The hostname says whose box it is (`flotta.address`), so a token
+        # for another org or client is refused here, before the control plane
+        # hears of it — no resolve to time, nothing for it to log. The check
+        # after resolve still runs: that one compares against the row.
+        try:
+            _, host_client, host_org = parse_address(name)
+        except ValueError:
+            raise BoxUnavailable(f"no box named {name!r}", status=404) from None
+        refusal = admits_tenant(token, org=host_org, client=host_client)
+        if refusal is not None:
+            _log.info("refused %r for %r before resolving: %s", name, token.subject, refusal)
+            raise BoxUnavailable(f"no box named {name!r}", status=404)
         address = await plane.resolve(name)
         refusal = admits(
             token,

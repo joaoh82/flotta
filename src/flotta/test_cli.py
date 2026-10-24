@@ -897,6 +897,51 @@ def test_create_refuses_a_taken_name_without_a_traceback(tmp_path, monkeypatch):
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
+def test_create_puts_the_agent_in_the_client_it_is_told(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import provision
+    from flotta.cli import app
+    from flotta.test_provision import _AdoptingByName
+
+    db = tmp_path / "fleet.db"
+    with FleetStore(db) as fleet:
+        fleet.create_org("agency-x", "X")
+        fleet.create_client("agency-x", "acme", "Acme")
+    backend = _AdoptingByName()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(provision, "_backend_for", lambda _scheme: backend)
+
+    args = ["create", "support", "--org", "agency-x", "--client", "acme"]
+    result = CliRunner().invoke(app, [*args, "--store", str(db), "--json"])
+
+    assert result.exit_code == 0, result.output
+    box = json.loads(result.output)["box"]
+    assert (box["name"], box["org"], box["client"]) == (
+        "support--acme--agency-x",
+        "agency-x",
+        "acme",
+    )
+
+
+def test_create_in_a_client_that_does_not_exist_is_a_refusal(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import provision
+    from flotta.cli import app
+    from flotta.test_provision import _AdoptingByName
+
+    db = tmp_path / "fleet.db"
+    FleetStore(db).close()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(provision, "_backend_for", lambda _scheme: _AdoptingByName())
+
+    result = CliRunner().invoke(app, ["create", "support", "--client", "acme", "--store", str(db)])
+
+    assert result.exit_code == 2
+    assert "has no client 'acme'" in result.output
+
+
 # -- `flotta upgrade` against a deployed fleet -------------------------------
 #
 # Shipped store-first, which made it unusable against every fleet that actually

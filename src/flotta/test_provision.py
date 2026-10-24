@@ -3439,3 +3439,91 @@ def test_an_agent_still_being_created_cannot_have_its_model_changed(store, monke
     box = store.create_box("eng-new")
     with pytest.raises(ProvisionError, match="still being created"):
         set_model(box.id, "z-ai/glm-5.2", store=store, backend=Rotating())
+
+
+# -- M11.5: creating a box in a client ----------------------------------------
+
+
+def _two_agencies(store):
+    for org in ("agency-x", "agency-y"):
+        store.create_org(org, org.title())
+        store.create_client(org, "acme", "Acme")
+
+
+class _AdoptingByName(FakeBackend):
+    """Fly's shape: one app per name, and `create` adopts what is already in it."""
+
+    def __init__(self):
+        super().__init__()
+        self.machines: dict[str, object] = {}
+        self.specs = []
+
+    def create(self, spec):
+        from flotta.backend import BoxHandle
+
+        self.specs.append(spec)
+        n = len(self.machines) + 1
+        return self.machines.setdefault(spec.name, BoxHandle(id=f"m{n}", endpoint=f"fake://a/m{n}"))
+
+
+def test_two_orgs_may_both_have_a_support_agent_and_neither_adopts_the_others(store):
+    """The reason the address is the name: Fly adopts a machine by app name."""
+    _two_agencies(store)
+    backend = _AdoptingByName()
+
+    x = create_box("support", store=store, backend=backend, org="agency-x", client="acme")
+    y = create_box("support", store=store, backend=backend, org="agency-y", client="acme")
+
+    assert [s.name for s in backend.specs] == ["support--acme--agency-x", "support--acme--agency-y"]
+    assert x["endpoint"] != y["endpoint"], "the second org's agent adopted the first's machine"
+    assert (store.get_box(y["box_id"]).org, store.get_box(y["box_id"]).client) == (
+        "agency-y",
+        "acme",
+    )
+
+
+def test_a_callers_spec_cannot_name_a_tenant_box_by_its_short_name(store):
+    """`flotta create --image` passes a spec named after what was typed."""
+    from flotta.backend import BoxSpec
+
+    _two_agencies(store)
+    backend = _AdoptingByName()
+
+    create_box(
+        "support",
+        store=store,
+        backend=backend,
+        spec=BoxSpec(name="support", image="img:1"),
+        org="agency-x",
+        client="acme",
+    )
+
+    assert backend.specs[0].name == "support--acme--agency-x"
+    assert backend.specs[0].image == "img:1"
+
+
+def test_a_tenant_box_token_carries_its_tenancy(store, monkeypatch):
+    """Every later check compares a token's org with a box's; a box's own
+    token must find its own box in its own org."""
+    from flotta.auth import verify
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 43)
+    _two_agencies(store)
+    backend = _AdoptingByName()
+
+    create_box("support", store=store, backend=backend, org="agency-x", client="acme")
+    create_box("eng-a", store=store, backend=backend)
+
+    tenant, default = (verify(s.secrets["FLOTTA_BOX_TOKEN"]) for s in backend.specs)
+    assert (tenant.org, tenant.client) == ("agency-x", "acme")
+    assert (default.org, default.client) == (None, None), "a default box's token is unchanged"
+
+
+def test_a_box_in_a_client_that_does_not_exist_is_refused_before_a_machine(store):
+    backend = _AdoptingByName()
+
+    with pytest.raises(UnknownEntityError, match="has no client"):
+        create_box("support", store=store, backend=backend, org="agency-x", client="acme")
+
+    assert backend.specs == []
+    assert store.list_boxes() == []
