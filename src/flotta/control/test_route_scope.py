@@ -16,14 +16,19 @@ does for transactions. A route is **scoped** when:
    (`UNSCOPED_READS`), directly or through a helper, except inside a function
    in `SCOPE_FUNCTIONS`, which is where the tenant check is made.
 
+**Or** it is an operator route (`OPERATOR_ROUTES`): one that acts on the whole
+fleet on purpose — settings, image builds, rolling Hermes — and so may read it
+whole, provided its first statement is `_require_operator(<its principal>)`.
+First, so nothing the route does happens before the refusal.
+
 What it cannot see: functions imported from other modules. `provision.wake_box`
 reads a box by the id it is given, which is safe exactly when that id came from
 a scoped lookup — and this reader takes the route's word for it.
 
-Today no route is scoped, and they are all in `UNSCOPED_ROUTES`. **That list is
-a ratchet**: a new route that is not scoped fails, and so does a listed route
-that has become scoped and was not taken off — otherwise it could quietly
-regress. M11.6a and M11.6b empty it.
+The routes not yet scoped are in `UNSCOPED_ROUTES`. **That list is a ratchet**:
+a new route that is not scoped fails, and so does a listed route that has become
+scoped and was not taken off — otherwise it could quietly regress. M11.6a
+scoped every box route; what is left is agent-to-agent, which M11.6b scopes.
 """
 
 from __future__ import annotations
@@ -42,9 +47,23 @@ UNSCOPED_READS = frozenset(
 )
 
 #: Where a box lookup is allowed to happen, because the tenant check happens
-#: there too. Empty until M11.6a adds `_scoped_box`. Adding a name is a decision
-#: a reviewer must see: everything it reaches is exempt from this test.
-SCOPE_FUNCTIONS: frozenset[str] = frozenset()
+#: there too. Adding a name is a decision a reviewer must see: everything it
+#: reaches is exempt from this test. Each has behavioural tests of its own in
+#: `test_tenancy.py`.
+SCOPE_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "_scoped_box",  # one box, if the token's tenant may act on it
+        "_scoped_boxes",  # the token's org's boxes, or its client's
+        "_routable_box",  # `_scoped_box`, or any box for the door's `fleet:route`
+        "_occupant",  # fleet-wide on purpose (a machine is held or not); names scoped
+    }
+)
+
+#: Routes that act on the whole fleet and are the operator's alone. Each must
+#: open with `_require_operator(<principal>)`; after that it may read anything.
+OPERATOR_ROUTES = frozenset(
+    {"get_settings", "put_settings", "hermes_versions", "list_builds", "update_hermes"}
+)
 
 #: Routes with no principal at all, on purpose. They may not reach a box.
 OPEN_ROUTES = frozenset({"health"})
@@ -52,34 +71,6 @@ OPEN_ROUTES = frozenset({"health"})
 #: The routes not yet scoped. May only shrink.
 UNSCOPED_ROUTES = frozenset(
     {
-        # Operator-only — fleet-wide settings and builds. M11.6a: the default
-        # org's, and refused to every other.
-        "get_settings",
-        "put_settings",
-        "hermes_versions",
-        "list_builds",
-        "update_hermes",
-        # Every box route. M11.6a: through `_scoped_box`.
-        "list_boxes",
-        "create_box_endpoint",
-        "get_box",
-        "set_meta",
-        "set_instructions",
-        "get_events",
-        "get_machine",
-        "list_repos",
-        "grant_repo_endpoint",
-        "revoke_repo_endpoint",
-        "set_model_endpoint",
-        "rotate_identity_endpoint",
-        "upgrade_box_endpoint",
-        "box_address",
-        "wake_box_endpoint",
-        "destroy_box",
-        # Box-token routes. `confine_to_box` keeps a box to itself already, but
-        # these also accept non-box tokens. M11.6a.
-        "git_credential_repos",
-        "git_credential",
         # Agent-to-agent. M11.6b: peers in the same client only.
         "list_peers",
         "block_peer_endpoint",
@@ -186,11 +177,34 @@ def _unscoped_reads(node: _Function) -> set[str]:
     }
 
 
+def _guards_first(node: _Function, principal: str) -> bool:
+    """Whether the body opens (after a docstring) with `_require_operator(principal, …)`."""
+    body = node.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body or not isinstance(body[0], ast.Expr) or not isinstance(body[0].value, ast.Call):
+        return False
+    call = body[0].value
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "_require_operator"
+        and bool(call.args)
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == principal
+    )
+
+
 def _unscoped_routes(
     source: str,
     *,
     open_routes: frozenset[str] = OPEN_ROUTES,
     scope_functions: frozenset[str] = SCOPE_FUNCTIONS,
+    operator_routes: frozenset[str] = OPERATOR_ROUTES,
 ) -> dict[str, list[str]]:
     """Every route that is not scoped, with why. Empty means all of them are.
 
@@ -242,6 +256,14 @@ def _unscoped_routes(
         elif principal not in _names_read(route):
             reasons.append(f"never reads its token `{principal}`")
 
+        if route.name in operator_routes:
+            if principal is None or not _guards_first(route, principal):
+                reasons.append("is an operator route that does not open with `_require_operator`")
+            if reasons:
+                unscoped[route.name] = reasons
+            # Fleet-wide reads are what an operator route is for.
+            continue
+
         found = {(read, None) for read in _unscoped_reads(route)}
         for callee in _names_read(route) & graph.keys():
             found |= reach[callee]
@@ -290,7 +312,9 @@ def test_the_unscoped_allowlist_names_real_routes():
 
     assert not UNSCOPED_ROUTES - routes, f"not routes: {sorted(UNSCOPED_ROUTES - routes)}"
     assert not OPEN_ROUTES - routes, f"not routes: {sorted(OPEN_ROUTES - routes)}"
+    assert not OPERATOR_ROUTES - routes, f"not routes: {sorted(OPERATOR_ROUTES - routes)}"
     assert not UNSCOPED_ROUTES & OPEN_ROUTES
+    assert not OPERATOR_ROUTES & (UNSCOPED_ROUTES | OPEN_ROUTES)
 
     assert not SCOPE_FUNCTIONS - functions.keys(), (
         f"not functions: {sorted(SCOPE_FUNCTIONS - functions.keys())}"
@@ -463,3 +487,46 @@ def test_an_open_route_may_not_reach_a_box():
     route = "@app.get('/health')\ndef health():\n    return store.list_boxes()"
     unscoped = _unscoped_routes(route, open_routes=frozenset({"health"}))
     assert unscoped == {"health": ["calls `list_boxes`"]}
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "def ops(token: Token | None = needs_read):\n    return store.list_boxes()",
+        "def ops(token: Token | None = needs_read):\n"
+        "    boxes = store.list_boxes()\n"
+        "    _require_operator(token, 'x')\n"
+        "    return boxes",
+        "def ops(token: Token | None = needs_read):\n"
+        "    _require_operator(None, 'x')\n"
+        "    return token and store.list_boxes()",
+    ],
+    ids=["no-guard", "guard-after-the-read", "guard-on-another-value"],
+)
+def test_an_operator_route_must_refuse_before_it_reads(route):
+    unscoped = _unscoped_routes(
+        "@app.get('/x')\n" + route,
+        open_routes=frozenset(),
+        scope_functions=frozenset(),
+        operator_routes=frozenset({"ops"}),
+    )
+    assert "is an operator route that does not open with `_require_operator`" in unscoped["ops"]
+
+
+def test_an_operator_route_that_refuses_first_may_read_the_fleet():
+    route = (
+        "@app.get('/x')\n"
+        "def ops(token: Token | None = needs_read):\n"
+        '    """Docstring first is fine."""\n'
+        "    _require_operator(token, 'x')\n"
+        "    return store.list_boxes()"
+    )
+    assert (
+        _unscoped_routes(
+            route,
+            open_routes=frozenset(),
+            scope_functions=frozenset(),
+            operator_routes=frozenset({"ops"}),
+        )
+        == {}
+    )

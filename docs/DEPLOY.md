@@ -167,7 +167,15 @@ just door-deploy     # creates the app if needed, then deploys
 ```
 
 `door-secrets` mints the control-plane token rather than having you paste one,
-so it cannot drift from the key that has to verify it.
+so it cannot drift from the key that has to verify it. It carries one scope,
+`fleet:route`: the door resolves and wakes any org's box and checks the
+caller's token against the answer itself, and the control plane lets that
+scope reach those two routes and nothing else (M11.6a).
+
+> **Upgrading a door from before M11.6a:** re-run `just door-secrets` and
+> redeploy. Its old token (`fleet:read box:chat`) still reaches the default
+> org's boxes — every box that existed before tenancy — but no other org's,
+> so any tenant agent is a 404 through the door until it has the new one.
 
 > **Why secrets before deploy.** `flyctl secrets set` waits for the app to
 > become healthy — and the door **cannot** become healthy until it has a

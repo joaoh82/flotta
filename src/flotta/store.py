@@ -795,6 +795,24 @@ class FleetStore:
             ).fetchall()
         return [_box_from_row(r) for r in rows]
 
+    def list_boxes_in(self, org: str, client: str | None = None) -> list[Box]:
+        """One org's boxes, or one client's, newest first (M11.6a).
+
+        What the control plane lists for a token; `list_boxes` is the whole
+        store, which only the operator's CLI and the fleet-wide sweeps see.
+        """
+        if client is None:
+            rows = self._conn.execute(
+                "SELECT * FROM boxes WHERE org_id = ? ORDER BY created_at DESC, id DESC", (org,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM boxes WHERE org_id = ? AND client_id = ? "
+                "ORDER BY created_at DESC, id DESC",
+                (org, client),
+            ).fetchall()
+        return [_box_from_row(r) for r in rows]
+
     def count_active_boxes(self) -> int:
         """How many boxes are burning CPU (excludes ``stopped``)."""
         placeholders = ",".join("?" * len(BOX_ACTIVE))

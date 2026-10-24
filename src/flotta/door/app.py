@@ -29,7 +29,9 @@ written only by code that can reach the substrate; the door is a data-path
 component that should be restartable, replaceable and — eventually — horizontally
 scaled, and giving it a database handle would make it a second writer.
 
-It therefore holds a Flotta token of its own, with `fleet:read` and `box:chat`.
+It therefore holds a Flotta token of its own, with `fleet:route` (M11.6a): the
+one scope that resolves and wakes any org's box, because every other route is
+scoped to its caller's tenant and the door finds a box before it knows whose.
 
 ## Auth composes rather than stacks
 
@@ -316,7 +318,7 @@ class ControlPlane:
             # would tell the user to re-authenticate for an operator's mistake.
             _log.error(
                 "the door's own control-plane token was rejected (%s). It needs "
-                "fleet:read and box:chat, signed with the same key.",
+                "fleet:route, signed with the same key (`just door-secrets`).",
                 response.status_code,
             )
             raise BoxUnavailable("the door is not authorised to reach the fleet", status=500)

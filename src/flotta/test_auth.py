@@ -183,14 +183,16 @@ def test_destroy_is_not_implied_by_write():
     assert not claims.allows(SCOPE_BOX_DESTROY)
 
 
-def test_the_known_scopes_are_exactly_these_six():
+def test_the_known_scopes_are_exactly_these_seven():
     """A new scope should be a deliberate act, visible in a diff.
 
     This test earned its keep on the first change: adding `box:chat` for M5b
     failed here, which is exactly the prompt to ask whether the scope is
     warranted rather than to notice it in review three PRs later. It asked the
     question again for M7's `box:peer`, where the answer was that `box:chat`
-    would have handed every box a key to the whole fleet.
+    would have handed every box a key to the whole fleet — and for M11.6a's
+    `fleet:route`, where the answer is that once routes are scoped by tenant,
+    the door is the one caller that must find a box before it knows whose.
     """
     assert {
         "fleet:read",
@@ -199,6 +201,7 @@ def test_the_known_scopes_are_exactly_these_six():
         "box:chat",
         "git:credential",
         "box:peer",
+        "fleet:route",
     } == SCOPES
 
 

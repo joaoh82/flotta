@@ -47,6 +47,7 @@ from flotta.auth import (
     SCOPE_BOX_DESTROY,
     SCOPE_BOX_PEER,
     SCOPE_FLEET_READ,
+    SCOPE_FLEET_ROUTE,
     SCOPE_FLEET_WRITE,
     SCOPE_GIT_CREDENTIAL,
     SIGNING_KEY_ENV,
@@ -350,12 +351,14 @@ def create_app(
             SIGNING_KEY_ENV,
         )
 
-    def require(*scopes: str):
+    def require(*scopes: str, any_of: bool = False):
         """A dependency that admits a request carrying **all** of `scopes`.
 
         All rather than any: a route that needs two permissions needs two, and
         an "any" default is the kind of thing that reads as fine until someone
-        adds a second scope to a route and quietly widens it.
+        adds a second scope to a route and quietly widens it. `any_of=True` is
+        the explicit exception, for the two routes the door shares with a
+        person (`needs_route`).
 
         With no key configured this admits everything, which is the documented
         loopback-development state — `check_bind` is what stops that reaching a
@@ -384,6 +387,8 @@ def create_app(
                 ) from exc
 
             missing = [s for s in scopes if not token.allows(s)]
+            if any_of and len(missing) < len(scopes):
+                missing = []
             if missing:
                 # 403, not 401: the token is valid and re-authenticating with
                 # it will not help. Name the scope so the fix is obvious.
@@ -402,9 +407,96 @@ def create_app(
     needs_read = Depends(require(SCOPE_FLEET_READ))
     needs_write = Depends(require(SCOPE_FLEET_WRITE))
     needs_destroy = Depends(require(SCOPE_BOX_DESTROY))
-    needs_chat = Depends(require(SCOPE_BOX_CHAT))
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
     needs_peer = Depends(require(SCOPE_BOX_PEER))
+    # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
+    needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
+
+    # -- whose box: the tenant scope (M11.6a) ------------------------------
+    #
+    # Every route that names a box finds it through `_scoped_box`, and the
+    # list through `_scoped_boxes`; `control/test_route_scope.py` reads this
+    # file and fails a route that does not. A token reaches what `admits_tenant`
+    # allows — its own org, or its own client — and **no token at all means no
+    # signing key**, the loopback development path, where the caller is the
+    # operator over the whole store, exactly as the CLI is.
+
+    def _is_operator(token: Token | None) -> bool:
+        """The default org's, unconfined: the person who runs the fleet.
+
+        Not a box: a box's token is the default org's too, and lives on a
+        machine whose agent has root.
+        """
+        if token is None:
+            return True
+        return (
+            (token.org or DEFAULT_ORG) == DEFAULT_ORG
+            and token.client is None
+            and subject_box(token.subject) is None
+        )
+
+    def _require_operator(token: Token | None, action: str) -> None:
+        """403 unless the operator: for the routes that act on the whole fleet.
+
+        403, not the 404 a box answers with: the route plainly exists for
+        everyone, and what is refused is the act, not knowledge of a box.
+        """
+        if not _is_operator(token):
+            raise HTTPException(
+                status_code=403, detail=f"only the fleet's operator (the default org) may {action}"
+            )
+
+    def _scoped_box(store: Any, token: Token | None, ref: str) -> Any:
+        """A box by id or name that `token` may act on, or 404.
+
+        Another org's box is the same 404 as no box: "exists, but not yours"
+        would make every route a directory of other people's agents.
+        """
+        box = store.get_box(ref) or store.get_box_by_name(ref)
+        if box is None or (
+            token is not None and admits_tenant(token, org=box.org, client=box.client) is not None
+        ):
+            raise HTTPException(status_code=404, detail=f"no box {ref!r}")
+        return box
+
+    def _scoped_boxes(store: Any, token: Token | None) -> list[Any]:
+        """The boxes `token` may see: its org's, or its client's."""
+        if token is None:
+            return store.list_boxes()
+        return store.list_boxes_in(token.org or DEFAULT_ORG, token.client)
+
+    def _routable_box(store: Any, token: Token | None, ref: str) -> Any:
+        """`_scoped_box`, except for the front door, which finds any org's box.
+
+        The door resolves a hostname *before* it knows whose box it names, and
+        then checks the caller's token against the answer itself. So its own
+        token holds `fleet:route` and is the operator's; a tenant's token
+        carrying the scope gains nothing, which is the point of requiring both.
+        """
+        if token is not None and token.allows(SCOPE_FLEET_ROUTE) and _is_operator(token):
+            box = store.get_box(ref) or store.get_box_by_name(ref)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {ref!r}")
+            return box
+        return _scoped_box(store, token, ref)
+
+    def _occupant(store: Any, token: Token | None, endpoint: str) -> str | None:
+        """Why a machine is taken, as far as `token` may be told; `None` if free.
+
+        Fleet-wide on purpose: occupancy is a fact about the substrate, and a
+        machine held by another org is still held. Only the *name* is scoped.
+        Unreachable across orgs in practice — a box's Fly app is named after
+        its whole address — but this is the place a misconfiguration would show.
+        """
+        for existing in store.list_boxes():
+            if existing.endpoint == endpoint and not is_terminal("box", existing.status):
+                if (
+                    token is None
+                    or admits_tenant(token, org=existing.org, client=existing.client) is None
+                ):
+                    return f"box {existing.id} ({existing.name}) already occupies {endpoint}"
+                return f"another box already occupies {endpoint}"
+        return None
 
     #: Delegations in flight, so a chain can be recognised as one. Per app
     #: rather than per module: two tests building two apps must not share a
@@ -461,7 +553,7 @@ def create_app(
         )
 
     @app.get("/api/settings")
-    def get_settings(_: Token | None = needs_read) -> Any:
+    def get_settings(token: Token | None = needs_read) -> Any:
         """What the fleet is configured with, and where each value came from.
 
         The catalogue travels with the values so the app renders a form without
@@ -472,6 +564,7 @@ def create_app(
         an allowlist of configuration, and the signing key, the GitHub token and
         the box password are not in it — by construction, not by filtering.
         """
+        _require_operator(token, "read the fleet's settings")
         from flotta.settings import describe
 
         store = store_factory()
@@ -481,7 +574,7 @@ def create_app(
             store.close()
 
     @app.put("/api/settings")
-    def put_settings(body: dict[str, Any], _: Token | None = needs_write) -> Any:
+    def put_settings(body: dict[str, Any], token: Token | None = needs_write) -> Any:
         """Change fleet settings. `{"values": {"KEY": "value", ...}}`.
 
         An empty string clears an override, which is what an emptied field in
@@ -494,6 +587,7 @@ def create_app(
         the fleet in a state nobody asked for and the form showing something
         else.
         """
+        _require_operator(token, "change the fleet's settings")
         from flotta.settings import UnknownSettingError, describe, validate
 
         values = body.get("values")
@@ -521,7 +615,7 @@ def create_app(
             store.close()
 
     @app.get("/api/hermes")
-    def hermes_versions(_: Token | None = needs_read) -> Any:
+    def hermes_versions(token: Token | None = needs_read) -> Any:
         """Which Hermes the fleet would build next, and whether a newer exists.
 
         Three different facts have been one sentence until now, and the app
@@ -543,6 +637,7 @@ def create_app(
         the image it boots, and it comes back from
         `GET /api/boxes/{id}/machine`.
         """
+        _require_operator(token, "read the fleet's Hermes versions")
         from flotta.hermes import report
         from flotta.provision import _newest_release_image, resolve_fleet_image
 
@@ -592,8 +687,9 @@ def create_app(
         }
 
     @app.get("/api/hermes/builds")
-    def list_builds(_: Token | None = needs_read) -> Any:
+    def list_builds(token: Token | None = needs_read) -> Any:
         """What the fleet has built, newest first — the app's progress view."""
+        _require_operator(token, "read the fleet's image builds")
         store = store_factory()
         try:
             from dataclasses import asdict
@@ -603,7 +699,7 @@ def create_app(
             store.close()
 
     @app.post("/api/hermes/update", status_code=202)
-    def update_hermes(body: dict[str, Any] | None = None, _: Token | None = needs_write) -> Any:
+    def update_hermes(body: dict[str, Any] | None = None, token: Token | None = needs_write) -> Any:
         """Build the box image at a Hermes ref, then move every agent onto it.
 
         **This is the button.** Everything else in this API is a piece of it:
@@ -624,6 +720,7 @@ def create_app(
         failed upgrade leaves that agent exactly as it was, which is what makes
         stopping a real recovery rather than a half-migrated fleet.
         """
+        _require_operator(token, "update every agent's Hermes")
         from fastapi.responses import JSONResponse
 
         from flotta.box.image import HERMES_REF
@@ -647,7 +744,7 @@ def create_app(
         finally:
             store.close()
 
-        def run() -> None:
+        def roll() -> None:
             from flotta.images import BuildError, build_box_image
             from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
 
@@ -698,7 +795,7 @@ def create_app(
             finally:
                 inner.close()
 
-        worker = threading.Thread(target=run, name=f"hermes-{ref}", daemon=True)
+        worker = threading.Thread(target=roll, name=f"hermes-{ref}", daemon=True)
         _provisioning.add(worker)
         worker.start()
 
@@ -707,10 +804,10 @@ def create_app(
         )
 
     @app.get("/api/boxes")
-    def list_boxes(all_: bool = False, _: Token | None = needs_read) -> Any:
+    def list_boxes(all_: bool = False, token: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
-            boxes = store.list_boxes()
+            boxes = _scoped_boxes(store, token)
             if not all_:
                 # A stopped box is idle, not finished — hiding it would hide
                 # the point of the fleet.
@@ -854,6 +951,7 @@ def create_app(
         if background:
             return _create_in_background(
                 name,
+                token=token,
                 org=org,
                 client=client,
                 label=label,
@@ -899,7 +997,7 @@ def create_app(
                 # is watching, which this repo has done once already.
                 #
                 # 201 with the box, plus a warning saying it is not up.
-                box = store.get_box(exc.box_id)
+                box = _scoped_box(store, token, exc.box_id)
                 return JSONResponse(
                     {
                         "box": _box_dict(box),
@@ -914,7 +1012,7 @@ def create_app(
                 # asking for something impossible. 502 matches DELETE, which
                 # already reports a failed teardown that way.
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
-            box = store.get_box(result["box_id"])
+            box = _scoped_box(store, token, result["box_id"])
             return {"box": _with_meta(store, box), **result}
         finally:
             store.close()
@@ -922,6 +1020,7 @@ def create_app(
     def _create_in_background(
         name: str,
         *,
+        token: Token | None,
         org: str,
         client: str,
         label: str,
@@ -958,15 +1057,9 @@ def create_app(
             impl = _backend_for("fly://")
             # By address: that is what the Fly app is named after.
             probe = _peek_for(impl, label)
-            if probe:
-                for existing in store.list_boxes():
-                    if existing.endpoint == probe and not is_terminal("box", existing.status):
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"box {existing.id} ({existing.name}) already occupies {probe}"
-                            ),
-                        )
+            occupied = _occupant(store, token, probe) if probe else None
+            if occupied:
+                raise HTTPException(status_code=409, detail=occupied)
             try:
                 box = reserve_box(
                     name,
@@ -1024,12 +1117,10 @@ def create_app(
         return JSONResponse(payload, status_code=202)
 
     @app.get("/api/boxes/{box_id}")
-    def get_box(box_id: str, _: Token | None = needs_read) -> Any:
+    def get_box(box_id: str, token: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             # Only on the single-box read, never the list: it is one query per
             # box, and the list is the hot path that renders the sidebar on a
             # timer. The one consumer — deciding whether to resume a
@@ -1045,7 +1136,7 @@ def create_app(
             store.close()
 
     @app.put("/api/boxes/{box_id}/meta")
-    def set_meta(box_id: str, body: dict[str, Any], _: Token | None = needs_write) -> Any:
+    def set_meta(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
         """Rename or re-describe an agent. The address never changes.
 
         **Instructions are deliberately not editable here.** The store row is
@@ -1066,9 +1157,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             current = store.meta_for_box(box.id)
             try:
                 meta = store.set_box_meta(
@@ -1090,7 +1179,9 @@ def create_app(
             store.close()
 
     @app.put("/api/boxes/{box_id}/instructions")
-    def set_instructions(box_id: str, body: dict[str, Any], _: Token | None = needs_write) -> Any:
+    def set_instructions(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
         """Rewrite what an agent *is*, on the volume it reads.
 
         Separate from `PUT …/meta` because it is a different kind of act. A
@@ -1111,9 +1202,7 @@ def create_app(
         try:
             # Resolved here as well as inside, so an unknown agent is a 404
             # rather than the 409 every other refusal uses.
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             try:
                 written = write_soul(box.id, body.get("instructions"), store=store)
                 # Same shape and the same units as the single-box read, so the
@@ -1129,18 +1218,16 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/events")
-    def get_events(box_id: str, _: Token | None = needs_read) -> Any:
+    def get_events(box_id: str, token: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             return {"events": [_event_dict(e) for e in store.get_box_timeline(box.id)]}
         finally:
             store.close()
 
     @app.get("/api/boxes/{box_id}/machine")
-    def get_machine(box_id: str, _: Token | None = needs_read) -> Any:
+    def get_machine(box_id: str, token: Token | None = needs_read) -> Any:
         """What the substrate says about this box's machine, beside the row.
 
         Every other read the app makes is the store's *belief*. This is the one
@@ -1163,9 +1250,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             row = _with_meta(store, box)
             if not box.endpoint:
                 # Not a failure: a box being built has no machine yet, which is
@@ -1214,20 +1299,18 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/repos")
-    def list_repos(box_id: str, _: Token | None = needs_read) -> Any:
+    def list_repos(box_id: str, token: Token | None = needs_read) -> Any:
         """Which repositories a box may use."""
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
         finally:
             store.close()
 
     @app.post("/api/boxes/{box_id}/repos")
     def grant_repo_endpoint(
-        box_id: str, body: dict[str, Any], _: Token | None = needs_write
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
     ) -> Any:
         """Grant a box a repository. Idempotent.
 
@@ -1251,9 +1334,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             # Normalised first, because the check asks GitHub about a path: a
             # pasted URL or a `.git` suffix would ask about a repository that
             # does not exist and read as a denial.
@@ -1278,7 +1359,7 @@ def create_app(
 
     @app.delete("/api/boxes/{box_id}/repos/{owner}/{name}")
     def revoke_repo_endpoint(
-        box_id: str, owner: str, name: str, _: Token | None = needs_write
+        box_id: str, owner: str, name: str, token: Token | None = needs_write
     ) -> Any:
         """Withdraw a grant. Takes effect on the box's next credential request.
 
@@ -1287,9 +1368,7 @@ def create_app(
         """
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             had = store.revoke_repo(box.id, f"{owner}/{name}")
             if had:
                 store.add_event("box", box.id, "repo_revoked", {"repo": f"{owner}/{name}"})
@@ -1432,7 +1511,9 @@ def create_app(
         return model
 
     @app.put("/api/boxes/{box_id}/model")
-    def set_model_endpoint(box_id: str, body: dict[str, Any], _: Token | None = needs_write) -> Any:
+    def set_model_endpoint(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
         """Change the model an agent runs; `{"model": null}` means the fleet's.
 
         Like renewing an identity: the value is written to the agent's own
@@ -1448,19 +1529,19 @@ def create_app(
         model = _checked_model(body.get("model"))
         store = store_factory()
         try:
-            box = _resolve(store, box_id)
+            box = _scoped_box(store, token, box_id)
             try:
                 result = set_model(box.id, model, store=store)
             except UpgradeFailed as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             except ProvisionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return {**result, "box": _with_meta(store, store.get_box(box.id))}
+            return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
         finally:
             store.close()
 
     @app.post("/api/boxes/{box_id}/identity")
-    def rotate_identity_endpoint(box_id: str, _: Token | None = needs_write) -> Any:
+    def rotate_identity_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
         """Give an agent a fresh identity token, written to its own machine.
 
         Replaces a recipe that wrote the token to whichever Fly app `.env`
@@ -1478,7 +1559,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = _resolve(store, box_id)
+            box = _scoped_box(store, token, box_id)
             try:
                 return rotate_identity(box.id, store=store)
             except UpgradeFailed as exc:
@@ -1490,7 +1571,7 @@ def create_app(
 
     @app.post("/api/boxes/{box_id}/upgrade")
     def upgrade_box_endpoint(
-        box_id: str, body: dict[str, Any] | None = None, _: Token | None = needs_write
+        box_id: str, body: dict[str, Any] | None = None, token: Token | None = needs_write
     ) -> Any:
         """Move an agent onto a new image, keeping its disk.
 
@@ -1529,9 +1610,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             image = str((body or {}).get("image") or "").strip() or None
             if background:
                 return _upgrade_in_background(box, image)
@@ -1587,7 +1666,7 @@ def create_app(
                 ),
             )
 
-        def run() -> None:
+        def upgrade() -> None:
             from flotta.provision import upgrade_box
 
             inner = store_factory()
@@ -1604,7 +1683,7 @@ def create_app(
         # A thread, for the same reason `_create_in_background` uses one: this
         # endpoint is a sync `def`, so there is no running loop to schedule on,
         # and the work is blocking subprocess calls end to end.
-        worker = threading.Thread(target=run, name=f"upgrade-{box.name}", daemon=True)
+        worker = threading.Thread(target=upgrade, name=f"upgrade-{box.name}", daemon=True)
         _provisioning.add(worker)
         worker.start()
 
@@ -1647,9 +1726,7 @@ def create_app(
         """
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "list the repositories of")
             return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
         finally:
@@ -1876,9 +1953,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
 
             # Before anything else: is this token allowed to speak for this
             # box? A non-box subject (an operator) is unrestricted — see
@@ -1906,7 +1981,7 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/address")
-    def box_address(box_id: str, _: Token | None = needs_chat) -> Any:
+    def box_address(box_id: str, token: Token | None = needs_route) -> Any:
         """Which box this is and whose, without waking it (M11).
 
         For the front door, which has to know a box's tenant *before* it wakes
@@ -1917,8 +1992,9 @@ def create_app(
         box has none worth having), no tasks, no metadata. `GET /api/boxes/{id}`
         returns all of those and is one query per task.
 
-        Guarded by `box:chat`, like `wake`: it is the first half of the same
-        operation, and the door holds exactly that scope for it.
+        Guarded like `wake`, which it is the first half of: `fleet:route` for
+        the door, which finds any org's box and then checks the caller's token
+        itself, or `box:chat` for a person, who finds only their own tenant's.
 
         The tenancy is the box's own row (M11.4). Every box made before it
         belongs to the default org's default client, which is what a token
@@ -1926,9 +2002,7 @@ def create_app(
         """
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _routable_box(store, token, box_id)
             return {
                 "box": {
                     "id": box.id,
@@ -1942,7 +2016,7 @@ def create_app(
             store.close()
 
     @app.post("/api/boxes/{box_id}/wake")
-    def wake_box_endpoint(box_id: str, _: Token | None = needs_chat) -> Any:
+    def wake_box_endpoint(box_id: str, token: Token | None = needs_route) -> Any:
         """Ensure a box is up so it can be addressed. Idempotent.
 
         Exists for the front door (M5b), which cannot reach the substrate
@@ -1954,7 +2028,9 @@ def create_app(
         **Guarded by `box:chat`, not a scope of its own.** A box is asleep most
         of the time, so anything permitted to talk to one must be permitted to
         wake it or the permission means nothing. A separate `box:wake` would be
-        a scope nobody could sensibly withhold.
+        a scope nobody could sensibly withhold. The door holds `fleet:route`
+        instead, because it wakes any org's box once it has checked the caller
+        (`_routable_box`).
 
         `wake_box`, not `start_box`: the operator's verb refuses anything that
         is not `stopped`, which is right when a human asks and wrong here — the
@@ -1966,9 +2042,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _routable_box(store, token, box_id)
             _record_activity(store, box.id)
             try:
                 result = wake_box(box.id, store=store, reason="front-door")
@@ -1978,12 +2052,12 @@ def create_app(
                 # on the first and only retry the second.
                 status = 409 if "only a running or stopped box" in str(exc) else 502
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
-            return {"box": _box_dict(store.get_box(box.id)), **result}
+            return {"box": _box_dict(_routable_box(store, token, box.id)), **result}
         finally:
             store.close()
 
     @app.delete("/api/boxes/{box_id}")
-    def destroy_box(box_id: str, _: Token | None = needs_destroy) -> Any:
+    def destroy_box(box_id: str, token: Token | None = needs_destroy) -> Any:
         """Destroy a box and everything it remembers. Idempotent.
 
         Goes through `teardown_box`, which cancels the backend's machine and
@@ -1995,9 +2069,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = store.get_box(box_id) or store.get_box_by_name(box_id)
-            if box is None:
-                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            box = _scoped_box(store, token, box_id)
             try:
                 return {"result": teardown_box(box.id, store=store, reason="control-plane")}
             except (ProvisionError, UnknownEntityError) as exc:
