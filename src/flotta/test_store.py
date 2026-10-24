@@ -724,6 +724,8 @@ def test_the_guard_names_a_real_table():
 
     source = inspect.getsource(store_module)
     tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", source))
+    # Tables from M11 on arrive by migration, as a plain CREATE TABLE.
+    tables |= set(re.findall(r"CREATE TABLE (?!IF )(\w+)", inspect.getsource(migrations_module)))
     # The migration runner takes a guard too, on a table the baseline creates.
     named = set(re.findall(r'transaction\(guard="(\w+)"\)', source))
     named |= set(re.findall(r'transaction\(guard="(\w+)"\)', inspect.getsource(migrations_module)))

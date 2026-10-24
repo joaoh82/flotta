@@ -1,10 +1,11 @@
 """Tests for the migration runner, on every engine the suite has.
 
-`MIGRATIONS` is empty until tenancy (M11.4), so these swap in migrations of
-their own — written to be the shape tenancy needs: a `NOT NULL` column with a
-default, added to `boxes`, on a store that already has rows. Postgres is
-included when `$PYTEST_POSTGRES_URL` is set, which CI always does; DDL inside a
-transaction is exactly where the two engines could disagree.
+These append migrations of their own after this build's real ones, numbered
+from wherever those end, so they keep working as migrations are added: the
+store reads columns the real ones create (`boxes.org_id`), so they cannot be
+swapped out. Postgres is included when `$PYTEST_POSTGRES_URL` is set, which CI
+always does; DDL inside a transaction is exactly where the engines could
+disagree. What the real migrations *do* is `test_tenancy.py`'s business.
 """
 
 from __future__ import annotations
@@ -24,8 +25,15 @@ _ENGINES = ["sqlite"]
 if os.environ.get("PYTEST_POSTGRES_URL", "").strip():
     _ENGINES.append("postgres")
 
+#: This build's migrations, captured before any test swaps the module's list.
+BASE = migrations.MIGRATIONS
+N = len(BASE)
+VERSIONS = [m.version for m in BASE]
+
 PROBE = Migration(
-    1, "boxes gain a probe", ("ALTER TABLE boxes ADD COLUMN probe TEXT NOT NULL DEFAULT 'old'",)
+    N + 1,
+    "boxes gain a probe",
+    ("ALTER TABLE boxes ADD COLUMN probe TEXT NOT NULL DEFAULT 'old'",),
 )
 
 
@@ -53,8 +61,26 @@ def target(request, tmp_path):
 
 
 def _open(target, monkeypatch, *steps: Migration) -> FleetStore:
-    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(steps))
+    """Open with this build's migrations and then `steps`."""
+    monkeypatch.setattr(migrations, "MIGRATIONS", BASE + tuple(steps))
     return FleetStore(target)
+
+
+def _before_the_runner(target, monkeypatch) -> str:
+    """A store as every deployment before M11 had it: the baseline, no ledger.
+
+    Built by opening with no migrations at all, which is the shape the store
+    had then, and inserting a box with SQL since the store's own reads now
+    expect the tenancy columns. Returns the box's id.
+    """
+    monkeypatch.setattr(migrations, "MIGRATIONS", ())
+    with FleetStore(target) as store:
+        store._conn.execute(
+            "INSERT INTO boxes (id, name, status, created_at) VALUES (?, ?, ?, ?)",
+            ("b-old", "eng-a", "running", "2026-09-01T00:00:00+00:00"),
+        )
+        store._conn.execute("DROP TABLE schema_migrations")
+    return "b-old"
 
 
 def _box_keys(store: FleetStore) -> set[str]:
@@ -64,16 +90,18 @@ def _box_keys(store: FleetStore) -> set[str]:
     return set(row.keys())
 
 
-def test_a_fresh_store_has_the_ledger_and_nothing_in_it(target, monkeypatch):
+def test_a_fresh_store_has_applied_every_migration(target, monkeypatch):
     with _open(target, monkeypatch) as store:
-        assert migrations.status(store._conn, ()) == []
+        lines = migrations.status(store._conn, BASE)
+    assert [s.version for s in lines] == VERSIONS
+    assert all(s.applied_at and s.known and not s.conflict for s in lines)
 
 
 def test_a_pending_migration_runs_at_open_and_is_recorded(target, monkeypatch):
     with _open(target, monkeypatch, PROBE) as store:
         assert "probe" in _box_keys(store)
-        [line] = migrations.status(store._conn, (PROBE,))
-        assert (line.version, line.name, line.known) == (1, "boxes gain a probe", True)
+        line = migrations.status(store._conn, BASE + (PROBE,))[-1]
+        assert (line.version, line.name, line.known) == (N + 1, "boxes gain a probe", True)
         assert line.applied_at
 
 
@@ -92,13 +120,15 @@ def test_reopening_does_not_apply_a_migration_twice(target, monkeypatch):
     """`ADD COLUMN` twice is an error, so a second run would fail the open."""
     _open(target, monkeypatch, PROBE).close()
     with _open(target, monkeypatch, PROBE) as store:
-        assert [s.version for s in migrations.status(store._conn, (PROBE,))] == [1]
+        assert store.migrations_applied == []
+        lines = migrations.status(store._conn, BASE + (PROBE,))
+    assert [s.version for s in lines] == [*VERSIONS, N + 1]
 
 
 def test_a_failing_migration_leaves_nothing_behind(target, monkeypatch):
     """Applied and recorded, or neither — never a column with no ledger row."""
     broken = Migration(
-        2,
+        N + 2,
         "half a change",
         (
             "ALTER TABLE boxes ADD COLUMN half TEXT",
@@ -110,9 +140,10 @@ def test_a_failing_migration_leaves_nothing_behind(target, monkeypatch):
 
     with _open(target, monkeypatch, PROBE) as store:
         assert "half" not in _box_keys(store), "the first statement was rolled back"
-        assert [s.version for s in migrations.status(store._conn, (PROBE,))] == [1]
+        lines = migrations.status(store._conn, BASE + (PROBE,))
+        assert [s.version for s in lines] == [*VERSIONS, N + 1]
 
-    fixed = Migration(2, "half a change", ("ALTER TABLE boxes ADD COLUMN half TEXT",))
+    fixed = Migration(N + 2, "half a change", ("ALTER TABLE boxes ADD COLUMN half TEXT",))
     with _open(target, monkeypatch, PROBE, fixed) as store:
         assert "half" in _box_keys(store)
 
@@ -120,17 +151,16 @@ def test_a_failing_migration_leaves_nothing_behind(target, monkeypatch):
 def test_a_number_taken_twice_is_refused(target, monkeypatch):
     """Two branches both added migration 1; the second must not be skipped."""
     _open(target, monkeypatch, PROBE).close()
-    other = Migration(1, "something else entirely", ("SELECT 1",))
+    other = Migration(N + 1, "something else entirely", ("SELECT 1",))
     with pytest.raises(MigrationError, match="same number"):
         _open(target, monkeypatch, other)
 
 
 def test_status_shows_a_number_taken_twice_as_a_conflict(target, monkeypatch):
     _open(target, monkeypatch, PROBE).close()
-    other = Migration(1, "something else entirely", ("SELECT 1",))
-    monkeypatch.setattr(migrations, "MIGRATIONS", ())
-    with FleetStore(target) as store:
-        [line] = migrations.status(store._conn, (other,))
+    other = Migration(N + 1, "something else entirely", ("SELECT 1",))
+    with _open(target, monkeypatch) as store:
+        line = migrations.status(store._conn, BASE + (other,))[-1]
     assert (line.name, line.recorded_as, line.conflict) == (
         "something else entirely",
         "boxes gain a probe",
@@ -140,33 +170,34 @@ def test_status_shows_a_number_taken_twice_as_a_conflict(target, monkeypatch):
 
 def test_a_newer_store_opens_with_a_warning(target, monkeypatch, caplog):
     """A rollback runs the old build against the new schema. Refusing is an outage."""
-    second = Migration(2, "boxes gain a second probe", ("ALTER TABLE boxes ADD COLUMN p2 TEXT",))
+    second = Migration(
+        N + 2, "boxes gain a second probe", ("ALTER TABLE boxes ADD COLUMN p2 TEXT",)
+    )
     _open(target, monkeypatch, PROBE, second).close()
 
     with (
         caplog.at_level(logging.WARNING, logger="flotta.migrations"),
         _open(target, monkeypatch, PROBE) as store,
     ):
-        lines = migrations.status(store._conn, (PROBE,))
+        lines = migrations.status(store._conn, BASE + (PROBE,))
     assert "does not know" in caplog.text
-    assert [(s.version, s.known) for s in lines] == [(1, True), (2, False)]
+    assert [(s.version, s.known) for s in lines[-2:]] == [(N + 1, True), (N + 2, False)]
 
 
 def test_a_store_from_before_the_runner_gains_the_ledger(target, monkeypatch):
     """Every store deployed before M11 has no `schema_migrations` table."""
-    with _open(target, monkeypatch) as store:
-        store.create_box("eng-a")
-        store._conn.execute("DROP TABLE schema_migrations")
+    _before_the_runner(target, monkeypatch)
 
     with _open(target, monkeypatch, PROBE) as store:
+        assert store.migrations_applied == [*VERSIONS, N + 1]
         assert store.get_box_by_name("eng-a") is not None
         assert "probe" in _box_keys(store)
 
 
 def test_pending_migrations_are_listed_before_they_run(target, monkeypatch):
     with _open(target, monkeypatch) as store:
-        [line] = migrations.status(store._conn, (PROBE,))
-    assert (line.version, line.applied_at) == (1, None)
+        line = migrations.status(store._conn, BASE + (PROBE,))[-1]
+    assert (line.version, line.applied_at) == (N + 1, None)
 
 
 def test_two_stores_opening_at_once_apply_a_migration_once(target, monkeypatch):
@@ -175,8 +206,8 @@ def test_two_stores_opening_at_once_apply_a_migration_once(target, monkeypatch):
     The baseline is laid first: two *fresh* Postgres stores racing on `CREATE
     TABLE IF NOT EXISTS` is a separate, older question, and not this one.
     """
-    FleetStore(target).close()
-    monkeypatch.setattr(migrations, "MIGRATIONS", (PROBE,))
+    _open(target, monkeypatch).close()
+    monkeypatch.setattr(migrations, "MIGRATIONS", BASE + (PROBE,))
 
     start = threading.Barrier(4)
     errors: list[BaseException] = []
@@ -196,7 +227,8 @@ def test_two_stores_opening_at_once_apply_a_migration_once(target, monkeypatch):
 
     assert errors == [], errors
     with FleetStore(target) as store:
-        assert [s.version for s in migrations.status(store._conn, (PROBE,))] == [1]
+        lines = migrations.status(store._conn, BASE + (PROBE,))
+    assert [s.version for s in lines] == [*VERSIONS, N + 1]
 
 
 @pytest.mark.parametrize("start", ["before-the-runner", "empty"])
@@ -207,13 +239,11 @@ def test_stores_opening_at_once_lay_the_baseline_together(target, monkeypatch, s
     creating the same missing table — the loser fails on `pg_type`'s unique
     index rather than finding it there. Upgrading is the case that matters (only
     `schema_migrations` is missing), and an empty database is the same race
-    across every table.
+    across every table. Both then run this build's real migrations, racing.
     """
-    monkeypatch.setattr(migrations, "MIGRATIONS", (PROBE,))
     if start == "before-the-runner":
-        with FleetStore(target) as store:
-            store._conn.execute("DROP TABLE schema_migrations")
-            store._conn.execute("ALTER TABLE boxes DROP COLUMN probe")
+        _before_the_runner(target, monkeypatch)
+    monkeypatch.setattr(migrations, "MIGRATIONS", BASE + (PROBE,))
 
     start_together = threading.Barrier(8)
     errors: list[BaseException] = []
@@ -233,7 +263,9 @@ def test_stores_opening_at_once_lay_the_baseline_together(target, monkeypatch, s
 
     assert errors == [], errors
     with FleetStore(target) as store:
-        assert [s.version for s in migrations.status(store._conn, (PROBE,))] == [1]
+        lines = migrations.status(store._conn, BASE + (PROBE,))
+        assert [o.id for o in store.list_orgs()] == ["default"], "the default is made once"
+    assert [s.version for s in lines] == [*VERSIONS, N + 1]
 
 
 # -- the sequence ---------------------------------------------------------------
