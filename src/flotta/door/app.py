@@ -231,6 +231,10 @@ class ControlPlane:
     base_url: str
     token: str | None = None
     timeout_s: float = 30.0
+    #: How requests travel: the network when `None`. A test hands it an
+    #: `httpx.ASGITransport` around a real control plane, so the door and the
+    #: fleet API run in one process with nothing but the machines faked.
+    transport: Any = None
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
@@ -302,7 +306,9 @@ class ControlPlane:
 
         url = f"{self.base_url.rstrip('/')}{path}"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_s, transport=self.transport
+            ) as client:
                 response = await client.request(method, url, headers=self._headers())
         except Exception as exc:
             # The control plane being unreachable is the door's own outage, not
