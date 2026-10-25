@@ -547,12 +547,16 @@ conventions, and the sharp edges below.
   store, as the CLI is. `control/test_route_scope.py` fails a route that
   discards its token, reaches a fleet-wide read outside a `SCOPE_FUNCTIONS`
   helper, or is an operator route that does anything before refusing;
-  `UNSCOPED_ROUTES` now holds only `peer_roster` and `peer_ask`, the two a box
-  calls with its own token, which M11.6b scopes. **Colleagues keep to one
-  client**: `peers_for_box` and `blocked_peers_for_box` answer only for the
-  box's own org and client, the Colleagues routes (`/peers`, `/peer-blocks`)
-  find the box through `_scoped_box` and the peer within its client, and
-  `peer_ask` refuses another client's agent as the 404 of no agent. **The door's token is `fleet:route`**, the one scope that resolves
+  `UNSCOPED_ROUTES` is empty since M11.6b and may stay that way. **Colleagues
+  keep to one client**: `peers_for_box` and `blocked_peers_for_box` answer
+  only for the box's own org and client; every route finds the box through
+  `_scoped_box` and a colleague through `_colleague`, which looks only in
+  that client, so another client's agent is the 404 of no agent. A tenant
+  box's own token carries its org and client (M11.5), which is why
+  `/peer/roster` and `/peer/ask` admit it. **The relay token carries the
+  peer's tenancy**, read from the peer's address exactly as the door reads
+  it: without the claims the door would refuse every message between two
+  tenant agents. **The door's token is `fleet:route`**, the one scope that resolves
   and wakes any org's box (it then checks the caller itself), honoured only
   on an operator token and only by `address` and `wake`. An old door token
   (`fleet:read box:chat`) still reaches the default org; re-run

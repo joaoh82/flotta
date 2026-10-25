@@ -28,8 +28,8 @@ a scoped lookup — and this reader takes the route's word for it.
 The routes not yet scoped are in `UNSCOPED_ROUTES`. **That list is a ratchet**:
 a new route that is not scoped fails, and so does a listed route that has become
 scoped and was not taken off — otherwise it could quietly regress. M11.6a
-scoped every box route; what is left is the two a box calls with its own token
-to reach its colleagues, which M11.6b scopes.
+scoped every box route and M11.6b the two a box calls to reach its colleagues,
+so it is empty, and a route that would go on it is a decision a reviewer sees.
 """
 
 from __future__ import annotations
@@ -66,15 +66,8 @@ OPERATOR_ROUTES = frozenset(
 #: Routes with no principal at all, on purpose. They may not reach a box.
 OPEN_ROUTES = frozenset({"health"})
 
-#: The routes not yet scoped. May only shrink.
-UNSCOPED_ROUTES = frozenset(
-    {
-        # Agent-to-agent, on a box's own token. M11.6b scopes the box lookup
-        # and gives the relay's token the peer's tenancy.
-        "peer_roster",
-        "peer_ask",
-    }
-)
+#: The routes not yet scoped. May only shrink — and is empty since M11.6b.
+UNSCOPED_ROUTES: frozenset[str] = frozenset()
 
 #: Every `FastAPI` method that registers the function it decorates.
 _ROUTE_DECORATORS = frozenset(
