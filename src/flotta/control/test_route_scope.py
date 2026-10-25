@@ -28,7 +28,8 @@ a scoped lookup — and this reader takes the route's word for it.
 The routes not yet scoped are in `UNSCOPED_ROUTES`. **That list is a ratchet**:
 a new route that is not scoped fails, and so does a listed route that has become
 scoped and was not taken off — otherwise it could quietly regress. M11.6a
-scoped every box route; what is left is agent-to-agent, which M11.6b scopes.
+scoped every box route; what is left is the two a box calls with its own token
+to reach its colleagues, which M11.6b scopes.
 """
 
 from __future__ import annotations
@@ -39,12 +40,9 @@ import inspect
 import pytest
 
 #: Store reads that answer for the whole fleet. Each one, called from a route,
-#: is a way to reach a box without asking whose it is. `peers_for_box` and
-#: `may_message` are here because their answer spans every org; M11.6b scopes
-#: them to one client, and takes them off.
-UNSCOPED_READS = frozenset(
-    {"get_box", "get_box_by_name", "list_boxes", "peers_for_box", "may_message"}
-)
+#: is a way to reach a box without asking whose it is. (`peers_for_box` and
+#: `may_message` were here until they kept to the box's own client.)
+UNSCOPED_READS = frozenset({"get_box", "get_box_by_name", "list_boxes"})
 
 #: Where a box lookup is allowed to happen, because the tenant check happens
 #: there too. Adding a name is a decision a reviewer must see: everything it
@@ -71,10 +69,8 @@ OPEN_ROUTES = frozenset({"health"})
 #: The routes not yet scoped. May only shrink.
 UNSCOPED_ROUTES = frozenset(
     {
-        # Agent-to-agent. M11.6b: peers in the same client only.
-        "list_peers",
-        "block_peer_endpoint",
-        "allow_peer_endpoint",
+        # Agent-to-agent, on a box's own token. M11.6b scopes the box lookup
+        # and gives the relay's token the peer's tenancy.
         "peer_roster",
         "peer_ask",
     }

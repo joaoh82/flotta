@@ -1383,24 +1383,29 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"no box {ref!r}")
         return box
 
-    def _described(store: Any, ids: list[str]) -> list[dict[str, Any]]:
-        """Agents named the way a person and a model both need.
+    def _described(store: Any, box: Any, ids: list[str]) -> list[dict[str, Any]]:
+        """`box`'s colleagues, named the way a person and a model both need.
 
         The address and the description together: an agent choosing whom to
         ask needs "Reviewer — backend PRs", and the thing it must then type is
         the name. FLOTTA-40 put the first on the fleet; this is where it pays.
+
+        Looked up among `box`'s own client only, so an id from anywhere else
+        names nobody here — the queries already keep to one client; this is
+        the second lock on the same door.
         """
         meta = store.meta_for_boxes(ids)
+        same_client = {b.id: b for b in store.list_boxes_in(box.org, box.client)}
         out = []
         for pid in ids:
-            box = store.get_box(pid)
-            if box is None:  # pragma: no cover - the queries already exclude these
+            peer = same_client.get(pid)
+            if peer is None:  # pragma: no cover - the queries already exclude these
                 continue
             info = meta.get(pid)
             out.append(
                 {
-                    "id": box.id,
-                    "name": box.name,
+                    "id": peer.id,
+                    "name": peer.name,
                     "display_name": info.display_name if info else None,
                     "description": info.description if info else None,
                 }
@@ -1412,15 +1417,24 @@ def create_app(
         return {
             "box_id": box.id,
             "name": box.name,
-            "peers": _described(store, store.peers_for_box(box.id)),
-            "blocked": _described(store, store.blocked_peers_for_box(box.id)),
+            "peers": _described(store, box, store.peers_for_box(box.id)),
+            "blocked": _described(store, box, store.blocked_peers_for_box(box.id)),
         }
 
     def _peer_target(store: Any, box: Any, ref: str) -> Any:
+        """The agent `ref` names among `box`'s client — or 404.
+
+        Looked for there and nowhere else: an agent in another client is the
+        404 of no agent, or a block would be a way to ask whether another org
+        has one.
+        """
         ref = ref.strip()
         if not ref:
             raise HTTPException(status_code=422, detail="which agent?")
-        peer = store.get_box(ref) or store.get_box_by_name(ref)
+        same_client = store.list_boxes_in(box.org, box.client)
+        peer = next((b for b in same_client if b.id == ref), None) or next(
+            (b for b in same_client if b.name == ref), None
+        )
         if peer is None or is_terminal("box", peer.status):
             raise HTTPException(status_code=404, detail=f"no agent {ref!r}")
         if peer.id == box.id:
@@ -1430,7 +1444,7 @@ def create_app(
         return peer
 
     @app.get("/api/boxes/{box_id}/peers")
-    def list_peers(box_id: str, _: Token | None = needs_read) -> Any:
+    def list_peers(box_id: str, token: Token | None = needs_read) -> Any:
         """Who this agent may ask, and who it has been stopped from asking.
 
         **Everyone, by default** (FLOTTA-65). A new agent is on every list the
@@ -1438,13 +1452,13 @@ def create_app(
         """
         store = store_factory()
         try:
-            return _colleagues(store, _resolve(store, box_id))
+            return _colleagues(store, _scoped_box(store, token, box_id))
         finally:
             store.close()
 
     @app.post("/api/boxes/{box_id}/peer-blocks")
     def block_peer_endpoint(
-        box_id: str, body: dict[str, Any], _: Token | None = needs_write
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
     ) -> Any:
         """Stop this agent asking one other agent. Idempotent, directed.
 
@@ -1457,7 +1471,7 @@ def create_app(
         """
         store = store_factory()
         try:
-            box = _resolve(store, box_id)
+            box = _scoped_box(store, token, box_id)
             peer = _peer_target(store, box, str(body.get("peer") or ""))
             if store.block_peer(box.id, peer.id):
                 store.add_event("box", box.id, "peer_blocked", {"peer": peer.name})
@@ -1466,13 +1480,13 @@ def create_app(
             store.close()
 
     @app.delete("/api/boxes/{box_id}/peer-blocks/{peer}")
-    def allow_peer_endpoint(box_id: str, peer: str, _: Token | None = needs_write) -> Any:
+    def allow_peer_endpoint(box_id: str, peer: str, token: Token | None = needs_write) -> Any:
         """Lift a block. Takes effect on the next message, with no restart —
         the box never held a way to reach the other agent, only permission to
         ask the control plane for one."""
         store = store_factory()
         try:
-            box = _resolve(store, box_id)
+            box = _scoped_box(store, token, box_id)
             target = _peer_target(store, box, peer)
             if store.allow_peer(box.id, target.id):
                 # The name, whichever was sent: the app sends ids, and a
@@ -1774,7 +1788,7 @@ def create_app(
             return {
                 "box_id": box.id,
                 "name": box.name,
-                "peers": _described(store, store.peers_for_box(box.id)),
+                "peers": _described(store, box, store.peers_for_box(box.id)),
             }
         finally:
             store.close()
@@ -1806,7 +1820,14 @@ def create_app(
                 raise HTTPException(status_code=422, detail="what should they be told?")
 
             peer = store.get_box(wanted) or store.get_box_by_name(wanted)
-            if peer is None or is_terminal("box", peer.status):
+            # Another client's agent is no agent: told "not ready" instead, the
+            # asking agent would wait for one it may never reach. (M11.6b
+            # scopes the rest of this route.)
+            if (
+                peer is None
+                or is_terminal("box", peer.status)
+                or (peer.org, peer.client) != (box.org, box.client)
+            ):
                 raise HTTPException(
                     status_code=404,
                     detail=f"there is no agent called {wanted!r} on this fleet. "

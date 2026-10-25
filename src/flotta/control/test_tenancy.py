@@ -91,8 +91,8 @@ def api(fleet):
 
 
 #: Every route that names a box, spelled out — `test_every_box_route_is_here`
-#: checks this against the app, so a new route cannot be left off.
-#: Agent-to-agent routes are M11.6b's.
+#: checks this against the app, so a new route cannot be left off. The two a
+#: box calls with its own token (`/peer/roster`, `/peer/ask`) are M11.6b's.
 BOX_ROUTES = [
     ("GET", "/api/boxes/{b}", SCOPE_FLEET_READ, None),
     ("PUT", "/api/boxes/{b}/meta", SCOPE_FLEET_WRITE, {"display_name": "Mine now"}),
@@ -110,6 +110,9 @@ BOX_ROUTES = [
     ("DELETE", "/api/boxes/{b}", SCOPE_BOX_DESTROY, None),
     ("GET", "/api/boxes/{b}/git-credential/repos", SCOPE_GIT_CREDENTIAL, None),
     ("POST", "/api/boxes/{b}/git-credential", SCOPE_GIT_CREDENTIAL, {"repo": "acme/secrets"}),
+    ("GET", "/api/boxes/{b}/peers", SCOPE_FLEET_READ, None),
+    ("POST", "/api/boxes/{b}/peer-blocks", SCOPE_FLEET_WRITE, {"peer": "eng-a"}),
+    ("DELETE", "/api/boxes/{b}/peer-blocks/eng-a", SCOPE_FLEET_WRITE, None),
 ]
 
 
@@ -118,11 +121,11 @@ def test_every_box_route_is_here(api):
     served = {
         (method, route.path.replace("{box_id}", "{b}"))
         for route in api.app.routes
-        if "{box_id}" in getattr(route, "path", "") and "peer" not in route.path
+        if "{box_id}" in getattr(route, "path", "") and "/peer/" not in route.path
         for method in route.methods
     }
     listed = {
-        (method, path.replace("/acme/secrets", "/{owner}/{name}"))
+        (method, path.replace("/acme/secrets", "/{owner}/{name}").replace("/eng-a", "/{peer}"))
         for method, path, _, _ in BOX_ROUTES
     }
     assert served == listed
@@ -325,3 +328,99 @@ def test_a_machine_held_by_another_org_is_not_named(fleet, monkeypatch):
     assert theirs.status_code == 409
     assert theirs.json()["detail"] == f"another box already occupies fly://flotta-{X}/m1"
     assert X in mine.json()["detail"], "the owner is told which of its boxes holds it"
+
+
+# -- colleagues ------------------------------------------------------------------
+#
+# Agents in one client know each other and nobody else: the Colleagues panel,
+# a block, and the relay all keep to the box's own client.
+
+TRIAGE = "triage--acme--agency-x"
+
+
+@pytest.fixture
+def colleagues(fleet):
+    """agency-x gets a second agent for acme, and one for another client."""
+    with FleetStore(fleet) as store:
+        store.create_client("agency-x", "globex", "Globex")
+        for name, client in (("triage", "acme"), ("support", "globex")):
+            box = store.create_box(name, org="agency-x", client=client)
+            store.update_box_status(box.id, "running", endpoint=f"fly://flotta-{box.name}/m1")
+    return fleet
+
+
+def _peers(api, box, **claims):
+    response = api.get(f"/api/boxes/{box}/peers", headers=_bearer(SCOPE_FLEET_READ, **claims))
+    assert response.status_code == 200, response.text
+    return [p["name"] for p in response.json()["peers"]]
+
+
+def test_an_agents_colleagues_are_its_own_clients(api, colleagues):
+    """Not the operator's agent, not another agency's, not a sibling client's."""
+    assert _peers(api, X, org="agency-x") == [TRIAGE]
+    assert _peers(api, X, org="agency-x", client="acme") == [TRIAGE]
+
+
+def test_the_operators_agents_are_not_told_tenants_exist(api, colleagues):
+    assert _peers(api, "eng-a") == []
+
+
+@pytest.mark.parametrize("ref", ["name", "id"])
+def test_a_block_cannot_name_an_agent_in_another_client(api, colleagues, ref):
+    """Or "no agent" against 200 would ask whether another org has one."""
+    ids = _ids(colleagues)
+    write = _bearer(SCOPE_FLEET_WRITE, org="agency-x")
+    for other in ("eng-a", Y, "support--globex--agency-x"):
+        target = other if ref == "name" else ids[other]
+        blocked = api.post(f"/api/boxes/{X}/peer-blocks", json={"peer": target}, headers=write)
+        allowed = api.delete(f"/api/boxes/{X}/peer-blocks/{target}", headers=write)
+        assert blocked.status_code == allowed.status_code == 404, (other, blocked.text)
+        assert blocked.json() == {"detail": f"no agent {target!r}"}
+
+    with FleetStore(colleagues) as store:
+        assert store.blocked_peers_for_box(ids[X]) == []
+        assert not store._conn.execute("SELECT * FROM box_peer_blocks").fetchall()
+
+
+def test_an_org_still_blocks_and_allows_its_own_colleague(api, colleagues):
+    write = _bearer(SCOPE_FLEET_WRITE, org="agency-x")
+    blocked = api.post(f"/api/boxes/{X}/peer-blocks", json={"peer": TRIAGE}, headers=write)
+    assert [p["name"] for p in blocked.json()["blocked"]] == [TRIAGE]
+    allowed = api.delete(f"/api/boxes/{X}/peer-blocks/{TRIAGE}", headers=write)
+    assert allowed.json()["blocked"] == []
+    assert [p["name"] for p in allowed.json()["peers"]] == [TRIAGE]
+
+
+def test_an_agent_cannot_ask_one_in_another_client(colleagues):
+    """The 404 of no agent, carried nowhere — not "still being set up", which
+    would have the asking agent wait for one it can never reach."""
+    from flotta.auth import SCOPE_BOX_PEER, box_subject
+
+    delivered = []
+
+    async def deliver(peer_name, text, *, title):
+        delivered.append(peer_name)
+        return "hello"
+
+    app = create_app(
+        store_factory=lambda: FleetStore(colleagues),
+        run_loop=False,
+        background=False,
+        signing_key=KEY,
+        deliver=deliver,
+    )
+    me = _bearer(SCOPE_BOX_PEER, subject=box_subject(_ids(colleagues)[X]))
+    with TestClient(app) as client:
+        for other in ("eng-a", Y, "support--globex--agency-x"):
+            response = client.post(
+                f"/api/boxes/{X}/peer/ask", json={"peer": other, "message": "hi"}, headers=me
+            )
+            assert response.status_code == 404, (other, response.text)
+        roster = client.get(f"/api/boxes/{X}/peer/roster", headers=me).json()
+        mine = client.post(
+            f"/api/boxes/{X}/peer/ask", json={"peer": TRIAGE, "message": "hi"}, headers=me
+        )
+
+    assert [p["name"] for p in roster["peers"]] == [TRIAGE]
+    assert mine.status_code == 200, mine.text
+    assert delivered == [TRIAGE]

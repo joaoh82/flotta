@@ -1051,6 +1051,28 @@ def test_both_lists_are_ordered_by_name(store):
     assert store.blocked_peers_for_box(a.id) == [c.id, z.id]
 
 
+def test_colleagues_are_the_same_client_only(store):
+    """M11: another org's agents, and a sibling client's, are on neither list
+    — and no block is needed to keep them off."""
+    a = _live(store, "eng-a")
+    store.create_org("agency-x", "X")
+    for client in ("acme", "globex"):
+        store.create_client("agency-x", client, client)
+    mine, also = (store.create_box(n, org="agency-x", client="acme") for n in ("one", "two"))
+    sibling = store.create_box("one", org="agency-x", client="globex")
+    for box in (mine, also, sibling):
+        store.update_box_status(box.id, "running", endpoint=f"fly://app/{box.name}")
+
+    assert store.peers_for_box(a.id) == []
+    assert store.peers_for_box(mine.id) == [also.id]
+    assert not store.may_message(mine.id, sibling.id)
+    assert not store.may_message(a.id, mine.id)
+
+    # A block the API would refuse, written anyway: still not listed.
+    store.block_peer(mine.id, sibling.id)
+    assert store.blocked_peers_for_box(mine.id) == []
+
+
 # -- per-agent model (FLOTTA-39) ---------------------------------------------
 
 
