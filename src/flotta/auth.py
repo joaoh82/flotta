@@ -40,7 +40,7 @@ parties — an M10 concern, not a today concern.
 
 ## Scopes are flat, and the dangerous ones are their own
 
-Six, no wildcards, no hierarchy:
+Seven, no wildcards, no hierarchy:
 
     fleet:read     list and inspect boxes, read their events
     fleet:write    create boxes
@@ -48,6 +48,14 @@ Six, no wildcards, no hierarchy:
     box:chat       talk to the agent on a box — and wake it to do so
     git:credential mint a git credential for a repository a box is granted
     box:peer       ask the control plane to relay a message to a granted agent
+    fleet:route    resolve and wake any org's box — the front door's, and only it
+
+`fleet:route` exists because the door is the one caller that must find a box
+*before* it knows whose it is: it resolves the hostname, then checks the
+caller's token against the answer (`admits`). Every other route is scoped to
+the token's tenant (M11.6a), so the door's own token needs a power no tenant
+has — and a narrow one, which reaches `address` and `wake` and nothing else,
+and only on a token of the default org's (the operator's).
 
 `box:peer` is deliberately not `box:chat`. When it was chosen, a box holding
 `box:chat` could reach *every* agent, because the front door checked the scope
@@ -102,6 +110,7 @@ SCOPE_BOX_DESTROY = "box:destroy"
 SCOPE_BOX_CHAT = "box:chat"
 SCOPE_GIT_CREDENTIAL = "git:credential"
 SCOPE_BOX_PEER = "box:peer"
+SCOPE_FLEET_ROUTE = "fleet:route"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -110,6 +119,7 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_BOX_CHAT,
         SCOPE_GIT_CREDENTIAL,
         SCOPE_BOX_PEER,
+        SCOPE_FLEET_ROUTE,
     }
 )
 

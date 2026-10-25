@@ -7,7 +7,7 @@ set dotenv-load := true
 
 # Binds `::` and refuses to start without $FLOTTA_SIGNING_KEY — a front door has
 # no unauthenticated mode. Needs a running control plane ($FLOTTA_CONTROL_URL)
-# and its own token ($FLOTTA_CONTROL_TOKEN) with fleet:read + box:chat.
+# and its own token ($FLOTTA_CONTROL_TOKEN) with fleet:route (M11.6a).
 # M5b front door — public access to a box, on http://127.0.0.1:8081
 door port="8081":
     #!/usr/bin/env bash
@@ -81,7 +81,10 @@ door-secrets: fly-whoami
     # authorised to reach the fleet") took every agent offline on 2026-10-22.
     # Rotate by re-running this recipe; rotating the signing key revokes it.
     DAYS="${FLOTTA_DOOR_TOKEN_DAYS:-365}"
-    TOKEN=$(uv run flotta token mint door --scope fleet:read --scope box:chat --days "$DAYS")
+    # fleet:route, and nothing else: the door resolves and wakes any org's box
+    # and checks the caller itself; the control plane lets this scope reach
+    # those two routes only.
+    TOKEN=$(uv run flotta token mint door --scope fleet:route --days "$DAYS")
 
     # --stage, deliberately. Without it `flyctl secrets set` waits for the app
     # to become healthy, and the door CANNOT become healthy until it has these

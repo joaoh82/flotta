@@ -795,6 +795,24 @@ class FleetStore:
             ).fetchall()
         return [_box_from_row(r) for r in rows]
 
+    def list_boxes_in(self, org: str, client: str | None = None) -> list[Box]:
+        """One org's boxes, or one client's, newest first (M11.6a).
+
+        What the control plane lists for a token; `list_boxes` is the whole
+        store, which only the operator's CLI and the fleet-wide sweeps see.
+        """
+        if client is None:
+            rows = self._conn.execute(
+                "SELECT * FROM boxes WHERE org_id = ? ORDER BY created_at DESC, id DESC", (org,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM boxes WHERE org_id = ? AND client_id = ? "
+                "ORDER BY created_at DESC, id DESC",
+                (org, client),
+            ).fetchall()
+        return [_box_from_row(r) for r in rows]
+
     def count_active_boxes(self) -> int:
         """How many boxes are burning CPU (excludes ``stopped``)."""
         placeholders = ",".join("?" * len(BOX_ACTIVE))
@@ -1329,11 +1347,14 @@ class FleetStore:
         """The agents this box may not ask, as ids, by name.
 
         Destroyed agents are left out. The block outlives the machine, but an
-        agent that no longer exists is not somebody to list.
+        agent that no longer exists is not somebody to list. So is an agent in
+        another client, for the reason `peers_for_box` gives.
         """
         rows = self._conn.execute(
-            "SELECT k.peer_id FROM box_peer_blocks k JOIN boxes b ON b.id = k.peer_id "
-            "WHERE k.box_id = ? AND b.destroyed_at IS NULL ORDER BY b.name",
+            "SELECT k.peer_id FROM box_peer_blocks k "
+            "JOIN boxes me ON me.id = k.box_id JOIN boxes b ON b.id = k.peer_id "
+            "WHERE k.box_id = ? AND b.destroyed_at IS NULL "
+            "AND b.org_id = me.org_id AND b.client_id = me.client_id ORDER BY b.name",
             (box_id,),
         )
         return [str(r["peer_id"]) for r in rows]
@@ -1345,13 +1366,18 @@ class FleetStore:
         reached" is `running` or `stopped` — the door wakes a sleeping agent,
         which is most of them most of the time. An agent still being built has
         no machine to answer, and a destroyed one has nothing at all.
+
+        **Everyone in the same client, and nobody outside it** (M11): an
+        agency's agents for one customer do not know another customer's exist,
+        and no block is needed to keep them apart.
         """
         rows = self._conn.execute(
-            "SELECT b.id FROM boxes b "
-            "WHERE b.id <> ? AND b.status IN ('running', 'stopped') "
-            "AND b.id NOT IN (SELECT peer_id FROM box_peer_blocks WHERE box_id = ?) "
+            "SELECT b.id FROM boxes b JOIN boxes me ON me.id = ? "
+            "WHERE b.id <> me.id AND b.status IN ('running', 'stopped') "
+            "AND b.org_id = me.org_id AND b.client_id = me.client_id "
+            "AND b.id NOT IN (SELECT peer_id FROM box_peer_blocks WHERE box_id = me.id) "
             "ORDER BY b.name",
-            (box_id, box_id),
+            (box_id,),
         )
         return [str(r["id"]) for r in rows]
 

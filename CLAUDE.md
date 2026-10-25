@@ -534,15 +534,29 @@ conventions, and the sharp edges below.
   ask the *control plane* to act, where hop limits and events live. **Deploy
   the door and control plane before minting any token with an `org` claim** —
   an older door ignores claims it does not know.
-- **The fleet API itself is not tenant-scoped yet, and a test says so (M11).**
-  The door guard covers the path through the door; the control plane is also
-  reachable directly, and its routes take their token as `_` and look boxes up
-  with `store.get_box`. `control/test_route_scope.py` reads `app.py` and lists
-  every route that does not bind its token or that reaches a fleet-wide read
-  (`get_box`, `get_box_by_name`, `list_boxes`, `peers_for_box`, `may_message`),
-  through helpers included. **`UNSCOPED_ROUTES` is a ratchet**: a new route
-  that is not scoped fails, and so does a scoped one left on the list. Do not
-  add a route to it — scope the route. M11.6a/b empty it.
+- **The fleet API is scoped by tenant, and a test reads the source to keep it
+  so (M11.6a).** Every route that names a box finds it through `_scoped_box`
+  (or the list through `_scoped_boxes`), which applies `auth.admits_tenant`:
+  a token reaches its own org's boxes, or its own client's, and **another
+  org's box is the same 404 as no box**. An absent `org` is the default org
+  here too, so the operator's token does not see tenants' agents. The five
+  fleet-wide routes (settings, Hermes versions, builds, the Hermes roll) are
+  `OPERATOR_ROUTES` and open with `_require_operator` — the default org's,
+  with no client claim and not a box — answering 403 to anyone else. No
+  signing key means no tokens and the caller is the operator over the whole
+  store, as the CLI is. `control/test_route_scope.py` fails a route that
+  discards its token, reaches a fleet-wide read outside a `SCOPE_FUNCTIONS`
+  helper, or is an operator route that does anything before refusing;
+  `UNSCOPED_ROUTES` now holds only `peer_roster` and `peer_ask`, the two a box
+  calls with its own token, which M11.6b scopes. **Colleagues keep to one
+  client**: `peers_for_box` and `blocked_peers_for_box` answer only for the
+  box's own org and client, the Colleagues routes (`/peers`, `/peer-blocks`)
+  find the box through `_scoped_box` and the peer within its client, and
+  `peer_ask` refuses another client's agent as the 404 of no agent. **The door's token is `fleet:route`**, the one scope that resolves
+  and wakes any org's box (it then checks the caller itself), honoured only
+  on an operator token and only by `address` and `wake`. An old door token
+  (`fleet:read box:chat`) still reaches the default org; re-run
+  `just door-secrets` before tenant agents need the door.
 - **The door also strips the caller's `Authorization` before proxying** and
   substitutes the fleet's basic auth, so the answering box learns nothing about
   who is calling it. "Who is asking" has to travel in the message body —

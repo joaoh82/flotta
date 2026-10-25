@@ -695,19 +695,19 @@ def test_the_address_says_whose_box_it_is(secured):
 def test_the_address_reads_the_tenancy_off_the_box(secured, fleet):
     """Not a constant: the door's subject check is only as good as this answer.
 
-    No path creates a box in another org until M11.5, so the row is moved by
-    hand — what is under test is that the route reports the row.
+    Asked with the door's `fleet:route`, which finds any org's box — an
+    operator's `box:chat` would get the 404 every other tenant gets.
     """
-    from flotta.auth import SCOPE_BOX_CHAT
+    from flotta.auth import SCOPE_FLEET_ROUTE
 
     with FleetStore(fleet) as store:
         store.create_org("agency-x", "Agency X")
         store.create_client("agency-x", "acme", "Acme")
-        store._conn.execute(
-            "UPDATE boxes SET org_id = 'agency-x', client_id = 'acme' WHERE name = 'eng-a'"
-        )
+        store.create_box("support", org="agency-x", client="acme")
 
-    box = secured.get("/api/boxes/eng-a/address", headers=_bearer(SCOPE_BOX_CHAT)).json()["box"]
+    box = secured.get(
+        "/api/boxes/support--acme--agency-x/address", headers=_bearer(SCOPE_FLEET_ROUTE)
+    ).json()["box"]
     assert (box["org"], box["client"]) == ("agency-x", "acme")
 
 
