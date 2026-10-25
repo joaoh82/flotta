@@ -561,6 +561,20 @@ conventions, and the sharp edges below.
   on an operator token and only by `address` and `wake`. An old door token
   (`fleet:read box:chat`) still reaches the default org; re-run
   `just door-secrets` before tenant agents need the door.
+- **Orgs, clients and people's tokens come through the fleet API (M11.7).**
+  `POST /api/orgs` is the operator's alone (an `OPERATOR_ROUTES` entry);
+  `POST /api/orgs/{org}/clients` and `POST /api/orgs/{org}/tokens` need
+  `org:admin` on that org — the operator, or the org's own owner — and
+  another org is the 404 of no org. **People get tokens by role** (`ROLES`
+  in `auth.py`: `owner` = `member` + `org:admin`, `member` = read, write,
+  chat, destroy, `client_viewer` = `fleet:read` in one client), mapped at
+  mint time so a token is still a flat scope list. No role holds a machine's
+  scope (`git:credential`, `box:peer`, `fleet:route`), and `mint` refuses
+  `org:admin` on a client-confined token. `flotta token mint --role` goes
+  through the control plane when `$FLOTTA_CONTROL_URL` is set — that is how an
+  owner without the signing key mints for its people — while `--scope` always
+  mints locally, which `just door-secrets` relies on. The default org's
+  tokens still carry no `org` claim.
 - **The door also strips the caller's `Authorization` before proxying** and
   substitutes the fleet's basic auth, so the answering box learns nothing about
   who is calling it. "Who is asking" has to travel in the message body —
@@ -667,6 +681,8 @@ just deploy-config          # every secret a first deployment needs — see docs
 just hermes-check           # Hermes version drift: pinned vs. latest vs. your local install
 just fly-build              # COSTS MONEY: build + release the fleet image, leaving nothing running
 just fly-doctor             # what is true about a live box (starts it first)
+just org-create <id> <name> # M11.7: an agency (operator); `just client-create <org> <id> <name>` for its customers
+just token-role <who> <role> <org> [client]  # a person's token: owner | member | client_viewer
 ```
 
 **Run `just check` in the main checkout, not only in a worktree** — it loads `.env`, and code under test may re-read that file at run time.

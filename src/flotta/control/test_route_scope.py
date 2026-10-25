@@ -60,7 +60,14 @@ SCOPE_FUNCTIONS: frozenset[str] = frozenset(
 #: Routes that act on the whole fleet and are the operator's alone. Each must
 #: open with `_require_operator(<principal>)`; after that it may read anything.
 OPERATOR_ROUTES = frozenset(
-    {"get_settings", "put_settings", "hermes_versions", "list_builds", "update_hermes"}
+    {
+        "get_settings",
+        "put_settings",
+        "hermes_versions",
+        "list_builds",
+        "update_hermes",
+        "create_org",
+    }
 )
 
 #: Routes with no principal at all, on purpose. They may not reach a box.

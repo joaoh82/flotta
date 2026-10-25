@@ -40,7 +40,7 @@ parties — an M10 concern, not a today concern.
 
 ## Scopes are flat, and the dangerous ones are their own
 
-Seven, no wildcards, no hierarchy:
+Eight, no wildcards, no hierarchy:
 
     fleet:read     list and inspect boxes, read their events
     fleet:write    create boxes
@@ -49,6 +49,7 @@ Seven, no wildcards, no hierarchy:
     git:credential mint a git credential for a repository a box is granted
     box:peer       ask the control plane to relay a message to a granted agent
     fleet:route    resolve and wake any org's box — the front door's, and only it
+    org:admin      add clients to one org, and mint its people's tokens
 
 `fleet:route` exists because the door is the one caller that must find a box
 *before* it knows whose it is: it resolves the hostname, then checks the
@@ -56,6 +57,14 @@ caller's token against the answer (`admits`). Every other route is scoped to
 the token's tenant (M11.6a), so the door's own token needs a power no tenant
 has — and a narrow one, which reaches `address` and `wake` and nothing else,
 and only on a token of the default org's (the operator's).
+
+`org:admin` is an agency's, over its own org (M11.7): it adds the agency's
+clients and mints tokens for the agency's people, so the operator hands over
+one token and is not needed for the second. It is the whole org's, so a token
+confined to one client may not hold it — `mint` refuses the pair — and it
+grants nothing over boxes; what a person may do to agents is `fleet:*` and
+`box:*`, as for anyone. People get scopes through a **role** (`ROLES`), mapped
+at mint time so the door and the hot path still read a flat list.
 
 `box:peer` is deliberately not `box:chat`. When it was chosen, a box holding
 `box:chat` could reach *every* agent, because the front door checked the scope
@@ -111,6 +120,7 @@ SCOPE_BOX_CHAT = "box:chat"
 SCOPE_GIT_CREDENTIAL = "git:credential"
 SCOPE_BOX_PEER = "box:peer"
 SCOPE_FLEET_ROUTE = "fleet:route"
+SCOPE_ORG_ADMIN = "org:admin"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -120,8 +130,38 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_GIT_CREDENTIAL,
         SCOPE_BOX_PEER,
         SCOPE_FLEET_ROUTE,
+        SCOPE_ORG_ADMIN,
     }
 )
+
+#: What a person may do, by role (M11.7). Mapped to scopes at mint time, so a
+#: token is still a flat list and nothing on the hot path knows roles exist.
+#: No box scopes (`git:credential`, `box:peer`) and no `fleet:route`: those are
+#: held by machines, never handed to a person.
+ROLES: dict[str, frozenset[str]] = {
+    "owner": frozenset(
+        {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY, SCOPE_ORG_ADMIN}
+    ),
+    "member": frozenset({SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY}),
+    # A client's own view of its agents: one client, read-only.
+    "client_viewer": frozenset({SCOPE_FLEET_READ}),
+}
+
+
+def scopes_for_role(role: str, *, client: str | None = None) -> frozenset[str]:
+    """The scopes `role` is, or a refusal naming what is wrong.
+
+    An owner is the whole org's, so it takes no client; a client viewer is one
+    client's, so it must name one. A member may be either.
+    """
+    if role not in ROLES:
+        raise AuthError(f"unknown role {role!r}. Known: {', '.join(ROLES)}")
+    if role == "owner" and client is not None:
+        raise AuthError("an owner is the whole org's; mint a member to confine one to a client")
+    if role == "client_viewer" and client is None:
+        raise AuthError("a client viewer sees one client's agents; name the client")
+    return ROLES[role]
+
 
 #: A default that is short because revocation is coarse. Long-lived tokens are
 #: an explicit `--expires` away.
@@ -361,6 +401,10 @@ def mint(
     for claim, value in (("org", org), ("client", client)):
         if value is not None and not value.strip():
             raise AuthError(f"an empty {claim} names nothing; omit it for the default")
+    if SCOPE_ORG_ADMIN in wanted and client is not None:
+        raise AuthError(
+            f"{SCOPE_ORG_ADMIN} is the whole org's; a token confined to one client cannot hold it"
+        )
 
     issued = int(time.time()) if now is None else now
     claims: dict[str, Any] = {

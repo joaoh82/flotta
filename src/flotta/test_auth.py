@@ -183,7 +183,7 @@ def test_destroy_is_not_implied_by_write():
     assert not claims.allows(SCOPE_BOX_DESTROY)
 
 
-def test_the_known_scopes_are_exactly_these_seven():
+def test_the_known_scopes_are_exactly_these_eight():
     """A new scope should be a deliberate act, visible in a diff.
 
     This test earned its keep on the first change: adding `box:chat` for M5b
@@ -192,7 +192,9 @@ def test_the_known_scopes_are_exactly_these_seven():
     question again for M7's `box:peer`, where the answer was that `box:chat`
     would have handed every box a key to the whole fleet — and for M11.6a's
     `fleet:route`, where the answer is that once routes are scoped by tenant,
-    the door is the one caller that must find a box before it knows whose.
+    the door is the one caller that must find a box before it knows whose —
+    and for M11.7's `org:admin`, so an agency can run its own clients and
+    people without the operator holding its hand.
     """
     assert {
         "fleet:read",
@@ -202,6 +204,7 @@ def test_the_known_scopes_are_exactly_these_seven():
         "git:credential",
         "box:peer",
         "fleet:route",
+        "org:admin",
     } == SCOPES
 
 
@@ -407,3 +410,54 @@ def test_a_box_subject_may_name_its_box_by_name():
         )
         is None
     )
+
+
+# -- roles (M11.7) -------------------------------------------------------------
+
+
+def test_role_maps_to_scopes_at_mint():
+    """A token is still a flat list of scopes; the role is gone once minted."""
+    from flotta.auth import SCOPE_ORG_ADMIN, scopes_for_role
+
+    owner = scopes_for_role("owner")
+    member = scopes_for_role("member", client="acme")
+    viewer = scopes_for_role("client_viewer", client="acme")
+
+    assert owner == member | {SCOPE_ORG_ADMIN}
+    assert {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY} == member
+    assert viewer == {SCOPE_FLEET_READ}
+    token = verify(mint(subject="alice", scopes=owner, key=KEY, org="agency-x"), key=KEY)
+    assert token.scopes == owner
+
+
+def test_no_role_holds_a_machines_scope():
+    """`git:credential`, `box:peer` and `fleet:route` are held by boxes and the
+    door; a person handed one could act as a machine."""
+    from flotta.auth import ROLES, SCOPE_BOX_PEER, SCOPE_FLEET_ROUTE, SCOPE_GIT_CREDENTIAL
+
+    for role, scopes in ROLES.items():
+        assert not scopes & {SCOPE_GIT_CREDENTIAL, SCOPE_BOX_PEER, SCOPE_FLEET_ROUTE}, role
+
+
+@pytest.mark.parametrize(
+    ("role", "client", "why"),
+    [
+        ("owner", "acme", "whole org"),
+        ("client_viewer", None, "name the client"),
+        ("admin", None, "unknown role"),
+    ],
+)
+def test_a_role_that_does_not_fit_its_client_is_refused(role, client, why):
+    from flotta.auth import scopes_for_role
+
+    with pytest.raises(AuthError, match=why):
+        scopes_for_role(role, client=client)
+
+
+def test_org_admin_cannot_be_confined_to_a_client():
+    """An org admin adds the org's clients; one confined to a client is a
+    contradiction, and the route that checks the org would trust it."""
+    from flotta.auth import SCOPE_ORG_ADMIN
+
+    with pytest.raises(AuthError, match="whole org"):
+        mint(subject="s", scopes={SCOPE_ORG_ADMIN}, key=KEY, org="agency-x", client="acme")

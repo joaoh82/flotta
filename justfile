@@ -188,6 +188,30 @@ token-key:
 token-mint SUBJECT SCOPE:
     uv run flotta token mint {{SUBJECT}} --scope {{SCOPE}}
 
+# With $FLOTTA_CONTROL_URL set the control plane mints it, so an org's owner can
+# run this holding only their own token in $FLOTTA_CONTROL_TOKEN.
+# M11.7 — a person's token by role (owner | member | client_viewer), e.g. `just token-role sam member agency-x acme`
+token-role SUBJECT ROLE ORG CLIENT="":
+    uv run flotta token mint "{{SUBJECT}}" --role {{ROLE}} --org {{ORG}} {{ if CLIENT == "" { "" } else { "--client " + CLIENT } }}
+
+# The operator's; through the control plane when $FLOTTA_CONTROL_URL is set,
+# else the local store — as every org and client recipe below.
+# M11.7 — add an org (an agency), e.g. `just org-create agency-x "Agency X"`
+org-create ID NAME:
+    uv run flotta org create {{ID}} --name "{{NAME}}"
+
+# M11.7 — every org on this control plane
+org-list:
+    uv run flotta org list
+
+# M11.7 — add one of an org's customers, e.g. `just client-create agency-x acme "Acme"`
+client-create ORG ID NAME:
+    uv run flotta client create {{ORG}} {{ID}} --name "{{NAME}}"
+
+# M11.7 — an org's clients
+client-list ORG:
+    uv run flotta client list {{ORG}}
+
 # `tauri dev` runs the Vite server and the Rust shell together, so this is the
 # only command needed — running `npm run dev` alone gives a page in a browser,
 # which is precisely the thing this app is not.
