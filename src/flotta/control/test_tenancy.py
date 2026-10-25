@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from flotta.auth import (
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
+    SCOPE_BOX_PEER,
     SCOPE_FLEET_READ,
     SCOPE_FLEET_ROUTE,
     SCOPE_FLEET_WRITE,
@@ -91,8 +92,7 @@ def api(fleet):
 
 
 #: Every route that names a box, spelled out — `test_every_box_route_is_here`
-#: checks this against the app, so a new route cannot be left off. The two a
-#: box calls with its own token (`/peer/roster`, `/peer/ask`) are M11.6b's.
+#: checks this against the app, so a new route cannot be left off.
 BOX_ROUTES = [
     ("GET", "/api/boxes/{b}", SCOPE_FLEET_READ, None),
     ("PUT", "/api/boxes/{b}/meta", SCOPE_FLEET_WRITE, {"display_name": "Mine now"}),
@@ -113,6 +113,8 @@ BOX_ROUTES = [
     ("GET", "/api/boxes/{b}/peers", SCOPE_FLEET_READ, None),
     ("POST", "/api/boxes/{b}/peer-blocks", SCOPE_FLEET_WRITE, {"peer": "eng-a"}),
     ("DELETE", "/api/boxes/{b}/peer-blocks/eng-a", SCOPE_FLEET_WRITE, None),
+    ("GET", "/api/boxes/{b}/peer/roster", SCOPE_BOX_PEER, None),
+    ("POST", "/api/boxes/{b}/peer/ask", SCOPE_BOX_PEER, {"peer": "eng-a", "message": "hi"}),
 ]
 
 
@@ -121,7 +123,7 @@ def test_every_box_route_is_here(api):
     served = {
         (method, route.path.replace("{box_id}", "{b}"))
         for route in api.app.routes
-        if "{box_id}" in getattr(route, "path", "") and "/peer/" not in route.path
+        if "{box_id}" in getattr(route, "path", "")
         for method in route.methods
     }
     listed = {
@@ -394,7 +396,7 @@ def test_an_org_still_blocks_and_allows_its_own_colleague(api, colleagues):
 def test_an_agent_cannot_ask_one_in_another_client(colleagues):
     """The 404 of no agent, carried nowhere — not "still being set up", which
     would have the asking agent wait for one it can never reach."""
-    from flotta.auth import SCOPE_BOX_PEER, box_subject
+    from flotta.auth import box_subject
 
     delivered = []
 
@@ -409,7 +411,9 @@ def test_an_agent_cannot_ask_one_in_another_client(colleagues):
         signing_key=KEY,
         deliver=deliver,
     )
-    me = _bearer(SCOPE_BOX_PEER, subject=box_subject(_ids(colleagues)[X]))
+    me = _bearer(
+        SCOPE_BOX_PEER, subject=box_subject(_ids(colleagues)[X]), org="agency-x", client="acme"
+    )
     with TestClient(app) as client:
         for other in ("eng-a", Y, "support--globex--agency-x"):
             response = client.post(
@@ -424,3 +428,73 @@ def test_an_agent_cannot_ask_one_in_another_client(colleagues):
     assert [p["name"] for p in roster["peers"]] == [TRIAGE]
     assert mine.status_code == 200, mine.text
     assert delivered == [TRIAGE]
+
+
+def _relayed(fleet, monkeypatch, asker, peer, **claims):
+    """Ask through the real `_deliver`, catching the token it hands the door."""
+    import flotta.control.app as app_module
+    from flotta.auth import box_subject, verify
+
+    handed = []
+
+    async def door(peer_name, text, *, token, title, timeout_s):
+        handed.append((peer_name, verify(token, key=KEY)))
+        return "hello"
+
+    monkeypatch.setattr(app_module, "deliver_through_door", door)
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet), run_loop=False, background=False, signing_key=KEY
+    )
+    me = _bearer(SCOPE_BOX_PEER, subject=box_subject(_ids(fleet)[asker]), **claims)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/boxes/{asker}/peer/ask", json={"peer": peer, "message": "hi"}, headers=me
+        )
+    assert response.status_code == 200, response.text
+    [(name, token)] = handed
+    assert name == peer
+    return token
+
+
+def test_the_relay_token_carries_the_peers_tenancy(colleagues, monkeypatch):
+    """The door admits a token to its own org and client: without the claims,
+    a message between two tenant agents would be refused at the door."""
+    from flotta.auth import admits
+
+    token = _relayed(colleagues, monkeypatch, X, TRIAGE, org="agency-x", client="acme")
+    ids = _ids(colleagues)
+
+    assert (token.subject, token.scopes) == ("relay", frozenset({SCOPE_BOX_CHAT}))
+    assert (token.org, token.client) == ("agency-x", "acme")
+    assert admits(token, box_id=ids[TRIAGE], org="agency-x", client="acme") is None
+    # And nowhere else: not the operator's agents, not a sibling client's.
+    assert admits(token, box_id=ids["eng-a"], org="default", client="default") is not None
+    assert admits(token, box_id=ids[Y], org="agency-y", client="acme") is not None
+    sibling = ids["support--globex--agency-x"]
+    assert admits(token, box_id=sibling, org="agency-x", client="globex") is not None
+
+
+def test_the_operators_agents_relay_as_they_always_have(fleet, monkeypatch):
+    """The single-operator fleet: no claims, so the token is the one it was."""
+    with FleetStore(fleet) as store:
+        store.update_box_status(store.create_box("eng-b").id, "running", endpoint="fly://app/b")
+
+    token = _relayed(fleet, monkeypatch, "eng-a", "eng-b")
+
+    assert (token.org, token.client) == (None, None)
+
+
+def test_a_tenant_agents_token_without_its_tenancy_reaches_nothing(colleagues):
+    """A box's own token names its box *and* its tenancy; one without the
+    claims is the default org's, and the tenant's box is not there."""
+    from flotta.auth import box_subject
+
+    app = create_app(
+        store_factory=lambda: FleetStore(colleagues),
+        run_loop=False,
+        background=False,
+        signing_key=KEY,
+    )
+    bare = _bearer(SCOPE_BOX_PEER, subject=box_subject(_ids(colleagues)[X]))
+    with TestClient(app) as client:
+        assert client.get(f"/api/boxes/{X}/peer/roster", headers=bare).status_code == 404

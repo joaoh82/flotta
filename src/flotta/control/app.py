@@ -40,6 +40,7 @@ from datetime import datetime
 from typing import Any
 
 from flotta import db
+from flotta.address import parse as parse_address
 from flotta.auth import (
     DEFAULT_CLIENT,
     DEFAULT_ORG,
@@ -1376,13 +1377,6 @@ def create_app(
         finally:
             store.close()
 
-    def _resolve(store: Any, ref: str) -> Any:
-        """A box by id or name, or 404. The lookup every route starts with."""
-        box = store.get_box(ref) or store.get_box_by_name(ref)
-        if box is None:
-            raise HTTPException(status_code=404, detail=f"no box {ref!r}")
-        return box
-
     def _described(store: Any, box: Any, ids: list[str]) -> list[dict[str, Any]]:
         """`box`'s colleagues, named the way a person and a model both need.
 
@@ -1421,6 +1415,19 @@ def create_app(
             "blocked": _described(store, box, store.blocked_peers_for_box(box.id)),
         }
 
+    def _colleague(store: Any, box: Any, ref: str) -> Any:
+        """The live agent `ref` names (id or name) in `box`'s client, or None.
+
+        Looked for there and nowhere else, so every way of naming a colleague —
+        a block, a message — answers for another client's agent exactly as for
+        one that does not exist.
+        """
+        same_client = store.list_boxes_in(box.org, box.client)
+        peer = next((b for b in same_client if b.id == ref), None) or next(
+            (b for b in same_client if b.name == ref), None
+        )
+        return None if peer is None or is_terminal("box", peer.status) else peer
+
     def _peer_target(store: Any, box: Any, ref: str) -> Any:
         """The agent `ref` names among `box`'s client — or 404.
 
@@ -1431,11 +1438,8 @@ def create_app(
         ref = ref.strip()
         if not ref:
             raise HTTPException(status_code=422, detail="which agent?")
-        same_client = store.list_boxes_in(box.org, box.client)
-        peer = next((b for b in same_client if b.id == ref), None) or next(
-            (b for b in same_client if b.name == ref), None
-        )
-        if peer is None or is_terminal("box", peer.status):
+        peer = _colleague(store, box, ref)
+        if peer is None:
             raise HTTPException(status_code=404, detail=f"no agent {ref!r}")
         if peer.id == box.id:
             raise HTTPException(
@@ -1749,10 +1753,15 @@ def create_app(
     async def _deliver(peer_name: str, text: str, *, title: str) -> str:
         """The default delivery: through the front door, as the app would.
 
-        Mints its own short-lived `box:chat` token. This is the one credential
-        in the system that can address any agent, and it exists for seconds
+        Mints its own short-lived `box:chat` token, which exists for seconds
         inside this process — never on a box, which is the entire point of
         relaying rather than handing one out.
+
+        **It carries the peer's tenancy** (M11.6b), read from the same address
+        the door will read: the door admits a token to its own org and client
+        only, so a relay token without the claims reaches the default org's
+        agents and no tenant's. With them, it reaches the one client the two
+        agents share and nothing else.
         """
         if not key:
             raise HTTPException(
@@ -1760,11 +1769,16 @@ def create_app(
                 detail=f"no ${SIGNING_KEY_ENV} configured on the control plane; "
                 f"agents cannot message each other without one",
             )
+        _, client, org = parse_address(peer_name)
+        tenancy = (
+            {} if (org, client) == (DEFAULT_ORG, DEFAULT_CLIENT) else {"org": org, "client": client}
+        )
         token = mint(
             subject="relay",
             scopes={SCOPE_BOX_CHAT},
             ttl_s=int(RELAY_TIMEOUT_S) + 60,
             key=key,
+            **tenancy,
         )
         return await deliver_through_door(
             peer_name, text, token=token, title=title, timeout_s=RELAY_TIMEOUT_S
@@ -1783,7 +1797,7 @@ def create_app(
         """
         store = store_factory()
         try:
-            box = _resolve(store, box_id)
+            box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "list the colleagues of")
             return {
                 "box_id": box.id,
@@ -1809,7 +1823,7 @@ def create_app(
         store = store_factory()
         hop = None
         try:
-            box = _resolve(store, box_id)
+            box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "send messages as")
 
             wanted = str(body.get("peer") or "").strip()
@@ -1819,15 +1833,10 @@ def create_app(
             if not message:
                 raise HTTPException(status_code=422, detail="what should they be told?")
 
-            peer = store.get_box(wanted) or store.get_box_by_name(wanted)
             # Another client's agent is no agent: told "not ready" instead, the
-            # asking agent would wait for one it may never reach. (M11.6b
-            # scopes the rest of this route.)
-            if (
-                peer is None
-                or is_terminal("box", peer.status)
-                or (peer.org, peer.client) != (box.org, box.client)
-            ):
+            # asking agent would wait for one it may never reach.
+            peer = _colleague(store, box, wanted)
+            if peer is None:
                 raise HTTPException(
                     status_code=404,
                     detail=f"there is no agent called {wanted!r} on this fleet. "
@@ -1862,12 +1871,10 @@ def create_app(
                 )
                 raise HTTPException(status_code=403 if why == "blocked" else 409, detail=detail)
 
-            def name_of(box_id: str) -> str:
-                found = store.get_box(box_id)
-                return found.name if found else box_id
-
+            # Every agent in a chain is a colleague of the last — one client.
+            names = {b.id: b.name for b in store.list_boxes_in(box.org, box.client)}
             try:
-                hop = chains.begin(box.id, peer.id, name=name_of)
+                hop = chains.begin(box.id, peer.id, name=lambda i: names.get(i, i))
             except RelayRefused as exc:
                 store.add_event(
                     "box",
