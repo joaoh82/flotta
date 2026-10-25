@@ -51,12 +51,14 @@ from flotta.auth import (
     SCOPE_FLEET_ROUTE,
     SCOPE_FLEET_WRITE,
     SCOPE_GIT_CREDENTIAL,
+    SCOPE_ORG_ADMIN,
     SIGNING_KEY_ENV,
     AuthError,
     Token,
     admits_tenant,
     mint,
     resolve_signing_key,
+    scopes_for_role,
     subject_box,
     verify,
 )
@@ -410,6 +412,7 @@ def create_app(
     needs_destroy = Depends(require(SCOPE_BOX_DESTROY))
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
     needs_peer = Depends(require(SCOPE_BOX_PEER))
+    needs_admin = Depends(require(SCOPE_ORG_ADMIN))
     # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
     needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
 
@@ -552,6 +555,178 @@ def create_app(
             },
             status_code=200 if healthy else 503,
         )
+
+    # -- orgs and clients (M11.7) ------------------------------------------
+    #
+    # The operator creates an org and hands its owner one token; the owner adds
+    # the org's clients and mints its people's tokens from then on. Another
+    # org is the 404 of no org, as another org's box is the 404 of no box.
+
+    def _admin_of(token: Token | None, org_id: str) -> None:
+        """404 unless `token` may administer `org_id`: the operator, or the org's own.
+
+        The scope (`org:admin`) is checked by the route's dependency; this is
+        the *which org* half. A client-confined token cannot hold the scope —
+        `mint` refuses it — so the org's own is always org-wide here.
+        """
+        if _is_operator(token):
+            return
+        assert token is not None
+        if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+
+    def _org_or_404(store: Any, org_id: str) -> Any:
+        org = store.get_org(org_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+        return org
+
+    @app.get("/api/orgs")
+    def list_orgs(token: Token | None = needs_read) -> Any:
+        """Every org, for the operator; for anyone else, their own."""
+        from dataclasses import asdict
+
+        store = store_factory()
+        try:
+            if _is_operator(token):
+                orgs = store.list_orgs()
+            else:
+                assert token is not None
+                own = store.get_org(token.org or DEFAULT_ORG)
+                orgs = [own] if own is not None else []
+            return {"orgs": [asdict(o) for o in orgs]}
+        finally:
+            store.close()
+
+    @app.post("/api/orgs", status_code=201)
+    def create_org(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Add an agency: `{"id": "agency-x", "name": "Agency X"}`. The operator's alone.
+
+        The id is part of every address in the org and never changes, so it is
+        refused here, before anything exists, if it could not be one.
+        """
+        _require_operator(token, "create an org")
+        from dataclasses import asdict
+
+        from flotta.store import DuplicateTenantError, InvalidTenantError
+
+        store = store_factory()
+        try:
+            org = store.create_org(str(body.get("id") or ""), str(body.get("name") or ""))
+        except InvalidTenantError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except DuplicateTenantError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {"org": asdict(org)}
+
+    @app.get("/api/orgs/{org_id}/clients")
+    def list_org_clients(org_id: str, token: Token | None = needs_read) -> Any:
+        """An org's clients — or, for a token confined to one, that one."""
+        from dataclasses import asdict
+
+        if token is not None and not _is_operator(token) and (token.org or DEFAULT_ORG) != org_id:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            clients = store.list_clients(org_id)
+            if token is not None and token.client is not None:
+                clients = [c for c in clients if c.id == token.client]
+            return {"org": org_id, "clients": [asdict(c) for c in clients]}
+        finally:
+            store.close()
+
+    @app.post("/api/orgs/{org_id}/clients", status_code=201)
+    def create_org_client(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Add one of an org's customers: `{"id": "acme", "name": "Acme"}`."""
+        _admin_of(token, org_id)
+        from dataclasses import asdict
+
+        from flotta.store import DuplicateTenantError, InvalidTenantError
+
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            client = store.create_client(
+                org_id, str(body.get("id") or ""), str(body.get("name") or "")
+            )
+        except InvalidTenantError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except DuplicateTenantError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {"client": asdict(client)}
+
+    @app.post("/api/orgs/{org_id}/tokens", status_code=201)
+    def mint_org_token(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """A token for one of an org's people: `{"subject", "role", "client"?, "days"?}`.
+
+        By role, never by scope list: an org admin hands out what a person in
+        the org may be, and cannot reach for the machine scopes (`box:peer`,
+        `git:credential`, `fleet:route`) that only boxes and the door hold.
+
+        Shown once, in this response; nothing is stored, because revocation is
+        rotating the key (D-log, M5a) and a stored token would be one more copy.
+        """
+        _admin_of(token, org_id)
+        if not key:
+            raise HTTPException(
+                status_code=503,
+                detail=f"no ${SIGNING_KEY_ENV} configured on the control plane; "
+                "it cannot mint tokens without one",
+            )
+        subject = str(body.get("subject") or "").strip()
+        if not subject:
+            raise HTTPException(status_code=422, detail="who is this token for? name a subject")
+        if subject_box(subject) is not None or subject == "relay":
+            raise HTTPException(
+                status_code=422,
+                detail=f"{subject!r} names a machine; a box's token is minted when it is created",
+            )
+        client = body.get("client")
+        client = str(client).strip() if client is not None else None
+        days = body.get("days", 30)
+        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 365:
+            raise HTTPException(status_code=422, detail="days must be a whole number from 1 to 365")
+        try:
+            scopes = scopes_for_role(str(body.get("role") or ""), client=client)
+        except AuthError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            if client is not None and store.get_client(org_id, client) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"org {org_id!r} has no client {client!r}"
+                )
+        finally:
+            store.close()
+
+        value = mint(
+            subject=subject,
+            scopes=scopes,
+            ttl_s=days * 24 * 3600,
+            key=key,
+            # The default org's tokens carry no org claim, exactly as before.
+            org=None if org_id == DEFAULT_ORG else org_id,
+            client=client,
+        )
+        claims = verify(value, key=key)
+        return {
+            "token": value,
+            "subject": claims.subject,
+            "org": org_id,
+            "client": client,
+            "role": body["role"],
+            "scopes": sorted(claims.scopes),
+            "expires_at": claims.expires_at,
+        }
 
     @app.get("/api/settings")
     def get_settings(token: Token | None = needs_read) -> Any:

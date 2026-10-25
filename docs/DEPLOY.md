@@ -547,6 +547,39 @@ them.
 
 ---
 
+## Step 8 — A second agency (M11.7)
+
+The fleet you deployed is the **default org**, and you are its operator. An
+agency is another org on the same control plane: its agents live at
+`<agent>--<client>--<org>.flotta.dev`, and its tokens reach nothing of yours.
+
+Needs a control plane from M11.7 on, and a door holding the `fleet:route`
+token (Step 4, M11.6a) — without it the door 404s every tenant's agent.
+
+With `$FLOTTA_CONTROL_URL` and the signing key in `.env`:
+
+```bash
+just org-create agency-x "Agency X"
+just client-create agency-x acme "Acme"
+just token-role alice owner agency-x          # hand this to the agency's owner
+```
+
+That is the operator's whole part. The owner, with the control plane's URL in
+`$FLOTTA_CONTROL_URL` and their token in `$FLOTTA_CONTROL_TOKEN`, adds clients
+and mints their people's tokens themselves, without the signing key:
+
+```bash
+just client-create agency-x globex "Globex"
+just token-role sam member agency-x acme      # one client's agents, read and write
+just token-role peter client_viewer agency-x acme
+```
+
+Roles map to scopes when minted (`flotta.auth.ROLES`). Revocation is still
+rotating the one signing key, which revokes every token in every org — keep
+lifetimes short (`--days`).
+
+---
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would

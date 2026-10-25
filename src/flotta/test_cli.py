@@ -1247,3 +1247,196 @@ def test_db_status_reports_a_number_taken_twice_instead_of_up_to_date(tmp_path, 
     body = json.loads(result.output)
     assert body["conflicts"] == [_NEXT]
     assert body["migrations"][-1]["recorded_as"] == "boxes gain a probe"
+
+
+# -- `flotta org`, `flotta client`, and tokens by role (M11.7) ------------------
+
+
+def _invoke(tmp_path, monkeypatch, argv, *, remote=None):
+    """Run the CLI; with `remote`, against a stand-in fleet API answering it."""
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    calls = []
+    if remote is None:
+        monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    else:
+        monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+        calls = _remote(monkeypatch, box=remote)
+    return calls, CliRunner().invoke(cli.app, argv)
+
+
+def test_flotta_org_create_goes_through_the_control_plane(tmp_path, monkeypatch):
+    """A deployed fleet's orgs live in its Postgres, not in a laptop's fleet.db."""
+    org = {"id": "agency-x", "name": "Agency X", "created_at": "now"}
+    calls, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["org", "create", "agency-x", "--name", "Agency X"],
+        remote={"org": org},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("POST", "/api/orgs", ["org:admin"], {"id": "agency-x", "name": "Agency X"})]
+    assert not (tmp_path / "fleet.db").exists()
+
+
+def test_flotta_client_create_goes_through_the_control_plane(tmp_path, monkeypatch):
+    client = {"org": "agency-x", "id": "acme", "name": "Acme", "created_at": "now"}
+    calls, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["client", "create", "agency-x", "acme", "--name", "Acme"],
+        remote={"client": client},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        ("POST", "/api/orgs/agency-x/clients", ["org:admin"], {"id": "acme", "name": "Acme"})
+    ]
+
+
+def test_listing_orgs_and_clients_needs_only_read(tmp_path, monkeypatch):
+    calls, _ = _invoke(tmp_path, monkeypatch, ["org", "list"], remote={"orgs": []})
+    more, _ = _invoke(tmp_path, monkeypatch, ["client", "list", "agency-x"], remote={"clients": []})
+    assert [(c[1], c[2]) for c in calls + more] == [
+        ("/api/orgs", ["fleet:read"]),
+        ("/api/orgs/agency-x/clients", ["fleet:read"]),
+    ]
+
+
+def test_org_and_client_against_a_local_store(tmp_path, monkeypatch):
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    steps = [
+        ["org", "create", "agency-x", "--name", "Agency X"],
+        ["client", "create", "agency-x", "acme", "--name", "Acme"],
+    ]
+    for argv in steps:
+        _, result = _invoke(tmp_path, monkeypatch, [*argv, "--store", db])
+        assert result.exit_code == 0, result.output
+
+    _, orgs = _invoke(tmp_path, monkeypatch, ["org", "list", "--store", db, "--json"])
+    _, clients = _invoke(
+        tmp_path, monkeypatch, ["client", "list", "agency-x", "--store", db, "--json"]
+    )
+    assert [o["id"] for o in json.loads(orgs.stdout)["orgs"]] == ["default", "agency-x"]
+    assert [c["id"] for c in json.loads(clients.stdout)["clients"]] == ["acme"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [
+        (["org", "create", "a--b", "--name", "Joins"], 2),
+        (["org", "create", "default", "--name", "Again"], 1),
+        (["client", "create", "nope", "acme", "--name", "Acme"], 1),
+        (["client", "list", "nope"], 1),
+    ],
+    ids=["bad-id", "duplicate", "no-such-org", "list-no-such-org"],
+)
+def test_org_and_client_refusals_against_a_local_store(tmp_path, monkeypatch, argv, code):
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    _, result = _invoke(tmp_path, monkeypatch, [*argv, "--store", db])
+    assert result.exit_code == code, result.output
+
+
+def _minted(result):
+    from flotta.auth import verify
+
+    return verify(json.loads(result.stdout)["token"], key="k" * 32)
+
+
+def test_token_mint_by_role_carries_the_roles_scopes_and_tenancy(tmp_path, monkeypatch):
+    from flotta.auth import scopes_for_role
+
+    _, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["token", "mint", "sam", "--role", "member", "--org", "agency-x", "--client", "acme"]
+        + ["--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    token = _minted(result)
+    assert (token.org, token.client) == ("agency-x", "acme")
+    assert token.scopes == scopes_for_role("member")
+
+
+def test_token_mint_for_the_default_org_carries_no_org_claim(tmp_path, monkeypatch):
+    _, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["token", "mint", "bob", "--role", "owner", "--org", "default"] + ["--json"],
+    )
+    assert _minted(result).org is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["token", "mint", "x"],
+        ["token", "mint", "x", "--role", "member", "--scope", "fleet:read"],
+        ["token", "mint", "x", "--role", "owner", "--org", "agency-x", "--client", "acme"],
+        ["token", "mint", "x", "--role", "client_viewer", "--org", "agency-x"],
+        ["token", "mint", "x", "--scope", "org:admin", "--org", "agency-x", "--client", "acme"],
+    ],
+    ids=["neither", "both", "owner-in-a-client", "viewer-of-no-client", "admin-in-a-client"],
+)
+def test_token_mint_refuses_a_token_that_should_not_exist(tmp_path, monkeypatch, argv):
+    _, result = _invoke(tmp_path, monkeypatch, argv)
+    assert result.exit_code == 2, result.output
+
+
+def test_token_mint_by_role_goes_through_the_control_plane(tmp_path, monkeypatch):
+    """How an agency's owner mints for its people: it holds no signing key, so
+    the control plane mints, and checks the org is the caller's to mint for."""
+    from flotta.auth import mint
+
+    issued = mint(subject="sam", scopes={"fleet:read"}, key="the-control-planes-key")
+    calls, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["token", "mint", "sam", "--role", "client_viewer", "--org", "agency-x"]
+        + ["--client", "acme", "--days", "7", "--json"],
+        remote={"token": issued, "scopes": ["fleet:read"], "expires_at": 1},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        (
+            "POST",
+            "/api/orgs/agency-x/tokens",
+            ["org:admin"],
+            {"subject": "sam", "role": "client_viewer", "client": "acme", "days": 7},
+        )
+    ]
+    assert json.loads(result.stdout)["token"] == issued
+
+
+def test_token_mint_by_scope_never_asks_the_control_plane(tmp_path, monkeypatch):
+    """`just door-secrets` mints the door's token this way with the control
+    plane's URL in `.env`; it must stay a local mint from the key."""
+    calls, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["token", "mint", "door", "--scope", "fleet:route", "--json"],
+        remote={"unexpected": True},
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == []
+    assert _minted(result).scopes == {"fleet:route"}
+
+
+def test_token_inspect_names_the_tenancy(tmp_path, monkeypatch):
+    from flotta.auth import mint
+
+    value = mint(subject="sam", scopes={"fleet:read"}, key="k" * 32, org="agency-x", client="acme")
+    _, result = _invoke(tmp_path, monkeypatch, ["token", "inspect", value, "--json"])
+    assert (json.loads(result.stdout)["org"], json.loads(result.stdout)["client"]) == (
+        "agency-x",
+        "acme",
+    )

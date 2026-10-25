@@ -1560,6 +1560,156 @@ def repo_list(
         )
 
 
+# -- orgs and clients (M11.7) ----------------------------------------------
+#
+# Through the fleet API when $FLOTTA_CONTROL_URL is set, as `repo` does: a
+# deployed fleet's orgs live in the control plane's Postgres, and a laptop's
+# `fleet.db` is not where anyone else will look for them.
+
+org_app = typer.Typer(
+    name="org",
+    help="Agencies: the orgs on this control plane.",
+    no_args_is_help=True,
+)
+app.add_typer(org_app)
+
+client_app = typer.Typer(
+    name="client",
+    help="An org's customers. Each owns agents.",
+    no_args_is_help=True,
+)
+app.add_typer(client_app)
+
+
+def _org_lines(orgs: list[dict[str, Any]]) -> str:
+    return "\n".join(f"  {o['id']:<16}  {o['name']}" for o in orgs) or "  (none)"
+
+
+@org_app.command("create")
+def org_create(
+    org_id: str = typer.Argument(..., help="Its id: part of every address in it, never changed"),
+    name: str = typer.Option(..., "--name", help="What people call it"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Add an org. The operator's act; its owner takes it from there.
+
+    Next: `flotta client create <org> <client>`, then hand the owner a token
+    with `flotta token mint <who> --org <org> --role owner`.
+    """
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import DuplicateTenantError, InvalidTenantError
+
+    if control_url():
+        try:
+            org = control_request(
+                "POST",
+                "/api/orgs",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"id": org_id, "name": name},
+            )["org"]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                created = fleet.create_org(org_id, name)
+            except InvalidTenantError as exc:
+                raise _fail(exc, code=2) from exc
+            except DuplicateTenantError as exc:
+                raise _fail(exc) from exc
+            org = {"id": created.id, "name": created.name, "created_at": created.created_at}
+    emit({"org": org}, f"created org {org['id']} ({org['name']})", as_json=as_json)
+
+
+@org_app.command("list")
+def org_list(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
+    """Every org — or, with an org's own token, that one."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    if control_url():
+        try:
+            orgs = control_request("GET", "/api/orgs", scopes=(SCOPE_FLEET_READ,))["orgs"]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            orgs = [
+                {"id": o.id, "name": o.name, "created_at": o.created_at} for o in fleet.list_orgs()
+            ]
+    emit({"orgs": orgs}, _org_lines(orgs), as_json=as_json)
+
+
+@client_app.command("create")
+def client_create(
+    org_id: str = typer.Argument(..., help="The org it belongs to"),
+    client_id: str = typer.Argument(..., help="Its id: part of its agents' addresses"),
+    name: str = typer.Option(..., "--name", help="What people call it"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Add one of an org's customers. The operator, or the org's owner."""
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import DuplicateTenantError, InvalidTenantError, UnknownEntityError
+
+    if control_url():
+        try:
+            client = control_request(
+                "POST",
+                f"/api/orgs/{org_id}/clients",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"id": client_id, "name": name},
+            )["client"]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                created = fleet.create_client(org_id, client_id, name)
+            except InvalidTenantError as exc:
+                raise _fail(exc, code=2) from exc
+            except (DuplicateTenantError, UnknownEntityError) as exc:
+                raise _fail(exc) from exc
+            client = {
+                "org": created.org,
+                "id": created.id,
+                "name": created.name,
+                "created_at": created.created_at,
+            }
+    emit(
+        {"client": client},
+        f"created client {client['id']} ({client['name']}) in org {client['org']}",
+        as_json=as_json,
+    )
+
+
+@client_app.command("list")
+def client_list(
+    org_id: str = typer.Argument(..., help="Whose clients"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """An org's clients."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    if control_url():
+        try:
+            clients = control_request(
+                "GET", f"/api/orgs/{org_id}/clients", scopes=(SCOPE_FLEET_READ,)
+            )["clients"]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            if fleet.get_org(org_id) is None:
+                raise _fail(Exception(f"no org {org_id!r}"))
+            clients = [
+                {"org": c.org, "id": c.id, "name": c.name, "created_at": c.created_at}
+                for c in fleet.list_clients(org_id)
+            ]
+    emit({"org": org_id, "clients": clients}, _org_lines(clients), as_json=as_json)
+
+
 # -- schema migrations (M11) -----------------------------------------------
 
 db_app = typer.Typer(
@@ -1911,48 +2061,91 @@ def token_key() -> None:
 def token_mint(
     subject: str = typer.Argument(..., help="Who this token is for, e.g. dashboard"),
     scope: list[str] = ScopeOpt,
+    role: str | None = typer.Option(
+        None, "--role", help="owner | member | client_viewer — a person's scopes, by role"
+    ),
+    org: str | None = typer.Option(None, "--org", help="The org it acts in [default org]"),
+    client: str | None = typer.Option(None, "--client", help="Confine it to one client"),
     days: int = typer.Option(30, "--days", help="Lifetime in days"),
     as_json: bool = JsonOpt,
 ) -> None:
-    """Mint a scoped token.
+    """Mint a token: by `--scope` for a machine or a tool, by `--role` for a person.
 
     Scopes are named explicitly rather than defaulted: the point of the split
     is that a dashboard carries `fleet:read` and nothing else, and a default
-    that granted more would quietly undo it.
-    """
-    from flotta.auth import SCOPES, AuthError, mint
+    that granted more would quietly undo it. A role is the same list, chosen
+    for what a person in an org may do (M11.7).
 
-    if not scope:
+    **By role, with `$FLOTTA_CONTROL_URL` set, the control plane mints it**,
+    checking that the org and client exist and that the caller administers the
+    org — which is how an agency's owner, holding no signing key, mints for its
+    own people. By scope, it is always minted here, from the signing key.
+    """
+    from flotta.auth import DEFAULT_ORG, SCOPE_ORG_ADMIN, SCOPES, AuthError, mint, scopes_for_role
+
+    if bool(scope) == bool(role):
         typer.secho(
-            f"name at least one --scope. Known: {', '.join(sorted(SCOPES))}",
+            "name a --role (owner, member, client_viewer) or at least one --scope, not both. "
+            f"Known scopes: {', '.join(sorted(SCOPES))}",
             fg=typer.colors.RED,
             err=True,
         )
         raise typer.Exit(code=2)
+
+    if role and control_url():
+        try:
+            minted = control_request(
+                "POST",
+                f"/api/orgs/{org or DEFAULT_ORG}/tokens",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"subject": subject, "role": role, "client": client, "days": days},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        value = minted["token"]
+    else:
+        try:
+            scopes = scopes_for_role(role, client=client) if role else frozenset(scope)
+            value = mint(
+                subject=subject,
+                scopes=scopes,
+                ttl_s=days * 24 * 3600,
+                # The default org's tokens carry no org claim, as they always have.
+                org=None if org in (None, DEFAULT_ORG) else org,
+                client=client,
+            )
+        except AuthError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+
+    from flotta.auth import verify
+
     try:
-        value = mint(subject=subject, scopes=set(scope), ttl_s=days * 24 * 3600)
-    except AuthError as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-
-    if as_json:
-        from flotta.auth import verify
-
         claims = verify(value)
+    except AuthError:
+        # Minted by a control plane whose key this machine does not hold —
+        # an owner's laptop. The response is the answer; nothing to check.
+        claims = None
+    tenancy = {"org": org or DEFAULT_ORG, "client": client}
+    if as_json:
         emit(
             {
                 "token": value,
-                "subject": claims.subject,
-                "scopes": sorted(claims.scopes),
-                "expires_at": claims.expires_at,
+                "subject": subject,
+                **tenancy,
+                "role": role,
+                "scopes": sorted(claims.scopes) if claims else minted["scopes"],
+                "expires_at": claims.expires_at if claims else minted["expires_at"],
             },
             "",
             as_json=True,
         )
         return
     typer.echo(value)
+    what = role or ", ".join(sorted(scope))
+    where = f" · org {tenancy['org']}" + (f" · client {client}" if client else "")
     typer.secho(
-        f"\n{subject} · {', '.join(sorted(scope))} · expires in {days}d\n"
+        f"\n{subject} · {what}{where} · expires in {days}d\n"
         "Shown once. Store it like a password; anyone holding it has these scopes.",
         fg=typer.colors.BRIGHT_BLACK,
         err=True,
@@ -2113,14 +2306,21 @@ def token_inspect(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
+    from flotta.auth import DEFAULT_ORG
+
+    org = claims.org or DEFAULT_ORG
     emit(
         {
             "subject": claims.subject,
+            "org": org,
+            "client": claims.client,
             "scopes": sorted(claims.scopes),
             "issued_at": claims.issued_at,
             "expires_at": claims.expires_at,
         },
-        f"{claims.subject}\nscopes:  {', '.join(sorted(claims.scopes)) or '(none)'}\n"
+        f"{claims.subject}\norg:     {org}"
+        + (f" · client {claims.client}" if claims.client else "")
+        + f"\nscopes:  {', '.join(sorted(claims.scopes)) or '(none)'}\n"
         f"expires: {datetime.fromtimestamp(claims.expires_at, tz=UTC):%Y-%m-%d %H:%M} UTC",
         as_json=as_json,
     )
