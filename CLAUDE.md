@@ -575,6 +575,14 @@ conventions, and the sharp edges below.
   owner without the signing key mints for its people — while `--scope` always
   mints locally, which `just door-secrets` relies on. The default org's
   tokens still carry no `org` claim.
+- **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
+  real control plane and the real door in one process — the door's
+  `ControlPlane` takes an `httpx.ASGITransport` as its `transport` — over a
+  real store, with orgs, clients and tokens made through the API the way an
+  agency gets them. Only the machines are faked (`wake_box`, and a stub
+  `hermes serve`). Each M11 guard has its own tests; this one asks whether
+  either agency can reach the other's agent by any address it can type, and
+  a new way to address an agent belongs here as well as in its own tests.
 - **The door also strips the caller's `Authorization` before proxying** and
   substitutes the fleet's basic auth, so the answering box learns nothing about
   who is calling it. "Who is asking" has to travel in the message body —
