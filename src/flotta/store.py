@@ -1185,29 +1185,34 @@ class FleetStore:
         Only for a member of that org, and only for an account that is not
         disabled. Whether the membership still exists when the session is used
         is M12.2's question, asked on every request.
+
+        The check and the insert share `disable_user`'s guard. Without it, a
+        disable landing between them deletes every session but the one about
+        to be written, and that one lives for a month on a disabled account.
         """
-        user = self.get_user(user_id)
-        if user is None:
-            raise UnknownEntityError(f"no user with id {user_id!r}")
-        if user.disabled_at is not None:
-            raise InvalidAccountError(f"user {user_id!r} is disabled")
-        if self.membership(user_id, org_id) is None:
-            raise UnknownEntityError(f"user {user_id!r} is not a member of org {org_id!r}")
         if ttl_s <= 0:
             raise InvalidAccountError("a session must last some time")
         moment = now or datetime.now(UTC)
         secret = _new_secret()
-        self._conn.execute(
-            "INSERT INTO sessions (id_hash, user_id, org_id, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                secret_hash(secret),
-                user_id,
-                org_id,
-                _stamp(moment),
-                _stamp(moment + timedelta(seconds=ttl_s)),
-            ),
-        )
+        with self._conn.transaction(guard="users"):
+            user = self.get_user(user_id)
+            if user is None:
+                raise UnknownEntityError(f"no user with id {user_id!r}")
+            if user.disabled_at is not None:
+                raise InvalidAccountError(f"user {user_id!r} is disabled")
+            if self.membership(user_id, org_id) is None:
+                raise UnknownEntityError(f"user {user_id!r} is not a member of org {org_id!r}")
+            self._conn.execute(
+                "INSERT INTO sessions (id_hash, user_id, org_id, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    secret_hash(secret),
+                    user_id,
+                    org_id,
+                    _stamp(moment),
+                    _stamp(moment + timedelta(seconds=ttl_s)),
+                ),
+            )
         return secret
 
     def session(self, secret: str, *, now: datetime | None = None) -> Session | None:

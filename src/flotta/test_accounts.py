@@ -12,6 +12,7 @@ an event's detail or a new column fails it too.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -140,6 +141,49 @@ def test_disabling_a_user_ends_their_sessions(agency):
 def test_disabling_someone_who_does_not_exist_is_refused(fleet):
     with pytest.raises(UnknownEntityError):
         fleet.disable_user("u-nobody")
+
+
+def test_a_disable_during_a_sign_in_leaves_no_session(target, agency):  # noqa: F811
+    """The interleaving the sequential test cannot reach: a sign-in has read an
+    enabled account, and a disable lands before its insert.
+
+    The sign-in pauses at the membership check and lets the disable run on a
+    second connection for half a second. Unguarded, the disable finishes in
+    that time, deleting every session but the one about to be written. Guarded,
+    it waits for the sign-in to commit and then deletes that session too.
+    """
+    user = agency.create_user("ana@studionord.example")
+    agency.add_membership(user.id, "studio-nord", "owner")
+    errors: list[BaseException] = []
+
+    def disable() -> None:
+        try:
+            with FleetStore(target) as other:
+                other.disable_user(user.id)
+        except BaseException as exc:  # surfaced below, not lost in the thread
+            errors.append(exc)
+
+    disabler = threading.Thread(target=disable)
+    membership = agency.membership
+
+    def membership_then_disable(user_id, org_id):
+        found = membership(user_id, org_id)
+        disabler.start()
+        disabler.join(timeout=0.5)
+        return found
+
+    agency.membership = membership_then_disable
+    try:
+        secret = agency.create_session(user.id, "studio-nord")
+    finally:
+        del agency.membership
+    disabler.join(timeout=15)
+
+    assert not disabler.is_alive() and errors == []
+    assert agency.get_user(user.id).disabled_at is not None
+    assert agency.session(secret) is None
+    rows = agency._conn.execute("SELECT * FROM sessions WHERE user_id = ?", (user.id,))
+    assert rows.fetchall() == []
 
 
 # -- memberships ------------------------------------------------------------
