@@ -170,9 +170,28 @@ conventions, and the sharp edges below.
   secret appears in any of them. A link redeems once, under a guarded
   transaction (race test in `test_store_postgres.py`); unknown, used and
   expired all answer `None`. A session is revoked by deleting its row, and
-  `disable_user` deletes them all. Nothing outside the store reads these yet:
-  sessions become credentials in M12.2 (`docs/flotta-pivot/02-design-spec.md`
-  §2.5 in the parent repo).
+  `disable_user` deletes them all. `create_session` takes the same `users`
+  guard as `disable_user`, so a disable cannot land between its check and its
+  insert (two-connection test in `test_accounts.py`).
+- **A session is a credential from M12.2: `Authorization: Session <secret>`.**
+  `require` turns it into **exactly the token its membership would mint**
+  (`auth.person_token`: subject `user:<id>`, `scopes_for_role`, no `org` claim
+  for the default org, the membership's client), so every scope and tenant
+  check M11 wrote applies unchanged. `control/test_sessions.py` holds that
+  equal to a token minted through `POST /api/orgs/{org}/tokens`, role by role,
+  and `test_tenancy.py` runs its cross-org tests with sessions as well as
+  tokens (the `credential` fixture). **The account, the membership and the
+  session are re-read on every request**, so revoking, disabling or removing
+  a membership is effective on the next one. **A session is honoured with or
+  without a signing key**: it is a row, not a signature, and a keyless local
+  control plane must still show a signed-in person their own org. A `user:`
+  subject cannot be minted through the API; people get sessions.
+  `GET /api/me` (anyone; for a session also the user, every membership and the
+  session), `POST /api/auth/sign-out`, `GET /api/sessions` and
+  `DELETE /api/sessions/{id}` (a session's own; another's is a 404). A session's
+  public id is its hash, which is not a way in. Nothing *creates* sessions over
+  HTTP yet: that is sign-in, M12.3 (`docs/flotta-pivot/02-design-spec.md` §2.5
+  in the parent repo).
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

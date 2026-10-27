@@ -5,14 +5,21 @@
 the operator's `eng-a` and one `support` agent in each of two agencies, and the
 substrate is wired to fail loudly — so a route that let a token through to
 another org's box errors here rather than answering 404.
+
+The tests that take `credential` run twice: with a token, and with a signed-in
+person's session (M12.2). A session becomes the token its membership would
+mint, so every answer here must be the same for both.
 """
 
 from __future__ import annotations
+
+import itertools
 
 import pytest
 from fastapi.testclient import TestClient
 
 from flotta.auth import (
+    ROLES,
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_BOX_PEER,
@@ -34,6 +41,42 @@ Y = "support--acme--agency-y"
 def _bearer(*scopes, **claims):
     claims.setdefault("subject", "test")
     return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, ttl_s=300, **claims)}"}
+
+
+def _role_for(scope, client):
+    """The role a person would hold `scope` by, or None for a machine's scope."""
+    if scope in ROLES["member"]:
+        return "member"
+    if scope in ROLES["owner"] and client is None:
+        return "owner"
+    return None
+
+
+@pytest.fixture(params=["token", "session"])
+def credential(request, fleet):
+    """`(scope, org=, client=) -> headers` for a token, or for a session.
+
+    The session's person holds the role that grants `scope`, in that org and
+    client. A scope only a machine holds (`git:credential`, `box:peer`) has no
+    such role, and the factory says so by returning None.
+    """
+    if request.param == "token":
+        return _bearer
+    emails = (f"person-{n}@example.com" for n in itertools.count())
+
+    def session(scope, *, org=None, client=None):
+        role = _role_for(scope, client)
+        if role is None:
+            return None
+        org = org or "default"
+        with FleetStore(fleet) as store:
+            if client is not None and store.get_client(org, client) is None:
+                store.create_client(org, client, client)
+            user = store.create_user(next(emails))
+            store.add_membership(user.id, org, role, client_id=client)
+            return {"Authorization": f"Session {store.create_session(user.id, org)}"}
+
+    return session
 
 
 @pytest.fixture
@@ -135,19 +178,26 @@ def test_every_box_route_is_here(api):
 
 @pytest.mark.parametrize(("method", "path", "scope", "body"), BOX_ROUTES)
 @pytest.mark.parametrize("ref", ["name", "id"])
-def test_org_a_cannot_touch_org_b_box(api, fleet, no_substrate, method, path, scope, body, ref):
-    """By address or by id: another org's box is the 404 of no box at all."""
+def test_org_a_cannot_touch_org_b_box(
+    api, fleet, no_substrate, credential, method, path, scope, body, ref
+):
+    """By address or by id: another org's box is the 404 of no box at all.
+
+    A person cannot hold a machine's scope, so a session asking a machine's
+    route is refused for the scope before the box is looked at.
+    """
     target = X if ref == "name" else _ids(fleet)[X]
+    headers = credential(scope, org="agency-y", client="acme")
+    expected = (404, {"detail": f"no box {target!r}"})
+    if headers is None:
+        headers = credential(SCOPE_FLEET_READ, org="agency-y", client="acme")
+        expected = (403, None)
 
-    response = api.request(
-        method,
-        path.format(b=target),
-        json=body,
-        headers=_bearer(scope, org="agency-y", client="acme"),
-    )
+    response = api.request(method, path.format(b=target), json=body, headers=headers)
 
-    assert response.status_code == 404, response.text
-    assert response.json() == {"detail": f"no box {target!r}"}
+    assert response.status_code == expected[0], response.text
+    if expected[1] is not None:
+        assert response.json() == expected[1]
 
 
 @pytest.mark.parametrize(
@@ -155,10 +205,10 @@ def test_org_a_cannot_touch_org_b_box(api, fleet, no_substrate, method, path, sc
     [{"org": "agency-x", "client": "globex"}, {}, {"client": "acme"}],
     ids=["sibling-client", "operator", "default-org-client"],
 )
-def test_nobody_else_reaches_a_tenant_box(api, no_substrate, claims):
+def test_nobody_else_reaches_a_tenant_box(api, no_substrate, credential, claims):
     """Not a sibling client, and not the operator: an absent org is the
     default org, never "any org" — the rule the door already keeps."""
-    response = api.get(f"/api/boxes/{X}", headers=_bearer(SCOPE_FLEET_READ, **claims))
+    response = api.get(f"/api/boxes/{X}", headers=credential(SCOPE_FLEET_READ, **claims))
     assert response.status_code == 404
 
 
@@ -168,13 +218,13 @@ def test_nobody_else_reaches_a_tenant_box(api, no_substrate, claims):
 @pytest.mark.parametrize(
     "claims", [{"org": "agency-x"}, {"org": "agency-x", "client": "acme"}], ids=["org", "client"]
 )
-def test_an_org_reaches_its_own_box(api, path, claims):
-    response = api.get(path.format(b=X), headers=_bearer(SCOPE_FLEET_READ, **claims))
+def test_an_org_reaches_its_own_box(api, credential, path, claims):
+    response = api.get(path.format(b=X), headers=credential(SCOPE_FLEET_READ, **claims))
     assert response.status_code == 200, response.text
 
 
-def test_the_operator_still_reaches_the_operators_box(api, no_substrate):
-    assert api.get("/api/boxes/eng-a", headers=_bearer(SCOPE_FLEET_READ)).status_code == 200
+def test_the_operator_still_reaches_the_operators_box(api, no_substrate, credential):
+    assert api.get("/api/boxes/eng-a", headers=credential(SCOPE_FLEET_READ)).status_code == 200
 
 
 # -- the list ------------------------------------------------------------------
@@ -190,8 +240,8 @@ def test_the_operator_still_reaches_the_operators_box(api, no_substrate):
     ],
     ids=["operator", "org", "client", "empty-client"],
 )
-def test_the_list_is_the_tokens_tenant(api, claims, names):
-    response = api.get("/api/boxes", headers=_bearer(SCOPE_FLEET_READ, **claims))
+def test_the_list_is_the_tokens_tenant(api, credential, claims, names):
+    response = api.get("/api/boxes", headers=credential(SCOPE_FLEET_READ, **claims))
     assert [b["name"] for b in response.json()["boxes"]] == names
 
 
@@ -242,11 +292,11 @@ def test_the_operator_can_still_read_and_change_fleet_settings(api, fleet):
         assert store.all_settings()["FLOTTA_FLY_REGION"] == "syd"
 
 
-def test_a_refused_settings_write_changes_nothing(api, fleet):
+def test_a_refused_settings_write_changes_nothing(api, fleet, credential):
     api.put(
         "/api/settings",
         json={"values": {"FLOTTA_FLY_REGION": "syd"}},
-        headers=_bearer(SCOPE_FLEET_WRITE, org="agency-x"),
+        headers=credential(SCOPE_FLEET_WRITE, org="agency-x"),
     )
     with FleetStore(fleet) as store:
         assert "FLOTTA_FLY_REGION" not in store.all_settings()

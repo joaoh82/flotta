@@ -53,10 +53,12 @@ from flotta.auth import (
     SCOPE_GIT_CREDENTIAL,
     SCOPE_ORG_ADMIN,
     SIGNING_KEY_ENV,
+    USER_SUBJECT_PREFIX,
     AuthError,
     Token,
     admits_tenant,
     mint,
+    person_token,
     resolve_signing_key,
     scopes_for_role,
     subject_box,
@@ -367,12 +369,21 @@ def create_app(
         loopback-development state — `check_bind` is what stops that reaching a
         public interface, and it is enforced at startup rather than here so the
         failure is a refusal to boot rather than a 401 nobody sees.
+
+        **A session is honoured with or without a key** (M12.2): it is a row in
+        the store, not a signature, and a web app run locally against a keyless
+        control plane must see one agency's view, not the operator's over
+        everything. It becomes the token its membership would mint
+        (`_session_token`), and from here on nothing can tell the two apart.
         """
 
         def dependency(authorization: str | None = Header(default=None)) -> Token | None:
-            if key is None:
+            scheme, _, credential = (authorization or "").partition(" ")
+            if scheme.lower() == "session":
+                token = _session_token(credential.strip())
+            elif key is None:
                 return None
-            if not authorization or not authorization.lower().startswith("bearer "):
+            elif scheme.lower() != "bearer":
                 # 401 with the challenge, not 403: the caller sent nothing, so
                 # the answer is "authenticate", not "you may not".
                 raise HTTPException(
@@ -380,14 +391,15 @@ def create_app(
                     detail="missing bearer token",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
-            try:
-                token = verify(authorization.split(" ", 1)[1].strip(), key=key)
-            except AuthError as exc:
-                raise HTTPException(
-                    status_code=401,
-                    detail=str(exc),
-                    headers={"WWW-Authenticate": "Bearer"},
-                ) from exc
+            else:
+                try:
+                    token = verify(credential.strip(), key=key)
+                except AuthError as exc:
+                    raise HTTPException(
+                        status_code=401,
+                        detail=str(exc),
+                        headers={"WWW-Authenticate": "Bearer"},
+                    ) from exc
 
             missing = [s for s in scopes if not token.allows(s)]
             if any_of and len(missing) < len(scopes):
@@ -403,6 +415,60 @@ def create_app(
 
         return dependency
 
+    def _session_token(secret: str) -> Token:
+        """The token a live session's membership would mint, or 401.
+
+        Asked on every request rather than fixed at sign-in, so ending the
+        session, disabling the account or removing the membership takes effect
+        on the next request, not when a month-long session would have expired.
+        """
+        refused = HTTPException(
+            status_code=401,
+            detail="no such session, or it has ended; sign in again",
+            headers={"WWW-Authenticate": "Session"},
+        )
+        store = store_factory()
+        try:
+            session = store.session(secret)
+            if session is None:
+                raise refused
+            user = store.get_user(session.user_id)
+            membership = store.membership(session.user_id, session.org)
+        finally:
+            store.close()
+        if user is None or user.disabled_at is not None or membership is None:
+            raise refused
+        try:
+            return person_token(
+                user_id=user.id,
+                org=session.org,
+                role=membership.role,
+                client=membership.client,
+                issued_at=int(datetime.fromisoformat(session.created_at).timestamp()),
+                expires_at=int(datetime.fromisoformat(session.expires_at).timestamp()),
+            )
+        except AuthError as exc:  # a role this build no longer knows
+            raise refused from exc
+
+    def _session_of(authorization: str | None) -> Any:
+        """The session a request was made with, or 403 if it was not a session.
+
+        For the routes about one's own sessions. A token is not signed out and
+        has no sessions to list: it ends when it expires or the key rotates.
+        """
+        scheme, _, credential = (authorization or "").partition(" ")
+        store = store_factory()
+        try:
+            session = store.session(credential.strip()) if scheme.lower() == "session" else None
+        finally:
+            store.close()
+        if session is None:
+            raise HTTPException(
+                status_code=403,
+                detail="only a signed-in person has sessions; this request carries a token",
+            )
+        return session
+
     # Hoisted rather than called inline in each route's default: a call in an
     # argument default is evaluated once at import, which is fine for Depends
     # but is a real footgun in general — so the linter flags it, and naming the
@@ -413,6 +479,8 @@ def create_app(
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
     needs_peer = Depends(require(SCOPE_BOX_PEER))
     needs_admin = Depends(require(SCOPE_ORG_ADMIN))
+    # Any valid credential at all: for the routes about the caller themselves.
+    needs_anyone = Depends(require())
     # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
     needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
 
@@ -688,6 +756,11 @@ def create_app(
                 status_code=422,
                 detail=f"{subject!r} names a machine; a box's token is minted when it is created",
             )
+        if subject.startswith(USER_SUBJECT_PREFIX):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{subject!r} names a person who signs in; they get a session, not a token",
+            )
         client = body.get("client")
         client = str(client).strip() if client is not None else None
         days = body.get("days", 30)
@@ -727,6 +800,107 @@ def create_app(
             "scopes": sorted(claims.scopes),
             "expires_at": claims.expires_at,
         }
+
+    # -- the caller, and their sessions (M12.2) -----------------------------
+
+    @app.get("/api/me")
+    def me(
+        token: Token | None = needs_anyone, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """Who this request is, and what it may do.
+
+        For a session, also the person, every org they belong to (the web app's
+        org switcher) and the session itself. For a token, its claims only: a
+        token names whoever it was minted for, not an account.
+        """
+        if token is None:
+            return {"authenticated": False, "operator": True, "user": None, "session": None}
+        payload: dict[str, Any] = {
+            "authenticated": True,
+            "operator": _is_operator(token),
+            "subject": token.subject,
+            "org": token.org or DEFAULT_ORG,
+            "client": token.client,
+            "scopes": sorted(token.scopes),
+            "expires_at": token.expires_at,
+            "user": None,
+            "memberships": [],
+            "session": None,
+        }
+        if (authorization or "").partition(" ")[0].lower() != "session":
+            return payload
+        session = _session_of(authorization)
+        store = store_factory()
+        try:
+            user = store.get_user(session.user_id)
+            memberships = store.memberships_for(session.user_id)
+        finally:
+            store.close()
+        assert user is not None  # `_session_token` refused this request otherwise
+        payload["user"] = {"id": user.id, "email": user.email, "name": user.name}
+        payload["memberships"] = [
+            {"org": m.org, "client": m.client, "role": m.role} for m in memberships
+        ]
+        payload["session"] = _session_view(session, current=session.id_hash)
+        return payload
+
+    def _session_view(session: Any, *, current: str) -> dict[str, Any]:
+        """A session as its owner sees it. Its id is the hash, never the secret."""
+        return {
+            "id": session.id_hash,
+            "org": session.org,
+            "created_at": session.created_at,
+            "expires_at": session.expires_at,
+            "current": session.id_hash == current,
+        }
+
+    @app.post("/api/auth/sign-out")
+    def sign_out(
+        token: Token | None = needs_anyone, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """End the session this request was made with."""
+        session = _session_of(authorization)
+        store = store_factory()
+        try:
+            store.revoke_session(session.id_hash)
+        finally:
+            store.close()
+        return {"signed_out": True, "subject": token.subject if token else None}
+
+    @app.get("/api/sessions")
+    def list_sessions(
+        token: Token | None = needs_anyone, authorization: str | None = Header(default=None)
+    ) -> Any:
+        """The caller's live sessions, in every org, newest first."""
+        session = _session_of(authorization)
+        assert token is not None and token.subject.startswith(USER_SUBJECT_PREFIX)
+        store = store_factory()
+        try:
+            mine = store.sessions_for(session.user_id)
+        finally:
+            store.close()
+        return {"sessions": [_session_view(s, current=session.id_hash) for s in mine]}
+
+    @app.delete("/api/sessions/{session_id}")
+    def revoke_session(
+        session_id: str,
+        token: Token | None = needs_anyone,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
+        """End one of the caller's own sessions: a browser left signed in elsewhere.
+
+        Someone else's session is the 404 of no session, as a box is.
+        """
+        session = _session_of(authorization)
+        assert token is not None and token.subject.startswith(USER_SUBJECT_PREFIX)
+        store = store_factory()
+        try:
+            if session_id not in {s.id_hash for s in store.sessions_for(session.user_id)}:
+                raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+            store.revoke_session(session_id)
+        finally:
+            store.close()
+        return {"revoked": session_id}
 
     @app.get("/api/settings")
     def get_settings(token: Token | None = needs_read) -> Any:
