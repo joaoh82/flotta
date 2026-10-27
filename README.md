@@ -1,88 +1,65 @@
 # Flotta
 
-**Hand a task to a disposable agent in the cloud. Get the answer back. Destroy it.**
+**Run your clients' AI agents in the cloud, one tenant per client, and keep each agent's memory.**
 
 [![CI](https://github.com/joaoh82/flotta/actions/workflows/ci.yml/badge.svg)](https://github.com/joaoh82/flotta/actions/workflows/ci.yml)
 
-![Flotta spawning a box, collecting its answer, and showing an empty fleet afterwards](assets/demo.gif)
+Flotta (Italian for *fleet*) is an open-source runtime for agencies that build AI agents for
+clients and then have to run them. Each client gets its own agents, and each agent is a long-lived
+cloud machine with its own memory that sleeps between conversations, so an idle agent costs disk
+and nothing else. One control plane holds many agencies, an agency holds many clients, and an
+agent belongs to exactly one client: a token for one client cannot find, wake or message another
+client's agent.
 
-*Real run, not a mockup — `just demo` re-records it. The box answers `4.19.0-gvisor`, which is
-Modal's sandbox kernel and not the laptop that asked; by the time `flotta ps` runs, the container
-is gone and only the store remembers it.*
-
-*(This recording predates the box/task rename, so its `ps` columns are the old ones. Re-recording
-costs a real spawn, so it waits for the next demo pass.)*
-
-Flotta (Italian for *fleet*) is an open-source fleet runtime for self-improving agents. A **box**
-is a long-lived machine that *is* an agent: it runs [Hermes Agent](https://github.com/NousResearch/Hermes-Agent)
-as PID 1, keeps its memory on a volume at `/data/hermes`, and sleeps between conversations. You
-create one, then talk to it as a client.
-
-Hermes is the engine inside the box — the agent loop, the tooling, the memory — the way
-[exe.dev](https://exe.dev) loads a box with Claude Code and a toolchain. Flotta hosts it.
+A **box** is a machine that *is* an agent. It runs [Hermes Agent](https://github.com/NousResearch/Hermes-Agent)
+as PID 1, keeps its memory on a volume at `/data/hermes`, and is woken by the first request that
+needs it. Hermes is the engine inside the box: the agent loop, the tools, the memory. Flotta hosts
+it, routes to it and keeps the record of what it did.
 
 ```
-you ──▶ Hermes ──spawn──▶ ┌─ box ──────────────────┐
-                          │  headless Hermes       │
-                          │  one task, then gone   │
-                          └────────────┬───────────┘
-        fleet.db ◀── watcher ──────────┘
-           ▲
-     control plane
-           ▲
-      CLI · dashboard
+ Flotta app · CLI                          ┌─ box: support--acme--studio ─┐
+        │  wss://support--acme--studio     │  hermes serve (PID 1)        │
+        ▼    .flotta.dev + token           │  /data/hermes  (its memory)  │
+   front door ── checks org and client ──▶ └──────────────────────────────┘
+        │        wakes it if asleep                  sleeps when idle
+        ▼
+   control plane ── fleet API, reconcile loop ── Postgres
 ```
 
-The container never writes fleet state. A machine that dies mid-task — OOM, preemption, a kill —
-writes nothing at all, so a local watcher owns the verdict precisely because it outlives the
-machine. That one rule shapes most of the design.
+The box never writes fleet state. A machine that dies mid-conversation writes nothing, so the
+control plane, which outlives it, owns the verdict. That one rule shapes most of the design.
 
-> **Status: the model is mid-pivot; read this before the rest.**
->
-> Flotta v0.1 shipped a **task runner**: it put the disposable thing in the cloud and kept the
-> persistent thing — your agent's memory — on the laptop. That is backwards for what this is
-> meant to be, which is a *host* for persistent cloud agents you talk to from a thin client.
->
-> The runtime names two tiers with two lifetimes: a **box** is a machine that *is* an agent
-> (months, durable memory on a volume); a **workspace** is where its untrusted code runs (hours,
-> no memory — M6, not built). A third, stateless Modal shards, was cut in 2026-08.
->
-> **The persistence is real now.** A box boots `hermes serve` on a Fly Machine with `/data/hermes`
-> on a volume, and memory survives a stop/start. What is *not* built is the front door: nothing is
-> authenticated, so boxes are reached over a private tunnel and the control plane refuses a public
-> bind. See [Limitations](#limitations) for the honest account.
-
-> [!WARNING]
-> **The control plane is authenticated. A box is not yet publicly routed.**
->
-> Set `$FLOTTA_SIGNING_KEY` and every fleet-API request needs a scoped token
-> (`flotta token key`, then `flotta token mint`). Leave it unset and the control plane runs
-> unauthenticated — which it will only do on a loopback bind; a public bind with no key is
-> refused at startup.
->
-> One thing is still open: **there is no multi-user model** — a token carries scopes, not an
-> identity, so "who did this" is not a question the fleet can answer. Treat a signing key as an
-> admin credential for the whole fleet.
+> [!NOTE]
+> **What exists and what does not.** The runtime, the tenancy and the front door are built and
+> running. The hosted product for agencies, with sign-up, per-client budgets, scheduled runs, a
+> client-facing report and billing, is planned and not built: today an operator creates an
+> agency and hands its owner a token, and there is no sign-in. See [Limitations](#limitations).
 
 ## What it does today
 
-- **Persistent cloud boxes.** A pinned image boots `hermes serve` as PID 1 on a Fly Machine with
-  a volume at `/data/hermes`, so an agent's memory survives a stop/start.
-- **A box can do engineering work.** The image is Ubuntu with a real toolchain — `git`, `gh`,
-  `ripgrep`, `fd`, `jq`, a compiler, Python, Node, `uv`, `sqlite3` — so an agent can clone a repo,
-  install its dependencies, build a C extension and run its tests. Work happens in the projects
-  folder (`/workspace` by default, settable in the app) on the rootfs; `/data` is the memory
-  volume and stays out of it. An image update replaces the rootfs, so clones are lost and the
-  agent re-clones on the next task.
-- **Every transition recorded.** A local SQLite store is the single source of truth, split into
-  `boxes` / `workspaces` / `tasks`, each with its own validated transition table. A box cannot be
-  `done` and a task cannot be `stopped`; the store refuses both.
-- **A CLI.** `create`, `chat`, `ps`, `logs`, `stop`, `start`, `kill`, `serve` — all with `--json`.
-- **A control plane.** `flotta serve` — the fleet API plus a reconcile loop on a timer.
-- **A local dashboard.** A browser view of the fleet, reading that API.
-
-Not yet: the front door and authentication (M5), the Flotta app (M8), shared memory across the
-fleet (M9). Nothing here is authenticated — localhost only.
+- **Persistent cloud agents.** A pinned image boots `hermes serve` on a Fly Machine with a volume
+  at `/data/hermes`, so an agent's memory survives sleep, restarts and image updates.
+- **Agencies and clients.** An **org** is an agency and a **client** is one of its customers. Every
+  agent belongs to one client and is addressed as `<agent>--<client>--<org>.flotta.dev`; a
+  single-operator fleet is the default org and keeps bare names (`<agent>.flotta.dev`). The
+  operator creates orgs; an org's owner adds clients and mints `member` and `client_viewer`
+  tokens (`flotta org`, `flotta client`, `flotta token mint --role`).
+- **Isolation enforced where requests arrive.** The front door refuses another tenant's address
+  before anything is woken, every fleet-API route is scoped by tenant, and a test reads the source
+  to fail the build if a route is not. Another tenant's agent is a 404, the same answer as one
+  that does not exist.
+- **Wake on request, sleep when idle.** The front door resolves the hostname, wakes the machine,
+  waits for it to be ready and proxies the conversation, including the WebSocket.
+- **Agents that do engineering work.** The image is Ubuntu with `git`, `gh`, a compiler, Python,
+  Node and `uv`. An agent clones private repos, commits and pushes while holding no GitHub
+  credential: the control plane trades the agent's scoped token for one per repository, per call.
+- **Colleagues.** An agent can ask another agent of the same client. The ask goes through the
+  control plane, which never hands one agent a token for another.
+- **The Flotta app.** A desktop app (Tauri) lists your agents, holds a conversation with each, and
+  creates or destroys them. Its token stays in the OS keychain and never reaches the webview.
+- **A CLI and a control plane.** `flotta create`, `chat`, `ps`, `logs`, `stop`, `start`, `kill`,
+  `serve`, all with `--json`; the control plane is the fleet API plus a reconcile loop, on SQLite
+  locally or Postgres when deployed.
 
 ## Requirements
 
@@ -459,15 +436,18 @@ Stated plainly, because finding these yourself is worse.
 - **One task at a time.** Enforced, not merely advised — a second concurrent spawn is refused with
   exit 2. Boxes themselves are uncapped. Raise the task cap with `--max-concurrent` only if you
   mean it; nothing above one is tested.
-- **No workspaces and no fan-out.** Boxes cannot see each other or anything you have, code runs in
-  the box rather than in an isolated workspace, and there is no shard tier yet.
+- **No workspaces and no fan-out.** Code runs in the box rather than in an isolated workspace
+  (M6), and an agent can ask a colleague but not split work across several (M7).
 - **A box only knows the string you send it.** It cannot see your files, your repo, or your
   conversation, and it cannot ask a question. Under-specified tasks come back as confident
   nonsense. (This is the failure durable box memory is meant to remove rather than mitigate.)
 - **`--wait`, or the row strands** until something sweeps for it — `flotta watch`,
   `flotta reconcile`, or a running `flotta serve`.
-- **A token has scopes, not an identity.** There is no user model, so the fleet cannot answer
-  "who destroyed that box". A signing key is an admin credential for everything.
+- **A token has scopes and a tenant, not a person.** There are no users and no sign-in, so the
+  fleet cannot answer "who destroyed that box", and an agency's owner is onboarded by being
+  handed a token. A signing key is an admin credential for every org.
+- **No metering, budgets or billing.** Nothing yet measures an agent's model spend or caps it per
+  client; that is the next milestone.
 - **A token cannot be individually revoked** before it expires. Rotating the signing key revokes
   all of them; mint short-lived ones.
   The dashboard's UI still says "worker" in places — renaming it is cosmetic churn, queued behind
@@ -488,13 +468,13 @@ Stated plainly, because finding these yourself is worse.
 | `src/flotta/cli.py` | the Typer CLI |
 | `src/flotta/db.py` | the engine seam — one store, SQLite or Postgres |
 | `src/flotta/control/` | the control plane: the fleet API, and the reconcile loop on a timer |
+| `src/flotta/door/` | the front door: hostname → tenant check → wake → proxy |
+| `src/flotta/auth.py` | signed tokens: scopes, roles, and the org and client they belong to |
+| `app/` | the Flotta app — Tauri + React; requests go from Rust, never from the webview |
 | `dashboard/` | Next.js over the control-plane API — it does not open the store |
 
 Storage is plain SQL behind a thin interface, so the engine is a startup decision rather than a
 rewrite: SQLite by default, Postgres when `$FLOTTA_DATABASE_URL` is set.
-
-`run_worker` keeps its v0.1 name deliberately. It is the stateless one-shot — the *shard* tier —
-and renaming it to match the box vocabulary would be wrong in the other direction.
 
 ## Development
 
