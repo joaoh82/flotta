@@ -158,8 +158,21 @@ conventions, and the sharp edges below.
   box name's budget. For the same reason **a box name may no longer contain
   `--`**. The box columns have no foreign key — SQLite refuses `ADD COLUMN …
   REFERENCES` with a non-NULL default while foreign keys are on — so the store
-  is what writes them. No `users` table yet: nothing would read it until
-  invitations exist, and a migration adds it when something does.
+  is what writes them.
+- **People are in the store from M12.1, and no secret is (migration 2).**
+  `users` (one per email, trimmed and lowercased by `normalize_email`),
+  `memberships` (a role in one org, and one client for a client viewer —
+  validated by `auth.scopes_for_role`, so the store cannot hold a membership
+  the auth layer would refuse to mint; a person may be in several orgs),
+  `login_links` (sign-in links and invites) and `sessions`. **The store
+  generates a link's or session's secret, returns it once and keys the row on
+  `secret_hash()`**; `test_accounts.py` reads every table and fails if a
+  secret appears in any of them. A link redeems once, under a guarded
+  transaction (race test in `test_store_postgres.py`); unknown, used and
+  expired all answer `None`. A session is revoked by deleting its row, and
+  `disable_user` deletes them all. Nothing outside the store reads these yet:
+  sessions become credentials in M12.2 (`docs/flotta-pivot/02-design-spec.md`
+  §2.5 in the parent repo).
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps
