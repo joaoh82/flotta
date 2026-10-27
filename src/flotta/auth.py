@@ -229,6 +229,21 @@ def subject_box(subject: str) -> str | None:
     return subject[len(BOX_SUBJECT_PREFIX) :].strip() or None
 
 
+#: Subjects starting with this name a **person who signed in** (M12.2).
+#:
+#: Only a session produces one. A token minted for a person names whoever the
+#: minter typed, so `mint` refuses this prefix on every path (the org token
+#: route, a local `flotta token mint`): a pasted token that claimed to be
+#: `user:u-1` would otherwise read as that person to anything that ever trusts
+#: the subject. `person_token` builds a session's token without minting one.
+USER_SUBJECT_PREFIX = "user:"
+
+
+def user_subject(user_id: str) -> str:
+    """The subject a signed-in person's requests carry."""
+    return f"{USER_SUBJECT_PREFIX}{user_id}"
+
+
 class AuthError(Exception):
     """A token is missing, malformed, expired, or not signed by this key."""
 
@@ -303,6 +318,34 @@ def admits_tenant(token: Token, *, org: str, client: str) -> str | None:
     if token.client is not None and token.client != client:
         return f"token for client {token.client!r} cannot address another client's box"
     return None
+
+
+def person_token(
+    *,
+    user_id: str,
+    org: str,
+    role: str,
+    client: str | None,
+    issued_at: int,
+    expires_at: int,
+) -> Token:
+    """The token a membership would mint, for a session that holds no token.
+
+    A session is turned into **exactly** these claims, so every scope check and
+    every tenant check written for tokens applies to a signed-in person
+    unchanged. Built with `scopes_for_role`, the function `mint`'s callers use,
+    and with the default org written as no org claim, which is how a minted
+    token spells it. `control/test_sessions.py` holds the two equal, role by
+    role, against a token minted through the API.
+    """
+    return Token(
+        subject=user_subject(user_id),
+        scopes=scopes_for_role(role, client=client),
+        issued_at=issued_at,
+        expires_at=expires_at,
+        org=None if org == DEFAULT_ORG else org,
+        client=client,
+    )
 
 
 def generate_signing_key() -> str:
@@ -388,6 +431,8 @@ def mint(
     mint error it actually is.
     """
     signing_key = _require_key(key, env)
+    if subject.startswith(USER_SUBJECT_PREFIX):
+        raise AuthError(f"{subject!r} names a person who signs in; they get a session, not a token")
     wanted = frozenset(scopes)
     if not wanted:
         raise AuthError("a token with no scopes can do nothing; name at least one")

@@ -1383,8 +1383,16 @@ def test_token_mint_for_the_default_org_carries_no_org_claim(tmp_path, monkeypat
         ["token", "mint", "x", "--role", "owner", "--org", "agency-x", "--client", "acme"],
         ["token", "mint", "x", "--role", "client_viewer", "--org", "agency-x"],
         ["token", "mint", "x", "--scope", "org:admin", "--org", "agency-x", "--client", "acme"],
+        ["token", "mint", "user:u-1", "--role", "owner"],
     ],
-    ids=["neither", "both", "owner-in-a-client", "viewer-of-no-client", "admin-in-a-client"],
+    ids=[
+        "neither",
+        "both",
+        "owner-in-a-client",
+        "viewer-of-no-client",
+        "admin-in-a-client",
+        "a-signed-in-person",
+    ],
 )
 def test_token_mint_refuses_a_token_that_should_not_exist(tmp_path, monkeypatch, argv):
     _, result = _invoke(tmp_path, monkeypatch, argv)
