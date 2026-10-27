@@ -49,18 +49,20 @@ Readers: the CLI and the dashboard API routes.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
 from flotta import address, db, migrations
-from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG
+from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -380,6 +382,19 @@ class InvalidTenantError(StoreError):
     name is missing."""
 
 
+class DuplicateUserError(StoreError):
+    """Raised when creating an account for an email address that has one."""
+
+
+class DuplicateMembershipError(StoreError):
+    """Raised when a user is added to an org they already belong to."""
+
+
+class InvalidAccountError(StoreError):
+    """Raised for an email address, role, membership or link that cannot be
+    stored as asked."""
+
+
 class InvalidBoxNameError(StoreError):
     """Raised when a box name could not be an address.
 
@@ -441,6 +456,86 @@ class Client:
     id: str
     name: str
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class User:
+    """A person who can sign in: one email address (M12)."""
+
+    id: str
+    email: str
+    name: str | None
+    created_at: str
+    disabled_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Membership:
+    """A user's role in one org, and in one client for a client viewer.
+
+    The role is one of `auth.ROLES`, and a session acting as this membership
+    becomes the token that role would mint (M12.2).
+    """
+
+    user_id: str
+    org: str
+    client: str | None
+    role: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoginLink:
+    """A sign-in link or invite that has just been redeemed.
+
+    There is no field for its secret, because the store never has it: the
+    secret is in the email, and the row is keyed on its hash.
+    """
+
+    email: str
+    purpose: str
+    org: str | None
+    client: str | None
+    role: str | None
+    created_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    """A signed-in user, acting as their membership of one org.
+
+    `id_hash` names it for listing and revoking; the secret that proves it is
+    only in the web app's cookie.
+    """
+
+    id_hash: str
+    user_id: str
+    org: str
+    created_at: str
+    expires_at: str
+
+
+#: What a link is for: proving an address, or that plus joining an org.
+LINK_PURPOSES = frozenset({"sign_in", "invite"})
+
+#: Long enough to switch to a mail client and back, short enough that a link
+#: found in an old inbox opens nothing.
+LINK_TTL_S = 15 * 60
+
+#: A fixed lifetime from sign-in. Revocation is a row delete, so this bounds
+#: how long a cookie nobody revoked keeps working, not how long a stolen one
+#: does.
+SESSION_TTL_S = 30 * 24 * 3600
+
+#: The longest address SMTP carries.
+EMAIL_MAX = 254
+
+USER_NAME_MAX = 100
+
+#: Something, an @, and a domain with a dot. Deliverability is the email's
+#: problem; this only refuses what could not be an address at all.
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -884,6 +979,273 @@ class FleetStore:
             "SELECT * FROM clients WHERE org_id = ? ORDER BY created_at, id", (org_id,)
         ).fetchall()
         return [_client_from_row(r) for r in rows]
+
+    # -- people (M12) ------------------------------------------------------
+    #
+    # Users, their memberships, and the two secrets that sign one in: a link
+    # (emailed, once, minutes) and a session (the web app's cookie, revocable).
+    # Both secrets are generated here, returned once, and stored only as their
+    # SHA-256, so nothing read from this database signs anybody in.
+
+    def create_user(self, email: str, *, name: str | None = None) -> User:
+        """Insert a user. One account per address, whatever its case."""
+        email = normalize_email(email)
+        name = (name or "").strip() or None
+        if name is not None and len(name) > USER_NAME_MAX:
+            raise InvalidAccountError(f"a name has at most {USER_NAME_MAX} characters")
+        user_id = f"u-{uuid.uuid4().hex[:12]}"
+        try:
+            self._conn.execute(
+                "INSERT INTO users (id, email, name, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, email, name, _utcnow()),
+            )
+        except db.UniqueViolation as exc:
+            raise DuplicateUserError(f"there is already an account for {email}") from exc
+        user = self.get_user(user_id)
+        assert user is not None
+        return user
+
+    def get_user(self, user_id: str) -> User | None:
+        row = self._conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return _user_from_row(row) if row else None
+
+    def get_user_by_email(self, email: str) -> User | None:
+        """The account for `email`, matched however it was typed."""
+        try:
+            email = normalize_email(email)
+        except InvalidAccountError:
+            return None
+        row = self._conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return _user_from_row(row) if row else None
+
+    def disable_user(self, user_id: str) -> User:
+        """Stop `user_id` signing in, and end every session they hold now.
+
+        Ending the sessions is the point: a disabled account whose browser
+        stayed signed in for another month would be disabled in name only.
+        """
+        with self._conn.transaction(guard="users"):
+            user = self.get_user(user_id)
+            if user is None:
+                raise UnknownEntityError(f"no user with id {user_id!r}")
+            if user.disabled_at is None:
+                self._conn.execute(
+                    "UPDATE users SET disabled_at = ? WHERE id = ?", (_utcnow(), user_id)
+                )
+            self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        user = self.get_user(user_id)
+        assert user is not None
+        return user
+
+    def add_membership(
+        self, user_id: str, org_id: str, role: str, *, client_id: str | None = None
+    ) -> Membership:
+        """Give `user_id` a role in `org_id`, confined to `client_id` if named.
+
+        The rules for which role may name a client are `auth.scopes_for_role`'s,
+        applied here too so a membership the auth layer would refuse to mint a
+        token for can never be stored.
+        """
+        try:
+            scopes_for_role(role, client=client_id)
+        except AuthError as exc:
+            raise InvalidAccountError(str(exc)) from exc
+        if self.get_user(user_id) is None:
+            raise UnknownEntityError(f"no user with id {user_id!r}")
+        if self.get_org(org_id) is None:
+            raise UnknownEntityError(f"no org with id {org_id!r}")
+        if client_id is not None and self.get_client(org_id, client_id) is None:
+            raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+        try:
+            self._conn.execute(
+                "INSERT INTO memberships (user_id, org_id, client_id, role, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, org_id, client_id, role, _utcnow()),
+            )
+        except db.UniqueViolation as exc:
+            raise DuplicateMembershipError(
+                f"user {user_id!r} already belongs to org {org_id!r}"
+            ) from exc
+        membership = self.membership(user_id, org_id)
+        assert membership is not None
+        return membership
+
+    def membership(self, user_id: str, org_id: str) -> Membership | None:
+        row = self._conn.execute(
+            "SELECT * FROM memberships WHERE user_id = ? AND org_id = ?", (user_id, org_id)
+        ).fetchone()
+        return _membership_from_row(row) if row else None
+
+    def memberships_for(self, user_id: str) -> list[Membership]:
+        """Every org `user_id` belongs to, oldest membership first."""
+        rows = self._conn.execute(
+            "SELECT * FROM memberships WHERE user_id = ? ORDER BY created_at, org_id",
+            (user_id,),
+        ).fetchall()
+        return [_membership_from_row(r) for r in rows]
+
+    def members_of(self, org_id: str) -> list[Membership]:
+        """Everyone in `org_id`, oldest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM memberships WHERE org_id = ? ORDER BY created_at, user_id",
+            (org_id,),
+        ).fetchall()
+        return [_membership_from_row(r) for r in rows]
+
+    def create_login_link(
+        self,
+        email: str,
+        *,
+        purpose: str = "sign_in",
+        org_id: str | None = None,
+        client_id: str | None = None,
+        role: str | None = None,
+        ttl_s: int = LINK_TTL_S,
+        now: datetime | None = None,
+    ) -> str:
+        """A new link for `email`. Returns its secret, which is not stored.
+
+        A sign-in link grants nothing beyond proving the address. An invite
+        also names the membership redeeming it creates, checked now so a bad
+        invite is refused when it is sent rather than when it is clicked.
+        """
+        email = normalize_email(email)
+        if purpose not in LINK_PURPOSES:
+            raise InvalidAccountError(
+                f"unknown link purpose {purpose!r}; expected one of {sorted(LINK_PURPOSES)}"
+            )
+        if purpose == "invite":
+            if org_id is None or role is None:
+                raise InvalidAccountError("an invite names the org and the role it grants")
+            try:
+                scopes_for_role(role, client=client_id)
+            except AuthError as exc:
+                raise InvalidAccountError(str(exc)) from exc
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if client_id is not None and self.get_client(org_id, client_id) is None:
+                raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+        elif org_id is not None or client_id is not None or role is not None:
+            raise InvalidAccountError("a sign-in link grants nothing; send an invite instead")
+        if ttl_s <= 0:
+            raise InvalidAccountError("a link must be valid for some time")
+        moment = now or datetime.now(UTC)
+        secret = _new_secret()
+        self._conn.execute(
+            "INSERT INTO login_links (token_hash, email, purpose, org_id, client_id, role, "
+            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                secret_hash(secret),
+                email,
+                purpose,
+                org_id,
+                client_id,
+                role,
+                _stamp(moment),
+                _stamp(moment + timedelta(seconds=ttl_s)),
+            ),
+        )
+        return secret
+
+    def redeem_login_link(self, secret: str, *, now: datetime | None = None) -> LoginLink | None:
+        """The link `secret` opens, now used up; `None` if it opens nothing.
+
+        Unknown, already used and expired all answer `None`, so a caller cannot
+        tell a guess from a stale link. Once means once: the read and the write
+        share a guarded transaction, so two clicks at the same moment cannot
+        both sign in.
+        """
+        if not secret:
+            return None
+        moment = now or datetime.now(UTC)
+        key = secret_hash(secret)
+        with self._conn.transaction(guard="login_links"):
+            row = self._conn.execute(
+                "SELECT * FROM login_links WHERE token_hash = ?", (key,)
+            ).fetchone()
+            if row is None or row["used_at"] is not None:
+                return None
+            if datetime.fromisoformat(row["expires_at"]) <= moment:
+                return None
+            self._conn.execute(
+                "UPDATE login_links SET used_at = ? WHERE token_hash = ?", (_stamp(moment), key)
+            )
+        return _link_from_row(row)
+
+    def create_session(
+        self,
+        user_id: str,
+        org_id: str,
+        *,
+        ttl_s: int = SESSION_TTL_S,
+        now: datetime | None = None,
+    ) -> str:
+        """A session for `user_id` acting in `org_id`. Returns its secret.
+
+        Only for a member of that org, and only for an account that is not
+        disabled. Whether the membership still exists when the session is used
+        is M12.2's question, asked on every request.
+
+        The check and the insert share `disable_user`'s guard. Without it, a
+        disable landing between them deletes every session but the one about
+        to be written, and that one lives for a month on a disabled account.
+        """
+        if ttl_s <= 0:
+            raise InvalidAccountError("a session must last some time")
+        moment = now or datetime.now(UTC)
+        secret = _new_secret()
+        with self._conn.transaction(guard="users"):
+            user = self.get_user(user_id)
+            if user is None:
+                raise UnknownEntityError(f"no user with id {user_id!r}")
+            if user.disabled_at is not None:
+                raise InvalidAccountError(f"user {user_id!r} is disabled")
+            if self.membership(user_id, org_id) is None:
+                raise UnknownEntityError(f"user {user_id!r} is not a member of org {org_id!r}")
+            self._conn.execute(
+                "INSERT INTO sessions (id_hash, user_id, org_id, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    secret_hash(secret),
+                    user_id,
+                    org_id,
+                    _stamp(moment),
+                    _stamp(moment + timedelta(seconds=ttl_s)),
+                ),
+            )
+        return secret
+
+    def session(self, secret: str, *, now: datetime | None = None) -> Session | None:
+        """The live session `secret` proves, or `None`."""
+        if not secret:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM sessions WHERE id_hash = ?", (secret_hash(secret),)
+        ).fetchone()
+        if row is None or datetime.fromisoformat(row["expires_at"]) <= (now or datetime.now(UTC)):
+            return None
+        return _session_from_row(row)
+
+    def sessions_for(self, user_id: str, *, now: datetime | None = None) -> list[Session]:
+        """`user_id`'s live sessions, newest first."""
+        moment = now or datetime.now(UTC)
+        rows = self._conn.execute(
+            "SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC", (user_id,)
+        ).fetchall()
+        return [
+            _session_from_row(r) for r in rows if datetime.fromisoformat(r["expires_at"]) > moment
+        ]
+
+    def revoke_session(self, id_hash: str) -> bool:
+        """End one session. Whether there was one to end."""
+        with self._conn.transaction(guard="sessions"):
+            row = self._conn.execute(
+                "SELECT id_hash FROM sessions WHERE id_hash = ?", (id_hash,)
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute("DELETE FROM sessions WHERE id_hash = ?", (id_hash,))
+        return True
 
     # -- workspaces --------------------------------------------------------
 
@@ -1664,6 +2026,79 @@ def _org_from_row(row: db.Row) -> Org:
 
 def _client_from_row(row: db.Row) -> Client:
     return Client(org=row["org_id"], id=row["id"], name=row["name"], created_at=row["created_at"])
+
+
+def _user_from_row(row: db.Row) -> User:
+    return User(
+        id=row["id"],
+        email=row["email"],
+        name=row["name"],
+        created_at=row["created_at"],
+        disabled_at=row["disabled_at"],
+    )
+
+
+def _membership_from_row(row: db.Row) -> Membership:
+    return Membership(
+        user_id=row["user_id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        role=row["role"],
+        created_at=row["created_at"],
+    )
+
+
+def _link_from_row(row: db.Row) -> LoginLink:
+    return LoginLink(
+        email=row["email"],
+        purpose=row["purpose"],
+        org=row["org_id"],
+        client=row["client_id"],
+        role=row["role"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+    )
+
+
+def _session_from_row(row: db.Row) -> Session:
+    return Session(
+        id_hash=row["id_hash"],
+        user_id=row["user_id"],
+        org=row["org_id"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+    )
+
+
+def normalize_email(value: str) -> str:
+    """An email address as the store keeps it: trimmed and lowercased.
+
+    Lowercasing the local part is not what the RFC says, and is what every
+    mail provider people actually use does. Two accounts for `Ana@x.com` and
+    `ana@x.com` would be one person locked out of the other.
+    """
+    v = (value or "").strip().lower()
+    if len(v) > EMAIL_MAX or not _EMAIL.match(v):
+        raise InvalidAccountError(f"{value!r} is not an email address")
+    return v
+
+
+def secret_hash(secret: str) -> str:
+    """What the store keys a link or session on in place of its secret.
+
+    SHA-256, unsalted: the secret is 256 random bits, so there is nothing for
+    a salt or a slow hash to protect against, and the lookup must be exact.
+    """
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def _new_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _stamp(moment: datetime) -> str:
+    """A UTC timestamp at a fixed precision, so two of them sort as times."""
+    return moment.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 #: A box name is a DNS label, and 63 is that standard's limit for one.
