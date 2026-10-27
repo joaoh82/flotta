@@ -131,6 +131,13 @@ def test_an_unknown_scope_is_refused_at_mint():
         mint(subject="s", scopes={"fleet:reed"}, key=KEY)
 
 
+def test_a_token_cannot_name_a_signed_in_person():
+    """Only a session speaks for a person. Refused here, not only on the API
+    route, so a local `flotta token mint` cannot forge one either."""
+    with pytest.raises(AuthError, match="session"):
+        mint(subject="user:u-1", scopes={SCOPE_FLEET_READ}, key=KEY)
+
+
 def test_a_token_with_no_scopes_is_refused():
     with pytest.raises(AuthError, match="no scopes"):
         mint(subject="s", scopes=set(), key=KEY)

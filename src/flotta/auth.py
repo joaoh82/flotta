@@ -232,9 +232,10 @@ def subject_box(subject: str) -> str | None:
 #: Subjects starting with this name a **person who signed in** (M12.2).
 #:
 #: Only a session produces one. A token minted for a person names whoever the
-#: minter typed, so the org token route refuses this prefix: a pasted token that
-#: claimed to be `user:u-1` would otherwise read as that person to anything
-#: that ever trusts the subject.
+#: minter typed, so `mint` refuses this prefix on every path (the org token
+#: route, a local `flotta token mint`): a pasted token that claimed to be
+#: `user:u-1` would otherwise read as that person to anything that ever trusts
+#: the subject. `person_token` builds a session's token without minting one.
 USER_SUBJECT_PREFIX = "user:"
 
 
@@ -430,6 +431,8 @@ def mint(
     mint error it actually is.
     """
     signing_key = _require_key(key, env)
+    if subject.startswith(USER_SUBJECT_PREFIX):
+        raise AuthError(f"{subject!r} names a person who signs in; they get a session, not a token")
     wanted = frozenset(scopes)
     if not wanted:
         raise AuthError("a token with no scopes can do nothing; name at least one")

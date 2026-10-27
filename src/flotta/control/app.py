@@ -756,6 +756,7 @@ def create_app(
                 status_code=422,
                 detail=f"{subject!r} names a machine; a box's token is minted when it is created",
             )
+        # `mint` refuses this too; checked here so it is a 422 and not a 500.
         if subject.startswith(USER_SUBJECT_PREFIX):
             raise HTTPException(
                 status_code=422,
