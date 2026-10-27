@@ -189,9 +189,25 @@ conventions, and the sharp edges below.
   `GET /api/me` (anyone; for a session also the user, every membership and the
   session), `POST /api/auth/sign-out`, `GET /api/sessions` and
   `DELETE /api/sessions/{id}` (a session's own; another's is a 404). A session's
-  public id is its hash, which is not a way in. Nothing *creates* sessions over
-  HTTP yet: that is sign-in, M12.3 (`docs/flotta-pivot/02-design-spec.md` §2.5
-  in the parent repo).
+  public id is its hash, which is not a way in. A `user:` subject is refused by
+  `auth.mint` itself, so no path mints one.
+- **Sign-in is an emailed link from M12.3.** `POST /api/auth/link {email}` is
+  an open route that **always answers `202 {"sent": true}`** and is limited
+  per address and per caller (`control/ratelimit.py`, in memory, counting
+  addresses with no account too — a limit only real accounts hit would answer
+  "is there an account?" with a 429). The lookup, the link and the email run
+  after the response. `POST /api/auth/redeem {secret, org?}` (open) trades a
+  link for a session once, within 15 minutes, in the person's first org or the
+  one named; every failure is the same 401. `POST /api/auth/switch {org}` (a
+  session) is the org switcher: a new session there, this one ended.
+  `POST /api/users` (operator only) and `flotta user add` put the first people
+  on a fleet (`store.add_person`). **Links print to the log only on a keyless
+  control plane or with `$FLOTTA_PRINT_SIGN_IN_LINKS=1`** (`mail.resolve_mailer`);
+  a keyed one with no `$FLOTTA_RESEND_API_KEY` makes no link, because a printed
+  link signs its address in for whoever reads the log. The link is
+  `$FLOTTA_APP_URL/sign-in#<secret>`: a fragment, so no server or mail scanner
+  ever receives the secret. `control/test_sign_in.py` opens with the guard
+  (once, 15 minutes, never another address); invites and sign-up are M12.4.
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

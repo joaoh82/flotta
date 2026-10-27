@@ -580,6 +580,35 @@ lifetimes short (`--days`).
 
 ---
 
+## Step 9 — People who sign in (M12.3)
+
+Tokens are for machines and scripts; people sign in with a link emailed to
+them, and the web app keeps the session. Give yourself an account first, as
+an owner of the default org, which makes you the operator:
+
+```bash
+just user-add you@example.com owner              # through $FLOTTA_CONTROL_URL when set
+just user-add alice@agency-x.example owner agency-x
+```
+
+To send links, set on the control plane:
+
+- `FLOTTA_RESEND_API_KEY`: a Resend API key, with the sending domain verified.
+- `FLOTTA_MAIL_FROM`: the sender, e.g. `Flotta <sign-in@flotta.dev>`.
+- `FLOTTA_APP_URL`: the web app, e.g. `https://app.flotta.dev`; links point at
+  `<it>/sign-in#<secret>`.
+
+Without a Resend key a deployed control plane makes **no** links, and says so
+at startup. It does not print them: a link in a log signs its address in for
+anyone who reads that log. Locally, a control plane with no signing key prints
+them, which is how sign-in is tried for $0.
+
+`POST /api/auth/link` answers `202` for any address and is limited per address
+and per caller. The web app's server is one caller for everybody, so it must
+limit each browser itself.
+
+---
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would

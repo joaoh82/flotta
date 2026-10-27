@@ -249,6 +249,38 @@ def test_a_membership_of_something_that_does_not_exist_is_refused(agency, user, 
 # -- sign-in links and invites ----------------------------------------------
 
 
+def test_adding_a_person_makes_their_account_once(agency):
+    user, membership, created = agency.add_person("Ana@Example.com", "studio-nord", "owner")
+    again, other, created_again = agency.add_person(
+        "ana@example.com", "default", "member", name="ignored for an existing account"
+    )
+
+    assert (created, created_again) == (True, False)
+    assert again.id == user.id and again.name is None
+    assert (membership.org, other.org) == ("studio-nord", "default")
+
+
+@pytest.mark.parametrize(
+    ("org", "role", "client"),
+    [
+        ("nowhere", "owner", None),
+        ("studio-nord", "client_viewer", None),
+        ("studio-nord", "member", "zed"),
+    ],
+    ids=["no-such-org", "viewer-of-no-client", "no-such-client"],
+)
+def test_adding_a_person_who_could_not_be_added_leaves_no_account(agency, org, role, client):
+    with pytest.raises((InvalidAccountError, UnknownEntityError)):
+        agency.add_person("ana@example.com", org, role, client_id=client)
+    assert agency.get_user_by_email("ana@example.com") is None
+
+
+def test_adding_a_person_to_an_org_they_are_in_is_refused(agency):
+    agency.add_person("ana@example.com", "studio-nord", "owner")
+    with pytest.raises(DuplicateMembershipError):
+        agency.add_person("ana@example.com", "studio-nord", "member")
+
+
 def test_a_link_signs_in_once(fleet):
     secret = fleet.create_login_link("Ana@StudioNord.example", now=T0)
 

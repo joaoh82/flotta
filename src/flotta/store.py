@@ -1070,6 +1070,41 @@ class FleetStore:
         assert membership is not None
         return membership
 
+    def add_person(
+        self,
+        email: str,
+        org_id: str,
+        role: str,
+        *,
+        client_id: str | None = None,
+        name: str | None = None,
+    ) -> tuple[User, Membership, bool]:
+        """`email` in `org_id` as `role`, with an account made if there is none.
+
+        Returns the user, the membership, and whether the account is new.
+        Everything that could refuse is asked before anything is written, so a
+        refusal never leaves an account behind that belongs to no org; and
+        under `users`' guard, so two adds of one address make one account.
+        """
+        email = normalize_email(email)
+        try:
+            scopes_for_role(role, client=client_id)
+        except AuthError as exc:
+            raise InvalidAccountError(str(exc)) from exc
+        with self._conn.transaction(guard="users"):
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if client_id is not None and self.get_client(org_id, client_id) is None:
+                raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+            user = self.get_user_by_email(email)
+            if user is not None and self.membership(user.id, org_id) is not None:
+                raise DuplicateMembershipError(f"{email} already belongs to org {org_id!r}")
+            created = user is None
+            if user is None:
+                user = self.create_user(email, name=name)
+            membership = self.add_membership(user.id, org_id, role, client_id=client_id)
+        return user, membership, created
+
     def membership(self, user_id: str, org_id: str) -> Membership | None:
         row = self._conn.execute(
             "SELECT * FROM memberships WHERE user_id = ? AND org_id = ?", (user_id, org_id)

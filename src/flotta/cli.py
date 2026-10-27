@@ -1710,6 +1710,74 @@ def client_list(
     emit({"org": org_id, "clients": clients}, _org_lines(clients), as_json=as_json)
 
 
+# -- people (M12.3) -----------------------------------------------------------
+#
+# The operator's way to put the first people on a fleet, starting with
+# themselves. After that, people sign in by emailed link (`POST /api/auth/link`)
+# and an org's owner invites their own team (M12.4).
+
+user_app = typer.Typer(
+    name="user",
+    help="People who sign in: an account per address, a role per org.",
+    no_args_is_help=True,
+)
+app.add_typer(user_app)
+
+
+@user_app.command("add")
+def user_add(
+    email: str = typer.Argument(..., help="Their address: where sign-in links go"),
+    role: str = typer.Option(..., "--role", help="owner | member | client_viewer"),
+    org_id: str = typer.Option("default", "--org", help="Which org; the default is yours"),
+    client: str | None = typer.Option(None, "--client", help="The client a viewer sees"),
+    name: str | None = typer.Option(None, "--name", help="What to call them"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Give a person a role in an org, making their account if there is none.
+
+    The first operator is `flotta user add you@example.com --role owner`: an
+    owner of the default org. They then sign in with a link sent to that
+    address. Through the fleet API when $FLOTTA_CONTROL_URL is set.
+    """
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import DuplicateMembershipError, InvalidAccountError, UnknownEntityError
+
+    if control_url():
+        try:
+            added = control_request(
+                "POST",
+                "/api/users",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"email": email, "org": org_id, "role": role, "client": client, "name": name},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                user, membership, created = fleet.add_person(
+                    email, org_id, role, client_id=client, name=name
+                )
+            except InvalidAccountError as exc:
+                raise _fail(exc, code=2) from exc
+            except (UnknownEntityError, DuplicateMembershipError) as exc:
+                raise _fail(exc) from exc
+        added = {
+            "user": {"id": user.id, "email": user.email, "name": user.name},
+            "membership": {
+                "org": membership.org,
+                "client": membership.client,
+                "role": membership.role,
+            },
+            "created": created,
+        }
+    m = added["membership"]
+    where = f"org {m['org']}" + (f", client {m['client']}" if m["client"] else "")
+    verb = "added" if added["created"] else "gave existing account"
+    emit(added, f"{verb} {added['user']['email']} as {m['role']} in {where}", as_json=as_json)
+
+
 # -- schema migrations (M11) -----------------------------------------------
 
 db_app = typer.Typer(

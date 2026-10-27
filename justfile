@@ -212,6 +212,11 @@ client-create ORG ID NAME:
 client-list ORG:
     uv run flotta client list {{ORG}}
 
+# M12.3 — give a person a role in an org, making their account if need be.
+# The first operator: `just user-add you@example.com owner`. Then sign in by link.
+user-add EMAIL ROLE ORG="default" CLIENT="":
+    uv run flotta user add "{{EMAIL}}" --role {{ROLE}} --org {{ORG}} {{ if CLIENT == "" { "" } else { "--client " + CLIENT } }}
+
 # `tauri dev` runs the Vite server and the Rust shell together, so this is the
 # only command needed — running `npm run dev` alone gives a page in a browser,
 # which is precisely the thing this app is not.

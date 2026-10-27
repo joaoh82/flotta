@@ -1448,3 +1448,72 @@ def test_token_inspect_names_the_tenancy(tmp_path, monkeypatch):
         "agency-x",
         "acme",
     )
+
+
+# -- people (M12.3) ------------------------------------------------------------
+
+
+def test_user_add_makes_the_first_operator_in_a_local_store(tmp_path, monkeypatch):
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+
+    _, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["user", "add", "Josh@Example.com", "--role", "owner"] + ["--store", db, "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["created"] is True
+    with FleetStore(db) as store:
+        user = store.get_user_by_email("josh@example.com")
+        assert [(m.org, m.role) for m in store.memberships_for(user.id)] == [("default", "owner")]
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [
+        (["user", "add", "not an address", "--role", "owner"], 2),
+        (["user", "add", "a@b.co", "--role", "client_viewer"], 2),
+        (["user", "add", "a@b.co", "--role", "owner", "--org", "nowhere"], 1),
+    ],
+    ids=["not-an-address", "viewer-of-no-client", "no-such-org"],
+)
+def test_user_add_refuses_and_leaves_no_account(tmp_path, monkeypatch, argv, code):
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    _, result = _invoke(tmp_path, monkeypatch, [*argv, "--store", db])
+    assert result.exit_code == code, result.output
+    with FleetStore(db) as store:
+        assert store._conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0
+
+
+def test_user_add_goes_through_the_control_plane(tmp_path, monkeypatch):
+    calls, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["user", "add", "sam@acme.example", "--role", "client_viewer", "--org", "agency-x"]
+        + ["--client", "acme"],
+        remote={
+            "user": {"id": "u-1", "email": "sam@acme.example", "name": None},
+            "membership": {"org": "agency-x", "client": "acme", "role": "client_viewer"},
+            "created": True,
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        (
+            "POST",
+            "/api/users",
+            ["org:admin"],
+            {
+                "email": "sam@acme.example",
+                "org": "agency-x",
+                "role": "client_viewer",
+                "client": "acme",
+                "name": None,
+            },
+        )
+    ]
+    assert "client acme" in result.output
