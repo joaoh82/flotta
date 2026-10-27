@@ -124,3 +124,19 @@ def test_concurrent_status_changes_do_not_both_win(pg_store):
         f"expected one winner and one rejected transition, got {outcomes}"
     )
     assert pg_store.get_box(box.id).status == "stopped"
+
+
+def test_a_link_clicked_twice_at_once_signs_in_once(pg_store):
+    """`redeem_login_link` is a read-check-write as well: two tabs opening the
+    same emailed link must not both get a session (M12.1)."""
+    secret = pg_store.create_login_link("ana@studionord.example")
+
+    def redeem(fleet, i):
+        if fleet.redeem_login_link(secret) is None:
+            raise LookupError("already used")
+
+    outcomes = _race(pg_store, redeem)
+
+    assert sorted(outcomes) == ["LookupError", "created"], (
+        f"expected exactly one redemption, got {outcomes} — a link can sign in twice"
+    )

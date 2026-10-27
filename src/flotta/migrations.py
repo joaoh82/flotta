@@ -137,6 +137,79 @@ def _tenancy(now: str) -> tuple[str, ...]:
     )
 
 
+def _accounts() -> tuple[str, ...]:
+    """People (M12): who may sign in, as what, and how they prove it.
+
+    M11 gave every token an org and a client, but a token was still minted by
+    hand and pasted. This is the other half of identity: a **user** is one
+    email address, a **membership** is that user's role in one org (and in one
+    client, for a client viewer), and a person may hold several — a dental
+    practice that works with two agencies is a client viewer of both.
+
+    `login_links` carries both sign-in links and invites; an invite is a link
+    that also says which membership redeeming it creates. `sessions` are what
+    a redeemed link becomes, and are revocable by deleting the row, which no
+    signed token ever was.
+
+    **Neither table holds a secret.** A link's secret is only ever in the
+    email, a session's only in the web app's cookie; both tables key on the
+    SHA-256 of it. A database dump, a backup or a log line of a row signs
+    nobody in. `test_accounts.py` reads every table after creating both and
+    fails if the secret appears anywhere.
+
+    Deliberately not here, for the reason `_tenancy` gives: `orgs.status`
+    (pending sign-ups, M12.4) and a session's last-seen time (M12.2) arrive
+    with the code that reads them.
+    """
+    return (
+        """
+        CREATE TABLE users (
+            id          TEXT PRIMARY KEY,
+            email       TEXT NOT NULL UNIQUE,
+            name        TEXT,
+            created_at  TEXT NOT NULL,
+            disabled_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE memberships (
+            user_id     TEXT NOT NULL REFERENCES users(id),
+            org_id      TEXT NOT NULL REFERENCES orgs(id),
+            client_id   TEXT,
+            role        TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (user_id, org_id),
+            FOREIGN KEY (org_id, client_id) REFERENCES clients(org_id, id)
+        )
+        """,
+        "CREATE INDEX idx_memberships_org ON memberships(org_id)",
+        """
+        CREATE TABLE login_links (
+            token_hash  TEXT PRIMARY KEY,
+            email       TEXT NOT NULL,
+            purpose     TEXT NOT NULL,
+            org_id      TEXT,
+            client_id   TEXT,
+            role        TEXT,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            used_at     TEXT
+        )
+        """,
+        "CREATE INDEX idx_login_links_email ON login_links(email)",
+        """
+        CREATE TABLE sessions (
+            id_hash      TEXT PRIMARY KEY,
+            user_id      TEXT NOT NULL REFERENCES users(id),
+            org_id       TEXT NOT NULL REFERENCES orgs(id),
+            created_at   TEXT NOT NULL,
+            expires_at   TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_sessions_user ON sessions(user_id)",
+    )
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -149,6 +222,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         "tenancy: orgs, clients, and the client each box belongs to",
         _tenancy(_NOW_SQLITE),
         postgres=_tenancy(_NOW_POSTGRES),
+    ),
+    Migration(
+        2,
+        "accounts: users, memberships, sign-in links, sessions",
+        _accounts(),
     ),
 )
 
