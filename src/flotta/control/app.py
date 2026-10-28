@@ -1990,12 +1990,12 @@ def create_app(
         """
         from fastapi.responses import JSONResponse
 
-        from flotta.provision import _backend_for, create_box, reserve_box
+        from flotta.provision import _default_backend, create_box, reserve_box
         from flotta.store import DuplicateBoxError
 
         store = store_factory()
         try:
-            impl = _backend_for("fly://")
+            impl = _default_backend()
             # By address: that is what the Fly app is named after.
             probe = _peek_for(impl, label)
             occupied = _occupant(store, token, probe) if probe else None

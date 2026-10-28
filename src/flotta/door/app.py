@@ -360,7 +360,8 @@ class ControlPlane:
         box_id = (body.get("box") or {}).get("id") or box_id or name
         if not endpoint:
             raise BoxUnavailable(f"box {name!r} has no endpoint to proxy to", status=502)
-        return Target(box_id=box_id, name=name, endpoint=endpoint, host=internal_host(endpoint))
+        host, port = upstream(endpoint)
+        return Target(box_id=box_id, name=name, endpoint=endpoint, host=host, port=port)
 
     async def resolve(self, name: str) -> Address:
         """Which box `name` is, and whose. Never wakes it.
@@ -431,6 +432,33 @@ def authority(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
+def upstream(endpoint: str) -> tuple[str, int]:
+    """Where a box's Hermes listens: `(host, port)`, by the endpoint's scheme.
+
+    A `fly://` box is reached over Fly's private network on Hermes's port. A
+    `local://` box (M12.6) is a stand-in on this machine, and its endpoint
+    names the port; `parse_endpoint` there refuses any host but loopback, so
+    a local row can never send the door somewhere else. Anything else is not
+    an address the door knows how to reach.
+    """
+    from flotta.backend import BackendError, scheme_of
+
+    scheme = scheme_of(endpoint)
+    try:
+        if scheme == "fly":
+            return internal_host(endpoint), DEFAULT_BOX_PORT
+        if scheme == "local":
+            from flotta.backends.local_backend import parse_endpoint
+
+            host, port, _ = parse_endpoint(endpoint)
+            return host, port
+    except BackendError as exc:
+        raise BoxUnavailable(
+            f"the box's endpoint is not one the door can reach: {exc}", status=502
+        ) from exc
+    raise BoxUnavailable(f"the door cannot reach a {scheme!r} box", status=502)
+
+
 def internal_host(endpoint: str) -> str:
     """`fly://app/machine` → `machine.vm.app.internal`.
 
@@ -468,7 +496,11 @@ async def wait_until_ready(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     last = "no response"
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    # Every connection to a box ignores `$http_proxy` (`trust_env=False`, and
+    # `proxy=None` for the socket). A box is on a private network or on this
+    # machine; a proxy can reach neither, and for a `local://` box it would
+    # carry a loopback request off the machine.
+    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
         while loop.time() < deadline:
             try:
                 response = await client.get(base_url + "/")
@@ -495,7 +527,7 @@ async def hermes_ticket(base_url: str, credentials: tuple[str, str]) -> str:
     """
     username, password = credentials
     try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=base_url, timeout=30.0, trust_env=False) as client:
             login = await client.post(
                 LOGIN_PATH,
                 json={"provider": "basic", "username": username, "password": password, "next": ""},
@@ -659,7 +691,7 @@ def create_door(
 
         url = f"http://{authority(target.host, target.port)}/{path}"
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 upstream = await client.request(
                     request.method,
                     url,
@@ -756,7 +788,9 @@ def create_door(
         headers = {"Authorization": _basic(*creds)} if creds else {}
 
         try:
-            async with websockets.connect(upstream_url, additional_headers=headers) as upstream:
+            async with websockets.connect(
+                upstream_url, additional_headers=headers, proxy=None
+            ) as upstream:
 
                 async def downstream_to_box() -> None:
                     while True:

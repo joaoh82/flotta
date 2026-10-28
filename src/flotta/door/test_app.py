@@ -15,6 +15,7 @@ import pytest
 
 from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_READ, mint
 from flotta.door.app import (
+    DEFAULT_BOX_PORT,
     BoxUnavailable,
     ControlPlane,
     Target,
@@ -22,6 +23,7 @@ from flotta.door.app import (
     host_to_box_name,
     internal_host,
     resolve_box_credentials,
+    upstream,
 )
 
 KEY = "a-signing-key-for-door-tests"
@@ -83,6 +85,31 @@ def test_a_box_is_addressed_by_machine_not_by_app():
     whichever answered — someone else's agent, with someone else's memory.
     """
     assert internal_host("fly://my-app/48ed9344ce3798") == "48ed9344ce3798.vm.my-app.internal"
+
+
+def test_a_fly_box_is_reached_on_hermess_port():
+    assert upstream("fly://my-app/m1") == ("m1.vm.my-app.internal", DEFAULT_BOX_PORT)
+
+
+def test_a_local_box_is_reached_on_the_port_its_endpoint_names():
+    assert upstream("local://127.0.0.1:41234/eng-a") == ("127.0.0.1", 41234)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "local://10.0.0.5:41234/eng-a",
+        "local://agents.example.com:41234/eng-a",
+        "modal://x/y",
+        "eng-a",
+    ],
+)
+def test_an_endpoint_the_door_cannot_reach_is_a_502_not_a_connection(endpoint):
+    """A `local://` row naming another machine would make a free local agent a
+    way to send the door's traffic anywhere."""
+    with pytest.raises(BoxUnavailable) as refused:
+        upstream(endpoint)
+    assert refused.value.status == 502
 
 
 # -- who gets through -------------------------------------------------------

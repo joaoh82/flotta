@@ -434,6 +434,34 @@ serve port="8080":
     set -euo pipefail
     uv run flotta serve --port {{port}}
 
+# Every agent is a stand-in on this machine (`local://`): no Fly, no model, $0.
+# Never the deployed fleet's: .env's database, Resend key and signing key are
+# all set aside, and the local fleet keeps its own key and box password in
+# $FLOTTA_LOCAL_DIR (~/.flotta/local), so nothing minted here works anywhere
+# else. Sign-in links print here. Agents are at http://<agent>.localhost:<door>.
+# Ctrl-C stops the control plane, the door and every agent.
+# M12.6: the whole fleet on this machine — control plane on :8080, door on :8081
+local control="8080" door="8081":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DIR="${FLOTTA_LOCAL_DIR:-$HOME/.flotta/local}"
+    mkdir -p "$DIR"
+    unset FLOTTA_DATABASE_URL FLOTTA_RESEND_API_KEY FLOTTA_CONTROL_TOKEN
+    [ -s "$DIR/signing-key" ] || (umask 077; uv run flotta token key 2>/dev/null > "$DIR/signing-key")
+    [ -s "$DIR/box-password" ] || (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > "$DIR/box-password")
+    export FLOTTA_BACKEND=local FLOTTA_LOCAL_HOME="$DIR/boxes" FLOTTA_STORE="$DIR/fleet.db"
+    export FLOTTA_SIGNING_KEY="$(cat "$DIR/signing-key")" FLOTTA_BOX_PASSWORD="$(cat "$DIR/box-password")"
+    export FLOTTA_PRINT_SIGN_IN_LINKS=1 FLOTTA_DOMAIN=localhost FLOTTA_DOOR_ORIGINS=http://localhost:3001
+    export FLOTTA_CONTROL_URL="http://127.0.0.1:{{control}}"
+    CP= DOOR=
+    trap 'kill $CP $DOOR 2>/dev/null; pkill -f "[f]lotta.backends.standin .*--home $FLOTTA_LOCAL_HOME/" || true' EXIT
+    uv run --extra control flotta serve --port {{control}} & CP=$!
+    until curl -sf "127.0.0.1:{{control}}/health" >/dev/null; do sleep 0.5; done
+    export FLOTTA_CONTROL_TOKEN="$(uv run flotta token mint door --scope fleet:route --days 30 2>/dev/null)"
+    uv run --extra door flotta door --host 127.0.0.1 --port {{door}} & DOOR=$!
+    echo "local fleet: control plane http://127.0.0.1:{{control}}, agents at http://<agent>.localhost:{{door}}, state in $DIR"
+    wait
+
 # Port 3001 is baked into dashboard/package.json rather than passed here: 3000
 # is reserved for another local service and a flag is too easy to forget.
 # Needs `just serve` running: the dashboard reads the control-plane API, not

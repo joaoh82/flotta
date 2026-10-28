@@ -254,6 +254,23 @@ conventions, and the sharp edges below.
   ticket and `verify_ticket` every token: a ticket cannot call the fleet API or
   ride the door's `Authorization`/`?access_token=` path, where no origin is
   checked, and a door built before tickets refuses them on the signature.
+- **An agent can be a process on this machine (M12.6).** `$FLOTTA_BACKEND`
+  picks where a *new* box goes (`fly` unless set; a typo is refused, not read
+  as Fly), and `local` is `LocalBackend`: each agent is a stand-in for Hermes
+  (`backends/standin.py`) on a loopback port, with `$FLOTTA_LOCAL_HOME/<name>/`
+  as its volume. The stand-in speaks the handshake and the session methods
+  the clients use, **Hermes's two session ids included**, and replies from a
+  script, so no model is called. The endpoint is
+  `local://127.0.0.1:<port>/<name>`, the door routes it (`upstream`), and
+  `parse_endpoint` refuses any host but loopback. Every connection the door
+  and the backend make to a box ignores `$http_proxy`, which would otherwise
+  carry a loopback request off the machine. Only the login is written to a
+  stand-in's disk, never the model key. `just local` runs the whole
+  fleet (control plane, door, agents) with its own key and password in
+  `~/.flotta/local`, and never `.env`'s database, key or Resend. **The guard
+  is `backends/test_local_offline.py`:** sign in, create, ticket, talk through
+  the door, sleep, wake, destroy, with every socket and process recorded and
+  anything off loopback, or anything but the stand-in, a failure.
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

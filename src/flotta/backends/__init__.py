@@ -5,12 +5,13 @@ Imported for their side effect: each module registers its factory with
 knowing which substrates exist. Registration is lazy — a factory is a callable,
 not an instance — so importing this package never touches `flyctl`.
 
-One entry today. `modal` was the second and was removed with the shard tier;
-the protocol's next implementation is Hetzner + Firecracker. The registry is
-kept rather than collapsed into a direct import because scheme routing is what
-lets one fleet span substrates with no schema change — and a stored
-`modal://` endpoint now resolving to "names no substrate" is the correct,
-loud answer for a fleet row written before the cut.
+Two entries: `fly`, and `local` (M12.6), which runs each agent as a stand-in
+process on this machine so the product can be tried for $0. `modal` was
+removed with the shard tier; the next real substrate is Hetzner + Firecracker.
+The registry is kept rather than collapsed into a direct import because scheme
+routing is what lets one fleet span substrates with no schema change — and a
+stored `modal://` endpoint now resolving to "names no substrate" is the
+correct, loud answer for a fleet row written before the cut.
 """
 
 from __future__ import annotations
@@ -24,4 +25,11 @@ def _fly():
     return FlyBackend()
 
 
+def _local():
+    from flotta.backends.local_backend import LocalBackend
+
+    return LocalBackend()
+
+
 register("fly", _fly)
+register("local", _local)
