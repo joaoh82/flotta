@@ -604,8 +604,27 @@ anyone who reads that log. Locally, a control plane with no signing key prints
 them, which is how sign-in is tried for $0.
 
 `POST /api/auth/link` answers `202` for any address and is limited per address
-and per caller. The web app's server is one caller for everybody, so it must
-limit each browser itself.
+(5) and per caller (30) every 15 minutes. **The web app's server is one caller
+for every browser**, and behind Render's proxy so is everyone else, so the
+web app names the browser it is asking for:
+
+```bash
+just token-mint web auth:relay     # the web app's server holds this, nothing else does
+```
+
+and sends it with the browser's address in `X-Flotta-Caller-IP`. Only an
+operator token holding `auth:relay` may name a caller; anything else naming
+one is refused, and a request that names nobody is counted against the address
+it connected from. On Render that is Render's proxy, one bucket for every
+direct caller, which is safe (a direct caller can empty only its own bucket,
+never the web app's browsers') but crude.
+
+`FLOTTA_TRUSTED_PROXY_HOPS` tells the control plane how many proxies append to
+`X-Forwarded-For` in front of it, and the caller becomes the entry the
+outermost of them appended. Leave it unset until that count is **checked on
+the deployment** rather than assumed: set it too high and every caller names
+their own bucket. Render's own description of what it appends is a forum
+reply, not documentation.
 
 ---
 

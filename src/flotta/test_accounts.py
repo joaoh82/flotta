@@ -302,6 +302,19 @@ def test_a_link_expires(fleet):
     assert fleet.redeem_login_link(fresh, now=T0 + timedelta(seconds=LINK_TTL_S - 1)) is not None
 
 
+def test_looking_at_a_link_leaves_it_to_be_redeemed(fleet):
+    secret = fleet.create_login_link("ana@studionord.example", now=T0)
+
+    assert fleet.login_link(secret, now=T0).email == "ana@studionord.example"
+    assert fleet.redeem_login_link(secret, now=T0) is not None
+    # Looked at the same way as a redeem: used, expired and unknown are None.
+    assert fleet.login_link(secret, now=T0) is None
+    late = fleet.create_login_link("ana@studionord.example", now=T0)
+    assert fleet.login_link(late, now=T0 + timedelta(seconds=LINK_TTL_S)) is None
+    assert fleet.login_link("") is None
+    assert fleet.login_link("not-a-link") is None
+
+
 @pytest.mark.parametrize("guess", ["", "not-a-link", secret_hash("x")])
 def test_a_guess_opens_nothing(fleet, guess):
     fleet.create_login_link("ana@studionord.example")

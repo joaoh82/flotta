@@ -1193,19 +1193,37 @@ class FleetStore:
         if not secret:
             return None
         moment = now or datetime.now(UTC)
-        key = secret_hash(secret)
         with self._conn.transaction(guard="login_links"):
-            row = self._conn.execute(
-                "SELECT * FROM login_links WHERE token_hash = ?", (key,)
-            ).fetchone()
-            if row is None or row["used_at"] is not None:
-                return None
-            if datetime.fromisoformat(row["expires_at"]) <= moment:
+            row = self._live_link_row(secret, moment)
+            if row is None:
                 return None
             self._conn.execute(
-                "UPDATE login_links SET used_at = ? WHERE token_hash = ?", (_stamp(moment), key)
+                "UPDATE login_links SET used_at = ? WHERE token_hash = ?",
+                (_stamp(moment), row["token_hash"]),
             )
         return _link_from_row(row)
+
+    def login_link(self, secret: str, *, now: datetime | None = None) -> LoginLink | None:
+        """The link `secret` would open, left unused; `None` as `redeem_login_link`.
+
+        For checking what redeeming would do before spending the link on it.
+        Only a redeem signs anyone in, so a link this says is live may still be
+        gone by then, and the redeem's answer is the one that counts.
+        """
+        if not secret:
+            return None
+        row = self._live_link_row(secret, now or datetime.now(UTC))
+        return _link_from_row(row) if row else None
+
+    def _live_link_row(self, secret: str, moment: datetime) -> Any:
+        row = self._conn.execute(
+            "SELECT * FROM login_links WHERE token_hash = ?", (secret_hash(secret),)
+        ).fetchone()
+        if row is None or row["used_at"] is not None:
+            return None
+        if datetime.fromisoformat(row["expires_at"]) <= moment:
+            return None
+        return row
 
     def create_session(
         self,

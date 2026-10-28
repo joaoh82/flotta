@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import os
 import threading
@@ -44,6 +45,7 @@ from flotta.address import parse as parse_address
 from flotta.auth import (
     DEFAULT_CLIENT,
     DEFAULT_ORG,
+    SCOPE_AUTH_RELAY,
     SCOPE_BOX_CHAT,
     SCOPE_BOX_DESTROY,
     SCOPE_BOX_PEER,
@@ -65,7 +67,7 @@ from flotta.auth import (
     verify,
 )
 from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loop
-from flotta.control.ratelimit import RateLimit
+from flotta.control.ratelimit import RateLimit, hit_all
 from flotta.relay import (
     DEFAULT_TIMEOUT_S as RELAY_TIMEOUT_S,
 )
@@ -148,10 +150,46 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 #: person who mistyped, deleted the email or switched devices.
 LINK_LIMIT_PER_ADDRESS = 5
 #: And one caller, across addresses. The web app's server is one caller for
-#: everybody, so this bounds anyone reaching the control plane directly; the
-#: web app limits each browser itself.
+#: every browser, so it names the browser (`CALLER_IP_HEADER`) and the limit
+#: applies to that; anyone else is limited by the address they connect from.
 LINK_LIMIT_PER_IP = 30
 LINK_LIMIT_WINDOW_S = LINK_TTL_S
+#: The browser behind a sign-in request, as the web app's server says. Only
+#: believed on the operator's token holding `auth:relay`: from anyone else it
+#: would be a way to pick a fresh bucket for every request.
+CALLER_IP_HEADER = "X-Flotta-Caller-IP"
+#: How many proxies in front of the control plane append to `X-Forwarded-For`.
+#: Unset is none, and the caller is whoever connected: on Render, that is
+#: Render's proxy, for everybody.
+TRUSTED_PROXY_HOPS_ENV = "FLOTTA_TRUSTED_PROXY_HOPS"
+
+
+def resolve_trusted_proxy_hops(env: dict[str, str] | None = None) -> int:
+    env = os.environ if env is None else env
+    raw = (env.get(TRUSTED_PROXY_HOPS_ENV) or "").strip()
+    if not raw:
+        return 0
+    if not raw.isdigit():
+        raise ValueError(f"${TRUSTED_PROXY_HOPS_ENV} is a count of proxies, not {raw!r}")
+    return int(raw)
+
+
+def caller_address(peer: str | None, forwarded_for: list[str], hops: int) -> str:
+    """Where a request came from, seen past `hops` proxies that are trusted.
+
+    Each proxy appends the address it was reached from, so the entry `hops`
+    from the right is what the outermost trusted proxy saw. Everything left of
+    it the caller wrote, and could have made up: reading the leftmost entry
+    would hand every request a fresh bucket for the price of a header. Fewer
+    entries than hops means the request did not come through those proxies,
+    and the peer is all there is.
+    """
+    entries = [e.strip() for line in forwarded_for for e in line.split(",") if e.strip()]
+    if hops == 0 or len(entries) < hops:
+        return peer or "unknown"
+    return entries[-hops]
+
+
 INTERVAL_ENV = "FLOTTA_RECONCILE_INTERVAL_S"
 #: The credential boxes borrow. Held here, never on a box — see
 #: `git_credential` for what that does and does not buy.
@@ -355,6 +393,9 @@ def create_app(
     mailer: Any = None,
     #: Where sign-in links point: the web app. `None` reads `$FLOTTA_APP_URL`.
     app_url: str | None = None,
+    #: Proxies in front of this process (`caller_address`). `None` reads
+    #: `$FLOTTA_TRUSTED_PROXY_HOPS`.
+    trusted_proxy_hops: int | None = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -401,6 +442,9 @@ def create_app(
     link_base = app_url if app_url is not None else resolve_app_url()
     per_address = RateLimit(LINK_LIMIT_PER_ADDRESS, LINK_LIMIT_WINDOW_S)
     per_ip = RateLimit(LINK_LIMIT_PER_IP, LINK_LIMIT_WINDOW_S)
+    proxy_hops = (
+        trusted_proxy_hops if trusted_proxy_hops is not None else resolve_trusted_proxy_hops()
+    )
 
     def require(*scopes: str, any_of: bool = False):
         """A dependency that admits a request carrying **all** of `scopes`.
@@ -529,6 +573,8 @@ def create_app(
     needs_anyone = Depends(require())
     # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
     needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
+    # Called, not a dependency: only a request naming its caller needs it.
+    check_relay = require(SCOPE_AUTH_RELAY)
 
     # -- whose box: the tenant scope (M11.6a) ------------------------------
     #
@@ -956,7 +1002,12 @@ def create_app(
     # proves the inbox, and the session it creates is that address's alone.
 
     @app.post("/api/auth/link", status_code=202)
-    def request_link(body: dict[str, Any], request: Request, tasks: BackgroundTasks) -> Any:
+    def request_link(
+        body: dict[str, Any],
+        request: Request,
+        tasks: BackgroundTasks,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
         """Email a sign-in link to `email`, if it can sign in. Always `202`.
 
         The same answer, the same limits and the same timing whether or not
@@ -967,8 +1018,8 @@ def create_app(
             email = normalize_email(str(body.get("email") or ""))
         except InvalidAccountError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        caller = request.client.host if request.client else "unknown"
-        if not per_address.hit(email) or not per_ip.hit(caller):
+        caller = _link_caller(request, authorization)
+        if not hit_all((per_address, email), (per_ip, caller)):
             raise HTTPException(
                 status_code=429,
                 detail="too many sign-in links asked for; wait, then ask again",
@@ -976,6 +1027,28 @@ def create_app(
             )
         tasks.add_task(_send_link, email)
         return {"sent": True}
+
+    def _link_caller(request: Request, authorization: str | None) -> str:
+        """Whom the per-caller limit counts: the browser the web app names, or the peer."""
+        vouched = request.headers.get(CALLER_IP_HEADER)
+        if vouched is None:
+            return caller_address(
+                request.client.host if request.client else None,
+                request.headers.getlist("x-forwarded-for"),
+                proxy_hops,
+            )
+        token = check_relay(authorization)
+        if not _is_operator(token):
+            raise HTTPException(
+                status_code=403,
+                detail=f"only the operator's token may name the caller in {CALLER_IP_HEADER}",
+            )
+        try:
+            return str(ipaddress.ip_address(vouched.strip()))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"{CALLER_IP_HEADER} is not an address: {vouched!r}"
+            ) from exc
 
     def _send_link(email: str) -> None:
         """Make and deliver a link, for an account that could use one."""
@@ -1009,9 +1082,13 @@ def create_app(
             status_code=401, detail="this link has expired or was already used; ask for a new one"
         )
         wanted = body.get("org")
+        offered = str(body.get("secret") or "")
         store = store_factory()
         try:
-            link = store.redeem_login_link(str(body.get("secret") or ""))
+            # Everything is checked against a look at the link, and only then
+            # is it spent: a refusal that used it up would leave someone who
+            # named the wrong org holding a dead link.
+            link = store.login_link(offered)
             # Invites are M12.4's; until then one signs nobody in.
             if link is None or link.purpose != "sign_in":
                 raise refused
@@ -1023,7 +1100,13 @@ def create_app(
                 raise refused
             org = str(wanted) if wanted is not None else orgs[0]
             if org not in orgs:
-                raise HTTPException(status_code=403, detail=f"you are not a member of {org!r}")
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"you are not a member of {org!r}; the link still works for {orgs}",
+                )
+            # The one that counts: two redeems may both have got this far.
+            if store.redeem_login_link(offered) is None:
+                raise refused
             try:
                 secret = store.create_session(user.id, org)
             except (InvalidAccountError, UnknownEntityError) as exc:
@@ -2690,4 +2773,5 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> None:  # pragma: no cove
         else "a local SQLite file"
     )
     _log.info("control plane on %s:%s, fleet state in %s", host, port, described)
-    uvicorn.run(create_app(), host=host, port=port)
+    # proxy_headers off: `caller_address` is the one reader of X-Forwarded-For.
+    uvicorn.run(create_app(), host=host, port=port, proxy_headers=False)

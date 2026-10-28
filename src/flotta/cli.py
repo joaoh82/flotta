@@ -1318,7 +1318,16 @@ def serve(
         fg=typer.colors.BRIGHT_BLACK,
         err=True,
     )
-    uvicorn.run(create_app(interval_s=interval_s), host=host, port=port, log_level="info")
+    # proxy_headers off: uvicorn would otherwise believe X-Forwarded-For from
+    # loopback on its own, and `$FLOTTA_TRUSTED_PROXY_HOPS` is meant to be the
+    # one answer to "which proxies are trusted" (`control.app.caller_address`).
+    uvicorn.run(
+        create_app(interval_s=interval_s),
+        host=host,
+        port=port,
+        log_level="info",
+        proxy_headers=False,
+    )
 
 
 @app.command()

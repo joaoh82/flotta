@@ -208,6 +208,16 @@ conventions, and the sharp edges below.
   `$FLOTTA_APP_URL/sign-in#<secret>`: a fragment, so no server or mail scanner
   ever receives the secret. `control/test_sign_in.py` opens with the guard
   (once, 15 minutes, never another address); invites and sign-up are M12.4.
+  **The per-caller limit's caller is the browser the web app names**
+  (`X-Flotta-Caller-IP`, believed only on an operator token holding
+  `auth:relay`), else the peer, seen past `$FLOTTA_TRUSTED_PROXY_HOPS` proxies
+  (`caller_address`; `flotta serve` turns uvicorn's own proxy-header reading
+  off so there is one reader). Without that, Render's proxy and the web app
+  were each one caller for everybody, and thirty requests stopped all sign-in.
+  `ratelimit.hit_all` checks every limit before counting any, so a refused
+  request spends nobody's budget. Redeem checks against `store.login_link`
+  (a look) before spending the link, so a wrong `org` is a 403 with the link
+  still good.
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

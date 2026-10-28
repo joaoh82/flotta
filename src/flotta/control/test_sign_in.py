@@ -18,8 +18,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
-from flotta.auth import SCOPE_ORG_ADMIN, mint, scopes_for_role
-from flotta.control.app import LINK_LIMIT_PER_ADDRESS, LINK_LIMIT_PER_IP, create_app
+from flotta.auth import SCOPE_AUTH_RELAY, SCOPE_ORG_ADMIN, mint, scopes_for_role
+from flotta.control.app import (
+    CALLER_IP_HEADER,
+    LINK_LIMIT_PER_ADDRESS,
+    LINK_LIMIT_PER_IP,
+    caller_address,
+    create_app,
+    resolve_trusted_proxy_hops,
+)
 from flotta.control.test_app import _uncatalogued, _unchecked
 from flotta.mail import PRINT_LINKS_ENV, RESEND_API_KEY_ENV
 from flotta.store import LINK_TTL_S, FleetStore, secret_hash
@@ -51,7 +58,7 @@ class Outbox(list):
         return self[index].link.partition("#")[2]
 
 
-def _app(fleet, *, mailer=None, signing_key=KEY):
+def _app(fleet, *, mailer=None, signing_key=KEY, hops=0):
     return create_app(
         store_factory=lambda: FleetStore(fleet),
         run_loop=False,
@@ -61,6 +68,7 @@ def _app(fleet, *, mailer=None, signing_key=KEY):
         known_model=_uncatalogued,
         mailer=mailer,
         app_url=APP_URL,
+        trusted_proxy_hops=hops,
     )
 
 
@@ -190,6 +198,142 @@ def test_one_caller_is_limited_across_addresses(api):
     assert set(answers[:-1]) == {202}
 
 
+# -- who the caller is ----------------------------------------------------------
+#
+# Behind Render's proxy every request arrives from the same address, and the
+# web app's server is one caller for every browser on top of that. Counting
+# either as "the caller" makes the per-caller limit one bucket for the whole
+# fleet, which anyone can empty to stop everybody signing in.
+
+
+def _relay(key=KEY, **claims):
+    token = mint(subject="web", scopes={SCOPE_AUTH_RELAY}, key=key, ttl_s=300, **claims)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _exhaust(api, headers=None, prefix="n"):
+    for i in range(LINK_LIMIT_PER_IP):
+        sent = api.post(
+            "/api/auth/link", json={"email": f"{prefix}{i}@example.com"}, headers=headers
+        )
+        assert sent.status_code == 202, sent.text
+
+
+def _ask(api, headers=None, email="someone@example.com"):
+    return api.post("/api/auth/link", json={"email": email}, headers=headers).status_code
+
+
+def test_two_callers_behind_a_trusted_proxy_have_a_bucket_each(fleet, outbox):
+    with TestClient(_app(fleet, mailer=outbox, hops=1)) as api:
+        _exhaust(api, {"X-Forwarded-For": "203.0.113.1"})
+
+        assert _ask(api, {"X-Forwarded-For": "203.0.113.1"}) == 429
+        assert _ask(api, {"X-Forwarded-For": "203.0.113.2"}) == 202
+
+
+def test_a_caller_cannot_pick_a_fresh_bucket_by_writing_the_header(fleet, outbox):
+    """Only the entry the trusted proxy appended counts; the rest is the caller's."""
+    with TestClient(_app(fleet, mailer=outbox, hops=1)) as api:
+        answers = [
+            _ask(api, {"X-Forwarded-For": f"198.51.100.{i}, 203.0.113.1"}, f"n{i}@example.com")
+            for i in range(LINK_LIMIT_PER_IP + 1)
+        ]
+    assert answers == [202] * LINK_LIMIT_PER_IP + [429]
+
+
+def test_with_no_trusted_proxy_the_header_is_ignored(api):
+    """The default, and on Render one bucket for every direct caller: by design,
+    because nothing a direct caller writes is believed. Browsers come through
+    the web app, which names them."""
+    _exhaust(api, {"X-Forwarded-For": "203.0.113.1"})
+    assert _ask(api, {"X-Forwarded-For": "203.0.113.2"}) == 429
+
+
+def test_the_web_app_names_the_browser_and_each_has_its_own_bucket(api):
+    first = {**_relay(), CALLER_IP_HEADER: "203.0.113.1"}
+    _exhaust(api, first)
+
+    assert _ask(api, first) == 429
+    assert _ask(api, {**_relay(), CALLER_IP_HEADER: "2001:db8::1"}) == 202
+
+
+def test_emptying_the_direct_bucket_does_not_stop_the_web_app(api):
+    """The attack in the review: thirty requests straight at the control plane,
+    with made-up addresses, and nobody could sign in for fifteen minutes."""
+    _exhaust(api)
+    assert _ask(api) == 429
+
+    assert _ask(api, {**_relay(), CALLER_IP_HEADER: "203.0.113.1"}) == 202
+
+
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        ({}, 401),
+        ({"Authorization": "Bearer not-a-token"}, 401),
+        (
+            {
+                "Authorization": "Bearer "
+                + mint(subject="x", scopes={SCOPE_ORG_ADMIN}, key=KEY, ttl_s=300)
+            },
+            403,
+        ),
+        # An agency's token: no role holds the scope, and a token minted with
+        # it outside the default org is not the operator's.
+        (_relay(org="agency-x"), 403),
+    ],
+    ids=["no-token", "bad-token", "no-relay-scope", "not-the-operator"],
+)
+def test_only_the_operators_relay_token_may_name_the_caller(api, headers, status):
+    assert _ask(api, {**headers, CALLER_IP_HEADER: "203.0.113.1"}) == status
+
+
+def test_a_session_may_not_name_the_caller(api, outbox):
+    """Ana owns an org; a session is a person's, and never holds the scope."""
+    session = _signed_in(api, outbox)
+    assert _ask(api, {**session, CALLER_IP_HEADER: "203.0.113.1"}) == 403
+
+
+def test_a_named_caller_must_be_an_address(api):
+    assert _ask(api, {**_relay(), CALLER_IP_HEADER: "everyone"}) == 422
+
+
+def test_a_request_one_limit_refuses_spends_nothing_from_the_other(api, outbox):
+    """A caller over its own limit cannot use up a stranger's five."""
+    _exhaust(api)
+    for _ in range(LINK_LIMIT_PER_ADDRESS * 2):
+        assert _ask(api, email="ana@example.com") == 429
+
+    browser = {**_relay(), CALLER_IP_HEADER: "203.0.113.9"}
+    answers = [_ask(api, browser, "ana@example.com") for _ in range(LINK_LIMIT_PER_ADDRESS)]
+    assert answers == [202] * LINK_LIMIT_PER_ADDRESS
+
+
+@pytest.mark.parametrize(
+    ("peer", "forwarded", "hops", "caller"),
+    [
+        ("10.0.0.1", [], 0, "10.0.0.1"),
+        ("10.0.0.1", ["203.0.113.1"], 0, "10.0.0.1"),
+        ("10.0.0.1", ["203.0.113.1"], 1, "203.0.113.1"),
+        ("10.0.0.1", ["1.1.1.1, 203.0.113.1, 10.0.0.2"], 2, "203.0.113.1"),
+        ("10.0.0.1", ["1.1.1.1", "203.0.113.1"], 1, "203.0.113.1"),
+        ("10.0.0.1", ["203.0.113.1"], 2, "10.0.0.1"),
+        (None, [], 0, "unknown"),
+    ],
+)
+def test_the_caller_is_the_entry_the_outermost_trusted_proxy_appended(
+    peer, forwarded, hops, caller
+):
+    assert caller_address(peer, forwarded, hops) == caller
+
+
+def test_the_proxy_count_is_a_count():
+    assert resolve_trusted_proxy_hops({}) == 0
+    assert resolve_trusted_proxy_hops({"FLOTTA_TRUSTED_PROXY_HOPS": "1"}) == 1
+    with pytest.raises(ValueError, match="count of proxies"):
+        resolve_trusted_proxy_hops({"FLOTTA_TRUSTED_PROXY_HOPS": "-1"})
+
+
 def test_a_refused_request_says_when_to_try_again(api):
     for _ in range(LINK_LIMIT_PER_ADDRESS):
         api.post("/api/auth/link", json={"email": "ana@example.com"})
@@ -280,12 +424,17 @@ def test_redeeming_signs_in_to_the_first_org_by_default_or_the_one_named(api, fl
     assert (named["org"], named["client"]) == ("default", "acme")
 
 
-def test_redeeming_into_an_org_one_is_not_in_is_refused(api, fleet, outbox):
+def test_redeeming_into_an_org_one_is_not_in_is_refused_and_keeps_the_link(api, fleet, outbox):
+    """A web app that remembered a stale org gets a 403 and a link that still works."""
     api.post("/api/auth/link", json={"email": "ana@example.com"})
     response = api.post("/api/auth/redeem", json={"secret": outbox.secret(), "org": "default"})
     assert response.status_code == 403
     with FleetStore(fleet) as store:
         assert store._conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == 0
+
+    retried = api.post("/api/auth/redeem", json={"secret": outbox.secret()})
+    assert retried.status_code == 200
+    assert retried.json()["org"] == "agency-x"
 
 
 def test_redeeming_returns_the_session_and_not_the_link(api, outbox):

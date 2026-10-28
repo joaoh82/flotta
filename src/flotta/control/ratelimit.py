@@ -9,6 +9,7 @@ A restart forgets the counts, which is a burst nobody can trigger at will.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections import deque
@@ -33,16 +34,45 @@ class RateLimit:
         A refused hit is not counted, so someone hammering a limit does not
         push their own window forward forever.
         """
-        now = self._clock()
-        with self._lock:
-            # Forget every key whose last hit has left the window, so what is
-            # held is bounded by the traffic of one window, not of all time.
-            for stale in [k for k, v in self._hits.items() if v[-1] <= now - self.window_s]:
-                del self._hits[stale]
-            hits = self._hits.setdefault(key, deque())
-            while hits and hits[0] <= now - self.window_s:
-                hits.popleft()
-            if len(hits) >= self.limit:
-                return False
-            hits.append(now)
-            return True
+        return hit_all((self, key))
+
+    def _room(self, key: str, now: float) -> bool:
+        """Whether one more hit for `key` fits. Counts nothing. Under `_lock`."""
+        # Forget every key whose last hit has left the window, so what is held
+        # is bounded by the traffic of one window, not of all time.
+        for stale in [k for k, v in self._hits.items() if v[-1] <= now - self.window_s]:
+            del self._hits[stale]
+        hits = self._hits.get(key)
+        if hits is None:
+            return self.limit > 0
+        while hits and hits[0] <= now - self.window_s:
+            hits.popleft()
+        return len(hits) < self.limit
+
+    def _count(self, key: str, now: float) -> None:
+        """One hit for `key`. Under `_lock`, after `_room` said yes.
+
+        The only place a key is added, and always with a hit in it: an empty
+        entry would be a key the pruning above cannot read the age of.
+        """
+        self._hits.setdefault(key, deque()).append(now)
+
+
+def hit_all(*checks: tuple[RateLimit, str]) -> bool:
+    """One hit in each `(limit, key)`, or in none of them.
+
+    Every limit is checked before any is counted. Counting as it went would
+    let a request refused by the second limit spend the first: a caller over
+    its own limit could still use up a stranger's address, five requests at a
+    time, and lock that person out without ever being let through.
+    """
+    with contextlib.ExitStack() as held:
+        # A fixed order, whatever the caller's, so two of these cannot deadlock.
+        for limit in sorted({id(c[0]): c[0] for c in checks}.values(), key=id):
+            held.enter_context(limit._lock)
+        moments = [(limit, key, limit._clock()) for limit, key in checks]
+        if not all(limit._room(key, now) for limit, key, now in moments):
+            return False
+        for limit, key, now in moments:
+            limit._count(key, now)
+        return True
