@@ -260,7 +260,9 @@ def hermes():
 
     from aiohttp import web
 
-    seen: dict[str, list] = {"logins": [], "sockets": []}
+    # `seen["ws_ticket"]` makes the ticket endpoint misbehave: "garbled" is a
+    # 200 that is not JSON, "hang_up" drops the connection mid-request.
+    seen: dict = {"logins": [], "sockets": [], "ws_ticket": None}
 
     async def ready(_request):
         return web.json_response({"ok": True})
@@ -277,6 +279,11 @@ def hermes():
     async def ws_ticket(request):
         if request.cookies.get("hermes_session_at") != "session-1":
             return web.json_response({"detail": "Unauthorized"}, status=401)
+        if seen["ws_ticket"] == "garbled":
+            return web.Response(text="<html>a proxy's error page</html>")
+        if seen["ws_ticket"] == "hang_up":
+            request.transport.close()
+            return web.Response()
         return web.json_response({"ticket": "hermes-ticket-1", "ttl_seconds": 30})
 
     async def agent(request):
@@ -362,6 +369,18 @@ def test_the_box_never_sees_the_flotta_ticket(hermes):
 def test_a_box_that_refuses_the_doors_credentials_is_said_to(hermes):
     port, seen = hermes
     app, _ = _door(port, box_credentials=("flotta", "a-stale-password"))
+    code, _ = _refused(app, protocols=_protocols(_ticket()))
+    assert code == 4502
+    assert seen["sockets"] == []
+
+
+@pytest.mark.parametrize("failure", ["garbled", "hang_up"])
+def test_a_handshake_that_breaks_is_said_to(hermes, failure):
+    """A dropped connection or a body that is not JSON is a close with a
+    reason, like every other refusal, not an opaque failed upgrade."""
+    port, seen = hermes
+    seen["ws_ticket"] = failure
+    app, _ = _door(port, box_credentials=("flotta", "the-box-password"))
     code, _ = _refused(app, protocols=_protocols(_ticket()))
     assert code == 4502
     assert seen["sockets"] == []

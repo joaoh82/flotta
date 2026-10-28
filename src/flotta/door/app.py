@@ -494,18 +494,23 @@ async def hermes_ticket(base_url: str, credentials: tuple[str, str]) -> str:
     what dropped them once before (`flotta.client.new_session`).
     """
     username, password = credentials
-    async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
-        login = await client.post(
-            LOGIN_PATH,
-            json={"provider": "basic", "username": username, "password": password, "next": ""},
-        )
-        if login.status_code != 200:
-            raise BoxUnavailable(
-                f"the box refused the door's credentials ({login.status_code})", status=502
+    try:
+        async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
+            login = await client.post(
+                LOGIN_PATH,
+                json={"provider": "basic", "username": username, "password": password, "next": ""},
             )
-        cookie = "; ".join(f"{k}={v}" for k, v in login.cookies.items())
-        minted = await client.post(HERMES_TICKET_PATH, headers={"cookie": cookie})
-    ticket = minted.json().get("ticket") if minted.status_code == 200 else None
+            if login.status_code != 200:
+                raise BoxUnavailable(
+                    f"the box refused the door's credentials ({login.status_code})", status=502
+                )
+            cookie = "; ".join(f"{k}={v}" for k, v in login.cookies.items())
+            minted = await client.post(HERMES_TICKET_PATH, headers={"cookie": cookie})
+        ticket = minted.json().get("ticket") if minted.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        # Anything else escaping here fails the upgrade before `accept`, and the
+        # browser gets an opaque 1006 instead of a reason it can show.
+        raise BoxUnavailable(f"the box's socket handshake failed: {exc}", status=502) from exc
     if not ticket:
         raise BoxUnavailable(
             f"the box would not issue a socket ticket ({minted.status_code})", status=502
