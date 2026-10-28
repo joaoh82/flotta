@@ -14,6 +14,7 @@ neither, no link is created at all, and the log says sign-in is off.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 from collections.abc import Callable
@@ -76,6 +77,58 @@ def sign_in_message(to: str, url: str) -> Message:
             f'<p><a href="{url}">Sign in to Flotta</a></p>'
             f"<p>The link works once, for {minutes}. If you did not ask for it, "
             "ignore this email; nobody can use it without this inbox.</p>"
+        ),
+        link=url,
+    )
+
+
+def sign_up_message(to: str, url: str) -> Message:
+    """The link that creates the agency `to` signed up, when followed.
+
+    The agency's name is not in it, on purpose: whoever signs up chooses it,
+    and an email that carried it would let anyone send text of their choosing
+    from our domain to any address. The web app shows the name once the link
+    has proved the address is theirs.
+    """
+    return Message(
+        to=to,
+        subject="Finish signing up for Flotta",
+        text=(
+            f"Finish signing up for Flotta:\n\n{url}\n\n"
+            "The link works once, for 15 minutes. Your agency can invite its team "
+            "straight away, and create agents once we approve it. If you did not "
+            "ask for this, ignore this email."
+        ),
+        html=(
+            f'<p><a href="{url}">Finish signing up for Flotta</a></p>'
+            "<p>The link works once, for 15 minutes. Your agency can invite its team "
+            "straight away, and create agents once we approve it. If you did not "
+            "ask for this, ignore this email.</p>"
+        ),
+        link=url,
+    )
+
+
+def invite_message(to: str, url: str, org_name: str, role: str) -> Message:
+    """An invitation to join `org_name` as `role`.
+
+    The name is the org's own, which a signed-up agency chose: escaped in the
+    HTML, and the reason a pending org may send only a few (`control.app`).
+    """
+    shown = role.replace("_", " ")
+    return Message(
+        to=to,
+        subject=f"You are invited to {org_name} on Flotta",
+        text=(
+            f"You are invited to join {org_name} on Flotta as a {shown}:\n\n{url}\n\n"
+            "The link works once, for 7 days. If you were not expecting it, ignore "
+            "this email."
+        ),
+        html=(
+            f'<p><a href="{url}">Join {html.escape(org_name)} on Flotta</a> '
+            f"as a {html.escape(shown)}.</p>"
+            "<p>The link works once, for 7 days. If you were not expecting it, ignore "
+            "this email.</p>"
         ),
         link=url,
     )

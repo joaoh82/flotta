@@ -210,6 +210,27 @@ def _accounts() -> tuple[str, ...]:
     )
 
 
+def _sign_up() -> tuple[str, ...]:
+    """Orgs that have not been approved yet (M12.4), and the sign-ups that make them.
+
+    `orgs.status` is `pending` for an agency that signed itself up, `active`
+    once the operator approves it, `declined` if not. Every org that exists
+    already was made by the operator, so the default makes them all `active`
+    and nothing about them changes. Only an `active` org creates an agent
+    (`FleetStore.create_box`): a stranger signing up costs nothing until then.
+
+    `login_links.org_name` is what a sign-up link carries besides the org id
+    in `org_id`: the agency is created when the link is redeemed, which proves
+    the address, not when it is asked for, which proves nothing.
+
+    No `suspended` yet: nothing would set it, so nothing could read it.
+    """
+    return (
+        "ALTER TABLE orgs ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        "ALTER TABLE login_links ADD COLUMN org_name TEXT",
+    )
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -227,6 +248,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         2,
         "accounts: users, memberships, sign-in links, sessions",
         _accounts(),
+    ),
+    Migration(
+        3,
+        "sign-up: an org's status, and the org a sign-up link names",
+        _sign_up(),
     ),
 )
 

@@ -1308,6 +1308,38 @@ def test_listing_orgs_and_clients_needs_only_read(tmp_path, monkeypatch):
     ]
 
 
+def test_deciding_a_sign_up_goes_through_the_control_plane(tmp_path, monkeypatch):
+    org = {"id": "studio-pat", "name": "Studio Pat", "created_at": "now", "status": "active"}
+    calls, result = _invoke(
+        tmp_path, monkeypatch, ["org", "approve", "studio-pat"], remote={"org": org}
+    )
+    waiting, _ = _invoke(tmp_path, monkeypatch, ["org", "list", "--pending"], remote={"orgs": []})
+
+    assert result.exit_code == 0, result.output
+    assert "studio-pat is active" in result.output
+    assert [(c[0], c[1], c[2]) for c in calls + waiting] == [
+        ("POST", "/api/orgs/studio-pat/approve", ["org:admin"]),
+        ("GET", "/api/orgs?status=pending", ["fleet:read"]),
+    ]
+
+
+def test_deciding_a_sign_up_against_a_local_store(tmp_path, monkeypatch):
+    db = str(tmp_path / "fleet.db")
+    with FleetStore(db) as store:
+        store.create_org("studio-pat", "Studio Pat", status="pending")
+        store.create_org("studio-lee", "Studio Lee", status="pending")
+
+    _, pending = _invoke(tmp_path, monkeypatch, ["org", "list", "--pending", "--store", db])
+    _, approved = _invoke(tmp_path, monkeypatch, ["org", "approve", "studio-pat", "--store", db])
+    _, declined = _invoke(tmp_path, monkeypatch, ["org", "decline", "studio-lee", "--store", db])
+    _, again = _invoke(tmp_path, monkeypatch, ["org", "decline", "studio-pat", "--store", db])
+
+    assert "studio-pat" in pending.output and "default" not in pending.output
+    assert approved.exit_code == 0 and "studio-pat is active" in approved.output
+    assert declined.exit_code == 0 and "studio-lee is declined" in declined.output
+    assert again.exit_code == 1
+
+
 def test_org_and_client_against_a_local_store(tmp_path, monkeypatch):
     db = str(tmp_path / "fleet.db")
     FleetStore(db).close()

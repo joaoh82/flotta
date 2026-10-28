@@ -204,6 +204,16 @@ org-create ID NAME:
 org-list:
     uv run flotta org list
 
+# M12.4 — sign-ups waiting for an answer, and the answer
+org-pending:
+    uv run flotta org list --pending
+
+org-approve ID:
+    uv run flotta org approve {{ID}}
+
+org-decline ID:
+    uv run flotta org decline {{ID}}
+
 # M11.7 — add one of an org's customers, e.g. `just client-create agency-x acme "Acme"`
 client-create ORG ID NAME:
     uv run flotta client create {{ORG}} {{ID}} --name "{{NAME}}"

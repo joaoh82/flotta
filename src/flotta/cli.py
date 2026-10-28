@@ -67,6 +67,7 @@ from .store import (
     InvalidBoxNameError,
     InvalidTenantError,
     LegacyStoreError,
+    OrgNotActiveError,
     Task,
     UnknownEntityError,
     is_terminal,
@@ -1067,6 +1068,7 @@ def create(
             InvalidTenantError,
             UnknownEntityError,
             DuplicateBoxError,
+            OrgNotActiveError,
             InvalidModel,
         ) as exc:
             # Exit 2: the caller asked for something impossible, which is a
@@ -1591,7 +1593,14 @@ app.add_typer(client_app)
 
 
 def _org_lines(orgs: list[dict[str, Any]]) -> str:
-    return "\n".join(f"  {o['id']:<16}  {o['name']}" for o in orgs) or "  (none)"
+    return (
+        "\n".join(f"  {o['id']:<16}  {o.get('status', 'active'):<8}  {o['name']}" for o in orgs)
+        or "  (none)"
+    )
+
+
+def _org_view(org: Any) -> dict[str, Any]:
+    return {"id": org.id, "name": org.name, "created_at": org.created_at, "status": org.status}
 
 
 @org_app.command("create")
@@ -1627,26 +1636,71 @@ def org_create(
                 raise _fail(exc, code=2) from exc
             except DuplicateTenantError as exc:
                 raise _fail(exc) from exc
-            org = {"id": created.id, "name": created.name, "created_at": created.created_at}
+            org = _org_view(created)
     emit({"org": org}, f"created org {org['id']} ({org['name']})", as_json=as_json)
 
 
 @org_app.command("list")
-def org_list(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
+def org_list(
+    pending: bool = typer.Option(False, "--pending", help="Only sign-ups waiting for an answer"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
     """Every org — or, with an org's own token, that one."""
     from flotta.auth import SCOPE_FLEET_READ
 
+    status = "pending" if pending else None
     if control_url():
         try:
-            orgs = control_request("GET", "/api/orgs", scopes=(SCOPE_FLEET_READ,))["orgs"]
+            path = "/api/orgs?status=pending" if pending else "/api/orgs"
+            orgs = control_request("GET", path, scopes=(SCOPE_FLEET_READ,))["orgs"]
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
     else:
         with _open_store(store) as fleet:
-            orgs = [
-                {"id": o.id, "name": o.name, "created_at": o.created_at} for o in fleet.list_orgs()
-            ]
+            orgs = [_org_view(o) for o in fleet.list_orgs(status=status)]
     emit({"orgs": orgs}, _org_lines(orgs), as_json=as_json)
+
+
+def _decide_org(org_id: str, *, approve: bool, store: str | None, as_json: bool) -> None:
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import InvalidTransitionError
+
+    verb = "approve" if approve else "decline"
+    if control_url():
+        try:
+            org = control_request("POST", f"/api/orgs/{org_id}/{verb}", scopes=(SCOPE_ORG_ADMIN,))[
+                "org"
+            ]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                org = _org_view(fleet.decide_org(org_id, approve=approve))
+            except (UnknownEntityError, InvalidTransitionError) as exc:
+                raise _fail(exc) from exc
+    emit({"org": org}, f"{org['id']} is {org['status']}", as_json=as_json)
+
+
+@org_app.command("approve")
+def org_approve(
+    org_id: str = typer.Argument(..., help="A pending org: `flotta org list --pending`"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Let a signed-up org create agents. The operator's act, and final."""
+    _decide_org(org_id, approve=True, store=store, as_json=as_json)
+
+
+@org_app.command("decline")
+def org_decline(
+    org_id: str = typer.Argument(..., help="A pending org: `flotta org list --pending`"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Refuse a signed-up org: it keeps its sign-in and never creates an agent."""
+    _decide_org(org_id, approve=False, store=store, as_json=as_json)
 
 
 @client_app.command("create")

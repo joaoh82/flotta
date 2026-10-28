@@ -807,6 +807,13 @@ def create_box(
 
         model = validate_model(model)
 
+    # A pending org's agent is refused before a substrate is resolved, let alone
+    # probed. The store refuses the row too (`FleetStore.create_box`), and that
+    # is the guarantee; this keeps a sign-up from costing even a `flyctl` call.
+    # An org that does not exist is left to the store, which names the client.
+    if box is None and store.get_org(org) is not None:
+        store.require_active_org(org)
+
     impl = backend or _backend_for("fly://")  # default substrate for persistent boxes
 
     # `create` is idempotent over the *machine* — it adopts `machines[0]` rather

@@ -21,9 +21,12 @@ from flotta import migrations
 from flotta.store import (
     LINK_TTL_S,
     DuplicateMembershipError,
+    DuplicateTenantError,
     DuplicateUserError,
     FleetStore,
     InvalidAccountError,
+    LastOwnerError,
+    OrgNotActiveError,
     UnknownEntityError,
     normalize_email,
     secret_hash,
@@ -444,10 +447,88 @@ def test_a_link_secret_is_not_a_session_and_the_reverse(agency, ana):
 def test_a_store_from_before_accounts_gains_them_and_keeps_its_orgs(target, monkeypatch):  # noqa: F811
     monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:1])
     with FleetStore(target) as before:
-        before.create_org("studio-nord", "Studio Nord")
+        # The row that build wrote: this build's `create_org` names a status
+        # column that store does not have yet.
+        before._conn.execute(
+            "INSERT INTO orgs (id, name, created_at) VALUES (?, ?, ?)",
+            ("studio-nord", "Studio Nord", "2026-10-01T00:00:00+00:00"),
+        )
     monkeypatch.undo()
 
     with FleetStore(target) as after:
         assert after.get_org("studio-nord") is not None
         user = after.create_user("ana@studionord.example")
         assert after.add_membership(user.id, "studio-nord", "owner").role == "owner"
+
+
+# -- sign-up, invites and the team (M12.4) ---------------------------------------
+
+
+def test_a_sign_up_link_names_an_org_that_does_not_exist_yet(agency):
+    with pytest.raises(InvalidAccountError, match="names the org"):
+        agency.create_login_link("pat@example.com", purpose="sign_up", org_id="studio-pat")
+    with pytest.raises(DuplicateTenantError):
+        agency.create_login_link(
+            "pat@example.com", purpose="sign_up", org_id="studio-nord", org_name="Again"
+        )
+    with pytest.raises(InvalidAccountError, match="only a sign-up"):
+        agency.create_login_link("pat@example.com", org_name="Stray")
+
+    secret = agency.create_login_link(
+        "pat@example.com", purpose="sign_up", org_id="studio-pat", org_name="Studio Pat"
+    )
+    link = agency.login_link(secret)
+    assert (link.purpose, link.org, link.org_name) == ("sign_up", "studio-pat", "Studio Pat")
+
+
+def test_signing_up_is_all_or_nothing(agency):
+    user, org, membership = agency.sign_up("pat@example.com", "studio-pat", "Studio Pat")
+    assert (org.status, membership.role, membership.user_id) == ("pending", "owner", user.id)
+
+    with pytest.raises(DuplicateTenantError):
+        agency.sign_up("lee@example.com", "studio-pat", "Taken")
+    assert agency.get_user_by_email("lee@example.com") is None
+
+
+def test_a_declined_org_sends_no_invites(agency):
+    agency.create_org("signed-up", "Signed Up", status="pending")
+    agency.decide_org("signed-up", approve=False)
+    with pytest.raises(OrgNotActiveError):
+        agency.create_login_link(
+            "lee@example.com", purpose="invite", org_id="signed-up", role="member"
+        )
+
+
+def test_accepting_an_invite_keeps_a_membership_made_since(agency):
+    secret = agency.create_login_link(
+        "lee@example.com", purpose="invite", org_id="studio-nord", role="member"
+    )
+    lee, _, _ = agency.add_person("lee@example.com", "studio-nord", "owner")
+
+    user, membership = agency.accept_invite(agency.redeem_login_link(secret))
+    assert (user.id, membership.role) == (lee.id, "owner")
+
+
+def test_removing_a_member_ends_their_sessions_in_that_org_only(agency):
+    lee, _, _ = agency.add_person("lee@example.com", "studio-nord", "member")
+    agency.create_org("other", "Other")
+    agency.add_membership(lee.id, "other", "member")
+    agency.create_session(lee.id, "studio-nord")
+    kept = agency.create_session(lee.id, "other")
+
+    agency.remove_membership(lee.id, "studio-nord")
+
+    assert agency.membership(lee.id, "studio-nord") is None
+    assert [s.org for s in agency.sessions_for(lee.id)] == ["other"]
+    assert agency.session(kept) is not None
+
+
+def test_an_org_keeps_its_last_owner(agency):
+    _, owner, _ = agency.add_person("ana@example.com", "studio-nord", "owner")
+    with pytest.raises(LastOwnerError):
+        agency.remove_membership(owner.user_id, "studio-nord")
+
+    agency.add_person("lee@example.com", "studio-nord", "owner")
+    agency.remove_membership(owner.user_id, "studio-nord")
+    with pytest.raises(UnknownEntityError):
+        agency.remove_membership(owner.user_id, "studio-nord")
