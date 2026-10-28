@@ -236,7 +236,8 @@ conventions, and the sharp edges below.
   before the answer so a failure is a 502, a week long (`INVITE_TTL_S`); a
   pending org sends 3 per 15 minutes, an active one 20, a declined one none.
   `GET /api/orgs/{id}/members`, and `DELETE …/members/{user}` ends that person's
-  sessions in that org only and refuses an org's last owner. Redeem answers
+  sessions in that org only, withdraws their invites to it (opened or not, or a
+  spare one undoes the removal), and refuses an org's last owner. Redeem answers
   with `purpose` (`sign_in` | `invite` | `sign_up`), and `/api/me` with
   `org_status`.
 - **A box's name is its address, and the address names its tenant (M11.5).**

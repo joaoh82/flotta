@@ -523,6 +523,27 @@ def test_removing_a_member_ends_their_sessions_in_that_org_only(agency):
     assert agency.session(kept) is not None
 
 
+def test_removing_a_member_withdraws_their_invites_to_that_org(agency):
+    """Opened or not: an invite read before the removal cannot be accepted
+    after it, so the removal is the later word whichever request wins."""
+    invite = {"purpose": "invite", "org_id": "studio-nord", "role": "member"}
+    joined = agency.create_login_link("lee@example.com", **invite)
+    spare = agency.create_login_link("lee@example.com", **invite)
+    opened = agency.create_login_link("lee@example.com", **invite)
+    agency.create_org("other", "Other")
+    other = agency.create_login_link("lee@example.com", **{**invite, "org_id": "other"})
+    lee, _ = agency.accept_invite(agency.redeem_login_link(joined))
+    read = agency.redeem_login_link(opened)
+
+    agency.remove_membership(lee.id, "studio-nord")
+
+    assert agency.redeem_login_link(spare) is None
+    with pytest.raises(InvalidAccountError):
+        agency.accept_invite(read)
+    assert agency.membership(lee.id, "studio-nord") is None
+    assert agency.redeem_login_link(other).org == "other"
+
+
 def test_an_org_keeps_its_last_owner(agency):
     _, owner, _ = agency.add_person("ana@example.com", "studio-nord", "owner")
     with pytest.raises(LastOwnerError):

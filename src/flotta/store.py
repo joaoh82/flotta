@@ -518,6 +518,8 @@ class LoginLink:
     expires_at: str
     #: For a sign-up: what to call the org `org` it creates.
     org_name: str | None = None
+    #: The row's key, the hash of the secret: how an invite is found again.
+    token_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1220,6 +1222,11 @@ class FleetStore:
         from the person's list of sessions too, not just refused. Their
         sessions in other orgs are theirs and untouched.
 
+        Their invites to this org go too, opened or not. An owner can send two
+        before either is clicked, and a removal that left the spare would be
+        undone by it; `accept_invite` asks for its link under the same guard,
+        so one opened just before the removal cannot be accepted just after.
+
         An org's last owner stays: an org nobody can administer is one only
         the operator can fix. Under `users`' guard, so two owners removing
         each other at once cannot both succeed.
@@ -1241,6 +1248,12 @@ class FleetStore:
             self._conn.execute(
                 "DELETE FROM sessions WHERE user_id = ? AND org_id = ?", (user_id, org_id)
             )
+            user = self.get_user(user_id)
+            if user is not None:
+                self._conn.execute(
+                    "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ?",
+                    (org_id, user.email),
+                )
         return membership
 
     def sign_up(self, email: str, org_id: str, org_name: str) -> tuple[User, Org, Membership]:
@@ -1267,11 +1280,18 @@ class FleetStore:
         """The membership a redeemed invite grants, and the account if need be.
 
         If the person joined the org some other way since, they keep what they
-        have: an invite adds someone, it does not change their role.
+        have: an invite adds someone, it does not change their role. If they
+        were removed since it was redeemed, the removal took the link with it
+        (`remove_membership`), and the invite grants nothing.
         """
         if link.purpose != "invite" or link.org is None or link.role is None:
             raise InvalidAccountError("only an invite grants a membership")
         with self._conn.transaction(guard="users"):
+            kept = self._conn.execute(
+                "SELECT 1 FROM login_links WHERE token_hash = ?", (link.token_hash,)
+            ).fetchone()
+            if kept is None:
+                raise InvalidAccountError("this invite was withdrawn")
             user = self.get_user_by_email(link.email)
             if user is not None and user.disabled_at is not None:
                 raise InvalidAccountError(f"the account for {link.email} is disabled")
@@ -2288,6 +2308,7 @@ def _link_from_row(row: db.Row) -> LoginLink:
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         org_name=row["org_name"],
+        token_hash=row["token_hash"],
     )
 
 

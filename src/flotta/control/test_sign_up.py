@@ -448,6 +448,41 @@ def test_removing_someone_ends_their_sessions_there_and_nowhere_else(api, fleet,
         assert [s.org for s in store.sessions_for(bo.id)] == ["agency-y"]
 
 
+def test_a_spare_invite_does_not_undo_a_removal(api, fleet, outbox):
+    """Two invites sent before either is opened: one joins, the removal must
+    take the other with it, or it is a way back in for a week."""
+    ana = _signed_in(api, outbox, "ana@example.com")
+    assert _invite(api, ana, email="cy@example.com", role="owner").status_code == 202
+    assert _invite(api, ana, email="cy@example.com", role="owner").status_code == 202
+    spare = outbox.secret(-2)
+    cy = _redeem(api, outbox)
+
+    removed = api.delete(f"/api/orgs/agency-x/members/{cy['user']['id']}", headers=ana)
+    assert removed.status_code == 200, removed.text
+    assert api.get("/api/me", headers=_session(cy)).status_code == 401
+
+    assert api.post("/api/auth/redeem", json={"secret": spare}).status_code == 401
+    with FleetStore(fleet) as store:
+        assert store.memberships_for(cy["user"]["id"]) == []
+
+
+def test_a_removal_leaves_invites_to_other_orgs(api, fleet, outbox):
+    with FleetStore(fleet) as store:
+        store.create_org("agency-y", "Agency Y")
+        yan = store.create_user("yan@example.com")
+        store.add_membership(yan.id, "agency-y", "owner")
+        bo_id = store.get_user_by_email("bo@example.com").id
+    yan = _signed_in(api, outbox, "yan@example.com")
+    _invite(api, yan, org="agency-y", email="bo@example.com", role="member")
+    elsewhere = outbox.secret()
+
+    ana = _signed_in(api, outbox, "ana@example.com")
+    assert api.delete(f"/api/orgs/agency-x/members/{bo_id}", headers=ana).status_code == 200
+
+    body = _redeem(api, outbox, secret=elsewhere)
+    assert (body["purpose"], body["org"]) == ("invite", "agency-y")
+
+
 def test_an_org_keeps_its_last_owner(api, fleet, outbox):
     ana = _signed_in(api, outbox, "ana@example.com")
     ana_id = api.get("/api/me", headers=ana).json()["user"]["id"]
