@@ -1310,6 +1310,14 @@ def serve(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
+    from flotta.backend import UnknownBackendError, default_scheme
+
+    try:
+        default_scheme()
+    except UnknownBackendError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
     import uvicorn
 
     from flotta.control import create_app
@@ -1415,6 +1423,18 @@ def door(
             f"the front door will not start without ${SIGNING_KEY_ENV}.\n"
             f"It is a public entrypoint to every agent in the fleet; there is no "
             f"unauthenticated mode. Generate one with `flotta token key`.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    from flotta.door.app import LOCAL_BOXES_ENV, resolve_local_boxes
+
+    if resolve_local_boxes() and host not in ("127.0.0.1", "localhost", "::1"):
+        typer.secho(
+            f"${LOCAL_BOXES_ENV}=1 routes local:// boxes to this machine's own "
+            f"loopback; a door bound to {host!r} would offer that to anyone who can "
+            f"reach it. Bind 127.0.0.1, or unset it.",
             fg=typer.colors.RED,
             err=True,
         )

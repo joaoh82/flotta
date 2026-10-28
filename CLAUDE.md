@@ -261,8 +261,10 @@ conventions, and the sharp edges below.
   as its volume. The stand-in speaks the handshake and the session methods
   the clients use, **Hermes's two session ids included**, and replies from a
   script, so no model is called. The endpoint is
-  `local://127.0.0.1:<port>/<name>`, the door routes it (`upstream`), and
-  `parse_endpoint` refuses any host but loopback. Every connection the door
+  `local://127.0.0.1:<port>/<name>`, and `parse_endpoint` refuses any host
+  but loopback. **Only a local door routes one** (`$FLOTTA_DOOR_LOCAL=1`, which
+  `flotta door` refuses on a non-loopback bind): on Fly, loopback is the door's
+  own machine. A mistyped `$FLOTTA_BACKEND` stops the control plane starting. Every connection the door
   and the backend make to a box ignores `$http_proxy`, which would otherwise
   carry a loopback request off the machine. Only the login is written to a
   stand-in's disk, never the model key. `just local` runs the whole

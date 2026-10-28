@@ -217,7 +217,12 @@ def test_the_whole_local_path_stays_on_the_machine(local_fleet, offline, caplog)
             token=door_token,
             transport=httpx.ASGITransport(app=control),
         )
-        door = create_door(control=plane, domain="flotta.dev", allowed_origins=frozenset({WEB_APP}))
+        door = create_door(
+            control=plane,
+            domain="flotta.dev",
+            allowed_origins=frozenset({WEB_APP}),
+            local_boxes=True,
+        )
         with _conversation(door, ticket) as ws:
             live = _rpc(ws, 1, "session.create", {})["result"]["session_id"]
             reply, streamed = _turn(ws, 2, live, "hi")

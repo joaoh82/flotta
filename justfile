@@ -458,7 +458,7 @@ local control="8080" door="8081":
     uv run --extra control flotta serve --port {{control}} & CP=$!
     until curl -sf "127.0.0.1:{{control}}/health" >/dev/null; do sleep 0.5; done
     export FLOTTA_CONTROL_TOKEN="$(uv run flotta token mint door --scope fleet:route --days 30 2>/dev/null)"
-    uv run --extra door flotta door --host 127.0.0.1 --port {{door}} & DOOR=$!
+    FLOTTA_DOOR_LOCAL=1 uv run --extra door flotta door --host 127.0.0.1 --port {{door}} & DOOR=$!
     echo "local fleet: control plane http://127.0.0.1:{{control}}, agents at http://<agent>.localhost:{{door}}, state in $DIR"
     wait
 
