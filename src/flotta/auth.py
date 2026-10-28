@@ -102,6 +102,22 @@ separate `box:wake` would be a scope nobody could sensibly withhold.
 to an agent and being able to push to its repositories are different powers,
 and the token a *person* holds to chat should not also be a key to their code.
 The box holds this one; a human normally does not.
+
+## A chat ticket is not a token (M12.5)
+
+A browser opens the conversation's WebSocket to the door itself, and a browser
+cannot set `Authorization` on one. So the web app's server asks the control
+plane for a **ticket** (`mint_ticket`): `box:chat` on one box, for two minutes,
+held in the page's memory for one connection. The door takes it only in
+`Sec-WebSocket-Protocol`, only from an allowed `Origin` (`flotta.door.app`).
+
+It is signed under its own name (`_TICKET_DOMAIN`), so **`verify` refuses
+every ticket and `verify_ticket` refuses every token.** A ticket therefore
+cannot call the fleet API or open the door's `Authorization` and
+`?access_token=` path, where no `Origin` is checked; and a long-lived token
+cannot be passed off as a ticket. A verifier built before tickets existed
+refuses them too, on the signature, rather than reading one as a token that
+reaches every box in its tenant.
 """
 
 from __future__ import annotations
@@ -173,6 +189,21 @@ def scopes_for_role(role: str, *, client: str | None = None) -> frozenset[str]:
         raise AuthError("a client viewer sees one client's agents; name the client")
     return ROLES[role]
 
+
+#: A chat ticket's lifetime. It only has to last from the web app's server
+#: minting it to the browser opening the socket; the conversation outlives it.
+TICKET_TTL_S = 120
+#: The longest ticket `mint_ticket` will make. "Minutes", never a session.
+TICKET_MAX_TTL_S = 600
+#: Greppable like a token, and distinct, so a leaked one says what it is.
+TICKET_PREFIX = "flotta_ticket_"
+#: Signed into every ticket, and into no token: see "A chat ticket is not a token".
+_TICKET_DOMAIN = "flotta-chat-ticket:"
+#: The subprotocol a browser offers beside its ticket, and the only one the
+#: door answers with. Here because the control plane and the door both name it.
+CHAT_PROTOCOL = "flotta.chat.v1"
+#: The subprotocol that carries a ticket: this, then the ticket.
+TICKET_PROTOCOL_PREFIX = "flotta.ticket."
 
 #: A default that is short because revocation is coarse. Long-lived tokens are
 #: an explicit `--expires` away.
@@ -277,6 +308,9 @@ class Token:
     #: its org. A box's token and a client viewer's carry one; an agency
     #: member's does not.
     client: str | None = None
+    #: The one box this token may address, or `None`. Only a chat ticket
+    #: carries one.
+    box: str | None = None
 
     def allows(self, scope: str) -> bool:
         return scope in self.scopes
@@ -300,7 +334,7 @@ def admits(
     Three rules, all of which must hold:
 
     - a `box:` subject addresses its own box and no other — it lives on a
-      machine whose agent has root;
+      machine whose agent has root — and a chat ticket the one box it names;
     - the token's org is the box's org, an absent claim meaning the default
       org (see `DEFAULT_ORG`);
     - a token confined to a client reaches only that client's boxes.
@@ -313,6 +347,8 @@ def admits(
     claimed = subject_box(token.subject)
     if claimed is not None and claimed not in {box_id, box_name}:
         return f"token for box {claimed!r} cannot address another box"
+    if token.box is not None and token.box != box_id:
+        return f"ticket for box {token.box!r} cannot address another box"
     return admits_tenant(token, org=org, client=client)
 
 
@@ -476,14 +512,85 @@ def mint(
         claims["org"] = org.strip()
     if client is not None:
         claims["client"] = client.strip()
-    payload = _b64(
-        json.dumps(
-            claims,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-    )
+    payload = _encode(claims)
     return f"{TOKEN_PREFIX}{payload}.{_sign(payload, signing_key)}"
+
+
+def mint_ticket(
+    *,
+    subject: str,
+    box_id: str,
+    org: str,
+    client: str,
+    ttl_s: int = TICKET_TTL_S,
+    key: str | None = None,
+    env: dict[str, str] | None = None,
+    now: int | None = None,
+) -> str:
+    """A chat ticket: `box:chat` on `box_id` alone, for minutes (M12.5).
+
+    `org` and `client` are the box's own, so the door's tenant checks hold for
+    it exactly as for a token. `subject` is whoever asked, for the door's log;
+    it grants nothing, which is why a person's `user:` subject is allowed here
+    when `mint` refuses it.
+    """
+    signing_key = _require_key(key, env)
+    if not 0 < ttl_s <= TICKET_MAX_TTL_S:
+        raise AuthError(f"a ticket lasts minutes: 1 to {TICKET_MAX_TTL_S} seconds")
+    for claim, value in (("box", box_id), ("org", org), ("client", client)):
+        if not value or not value.strip():
+            raise AuthError(f"a ticket names its box's {claim}")
+    issued = int(time.time()) if now is None else now
+    payload = _encode(
+        {
+            "v": 1,
+            "sub": subject,
+            "scopes": [SCOPE_BOX_CHAT],
+            "box": box_id.strip(),
+            "org": org.strip(),
+            "client": client.strip(),
+            "iat": issued,
+            "exp": issued + ttl_s,
+        }
+    )
+    return f"{TICKET_PREFIX}{payload}.{_sign(_TICKET_DOMAIN + payload, signing_key)}"
+
+
+def verify_ticket(
+    ticket: str,
+    *,
+    key: str | None = None,
+    env: dict[str, str] | None = None,
+    now: int | None = None,
+) -> Token:
+    """A chat ticket's claims, or `AuthError`. Refuses every token.
+
+    What comes back always names one box, and holds `box:chat` and nothing
+    else, whatever the payload says: a ticket is never more than that.
+    """
+    signing_key = _require_key(key, env)
+    if not ticket or not ticket.startswith(TICKET_PREFIX):
+        raise AuthError("not a chat ticket")
+    claims = _open(ticket[len(TICKET_PREFIX) :], signing_key, now=now, domain=_TICKET_DOMAIN)
+    box = claims.get("box")
+    if not isinstance(box, str) or not box.strip():
+        raise AuthError("malformed ticket: it names no box")
+    token = _token_from(claims)
+    if not token.allows(SCOPE_BOX_CHAT):
+        raise AuthError("malformed ticket: it does not open a conversation")
+    return Token(
+        subject=token.subject,
+        scopes=frozenset({SCOPE_BOX_CHAT}),
+        issued_at=token.issued_at,
+        expires_at=token.expires_at,
+        org=token.org,
+        client=token.client,
+        box=box,
+    )
+
+
+def _encode(claims: dict[str, Any]) -> str:
+    return _b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
 
 
 def verify(
@@ -500,16 +607,29 @@ def verify(
     checking the clock first would be checking a number they chose.
     """
     signing_key = _require_key(key, env)
+    if token and token.startswith(TICKET_PREFIX):
+        raise AuthError(
+            "a chat ticket opens one conversation through the door, from a browser; "
+            "it is not a token"
+        )
     if not token or not token.startswith(TOKEN_PREFIX):
         raise AuthError("not a Flotta token")
-    body = token[len(TOKEN_PREFIX) :]
+    return _token_from(_open(token[len(TOKEN_PREFIX) :], signing_key, now=now))
+
+
+def _open(body: str, signing_key: str, *, now: int | None, domain: str = "") -> dict[str, Any]:
+    """The claims of a signed `<payload>.<signature>`, checked and unexpired.
+
+    `domain` is what was signed ahead of the payload: nothing for a token,
+    `_TICKET_DOMAIN` for a ticket, so neither verifies as the other.
+    """
     payload, _, signature = body.partition(".")
     if not payload or not signature:
         raise AuthError("malformed token: expected <payload>.<signature>")
 
     # compare_digest, not `==`: a plain comparison leaks how many leading bytes
     # matched through timing, which is enough to forge a signature byte by byte.
-    if not hmac.compare_digest(_sign(payload, signing_key), signature):
+    if not hmac.compare_digest(_sign(domain + payload, signing_key), signature):
         raise AuthError("bad signature: this token was not signed by the current key")
 
     try:
@@ -525,7 +645,10 @@ def verify(
     current = int(time.time()) if now is None else now
     if current >= expires:
         raise AuthError("token expired")
+    return claims
 
+
+def _token_from(claims: dict[str, Any]) -> Token:
     raw_scopes = claims.get("scopes")
     if not isinstance(raw_scopes, list):
         raise AuthError("malformed token: no scopes")
@@ -552,7 +675,7 @@ def verify(
         # as granting it.
         scopes=frozenset(str(s) for s in raw_scopes) & SCOPES,
         issued_at=int(claims.get("iat") or 0),
-        expires_at=expires,
+        expires_at=claims["exp"],
         org=tenancy["org"],
         client=tenancy["client"],
     )

@@ -43,6 +43,7 @@ from typing import Any
 from flotta import db
 from flotta.address import parse as parse_address
 from flotta.auth import (
+    CHAT_PROTOCOL,
     DEFAULT_CLIENT,
     DEFAULT_ORG,
     SCOPE_AUTH_RELAY,
@@ -55,11 +56,15 @@ from flotta.auth import (
     SCOPE_GIT_CREDENTIAL,
     SCOPE_ORG_ADMIN,
     SIGNING_KEY_ENV,
+    TICKET_PROTOCOL_PREFIX,
+    TICKET_TTL_S,
     USER_SUBJECT_PREFIX,
     AuthError,
     Token,
+    admits,
     admits_tenant,
     mint,
+    mint_ticket,
     person_token,
     resolve_signing_key,
     scopes_for_role,
@@ -589,6 +594,7 @@ def create_app(
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
     needs_peer = Depends(require(SCOPE_BOX_PEER))
     needs_admin = Depends(require(SCOPE_ORG_ADMIN))
+    needs_chat = Depends(require(SCOPE_BOX_CHAT))
     # Any valid credential at all: for the routes about the caller themselves.
     needs_anyone = Depends(require())
     # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
@@ -3017,6 +3023,54 @@ def create_app(
             return {"box": _box_dict(_routable_box(store, token, box.id)), **result}
         finally:
             store.close()
+
+    @app.post("/api/boxes/{box_id}/ticket")
+    def chat_ticket(box_id: str, token: Token | None = needs_chat) -> Any:
+        """A chat ticket for this one agent, for a browser to open it with (M12.5).
+
+        For the web app's server, which holds the person's session and hands
+        the ticket to the page for one connection: `box:chat` on this box and
+        nothing else, for `TICKET_TTL_S`. The door takes it in
+        `Sec-WebSocket-Protocol` from an allowed `Origin` (`flotta.door.app`);
+        `protocols` is what the page offers and `url` where.
+
+        Scoped like every box route, and by `admits` as well, so a box's own
+        token cannot get a ticket for a colleague. Nothing is woken: the door
+        does that when the socket opens, which may be never.
+        """
+        if key is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"no {SIGNING_KEY_ENV}: a ticket is signed, and the door checks it",
+            )
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            if token is not None and admits(
+                token, box_id=box.id, box_name=box.name, org=box.org, client=box.client
+            ):
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
+            if is_terminal("box", box.status):
+                raise HTTPException(status_code=409, detail=f"box {box.name!r} is {box.status}")
+        finally:
+            store.close()
+        ticket = mint_ticket(
+            subject=token.subject if token is not None else "operator",
+            box_id=box.id,
+            org=box.org,
+            client=box.client,
+            key=key,
+        )
+        from flotta.client import DEFAULT_DOMAIN, DOMAIN_ENV
+
+        domain = (os.environ.get(DOMAIN_ENV) or DEFAULT_DOMAIN).strip().strip(".")
+        return {
+            "ticket": ticket,
+            "ttl_s": TICKET_TTL_S,
+            "box": {"id": box.id, "name": box.name},
+            "url": f"wss://{box.name}.{domain}/api/ws",
+            "protocols": [CHAT_PROTOCOL, f"{TICKET_PROTOCOL_PREFIX}{ticket}"],
+        }
 
     @app.delete("/api/boxes/{box_id}")
     def destroy_box(box_id: str, token: Token | None = needs_destroy) -> Any:

@@ -642,6 +642,23 @@ Both answers are final. An org you make yourself (`just org-create`) is active
 from the start. Invites go out through the same Resend key as sign-in links;
 without one the control plane refuses to send them (`503`) rather than pretend.
 
+### Conversations in the browser (M12.5)
+
+The web app's server asks `POST /api/boxes/{id}/ticket` with the person's
+session and hands the page what comes back; the page opens the door's socket
+with it. The door takes a ticket only from an origin you name, so set the web
+app's on the door and redeploy it:
+
+```bash
+# in .env: FLOTTA_DOOR_ORIGINS=https://app.flotta.dev
+just door-secrets
+flyctl secrets deploy --app "${FLOTTA_DOOR_APP:-flotta-door}"
+```
+
+Unset, the door refuses every ticket (`4403`), and nothing else changes:
+`flotta chat` still goes through with its token. A ticket is good for two
+minutes, for one agent, and for nothing but that agent's conversation.
+
 ---
 
 ## What is not automated yet

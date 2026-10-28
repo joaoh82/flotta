@@ -240,6 +240,20 @@ conventions, and the sharp edges below.
   spare one undoes the removal), and refuses an org's last owner. Redeem answers
   with `purpose` (`sign_in` | `invite` | `sign_up`), and `/api/me` with
   `org_status`.
+- **A browser opens a conversation with a chat ticket (M12.5).**
+  `POST /api/boxes/{id}/ticket` (`box:chat`, scoped, and `admits`, so a box's
+  token gets none for a colleague) answers `{ticket, ttl_s, url, protocols}`:
+  `box:chat` on that box only, for `TICKET_TTL_S` (120 s), nothing woken. The
+  page opens `new WebSocket(url, protocols)`, i.e. `flotta.chat.v1` plus
+  `flotta.ticket.<ticket>`, and the door (`admit_ticket`) takes a ticket there
+  and nowhere else: only from an `Origin` in `$FLOTTA_DOOR_ORIGINS` (unset means
+  no browser), only for `/api/ws`, only to the box it names; it answers
+  `flotta.chat.v1` alone, then does Hermes's login and Hermes's own ticket on the
+  server side (`hermes_ticket`), because a browser can do neither. **A ticket is
+  signed under its own name** (`_TICKET_DOMAIN`), so `verify` refuses every
+  ticket and `verify_ticket` every token: a ticket cannot call the fleet API or
+  ride the door's `Authorization`/`?access_token=` path, where no origin is
+  checked, and a door built before tickets refuses them on the signature.
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

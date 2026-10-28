@@ -52,6 +52,29 @@ A browser cannot set headers on a WebSocket handshake. So the door accepts
 cost: query strings land in logs and proxy access records in a way headers do
 not. It is accepted **only** for the WS path, never for plain HTTP, where an
 `Authorization` header is always available and there is no excuse.
+
+## A browser comes with a ticket (M12.5)
+
+The web app's conversation is the one connection a browser opens itself, and
+it does not hold a token: the web app's server asks the control plane for a
+**chat ticket** (`flotta.auth.mint_ticket`) — one box, `box:chat`, two minutes
+— and the page opens
+
+    new WebSocket("wss://<box>.flotta.dev/api/ws",
+                  ["flotta.chat.v1", "flotta.ticket.<ticket>"])
+
+A subprotocol rather than the query string, so the ticket is not in a URL. The
+door takes a ticket there and nowhere else, and only:
+
+- from an `Origin` in `$FLOTTA_DOOR_ORIGINS` (none by default, so no browser
+  gets in until the operator names the web app);
+- for the agent socket (`/api/ws`), not anything else the box serves;
+- for the box it names (`admits`), checked before the box is woken.
+
+It answers with `flotta.chat.v1` alone: the protocol carrying the ticket is a
+credential and is never echoed. A browser can do none of Hermes's handshake
+(a login form, then Hermes's own ticket), so for a ticket the door does both
+on the server side (`hermes_ticket`), with the credentials it already holds.
 """
 
 from __future__ import annotations
@@ -72,14 +95,17 @@ from fastapi.responses import JSONResponse, Response
 
 from flotta.address import parse as parse_address
 from flotta.auth import (
+    CHAT_PROTOCOL,
     DEFAULT_CLIENT,
     DEFAULT_ORG,
     SCOPE_BOX_CHAT,
+    TICKET_PROTOCOL_PREFIX,
     AuthError,
     Token,
     admits,
     admits_tenant,
     verify,
+    verify_ticket,
 )
 
 # Imported at module level, not lazily inside `create_door`, and the reason is
@@ -100,6 +126,14 @@ CONTROL_TOKEN_ENV = "FLOTTA_CONTROL_TOKEN"
 BOX_PASSWORD_ENV = "FLOTTA_BOX_PASSWORD"
 BOX_USERNAME_ENV = "FLOTTA_BOX_USERNAME"
 DOMAIN_ENV = "FLOTTA_DOMAIN"
+#: The browser origins a chat ticket is accepted from, comma-separated: the web
+#: app's, e.g. `https://app.flotta.dev`. Unset, no browser gets in.
+ALLOWED_ORIGINS_ENV = "FLOTTA_DOOR_ORIGINS"
+
+#: The one path a ticket opens: Hermes's agent socket.
+AGENT_SOCKET_PATH = "api/ws"
+#: Hermes's own handshake, which the door does for a browser.
+HERMES_TICKET_PATH = "/api/auth/ws-ticket"
 
 DEFAULT_DOMAIN = "flotta.dev"
 DEFAULT_BOX_PORT = 9119
@@ -213,6 +247,54 @@ def authorize(
             f"token for {token.subject!r} lacks scope: {SCOPE_BOX_CHAT}", status=403
         )
     return token
+
+
+def resolve_allowed_origins(env: dict[str, str] | None = None) -> frozenset[str]:
+    """`$FLOTTA_DOOR_ORIGINS`, as origins to compare exactly."""
+    env = os.environ if env is None else env
+    raw = env.get(ALLOWED_ORIGINS_ENV) or ""
+    return frozenset(o for o in (_origin(part) for part in raw.split(",")) if o)
+
+
+def _origin(value: str | None) -> str:
+    """An origin as a browser sends one: lowercase, no trailing slash."""
+    return (value or "").strip().rstrip("/").lower()
+
+
+def offers_ticket(protocols: list[str]) -> bool:
+    """Whether a handshake came with a ticket, rightly or not."""
+    return any(p.startswith(TICKET_PROTOCOL_PREFIX) for p in protocols)
+
+
+def admit_ticket(
+    *,
+    protocols: list[str],
+    origin: str | None,
+    path: str,
+    allowed_origins: frozenset[str],
+    key: str | None,
+) -> Token:
+    """The ticket a browser's handshake carries, if the door takes it here.
+
+    The origin first, so a page the operator never named learns nothing about
+    the ticket it holds; then the path, then the ticket itself. The box it
+    names is `_target`'s to check, against the hostname's.
+    """
+    if _origin(origin) not in allowed_origins:
+        raise BoxUnavailable(
+            f"origin {origin or '(none)'!r} may not open a conversation", status=403
+        )
+    if path != AGENT_SOCKET_PATH:
+        raise BoxUnavailable("a ticket opens the agent's conversation and nothing else", status=404)
+    tickets = [
+        p[len(TICKET_PROTOCOL_PREFIX) :] for p in protocols if p.startswith(TICKET_PROTOCOL_PREFIX)
+    ]
+    if CHAT_PROTOCOL not in protocols or len(tickets) != 1:
+        raise BoxUnavailable(f"offer {CHAT_PROTOCOL} and exactly one ticket", status=400)
+    try:
+        return verify_ticket(tickets[0], key=key)
+    except AuthError as exc:
+        raise BoxUnavailable(str(exc), status=401) from exc
 
 
 # -- talking to the control plane ------------------------------------------
@@ -402,6 +484,35 @@ async def wait_until_ready(
     )
 
 
+async def hermes_ticket(base_url: str, credentials: tuple[str, str]) -> str:
+    """Hermes's own one-use socket ticket, got the way `flotta chat` gets one.
+
+    Its login form answers with session cookies, and those mint the ticket. A
+    browser cannot do this through the door without the door's credentials, so
+    the door does it, here, and the browser only ever opens the socket. The
+    cookies are passed by hand rather than kept in a jar: a jar's policy is
+    what dropped them once before (`flotta.client.new_session`).
+    """
+    username, password = credentials
+    async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
+        login = await client.post(
+            LOGIN_PATH,
+            json={"provider": "basic", "username": username, "password": password, "next": ""},
+        )
+        if login.status_code != 200:
+            raise BoxUnavailable(
+                f"the box refused the door's credentials ({login.status_code})", status=502
+            )
+        cookie = "; ".join(f"{k}={v}" for k, v in login.cookies.items())
+        minted = await client.post(HERMES_TICKET_PATH, headers={"cookie": cookie})
+    ticket = minted.json().get("ticket") if minted.status_code == 200 else None
+    if not ticket:
+        raise BoxUnavailable(
+            f"the box would not issue a socket ticket ({minted.status_code})", status=502
+        )
+    return str(ticket)
+
+
 # -- the app ----------------------------------------------------------------
 
 
@@ -429,6 +540,7 @@ def create_door(
     domain: str | None = None,
     box_credentials: tuple[str, str] | None = None,
     ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
+    allowed_origins: frozenset[str] | None = None,
 ) -> Any:
     """Build the front-door ASGI app.
 
@@ -445,6 +557,7 @@ def create_door(
         token=os.environ.get(CONTROL_TOKEN_ENV) or None,
     )
     creds = box_credentials if box_credentials is not None else resolve_box_credentials()
+    origins = allowed_origins if allowed_origins is not None else resolve_allowed_origins()
 
     app = FastAPI(title="Flotta front door")
 
@@ -569,25 +682,45 @@ def create_door(
         it.
 
         The token may arrive in the query string here, and only here — a
-        browser cannot set headers on a WS handshake. See `authorize`.
+        browser cannot set headers on a WS handshake. See `authorize`. A
+        browser's ticket arrives as a subprotocol instead (`admit_ticket`).
         """
+        protocols = list(websocket.scope.get("subprotocols") or [])
+        ticketed = offers_ticket(protocols)
+        # Only ever the public protocol, and only to a client that offered it:
+        # a browser that offered subprotocols fails a handshake answering none.
+        answer = CHAT_PROTOCOL if CHAT_PROTOCOL in protocols else None
         try:
-            token = authorize(
-                header=websocket.headers.get("authorization"),
-                query_token=websocket.query_params.get("access_token"),
-                key=key,
-                allow_query=True,
-            )
+            if ticketed:
+                token = admit_ticket(
+                    protocols=protocols,
+                    origin=websocket.headers.get("origin"),
+                    path=path,
+                    allowed_origins=origins,
+                    key=key,
+                )
+            else:
+                token = authorize(
+                    header=websocket.headers.get("authorization"),
+                    query_token=websocket.query_params.get("access_token"),
+                    key=key,
+                    allow_query=True,
+                )
             target = await _target(token, websocket.headers.get("host"))
+            upstream_ticket = None
+            if ticketed and creds:
+                upstream_ticket = await hermes_ticket(
+                    f"http://{authority(target.host, target.port)}", creds
+                )
         except BoxUnavailable as exc:
             # The handshake has to be accepted before a close code carries a
             # reason a client can read; rejecting outright gives the browser an
             # opaque failure. Accept, say why, close.
-            await websocket.accept()
+            await websocket.accept(subprotocol=answer)
             await websocket.close(code=4000 + min(exc.status, 999), reason=str(exc)[:120])
             return
 
-        await websocket.accept()
+        await websocket.accept(subprotocol=answer)
 
         async def keep_awake() -> None:
             """Hold the box awake for as long as someone is talking to it.
@@ -607,7 +740,11 @@ def create_door(
         # query carries `access_token`, and the box must not receive it.
         from urllib.parse import urlencode
 
-        query = urlencode(strip_door_params(websocket.query_params))
+        pairs = strip_door_params(websocket.query_params)
+        if upstream_ticket is not None:
+            # Hermes's ticket, not anything the browser put in the URL.
+            pairs = [(k, v) for k, v in pairs if k != "ticket"] + [("ticket", upstream_ticket)]
+        query = urlencode(pairs)
         upstream_url = f"ws://{authority(target.host, target.port)}/{path}" + (
             f"?{query}" if query else ""
         )
@@ -654,6 +791,7 @@ def create_door(
 
     app.state.plane = plane
     app.state.signing_key = key
+    app.state.allowed_origins = origins
     return app
 
 

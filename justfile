@@ -99,9 +99,14 @@ door-secrets: fly-whoami
       printf 'FLOTTA_CONTROL_TOKEN=%s\n' "$TOKEN"
       printf 'FLOTTA_DOMAIN=%s\n' "$DOMAIN"
       printf 'FLOTTA_BOX_PASSWORD=%s\n' "$FLOTTA_BOX_PASSWORD"
+      # M12.5: the web app's origin, for a browser's chat ticket. Optional, and
+      # not a secret; unset here leaves whatever the door already has.
+      if [ -n "${FLOTTA_DOOR_ORIGINS:-}" ]; then
+        printf 'FLOTTA_DOOR_ORIGINS=%s\n' "$FLOTTA_DOOR_ORIGINS"
+      fi
     } | flyctl secrets import --stage --app "$APP"
 
-    echo "staged 5 secrets on $APP (values not echoed); door token expires $(date -d "+$DAYS days" +%F 2>/dev/null || date -v+"$DAYS"d +%F)"
+    echo "staged secrets on $APP (values not echoed); door token expires $(date -d "+$DAYS days" +%F 2>/dev/null || date -v+"$DAYS"d +%F)"
     echo "now run: just door-deploy  (or, for a running door: flyctl secrets deploy --app $APP)"
 
 # Prints the exact Cloudflare records to add. Run after `just door-deploy`,
