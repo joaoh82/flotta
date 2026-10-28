@@ -68,12 +68,14 @@ OPERATOR_ROUTES = frozenset(
         "update_hermes",
         "create_org",
         "add_user",
+        "approve_org",
+        "decline_org",
     }
 )
 
 #: Routes with no principal at all, on purpose. They may not reach a box.
-#: The two sign-in routes are how a person without a credential gets one.
-OPEN_ROUTES = frozenset({"health", "request_link", "redeem_link"})
+#: The sign-in and sign-up routes are how a person without a credential gets one.
+OPEN_ROUTES = frozenset({"health", "request_link", "redeem_link", "sign_up"})
 
 #: The routes not yet scoped. May only shrink — and is empty since M11.6b.
 UNSCOPED_ROUTES: frozenset[str] = frozenset()

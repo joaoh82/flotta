@@ -169,8 +169,8 @@ def test_a_disabled_accounts_session_is_refused_even_if_its_row_survived(api, fl
 
 
 def test_losing_the_membership_ends_the_session(api, fleet):
-    """There is no `remove_membership` yet (M12.4's invites bring one); the row
-    going is what matters, however it goes."""
+    """The re-read, not `remove_membership`, which deletes the sessions too:
+    the row going is what matters, however it goes."""
     user_id, session = _person(fleet, "ana@example.com", "agency-x", "owner")
     with FleetStore(fleet) as store:
         store._conn.execute("DELETE FROM memberships WHERE user_id = ?", (user_id,))

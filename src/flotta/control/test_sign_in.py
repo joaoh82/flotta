@@ -401,15 +401,6 @@ def test_a_link_for_an_account_disabled_since_gives_no_session(api, fleet, outbo
     assert api.post("/api/auth/redeem", json={"secret": outbox.secret()}).status_code == 401
 
 
-def test_an_invite_is_not_a_sign_in(api, fleet):
-    """Invites are M12.4's; until then one is refused rather than half-honoured."""
-    with FleetStore(fleet) as store:
-        secret = store.create_login_link(
-            "ana@example.com", purpose="invite", org_id="agency-x", role="member"
-        )
-    assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 401
-
-
 def test_redeeming_signs_in_to_the_first_org_by_default_or_the_one_named(api, fleet, outbox):
     with FleetStore(fleet) as store:
         store.create_client("default", "acme", "Acme")

@@ -85,10 +85,16 @@ from flotta.relay import (
     envelope,
 )
 from flotta.store import (
+    INVITE_TTL_S,
     LINK_TTL_S,
     DuplicateMembershipError,
+    DuplicateTenantError,
     FleetStore,
     InvalidAccountError,
+    InvalidTenantError,
+    InvalidTransitionError,
+    LastOwnerError,
+    OrgNotActiveError,
     UnknownEntityError,
     is_terminal,
     normalize_email,
@@ -154,6 +160,11 @@ LINK_LIMIT_PER_ADDRESS = 5
 #: applies to that; anyone else is limited by the address they connect from.
 LINK_LIMIT_PER_IP = 30
 LINK_LIMIT_WINDOW_S = LINK_TTL_S
+#: Invites one org may send per window. A pending org is a stranger who signed
+#: up, and an invite carries the org's own name to any address it is given, so
+#: a pending org sends enough to bring in a small team and no more.
+INVITE_LIMIT_PER_ORG = 20
+INVITE_LIMIT_PER_PENDING_ORG = 3
 #: The browser behind a sign-in request, as the web app's server says. Only
 #: believed on the operator's token holding `auth:relay`: from anyone else it
 #: would be a way to pick a fresh bucket for every request.
@@ -413,7 +424,14 @@ def create_app(
     """
     from fastapi import Depends, FastAPI, Header, HTTPException
 
-    from flotta.mail import resolve_app_url, resolve_mailer, sign_in_message, sign_in_url
+    from flotta.mail import (
+        invite_message,
+        resolve_app_url,
+        resolve_mailer,
+        sign_in_message,
+        sign_in_url,
+        sign_up_message,
+    )
 
     resolved_interval = interval_s
     if resolved_interval is None:
@@ -442,6 +460,8 @@ def create_app(
     link_base = app_url if app_url is not None else resolve_app_url()
     per_address = RateLimit(LINK_LIMIT_PER_ADDRESS, LINK_LIMIT_WINDOW_S)
     per_ip = RateLimit(LINK_LIMIT_PER_IP, LINK_LIMIT_WINDOW_S)
+    invites_per_org = RateLimit(INVITE_LIMIT_PER_ORG, LINK_LIMIT_WINDOW_S)
+    invites_per_pending_org = RateLimit(INVITE_LIMIT_PER_PENDING_ORG, LINK_LIMIT_WINDOW_S)
     proxy_hops = (
         trusted_proxy_hops if trusted_proxy_hops is not None else resolve_trusted_proxy_hops()
     )
@@ -742,14 +762,17 @@ def create_app(
         return org
 
     @app.get("/api/orgs")
-    def list_orgs(token: Token | None = needs_read) -> Any:
-        """Every org, for the operator; for anyone else, their own."""
+    def list_orgs(status: str | None = None, token: Token | None = needs_read) -> Any:
+        """Every org, for the operator; for anyone else, their own.
+
+        `?status=pending` is the operator's queue of sign-ups to decide.
+        """
         from dataclasses import asdict
 
         store = store_factory()
         try:
             if _is_operator(token):
-                orgs = store.list_orgs()
+                orgs = store.list_orgs(status=status)
             else:
                 assert token is not None
                 own = store.get_org(token.org or DEFAULT_ORG)
@@ -780,6 +803,136 @@ def create_app(
         finally:
             store.close()
         return {"org": asdict(org)}
+
+    @app.post("/api/orgs/{org_id}/approve")
+    def approve_org(org_id: str, token: Token | None = needs_admin) -> Any:
+        """Let a signed-up org create agents. The operator's alone, and final."""
+        _require_operator(token, "approve an org")
+        return _decide(org_id, approve=True)
+
+    @app.post("/api/orgs/{org_id}/decline")
+    def decline_org(org_id: str, token: Token | None = needs_admin) -> Any:
+        """Refuse a signed-up org. It keeps its sign-in and creates nothing, ever."""
+        _require_operator(token, "decline an org")
+        return _decide(org_id, approve=False)
+
+    def _decide(org_id: str, *, approve: bool) -> Any:
+        from dataclasses import asdict
+
+        store = store_factory()
+        try:
+            org = store.decide_org(org_id, approve=approve)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {"org": asdict(org)}
+
+    @app.get("/api/orgs/{org_id}/members")
+    def list_members(org_id: str, token: Token | None = needs_admin) -> Any:
+        """Who is in an org, as what: the team page."""
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            members = []
+            for m in store.members_of(org_id):
+                user = store.get_user(m.user_id)
+                assert user is not None
+                members.append(
+                    {
+                        "user": {"id": user.id, "email": user.email, "name": user.name},
+                        "role": m.role,
+                        "client": m.client,
+                        "since": m.created_at,
+                    }
+                )
+        finally:
+            store.close()
+        return {"org": org_id, "members": members}
+
+    @app.delete("/api/orgs/{org_id}/members/{user_id}")
+    def remove_member(org_id: str, user_id: str, token: Token | None = needs_admin) -> Any:
+        """Take someone out of an org. Their sessions there end with it.
+
+        Not its last owner: an org nobody can administer is one only the
+        operator can fix.
+        """
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            removed = store.remove_membership(user_id, org_id)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except LastOwnerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {"removed": {"user": removed.user_id, "org": org_id, "role": removed.role}}
+
+    @app.post("/api/orgs/{org_id}/invites", status_code=202)
+    def invite(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Email someone a link that joins `org_id`: `{"email", "role", "client"?}`.
+
+        A pending org may invite (its team should be there when it is
+        approved), a few at a time; a declined one may not. Sent before the
+        answer, unlike a sign-in link: the person inviting is told if it did
+        not go, rather than waiting on an email that never comes.
+        """
+        _admin_of(token, org_id)
+        if deliver_link is None:
+            raise HTTPException(
+                status_code=503,
+                detail="this control plane cannot send email; set $FLOTTA_RESEND_API_KEY",
+            )
+        try:
+            email = normalize_email(str(body.get("email") or ""))
+        except InvalidAccountError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        role = str(body.get("role") or "")
+        client = body.get("client")
+        client = str(client).strip() if client is not None else None
+        store = store_factory()
+        try:
+            org = _org_or_404(store, org_id)
+            invitee = store.get_user_by_email(email)
+            if invitee is not None and store.membership(invitee.id, org_id) is not None:
+                raise HTTPException(status_code=409, detail=f"{email} is already in {org_id!r}")
+            org_limit = invites_per_pending_org if org.status == "pending" else invites_per_org
+            if not hit_all((per_address, email), (org_limit, org_id)):
+                raise HTTPException(
+                    status_code=429,
+                    detail="too many invites sent; wait, then send again",
+                    headers={"Retry-After": str(int(LINK_LIMIT_WINDOW_S))},
+                )
+            try:
+                secret = store.create_login_link(
+                    email,
+                    purpose="invite",
+                    org_id=org_id,
+                    client_id=client,
+                    role=role,
+                    ttl_s=INVITE_TTL_S,
+                )
+            except InvalidAccountError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except OrgNotActiveError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+        finally:
+            store.close()
+        try:
+            deliver_link(invite_message(email, sign_in_url(link_base, secret), org.name, role))
+        except Exception as exc:  # noqa: BLE001 - said to the inviter, not swallowed
+            _log.exception("could not deliver an invite to %s", email)
+            raise HTTPException(
+                status_code=502, detail=f"the invite to {email} could not be sent; try again"
+            ) from exc
+        return {"invited": email, "org": org_id, "role": role, "client": client}
 
     @app.get("/api/orgs/{org_id}/clients")
     def list_org_clients(org_id: str, token: Token | None = needs_read) -> Any:
@@ -908,11 +1061,19 @@ def create_app(
         """
         if token is None:
             return {"authenticated": False, "operator": True, "user": None, "session": None}
+        status_store = store_factory()
+        try:
+            acting = status_store.get_org(token.org or DEFAULT_ORG)
+        finally:
+            status_store.close()
         payload: dict[str, Any] = {
             "authenticated": True,
             "operator": _is_operator(token),
             "subject": token.subject,
             "org": token.org or DEFAULT_ORG,
+            # `pending` until the operator approves a sign-up: the web app's
+            # "waiting for approval", and why creating an agent is refused.
+            "org_status": acting.status if acting else None,
             "client": token.client,
             "scopes": sorted(token.scopes),
             "expires_at": token.expires_at,
@@ -1028,6 +1189,79 @@ def create_app(
         tasks.add_task(_send_link, email)
         return {"sent": True}
 
+    @app.post("/api/auth/sign-up", status_code=202)
+    def sign_up(
+        body: dict[str, Any],
+        request: Request,
+        tasks: BackgroundTasks,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
+        """Email a link that creates an agency: `{"email", "org", "org_name"}`.
+
+        The org is made when the link is redeemed, which proves the address,
+        and made `pending`: it can sign in and invite its team, and creates no
+        agent until the operator approves it.
+
+        Like asking for a sign-in link, always `202` and the same limits, so
+        it says nothing about who has an account; someone who already belongs
+        to an org gets a sign-in link instead. What it does say is whether the
+        org id is free, which is no secret: org ids are in agents' hostnames.
+        """
+        try:
+            email = normalize_email(str(body.get("email") or ""))
+        except InvalidAccountError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        from flotta.store import _tenant_name, validate_tenant_id
+
+        try:
+            org_id = validate_tenant_id(str(body.get("org") or ""), kind="org")
+            org_name = _tenant_name(str(body.get("org_name") or ""), kind="org")
+        except InvalidTenantError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            if store.get_org(org_id) is not None:
+                raise HTTPException(status_code=409, detail=f"an org {org_id!r} already exists")
+        finally:
+            store.close()
+        caller = _link_caller(request, authorization)
+        if not hit_all((per_address, email), (per_ip, caller)):
+            raise HTTPException(
+                status_code=429,
+                detail="too many sign-in links asked for; wait, then ask again",
+                headers={"Retry-After": str(int(LINK_LIMIT_WINDOW_S))},
+            )
+        tasks.add_task(_send_sign_up, email, org_id, org_name)
+        return {"sent": True}
+
+    def _send_sign_up(email: str, org_id: str, org_name: str) -> None:
+        """A sign-up link, or a sign-in link for someone who has an org already."""
+        if deliver_link is None:
+            return
+        store = store_factory()
+        try:
+            user = store.get_user_by_email(email)
+            if user is not None and user.disabled_at is not None:
+                return
+            if user is not None and store.memberships_for(user.id):
+                message = sign_in_message(
+                    user.email, sign_in_url(link_base, store.create_login_link(user.email))
+                )
+            else:
+                try:
+                    secret = store.create_login_link(
+                        email, purpose="sign_up", org_id=org_id, org_name=org_name
+                    )
+                except DuplicateTenantError:
+                    return  # taken since the 202; the redeem would refuse it anyway
+                message = sign_up_message(email, sign_in_url(link_base, secret))
+        finally:
+            store.close()
+        try:
+            deliver_link(message)
+        except Exception:  # noqa: BLE001 - the caller already has its 202
+            _log.exception("could not deliver a sign-up link to %s", email)
+
     def _link_caller(request: Request, authorization: str | None) -> str:
         """Whom the per-caller limit counts: the browser the web app names, or the peer."""
         vouched = request.headers.get(CALLER_IP_HEADER)
@@ -1059,7 +1293,7 @@ def create_app(
             user = store.get_user_by_email(email)
             if user is None or user.disabled_at is not None:
                 return
-            # No membership, no session to sign in to (sign-up is M12.4's).
+            # No membership, no session to sign in to: that is a sign-up.
             if not store.memberships_for(user.id):
                 return
             secret = store.create_login_link(user.email)
@@ -1072,11 +1306,13 @@ def create_app(
 
     @app.post("/api/auth/redeem")
     def redeem_link(body: dict[str, Any]) -> Any:
-        """Trade a link's secret for a session: once, within fifteen minutes.
+        """Trade a link's secret for a session: once, within its lifetime.
 
-        In the person's first org, or in `org` if they name one of theirs.
-        Every reason a link opens nothing is the same 401, so a guess and a
-        stale link look alike.
+        A sign-in link signs in to the person's first org, or `org` if they
+        name one of theirs. An invite joins its org and signs in there; a
+        sign-up creates its org, `pending`, and signs in there. `purpose` in
+        the answer says which happened. Every reason a link opens nothing is
+        the same 401, so a guess and a stale link look alike.
         """
         refused = HTTPException(
             status_code=401, detail="this link has expired or was already used; ask for a new one"
@@ -1089,8 +1325,13 @@ def create_app(
             # is it spent: a refusal that used it up would leave someone who
             # named the wrong org holding a dead link.
             link = store.login_link(offered)
-            # Invites are M12.4's; until then one signs nobody in.
-            if link is None or link.purpose != "sign_in":
+            if link is None:
+                raise refused
+            if link.purpose == "invite":
+                return _join(store, link, offered, refused)
+            if link.purpose == "sign_up":
+                return _create(store, link, offered, refused)
+            if link.purpose != "sign_in":
                 raise refused
             user = store.get_user_by_email(link.email)
             if user is None or user.disabled_at is not None:
@@ -1115,15 +1356,59 @@ def create_app(
         finally:
             store.close()
         assert session is not None
-        return _signed_in(user, session, secret)
+        return _signed_in(user, session, secret, purpose="sign_in")
 
-    def _signed_in(user: Any, session: Any, secret: str) -> dict[str, Any]:
+    def _join(store: Any, link: Any, offered: str, refused: HTTPException) -> Any:
+        """An invite: the membership it names, then a session in that org."""
+        user = store.get_user_by_email(link.email)
+        if user is not None and user.disabled_at is not None:
+            raise refused
+        org = store.get_org(link.org)
+        # Declined since it was sent: the decline is the later word.
+        if org is None or org.status == "declined":
+            raise refused
+        if store.redeem_login_link(offered) is None:
+            raise refused
+        try:
+            user, _membership = store.accept_invite(link)
+            secret = store.create_session(user.id, link.org)
+        except (InvalidAccountError, UnknownEntityError) as exc:
+            raise refused from exc
+        session = store.session(secret)
+        assert session is not None
+        return _signed_in(user, session, secret, purpose="invite")
+
+    def _create(store: Any, link: Any, offered: str, refused: HTTPException) -> Any:
+        """A sign-up: a pending org with this person as its owner, signed in."""
+        user = store.get_user_by_email(link.email)
+        if user is not None and user.disabled_at is not None:
+            raise refused
+        if store.get_org(link.org) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"an org {link.org!r} was created since this link was sent; sign up again",
+            )
+        if store.redeem_login_link(offered) is None:
+            raise refused
+        try:
+            user, _org, _membership = store.sign_up(link.email, link.org, link.org_name)
+            secret = store.create_session(user.id, link.org)
+        except InvalidAccountError as exc:
+            raise refused from exc
+        except DuplicateTenantError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        session = store.session(secret)
+        assert session is not None
+        return _signed_in(user, session, secret, purpose="sign_up")
+
+    def _signed_in(user: Any, session: Any, secret: str, *, purpose: str) -> dict[str, Any]:
         """A new session, for the web app's server to put in its cookie."""
         return {
             "session": secret,
             "id": session.id_hash,
             "org": session.org,
             "expires_at": session.expires_at,
+            "purpose": purpose,
             "user": {"id": user.id, "email": user.email, "name": user.name},
         }
 
@@ -1155,7 +1440,7 @@ def create_app(
         finally:
             store.close()
         assert user is not None and switched is not None
-        return _signed_in(user, switched, secret)
+        return _signed_in(user, switched, secret, purpose="switch")
 
     @app.post("/api/users", status_code=201)
     def add_user(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
@@ -1163,8 +1448,8 @@ def create_app(
 
         The operator's, for the first people on a fleet: the first operator
         (an owner of the default org) and an agency's first owner. An owner
-        inviting their own team is M12.4's invite, which the invited person
-        accepts; this is not that.
+        adding their own team sends an invite (`POST /api/orgs/{id}/invites`),
+        which the invited person accepts; this is not that.
         """
         _require_operator(token, "add people directly")
         client = body.get("client")
@@ -1554,6 +1839,13 @@ def create_app(
         try:
             if tenant_store.get_client(org, client) is None:
                 raise nowhere
+            # Before the occupancy probe, which on Fly is a `flyctl` call: a
+            # sign-up that is not approved yet costs nothing. The store refuses
+            # the row too (M12.4); this is the early, honest answer.
+            try:
+                tenant_store.require_active_org(org)
+            except OrgNotActiveError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
         finally:
             tenant_store.close()
 

@@ -626,6 +626,22 @@ the deployment** rather than assumed: set it too high and every caller names
 their own bucket. Render's own description of what it appends is a forum
 reply, not documentation.
 
+### Sign-ups and invites (M12.4)
+
+Anyone can sign an agency up (`POST /api/auth/sign-up`, from the web app). It
+arrives `pending`: its people sign in, add clients and invite their team, and
+it creates no agent until you answer:
+
+```bash
+just org-pending                 # what is waiting
+just org-approve studio-pat      # it can create agents from now on
+just org-decline studio-pat      # it never will; its people can still sign in
+```
+
+Both answers are final. An org you make yourself (`just org-create`) is active
+from the start. Invites go out through the same Resend key as sign-in links;
+without one the control plane refuses to send them (`503`) rather than pretend.
+
 ---
 
 ## What is not automated yet

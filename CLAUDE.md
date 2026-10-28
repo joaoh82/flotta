@@ -207,7 +207,7 @@ conventions, and the sharp edges below.
   link signs its address in for whoever reads the log. The link is
   `$FLOTTA_APP_URL/sign-in#<secret>`: a fragment, so no server or mail scanner
   ever receives the secret. `control/test_sign_in.py` opens with the guard
-  (once, 15 minutes, never another address); invites and sign-up are M12.4.
+  (once, 15 minutes, never another address).
   **The per-caller limit's caller is the browser the web app names**
   (`X-Flotta-Caller-IP`, believed only on an operator token holding
   `auth:relay`), else the peer, seen past `$FLOTTA_TRUSTED_PROXY_HOPS` proxies
@@ -218,6 +218,28 @@ conventions, and the sharp edges below.
   request spends nobody's budget. Redeem checks against `store.login_link`
   (a look) before spending the link, so a wrong `org` is a 403 with the link
   still good.
+- **A pending org cannot create an agent, through any route (M12.4).**
+  `orgs.status` is `pending` | `active` | `declined` (migration 3; every older
+  org is `active`, as is one the operator makes). `FleetStore.create_box` calls
+  `require_active_org` before the insert, and `test_pending_orgs.py` reads the
+  source and fails if a second place writes a box row or calls
+  `Backend.create`. `POST /api/boxes` and `provision.create_box` refuse earlier,
+  before the occupancy probe, because on Fly that is a `flyctl` call.
+  **Sign-up** is `POST /api/auth/sign-up {email, org, org_name}`: open, always
+  `202`, sharing the sign-in limits; the org is made when the link is redeemed
+  (`store.sign_up`), never when it is asked for, and someone who already has an
+  org gets a sign-in link instead. **The sign-up email carries nothing the
+  stranger typed** (`mail.sign_up_message`): anyone can sign up any address. The
+  operator decides once: `POST /api/orgs/{id}/approve|decline`, `flotta org
+  approve|decline`, `flotta org list --pending`. **Invites**:
+  `POST /api/orgs/{id}/invites {email, role, client?}` (the org's admins), sent
+  before the answer so a failure is a 502, a week long (`INVITE_TTL_S`); a
+  pending org sends 3 per 15 minutes, an active one 20, a declined one none.
+  `GET /api/orgs/{id}/members`, and `DELETE …/members/{user}` ends that person's
+  sessions in that org only, withdraws their invites to it (opened or not, or a
+  spare one undoes the removal), and refuses an org's last owner. Redeem answers
+  with `purpose` (`sign_in` | `invite` | `sign_up`), and `/api/me` with
+  `org_status`.
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

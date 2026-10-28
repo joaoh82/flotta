@@ -395,6 +395,19 @@ class InvalidAccountError(StoreError):
     stored as asked."""
 
 
+class OrgNotActiveError(StoreError):
+    """Raised when an org that is not `active` is asked to do what costs money.
+
+    A signed-up agency is `pending` until the operator approves it, and may
+    sign in, add clients and invite its team meanwhile. It may not create an
+    agent, which is a machine and a volume someone pays for (M12.4).
+    """
+
+
+class LastOwnerError(StoreError):
+    """Raised when removing an org's last owner would leave nobody to run it."""
+
+
 class InvalidBoxNameError(StoreError):
     """Raised when a box name could not be an address.
 
@@ -441,11 +454,15 @@ class Box:
 
 @dataclass(frozen=True, slots=True)
 class Org:
-    """An agency: the customer that owns clients (M11)."""
+    """An agency: the customer that owns clients (M11).
+
+    `status` is one of `ORG_STATUSES`; only an `active` org creates agents.
+    """
 
     id: str
     name: str
     created_at: str
+    status: str = "active"
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +516,10 @@ class LoginLink:
     role: str | None
     created_at: str
     expires_at: str
+    #: For a sign-up: what to call the org `org` it creates.
+    org_name: str | None = None
+    #: The row's key, the hash of the secret: how an invite is found again.
+    token_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,8 +537,18 @@ class Session:
     expires_at: str
 
 
-#: What a link is for: proving an address, or that plus joining an org.
-LINK_PURPOSES = frozenset({"sign_in", "invite"})
+#: What a link is for: proving an address, that plus joining an org, or that
+#: plus creating one.
+LINK_PURPOSES = frozenset({"sign_in", "invite", "sign_up"})
+
+#: An org's lifecycle (M12.4). `pending` is a sign-up waiting for the operator,
+#: who makes it `active` or `declined`; both are final. An org made by the
+#: operator starts `active`.
+ORG_STATUSES = ("pending", "active", "declined")
+
+#: An invite waits for someone who is not expecting it, so it lives for a
+#: week, not the quarter-hour a sign-in link does.
+INVITE_TTL_S = 7 * 24 * 3600
 
 #: Long enough to switch to a mail client and back, short enough that a link
 #: found in an old inbox opens nothing.
@@ -821,6 +852,10 @@ class FleetStore:
         label = box_label(name, org=org, client=client)
         if self.get_client(org, client) is None:
             raise UnknownEntityError(f"org {org!r} has no client {client!r}")
+        # The guard M12.4 rests on, here because every way to make an agent
+        # writes this row first: a pending org's agent never gets one, so it
+        # never gets a machine either.
+        self.require_active_org(org)
         bid = box_id or f"b-{uuid.uuid4().hex[:12]}"
         try:
             self._conn.execute(
@@ -919,14 +954,22 @@ class FleetStore:
 
     # -- tenancy (M11) -----------------------------------------------------
 
-    def create_org(self, org_id: str, name: str) -> Org:
-        """Insert an org. Its id is part of every address in it, so it never changes."""
+    def create_org(self, org_id: str, name: str, *, status: str = "active") -> Org:
+        """Insert an org. Its id is part of every address in it, so it never changes.
+
+        `active` unless said otherwise: the operator making an org is the
+        approval. A sign-up makes a `pending` one (`sign_up`).
+        """
         org_id = validate_tenant_id(org_id, kind="org")
         name = _tenant_name(name, kind="org")
+        if status not in ORG_STATUSES:
+            raise InvalidTenantError(
+                f"unknown org status {status!r}; expected one of {ORG_STATUSES}"
+            )
         try:
             self._conn.execute(
-                "INSERT INTO orgs (id, name, created_at) VALUES (?, ?, ?)",
-                (org_id, name, _utcnow()),
+                "INSERT INTO orgs (id, name, created_at, status) VALUES (?, ?, ?, ?)",
+                (org_id, name, _utcnow(), status),
             )
         except db.UniqueViolation as exc:
             raise DuplicateTenantError(f"an org {org_id!r} already exists") from exc
@@ -938,10 +981,54 @@ class FleetStore:
         row = self._conn.execute("SELECT * FROM orgs WHERE id = ?", (org_id,)).fetchone()
         return _org_from_row(row) if row else None
 
-    def list_orgs(self) -> list[Org]:
-        """Every org, oldest first — so the default one leads."""
-        rows = self._conn.execute("SELECT * FROM orgs ORDER BY created_at, id").fetchall()
+    def list_orgs(self, *, status: str | None = None) -> list[Org]:
+        """Every org, oldest first — so the default one leads. Or those in `status`."""
+        if status is None:
+            rows = self._conn.execute("SELECT * FROM orgs ORDER BY created_at, id").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM orgs WHERE status = ? ORDER BY created_at, id", (status,)
+            ).fetchall()
         return [_org_from_row(r) for r in rows]
+
+    def require_active_org(self, org_id: str) -> Org:
+        """`org_id`, if it may create agents; `OrgNotActiveError` if not."""
+        org = self.get_org(org_id)
+        if org is None:
+            raise UnknownEntityError(f"no org with id {org_id!r}")
+        if org.status != "active":
+            raise OrgNotActiveError(
+                f"org {org_id!r} is {org.status}: "
+                + (
+                    "it can create agents once the operator approves it"
+                    if org.status == "pending"
+                    else "it cannot create agents"
+                )
+            )
+        return org
+
+    def decide_org(self, org_id: str, *, approve: bool) -> Org:
+        """Approve or decline a pending org. Once: both answers are final.
+
+        Under the org table's guard, so an approve and a decline arriving
+        together cannot both succeed and leave the answer to whichever wrote
+        last.
+        """
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.status != "pending":
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is {org.status}, not pending; there is nothing to decide"
+                )
+            self._conn.execute(
+                "UPDATE orgs SET status = ? WHERE id = ?",
+                ("active" if approve else "declined", org_id),
+            )
+        decided = self.get_org(org_id)
+        assert decided is not None
+        return decided
 
     def create_client(self, org_id: str, client_id: str, name: str) -> Client:
         """Insert a client of `org_id`. Its id is unique within the org only.
@@ -1127,6 +1214,96 @@ class FleetStore:
         ).fetchall()
         return [_membership_from_row(r) for r in rows]
 
+    def remove_membership(self, user_id: str, org_id: str) -> Membership:
+        """Take `user_id` out of `org_id`, and end their sessions there now.
+
+        M12.2 re-reads the membership on every request, so a session in this
+        org would stop working anyway; deleting it as well means it is gone
+        from the person's list of sessions too, not just refused. Their
+        sessions in other orgs are theirs and untouched.
+
+        Their invites to this org go too, opened or not. An owner can send two
+        before either is clicked, and a removal that left the spare would be
+        undone by it; `accept_invite` asks for its link under the same guard,
+        so one opened just before the removal cannot be accepted just after.
+
+        An org's last owner stays: an org nobody can administer is one only
+        the operator can fix. Under `users`' guard, so two owners removing
+        each other at once cannot both succeed.
+        """
+        with self._conn.transaction(guard="users"):
+            membership = self.membership(user_id, org_id)
+            if membership is None:
+                raise UnknownEntityError(f"user {user_id!r} is not in org {org_id!r}")
+            if membership.role == "owner":
+                owners = [m for m in self.members_of(org_id) if m.role == "owner"]
+                if len(owners) == 1:
+                    raise LastOwnerError(
+                        f"{user_id!r} is org {org_id!r}'s only owner; make someone else "
+                        "an owner first"
+                    )
+            self._conn.execute(
+                "DELETE FROM memberships WHERE user_id = ? AND org_id = ?", (user_id, org_id)
+            )
+            self._conn.execute(
+                "DELETE FROM sessions WHERE user_id = ? AND org_id = ?", (user_id, org_id)
+            )
+            user = self.get_user(user_id)
+            if user is not None:
+                self._conn.execute(
+                    "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ?",
+                    (org_id, user.email),
+                )
+        return membership
+
+    def sign_up(self, email: str, org_id: str, org_name: str) -> tuple[User, Org, Membership]:
+        """A `pending` org with `email` as its owner, and the account if need be.
+
+        For a redeemed sign-up link, which proved the address. All or nothing,
+        under `users`' guard: a taken org id or a disabled account leaves no
+        account, org or membership behind.
+        """
+        email = normalize_email(email)
+        with self._conn.transaction(guard="users"):
+            user = self.get_user_by_email(email)
+            if user is not None and user.disabled_at is not None:
+                raise InvalidAccountError(f"the account for {email} is disabled")
+            if self.get_org(validate_tenant_id(org_id, kind="org")) is not None:
+                raise DuplicateTenantError(f"an org {org_id!r} already exists")
+            if user is None:
+                user = self.create_user(email)
+            org = self.create_org(org_id, org_name, status="pending")
+            membership = self.add_membership(user.id, org.id, "owner")
+        return user, org, membership
+
+    def accept_invite(self, link: LoginLink) -> tuple[User, Membership]:
+        """The membership a redeemed invite grants, and the account if need be.
+
+        If the person joined the org some other way since, they keep what they
+        have: an invite adds someone, it does not change their role. If they
+        were removed since it was redeemed, the removal took the link with it
+        (`remove_membership`), and the invite grants nothing.
+        """
+        if link.purpose != "invite" or link.org is None or link.role is None:
+            raise InvalidAccountError("only an invite grants a membership")
+        with self._conn.transaction(guard="users"):
+            kept = self._conn.execute(
+                "SELECT 1 FROM login_links WHERE token_hash = ?", (link.token_hash,)
+            ).fetchone()
+            if kept is None:
+                raise InvalidAccountError("this invite was withdrawn")
+            user = self.get_user_by_email(link.email)
+            if user is not None and user.disabled_at is not None:
+                raise InvalidAccountError(f"the account for {link.email} is disabled")
+            if user is None:
+                user = self.create_user(link.email)
+            membership = self.membership(user.id, link.org)
+            if membership is None:
+                membership = self.add_membership(
+                    user.id, link.org, link.role, client_id=link.client
+                )
+        return user, membership
+
     def create_login_link(
         self,
         email: str,
@@ -1135,6 +1312,7 @@ class FleetStore:
         org_id: str | None = None,
         client_id: str | None = None,
         role: str | None = None,
+        org_name: str | None = None,
         ttl_s: int = LINK_TTL_S,
         now: datetime | None = None,
     ) -> str:
@@ -1142,7 +1320,9 @@ class FleetStore:
 
         A sign-in link grants nothing beyond proving the address. An invite
         also names the membership redeeming it creates, checked now so a bad
-        invite is refused when it is sent rather than when it is clicked.
+        invite is refused when it is sent rather than when it is clicked; a
+        declined org sends none. A sign-up names the org redeeming it creates
+        (`org_id`, `org_name`), which must not exist yet.
         """
         email = normalize_email(email)
         if purpose not in LINK_PURPOSES:
@@ -1156,19 +1336,35 @@ class FleetStore:
                 scopes_for_role(role, client=client_id)
             except AuthError as exc:
                 raise InvalidAccountError(str(exc)) from exc
-            if self.get_org(org_id) is None:
+            org = self.get_org(org_id)
+            if org is None:
                 raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.status == "declined":
+                raise OrgNotActiveError(f"org {org_id!r} was declined; it cannot invite anyone")
             if client_id is not None and self.get_client(org_id, client_id) is None:
                 raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+        elif purpose == "sign_up":
+            if org_id is None or org_name is None:
+                raise InvalidAccountError("a sign-up names the org it creates: an id and a name")
+            if client_id is not None or role is not None:
+                raise InvalidAccountError(
+                    "a sign-up makes its person the org's owner, nothing else"
+                )
+            org_id = validate_tenant_id(org_id, kind="org")
+            org_name = _tenant_name(org_name, kind="org")
+            if self.get_org(org_id) is not None:
+                raise DuplicateTenantError(f"an org {org_id!r} already exists")
         elif org_id is not None or client_id is not None or role is not None:
             raise InvalidAccountError("a sign-in link grants nothing; send an invite instead")
+        if purpose != "sign_up" and org_name is not None:
+            raise InvalidAccountError("only a sign-up names an org to create")
         if ttl_s <= 0:
             raise InvalidAccountError("a link must be valid for some time")
         moment = now or datetime.now(UTC)
         secret = _new_secret()
         self._conn.execute(
             "INSERT INTO login_links (token_hash, email, purpose, org_id, client_id, role, "
-            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "org_name, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 secret_hash(secret),
                 email,
@@ -1176,6 +1372,7 @@ class FleetStore:
                 org_id,
                 client_id,
                 role,
+                org_name,
                 _stamp(moment),
                 _stamp(moment + timedelta(seconds=ttl_s)),
             ),
@@ -2074,7 +2271,7 @@ def _box_from_row(row: db.Row) -> Box:
 
 
 def _org_from_row(row: db.Row) -> Org:
-    return Org(id=row["id"], name=row["name"], created_at=row["created_at"])
+    return Org(id=row["id"], name=row["name"], created_at=row["created_at"], status=row["status"])
 
 
 def _client_from_row(row: db.Row) -> Client:
@@ -2110,6 +2307,8 @@ def _link_from_row(row: db.Row) -> LoginLink:
         role=row["role"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
+        org_name=row["org_name"],
+        token_hash=row["token_hash"],
     )
 
 
