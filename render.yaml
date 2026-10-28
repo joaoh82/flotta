@@ -72,6 +72,14 @@ projects:
               # Optional: GitHub identity for agents (step 7a).
               - key: FLOTTA_GITHUB_TOKEN
                 sync: false
+              # Optional: sign-in by emailed link (step 9). Without a Resend
+              # key no link is made; the control plane never prints one here.
+              - key: FLOTTA_RESEND_API_KEY
+                sync: false
+              - key: FLOTTA_MAIL_FROM
+                sync: false
+              - key: FLOTTA_APP_URL
+                sync: false
         databases:
           - name: flotta-db
             region: virginia

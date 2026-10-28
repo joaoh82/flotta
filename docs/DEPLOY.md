@@ -580,6 +580,54 @@ lifetimes short (`--days`).
 
 ---
 
+## Step 9 — People who sign in (M12.3)
+
+Tokens are for machines and scripts; people sign in with a link emailed to
+them, and the web app keeps the session. Give yourself an account first, as
+an owner of the default org, which makes you the operator:
+
+```bash
+just user-add you@example.com owner              # through $FLOTTA_CONTROL_URL when set
+just user-add alice@agency-x.example owner agency-x
+```
+
+To send links, set on the control plane:
+
+- `FLOTTA_RESEND_API_KEY`: a Resend API key, with the sending domain verified.
+- `FLOTTA_MAIL_FROM`: the sender, e.g. `Flotta <sign-in@flotta.dev>`.
+- `FLOTTA_APP_URL`: the web app, e.g. `https://app.flotta.dev`; links point at
+  `<it>/sign-in#<secret>`.
+
+Without a Resend key a deployed control plane makes **no** links, and says so
+at startup. It does not print them: a link in a log signs its address in for
+anyone who reads that log. Locally, a control plane with no signing key prints
+them, which is how sign-in is tried for $0.
+
+`POST /api/auth/link` answers `202` for any address and is limited per address
+(5) and per caller (30) every 15 minutes. **The web app's server is one caller
+for every browser**, and behind Render's proxy so is everyone else, so the
+web app names the browser it is asking for:
+
+```bash
+just token-mint web auth:relay     # the web app's server holds this, nothing else does
+```
+
+and sends it with the browser's address in `X-Flotta-Caller-IP`. Only an
+operator token holding `auth:relay` may name a caller; anything else naming
+one is refused, and a request that names nobody is counted against the address
+it connected from. On Render that is Render's proxy, one bucket for every
+direct caller, which is safe (a direct caller can empty only its own bucket,
+never the web app's browsers') but crude.
+
+`FLOTTA_TRUSTED_PROXY_HOPS` tells the control plane how many proxies append to
+`X-Forwarded-For` in front of it, and the caller becomes the entry the
+outermost of them appended. Leave it unset until that count is **checked on
+the deployment** rather than assumed: set it too high and every caller names
+their own bucket. Render's own description of what it appends is a forum
+reply, not documentation.
+
+---
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would

@@ -201,7 +201,8 @@ def test_the_known_scopes_are_exactly_these_eight():
     `fleet:route`, where the answer is that once routes are scoped by tenant,
     the door is the one caller that must find a box before it knows whose —
     and for M11.7's `org:admin`, so an agency can run its own clients and
-    people without the operator holding its hand.
+    people without the operator holding its hand — and for M12.3's
+    `auth:relay`, because the web app is one caller for every browser.
     """
     assert {
         "fleet:read",
@@ -212,6 +213,7 @@ def test_the_known_scopes_are_exactly_these_eight():
         "box:peer",
         "fleet:route",
         "org:admin",
+        "auth:relay",
     } == SCOPES
 
 

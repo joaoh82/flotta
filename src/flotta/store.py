@@ -1070,6 +1070,41 @@ class FleetStore:
         assert membership is not None
         return membership
 
+    def add_person(
+        self,
+        email: str,
+        org_id: str,
+        role: str,
+        *,
+        client_id: str | None = None,
+        name: str | None = None,
+    ) -> tuple[User, Membership, bool]:
+        """`email` in `org_id` as `role`, with an account made if there is none.
+
+        Returns the user, the membership, and whether the account is new.
+        Everything that could refuse is asked before anything is written, so a
+        refusal never leaves an account behind that belongs to no org; and
+        under `users`' guard, so two adds of one address make one account.
+        """
+        email = normalize_email(email)
+        try:
+            scopes_for_role(role, client=client_id)
+        except AuthError as exc:
+            raise InvalidAccountError(str(exc)) from exc
+        with self._conn.transaction(guard="users"):
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if client_id is not None and self.get_client(org_id, client_id) is None:
+                raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+            user = self.get_user_by_email(email)
+            if user is not None and self.membership(user.id, org_id) is not None:
+                raise DuplicateMembershipError(f"{email} already belongs to org {org_id!r}")
+            created = user is None
+            if user is None:
+                user = self.create_user(email, name=name)
+            membership = self.add_membership(user.id, org_id, role, client_id=client_id)
+        return user, membership, created
+
     def membership(self, user_id: str, org_id: str) -> Membership | None:
         row = self._conn.execute(
             "SELECT * FROM memberships WHERE user_id = ? AND org_id = ?", (user_id, org_id)
@@ -1158,19 +1193,37 @@ class FleetStore:
         if not secret:
             return None
         moment = now or datetime.now(UTC)
-        key = secret_hash(secret)
         with self._conn.transaction(guard="login_links"):
-            row = self._conn.execute(
-                "SELECT * FROM login_links WHERE token_hash = ?", (key,)
-            ).fetchone()
-            if row is None or row["used_at"] is not None:
-                return None
-            if datetime.fromisoformat(row["expires_at"]) <= moment:
+            row = self._live_link_row(secret, moment)
+            if row is None:
                 return None
             self._conn.execute(
-                "UPDATE login_links SET used_at = ? WHERE token_hash = ?", (_stamp(moment), key)
+                "UPDATE login_links SET used_at = ? WHERE token_hash = ?",
+                (_stamp(moment), row["token_hash"]),
             )
         return _link_from_row(row)
+
+    def login_link(self, secret: str, *, now: datetime | None = None) -> LoginLink | None:
+        """The link `secret` would open, left unused; `None` as `redeem_login_link`.
+
+        For checking what redeeming would do before spending the link on it.
+        Only a redeem signs anyone in, so a link this says is live may still be
+        gone by then, and the redeem's answer is the one that counts.
+        """
+        if not secret:
+            return None
+        row = self._live_link_row(secret, now or datetime.now(UTC))
+        return _link_from_row(row) if row else None
+
+    def _live_link_row(self, secret: str, moment: datetime) -> Any:
+        row = self._conn.execute(
+            "SELECT * FROM login_links WHERE token_hash = ?", (secret_hash(secret),)
+        ).fetchone()
+        if row is None or row["used_at"] is not None:
+            return None
+        if datetime.fromisoformat(row["expires_at"]) <= moment:
+            return None
+        return row
 
     def create_session(
         self,

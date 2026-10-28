@@ -40,7 +40,7 @@ parties — an M10 concern, not a today concern.
 
 ## Scopes are flat, and the dangerous ones are their own
 
-Eight, no wildcards, no hierarchy:
+Nine, no wildcards, no hierarchy:
 
     fleet:read     list and inspect boxes, read their events
     fleet:write    create boxes
@@ -50,6 +50,7 @@ Eight, no wildcards, no hierarchy:
     box:peer       ask the control plane to relay a message to a granted agent
     fleet:route    resolve and wake any org's box — the front door's, and only it
     org:admin      add clients to one org, and mint its people's tokens
+    auth:relay     vouch for the browser behind a sign-in request — the web app's
 
 `fleet:route` exists because the door is the one caller that must find a box
 *before* it knows whose it is: it resolves the hostname, then checks the
@@ -57,6 +58,13 @@ caller's token against the answer (`admits`). Every other route is scoped to
 the token's tenant (M11.6a), so the door's own token needs a power no tenant
 has — and a narrow one, which reaches `address` and `wake` and nothing else,
 and only on a token of the default org's (the operator's).
+
+`auth:relay` is the web app's server's, for the same reason `fleet:route` is
+the door's. Asking for a sign-in link is limited per caller, and the web app
+is one caller for every browser it serves; with this scope it names the
+browser (`X-Flotta-Caller-IP`), and the limit applies to that instead. Like
+`fleet:route` it is honoured only on the operator's token, and no role holds
+it, so no agency can mint it for itself.
 
 `org:admin` is an agency's, over its own org (M11.7): it adds the agency's
 clients and mints tokens for the agency's people, so the operator hands over
@@ -121,6 +129,7 @@ SCOPE_GIT_CREDENTIAL = "git:credential"
 SCOPE_BOX_PEER = "box:peer"
 SCOPE_FLEET_ROUTE = "fleet:route"
 SCOPE_ORG_ADMIN = "org:admin"
+SCOPE_AUTH_RELAY = "auth:relay"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -131,12 +140,14 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_BOX_PEER,
         SCOPE_FLEET_ROUTE,
         SCOPE_ORG_ADMIN,
+        SCOPE_AUTH_RELAY,
     }
 )
 
 #: What a person may do, by role (M11.7). Mapped to scopes at mint time, so a
 #: token is still a flat list and nothing on the hot path knows roles exist.
-#: No box scopes (`git:credential`, `box:peer`) and no `fleet:route`: those are
+#: No box scopes (`git:credential`, `box:peer`), no `fleet:route` and no
+#: `auth:relay`: those are
 #: held by machines, never handed to a person.
 ROLES: dict[str, frozenset[str]] = {
     "owner": frozenset(
