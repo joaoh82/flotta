@@ -158,17 +158,38 @@ def test_a_stop_from_another_backend_is_prompt_and_leaves_no_zombie(backend, tmp
         os.kill(pid, 0)
 
 
-def test_an_agent_that_will_not_stop_is_killed(backend):
-    """One that ignores the request to stop is killed when its time is up, not left running."""
+def test_an_agent_that_will_not_stop_is_killed_by_any_backend(backend, tmp_path):
+    """One that ignores the request to stop is killed when its time is up, not left running.
+
+    By a backend that did not start it, as on the control plane, which makes
+    one per request: a hung agent cannot answer the probe, so only what was
+    recorded when it started says which process it is.
+    """
     import signal
 
     handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
     backend.start(handle.endpoint)
     pid = int(backend._probe("eng-a")["pid"])
-    os.kill(pid, signal.SIGSTOP)  # frozen: it cannot act on SIGTERM
-    backend.stop(handle.endpoint)
+    os.kill(pid, signal.SIGSTOP)  # frozen: it cannot act on SIGTERM, or answer
+    LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+    backend._children.pop("eng-a").wait(timeout=STOP_TIMEOUT_S)  # reap what was killed
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_a_recorded_pid_that_is_someone_else_now_is_never_signalled(backend, tmp_path):
+    """Pids are reused: a stop signals the recorded one only while it is still this agent."""
+    import subprocess
+
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    stranger = subprocess.Popen(["sleep", "30"])
+    try:
+        (tmp_path / "boxes" / "eng-a" / "pid").write_text(str(stranger.pid))
+        LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait()
 
 
 def test_creating_a_name_that_exists_adopts_it(backend):

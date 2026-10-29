@@ -93,6 +93,29 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+#: Where a stand-in's pid is kept, beside its endpoint, for any backend to find.
+PID_FILE = "pid"
+
+
+def _is_standin(pid: int, name: str) -> bool:
+    """Whether `pid` is the stand-in for `name`: pids are reused, and a stop
+    must never signal whatever process has one now."""
+    try:
+        listed = subprocess.run(
+            ["ps", "-ww", "-o", "args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.split()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if "flotta.backends.standin" not in listed or "--name" not in listed:
+        return False
+    at = listed.index("--name") + 1
+    return at < len(listed) and listed[at] == name
+
+
 def _alive(pid: int, child: subprocess.Popen | None) -> bool:
     """Whether the process is still there, reaping it if it is ours and has exited.
 
@@ -238,6 +261,7 @@ class LocalBackend:
                 start_new_session=True,
             )
         self._children[name] = child
+        (directory / PID_FILE).write_text(str(child.pid))
         deadline = time.monotonic() + START_TIMEOUT_S
         while time.monotonic() < deadline:
             if self._probe(name) is not None:
@@ -257,11 +281,18 @@ class LocalBackend:
         name = self._name(box_id)
         running = self._probe(name)
         # A hung agent does not answer the probe, and is the one that most
-        # needs stopping: the process this backend started is known anyway.
+        # needs stopping. The backend that started it knows its process; any
+        # other (the control plane makes one per request) has the pid it
+        # recorded, which counts only while that process is still this agent.
         child = self._children.pop(name, None)
-        if running is None and (child is None or child.poll() is not None):
+        if running is not None:
+            pid: int | None = int(running["pid"])
+        elif child is not None and child.poll() is None:
+            pid = child.pid
+        else:
+            pid = self._recorded_pid(name)
+        if pid is None:
             return
-        pid = int(running["pid"]) if running is not None else child.pid
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -277,6 +308,16 @@ class LocalBackend:
                 os.kill(pid, signal.SIGKILL)
         if child is not None:
             child.wait(timeout=STOP_TIMEOUT_S)
+        with contextlib.suppress(FileNotFoundError):
+            (self._dir(name) / PID_FILE).unlink()
+
+    def _recorded_pid(self, name: str) -> int | None:
+        """The pid this agent's stand-in started with, if that process is still it."""
+        try:
+            pid = int((self._dir(name) / PID_FILE).read_text().strip())
+        except (FileNotFoundError, ValueError):
+            return None
+        return pid if _is_standin(pid, name) else None
 
     def destroy(self, box_id: str) -> None:
         try:
