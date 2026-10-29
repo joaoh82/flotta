@@ -36,4 +36,8 @@ vendor/
 dashboard/
 skills/
 assets/
-node_modules/
+# The retired desktop app (D17): no image builds from it, and its Rust build
+# output and node_modules made every `just door-deploy` upload 7.3 GB.
+app/
+# At any depth: a bare `node_modules/` only matches the one at the root.
+**/node_modules/
