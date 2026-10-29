@@ -146,6 +146,18 @@ def test_stopping_an_agent_ends_the_conversations_open_on_it(backend):
         os.kill(pid, 0)
 
 
+def test_a_stop_from_another_backend_is_prompt_and_leaves_no_zombie(backend, tmp_path):
+    """As on the control plane, which makes a backend per request: not the one that started it."""
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    pid = int(backend._probe("eng-a")["pid"])
+    started = time.monotonic()
+    LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+    assert time.monotonic() - started < STOP_TIMEOUT_S / 2
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
 def test_an_agent_that_will_not_stop_is_killed(backend):
     """One that ignores the request to stop is killed when its time is up, not left running."""
     import signal

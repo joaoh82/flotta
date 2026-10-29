@@ -94,9 +94,22 @@ def _free_port() -> int:
 
 
 def _alive(pid: int, child: subprocess.Popen | None) -> bool:
-    """Whether the process is still there. A child of ours is asked, which also reaps it."""
+    """Whether the process is still there, reaping it if it is ours and has exited.
+
+    The control plane makes a backend per request, so the one stopping an
+    agent is usually not the one that started it and has no `Popen` for it.
+    The process is still this process's child, though, and one that has
+    exited stays a zombie, which `kill(pid, 0)` reports as alive: every stop
+    waited its whole timeout and left one behind. `waitpid` reaps it.
+    """
     if child is not None:
         return child.poll() is None
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass  # not ours: ask the kernel whether it exists
+    else:
+        return reaped == 0
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
