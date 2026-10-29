@@ -712,6 +712,129 @@ def test_a_substrate_failure_waking_is_502(secured, monkeypatch):
     assert secured.post("/api/boxes/eng-a/wake", headers=_bearer(SCOPE_BOX_CHAT)).status_code == 502
 
 
+# -- putting an agent to sleep when asked (M12.8) ---------------------------
+
+
+@pytest.fixture
+def idle(fleet):
+    """`eng-a` with its task finished, so nothing in flight refuses a sleep."""
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name("eng-a")
+        for task in store.list_tasks(box_id=box.id):
+            store.update_task_status(task.id, "done")
+    return fleet
+
+
+@pytest.fixture
+def machine(monkeypatch):
+    """The real `stop_box`, on a substrate that records what it was asked."""
+    import flotta.provision as provision
+    from flotta.test_provision import FakeBackend
+
+    backend = FakeBackend()
+    monkeypatch.setattr(provision, "_backend_for", lambda scheme: backend)
+    return backend
+
+
+def test_sleep_takes_fleet_write(secured, idle, machine):
+    """The scope that creates and changes an agent; not the one that talks to it.
+
+    Waking takes `box:chat`, because talking to an agent wakes it anyway.
+    Sleeping is a decision about the agent, and a client's read-only view
+    cannot make it.
+    """
+    from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_READ
+
+    for scopes in ({SCOPE_FLEET_READ}, {SCOPE_BOX_CHAT}):
+        denied = secured.post("/api/boxes/eng-a/sleep", headers=_bearer(*scopes))
+        assert denied.status_code == 403, denied.text
+        assert "fleet:write" in denied.json()["detail"]
+    assert machine.calls == []
+
+
+def test_sleep_releases_the_machine_and_records_who_asked(secured, idle, machine):
+    """Through `stop_box`, so the row moves only after the substrate did."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    response = secured.post("/api/boxes/eng-a/sleep", headers=_bearer(SCOPE_FLEET_WRITE))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["box"]["status"] == "stopped"
+    assert body["already_stopped"] is False
+    assert machine.calls == ["suspend"]
+    with FleetStore(idle) as store:
+        box = store.get_box_by_name("eng-a")
+        stopped = [e for e in store.get_events("box", box.id) if e.type == "stopped"]
+    assert [e.payload["reason"] for e in stopped] == ["asked"]
+
+
+def test_sleeping_an_agent_that_is_asleep_is_not_an_error(secured, idle, machine):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    headers = _bearer(SCOPE_FLEET_WRITE)
+    assert secured.post("/api/boxes/eng-a/sleep", headers=headers).status_code == 200
+    again = secured.post("/api/boxes/eng-a/sleep", headers=headers)
+
+    assert again.status_code == 200
+    assert again.json()["already_stopped"] is True
+    assert machine.calls == ["suspend"]
+
+
+def test_an_agent_mid_task_is_not_put_to_sleep(secured, machine):
+    """409, and the machine is not touched: freezing it would strand the work."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    response = secured.post("/api/boxes/eng-a/sleep", headers=_bearer(SCOPE_FLEET_WRITE))
+
+    assert response.status_code == 409, response.text
+    assert "still running" in response.json()["detail"]
+    assert machine.calls == []
+
+
+def test_a_destroyed_agent_cannot_be_put_to_sleep(secured, idle, machine):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    with FleetStore(idle) as store:
+        store.update_box_status(store.get_box_by_name("eng-a").id, "torn_down")
+
+    response = secured.post("/api/boxes/eng-a/sleep", headers=_bearer(SCOPE_FLEET_WRITE))
+
+    assert response.status_code == 409, response.text
+    assert machine.calls == []
+
+
+def test_a_substrate_failure_sleeping_is_502_and_the_agent_stays_awake(secured, idle, monkeypatch):
+    """The caller can retry a 502; and the row must not claim a sleep that failed."""
+    import flotta.provision as provision
+    from flotta.auth import SCOPE_FLEET_WRITE
+    from flotta.backend import BackendError
+    from flotta.test_provision import FakeBackend
+
+    class Refusing(FakeBackend):
+        def suspend(self, box_id):
+            raise BackendError("flyctl timed out")
+
+        def stop(self, box_id):
+            raise BackendError("flyctl timed out")
+
+    monkeypatch.setattr(provision, "_backend_for", lambda scheme: Refusing())
+
+    response = secured.post("/api/boxes/eng-a/sleep", headers=_bearer(SCOPE_FLEET_WRITE))
+
+    assert response.status_code == 502, response.text
+    with FleetStore(idle) as store:
+        assert store.get_box_by_name("eng-a").status == "running"
+
+
+def test_sleeping_an_unknown_agent_is_404(secured):
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    assert (
+        secured.post("/api/boxes/nope/sleep", headers=_bearer(SCOPE_FLEET_WRITE)).status_code == 404
+    )
+
+
 # -- resolving a box for the front door, without waking it (M11) ------------
 
 
