@@ -273,6 +273,20 @@ conventions, and the sharp edges below.
   is `backends/test_local_offline.py`:** sign in, create, ticket, talk through
   the door, sleep, wake, destroy, with every socket and process recorded and
   anything off loopback, or anything but the stand-in, a failure.
+- **The operator can look at an agency as its owner, and change nothing (M12.9).**
+  `POST /api/orgs/{id}/view-as`, from the operator's own session (a person in
+  the default org who is not one client's: `store.is_operator`), answers a
+  second session in that org for an hour (`VIEW_SESSION_TTL_S`), with
+  `sessions.read_only = 1` (migration 4). It is no membership: `_session_token`
+  honours it only while its holder is still the operator, turns it into an
+  owner's token narrowed to `fleet:read` + `org:admin`, and **refuses every
+  request made with it that is not a GET, HEAD or OPTIONS, before any route
+  runs**, except signing itself out. `control/test_view_as.py` sends one to
+  every changing route in the app's own route table and checks the store is
+  untouched. Not for the default org, and not from a token. `/api/me` says
+  `viewing_as`. Two operator reads came with it: `GET /api/users` (everyone,
+  with their memberships) and `GET /api/fleet/boxes` (every org's agents;
+  `GET /api/boxes` stays the caller's own org's).
 - **A box's name is its address, and the address names its tenant (M11.5).**
   `store.create_box(name, org=, client=)` stores `support--acme--agency-x` in
   `boxes.name` (`flotta.address`); the default org's default client keeps

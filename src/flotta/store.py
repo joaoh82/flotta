@@ -404,6 +404,14 @@ class OrgNotActiveError(StoreError):
     """
 
 
+class NotOperatorError(StoreError):
+    """Raised when someone who is not the fleet's operator asks for what only they may do.
+
+    The operator is a person in the default org who is not confined to a
+    client: the same rule `_is_operator` applies to a token.
+    """
+
+
 class LastOwnerError(StoreError):
     """Raised when removing an org's last owner would leave nobody to run it."""
 
@@ -535,6 +543,9 @@ class Session:
     org: str
     created_at: str
     expires_at: str
+    #: The operator viewing an org as its owner (M12.9): it may look, and
+    #: nothing else. Not a membership of `org`; see `create_view_session`.
+    read_only: bool = False
 
 
 #: What a link is for: proving an address, that plus joining an org, or that
@@ -558,6 +569,10 @@ LINK_TTL_S = 15 * 60
 #: how long a cookie nobody revoked keeps working, not how long a stolen one
 #: does.
 SESSION_TTL_S = 30 * 24 * 3600
+
+#: How long the operator may look at an agency as its owner before asking
+#: again: a visit, not a second sign-in.
+VIEW_SESSION_TTL_S = 3600
 
 #: The longest address SMTP carries.
 EMAIL_MAX = 254
@@ -1096,6 +1111,11 @@ class FleetStore:
         row = self._conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return _user_from_row(row) if row else None
 
+    def list_users(self) -> list[User]:
+        """Everyone with an account, oldest first: the operator's list of people."""
+        rows = self._conn.execute("SELECT * FROM users ORDER BY created_at, id").fetchall()
+        return [_user_from_row(r) for r in rows]
+
     def get_user_by_email(self, email: str) -> User | None:
         """The account for `email`, matched however it was typed."""
         try:
@@ -1464,6 +1484,56 @@ class FleetStore:
                 ),
             )
         return secret
+
+    def create_view_session(
+        self,
+        user_id: str,
+        org_id: str,
+        *,
+        ttl_s: int = VIEW_SESSION_TTL_S,
+        now: datetime | None = None,
+    ) -> str:
+        """A read-only session for the operator, acting in `org_id` as its owner.
+
+        Not a membership: the operator is not in the agency they are looking
+        at, and nothing about the agency changes because they looked. Only for
+        the operator (`is_operator`), and not in the default org, which is
+        already theirs. The control plane asks `is_operator` again on every
+        request made with it, and refuses any that would change something.
+        """
+        if ttl_s <= 0:
+            raise InvalidAccountError("a session must last some time")
+        if org_id == DEFAULT_ORG:
+            raise InvalidAccountError("the default org is the operator's own; sign in to it")
+        moment = now or datetime.now(UTC)
+        secret = _new_secret()
+        with self._conn.transaction(guard="users"):
+            user = self.get_user(user_id)
+            if user is None:
+                raise UnknownEntityError(f"no user with id {user_id!r}")
+            if user.disabled_at is not None:
+                raise InvalidAccountError(f"user {user_id!r} is disabled")
+            if not self.is_operator(user_id):
+                raise NotOperatorError(f"user {user_id!r} is not the fleet's operator")
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org {org_id!r}")
+            self._conn.execute(
+                "INSERT INTO sessions (id_hash, user_id, org_id, created_at, expires_at, "
+                "read_only) VALUES (?, ?, ?, ?, ?, 1)",
+                (
+                    secret_hash(secret),
+                    user_id,
+                    org_id,
+                    _stamp(moment),
+                    _stamp(moment + timedelta(seconds=ttl_s)),
+                ),
+            )
+        return secret
+
+    def is_operator(self, user_id: str) -> bool:
+        """Whether `user_id` runs the fleet: in the default org, and not one client's."""
+        own = self.membership(user_id, DEFAULT_ORG)
+        return own is not None and own.client is None
 
     def session(self, secret: str, *, now: datetime | None = None) -> Session | None:
         """The live session `secret` proves, or `None`."""
@@ -2319,6 +2389,7 @@ def _session_from_row(row: db.Row) -> Session:
         org=row["org_id"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
+        read_only=bool(row["read_only"]),
     )
 
 
