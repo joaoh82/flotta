@@ -659,6 +659,12 @@ Unset, the door refuses every ticket (`4403`), and nothing else changes:
 `flotta chat` still goes through with its token. A ticket is good for two
 minutes, for one agent, and for nothing but that agent's conversation.
 
+The ticket tells the page where to connect: `wss://<box>.$FLOTTA_DOMAIN/api/ws`,
+or, with `$FLOTTA_DOOR_URL` set on the control plane, that door's scheme, host
+and port instead (`ws://localhost:8081` for `just local`). A self-hosted door
+on a port of its own needs it. The web app reads the same variable for the
+page's content security policy, so set it on both or neither.
+
 ---
 
 ## What is not automated yet

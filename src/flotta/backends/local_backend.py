@@ -27,6 +27,7 @@ to `reimage`, and no memory snapshot, so `suspend` is `NotSupported` and
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import os
@@ -90,6 +91,55 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+#: Where a stand-in's pid is kept, beside its endpoint, for any backend to find.
+PID_FILE = "pid"
+
+
+def _is_standin(pid: int, name: str) -> bool:
+    """Whether `pid` is the stand-in for `name`: pids are reused, and a stop
+    must never signal whatever process has one now."""
+    try:
+        listed = subprocess.run(
+            ["ps", "-ww", "-o", "args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.split()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if "flotta.backends.standin" not in listed or "--name" not in listed:
+        return False
+    at = listed.index("--name") + 1
+    return at < len(listed) and listed[at] == name
+
+
+def _alive(pid: int, child: subprocess.Popen | None) -> bool:
+    """Whether the process is still there, reaping it if it is ours and has exited.
+
+    The control plane makes a backend per request, so the one stopping an
+    agent is usually not the one that started it and has no `Popen` for it.
+    The process is still this process's child, though, and one that has
+    exited stays a zombie, which `kill(pid, 0)` reports as alive: every stop
+    waited its whole timeout and left one behind. `waitpid` reaps it.
+    """
+    if child is not None:
+        return child.poll() is None
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass  # not ours: ask the kernel whether it exists
+    else:
+        return reaped == 0
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # someone else's: it exists
+        return True
+    return True
 
 
 class LocalBackend:
@@ -211,6 +261,7 @@ class LocalBackend:
                 start_new_session=True,
             )
         self._children[name] = child
+        (directory / PID_FILE).write_text(str(child.pid))
         deadline = time.monotonic() + START_TIMEOUT_S
         while time.monotonic() < deadline:
             if self._probe(name) is not None:
@@ -229,21 +280,48 @@ class LocalBackend:
     def stop(self, box_id: str) -> None:
         name = self._name(box_id)
         running = self._probe(name)
-        if running is None:
+        # A hung agent does not answer the probe, and is the one that most
+        # needs stopping. The backend that started it knows its process; any
+        # other (the control plane makes one per request) has the pid it
+        # recorded, which counts only while that process is still this agent.
+        child = self._children.pop(name, None)
+        if running is not None:
+            pid: int | None = int(running["pid"])
+        elif child is not None and child.poll() is None:
+            pid = child.pid
+        else:
+            pid = self._recorded_pid(name)
+        if pid is None:
             return
-        pid = int(running["pid"])
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return
+        # Until the process has gone, not until its port goes quiet: it stops
+        # listening first, and a stop that returned then left it holding every
+        # socket open on it, answering nothing.
         deadline = time.monotonic() + STOP_TIMEOUT_S
-        while time.monotonic() < deadline and self._probe(name) is not None:
-            time.sleep(0.1)
-        if self._probe(name) is not None:
-            os.kill(pid, signal.SIGKILL)
-        child = self._children.pop(name, None)
+        while time.monotonic() < deadline and _alive(pid, child):
+            time.sleep(0.05)
+        if _alive(pid, child):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            # And reaped once it has died, or it lingers as a zombie of this process.
+            killed = time.monotonic() + 1.0
+            while time.monotonic() < killed and _alive(pid, child):
+                time.sleep(0.02)
         if child is not None:
             child.wait(timeout=STOP_TIMEOUT_S)
+        with contextlib.suppress(FileNotFoundError):
+            (self._dir(name) / PID_FILE).unlink()
+
+    def _recorded_pid(self, name: str) -> int | None:
+        """The pid this agent's stand-in started with, if that process is still it."""
+        try:
+            pid = int((self._dir(name) / PID_FILE).read_text().strip())
+        except (FileNotFoundError, ValueError):
+            return None
+        return pid if _is_standin(pid, name) else None
 
     def destroy(self, box_id: str) -> None:
         try:

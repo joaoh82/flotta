@@ -192,3 +192,106 @@ def test_the_socket_needs_a_ticket_and_a_ticket_opens_one_socket(tmp_path):
 )
 def test_its_login_comes_from_the_variables_a_box_reads(env, expected):
     assert credentials_from(env) == expected
+
+
+# -- the scripted turns: a tool, and an approval ----------------------------------
+
+
+async def _frames_until(ws, done):
+    """Every frame up to and including the first that `done` accepts."""
+    frames = []
+    while not frames or not done(frames[-1]):
+        frames.append(json.loads((await _receive(ws)).data))
+    return frames
+
+
+def _complete(frame):
+    return (frame.get("params") or {}).get("type") == "message.complete"
+
+
+def test_a_tool_turn_reports_the_tool_as_a_gateway_does(tmp_path):
+    """`!tool`: what a client shows while an agent works, with no model behind it."""
+
+    async def test(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        acknowledged, events = await _turn(ws, 2, live, "!tool")
+        kinds = [e["type"] for e in events]
+        assert (
+            kinds.index("tool.generating")
+            < kinds.index("tool.start")
+            < kinds.index("tool.complete")
+        )
+        started = next(e["payload"] for e in events if e["type"] == "tool.start")
+        finished = next(e["payload"] for e in events if e["type"] == "tool.complete")
+        assert started["tool_id"] == finished["tool_id"] and started["name"] == "terminal"
+        assert finished["result"] == {"error": None, "exit_code": 0, "output": ""}
+        assert events[-1]["payload"] == {"text": "The workspace is empty.", "status": "complete"}
+
+    _run(test, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("choice", "ran", "reply"),
+    [
+        ("once", True, "Approved (once), so I ran it."),
+        ("session", True, "Approved (session), so I ran it."),
+        ("deny", False, "Not approved (deny), so I did not run it."),
+    ],
+)
+def test_an_approval_is_asked_as_a_gateway_asks_and_the_answer_decides(
+    tmp_path, choice, ran, reply
+):
+    """`!approve`: the gateway's own request, answered by its id, then the turn goes on."""
+
+    async def test(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        await ws.send_str(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "prompt.submit",
+                    "params": {"session_id": live, "text": "!approve"},
+                }
+            )
+        )
+        before = await _frames_until(ws, lambda f: f.get("method") == "approval")
+        ask = before[-1]
+        assert ask["id"].startswith("srq-")
+        assert ask["params"]["pattern_key"] == "delete in root path"
+        assert "always" in ask["params"]["choices"]  # offered, as Hermes does; a client drops it
+        assert not any(_complete(f) for f in before)
+
+        await ws.send_str(
+            json.dumps({"jsonrpc": "2.0", "id": ask["id"], "result": {"choice": choice}})
+        )
+        after = await _frames_until(ws, _complete)
+        kinds = [(f.get("params") or {}).get("type") for f in after]
+        assert ("tool.start" in kinds) is ran
+        assert after[-1]["params"]["payload"]["text"] == reply
+
+        # And kept, as a conversation is.
+        resumed = await _call(ws, 3, "session.most_recent")
+        stored = resumed["result"]["session_id"]
+        messages = (await _call(ws, 4, "session.resume", {"session_id": stored}))["result"][
+            "messages"
+        ]
+        assert messages[-2:] == [
+            {"role": "user", "text": "!approve"},
+            {"role": "assistant", "text": reply},
+        ]
+
+    _run(test, tmp_path)
+
+
+def test_an_answer_to_nothing_it_asked_is_ignored(tmp_path):
+    async def test(http):
+        ws = await _socket(http)
+        await ws.send_str(
+            json.dumps({"jsonrpc": "2.0", "id": "srq-nobody", "result": {"choice": "once"}})
+        )
+        assert (await _call(ws, 1, "session.most_recent"))["result"] == {"session_id": None}
+
+    _run(test, tmp_path)

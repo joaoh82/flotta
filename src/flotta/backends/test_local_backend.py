@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import http.server
 import json
+import os
 import stat
 import threading
+import time
 import urllib.request
 
 import pytest
@@ -26,7 +28,7 @@ from flotta.backend import (
     default_scheme,
     pause,
 )
-from flotta.backends.local_backend import _DIRECT, LocalBackend, parse_endpoint
+from flotta.backends.local_backend import _DIRECT, STOP_TIMEOUT_S, LocalBackend, parse_endpoint
 from flotta.backends.standin import PASSWORD_ENV, USERNAME_ENV
 
 LOGIN = {USERNAME_ENV: "flotta", PASSWORD_ENV: "the-box-password"}
@@ -110,6 +112,103 @@ def test_its_conversations_survive_sleep(backend, tmp_path):
     stored = json.loads((tmp_path / "boxes" / "eng-a" / "hermes" / "sessions.json").read_text())
     (conversation,) = stored.values()
     assert conversation["messages"][0] == {"role": "user", "text": "remember this"}
+
+
+def test_stopping_an_agent_ends_the_conversations_open_on_it(backend):
+    """As a stopped machine does: the socket closes, and `stop` returns once the process has gone.
+
+    The stand-in stopped listening at once but held each open socket for its
+    web server's minute of grace, answering nothing, so a page that was
+    talking to it said "thinking…" until the turn timed out. `stop` returned
+    as soon as the port went quiet, with the process still there.
+    """
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    pid = int(backend._probe("eng-a")["pid"])
+
+    async def scenario():
+        base = _base(handle.endpoint)
+        async with client.new_session() as session:
+            await client.login(session, base, "flotta", "the-box-password")
+            ticket = await client.ws_ticket(session, base)
+            ws = await client.open_agent_socket(session, base, ticket)
+            await client.await_ready(ws)
+            started = time.monotonic()
+            await asyncio.to_thread(backend.stop, handle.endpoint)
+            took = time.monotonic() - started
+            message = await asyncio.wait_for(ws.receive(), timeout=2)
+            return took, message
+
+    took, message = asyncio.run(scenario())
+    assert message.type.name in {"CLOSE", "CLOSING", "CLOSED"}
+    assert took < STOP_TIMEOUT_S
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_a_stop_from_another_backend_is_prompt_and_leaves_no_zombie(backend, tmp_path):
+    """As on the control plane, which makes a backend per request: not the one that started it."""
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    pid = int(backend._probe("eng-a")["pid"])
+    started = time.monotonic()
+    LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+    assert time.monotonic() - started < STOP_TIMEOUT_S / 2
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_an_agent_that_will_not_stop_is_killed_by_any_backend(backend, tmp_path):
+    """One that ignores the request to stop is killed when its time is up, not left running.
+
+    By a backend that did not start it, as on the control plane, which makes
+    one per request: a hung agent cannot answer the probe, so only what was
+    recorded when it started says which process it is.
+    """
+    import signal
+
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    pid = int(backend._probe("eng-a")["pid"])
+    os.kill(pid, signal.SIGSTOP)  # frozen: it cannot act on SIGTERM, or answer
+    LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+    backend._children.pop("eng-a").wait(timeout=STOP_TIMEOUT_S)  # reap what was killed
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_a_killed_agent_is_reaped_rather_than_left_a_zombie(tmp_path):
+    """Started and stopped by different backends in one process, as the control plane does.
+
+    The stopping backend holds no `Popen`, so after the kill only `waitpid`
+    collects it; a zombie answers `kill(pid, 0)` and stays in the process table.
+    """
+    import signal
+
+    starter = LocalBackend(tmp_path / "boxes")
+    handle = starter.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    starter.start(handle.endpoint)
+    pid = int(starter._probe("eng-a")["pid"])
+    starter._children.clear()  # as if a different request had started it
+    os.kill(pid, signal.SIGSTOP)
+    LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_a_recorded_pid_that_is_someone_else_now_is_never_signalled(backend, tmp_path):
+    """Pids are reused: a stop signals the recorded one only while it is still this agent."""
+    import subprocess
+
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    stranger = subprocess.Popen(["sleep", "30"])
+    try:
+        (tmp_path / "boxes" / "eng-a" / "pid").write_text(str(stranger.pid))
+        LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait()
 
 
 def test_creating_a_name_that_exists_adopts_it(backend):

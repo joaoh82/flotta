@@ -273,6 +273,19 @@ conventions, and the sharp edges below.
   is `backends/test_local_offline.py`:** sign in, create, ticket, talk through
   the door, sleep, wake, destroy, with every socket and process recorded and
   anything off loopback, or anything but the stand-in, a failure.
+- **The web app holds a conversation through the door (M12.10).** A ticket's
+  `url` is `client.ticket_url`: `wss://<box>.$FLOTTA_DOMAIN/api/ws`, or the
+  scheme, host and port in `$FLOTTA_DOOR_URL` (`browser_door` refuses at
+  start anything that is not one; `just local` sets `ws://localhost:<door>`).
+  **The local stand-in behaves as a stopped machine does**: it closes its open
+  sockets (1001) when it stops, and `LocalBackend.stop` waits for the process
+  to exit (reaping it: the control plane makes a backend per request, so the
+  one stopping an agent holds no `Popen` and `kill(pid, 0)` called a zombie
+  alive) and finds a hung one by the process it started. Before, a page
+  talking to an agent that was put to sleep said "thinking…" for a minute.
+  Two scripted turns try a client against what a model does, for $0: `!tool`
+  (a terminal command) and `!approve` (a v2026.9.14 `approval` request,
+  answered by id, then run or not).
 - **The operator can look at an agency as its owner, and change nothing (M12.9).**
   `POST /api/orgs/{id}/view-as`, from the operator's own session (a person in
   the default org who is not one client's: `store.is_operator`), answers a

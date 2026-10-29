@@ -452,6 +452,8 @@ local control="8080" door="8081":
     export FLOTTA_BACKEND=local FLOTTA_LOCAL_HOME="$DIR/boxes" FLOTTA_STORE="$DIR/fleet.db"
     export FLOTTA_SIGNING_KEY="$(cat "$DIR/signing-key")" FLOTTA_BOX_PASSWORD="$(cat "$DIR/box-password")"
     export FLOTTA_PRINT_SIGN_IN_LINKS=1 FLOTTA_DOMAIN=localhost FLOTTA_DOOR_ORIGINS=http://localhost:3001
+    # A browser reaches this door as `ws://<agent>.localhost:<port>`, not TLS on 443.
+    export FLOTTA_DOOR_URL="ws://localhost:{{door}}"
     export FLOTTA_CONTROL_URL="http://127.0.0.1:{{control}}"
     CP= DOOR=
     trap 'kill $CP $DOOR 2>/dev/null; pkill -f "[f]lotta.backends.standin .*--home $FLOTTA_LOCAL_HOME/" || true' EXIT
