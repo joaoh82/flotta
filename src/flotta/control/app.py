@@ -3035,6 +3035,37 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/boxes/{box_id}/sleep")
+    def sleep_box_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
+        """Put an agent to sleep now, rather than when it has been idle long enough.
+
+        The web app's "sleep" button (M12.8). The reconcile loop already sleeps
+        an idle agent (`sleep_idle_boxes`); this is the same `stop_box`, asked
+        for by a person, so the row moves only after the substrate released the
+        machine. Idempotent: an agent already asleep answers 200.
+
+        **`fleet:write`, not `box:chat`.** Waking takes `box:chat` because
+        talking to an agent wakes it anyway. Sleeping is a decision about the
+        agent, like changing its model, and a client's read-only view cannot
+        make it.
+
+        409 for what the caller can fix (a task still running, an agent that is
+        not running), 502 for the substrate failing, as `/wake` answers.
+        """
+        from flotta.provision import ProvisionError, stop_box
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                result = stop_box(box.id, store=store, reason="asked")
+            except ProvisionError as exc:
+                status = 502 if str(exc).startswith("could not stop") else 409
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            return {"box": _box_dict(_scoped_box(store, token, box.id)), **result}
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/ticket")
     def chat_ticket(box_id: str, token: Token | None = needs_chat) -> Any:
         """A chat ticket for this one agent, for a browser to open it with (M12.5).

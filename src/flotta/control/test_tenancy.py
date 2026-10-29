@@ -108,6 +108,7 @@ def no_substrate(monkeypatch):
 
     for verb in (
         "wake_box",
+        "stop_box",
         "teardown_box",
         "upgrade_box",
         "set_model",
@@ -150,6 +151,7 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/upgrade", SCOPE_FLEET_WRITE, {"image": "registry/img:1"}),
     ("GET", "/api/boxes/{b}/address", SCOPE_BOX_CHAT, None),
     ("POST", "/api/boxes/{b}/wake", SCOPE_BOX_CHAT, None),
+    ("POST", "/api/boxes/{b}/sleep", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/ticket", SCOPE_BOX_CHAT, None),
     ("DELETE", "/api/boxes/{b}", SCOPE_BOX_DESTROY, None),
     ("GET", "/api/boxes/{b}/git-credential/repos", SCOPE_GIT_CREDENTIAL, None),
