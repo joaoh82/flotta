@@ -27,6 +27,7 @@ to `reimage`, and no memory snapshot, so `suspend` is `NotSupported` and
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import os
@@ -90,6 +91,19 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _alive(pid: int, child: subprocess.Popen | None) -> bool:
+    """Whether the process is still there. A child of ours is asked, which also reaps it."""
+    if child is not None:
+        return child.poll() is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # someone else's: it exists
+        return True
+    return True
 
 
 class LocalBackend:
@@ -229,19 +243,25 @@ class LocalBackend:
     def stop(self, box_id: str) -> None:
         name = self._name(box_id)
         running = self._probe(name)
-        if running is None:
+        # A hung agent does not answer the probe, and is the one that most
+        # needs stopping: the process this backend started is known anyway.
+        child = self._children.pop(name, None)
+        if running is None and (child is None or child.poll() is not None):
             return
-        pid = int(running["pid"])
+        pid = int(running["pid"]) if running is not None else child.pid
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return
+        # Until the process has gone, not until its port goes quiet: it stops
+        # listening first, and a stop that returned then left it holding every
+        # socket open on it, answering nothing.
         deadline = time.monotonic() + STOP_TIMEOUT_S
-        while time.monotonic() < deadline and self._probe(name) is not None:
-            time.sleep(0.1)
-        if self._probe(name) is not None:
-            os.kill(pid, signal.SIGKILL)
-        child = self._children.pop(name, None)
+        while time.monotonic() < deadline and _alive(pid, child):
+            time.sleep(0.05)
+        if _alive(pid, child):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
         if child is not None:
             child.wait(timeout=STOP_TIMEOUT_S)
 

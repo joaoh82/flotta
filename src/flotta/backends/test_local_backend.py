@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import http.server
 import json
+import os
 import stat
 import threading
+import time
 import urllib.request
 
 import pytest
@@ -26,7 +28,7 @@ from flotta.backend import (
     default_scheme,
     pause,
 )
-from flotta.backends.local_backend import _DIRECT, LocalBackend, parse_endpoint
+from flotta.backends.local_backend import _DIRECT, STOP_TIMEOUT_S, LocalBackend, parse_endpoint
 from flotta.backends.standin import PASSWORD_ENV, USERNAME_ENV
 
 LOGIN = {USERNAME_ENV: "flotta", PASSWORD_ENV: "the-box-password"}
@@ -110,6 +112,51 @@ def test_its_conversations_survive_sleep(backend, tmp_path):
     stored = json.loads((tmp_path / "boxes" / "eng-a" / "hermes" / "sessions.json").read_text())
     (conversation,) = stored.values()
     assert conversation["messages"][0] == {"role": "user", "text": "remember this"}
+
+
+def test_stopping_an_agent_ends_the_conversations_open_on_it(backend):
+    """As a stopped machine does: the socket closes, and `stop` returns once the process has gone.
+
+    The stand-in stopped listening at once but held each open socket for its
+    web server's minute of grace, answering nothing, so a page that was
+    talking to it said "thinking…" until the turn timed out. `stop` returned
+    as soon as the port went quiet, with the process still there.
+    """
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    pid = int(backend._probe("eng-a")["pid"])
+
+    async def scenario():
+        base = _base(handle.endpoint)
+        async with client.new_session() as session:
+            await client.login(session, base, "flotta", "the-box-password")
+            ticket = await client.ws_ticket(session, base)
+            ws = await client.open_agent_socket(session, base, ticket)
+            await client.await_ready(ws)
+            started = time.monotonic()
+            await asyncio.to_thread(backend.stop, handle.endpoint)
+            took = time.monotonic() - started
+            message = await asyncio.wait_for(ws.receive(), timeout=2)
+            return took, message
+
+    took, message = asyncio.run(scenario())
+    assert message.type.name in {"CLOSE", "CLOSING", "CLOSED"}
+    assert took < STOP_TIMEOUT_S
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_an_agent_that_will_not_stop_is_killed(backend):
+    """One that ignores the request to stop is killed when its time is up, not left running."""
+    import signal
+
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    pid = int(backend._probe("eng-a")["pid"])
+    os.kill(pid, signal.SIGSTOP)  # frozen: it cannot act on SIGTERM
+    backend.stop(handle.endpoint)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_creating_a_name_that_exists_adopts_it(backend):

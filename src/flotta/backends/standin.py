@@ -41,10 +41,11 @@ import json
 import os
 import secrets
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 LOGIN_PATH = "/auth/password-login"
 TICKET_PATH = "/api/auth/ws-ticket"
@@ -125,6 +126,9 @@ class Agent:
 
 
 AGENT: web.AppKey[Agent] = web.AppKey("agent", Agent)
+#: Every socket open on this agent, so stopping it ends them, as a stopped
+#: machine does, rather than holding them for the web server's minute of grace.
+SOCKETS: web.AppKey[weakref.WeakSet[web.WebSocketResponse]] = web.AppKey("sockets", weakref.WeakSet)
 
 
 async def _ready(request: web.Request) -> web.Response:
@@ -177,6 +181,7 @@ async def _socket(request: web.Request) -> web.StreamResponse:
         return web.json_response({"detail": "Unauthorized"}, status=401)
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+    request.app[SOCKETS].add(ws)
     await ws.send_str(_event("gateway.ready", {"skin": {}, "change_events": True, "standin": True}))
     async for message in ws:
         if message.type is not WSMsgType.TEXT:
@@ -274,7 +279,15 @@ def build_app(*, name: str, home: Path, credentials: tuple[str, str] | None) -> 
     app.router.add_post(LOGIN_PATH, _login)
     app.router.add_post(TICKET_PATH, _ticket)
     app.router.add_get(SOCKET_PATH, _socket)
+    app[SOCKETS] = weakref.WeakSet()
+    app.on_shutdown.append(_hang_up)
     return app
+
+
+async def _hang_up(app: web.Application) -> None:
+    """Close every open socket, going away: the agent is stopping."""
+    for ws in set(app[SOCKETS]):
+        await ws.close(code=WSCloseCode.GOING_AWAY, message=b"the agent is going to sleep")
 
 
 def credentials_from(env: dict[str, str]) -> tuple[str, str] | None:
