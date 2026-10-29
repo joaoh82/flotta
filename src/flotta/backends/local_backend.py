@@ -306,6 +306,10 @@ class LocalBackend:
         if _alive(pid, child):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+            # And reaped once it has died, or it lingers as a zombie of this process.
+            killed = time.monotonic() + 1.0
+            while time.monotonic() < killed and _alive(pid, child):
+                time.sleep(0.02)
         if child is not None:
             child.wait(timeout=STOP_TIMEOUT_S)
         with contextlib.suppress(FileNotFoundError):

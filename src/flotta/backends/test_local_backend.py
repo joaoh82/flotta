@@ -177,6 +177,25 @@ def test_an_agent_that_will_not_stop_is_killed_by_any_backend(backend, tmp_path)
         os.kill(pid, 0)
 
 
+def test_a_killed_agent_is_reaped_rather_than_left_a_zombie(tmp_path):
+    """Started and stopped by different backends in one process, as the control plane does.
+
+    The stopping backend holds no `Popen`, so after the kill only `waitpid`
+    collects it; a zombie answers `kill(pid, 0)` and stays in the process table.
+    """
+    import signal
+
+    starter = LocalBackend(tmp_path / "boxes")
+    handle = starter.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    starter.start(handle.endpoint)
+    pid = int(starter._probe("eng-a")["pid"])
+    starter._children.clear()  # as if a different request had started it
+    os.kill(pid, signal.SIGSTOP)
+    LocalBackend(tmp_path / "boxes").stop(handle.endpoint)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
 def test_a_recorded_pid_that_is_someone_else_now_is_never_signalled(backend, tmp_path):
     """Pids are reused: a stop signals the recorded one only while it is still this agent."""
     import subprocess
