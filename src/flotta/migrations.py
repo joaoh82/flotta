@@ -231,6 +231,17 @@ def _sign_up() -> tuple[str, ...]:
     )
 
 
+def _view_as() -> tuple[str, ...]:
+    """A session that only looks (M12.9): the operator viewing an agency as its owner.
+
+    `sessions.read_only` is 1 for one. It acts in an org its holder does not
+    belong to, so it is honoured only while they are still the operator, and
+    the control plane refuses every request made with it that would change
+    anything. Every session that exists already is an ordinary one.
+    """
+    return ("ALTER TABLE sessions ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0",)
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -253,6 +264,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         3,
         "sign-up: an org's status, and the org a sign-up link names",
         _sign_up(),
+    ),
+    Migration(
+        4,
+        "view-as: a read-only session the operator holds in another org",
+        _view_as(),
     ),
 )
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import ipaddress
 import logging
 import os
@@ -99,6 +100,7 @@ from flotta.store import (
     InvalidTenantError,
     InvalidTransitionError,
     LastOwnerError,
+    NotOperatorError,
     OrgNotActiveError,
     UnknownEntityError,
     is_terminal,
@@ -115,6 +117,16 @@ except ImportError:  # pragma: no cover - create_app's own import says so
     BackgroundTasks = Request = Any  # type: ignore[assignment,misc]
 
 _log = logging.getLogger("flotta.control")
+
+#: What a read-only session may still be used for (M12.9). Looking, and
+#: ending itself: signing out changes nothing about the org being viewed.
+_LOOKING = frozenset({"GET", "HEAD", "OPTIONS"})
+_ENDS_ITSELF = ("POST", "/api/auth/sign-out")
+
+#: A read-only session's token: what an owner may read, and no scope that
+#: writes. The method check in `_session_token` is what refuses a change;
+#: this is so a route that forgot to be a GET still meets a 403.
+VIEW_AS_SCOPES = frozenset({SCOPE_FLEET_READ, SCOPE_ORG_ADMIN})
 
 #: Live provisioning threads, held so nothing collects them mid-flight.
 _provisioning: set[threading.Thread] = set()
@@ -498,10 +510,12 @@ def create_app(
         (`_session_token`), and from here on nothing can tell the two apart.
         """
 
-        def dependency(authorization: str | None = Header(default=None)) -> Token | None:
+        def dependency(
+            request: Request, authorization: str | None = Header(default=None)
+        ) -> Token | None:
             scheme, _, credential = (authorization or "").partition(" ")
             if scheme.lower() == "session":
-                token = _session_token(credential.strip())
+                token = _session_token(credential.strip(), request)
             elif key is None:
                 return None
             elif scheme.lower() != "bearer":
@@ -536,12 +550,19 @@ def create_app(
 
         return dependency
 
-    def _session_token(secret: str) -> Token:
+    def _session_token(secret: str, request: Request) -> Token:
         """The token a live session's membership would mint, or 401.
 
         Asked on every request rather than fixed at sign-in, so ending the
         session, disabling the account or removing the membership takes effect
         on the next request, not when a month-long session would have expired.
+
+        **A read-only session changes nothing** (M12.9, the operator's "view
+        as owner"). Every request made with one that is not a read is refused
+        here, before any route runs, whatever the route and whatever its
+        scope; `control/test_view_as.py` sends one to every route there is.
+        It is honoured only while its holder is still the operator, since it
+        is no membership of the org it looks at.
         """
         refused = HTTPException(
             status_code=401,
@@ -554,10 +575,35 @@ def create_app(
             if session is None:
                 raise refused
             user = store.get_user(session.user_id)
-            membership = store.membership(session.user_id, session.org)
+            if session.read_only:
+                looking = store.is_operator(session.user_id) and store.get_org(session.org)
+                membership = None
+            else:
+                membership = store.membership(session.user_id, session.org)
         finally:
             store.close()
-        if user is None or user.disabled_at is not None or membership is None:
+        if user is None or user.disabled_at is not None:
+            raise refused
+        if session.read_only:
+            if not looking:
+                raise refused
+            if request.method not in _LOOKING and (request.method, request.url.path) != (
+                _ENDS_ITSELF
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"you are viewing {session.org!r} as its owner, which is read-only",
+                )
+            owner = person_token(
+                user_id=user.id,
+                org=session.org,
+                role="owner",
+                client=None,
+                issued_at=int(datetime.fromisoformat(session.created_at).timestamp()),
+                expires_at=int(datetime.fromisoformat(session.expires_at).timestamp()),
+            )
+            return dataclasses.replace(owner, scopes=VIEW_AS_SCOPES)
+        if membership is None:
             raise refused
         try:
             return person_token(
@@ -842,6 +888,78 @@ def create_app(
             store.close()
         return {"org": asdict(org)}
 
+    # -- the operator's view (M12.9) ------------------------------------------
+    #
+    # Everyone, every org's agents, and an agency seen as its owner sees it.
+    # Each is the operator's alone, and says so first.
+
+    @app.post("/api/orgs/{org_id}/view-as", status_code=201)
+    def view_as(
+        org_id: str,
+        token: Token | None = needs_read,
+        authorization: str | None = Header(default=None),
+    ) -> Any:
+        """A read-only session in `org_id`: the agency as its owner sees it.
+
+        For the operator's own session: a person is looking, and the session
+        says who. It lasts an hour, and nothing made with it changes anything
+        (`_session_token`). The operator's own session is untouched.
+        """
+        _require_operator(token, "view an agency as its owner")
+        session = _session_of(authorization)
+        store = store_factory()
+        try:
+            try:
+                secret = store.create_view_session(session.user_id, org_id)
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no org {org_id!r}") from exc
+            except NotOperatorError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except InvalidAccountError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            viewing = store.session(secret)
+        finally:
+            store.close()
+        assert viewing is not None
+        return {"session": secret, "expires_at": viewing.expires_at, "org": org_id}
+
+    @app.get("/api/users")
+    def list_users(token: Token | None = needs_read) -> Any:
+        """Everyone with an account, and where each of them belongs."""
+        _require_operator(token, "list everyone with an account")
+        store = store_factory()
+        try:
+            people = [
+                {
+                    "id": user.id,
+                    "email": user.email,
+                    "name": user.name,
+                    "created_at": user.created_at,
+                    "disabled_at": user.disabled_at,
+                    "memberships": [
+                        {"org": m.org, "client": m.client, "role": m.role, "since": m.created_at}
+                        for m in store.memberships_for(user.id)
+                    ],
+                }
+                for user in store.list_users()
+            ]
+        finally:
+            store.close()
+        return {"users": people}
+
+    @app.get("/api/fleet/boxes")
+    def list_fleet_boxes(all_: bool = False, token: Token | None = needs_read) -> Any:
+        """Every org's agents, which `GET /api/boxes` never is: that one is the caller's org's."""
+        _require_operator(token, "list every org's agents")
+        store = store_factory()
+        try:
+            boxes = store.list_boxes()
+            if not all_:
+                boxes = [b for b in boxes if not is_terminal("box", b.status)]
+            return _box_listing(store, boxes)
+        finally:
+            store.close()
+
     @app.get("/api/orgs/{org_id}/members")
     def list_members(org_id: str, token: Token | None = needs_admin) -> Any:
         """Who is in an org, as what: the team page."""
@@ -1092,6 +1210,8 @@ def create_app(
             "user": None,
             "memberships": [],
             "session": None,
+            # The operator looking at this org as its owner: nothing may change.
+            "viewing_as": False,
         }
         if (authorization or "").partition(" ")[0].lower() != "session":
             return payload
@@ -1108,6 +1228,7 @@ def create_app(
             {"org": m.org, "client": m.client, "role": m.role} for m in memberships
         ]
         payload["session"] = _session_view(session, current=session.id_hash)
+        payload["viewing_as"] = session.read_only
         return payload
 
     def _session_view(session: Any, *, current: str) -> dict[str, Any]:
@@ -1118,6 +1239,7 @@ def create_app(
             "created_at": session.created_at,
             "expires_at": session.expires_at,
             "current": session.id_hash == current,
+            "read_only": session.read_only,
         }
 
     @app.post("/api/auth/sign-out")
@@ -1283,7 +1405,7 @@ def create_app(
                 request.headers.getlist("x-forwarded-for"),
                 proxy_hops,
             )
-        token = check_relay(authorization)
+        token = check_relay(request, authorization)
         if not _is_operator(token):
             raise HTTPException(
                 status_code=403,
@@ -1752,41 +1874,43 @@ def create_app(
                 # A stopped box is idle, not finished — hiding it would hide
                 # the point of the fleet.
                 boxes = [b for b in boxes if not is_terminal("box", b.status)]
-            # Each box's newest task and its total spend. Cost lives on tasks
-            # (the formula measures start-to-verdict, meaningless across a
-            # machine that spans months), so the list view has to sum it. The
-            # direct-SQL version this replaces did `SUM(cost_estimate)`, and
-            # dropping it silently turned every cost in the UI into a blank.
-            summaries: dict[str, dict[str, Any]] = {}
-            for box in boxes:
-                tasks = store.list_tasks(box_id=box.id)
-                costs = [t.cost_estimate for t in tasks if t.cost_estimate is not None]
-                summaries[box.id] = {
-                    "latest_task": tasks[0].prompt if tasks else None,
-                    "task_count": len(tasks),
-                    # None rather than 0.0 when nothing is priced: a blank says
-                    # "no rate configured", a zero claims the box ran for free.
-                    "cost_estimate": sum(costs) if costs else None,
-                }
-            from flotta.provision import fleet_model
-
-            ids = [b.id for b in boxes]
-            metas = store.meta_for_boxes(ids)
-            models = store.models_for_boxes(ids)
-            default = fleet_model(store)
-            return {
-                "boxes": [
-                    {
-                        **_box_dict(
-                            b, metas.get(b.id), model=models.get(b.id), fleet_model=default
-                        ),
-                        **summaries[b.id],
-                    }
-                    for b in boxes
-                ]
-            }
+            return _box_listing(store, boxes)
         finally:
             store.close()
+
+    def _box_listing(store: Any, boxes: list[Any]) -> Any:
+        """`boxes` as a list answers them, each with its newest task and spend."""
+        # Each box's newest task and its total spend. Cost lives on tasks
+        # (the formula measures start-to-verdict, meaningless across a
+        # machine that spans months), so the list view has to sum it. The
+        # direct-SQL version this replaces did `SUM(cost_estimate)`, and
+        # dropping it silently turned every cost in the UI into a blank.
+        summaries: dict[str, dict[str, Any]] = {}
+        for box in boxes:
+            tasks = store.list_tasks(box_id=box.id)
+            costs = [t.cost_estimate for t in tasks if t.cost_estimate is not None]
+            summaries[box.id] = {
+                "latest_task": tasks[0].prompt if tasks else None,
+                "task_count": len(tasks),
+                # None rather than 0.0 when nothing is priced: a blank says
+                # "no rate configured", a zero claims the box ran for free.
+                "cost_estimate": sum(costs) if costs else None,
+            }
+        from flotta.provision import fleet_model
+
+        ids = [b.id for b in boxes]
+        metas = store.meta_for_boxes(ids)
+        models = store.models_for_boxes(ids)
+        default = fleet_model(store)
+        return {
+            "boxes": [
+                {
+                    **_box_dict(b, metas.get(b.id), model=models.get(b.id), fleet_model=default),
+                    **summaries[b.id],
+                }
+                for b in boxes
+            ]
+        }
 
     @app.post("/api/boxes", status_code=201)
     def create_box_endpoint(body: dict[str, Any], token: Token | None = needs_write) -> Any:

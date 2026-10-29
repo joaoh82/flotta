@@ -70,6 +70,11 @@ OPERATOR_ROUTES = frozenset(
         "add_user",
         "approve_org",
         "decline_org",
+        # The operator's view (M12.9): everyone, every org's agents, and a
+        # read-only session in an agency.
+        "view_as",
+        "list_users",
+        "list_fleet_boxes",
     }
 )
 
