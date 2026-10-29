@@ -481,6 +481,10 @@ def create_app(
             "to this log on a machine whose log only you can read."
         )
     link_base = app_url if app_url is not None else resolve_app_url()
+    # Where tickets send a browser: refused now, not in a ticket nobody can use.
+    from flotta.client import browser_door
+
+    browser_door()
     per_address = RateLimit(LINK_LIMIT_PER_ADDRESS, LINK_LIMIT_WINDOW_S)
     per_ip = RateLimit(LINK_LIMIT_PER_IP, LINK_LIMIT_WINDOW_S)
     invites_per_org = RateLimit(INVITE_LIMIT_PER_ORG, LINK_LIMIT_WINDOW_S)
@@ -3227,14 +3231,13 @@ def create_app(
             client=box.client,
             key=key,
         )
-        from flotta.client import DEFAULT_DOMAIN, DOMAIN_ENV
+        from flotta.client import ticket_url
 
-        domain = (os.environ.get(DOMAIN_ENV) or DEFAULT_DOMAIN).strip().strip(".")
         return {
             "ticket": ticket,
             "ttl_s": TICKET_TTL_S,
             "box": {"id": box.id, "name": box.name},
-            "url": f"wss://{box.name}.{domain}/api/ws",
+            "url": ticket_url(box.name),
             "protocols": [CHAT_PROTOCOL, f"{TICKET_PROTOCOL_PREFIX}{ticket}"],
         }
 

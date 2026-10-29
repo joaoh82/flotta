@@ -33,13 +33,15 @@ import contextlib
 import itertools
 import json
 import os
+import re
 import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from flotta.backend import BackendError
 from flotta.backends.fly_backend import parse_endpoint
@@ -227,6 +229,52 @@ USERNAME = "flotta"
 
 DOMAIN_ENV = "FLOTTA_DOMAIN"
 DEFAULT_DOMAIN = "flotta.dev"
+
+
+#: Where a browser reaches the door, when that is not TLS on `$FLOTTA_DOMAIN`:
+#: `ws://localhost:8081` for `just local`, or a self-hosted door on a port.
+DOOR_URL_ENV = "FLOTTA_DOOR_URL"
+
+
+def browser_door(env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """The scheme and `host[:port]` a browser opens an agent's socket on.
+
+    `$FLOTTA_DOOR_URL` if set: `ws://` or `wss://`, a host, a port if it has
+    one, and nothing else, since each agent is a subdomain of that host.
+    Otherwise `wss://` on `$FLOTTA_DOMAIN`, which is the deployed door. Raises
+    `ValueError` for anything else, so the control plane refuses to start
+    rather than send browsers somewhere nothing listens.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(DOOR_URL_ENV) or "").strip()
+    if not raw:
+        return "wss", (env.get(DOMAIN_ENV) or DEFAULT_DOMAIN).strip().strip(".")
+    refused = ValueError(
+        f"${DOOR_URL_ENV} must be ws:// or wss:// and a host, with a port if it has one "
+        f"and nothing else (e.g. ws://localhost:8081); got {raw!r}"
+    )
+    parts = urlsplit(raw)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise refused from exc
+    host = parts.hostname or ""
+    if (
+        parts.scheme not in ("ws", "wss")
+        or not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", host)
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+        or parts.username is not None
+    ):
+        raise refused
+    return parts.scheme, f"{host}:{port}" if port else host
+
+
+def ticket_url(box_name: str, env: Mapping[str, str] | None = None) -> str:
+    """Where a browser opens `box_name`'s conversation with a chat ticket (M12.5)."""
+    scheme, where = browser_door(env)
+    return f"{scheme}://{box_name}.{where}/api/ws"
 
 
 def door_url(box_name: str, *, domain: str | None = None) -> str:

@@ -80,6 +80,37 @@ def test_a_person_gets_a_ticket_for_their_agent(api, fleet, monkeypatch):
     assert body["protocols"] == [CHAT_PROTOCOL, f"{TICKET_PROTOCOL_PREFIX}{body['ticket']}"]
 
 
+def test_the_ticket_names_the_door_a_browser_can_reach(api, fleet, monkeypatch):
+    """`$FLOTTA_DOOR_URL` is where the door is, for a door not on 443 or not on TLS.
+
+    `just local`'s door is plain `ws://` on a port of its own. Built from the
+    domain alone, the ticket sent a browser to `wss://<agent>.localhost/api/ws`,
+    where nothing listens.
+    """
+    monkeypatch.setenv("FLOTTA_DOOR_URL", "ws://localhost:8181")
+    monkeypatch.setenv("FLOTTA_DOMAIN", "boxes.example.org")
+    answer = _ticket(api, "b-support", _as(fleet, "ana@example.com"))
+    assert answer.json()["url"] == "ws://support--acme--agency-x.localhost:8181/api/ws"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["http://localhost:8181", "localhost:8181", "wss://", "wss://flotta.dev/api", "wss://a b"],
+)
+def test_a_door_url_that_is_not_one_is_refused_at_start(fleet, monkeypatch, value):
+    """At start, not in a ticket: a browser sent to the wrong place says nothing useful."""
+    monkeypatch.setenv("FLOTTA_DOOR_URL", value)
+    with pytest.raises(ValueError, match="FLOTTA_DOOR_URL"):
+        _app(fleet)
+
+
+def test_without_a_door_url_the_door_is_tls_on_the_domain(api, fleet, monkeypatch):
+    monkeypatch.delenv("FLOTTA_DOOR_URL", raising=False)
+    monkeypatch.setenv("FLOTTA_DOMAIN", "boxes.example.org")
+    answer = _ticket(api, "b-support", _as(fleet, "ana@example.com"))
+    assert answer.json()["url"] == "wss://support--acme--agency-x.boxes.example.org/api/ws"
+
+
 def test_an_agent_is_found_by_its_name_too(api, fleet):
     answer = _ticket(api, "support--acme--agency-x", _as(fleet, "ana@example.com"))
     assert verify_ticket(answer.json()["ticket"], key=KEY).box == "b-support"
