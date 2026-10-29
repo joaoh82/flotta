@@ -849,6 +849,16 @@ def create_door(
                 )
                 for task in pending:
                     task.cancel()
+                # Read what ended it. A side that closed, with or without a
+                # close frame (a killed agent sends none), is how a
+                # conversation ends; left unread, asyncio logged each one as a
+                # crash ("Task exception was never retrieved").
+                for task in done:
+                    error = task.exception()
+                    if isinstance(error, websockets.exceptions.ConnectionClosed):
+                        _log.info("ws to %s ended: %s", target.name, error)
+                    elif error is not None:
+                        raise error
         except Exception as exc:  # pragma: no cover - network faults
             _log.warning("ws proxy to %s failed: %s", target.name, exc)
         finally:

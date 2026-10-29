@@ -299,6 +299,10 @@ def hermes():
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         await ws.send_str('{"method":"event","params":{"type":"gateway.ready"}}')
+        if seen.get("drop"):
+            # Gone with no close frame: a killed process, a vanished machine.
+            request.transport.abort()
+            return ws
         message = await ws.receive()
         await ws.send_str(f"echo:{message.data}")
         await ws.close()
@@ -384,3 +388,34 @@ def test_a_handshake_that_breaks_is_said_to(hermes, failure):
     code, _ = _refused(app, protocols=_protocols(_ticket()))
     assert code == 4502
     assert seen["sockets"] == []
+
+
+def test_an_agent_that_drops_its_socket_ends_the_browsers_quietly(hermes, caplog):
+    """A dead agent closes the browser's socket, and is not logged as a crash.
+
+    The relay ended correctly before, but the half that read the agent raised
+    `ConnectionClosedError` into a task nobody read, and asyncio logged it as
+    "Task exception was never retrieved", with a traceback, every time an
+    agent died mid-conversation (flotta issue 6).
+    """
+    import gc
+    import logging
+
+    from starlette.websockets import WebSocketDisconnect
+
+    port, seen = hermes
+    seen["drop"] = True
+    app, _ = _door(port, box_credentials=("flotta", "the-box-password"))
+    with caplog.at_level(logging.DEBUG):
+        with (
+            TestClient(app) as client,
+            client.websocket_connect(
+                "/api/ws", headers={**HOST, "Origin": WEB_APP}, subprotocols=_protocols(_ticket())
+            ) as ws,
+        ):
+            assert "gateway.ready" in ws.receive_text()
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_text()
+        gc.collect()
+    noisy = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert noisy == [], [r.getMessage() for r in noisy]
