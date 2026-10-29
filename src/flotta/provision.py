@@ -71,6 +71,7 @@ from flotta.backend import (
     BoxSpec,
     NotSupported,
     UnknownBackendError,
+    default_scheme,
 )
 from flotta.backend import backend_for as _backend_for
 from flotta.backend import pause as _pause
@@ -120,6 +121,15 @@ MAX_CONCURRENT_ENV = "FLOTTA_MAX_CONCURRENT"
 # It covers **container time only**; model tokens are a separate bill Flotta
 # never sees.
 COST_PER_SECOND_ENV = "FLOTTA_COST_PER_SECOND"
+
+
+def _default_backend() -> Backend:
+    """Where a new box goes: `$FLOTTA_BACKEND`, else Fly.
+
+    Through `_backend_for` rather than `flotta.backend.default_backend`, so the
+    one seam every test patches to stand in for a substrate is still the one.
+    """
+    return _backend_for(f"{default_scheme()}://")
 
 
 def resolve_cost_rate(
@@ -596,7 +606,7 @@ def _close_stranded_provision(
         # learned its address. Finding it is the difference between a tidy row
         # and a machine billing forever.
         try:
-            endpoint = _peek_endpoint(resolve("fly://"), box.name)
+            endpoint = _peek_endpoint(resolve(f"{default_scheme()}://"), box.name)
         except Exception as exc:  # noqa: BLE001 - a probe must never end a sweep
             detail["probe_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -814,7 +824,7 @@ def create_box(
     if box is None and store.get_org(org) is not None:
         store.require_active_org(org)
 
-    impl = backend or _backend_for("fly://")  # default substrate for persistent boxes
+    impl = backend or _default_backend()
 
     # `create` is idempotent over the *machine* — it adopts `machines[0]` rather
     # than adding a second — but the store is not, so a second `create_box`
@@ -871,7 +881,9 @@ def create_box(
     # either behaviour on its own.
     #
     # An explicit `spec.image` still wins: a caller naming an image means it.
-    if not base.image:
+    # A backend that boots from no image (`local://`) is not given one, and the
+    # lookup is skipped rather than ignored: it asks Fly.
+    if not base.image and getattr(impl, "takes_image", True):
         fleet_image, _ = resolve_fleet_image()
         if fleet_image:
             base = replace(base, image=fleet_image)

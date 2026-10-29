@@ -9,8 +9,10 @@ delete sixteen tests from it.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -118,6 +120,39 @@ def test_the_insecure_override_is_gone():
 def test_the_refusal_says_how_to_fix_it():
     with pytest.raises(InsecureBindError, match="flotta token key"):
         check_bind("0.0.0.0", env={})
+
+
+# -- the default substrate --------------------------------------------------
+
+
+def test_a_control_plane_with_a_mistyped_backend_does_not_start(tmp_path, monkeypatch):
+    """Found when it starts, not by the first person to create an agent, and
+    never read as Fly: the typo is refused with the variable named."""
+    from flotta.backend import UnknownBackendError
+
+    monkeypatch.setenv("FLOTTA_BACKEND", "lcoal")
+    with pytest.raises(UnknownBackendError, match="FLOTTA_BACKEND"):
+        create_app(store_factory=lambda: FleetStore(tmp_path / "f.db"), run_loop=False)
+
+
+def test_flotta_serve_with_a_mistyped_backend_says_so_and_exits(monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.setenv("FLOTTA_BACKEND", "lcoal")
+    # Never a real server: without the check this would reach `uvicorn.run`.
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **k: None))
+    result = CliRunner().invoke(app, ["serve"])
+    assert result.exit_code == 2
+    assert "FLOTTA_BACKEND" in result.output
+
+
+def test_a_backend_mistyped_after_start_is_a_503_that_names_it(async_client, monkeypatch):
+    monkeypatch.setenv("FLOTTA_BACKEND", "lcoal")
+    response = async_client.post("/api/boxes", json={"name": "eng-z"})
+    assert response.status_code == 503
+    assert "FLOTTA_BACKEND" in response.json()["detail"]
 
 
 # -- reads ------------------------------------------------------------------

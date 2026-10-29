@@ -55,6 +55,8 @@ not latency — and `pause()` falls back to `stop` wherever suspend is refused.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -383,3 +385,35 @@ def backend_for(endpoint: str | None) -> Backend:
             f"no backend registered for {scheme!r}; have {registered_schemes()}"
         )
     return factory()
+
+
+# --- the default substrate -------------------------------------------------
+
+#: Where a new box is created, as a scheme. `fly` unless this says otherwise;
+#: `local` runs each agent as a stand-in process on this machine (M12.6).
+DEFAULT_BACKEND_ENV = "FLOTTA_BACKEND"
+DEFAULT_SCHEME = "fly"
+
+
+def default_scheme(env: Mapping[str, str] | None = None) -> str:
+    """The substrate a new box goes to.
+
+    Only *new* boxes: an existing one is always routed by its own endpoint
+    (`backend_for`), so changing this never moves or strands an agent. A value
+    naming nothing registered is refused rather than read as `fly`, because a
+    typo that quietly provisioned on Fly would spend money on the one machine
+    that was meant to be free.
+    """
+    env = os.environ if env is None else env
+    scheme = (env.get(DEFAULT_BACKEND_ENV) or "").strip().lower() or DEFAULT_SCHEME
+    if scheme not in registered_schemes():
+        raise UnknownBackendError(
+            f"${DEFAULT_BACKEND_ENV}={scheme!r} names no substrate; "
+            f"expected one of {registered_schemes()}"
+        )
+    return scheme
+
+
+def default_backend(env: Mapping[str, str] | None = None) -> Backend:
+    """The backend `default_scheme` names."""
+    return backend_for(f"{default_scheme(env)}://")

@@ -445,6 +445,12 @@ def create_app(
 
     state = LoopState(interval_s=resolved_interval)
 
+    # Where new agents go, checked now: a typo in `$FLOTTA_BACKEND` refuses to
+    # start, rather than starting healthy and failing the first create.
+    from flotta.backend import default_scheme
+
+    default_scheme()
+
     key = signing_key if signing_key is not None else resolve_signing_key()
     if key is None:
         _log.warning(
@@ -1990,12 +1996,17 @@ def create_app(
         """
         from fastapi.responses import JSONResponse
 
-        from flotta.provision import _backend_for, create_box, reserve_box
+        from flotta.backend import UnknownBackendError
+        from flotta.provision import _default_backend, create_box, reserve_box
         from flotta.store import DuplicateBoxError
 
         store = store_factory()
         try:
-            impl = _backend_for("fly://")
+            try:
+                impl = _default_backend()
+            except UnknownBackendError as exc:
+                # Checked at start; this is the variable changing underneath.
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
             # By address: that is what the Fly app is named after.
             probe = _peek_for(impl, label)
             occupied = _occupant(store, token, probe) if probe else None

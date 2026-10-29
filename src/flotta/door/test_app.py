@@ -10,11 +10,14 @@ someone's agent.
 from __future__ import annotations
 
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_READ, mint
 from flotta.door.app import (
+    DEFAULT_BOX_PORT,
     BoxUnavailable,
     ControlPlane,
     Target,
@@ -22,6 +25,8 @@ from flotta.door.app import (
     host_to_box_name,
     internal_host,
     resolve_box_credentials,
+    resolve_local_boxes,
+    upstream,
 )
 
 KEY = "a-signing-key-for-door-tests"
@@ -83,6 +88,62 @@ def test_a_box_is_addressed_by_machine_not_by_app():
     whichever answered — someone else's agent, with someone else's memory.
     """
     assert internal_host("fly://my-app/48ed9344ce3798") == "48ed9344ce3798.vm.my-app.internal"
+
+
+def test_a_fly_box_is_reached_on_hermess_port():
+    assert upstream("fly://my-app/m1") == ("m1.vm.my-app.internal", DEFAULT_BOX_PORT)
+
+
+def test_a_local_box_is_reached_on_the_port_its_endpoint_names():
+    assert upstream("local://127.0.0.1:41234/eng-a", local=True) == ("127.0.0.1", 41234)
+
+
+def test_a_door_that_was_not_told_it_is_local_routes_no_local_box():
+    """On Fly, loopback is the door's own machine. One misplaced
+    `FLOTTA_BACKEND=local` on the control plane must not make the deployed door
+    proxy authenticated traffic to whatever listens there."""
+    with pytest.raises(BoxUnavailable, match="FLOTTA_DOOR_LOCAL") as refused:
+        upstream("local://127.0.0.1:41234/eng-a")
+    assert refused.value.status == 502
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [({}, False), ({"FLOTTA_DOOR_LOCAL": "0"}, False), ({"FLOTTA_DOOR_LOCAL": "1"}, True)],
+)
+def test_a_local_door_is_one_that_says_so(env, expected):
+    assert resolve_local_boxes(env) is expected
+
+
+def test_a_local_door_will_not_bind_where_others_can_reach_it(monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
+    monkeypatch.setenv("FLOTTA_DOOR_LOCAL", "1")
+    # Never a real server: without the check this would reach `uvicorn.run`.
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **k: None))
+    result = CliRunner().invoke(app, ["door", "--host", "0.0.0.0"])
+    assert result.exit_code == 2
+    assert "FLOTTA_DOOR_LOCAL" in result.output
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "local://10.0.0.5:41234/eng-a",
+        "local://agents.example.com:41234/eng-a",
+        "modal://x/y",
+        "eng-a",
+    ],
+)
+def test_an_endpoint_the_door_cannot_reach_is_a_502_not_a_connection(endpoint):
+    """A `local://` row naming another machine would make a free local agent a
+    way to send the door's traffic anywhere, even from a local door."""
+    with pytest.raises(BoxUnavailable) as refused:
+        upstream(endpoint, local=True)
+    assert refused.value.status == 502
 
 
 # -- who gets through -------------------------------------------------------
@@ -268,6 +329,7 @@ def _door_for(
     woken_id=None,
     name_now_holds=None,
     torn_down=(),
+    endpoint="fly://app/m1",
     **kwargs,
 ):
     """A door in front of a fake control plane and the stub box.
@@ -300,7 +362,7 @@ def _door_for(
             return Target(
                 box_id=woken_id or started,
                 name=name,
-                endpoint="fly://app/m1",
+                endpoint=endpoint,
                 host="127.0.0.1",
                 port=port,
             )
@@ -327,6 +389,23 @@ def test_the_door_wakes_the_box_and_proxies_to_it(stub_box):
     assert response.json() == {"box": "ok"}
     assert plane.woken == ["eng-a"], "the box must be woken before it is proxied to"
     assert seen[-1]["path"] == "/api/status"
+
+
+@pytest.mark.parametrize("local_boxes, status", [(False, 502), (True, 200)])
+def test_a_local_box_is_proxied_to_only_by_a_local_door(stub_box, local_boxes, status):
+    """A deployed door, whose loopback is its own machine, sends nothing there."""
+    from fastapi.testclient import TestClient
+
+    port, seen = stub_box
+    app, _ = _door_for(port, endpoint=f"local://127.0.0.1:{port}/eng-a", local_boxes=local_boxes)
+    before = len(seen)
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/status",
+            headers={"Host": "eng-a.flotta.dev", "Authorization": _bearer(SCOPE_BOX_CHAT)},
+        )
+    assert response.status_code == status, response.text
+    assert (len(seen) > before) is local_boxes
 
 
 def test_the_box_sees_its_own_credentials_not_the_callers_token(stub_box):
