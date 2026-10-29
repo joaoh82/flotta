@@ -76,6 +76,14 @@ def reply_to(text: str, *, name: str, turn: int) -> str:
     )
 
 
+#: Messages that script a turn the way a real agent's goes, so a client can be
+#: tried against tools and approvals with no model: `!tool` uses one, `!approve`
+#: asks first. The frames are the shapes captured off a live gateway (v2026.9.14).
+TOOL_TRIGGER = "!tool"
+APPROVE_TRIGGER = "!approve"
+PROBE_COMMAND = "rm -rf /tmp/flotta-standin-probe"
+
+
 class Agent:
     """One stand-in's state: stored conversations, plus this process's live ids."""
 
@@ -87,6 +95,8 @@ class Agent:
         self.tickets: dict[str, float] = {}
         #: live id -> stored id. Per process, as Hermes's are.
         self.live: dict[str, str] = {}
+        #: An approval asked and not yet answered: its request id -> (live id, stored id).
+        self.asked: dict[str, tuple[str, str]] = {}
 
     # -- stored conversations -------------------------------------------------
 
@@ -200,11 +210,71 @@ async def _socket(request: web.Request) -> web.StreamResponse:
     return ws
 
 
+def _streamed(text: str, live_id: str) -> list[str]:
+    """`text` as the deltas a gateway streams it in, a word at a time."""
+    words = text.split(" ")
+    return [
+        _event("message.delta", {"text": word + (" " if i < len(words) - 1 else "")}, live_id)
+        for i, word in enumerate(words)
+    ]
+
+
+def _tool(live_id: str, context: str) -> list[str]:
+    """One terminal command, as a gateway reports it."""
+    tool_id = f"call_{secrets.token_hex(6)}"
+    args = {"command": context}
+    return [
+        _event("tool.generating", {"name": "terminal"}, live_id),
+        _event(
+            "tool.start",
+            {"tool_id": tool_id, "name": "terminal", "context": context, "args": args},
+            live_id,
+        ),
+        _event(
+            "tool.complete",
+            {
+                "tool_id": tool_id,
+                "name": "terminal",
+                "duration_s": 0.02,
+                "result": {"error": None, "exit_code": 0, "output": ""},
+                "args": args,
+            },
+            live_id,
+        ),
+    ]
+
+
+def _finish(agent: Agent, stored_id: str, live_id: str, answer: str) -> list[str]:
+    """End a turn with `answer`, kept in the conversation."""
+    sessions = agent.load()
+    if stored_id in sessions:
+        sessions[stored_id]["messages"].append({"role": "assistant", "text": answer})
+        agent.save(sessions)
+    return [
+        *_streamed(answer, live_id),
+        _event("message.complete", {"text": answer, "status": "complete"}, live_id),
+    ]
+
+
+def _answered(agent: Agent, rid: str, result: Any) -> list[str]:
+    """A person's answer to an approval this agent asked for: run it, or not."""
+    live_id, stored_id = agent.asked.pop(rid)
+    choice = result.get("choice") if isinstance(result, dict) else None
+    if choice in ("once", "session"):
+        return [
+            *_tool(live_id, PROBE_COMMAND),
+            *_finish(agent, stored_id, live_id, f"Approved ({choice}), so I ran it."),
+        ]
+    return _finish(agent, stored_id, live_id, f"Not approved ({choice}), so I did not run it.")
+
+
 def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
     """Every frame one request produces, in the order they are sent."""
     rid = frame.get("id")
     method = frame.get("method")
     params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+    if method is None and isinstance(rid, str) and rid in agent.asked:
+        return _answered(agent, rid, frame.get("result"))
     sessions = agent.load()
 
     if method == "session.create":
@@ -252,19 +322,43 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
         messages = sessions[stored_id]["messages"]
         messages.append({"role": "user", "text": text})
         turn = sum(1 for m in messages if m["role"] == "user")
-        answer = reply_to(text, name=agent.name, turn=turn)
-        messages.append({"role": "assistant", "text": answer})
         agent.save(sessions)
-        words = answer.split(" ")
-        deltas = [
-            _event("message.delta", {"text": word + (" " if i < len(words) - 1 else "")}, live_id)
-            for i, word in enumerate(words)
-        ]
+        started = [_result(rid, {"status": "submitted"}), _event("message.start", {}, live_id)]
+        if text.strip().startswith(APPROVE_TRIGGER):
+            # Asked as a gateway that asks: its own request, answered by id.
+            request_id = f"srq-{secrets.token_hex(6)}"
+            agent.asked[request_id] = (live_id, stored_id)
+            ask = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "approval",
+                "params": {
+                    "allow_permanent": True,
+                    "allow_session": True,
+                    "choices": ["once", "session", "always", "deny"],
+                    "command": PROBE_COMMAND,
+                    "description": "delete in root path",
+                    "pattern_key": "delete in root path",
+                    "pattern_keys": ["delete in root path"],
+                    "request_id": secrets.token_hex(16),
+                    "session_id": live_id,
+                },
+            }
+            return [
+                *started,
+                *_streamed("I need to delete something first.", live_id),
+                json.dumps(ask),
+            ]
+        if text.strip().startswith(TOOL_TRIGGER):
+            return [
+                *started,
+                *_streamed("Let me look.", live_id),
+                *_tool(live_id, "ls /workspace"),
+                *_finish(agent, stored_id, live_id, "The workspace is empty."),
+            ]
         return [
-            _result(rid, {"status": "submitted"}),
-            _event("message.start", {}, live_id),
-            *deltas,
-            _event("message.complete", {"text": answer, "status": "complete"}, live_id),
+            *started,
+            *_finish(agent, stored_id, live_id, reply_to(text, name=agent.name, turn=turn)),
         ]
 
     if rid is None:
