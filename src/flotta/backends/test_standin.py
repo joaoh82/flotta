@@ -14,10 +14,13 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from flotta.backends.standin import (
+    INSTRUCTIONS_ENV,
     METHOD_NOT_FOUND,
     SESSION_NOT_FOUND,
     build_app,
     credentials_from,
+    seed_soul,
+    soul_path,
 )
 
 
@@ -295,3 +298,44 @@ def test_an_answer_to_nothing_it_asked_is_ignored(tmp_path):
         assert (await _call(ws, 1, "session.most_recent"))["result"] == {"session_id": None}
 
     _run(test, tmp_path)
+
+
+# -- standing instructions, fixed when a session starts (FLOTTA-84) -----------
+
+
+def test_a_session_keeps_the_instructions_it_started_with(tmp_path):
+    """As Hermes's system prompt does: an edit reaches a new session, not this one.
+
+    That is what makes a client that resumes a session older than the edit
+    visible locally, rather than only on a real agent."""
+    seed_soul(tmp_path, {INSTRUCTIONS_ENV: "Answer in Dutch.\nAlways."})
+
+    async def test(http):
+        ws = await _socket(http)
+        before = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        soul_path(tmp_path).write_text("Answer in French.\n")
+        _, events = await _turn(ws, 2, before, "hello")
+        assert "'Answer in Dutch.'" in events[-1]["payload"]["text"]
+        after = (await _call(ws, 3, "session.create"))["result"]["session_id"]
+        _, events = await _turn(ws, 4, after, "hello")
+        assert "'Answer in French.'" in events[-1]["payload"]["text"]
+
+    _run(test, tmp_path)
+
+
+def test_without_instructions_it_says_nothing_about_them(tmp_path):
+    async def test(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        _, events = await _turn(ws, 2, live, "hello")
+        assert "instructions" not in events[-1]["payload"]["text"]
+
+    _run(test, tmp_path)
+
+
+def test_instructions_are_seeded_once_as_the_entrypoint_does(tmp_path):
+    """After the first boot the file is the agent's: a restart keeps an edit."""
+    seed_soul(tmp_path, {INSTRUCTIONS_ENV: "first"})
+    soul_path(tmp_path).write_text("edited\n")
+    seed_soul(tmp_path, {INSTRUCTIONS_ENV: "first"})
+    assert soul_path(tmp_path).read_text() == "edited\n"
