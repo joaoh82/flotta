@@ -1655,8 +1655,13 @@ class FleetStore:
         `repo` is normalised to `owner/name`: a grant recorded as a URL and a
         grant recorded as a slug would look like two different grants for the
         same repository, and the credential path compares them for equality.
+
+        Refused for another org's box, here so that every caller meets it: the
+        control plane, and the CLI writing the store directly.
         """
-        self._require("box", box_id)
+        box = self._get_box_or_raise(box_id)
+        if not reaches_fleet_github(box.org):
+            raise ValueError(AGENCY_GITHUB_UNAVAILABLE)
         normalised = normalise_repo(repo)
         self._conn.execute(
             "INSERT OR REPLACE INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?)"
@@ -2555,6 +2560,22 @@ def validate_box_name(name: str) -> str:
         f"{value!r} cannot be an address: an agent name is lowercase letters, "
         f"digits and dashes, and cannot start or end with a dash" + hint
     )
+
+
+#: Why a tenant's agent gets no repository (FLOTTA-83). `$FLOTTA_GITHUB_TOKEN`
+#: is the operator's own token, and the credential a box is handed *is* that
+#: token whatever repository it asked for, so a grant to another org's agent
+#: would put the operator's GitHub on that agency's machine. An org connecting
+#: its own GitHub (FLOTTA-22) is what lifts it.
+AGENCY_GITHUB_UNAVAILABLE = (
+    "GitHub access for an agency's agents is not available yet: the fleet's "
+    "GitHub token is the operator's own, and each agency will connect its own GitHub"
+)
+
+
+def reaches_fleet_github(org: str) -> bool:
+    """Whether an org's agents may use the fleet's GitHub token: the operator's only."""
+    return org == DEFAULT_ORG
 
 
 def normalise_repo(repo: str) -> str:

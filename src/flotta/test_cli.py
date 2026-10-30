@@ -850,6 +850,28 @@ def test_repo_reports_a_refusal_rather_than_a_traceback(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_a_local_grant_to_an_agencys_agent_is_refused_without_a_traceback(tmp_path, monkeypatch):
+    """The store refuses it (FLOTTA-83); the command says why, as a refusal."""
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    store = tmp_path / "fleet.db"
+    with FleetStore(store) as fleet:
+        fleet.create_org("agency-x", "agency-x")
+        fleet.create_client("agency-x", "acme", "Acme")
+        box = fleet.create_box("support", org="agency-x", client="acme")
+
+    result = CliRunner().invoke(
+        app, ["repo", "grant", box.name, "joaoh82/flotta", "--store", str(store)]
+    )
+
+    assert result.exit_code == 2, result.exception
+    assert "not available" in result.output
+
+
 # -- `flotta create` refuses a name that cannot be an address ---------------
 
 

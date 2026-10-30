@@ -91,6 +91,7 @@ from flotta.relay import (
     envelope,
 )
 from flotta.store import (
+    AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
     LINK_TTL_S,
     DuplicateMembershipError,
@@ -105,6 +106,7 @@ from flotta.store import (
     UnknownEntityError,
     is_terminal,
     normalize_email,
+    reaches_fleet_github,
 )
 
 try:
@@ -2378,13 +2380,21 @@ def create_app(
         finally:
             store.close()
 
+    def _usable_repos(store: Any, box: Any) -> list[str]:
+        """`box`'s grants, or none for another org's agent (FLOTTA-83).
+
+        A row from before the rule mints nothing, so naming it would be a
+        repository the agent is told it has and is refused when it asks.
+        """
+        return store.repos_for_box(box.id) if reaches_fleet_github(box.org) else []
+
     @app.get("/api/boxes/{box_id}/repos")
     def list_repos(box_id: str, token: Token | None = needs_read) -> Any:
         """Which repositories a box may use."""
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
+            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
         finally:
             store.close()
 
@@ -2409,12 +2419,20 @@ def create_app(
         outage must not stop somebody configuring their fleet, and the check is
         a point-in-time answer regardless: a token's scope can change after the
         grant, so this removes a surprise rather than a possibility.
+
+        **The operator's alone, for the operator's agents** (FLOTTA-83). The
+        token every grant spends is the operator's own, so `fleet:write` in an
+        agency's org is not enough: that was an agency granting itself the
+        operator's repositories. Both refusals come before GitHub is asked.
         """
         from flotta.store import normalise_repo
 
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            if not reaches_fleet_github(box.org):
+                raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
+            _require_operator(token, "grant a repository")
             # Normalised first, because the check asks GitHub about a path: a
             # pasted URL or a `.git` suffix would ask about a repository that
             # does not exist and read as a denial.
@@ -2825,7 +2843,7 @@ def create_app(
         try:
             box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "list the repositories of")
-            return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
+            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
         finally:
             store.close()
 
@@ -3066,6 +3084,10 @@ def create_app(
             # box? A non-box subject (an operator) is unrestricted — see
             # `auth.BOX_SUBJECT_PREFIX`.
             confine_to_box(token, box, "mint credentials for")
+            # Whatever the grants say: the credential is the operator's whole
+            # token, and a grant from before FLOTTA-83 must not hand it over.
+            if not reaches_fleet_github(box.org):
+                raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
 
             repo = str(body.get("repo") or "").strip()
             if not repo:
