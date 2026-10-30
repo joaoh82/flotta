@@ -344,7 +344,34 @@ class LocalBackend:
         raise NotSupported("a local stand-in has no image to replace")
 
     def exec(self, box_id: str, command: str, *, timeout_s: int = 300) -> ExecResult:
-        raise NotSupported("a local stand-in has no shell")
+        """No shell, but the two commands `set_instructions` sends, and nothing else.
+
+        A local agent's instructions have to be changeable for the web app's
+        agent page to be tried for $0 (FLOTTA-84). Each command is matched
+        whole against the shape `set_instructions` builds, and acts on this
+        agent's own `SOUL.md`; anything else is still refused.
+        """
+        import base64
+        import binascii
+
+        from flotta.provision import SOUL_PATH
+
+        path = standin.soul_path(self._dir(box_id))
+        if command == f"rm -f {SOUL_PATH}":
+            path.unlink(missing_ok=True)
+            return ExecResult(exit_code=0, stdout="", stderr="")
+        written = re.fullmatch(
+            rf"printf %s ([A-Za-z0-9+/=]+) \| base64 -d > {re.escape(SOUL_PATH)}", command
+        )
+        if written is None:
+            raise NotSupported("a local stand-in has no shell")
+        try:
+            content = base64.b64decode(written.group(1), validate=True)
+        except binascii.Error as exc:
+            raise BackendError(f"not base64: {exc}") from exc
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return ExecResult(exit_code=0, stdout="", stderr="")
 
     def state(self, box_id: str) -> str:
         name = self._name(box_id)

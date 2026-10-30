@@ -25,6 +25,13 @@ takes. Using either in the other's place is `session not found`. Collapsing
 them here would let a client that confuses them pass every local test and
 fail on the first real box, and that confusion has shipped once already.
 
+**Standing instructions are fixed when a session starts**, as Hermes renders
+its system prompt once per session (FLOTTA-58). `SOUL.md` is seeded from
+`$FLOTTA_INSTRUCTIONS` once, as the box's entrypoint does, and rewritten by
+`set_instructions` through `LocalBackend.exec`. Each session keeps the copy it
+started with and its replies quote it, so a client that resumes a session older
+than an edit can be seen doing so, for $0.
+
 Conversations are kept under `--home`, so stopping and starting the agent
 keeps them, as a real box's volume does. Live ids are not kept: like Hermes's,
 they belong to the process.
@@ -64,16 +71,44 @@ METHOD_NOT_FOUND = -32601
 SESSION_NOT_FOUND = 4001
 
 
-def reply_to(text: str, *, name: str, turn: int) -> str:
+def reply_to(text: str, *, name: str, turn: int, soul: str | None = None) -> str:
     """The scripted answer: who said it, what it heard, and how far along.
 
     The turn number is what shows a conversation was kept: ask again after the
-    agent has slept and the count carries on.
+    agent has slept and the count carries on. `soul` is the instructions this
+    session started with; their first line shows which ones it is following.
     """
-    return (
+    said = (
         f"This is {name}, a local stand-in with no model. "
         f"You said: {text.strip()!r}. That is message {turn} in this conversation."
     )
+    first = (soul or "").strip().splitlines()[:1]
+    if first:
+        said += f" My standing instructions begin: {first[0]!r}."
+    return said
+
+
+#: Where a box's `$FLOTTA_INSTRUCTIONS` arrives, as on a real box.
+INSTRUCTIONS_ENV = "FLOTTA_INSTRUCTIONS"
+
+
+def soul_path(home: Path) -> Path:
+    """`$HERMES_HOME/SOUL.md`: `--home` holds this agent's `hermes` directory."""
+    return home / "hermes" / "SOUL.md"
+
+
+def seed_soul(home: Path, env: dict[str, str]) -> None:
+    """Write `SOUL.md` from the instructions an agent was created with, once.
+
+    What `fly/box_entrypoint.sh` does: only when there is none, because after
+    that the file on the volume is the agent's, and rewriting it is
+    `set_instructions`'s job.
+    """
+    instructions = env.get(INSTRUCTIONS_ENV) or ""
+    path = soul_path(home)
+    if instructions and not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(instructions + "\n", encoding="utf-8")
 
 
 #: Messages that script a turn the way a real agent's goes, so a client can be
@@ -90,6 +125,7 @@ class Agent:
     def __init__(self, *, name: str, home: Path, credentials: tuple[str, str] | None) -> None:
         self.name = name
         self.store = home / "hermes" / "sessions.json"
+        self.soul = soul_path(home)
         self.credentials = credentials
         self.cookies: set[str] = set()
         self.tickets: dict[str, float] = {}
@@ -111,6 +147,12 @@ class Agent:
         partial = self.store.with_suffix(".partial")
         partial.write_text(json.dumps(sessions, indent=1))
         partial.replace(self.store)
+
+    def read_soul(self) -> str | None:
+        try:
+            return self.soul.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
 
     def attach(self, stored_id: str) -> str:
         live_id = f"live-{secrets.token_hex(6)}"
@@ -283,6 +325,8 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             "title": str(params.get("title") or ""),
             "started_at": time.time(),
             "messages": [],
+            # Fixed now, as a real session's system prompt is.
+            "soul": agent.read_soul(),
         }
         agent.save(sessions)
         return [_result(rid, {"session_id": agent.attach(stored_id)})]
@@ -358,7 +402,12 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             ]
         return [
             *started,
-            *_finish(agent, stored_id, live_id, reply_to(text, name=agent.name, turn=turn)),
+            *_finish(
+                agent,
+                stored_id,
+                live_id,
+                reply_to(text, name=agent.name, turn=turn, soul=sessions[stored_id].get("soul")),
+            ),
         ]
 
     if rid is None:
@@ -398,6 +447,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--home", required=True, type=Path)
     parser.add_argument("--port", required=True, type=int)
     args = parser.parse_args(argv)
+    seed_soul(args.home, dict(os.environ))
     app = build_app(name=args.name, home=args.home, credentials=credentials_from(dict(os.environ)))
     web.run_app(app, host="127.0.0.1", port=args.port, print=None, handle_signals=True)
 

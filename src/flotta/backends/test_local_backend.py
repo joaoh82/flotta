@@ -285,6 +285,11 @@ def test_what_a_stand_in_cannot_do_it_says(backend):
     handle = backend.create(BoxSpec(name="eng-a"))
     with pytest.raises(NotSupported):
         backend.exec(handle.endpoint, "echo hi")
+    # The shape `set_instructions` sends, pointed anywhere else, is not it.
+    with pytest.raises(NotSupported):
+        backend.exec(handle.endpoint, "printf %s aGk= | base64 -d > /etc/passwd")
+    with pytest.raises(NotSupported):
+        backend.exec(handle.endpoint, "rm -f /data/hermes/SOUL.md; rm -rf /")
     with pytest.raises(NotSupported):
         backend.reimage(handle.endpoint, "registry.fly.io/x:y")
     with pytest.raises(NotSupported):
@@ -350,3 +355,24 @@ def test_new_boxes_go_where_flotta_backend_says():
 def test_a_typo_in_flotta_backend_is_refused_rather_than_read_as_fly():
     with pytest.raises(UnknownBackendError, match="locl"):
         default_scheme({"FLOTTA_BACKEND": "locl"})
+
+
+def test_a_local_agents_instructions_are_written_where_it_reads_them(backend, tmp_path):
+    """FLOTTA-84: `set_instructions` reaches a stand-in, so the web app's agent
+    page can change them for $0. Through the real verb, not a copy of its
+    commands, so the two cannot drift apart."""
+    from flotta.backends.standin import soul_path
+    from flotta.provision import set_instructions
+    from flotta.store import FleetStore
+
+    handle = backend.create(BoxSpec(name="eng-a"))
+    with FleetStore(tmp_path / "fleet.db") as store:
+        box = store.create_box("eng-a")
+        store.update_box_status(box.id, "stopped", endpoint=handle.endpoint)
+        soul = soul_path(backend.home / "eng-a")
+
+        set_instructions(box.id, "Answer in Dutch.\n'$(rm -rf /)'", store=store, backend=backend)
+        assert soul.read_text() == "Answer in Dutch.\n'$(rm -rf /)'"
+
+        set_instructions(box.id, None, store=store, backend=backend)
+        assert not soul.exists()

@@ -341,7 +341,10 @@ def _box_dict(
 
     `display_name` / `description` / `instructions` are always present so the
     app never reads `undefined` — `None` means "not set", which is a real
-    state. `meta` is optional because the identity is a side table: the list
+    state. A read route then removes `instructions` for a caller who may not
+    see them (`_for_reader`), so absent means "not yours", never "none".
+
+    `meta` is optional because the identity is a side table: the list
     endpoint fetches it in one query for the fleet, the single-box endpoints
     fetch one row, and a few internal callers have no store handy and get
     Nones — which is honest, since they did not look.
@@ -369,6 +372,61 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         model=store.model_for_box(box.id),
         fleet_model=fleet_model(store),
     )
+
+
+def _reads_instructions(token: Token | None) -> bool:
+    """Whether `token` may read an agent's standing instructions (FLOTTA-84).
+
+    Whoever may change them (`fleet:write`), and the operator viewing an agency
+    as its owner (`org:admin`, read-only). Not a client viewer: instructions
+    are how an agency runs the agent *for* that client, and a client reads its
+    description instead. `None` is a loopback control plane with no auth,
+    whose caller is the operator.
+    """
+    return token is None or bool(token.scopes & {SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN})
+
+
+def _for_reader(row: dict[str, Any], token: Token | None) -> dict[str, Any]:
+    """`row`, without the instructions if `token` may not read them."""
+    if not _reads_instructions(token):
+        row.pop("instructions", None)
+    return row
+
+
+#: Where a stored diagnostic may carry an agent's instructions: Fly's error
+#: quoted a failed `machine run` whole, `--env FLOTTA_INSTRUCTIONS=…` included,
+#: and an `exec` as its `/bin/sh -c` command, which for an instruction write is
+#: those instructions in base64. `fly_backend._shown` stopped both at the
+#: source; events recorded before that are still in the store.
+_INSTRUCTION_MARKERS = ("FLOTTA_INSTRUCTIONS=", "/bin/sh -c ")
+WITHHELD = "… (withheld: it may contain the agent's standing instructions)"
+
+
+def _withheld(value: Any, instructions: str | None) -> Any:
+    """`value` with the agent's instructions taken out, for a caller who may
+    not read them (FLOTTA-84): every string cut where a marker begins, and the
+    current instructions replaced wherever they appear whole.
+
+    Cut to the end, because an old diagnostic quoted the command unquoted and
+    nothing marks where the instructions in it stop. A marker already followed
+    by `…` was redacted where it was written, and the rest of that string,
+    Fly's own reason among it, is kept."""
+    if isinstance(value, str):
+        for marker in _INSTRUCTION_MARKERS:
+            at = 0
+            while (at := value.find(marker, at)) >= 0:
+                at += len(marker)
+                if not value.startswith("…", at):
+                    value = value[:at] + WITHHELD
+                    break
+        if instructions and instructions in value:
+            value = value.replace(instructions, WITHHELD)
+        return value
+    if isinstance(value, dict):
+        return {k: _withheld(v, instructions) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_withheld(v, instructions) for v in value]
+    return value
 
 
 def _epoch(iso: str | None) -> float | None:
@@ -962,7 +1020,7 @@ def create_app(
             boxes = store.list_boxes()
             if not all_:
                 boxes = [b for b in boxes if not is_terminal("box", b.status)]
-            return _box_listing(store, boxes)
+            return _box_listing(store, boxes, token)
         finally:
             store.close()
 
@@ -1880,11 +1938,11 @@ def create_app(
                 # A stopped box is idle, not finished — hiding it would hide
                 # the point of the fleet.
                 boxes = [b for b in boxes if not is_terminal("box", b.status)]
-            return _box_listing(store, boxes)
+            return _box_listing(store, boxes, token)
         finally:
             store.close()
 
-    def _box_listing(store: Any, boxes: list[Any]) -> Any:
+    def _box_listing(store: Any, boxes: list[Any], token: Token | None) -> Any:
         """`boxes` as a list answers them, each with its newest task and spend."""
         # Each box's newest task and its total spend. Cost lives on tasks
         # (the formula measures start-to-verdict, meaningless across a
@@ -1910,10 +1968,15 @@ def create_app(
         default = fleet_model(store)
         return {
             "boxes": [
-                {
-                    **_box_dict(b, metas.get(b.id), model=models.get(b.id), fleet_model=default),
-                    **summaries[b.id],
-                }
+                _for_reader(
+                    {
+                        **_box_dict(
+                            b, metas.get(b.id), model=models.get(b.id), fleet_model=default
+                        ),
+                        **summaries[b.id],
+                    },
+                    token,
+                )
                 for b in boxes
             ]
         }
@@ -2208,10 +2271,13 @@ def create_app(
             # timer. The one consumer — deciding whether to resume a
             # conversation or start a fresh one — is opening a single agent.
             return {
-                "box": {
-                    **_with_meta(store, box),
-                    "instructions_changed_at": _epoch(store.instructions_changed_at(box.id)),
-                },
+                "box": _for_reader(
+                    {
+                        **_with_meta(store, box),
+                        "instructions_changed_at": _epoch(store.instructions_changed_at(box.id)),
+                    },
+                    token,
+                ),
                 "tasks": [_task_dict(t) for t in store.list_tasks(box_id=box.id)],
             }
         finally:
@@ -2304,7 +2370,12 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            return {"events": [_event_dict(e) for e in store.get_box_timeline(box.id)]}
+            events = [_event_dict(e) for e in store.get_box_timeline(box.id)]
+            if _reads_instructions(token):
+                return {"events": events}
+            meta = store.meta_for_box(box.id)
+            instructions = meta.instructions if meta else None
+            return {"events": [_withheld(e, instructions) for e in events]}
         finally:
             store.close()
 
@@ -2333,7 +2404,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            row = _with_meta(store, box)
+            row = _for_reader(_with_meta(store, box), token)
             if not box.endpoint:
                 # Not a failure: a box being built has no machine yet, which is
                 # the honest thing to say rather than an error about flyctl.
