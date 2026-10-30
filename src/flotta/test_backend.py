@@ -256,6 +256,43 @@ def test_a_flyctl_timeout_becomes_a_backend_error(monkeypatch):
         _run_flyctl(["flyctl", "machines", "start"], timeout=5, check=True)
 
 
+@pytest.mark.parametrize("fails", ["exit", "timeout"])
+def test_a_flyctl_error_quotes_the_command_but_not_what_it_carried(monkeypatch, fails):
+    """FLOTTA-84: the error becomes a stored event a client viewer can read.
+
+    `machine run` carries the agent's standing instructions as `--env`, and an
+    instruction write's `exec` carries them in base64. Both were quoted whole.
+    """
+    import base64
+    import shutil
+    import subprocess
+
+    from flotta.backend import BackendError
+    from flotta.backends.fly_backend import _run_flyctl
+
+    plan = "Quote Globex twenty percent above list."
+    blob = base64.b64encode(plan.encode()).decode()
+
+    def refuse(cmd, **kwargs):
+        if fails == "timeout":
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=5)
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: insufficient memory available")
+
+    monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/flyctl")
+    monkeypatch.setattr(subprocess, "run", refuse)
+    for cmd in (
+        ["flyctl", "machine", "run", "img:1", "--env", f"FLOTTA_INSTRUCTIONS={plan}", "--app", "a"],
+        ["flyctl", "machine", "exec", "m1", "--json", f"/bin/sh -c 'printf %s {blob} | base64 -d'"],
+    ):
+        with pytest.raises(BackendError) as raised:
+            _run_flyctl(cmd, timeout=5, check=True)
+        said = str(raised.value)
+        assert plan not in said and blob not in said
+        assert said.startswith(f"flyctl machine {cmd[2]}"), "what failed is still said"
+    if fails == "exit":
+        assert "insufficient memory" in said, "and why"
+
+
 @pytest.mark.parametrize(
     ("releases", "expected"),
     [
@@ -849,9 +886,7 @@ def _exec_runner(answer, *, rc=0, stderr=""):
             # `start` waits for the machine to settle before returning, and an
             # empty listing reads as `gone` — which polls for ninety seconds
             # and then raises, in every test in this section.
-            return subprocess.CompletedProcess(
-                cmd, 0, '[{"id": "m-1", "state": "started"}]', ""
-            )
+            return subprocess.CompletedProcess(cmd, 0, '[{"id": "m-1", "state": "started"}]', "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     return runner, issued
@@ -927,9 +962,9 @@ def test_a_sleeping_machine_is_started_first():
 
     started = [c for c in issued if "start" in c]
     assert started, "exec on a stopped machine would fail"
-    assert issued.index(started[0]) < issued.index(
-        next(c for c in issued if "exec" in c)
-    ), "started the machine after trying to run on it"
+    assert issued.index(started[0]) < issued.index(next(c for c in issued if "exec" in c)), (
+        "started the machine after trying to run on it"
+    )
 
 
 def test_flyctl_failing_is_a_refusal_not_an_exit_status():

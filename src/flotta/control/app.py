@@ -393,6 +393,42 @@ def _for_reader(row: dict[str, Any], token: Token | None) -> dict[str, Any]:
     return row
 
 
+#: Where a stored diagnostic may carry an agent's instructions: Fly's error
+#: quoted a failed `machine run` whole, `--env FLOTTA_INSTRUCTIONS=…` included,
+#: and an `exec` as its `/bin/sh -c` command, which for an instruction write is
+#: those instructions in base64. `fly_backend._shown` stopped both at the
+#: source; events recorded before that are still in the store.
+_INSTRUCTION_MARKERS = ("FLOTTA_INSTRUCTIONS=", "/bin/sh -c ")
+WITHHELD = "… (withheld: it may contain the agent's standing instructions)"
+
+
+def _withheld(value: Any, instructions: str | None) -> Any:
+    """`value` with the agent's instructions taken out, for a caller who may
+    not read them (FLOTTA-84): every string cut where a marker begins, and the
+    current instructions replaced wherever they appear whole.
+
+    Cut to the end, because an old diagnostic quoted the command unquoted and
+    nothing marks where the instructions in it stop. A marker already followed
+    by `…` was redacted where it was written, and the rest of that string,
+    Fly's own reason among it, is kept."""
+    if isinstance(value, str):
+        for marker in _INSTRUCTION_MARKERS:
+            at = 0
+            while (at := value.find(marker, at)) >= 0:
+                at += len(marker)
+                if not value.startswith("…", at):
+                    value = value[:at] + WITHHELD
+                    break
+        if instructions and instructions in value:
+            value = value.replace(instructions, WITHHELD)
+        return value
+    if isinstance(value, dict):
+        return {k: _withheld(v, instructions) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_withheld(v, instructions) for v in value]
+    return value
+
+
 def _epoch(iso: str | None) -> float | None:
     """A store timestamp as seconds since the Unix epoch, or None.
 
@@ -2334,7 +2370,12 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            return {"events": [_event_dict(e) for e in store.get_box_timeline(box.id)]}
+            events = [_event_dict(e) for e in store.get_box_timeline(box.id)]
+            if _reads_instructions(token):
+                return {"events": events}
+            meta = store.meta_for_box(box.id)
+            instructions = meta.instructions if meta else None
+            return {"events": [_withheld(e, instructions) for e in events]}
         finally:
             store.close()
 

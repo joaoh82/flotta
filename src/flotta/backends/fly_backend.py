@@ -694,7 +694,7 @@ def _run_flyctl(
         # Must surface as BackendError: that is the only exception `create_box`
         # and `stop_box` catch, and anything else escapes past their cleanup —
         # leaving a row in `provisioning` with a real machine attached to it.
-        raise BackendError(f"{' '.join(cmd)} timed out after {timeout}s") from exc
+        raise BackendError(f"{_shown(cmd)} timed out after {timeout}s") from exc
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         # Fly refuses suspend on some configurations. Surfacing that as
@@ -702,8 +702,31 @@ def _run_flyctl(
         # an error the caller must see.
         if "suspend" in cmd and _looks_unsupported(stderr):
             raise NotSupported(f"this machine cannot be suspended: {stderr[:200]}")
-        raise BackendError(f"{' '.join(cmd)} failed ({result.returncode}): {stderr[:300]}")
+        raise BackendError(f"{_shown(cmd)} failed ({result.returncode}): {stderr[:300]}")
     return result
+
+
+def _shown(cmd: list[str]) -> str:
+    """`cmd` as an error may quote it: the command, not what it carried.
+
+    An error becomes a stored event (a failed provision's `reason`), and an
+    event is read by whoever may read the agent, a client viewer included
+    (FLOTTA-84). `machine run` carries the agent's environment, its standing
+    instructions among them (`--env FLOTTA_INSTRUCTIONS=…`), and `machine exec`
+    carries a shell command, which for an instruction write is those
+    instructions in base64. So every `--env` keeps its name and loses its
+    value, and a shell command is not shown at all. What failed, and Fly's own
+    reason, are still there.
+    """
+    shown: list[str] = []
+    for previous, arg in zip(["", *cmd], cmd, strict=False):
+        if previous == "--env" and "=" in arg:
+            shown.append(arg.split("=", 1)[0] + "=…")
+        elif arg.startswith("/bin/sh -c "):
+            shown.append("/bin/sh -c …")
+        else:
+            shown.append(arg)
+    return " ".join(shown)
 
 
 #: The image label carrying the Hermes the box runs. Written by `fly/Dockerfile`
