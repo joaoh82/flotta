@@ -29,6 +29,7 @@ from flotta.auth import (
     AuthError,
     Token,
     admits,
+    box_password,
     mint,
     mint_ticket,
     verify,
@@ -270,7 +271,8 @@ def hermes():
     async def login(request):
         body = await request.json()
         seen["logins"].append(body)
-        if body.get("password") != "the-box-password":
+        # The box holds its own password, derived from the fleet's (FLOTTA-96).
+        if body.get("password") != box_password("the-box-password", "b-1"):
             return web.json_response({"detail": "no"}, status=401)
         response = web.json_response({"ok": True})
         response.set_cookie("hermes_session_at", "session-1", httponly=True)
@@ -354,7 +356,7 @@ def test_a_browser_with_a_ticket_talks_to_its_agent(hermes):
     assert "gateway.ready" in ready
     assert echoed == "echo:hello"
     assert plane.woken_ids == ["b-1"]
-    assert seen["logins"][-1]["password"] == "the-box-password"
+    assert seen["logins"][-1]["password"] == box_password("the-box-password", "b-1")
 
 
 def test_the_box_never_sees_the_flotta_ticket(hermes):

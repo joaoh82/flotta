@@ -866,7 +866,7 @@ def chat(
             if token is None:
                 # Tunnel: nothing in the path can supply credentials, so the
                 # caller must hold them.
-                username, password = chat_client.credentials()
+                username, password = chat_client.credentials(box_id=box.id)
             else:
                 username = password = None
             session = chat_client.new_session()
@@ -2346,9 +2346,12 @@ def token_rotate(
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     expires = datetime.fromtimestamp(body["expires_at"], UTC).strftime("%Y-%m-%d")
+    # `own_password` is absent from a control plane older than FLOTTA-96.
+    password = " and its own password" if body.get("own_password") else ""
     emit(
         body,
-        f"{body['name']} has a new identity ({', '.join(body['scopes'])}), valid until {expires}",
+        f"{body['name']} has a new identity ({', '.join(body['scopes'])}){password}, "
+        f"valid until {expires}",
         as_json=as_json,
     )
 
