@@ -322,9 +322,9 @@ def credentials(dotenv: str = ".env", *, box_id: str) -> tuple[str, str]:
     The box's own, as the door sends it (FLOTTA-96): a box no longer accepts
     the fleet's password, which is what stopped one agent logging in to another.
 
-    Written there by `just fly-auth`, which also pushes them to the box as Fly
-    secrets. Never committed — the box is reachable only over Fly's private
-    network, but that is one layer and Hermes's auth gate is the other.
+    The fleet's is written there by `just fly-auth` (or `just fleet-key`) and
+    sent to no box. Never committed — the box is reachable only over Fly's
+    private network, but that is one layer and Hermes's auth gate is the other.
     """
     from pathlib import Path
 

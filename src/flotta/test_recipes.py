@@ -380,3 +380,27 @@ def test_the_entrypoint_tells_hermes_its_model_for_real(tmp_path):
         text=True,
     )
     assert bare.returncode == 0 and "still-booting" in bare.stdout, bare.stderr
+
+
+# -- the fleet's password never reaches an agent (FLOTTA-96) ------------------
+
+
+def _recipe(name: str) -> str:
+    if not _JUSTFILE.is_file():  # pragma: no cover - only if run outside the repo
+        pytest.skip(f"no justfile at {_JUSTFILE}")
+    text = _JUSTFILE.read_text(encoding="utf-8")
+    match = re.search(rf"^{re.escape(name)}\b[^\n]*:[^\n]*\n((?:[ \t]+[^\n]*\n|\n)*)", text, re.M)
+    assert match, f"no `{name}` recipe in the justfile"
+    return match.group(1)
+
+
+def test_fly_auth_sends_the_first_machine_its_own_login_and_nothing_else():
+    """`fly-auth` used to import the fleet's password as the machine's login,
+    and root on that machine could then derive every agent's password. What it
+    sends Fly now comes only from `fleet_key bootstrap`, which never reads it."""
+    body = _recipe("fly-auth")
+    sends = [ln.strip() for ln in body.splitlines() if "flyctl secrets" in ln]
+    assert sends, "fly-auth no longer sets anything — has the pattern rotted?"
+    for line in sends:
+        assert line.startswith("uv run python -m flotta.fleet_key bootstrap |"), line
+    assert "FLOTTA_BOX_PASSWORD" not in body

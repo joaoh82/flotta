@@ -822,28 +822,31 @@ box-identity NAME:
     : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the control plane does the writing}"
     uv run flotta token rotate {{NAME}}
 
-# M3: mint and push the box's dashboard credentials (this is how you rotate)
+# M3: give the first machine a login — never the fleet's password (FLOTTA-96)
 fly-auth: fly-whoami
     #!/usr/bin/env bash
     set -euo pipefail
     APP=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().app)")
-    # Generated here, never committed: the box is reachable only over Fly's
-    # private network, but "private network" is one layer and Hermes's own auth
-    # gate is the other. Neither is meant to hold alone.
-    PASS=$(uv run python -c "import secrets; print(secrets.token_urlsafe(32))")
-    SECRET=$(uv run python -c "import secrets; print(secrets.token_urlsafe(48))")
-    printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD=%s\nHERMES_DASHBOARD_BASIC_AUTH_SECRET=%s\n' \
-      flotta "$PASS" "$SECRET" | flyctl secrets import --app "$APP"
-    # Written locally so `flotta chat` can log in. Gitignored with the rest of .env.
-    uv run python - "$PASS" <<'PY'
-    import pathlib, sys
-    env = pathlib.Path(".env")
-    text = env.read_text() if env.exists() else ""
-    lines = [ln for ln in text.splitlines() if not ln.startswith("FLOTTA_BOX_PASSWORD=")]
-    lines.append(f"FLOTTA_BOX_PASSWORD={sys.argv[1]}")
-    env.write_text("\n".join(lines) + "\n")
-    PY
-    echo "credentials set on $APP and recorded in .env (values not echoed)"
+    # The machine gets a login of its own and never the fleet's password
+    # (FLOTTA-96): every agent's password is derived from that, and this machine
+    # runs an agent that is root on it. Nothing records its login — it is
+    # reached over `fly ssh` until `flotta create` adopts it, and adoption
+    # writes the derived one the door expects.
+    uv run python -m flotta.fleet_key bootstrap | flyctl secrets import --app "$APP"
+    # The fleet's password, for the door and the control plane only. Kept if
+    # .env already has one: a new one would lock the door out of every agent.
+    uv run python -m flotta.fleet_key generate
+    echo "login set on $APP; the fleet's password is in .env and nowhere else (values not echoed)"
+
+# FLOTTA-96: replace the fleet's password in .env — every agent must then be rotated
+fleet-key:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run python -m flotta.fleet_key generate --replace
+    echo "the door and every agent now disagree with it. In this order:"
+    echo "  1. set FLOTTA_BOX_PASSWORD on the control plane to the new value (Render dashboard)"
+    echo "  2. just door-secrets && just door-deploy"
+    echo "  3. uv run flotta token rotate <agent>, for every agent"
 
 # M3: what is true about the box — HERMES_HOME, sessions, memory, serving
 fly-doctor: fly-whoami

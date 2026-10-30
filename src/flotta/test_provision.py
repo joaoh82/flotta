@@ -3251,6 +3251,32 @@ def test_only_the_token_and_the_boxs_own_password_are_rewritten(store, monkeypat
     assert "hunter2" not in repr(rotated[-1].payload)
 
 
+def test_after_a_fresh_fleet_key_the_old_one_opens_no_agent(store, monkeypatch, tmp_path):
+    """Every agent made before FLOTTA-96 held the fleet's password as its own,
+    and root could have kept it. Rotating rewrites the environment, not what
+    was kept, so the rollout replaces the key: an agent's password derived
+    from the old one, or the old one itself, must then be refused."""
+    from flotta.auth import box_password
+    from flotta.backends.standin import Agent, credentials_from
+    from flotta.provision import rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_BOX_PASSWORD", "the-fresh-key")
+    target = _running(store, name="eng-d")
+    backend = Rotating()
+    rotate_identity(target.id, store=store, backend=backend)
+
+    env = {"HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "flotta", **backend.applied}
+    agent = Agent(name="eng-d", home=tmp_path, credentials=credentials_from(env))
+
+    def logs_in(password):
+        return agent.admits_login({"username": "flotta", "password": password})
+
+    assert not logs_in(box_password("the-old-key", target.id))
+    assert not logs_in("the-old-key")
+    assert logs_in(box_password("the-fresh-key", target.id))
+
+
 def test_a_rotation_without_the_fleets_password_still_rotates_the_token(store, monkeypatch):
     """A self-hoster with no `$FLOTTA_BOX_PASSWORD` on the control plane: the
     box keeps whatever it has, rather than being written a blank one."""
