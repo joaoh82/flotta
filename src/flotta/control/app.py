@@ -2380,13 +2380,21 @@ def create_app(
         finally:
             store.close()
 
+    def _usable_repos(store: Any, box: Any) -> list[str]:
+        """`box`'s grants, or none for another org's agent (FLOTTA-83).
+
+        A row from before the rule mints nothing, so naming it would be a
+        repository the agent is told it has and is refused when it asks.
+        """
+        return store.repos_for_box(box.id) if reaches_fleet_github(box.org) else []
+
     @app.get("/api/boxes/{box_id}/repos")
     def list_repos(box_id: str, token: Token | None = needs_read) -> Any:
         """Which repositories a box may use."""
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
+            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
         finally:
             store.close()
 
@@ -2835,7 +2843,7 @@ def create_app(
         try:
             box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "list the repositories of")
-            return {"box_id": box.id, "name": box.name, "repos": store.repos_for_box(box.id)}
+            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
         finally:
             store.close()
 

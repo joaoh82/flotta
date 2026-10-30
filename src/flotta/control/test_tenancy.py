@@ -607,18 +607,26 @@ def test_the_operator_still_grants_its_own_agent_a_repository(api, credential):
     assert response.json()["repos"] == ["joaoh82/flotta_parent"]
 
 
+def _grant_from_before(fleet, name):
+    """A `box_repos` row for a tenant's agent, as one made before FLOTTA-83 was.
+
+    Straight into the table: the store itself now refuses this grant.
+    """
+    box_id = _ids(fleet)[name]
+    with FleetStore(fleet) as store:
+        store._conn.execute(
+            "INSERT INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?)",
+            (box_id, "joaoh82/flotta_parent", "2026-10-29T00:00:00+00:00"),
+        )
+    return box_id
+
+
 def test_a_tenant_agent_is_refused_a_credential_even_with_a_grant(api, fleet, no_substrate):
     """Defence in depth: a grant written before this rule, or by any path that
     forgets it, still never puts the operator's token on an agency's machine."""
     from flotta.auth import box_subject
 
-    box_id = _ids(fleet)[X]
-    with FleetStore(fleet) as store:
-        # Straight into the table: the store itself now refuses this grant.
-        store._conn.execute(
-            "INSERT INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?)",
-            (box_id, "joaoh82/flotta_parent", "2026-10-29T00:00:00+00:00"),
-        )
+    box_id = _grant_from_before(fleet, X)
     own = _bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(box_id), org="agency-x", client="acme")
 
     response = api.post(
@@ -634,3 +642,19 @@ def test_the_store_refuses_a_grant_to_a_tenants_agent(fleet):
     """Where every caller meets it — the CLI writes the store directly."""
     with FleetStore(fleet) as store, pytest.raises(ValueError, match="not available"):
         store.grant_repo(_ids(fleet)[X], "joaoh82/flotta_parent")
+
+
+def test_a_grant_that_mints_nothing_is_not_listed(api, fleet):
+    """Neither to the agency nor to its agent: a repository named in the list
+    and refused at the credential is the window telling a lie."""
+    from flotta.auth import box_subject
+
+    box_id = _grant_from_before(fleet, X)
+    owner = _bearer(SCOPE_FLEET_READ, org="agency-x")
+    own = _bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(box_id), org="agency-x", client="acme")
+
+    listed = api.get(f"/api/boxes/{X}/repos", headers=owner)
+    asked = api.get(f"/api/boxes/{X}/git-credential/repos", headers=own)
+
+    assert listed.status_code == asked.status_code == 200, (listed.text, asked.text)
+    assert listed.json()["repos"] == asked.json()["repos"] == []

@@ -1502,7 +1502,12 @@ def repo_grant(
 
     with _open_store(store) as fleet:
         box_row = _require_box(fleet, box_id)
-        granted = fleet.grant_repo(box_row.id, repo)
+        try:
+            granted = fleet.grant_repo(box_row.id, repo)
+        except ValueError as exc:
+            # Another org's agent (FLOTTA-83): refused by the store, as the
+            # control plane refuses it with a 403.
+            raise _fail(exc, code=2) from exc
         fleet.add_event("box", box_row.id, "repo_granted", {"repo": granted})
         emit(
             {"box_id": box_row.id, "name": box_row.name, "repos": fleet.repos_for_box(box_row.id)},
