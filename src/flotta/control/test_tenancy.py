@@ -551,3 +551,86 @@ def test_a_tenant_agents_token_without_its_tenancy_reaches_nothing(colleagues):
     bare = _bearer(SCOPE_BOX_PEER, subject=box_subject(_ids(colleagues)[X]))
     with TestClient(app) as client:
         assert client.get(f"/api/boxes/{X}/peer/roster", headers=bare).status_code == 404
+
+
+# -- GitHub: the fleet's token is the operator's (FLOTTA-83) -----------------------
+#
+# `$FLOTTA_GITHUB_TOKEN` is one person's token, and a minted credential *is*
+# that token, whatever repository it was asked for. Tenancy scoped the box and
+# not the credential behind it, so an agency granting its own agent a
+# repository was an agency reading the operator's. Until an org connects its
+# own GitHub (FLOTTA-22) no tenant's agent gets one.
+
+
+def _tenant_repos(fleet, name):
+    with FleetStore(fleet) as store:
+        return store.repos_for_box(_ids(fleet)[name])
+
+
+@pytest.mark.parametrize(
+    "claims", [{"org": "agency-x"}, {"org": "agency-x", "client": "acme"}], ids=["org", "client"]
+)
+def test_an_agency_cannot_grant_its_agent_a_repository(api, fleet, credential, claims):
+    response = api.post(
+        f"/api/boxes/{X}/repos",
+        json={"repo": "joaoh82/flotta_parent"},
+        headers=credential(SCOPE_FLEET_WRITE, **claims),
+    )
+
+    assert response.status_code == 403, response.text
+    assert "not available" in response.json()["detail"]
+    assert _tenant_repos(fleet, X) == []
+
+
+def test_only_the_operator_grants_a_repository_in_its_own_org(api, fleet, credential):
+    """A person in the default org confined to a client reaches `eng-a`, and
+    still is not the operator whose token it would spend."""
+    response = api.post(
+        "/api/boxes/eng-a/repos",
+        json={"repo": "joaoh82/flotta_parent"},
+        headers=credential(SCOPE_FLEET_WRITE, client="default"),
+    )
+
+    assert response.status_code == 403, response.text
+    assert "only the fleet's operator" in response.json()["detail"]
+    with FleetStore(fleet) as store:
+        assert store.repos_for_box(_ids(fleet)["eng-a"]) == []
+
+
+def test_the_operator_still_grants_its_own_agent_a_repository(api, credential):
+    response = api.post(
+        "/api/boxes/eng-a/repos",
+        json={"repo": "joaoh82/flotta_parent"},
+        headers=credential(SCOPE_FLEET_WRITE),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["repos"] == ["joaoh82/flotta_parent"]
+
+
+def test_a_tenant_agent_is_refused_a_credential_even_with_a_grant(api, fleet, no_substrate):
+    """Defence in depth: a grant written before this rule, or by any path that
+    forgets it, still never puts the operator's token on an agency's machine."""
+    from flotta.auth import box_subject
+
+    box_id = _ids(fleet)[X]
+    with FleetStore(fleet) as store:
+        # Straight into the table: the store itself now refuses this grant.
+        store._conn.execute(
+            "INSERT INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?)",
+            (box_id, "joaoh82/flotta_parent", "2026-10-29T00:00:00+00:00"),
+        )
+    own = _bearer(SCOPE_GIT_CREDENTIAL, subject=box_subject(box_id), org="agency-x", client="acme")
+
+    response = api.post(
+        f"/api/boxes/{X}/git-credential", json={"repo": "joaoh82/flotta_parent"}, headers=own
+    )
+
+    assert response.status_code == 403, response.text
+    assert "ghp_not_a_real_token" not in response.text
+    assert "not available" in response.json()["detail"]
+
+
+def test_the_store_refuses_a_grant_to_a_tenants_agent(fleet):
+    """Where every caller meets it — the CLI writes the store directly."""
+    with FleetStore(fleet) as store, pytest.raises(ValueError, match="not available"):
+        store.grant_repo(_ids(fleet)[X], "joaoh82/flotta_parent")
