@@ -79,12 +79,15 @@ def test_the_client_holds_no_agent_logic():
 # -- authenticating against a box -------------------------------------------
 
 
-def test_credentials_come_from_the_dotenv(tmp_path):
+def test_credentials_are_the_boxs_own_derived_from_the_dotenv(tmp_path):
+    """The tunnel logs in as the door does: with the box's own password, which
+    the fleet's derives (FLOTTA-96). A box no longer accepts the fleet's."""
+    from flotta.auth import box_password
     from flotta.client import USERNAME, credentials
 
     env = tmp_path / ".env"
     env.write_text("FLOTTA_MODEL=x\nFLOTTA_BOX_PASSWORD=s3cret\n")
-    assert credentials(str(env)) == (USERNAME, "s3cret")
+    assert credentials(str(env), box_id="b-1") == (USERNAME, box_password("s3cret", "b-1"))
 
 
 def test_missing_credentials_point_at_the_command_that_mints_them(tmp_path):
@@ -93,10 +96,10 @@ def test_missing_credentials_point_at_the_command_that_mints_them(tmp_path):
     env = tmp_path / ".env"
     env.write_text("FLOTTA_MODEL=x\n")
     with pytest.raises(ChatError, match="just fly-auth"):
-        credentials(str(env))
+        credentials(str(env), box_id="b-1")
 
     with pytest.raises(ChatError, match="just fly-auth"):
-        credentials(str(tmp_path / "nope.env"))
+        credentials(str(tmp_path / "nope.env"), box_id="b-1")
 
 
 def test_the_cookie_jar_must_be_unsafe_for_ip_hosts():

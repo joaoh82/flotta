@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_READ, mint
+from flotta.auth import SCOPE_BOX_CHAT, SCOPE_FLEET_READ, box_password, mint
 from flotta.door.app import (
     DEFAULT_BOX_PORT,
     BoxUnavailable,
@@ -841,8 +841,32 @@ def test_the_box_receives_the_real_password_and_the_client_never_sends_one(stub_
         )
 
     body = json.loads(seen[-1]["body"])
-    assert body["password"] == "the-real-password"
+    assert body["password"] == box_password("the-real-password", "b-1")
     assert body["username"] == "flotta"
+
+
+def test_each_box_is_logged_in_to_with_its_own_password(stub_box_login):
+    """FLOTTA-96. The door holds the fleet's password and derives each box's;
+    the fleet's own never reaches a box, so no box holds one that opens another."""
+    from fastapi.testclient import TestClient
+
+    port, seen = stub_box_login
+    sent = {}
+    for box_id in ("b-1", "b-2"):
+        app, _ = _door_for(port, box_id=box_id, box_credentials=("flotta", "the-fleets"))
+        with TestClient(app) as client:
+            client.post(
+                "/auth/password-login",
+                headers={"Host": "eng-a.flotta.dev", "Authorization": _bearer(SCOPE_BOX_CHAT)},
+                json={"provider": "basic", "username": "", "password": "", "next": ""},
+            )
+        sent[box_id] = json.loads(seen[-1]["body"])["password"]
+
+    assert sent == {
+        "b-1": box_password("the-fleets", "b-1"),
+        "b-2": box_password("the-fleets", "b-2"),
+    }
+    assert sent["b-1"] != sent["b-2"]
 
 
 @pytest.fixture

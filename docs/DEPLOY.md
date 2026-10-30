@@ -138,10 +138,15 @@ Skip if `just fly-doctor` already reports a healthy box.
 
 ```bash
 just fly-up        # builds the box image and boots a machine — REAL Fly spend
-just fly-auth      # mints the box's Hermes credentials into .env
+just fly-auth      # gives the machine a login, and the fleet a password in .env
 ```
 
-`fly-auth` writes `FLOTTA_BOX_PASSWORD` into your local `.env`. Step 4 needs it.
+`fly-auth` writes `FLOTTA_BOX_PASSWORD` into your local `.env` (keeping one
+already there). Step 4 needs it. It is the fleet's password: every agent's own
+is derived from it, so it goes to the door and the control plane and **never to
+an agent** — this first machine included. That machine gets a login of its own
+that nothing records; you reach it with `fly ssh` until `flotta create` adopts
+it (step 6b), and adoption writes the password the door expects.
 
 ---
 
@@ -330,10 +335,30 @@ the only arrangement in which Hermes sends a key to a non-OpenRouter host. An
 image built before FLOTTA-39 has no such step, so its agents run Hermes's own
 default model whatever this says.
 
-**`FLOTTA_BOX_PASSWORD` must match the door's.** The door logs into every box
-on the caller's behalf using its copy; a different value locks it out of the
-agent that was just created. That is also why creation does not generate one
-per box.
+**`FLOTTA_BOX_PASSWORD` must match the door's, and no agent holds it.** Each
+agent is given its own password, derived from this one and its id
+(`flotta.auth.box_password`, FLOTTA-96), and the door derives the same from its
+copy, so a different value locks the door out of every agent. When every agent
+held this value, Fly's private network let any agent log in to any other — an
+agency's to the operator's — without passing the door, which is where tenancy
+is checked.
+
+**A fleet with agents made before FLOTTA-96 needs a fresh value, not just
+rotated agents.** Each of them held this value as its own password, and root
+could have kept a copy; rotating rewrites an agent's environment but not what
+it kept, and with the old value as the key, a kept copy derives every new
+password from an agent's id. So, in this order:
+
+1. `just fleet-key` — a fresh `FLOTTA_BOX_PASSWORD` in `.env`, sent nowhere.
+2. Set the same value on the control plane (Render → Environment).
+3. `just door-secrets && just door-deploy`.
+4. `uv run flotta token rotate <agent>` for **every** agent.
+
+The same steps change it at any other time. A rotation writes the agent's
+derived password along with its token; a sleeping agent stays asleep and picks
+it up when it next wakes. Until an agent is rotated the door cannot log in to
+it. The door never falls back to this value: an agent is root on its own
+machine and could refuse its own password on purpose to be sent this one.
 
 **The last two look redundant on the control plane and are not.** It stamps
 them onto every box it creates, so the box knows where to fetch git credentials

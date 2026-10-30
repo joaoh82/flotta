@@ -64,7 +64,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG
+from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, box_password
 from flotta.backend import (
     Backend,
     BackendError,
@@ -390,11 +390,13 @@ BOX_TOKEN_TTL_S = 90 * 24 * 3600
 BOX_AUTH_USER = "flotta"
 
 
-def fleet_secrets(env: dict[str, str] | None = None) -> tuple[dict[str, str], list[str]]:
+def fleet_secrets(
+    env: dict[str, str] | None = None, *, box_id: str
+) -> tuple[dict[str, str], list[str]]:
     """What every box in this fleet needs to boot, and what is missing.
 
     Returns `(secrets, missing)`. Distinct from `build_identity`, which is what
-    makes a box *itself*: these are the same for every agent, and until M8.3
+    makes a box *itself*: these come from the fleet's configuration, and until M8.3
     they were never injected at all — one Fly app held the whole fleet and
     `just fly-auth` / `just fly-secrets` had set them on it once, by hand.
 
@@ -405,11 +407,14 @@ def fleet_secrets(env: dict[str, str] | None = None) -> tuple[dict[str, str], li
         just fly-auth
         Main child exited normally with code: 1
 
-    **The password is fleet-wide and must stay so.** The door logs into every
-    box on the caller's behalf using its own copy; a password generated per box
-    would lock the door out of the agent it just created. The session *secret*
-    is per-app state and is generated fresh, because nothing else needs to know
-    it.
+    **The password is the box's own, derived from the fleet's** (FLOTTA-96,
+    `flotta.auth.box_password`). The door logs into every box on the caller's
+    behalf, so a password generated at random per box would lock it out of the
+    agent it just created; the fleet's own on every box let any agent log in to
+    any other. Derived is both: the door works it out, and it opens one box.
+    `box_id` is required so that no caller can forget it and hand out the
+    fleet's. The session *secret* is per-app state and is generated fresh,
+    because nothing else needs to know it.
     """
     source = os.environ if env is None else env
     secrets: dict[str, str] = {}
@@ -418,7 +423,7 @@ def fleet_secrets(env: dict[str, str] | None = None) -> tuple[dict[str, str], li
     password = (source.get("FLOTTA_BOX_PASSWORD") or "").strip()
     if password:
         secrets["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] = BOX_AUTH_USER
-        secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = password
+        secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = box_password(password, box_id)
         secrets["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = secrets_module.token_urlsafe(48)
     else:
         # Without it the entrypoint refuses to serve and the machine restarts
@@ -926,7 +931,7 @@ def create_box(
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
-    fleet, missing_fleet = fleet_secrets(source)
+    fleet, missing_fleet = fleet_secrets(source, box_id=box.id)
     # This agent's own model, if it has one — from the store for the reason
     # `meta` is. Only the model is overridden: the endpoint and key stay the
     # fleet's (see the `box_models` table).
@@ -1468,10 +1473,14 @@ def rotate_identity(
     eng-g's token on the wrong app and left eng-g unchanged. The endpoint is
     the one place that says where an agent actually lives.
 
-    **Only the token.** `build_identity` also produces the machine's id, name,
-    control-plane URL and commit-email domain, but those were set when the
-    machine was created and have not changed — re-writing them from whatever
-    this process happens to have would be a way to change them by accident.
+    **Only the token, and the box's own password.** `build_identity` also
+    produces the machine's id, name, control-plane URL and commit-email domain,
+    but those were set when the machine was created and have not changed —
+    re-writing them from whatever this process happens to have would be a way
+    to change them by accident. The password cannot change that way: it is
+    derived from the box's id (FLOTTA-96), and writing it is how an agent made
+    before that stops holding the fleet's. Skipped when the control plane has
+    no `$FLOTTA_BOX_PASSWORD`, rather than writing a blank one.
 
     **A sleeping agent stays asleep.** `apply_secrets` deploys without
     `--stage`, which flyctl runs as a restart-only update; its
@@ -1484,6 +1493,7 @@ def rotate_identity(
     rotating the signing key; this does not pretend otherwise.
     """
     from flotta.auth import AuthError, verify
+    from flotta.settings import layered
 
     box = _require_box(store, box_id)
     if is_terminal("box", box.status):
@@ -1506,9 +1516,14 @@ def rotate_identity(
     except AuthError as exc:  # pragma: no cover - we just minted it with this key
         raise ProvisionError(f"the new token does not verify: {exc}") from exc
 
+    rewritten = {"FLOTTA_BOX_TOKEN": token}
+    fleet_password = (layered(store).get("FLOTTA_BOX_PASSWORD") or "").strip()
+    if fleet_password:
+        rewritten["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = box_password(fleet_password, box.id)
+
     impl = _resolve_backend(box, backend)
     try:
-        impl.apply_secrets(box.endpoint, {"FLOTTA_BOX_TOKEN": token})
+        impl.apply_secrets(box.endpoint, rewritten)
     except BackendError as exc:
         store.add_event(
             "box",
@@ -1525,12 +1540,20 @@ def rotate_identity(
         "name": box.name,
         "expires_at": claims.expires_at,
         "scopes": sorted(claims.scopes),
+        # Whether the box now holds its own password rather than the fleet's:
+        # the timeline is how to tell which agents a FLOTTA-96 rollout reached.
+        "own_password": "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" in rewritten,
     }
     store.add_event(
         "box",
         box.id,
         IDENTITY_ROTATED,
-        {"reason": reason, "expires_at": claims.expires_at, "scopes": result["scopes"]},
+        {
+            "reason": reason,
+            "expires_at": claims.expires_at,
+            "scopes": result["scopes"],
+            "own_password": result["own_password"],
+        },
     )
     return result
 

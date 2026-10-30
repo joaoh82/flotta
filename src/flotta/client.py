@@ -316,12 +316,15 @@ def flotta_token(env: dict[str, str] | None = None) -> str:
     return token
 
 
-def credentials(dotenv: str = ".env") -> tuple[str, str]:
-    """(username, password) for the box, from the local dotenv.
+def credentials(dotenv: str = ".env", *, box_id: str) -> tuple[str, str]:
+    """(username, password) for one box, derived from the fleet's in the dotenv.
 
-    Written there by `just fly-auth`, which also pushes them to the box as Fly
-    secrets. Never committed — the box is reachable only over Fly's private
-    network, but that is one layer and Hermes's auth gate is the other.
+    The box's own, as the door sends it (FLOTTA-96): a box no longer accepts
+    the fleet's password, which is what stopped one agent logging in to another.
+
+    The fleet's is written there by `just fly-auth` (or `just fleet-key`) and
+    sent to no box. Never committed — the box is reachable only over Fly's
+    private network, but that is one layer and Hermes's auth gate is the other.
     """
     from pathlib import Path
 
@@ -331,7 +334,9 @@ def credentials(dotenv: str = ".env") -> tuple[str, str]:
         raise ChatError(f"no {dotenv} to read box credentials from — run `just fly-auth`") from exc
     for line in text.splitlines():
         if line.startswith("FLOTTA_BOX_PASSWORD="):
-            return USERNAME, line.split("=", 1)[1].strip()
+            from flotta.auth import box_password
+
+            return USERNAME, box_password(line.split("=", 1)[1].strip(), box_id)
     raise ChatError(f"FLOTTA_BOX_PASSWORD is not in {dotenv} — run `just fly-auth`")
 
 

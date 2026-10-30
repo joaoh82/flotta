@@ -470,3 +470,20 @@ def test_org_admin_cannot_be_confined_to_a_client():
 
     with pytest.raises(AuthError, match="whole org"):
         mint(subject="s", scopes={SCOPE_ORG_ADMIN}, key=KEY, org="agency-x", client="acme")
+
+
+# -- a box's own password (FLOTTA-96) -------------------------------------------
+
+
+def test_a_box_password_opens_one_box_and_is_not_the_fleets():
+    """Every agent held the fleet's password, and Fly's private network reaches
+    every agent: an agency's agent could log in to anyone's. Its own password
+    opens itself, and the door can work it out from the fleet's."""
+    from flotta.auth import box_password
+
+    mine, theirs = box_password("fleet-pw", "b-1"), box_password("fleet-pw", "b-2")
+
+    assert mine != theirs
+    assert mine == box_password("fleet-pw", "b-1"), "the door must derive the same one"
+    assert "fleet-pw" not in mine and "fleet-pw" not in theirs
+    assert box_password("another-fleet", "b-1") != mine

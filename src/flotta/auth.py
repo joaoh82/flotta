@@ -459,6 +459,28 @@ def _sign(payload: str, key: str) -> str:
     return _b64(hmac.new(key.encode(), payload.encode(), hashlib.sha256).digest())
 
 
+#: Prefixed to a box id before it is signed, so a box's password is never the
+#: signature some other use of the fleet's password would produce.
+BOX_PASSWORD_DOMAIN = "flotta-box-password:"
+
+
+def box_password(fleet_password: str, box_id: str) -> str:
+    """The password that opens one box's `hermes serve`, and no other (FLOTTA-96).
+
+    Every box used to hold the fleet's own password, which the door logs in
+    with — and Fly's private network reaches every box in the org, so any
+    agent could log in to any other, an agency's included, around the door
+    where tenancy is checked. Now a box holds this, and the door, holding the
+    fleet's, derives it per box: one secret to keep, and none on a machine
+    that opens a machine but its own.
+
+    Keyed on the id, not the name: a name is released when its box is torn
+    down and can be taken again, and the next agent to take it must not
+    inherit a password that someone saw.
+    """
+    return _sign(BOX_PASSWORD_DOMAIN + box_id, fleet_password)
+
+
 def mint(
     *,
     subject: str,

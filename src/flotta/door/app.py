@@ -104,6 +104,7 @@ from flotta.auth import (
     Token,
     admits,
     admits_tenant,
+    box_password,
     verify,
     verify_ticket,
 )
@@ -576,14 +577,12 @@ async def hermes_ticket(base_url: str, credentials: tuple[str, str]) -> str:
 
 
 def resolve_box_credentials(env: dict[str, str] | None = None) -> tuple[str, str] | None:
-    """The box's own Hermes credentials, attached on the way out.
+    """The fleet's Hermes credentials, from which each box's own is derived.
 
-    One pair for the whole app today, because `just fly-auth` mints one pair
-    per Fly app and every box in that app shares it. That is a real limitation
-    and it is bounded: the credential never leaves the server side, so its blast
-    radius is "someone who already compromised the door", not "any user".
-    Per-box credentials become necessary at M10, where boxes belong to different
-    people.
+    Never sent to a box as they are: `_own` derives the password of the box
+    being proxied (FLOTTA-96), and that is the only one the box accepts. When
+    every box held the fleet's, Fly's private network let any agent log in to
+    any other — an agency's to the operator's — around this door.
     """
     env = os.environ if env is None else env
     password = (env.get(BOX_PASSWORD_ENV) or "").strip()
@@ -617,6 +616,20 @@ def create_door(
         token=os.environ.get(CONTROL_TOKEN_ENV) or None,
     )
     creds = box_credentials if box_credentials is not None else resolve_box_credentials()
+
+    def _own(target: Target) -> tuple[str, str] | None:
+        """The credentials of the box being proxied, and of no other.
+
+        Derived and nothing else — never a retry with the fleet's own on a
+        refusal. A box's agent has root on its machine and can refuse on
+        purpose, and a door that then tried the fleet's password would hand it
+        the one secret that opens everyone.
+        """
+        if creds is None:
+            return None
+        username, fleet_password = creds
+        return username, box_password(fleet_password, target.box_id)
+
     origins = allowed_origins if allowed_origins is not None else resolve_allowed_origins()
     if local_boxes is None:
         local_boxes = resolve_local_boxes()
@@ -702,7 +715,8 @@ def create_door(
         forwarded["host"] = authority(target.host, target.port)
 
         body = await request.body()
-        if creds:
+        own = _own(target)
+        if own:
             # Two mechanisms, because Hermes only honours one of them and it is
             # not the obvious one. Its "basic" provider is a *login form* that
             # exchanges a JSON body for session cookies, so the header below is
@@ -712,9 +726,9 @@ def create_door(
             # The rewrite is what actually authenticates: the client posts the
             # shape Hermes expects with no password it could know, and the door
             # fills in the real one here.
-            forwarded["authorization"] = _basic(*creds)
+            forwarded["authorization"] = _basic(*own)
             if request.method == "POST" and f"/{path}" == LOGIN_PATH:
-                body = rewrite_login(body, *creds)
+                body = rewrite_login(body, *own)
                 forwarded.pop("content-length", None)
 
         url = f"http://{authority(target.host, target.port)}/{path}"
@@ -773,9 +787,10 @@ def create_door(
                 )
             target = await _target(token, websocket.headers.get("host"))
             upstream_ticket = None
-            if ticketed and creds:
+            own = _own(target)
+            if ticketed and own:
                 upstream_ticket = await hermes_ticket(
-                    f"http://{authority(target.host, target.port)}", creds
+                    f"http://{authority(target.host, target.port)}", own
                 )
         except BoxUnavailable as exc:
             # The handshake has to be accepted before a close code carries a
@@ -813,7 +828,7 @@ def create_door(
         upstream_url = f"ws://{authority(target.host, target.port)}/{path}" + (
             f"?{query}" if query else ""
         )
-        headers = {"Authorization": _basic(*creds)} if creds else {}
+        headers = {"Authorization": _basic(*own)} if own else {}
 
         try:
             async with websockets.connect(

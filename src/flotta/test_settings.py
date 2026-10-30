@@ -276,5 +276,5 @@ def test_a_model_set_in_the_app_is_what_a_new_agent_is_created_with(store, monke
     monkeypatch.setenv("FLOTTA_API_KEY", "sk-abc")
     store.set_setting("FLOTTA_MODEL", "anthropic/claude-sonnet-4.5")
 
-    secrets, _ = fleet_secrets(layered(store))
+    secrets, _ = fleet_secrets(layered(store), box_id="b-1")
     assert secrets["FLOTTA_MODEL"] == "anthropic/claude-sonnet-4.5"

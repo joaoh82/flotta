@@ -2092,21 +2092,27 @@ def test_a_created_box_can_serve():
     without them exits 1 and restarts forever."""
     from flotta.provision import fleet_secrets
 
-    secrets, missing = fleet_secrets(_fleet_env())
+    secrets, missing = fleet_secrets(_fleet_env(), box_id="b-1")
     assert missing == []
     assert secrets["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] == "flotta"
-    assert secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == "hunter2"
+    assert secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]
     assert secrets["HERMES_DASHBOARD_BASIC_AUTH_SECRET"]
 
 
-def test_the_password_is_the_fleets_so_the_door_can_still_get_in():
-    """The door logs into every box with its own copy. A password generated per
-    box would lock it out of the agent it had just created."""
+def test_each_box_gets_its_own_password_which_the_door_can_derive():
+    """FLOTTA-96. The fleet's password on every agent let any agent log in to
+    any other over Fly's private network, around the door. Each now holds one
+    that opens itself; the door, which holds the fleet's, derives it — a
+    random one per box would lock the door out of the agent it just created."""
+    from flotta.auth import box_password
     from flotta.provision import fleet_secrets
 
-    a, _ = fleet_secrets(_fleet_env())
-    b, _ = fleet_secrets(_fleet_env())
-    assert a["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == b["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]
+    a, _ = fleet_secrets(_fleet_env(), box_id="b-1")
+    b, _ = fleet_secrets(_fleet_env(), box_id="b-2")
+    assert a["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == box_password("hunter2", "b-1")
+    assert b["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == box_password("hunter2", "b-2")
+    assert a["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] != b["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]
+    assert "hunter2" not in repr(a) + repr(b), "the fleet's own password reached a box"
     # The session secret is per-app state that nothing else needs to know.
     assert a["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] != b["HERMES_DASHBOARD_BASIC_AUTH_SECRET"]
 
@@ -2117,7 +2123,7 @@ def test_the_provider_is_set_in_both_vocabularies():
     with "No inference provider configured" — found by sending a real turn."""
     from flotta.provision import fleet_secrets
 
-    secrets, _ = fleet_secrets(_fleet_env())
+    secrets, _ = fleet_secrets(_fleet_env(), box_id="b-1")
     assert secrets["FLOTTA_API_KEY"] == "sk-abc"
     assert secrets["OPENROUTER_API_KEY"] == "sk-abc", "the native name is what serve reads"
 
@@ -2130,7 +2136,9 @@ def test_a_non_openrouter_endpoint_is_not_given_openai_env_names():
     `FLOTTA_*` values; those are the only names it needs."""
     from flotta.provision import fleet_secrets
 
-    secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL="https://api.together.xyz/v1"))
+    secrets, _ = fleet_secrets(
+        _fleet_env(FLOTTA_MODEL_BASE_URL="https://api.together.xyz/v1"), box_id="b-1"
+    )
     assert secrets["FLOTTA_API_KEY"] == "sk-abc"
     assert secrets["FLOTTA_MODEL_BASE_URL"] == "https://api.together.xyz/v1"
     assert not {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY"} & set(secrets)
@@ -2139,7 +2147,7 @@ def test_a_non_openrouter_endpoint_is_not_given_openai_env_names():
 def test_what_is_missing_is_named_rather_than_guessed():
     from flotta.provision import fleet_secrets
 
-    _, missing = fleet_secrets({})
+    _, missing = fleet_secrets({}, box_id="b-1")
     assert "FLOTTA_BOX_PASSWORD" in missing
     assert any("FLOTTA_API_KEY" in m for m in missing)
 
@@ -2149,10 +2157,14 @@ def test_creation_carries_the_fleets_secrets_onto_the_machine(store, monkeypatch
     for key, value in _fleet_env().items():
         monkeypatch.setenv(key, value)
 
-    impl = Recording()
-    create_box("eng-b", store=store, backend=impl)
+    from flotta.auth import box_password
 
-    assert impl.spec.secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == "hunter2"
+    impl = Recording()
+    out = create_box("eng-b", store=store, backend=impl)
+
+    assert impl.spec.secrets["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == box_password(
+        "hunter2", out["box_id"]
+    )
     assert impl.spec.secrets["OPENROUTER_API_KEY"] == "sk-abc"
     # And still a secret, never an env var anyone can read off the machine.
     assert not any(k.startswith("HERMES_DASHBOARD") for k in impl.spec.env)
@@ -2183,11 +2195,15 @@ def test_an_adopted_machine_gets_what_it_needs_to_serve(store, monkeypatch):
     for key, value in _fleet_env().items():
         monkeypatch.setenv(key, value)
 
+    from flotta.auth import box_password
+
     impl = Adopting()
-    create_box("eng-b", store=store, backend=impl)
+    out = create_box("eng-b", store=store, backend=impl)
 
     assert "apply_secrets" in impl.calls
-    assert impl.applied["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == "hunter2"
+    assert impl.applied["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == box_password(
+        "hunter2", out["box_id"]
+    )
     assert impl.applied["OPENROUTER_API_KEY"] == "sk-abc"
     assert "FLOTTA_BOX_TOKEN" in impl.applied, "the identity still travels too"
 
@@ -2214,7 +2230,7 @@ def test_a_proxy_url_mentioning_openrouter_is_not_openrouter():
     from flotta.provision import fleet_secrets
 
     secrets, _ = fleet_secrets(
-        _fleet_env(FLOTTA_MODEL_BASE_URL="https://proxy.internal/openrouter/v1")
+        _fleet_env(FLOTTA_MODEL_BASE_URL="https://proxy.internal/openrouter/v1"), box_id="b-1"
     )
     assert "OPENROUTER_API_KEY" not in secrets
     assert secrets["FLOTTA_MODEL_BASE_URL"] == "https://proxy.internal/openrouter/v1"
@@ -2224,7 +2240,7 @@ def test_openrouter_itself_still_uses_its_own_variable():
     from flotta.provision import fleet_secrets
 
     for url in ("https://openrouter.ai/api/v1", "https://api.openrouter.ai/v1"):
-        secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL=url))
+        secrets, _ = fleet_secrets(_fleet_env(FLOTTA_MODEL_BASE_URL=url), box_id="b-1")
         assert secrets["OPENROUTER_API_KEY"] == "sk-abc", url
 
 
@@ -3209,14 +3225,65 @@ def test_a_rotation_writes_a_fresh_token_to_the_agents_own_machine(store, monkey
     assert result["expires_at"] == claims.expires_at
 
 
-def test_only_the_token_is_rewritten(store, monkeypatch):
+def test_only_the_token_and_the_boxs_own_password_are_rewritten(store, monkeypatch):
     """The machine's id, name, control URL and commit domain were set when it
     was created. Re-writing them from this process's environment is how a
-    rotation would quietly change what an agent commits as."""
+    rotation would quietly change what an agent commits as.
+
+    The password is the exception (FLOTTA-96): it is derived from the box's id,
+    so writing it again cannot change it by accident, and rotating is how an
+    agent made before it stops holding the fleet's."""
+    from flotta.auth import box_password
     from flotta.provision import rotate_identity
 
     monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_BOX_PASSWORD", "hunter2")
     monkeypatch.setenv("FLOTTA_GIT_EMAIL_DOMAIN", "somewhere-else.example")
+    backend = Rotating()
+    box = _running(store)
+    rotate_identity(box.id, store=store, backend=backend)
+    assert sorted(backend.applied) == ["FLOTTA_BOX_TOKEN", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]
+    assert backend.applied["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] == box_password(
+        "hunter2", box.id
+    )
+    rotated = [e for e in store.get_events("box", box.id) if e.type == "identity_rotated"]
+    assert rotated[-1].payload["own_password"] is True
+    assert "hunter2" not in repr(rotated[-1].payload)
+
+
+def test_after_a_fresh_fleet_key_the_old_one_opens_no_agent(store, monkeypatch, tmp_path):
+    """Every agent made before FLOTTA-96 held the fleet's password as its own,
+    and root could have kept it. Rotating rewrites the environment, not what
+    was kept, so the rollout replaces the key: an agent's password derived
+    from the old one, or the old one itself, must then be refused."""
+    from flotta.auth import box_password
+    from flotta.backends.standin import Agent, credentials_from
+    from flotta.provision import rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_BOX_PASSWORD", "the-fresh-key")
+    target = _running(store, name="eng-d")
+    backend = Rotating()
+    rotate_identity(target.id, store=store, backend=backend)
+
+    env = {"HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "flotta", **backend.applied}
+    agent = Agent(name="eng-d", home=tmp_path, credentials=credentials_from(env))
+
+    def logs_in(password):
+        return agent.admits_login({"username": "flotta", "password": password})
+
+    assert not logs_in(box_password("the-old-key", target.id))
+    assert not logs_in("the-old-key")
+    assert logs_in(box_password("the-fresh-key", target.id))
+
+
+def test_a_rotation_without_the_fleets_password_still_rotates_the_token(store, monkeypatch):
+    """A self-hoster with no `$FLOTTA_BOX_PASSWORD` on the control plane: the
+    box keeps whatever it has, rather than being written a blank one."""
+    from flotta.provision import rotate_identity
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.delenv("FLOTTA_BOX_PASSWORD", raising=False)
     backend = Rotating()
     rotate_identity(_running(store).id, store=store, backend=backend)
     assert list(backend.applied) == ["FLOTTA_BOX_TOKEN"]
@@ -3231,7 +3298,7 @@ def test_a_rotation_is_recorded_without_the_token(store, monkeypatch):
     rotate_identity(box.id, store=store, backend=backend)
 
     (event,) = [e for e in store.get_box_timeline(box.id) if e.type == IDENTITY_ROTATED]
-    assert set(event.payload) == {"reason", "expires_at", "scopes"}
+    assert set(event.payload) == {"reason", "expires_at", "scopes", "own_password"}
     assert backend.applied["FLOTTA_BOX_TOKEN"] not in str(event.payload)
 
 
