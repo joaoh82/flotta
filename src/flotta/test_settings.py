@@ -85,6 +85,10 @@ def test_every_catalogued_setting_actually_changes_something():
         # shadow and the API refuses it. It is in the catalogue to be *read* —
         # "which provider is this fleet on" had no answer in the window.
         "FLOTTA_MODEL_BASE_URL",
+        # Read by `provision.allowed_models`, which `_checked_model` refuses
+        # every model against before an agent is created with it or moved to
+        # it (FLOTTA-85), and which `GET /api/models` serves to the picker.
+        "FLOTTA_MODELS",
         # Read by `provision.create_box` into `BoxSpec.env` as `FLOTTA_WORKDIR`,
         # which the entrypoint already mkdir's. The catalogue test exists to
         # make somebody check that wiring; a setting nobody reads is a field

@@ -2672,10 +2672,16 @@ def create_app(
         """A model id from a request, validated and looked up — or None.
 
         None and "" both mean "the fleet default": the common case, and a
-        cleared field in the app. Refused on a malformed id and on a definite
-        "no such model"; allowed when the catalogue cannot be asked.
+        cleared field in the app. Refused on a malformed id, on a model that is
+        not on the fleet's list (FLOTTA-85), and on a definite "no such model";
+        allowed when the catalogue cannot be asked.
+
+        **The list is for every caller**, the operator included: it is what
+        the fleet's key may be spent on, and the operator changes it in the
+        settings rather than going around it.
         """
         from flotta.inference import InvalidModel, validate_model
+        from flotta.provision import allowed_models
 
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             return None
@@ -2683,6 +2689,20 @@ def create_app(
             model = validate_model(str(raw))
         except InvalidModel as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            allowed = allowed_models(store)
+        finally:
+            store.close()
+        if model not in allowed:
+            listed = ", ".join(allowed) or "none: the fleet has no models set"
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{model} is not one of the fleet's models ({listed}). "
+                    "The fleet's operator chooses which models agents may use."
+                ),
+            )
         # The endpoint is the control plane's own configuration, not a stored
         # setting: it travels with the fleet's key, which never leaves the env.
         base_url = (os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip()
@@ -2695,6 +2715,22 @@ def create_app(
             if verdict.refuses:
                 raise HTTPException(status_code=422, detail=verdict.detail)
         return model
+
+    @app.get("/api/models")
+    def list_models(token: Token | None = needs_read) -> Any:
+        """The models an agent may be given, and which one is the default.
+
+        What a model picker offers (FLOTTA-85). Readable by anyone who can read
+        the fleet: which models exist is the operator's choice, not anyone's
+        secret. `default` is what `{"model": null}` means.
+        """
+        from flotta.provision import allowed_models, fleet_model
+
+        store = store_factory()
+        try:
+            return {"models": allowed_models(store), "default": fleet_model(store)}
+        finally:
+            store.close()
 
     @app.put("/api/boxes/{box_id}/model")
     def set_model_endpoint(

@@ -123,6 +123,19 @@ SETTINGS: tuple[Setting, ...] = (
         default="",
     ),
     Setting(
+        key="FLOTTA_MODELS",
+        label="Models agents may use",
+        help=(
+            "The models anyone may give an agent, separated by commas; the "
+            "model for new agents is always one of them. Every agent calls its "
+            "model with the fleet's key, so this is the fleet's bill: an agency "
+            "picks from here, and nothing else is accepted. Empty means only "
+            "the model for new agents."
+        ),
+        kind="text",
+        default="",
+    ),
+    Setting(
         key="FLOTTA_MODEL_BASE_URL",
         label="Provider endpoint",
         help=(
@@ -263,6 +276,20 @@ def validate(key: str, value: str) -> str:
             return validate_model(text)
         except InvalidModel as exc:
             raise ValueError(str(exc)) from exc
+    elif key == "FLOTTA_MODELS":
+        from flotta.inference import InvalidModel, validate_model
+
+        models: list[str] = []
+        for part in text.replace("\n", ",").split(","):
+            if not part.strip():
+                continue
+            try:
+                model = validate_model(part)
+            except InvalidModel as exc:
+                raise ValueError(f"{setting.label}: {exc}") from exc
+            if model not in models:
+                models.append(model)
+        return ", ".join(models)
     elif key == "FLOTTA_WORKDIR":
         from flotta.workdir import validate_workdir
 

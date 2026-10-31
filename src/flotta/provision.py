@@ -1570,6 +1570,22 @@ def fleet_model(store: FleetStore | None = None) -> str | None:
     return (env.get("FLOTTA_MODEL") or "").strip() or None
 
 
+def allowed_models(store: FleetStore | None = None) -> list[str]:
+    """The models an agent may be given (FLOTTA-85): the fleet's default first,
+    then `FLOTTA_MODELS`, each once.
+
+    The operator's list, because every agent calls its model with the fleet's
+    one key: whoever picks the model, the operator pays for it. Empty when the
+    fleet has neither, and then no agent can be given a model of its own.
+    """
+    from flotta.settings import layered
+
+    env = layered(store) if store is not None else os.environ
+    listed = (env.get("FLOTTA_MODELS") or "").replace("\n", ",").split(",")
+    models = [m for m in [fleet_model(store), *(p.strip() for p in listed)] if m]
+    return list(dict.fromkeys(models))
+
+
 def set_model(
     box_id: str,
     model: str | None,

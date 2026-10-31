@@ -3043,6 +3043,7 @@ def test_create_passes_the_model_on(client, monkeypatch):
 
     monkeypatch.setattr(provision, "create_box", fake_create)
     monkeypatch.setattr("flotta.control.app._peek_for", lambda impl, name: None, raising=False)
+    monkeypatch.setenv("FLOTTA_MODELS", "z-ai/glm-5.2")
     client.post("/api/boxes", json={"name": "eng-z", "model": " z-ai/glm-5.2 "})
     assert seen.get("model") == "z-ai/glm-5.2"
 
@@ -3075,6 +3076,8 @@ def test_a_model_the_catalogue_does_not_have_is_422(fleet, monkeypatch):
     from flotta.model_catalog import Known
 
     monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    # On the fleet's list, so the catalogue is what refuses it (FLOTTA-85).
+    monkeypatch.setenv("FLOTTA_MODELS", "anthropic/claude-sonet")
     app = create_app(
         store_factory=lambda: FleetStore(fleet),
         run_loop=False,
@@ -3121,6 +3124,7 @@ def test_changing_a_model_goes_through_the_provision_verb(client, monkeypatch):
         return {"box_id": box_id, "name": "eng-a", "model": model, "source": "agent"}
 
     monkeypatch.setattr(provision, "set_model", fake_set)
+    monkeypatch.setenv("FLOTTA_MODELS", "anthropic/claude-sonnet-4.5")
     response = client.put("/api/boxes/eng-a/model", json={"model": "anthropic/claude-sonnet-4.5"})
     assert response.status_code == 200
     assert called["model"] == "anthropic/claude-sonnet-4.5"
@@ -3166,6 +3170,7 @@ def test_a_model_change_the_substrate_refused_is_a_502(client, monkeypatch):
         raise provision.UpgradeFailed("could not change eng-a's model: flyctl exploded")
 
     monkeypatch.setattr(provision, "set_model", broken)
+    monkeypatch.setenv("FLOTTA_MODELS", "z-ai/glm-5.2")
     assert client.put("/api/boxes/eng-a/model", json={"model": "z-ai/glm-5.2"}).status_code == 502
 
 
