@@ -207,6 +207,7 @@ def test_the_backend_satisfies_the_protocol():
         # Both of these were added to the protocol without being listed here,
         # which is how a list like this quietly stops being the protocol.
         "apply_secrets",
+        "apply_env",
         "reimage",
         "exec",
         "state",
@@ -650,6 +651,36 @@ def test_reimaging_a_running_box_leaves_it_running():
     assert "--skip-health-checks" not in update, "a box that will not boot must fail loudly"
 
 
+def test_rewriting_env_names_only_the_keys_given_and_keeps_an_asleep_box_asleep():
+    """FLOTTA-98: `machine update --env` keeps every key it does not name, which
+    is what lets a repair change the address without touching the rest."""
+    issued, backend = _recording_fly(_machines_list(state="suspended"))
+    backend.apply_env(
+        "fly://joaoh82-flotta-eng-a/m-1", {"FLOTTA_CONTROL_URL": "https://control.example"}
+    )
+
+    update = next(c for c in issued if "update" in c)
+    assert update[update.index("update") + 1] == "m-1"
+    assert "FLOTTA_CONTROL_URL=https://control.example" in update
+    assert update.count("--env") == 1
+    assert "--skip-start" in update, update
+    assert "--image" not in update
+
+
+def test_rewriting_env_on_a_running_box_leaves_it_running():
+    issued, backend = _recording_fly(_machines_list(state="started"))
+    backend.apply_env("fly://joaoh82-flotta-eng-a/m-1", {"FLOTTA_BOX_ID": "b-1"})
+
+    update = next(c for c in issued if "update" in c)
+    assert "--skip-start" not in update, update
+
+
+def test_rewriting_no_env_touches_nothing():
+    issued, backend = _recording_fly(_machines_list())
+    backend.apply_env("fly://joaoh82-flotta-eng-a/m-1", {})
+    assert issued == []
+
+
 # -- inspect: the substrate's own account of a machine ----------------------
 #
 # The fixture is a real `flyctl machines list --json` record, trimmed —
@@ -716,6 +747,26 @@ def test_inspect_reports_the_projects_folder_from_the_machine_env():
         "config": {**_LIVE_MACHINE["config"], "env": {"FLOTTA_WORKDIR": "/mnt/src"}},
     }
     assert _inspecting([machine]).workdir == "/mnt/src"
+
+
+def test_inspect_reports_which_control_plane_the_machine_calls():
+    """FLOTTA-98: every agent kept the Railway address after the move, and
+    nothing could show it. The machine's own environment is the only answer."""
+    machine = {
+        **_LIVE_MACHINE,
+        "config": {
+            **_LIVE_MACHINE["config"],
+            "env": {
+                "FLOTTA_CONTROL_URL": "https://flotta-production.up.railway.app",
+                "FLOTTA_BOX_ID": "b-38921d1eb55e",
+            },
+        },
+    }
+    info = _inspecting([machine])
+    assert info.control_url == "https://flotta-production.up.railway.app"
+    assert info.env_box_id == "b-38921d1eb55e"
+    bare = _inspecting([_LIVE_MACHINE])
+    assert (bare.control_url, bare.env_box_id) == (None, None)
 
 
 def test_inspect_blanks_a_missing_workdir_rather_than_guessing():

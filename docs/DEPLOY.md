@@ -733,3 +733,11 @@ not what any agent knows.
    the memory — come back with it. Try the least important agent first.
 4. Re-grant repositories (`flotta repo grant`) and peers; they lived in the
    lost database.
+5. **Repair each agent's connection.** An adopted machine keeps the environment
+   it booted with, so it still calls the *old* control plane under its old box
+   id, and every git credential, `flotta-repos` and `flotta-ask` fails with a
+   404 from a dead host. Its Machine reading reports this as `connection`;
+   `POST /api/boxes/<name>/connection` (the console's "Repair connection")
+   points it at this one and renews its token. Set `FLOTTA_CONTROL_URL` on the
+   new control plane first: the repair refuses to guess its address. A running
+   agent restarts; an asleep one takes it when it wakes.

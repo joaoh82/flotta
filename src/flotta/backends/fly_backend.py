@@ -232,6 +232,23 @@ class FlyBackend:
             stdin="".join(f"{k}={v}\n" for k, v in secrets.items()),
         )
 
+    def apply_env(self, box_id: str, env: dict[str, str]) -> None:
+        """`flyctl machine update --env`, which keeps everything it does not name.
+
+        The same verb `reimage` uses, for the same reasons: the volume, the
+        image and every other key survive, and `--skip-start` keeps an asleep
+        agent asleep rather than billing it awake.
+        """
+        if not env:
+            return
+        app, machine_id = self._addr(box_id)
+        args = ["machine", "update", machine_id, "--yes"]
+        for key, value in env.items():
+            args += ["--env", f"{key}={value}"]
+        if self._state(app, machine_id) != "started":
+            args.append("--skip-start")
+        self._flyctl(*args, app=app)
+
     def reimage(self, box_id: str, image: str) -> None:
         """`flyctl machine update --image`, which keeps the volume mount.
 
@@ -378,6 +395,8 @@ class FlyBackend:
                 updated_at=machine.get("updated_at"),
                 host_status=machine.get("host_status"),
                 workdir=workdir,
+                control_url=_env_str(env, "FLOTTA_CONTROL_URL"),
+                env_box_id=_env_str(env, "FLOTTA_BOX_ID"),
             )
         return MachineInfo(state="gone", machine_id=machine_id, app=app)
 
@@ -733,6 +752,12 @@ def _shown(cmd: list[str]) -> str:
 #: from its `HERMES_REF` build arg — see the comment there for why a label and
 #: not an `ENV`.
 HERMES_REF_LABEL = "dev.flotta.hermes-ref"
+
+
+def _env_str(env: object, key: str) -> str | None:
+    """One key of a machine's `config.env`, or None when absent or blank."""
+    value = env.get(key) if isinstance(env, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _hermes_ref(machine: dict) -> str | None:

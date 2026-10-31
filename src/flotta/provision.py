@@ -1472,9 +1472,12 @@ def rotate_identity(
 
     **Only the token, and the box's own password.** `build_identity` also
     produces the machine's id, name, control-plane URL and commit-email domain,
-    but those were set when the machine was created and have not changed —
-    re-writing them from whatever this process happens to have would be a way
-    to change them by accident. The password cannot change that way: it is
+    which were set when the machine was created — re-writing them from whatever
+    this process happens to have would be a way to change them by accident.
+    They *can* go stale: re-registering after the Railway move left every
+    agent calling the old control plane under its old id. Fixing that is a
+    deliberate act with its own check, `repair_connection` (FLOTTA-98), which
+    compares the machine with this control plane first. The password cannot change that way: it is
     derived from the box's id (FLOTTA-96), and writing it is how an agent made
     before that stops holding the fleet's. Skipped when the control plane has
     no `$FLOTTA_BOX_PASSWORD`, rather than writing a blank one.
@@ -1551,6 +1554,169 @@ def rotate_identity(
             "scopes": result["scopes"],
             "own_password": result["own_password"],
         },
+    )
+    return result
+
+
+#: The events a connection repair writes (FLOTTA-98).
+CONNECTION_REPAIRED = "connection_repaired"
+CONNECTION_REPAIR_FAILED = "connection_repair_failed"
+
+
+def _same_url(a: str | None, b: str | None) -> bool:
+    return (a or "").strip().rstrip("/") == (b or "").strip().rstrip("/")
+
+
+def connection_of(box: Any, info: Any, *, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Whether `box`'s machine calls this control plane, as itself (FLOTTA-98).
+
+    Every box-side call — a git credential, `flotta-repos`, `flotta-ask` —
+    goes to the `FLOTTA_CONTROL_URL` the machine booted with. After the move
+    off Railway every agent kept the old address and its pre-move
+    `FLOTTA_BOX_ID`, so each of those calls reached a dead host and was
+    answered 404; the agent said, correctly, that it had no access, and
+    nothing on any screen said why.
+
+    Pure: `info` is the `MachineInfo` the caller already read. `ok` is
+    `None` when there is nothing to compare — no machine reading, or a
+    control plane that does not know its own address — which is not the
+    same as fine and must not be rendered as fine.
+    """
+    source = os.environ if env is None else env
+    wanted = (source.get("FLOTTA_CONTROL_URL") or "").strip()
+    has = getattr(info, "control_url", None) if info is not None else None
+    has_id = getattr(info, "env_box_id", None) if info is not None else None
+    out: dict[str, Any] = {
+        "ok": None,
+        "control_url": has,
+        "wanted_control_url": wanted or None,
+        "box_id": has_id,
+        "problems": [],
+    }
+    if info is None or getattr(info, "state", None) == "gone":
+        return out
+    if not wanted:
+        out["problems"].append(
+            "this control plane does not know its own address: set $FLOTTA_CONTROL_URL "
+            "where it runs, so agents can be pointed at it"
+        )
+        return out
+    problems: list[str] = out["problems"]
+    if not has:
+        problems.append(
+            "it has no control-plane address, so it cannot fetch a git credential, "
+            "list its repositories or ask a colleague"
+        )
+    elif not _same_url(has, wanted):
+        problems.append(
+            f"it calls {has}, not this control plane ({wanted}), so its git credentials, "
+            "repository list and colleagues all fail"
+        )
+    if has_id and has_id != box.id:
+        problems.append(f"it was told it is {has_id}; this agent is {box.id}")
+    out["ok"] = not problems
+    return out
+
+
+def repair_connection(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Point an agent's machine at this control plane, as itself (FLOTTA-98).
+
+    Rewrites whichever of `FLOTTA_CONTROL_URL`, `FLOTTA_BOX_ID` and
+    `FLOTTA_BOX_NAME` disagree with this control plane's record, then issues
+    a fresh token with `rotate_identity`, so the token names the box this
+    store knows too. `rotate_identity` alone deliberately leaves the
+    environment alone, on the reasoning that it "has not changed"; a
+    re-registration after a move is exactly when it has.
+
+    The commit-email domain is not touched: changing it changes what the
+    agent commits as, and nothing about a move makes the old one wrong.
+
+    **Refuses rather than guesses** when this control plane has no
+    `$FLOTTA_CONTROL_URL`: writing a blank, or an address inferred from a
+    request, would trade one dead host for another.
+
+    A running agent restarts — twice, when its environment was stale: once
+    for the environment and once for the token. An asleep one stays asleep
+    and takes both when it next wakes.
+    """
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to repair.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(
+            f"box {box_id} is still being created and is connected as part of that; "
+            "wait for it to settle."
+        )
+    wanted = (os.environ.get("FLOTTA_CONTROL_URL") or "").strip()
+    if not wanted:
+        raise ProvisionError(
+            "this control plane does not know its own address. Set $FLOTTA_CONTROL_URL "
+            "where it runs, then repair again."
+        )
+
+    impl = _resolve_backend(box, backend)
+    try:
+        info = impl.inspect(box.endpoint)
+    except (BackendError, NotSupported, NotImplementedError, AttributeError):
+        info = None
+    current = {
+        "FLOTTA_CONTROL_URL": getattr(info, "control_url", None),
+        "FLOTTA_BOX_ID": getattr(info, "env_box_id", None),
+    }
+    wanted_env = {
+        "FLOTTA_CONTROL_URL": wanted,
+        "FLOTTA_BOX_ID": box.id,
+        "FLOTTA_BOX_NAME": box.name,
+    }
+    if info is None:
+        # Unreadable counts as stale: rewriting a value that was already right
+        # costs a restart, leaving a wrong one costs every box-side call.
+        changed = dict(wanted_env)
+    else:
+        changed = {k: wanted_env[k] for k, v in current.items() if not _same_url(v, wanted_env[k])}
+        if changed:
+            # Not readable from the machine, and free in the same update.
+            changed["FLOTTA_BOX_NAME"] = box.name
+    if changed:
+        applier = getattr(impl, "apply_env", None)
+        try:
+            if applier is None:
+                raise NotSupported(f"{type(impl).__name__} cannot rewrite a machine's environment")
+            applier(box.endpoint, changed)
+        except (BackendError, NotSupported) as exc:
+            store.add_event(
+                "box", box.id, CONNECTION_REPAIR_FAILED, {"error": str(exc)[:400], "step": "env"}
+            )
+            raise UpgradeFailed(
+                f"could not point {box.name} at this control plane: {exc}. "
+                "Its machine is unchanged."
+            ) from exc
+
+    try:
+        identity = rotate_identity(box.id, store=store, backend=impl, reason="connection repair")
+    except (UpgradeFailed, ProvisionError) as exc:
+        store.add_event(
+            "box", box.id, CONNECTION_REPAIR_FAILED, {"error": str(exc)[:400], "step": "token"}
+        )
+        raise
+
+    result = {
+        "box_id": box.id,
+        "name": box.name,
+        "control_url": wanted,
+        "rewrote": sorted(changed),
+        "expires_at": identity["expires_at"],
+    }
+    store.add_event(
+        "box",
+        box.id,
+        CONNECTION_REPAIRED,
+        {"control_url": wanted, "rewrote": result["rewrote"], "was": current["FLOTTA_CONTROL_URL"]},
     )
     return result
 

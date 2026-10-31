@@ -192,6 +192,13 @@ class MachineInfo:
     #: `None` when the substrate did not report it — agents created before
     #: the setting was wired still use the entrypoint default `/workspace`.
     workdir: str | None = None
+    #: Which control plane the machine calls (`FLOTTA_CONTROL_URL` in its
+    #: environment), and which box it was told it is (`FLOTTA_BOX_ID`).
+    #: Reported so a machine still pointing somewhere else can be seen: the
+    #: Railway move left every agent calling a dead host for nine days, and
+    #: nothing anywhere showed it (FLOTTA-98).
+    control_url: str | None = None
+    env_box_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +255,20 @@ class Backend(Protocol):
         Having both is not duplication. Having only the first would mean an
         adopted box never gets an identity; having only this would mean every
         fresh box boots once without one.
+        """
+        ...
+
+    def apply_env(self, box_id: str, env: dict[str, str]) -> None:
+        """Rewrite plain environment on an **existing** box, keeping its disk.
+
+        The twin of `apply_secrets` for values that are not secret: the
+        control plane's address and the box's own id and name, which creation
+        writes as environment. A box adopted after a move keeps the
+        environment it booted with, so these can go stale while the token is
+        fresh (FLOTTA-98). Named keys change; every other key is kept.
+
+        Costs a restart of a running box, for the usual reason. A box that is
+        not running stays that way — the same promise `reimage` makes.
         """
         ...
 

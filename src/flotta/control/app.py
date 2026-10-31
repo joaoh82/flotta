@@ -2489,12 +2489,18 @@ def create_app(
             if fleet_image and info.image:
                 current = _same_image(info.image, fleet_image)
 
+            from flotta.provision import connection_of
+
             return {
                 "box": row,
                 "machine": asdict(info),
                 "unavailable": None,
                 "fleet_image": fleet_image,
                 "image_current": current,
+                # Whether the machine calls this control plane as this box
+                # (FLOTTA-98): a stale address fails every box-side call
+                # with nothing on screen to say why.
+                "connection": connection_of(box, info),
             }
         finally:
             store.close()
@@ -2798,6 +2804,68 @@ def create_app(
             return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
         finally:
             store.close()
+
+    @app.post("/api/boxes/{box_id}/connection")
+    def repair_connection_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
+        """Point an agent's machine at this control plane, as itself (FLOTTA-98).
+
+        For an agent whose machine still calls an old control plane, or carries
+        an old box id — every agent re-registered after the Railway move. See
+        `provision.repair_connection`.
+
+        `fleet:write`, like renewing an identity, which this includes: it
+        restarts a running agent. The operator reaches any org's agent
+        (`_operated_box`), because a broken connection is the fleet's to fix.
+
+        **`202`, then a thread**, for the reason upgrades are: a running agent
+        restarts twice, and the web app gives a call ten seconds. The refusals
+        a caller can act on are answered first; the outcome is the timeline's
+        `connection_repaired` or `connection_repair_failed`.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import ProvisionError, UpgradeFailed, repair_connection
+
+        store = store_factory()
+        try:
+            box = _operated_box(store, token, box_id)
+            if is_terminal("box", box.status) or box.status == "provisioning" or not box.endpoint:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"box {box.name} has no settled machine to repair ({box.status}).",
+                )
+            if not (os.environ.get("FLOTTA_CONTROL_URL") or "").strip():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "this control plane does not know its own address. Set "
+                        "$FLOTTA_CONTROL_URL where it runs, then repair again."
+                    ),
+                )
+            if not background:
+                try:
+                    return repair_connection(box.id, store=store)
+                except UpgradeFailed as exc:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                except ProvisionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+        def repair() -> None:
+            inner = store_factory()
+            try:
+                repair_connection(box.id, store=inner)
+            except Exception as exc:  # noqa: BLE001
+                # `repair_connection` writes the failure event before raising.
+                _log.warning("repairing %s failed: %s: %s", box.name, type(exc).__name__, exc)
+            finally:
+                inner.close()
+
+        worker = threading.Thread(target=repair, name=f"repair-{box.name}", daemon=True)
+        _provisioning.add(worker)
+        worker.start()
+        return JSONResponse({"box_id": box.id, "name": box.name, "started": True}, status_code=202)
 
     @app.post("/api/boxes/{box_id}/identity")
     def rotate_identity_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
