@@ -54,7 +54,9 @@ _NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 #: The only variables a stand-in reads, and so the only secrets written to its
 #: directory. A real box is also handed the fleet's model key and its own
 #: token; a stand-in calls no model and fetches nothing, so it gets neither.
-_KEPT_SECRETS = (standin.USERNAME_ENV, standin.PASSWORD_ENV)
+#: The model's *name* it does get: it says it, so a change of model can be seen
+#: to reach it (FLOTTA-85).
+_KEPT_SECRETS = (standin.USERNAME_ENV, standin.PASSWORD_ENV, standin.MODEL_ENV)
 #: What a stand-in inherits from whoever started it: enough to run Python.
 _INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
 START_TIMEOUT_S = 15.0
