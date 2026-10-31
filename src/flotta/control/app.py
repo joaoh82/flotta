@@ -2404,7 +2404,18 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            row = _for_reader(_with_meta(store, box), token)
+            from flotta.provision import last_activity_at
+
+            # When anything last happened to it (FLOTTA-85): the timeline idle
+            # sleep reads, so "last active" here and "why did it sleep" agree.
+            active = last_activity_at(store, box.id)
+            row = _for_reader(
+                {
+                    **_with_meta(store, box),
+                    "last_active_at": active.isoformat() if active else None,
+                },
+                token,
+            )
             if not box.endpoint:
                 # Not a failure: a box being built has no machine yet, which is
                 # the honest thing to say rather than an error about flyctl.

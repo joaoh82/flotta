@@ -1708,6 +1708,18 @@ def test_the_machine_endpoint_returns_the_row_and_the_substrate_unmerged(client,
     assert body["unavailable"] is None
 
 
+def test_the_machine_endpoint_says_when_the_agent_was_last_active(client, fleet, monkeypatch):
+    """From the timeline idle sleep reads (FLOTTA-85), so the page's "last
+    active" and the reason an agent went to sleep agree."""
+    from flotta.backend import MachineInfo
+
+    _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started"))
+    with FleetStore(fleet) as store:
+        newest = max(e.ts for e in store.get_box_timeline(store.get_box_by_name("eng-a").id))
+    seen = client.get("/api/boxes/eng-a/machine").json()["box"]["last_active_at"]
+    assert seen is not None and seen[:19] == newest.replace(" ", "T")[:19]
+
+
 def test_the_machine_endpoint_reports_a_substrate_failure_rather_than_500ing(client, monkeypatch):
     """A person clicked Info. `flyctl` being logged out is something to render,
     not a failed request — and the row must still arrive so the panel has
