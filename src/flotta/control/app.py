@@ -335,7 +335,12 @@ def _build_region() -> str:
 
 
 def _box_dict(
-    box: Any, meta: Any = None, *, model: str | None = None, fleet_model: str | None = None
+    box: Any,
+    meta: Any = None,
+    *,
+    model: str | None = None,
+    fleet_model: str | None = None,
+    given: str | None = None,
 ) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
@@ -358,8 +363,14 @@ def _box_dict(
     # What model the agent runs (FLOTTA-39), and whose choice that is: its
     # own, or the fleet's. `None` for both means the fleet has no model at
     # all, which the window should say rather than guess.
-    out["model"] = model or fleet_model
-    out["model_source"] = "agent" if model else ("fleet" if fleet_model else None)
+    #
+    # For one that follows the fleet, what its machine was `given` wins over
+    # the default (FLOTTA-86): a new default reaches no existing agent, and
+    # reporting it as what they run made the window wrong the moment the
+    # operator changed it. `fleet_model` is the default now, for comparing.
+    out["model"] = model or given or fleet_model
+    out["model_source"] = "agent" if model else ("fleet" if out["model"] else None)
+    out["fleet_model"] = fleet_model
     return out
 
 
@@ -371,6 +382,7 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         store.meta_for_box(box.id),
         model=store.model_for_box(box.id),
         fleet_model=fleet_model(store),
+        given=store.models_given([box.id]).get(box.id),
     )
 
 
@@ -764,6 +776,22 @@ def create_app(
         ):
             raise HTTPException(status_code=404, detail=f"no box {ref!r}")
         return box
+
+    def _operated_box(store: Any, token: Token | None, ref: str) -> Any:
+        """`_scoped_box`, except that the operator reaches any org's box (FLOTTA-86).
+
+        For the console's own acts on one agent: its machine, its timeline, an
+        upgrade and its repository grants, done with the operator's session.
+        View-as is no way round a 404 there, because it is read-only by design.
+        Anyone else gets exactly `_scoped_box`, the same 404 for another org's
+        box, and a box's own token is never the operator (`_is_operator`).
+        """
+        if token is not None and _is_operator(token):
+            box = store.get_box(ref) or store.get_box_by_name(ref)
+            if box is None:
+                raise HTTPException(status_code=404, detail=f"no box {ref!r}")
+            return box
+        return _scoped_box(store, token, ref)
 
     def _scoped_boxes(store: Any, token: Token | None) -> list[Any]:
         """The boxes `token` may see: its org's, or its client's."""
@@ -1965,13 +1993,18 @@ def create_app(
         ids = [b.id for b in boxes]
         metas = store.meta_for_boxes(ids)
         models = store.models_for_boxes(ids)
+        given = store.models_given(ids)
         default = fleet_model(store)
         return {
             "boxes": [
                 _for_reader(
                     {
                         **_box_dict(
-                            b, metas.get(b.id), model=models.get(b.id), fleet_model=default
+                            b,
+                            metas.get(b.id),
+                            model=models.get(b.id),
+                            fleet_model=default,
+                            given=given.get(b.id),
                         ),
                         **summaries[b.id],
                     },
@@ -2320,7 +2353,11 @@ def create_app(
 
             return {
                 "box": _box_dict(
-                    box, meta, model=store.model_for_box(box.id), fleet_model=fleet_model(store)
+                    box,
+                    meta,
+                    model=store.model_for_box(box.id),
+                    fleet_model=fleet_model(store),
+                    given=store.models_given([box.id]).get(box.id),
                 )
             }
         finally:
@@ -2369,7 +2406,7 @@ def create_app(
     def get_events(box_id: str, token: Token | None = needs_read) -> Any:
         store = store_factory()
         try:
-            box = _scoped_box(store, token, box_id)
+            box = _operated_box(store, token, box_id)
             events = [_event_dict(e) for e in store.get_box_timeline(box.id)]
             if _reads_instructions(token):
                 return {"events": events}
@@ -2403,7 +2440,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = _scoped_box(store, token, box_id)
+            box = _operated_box(store, token, box_id)
             from flotta.provision import last_activity_at
 
             # When anything last happened to it (FLOTTA-85): the timeline idle
@@ -2475,7 +2512,7 @@ def create_app(
         """Which repositories a box may use."""
         store = store_factory()
         try:
-            box = _scoped_box(store, token, box_id)
+            box = _operated_box(store, token, box_id)
             return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
         finally:
             store.close()
@@ -2511,7 +2548,7 @@ def create_app(
 
         store = store_factory()
         try:
-            box = _scoped_box(store, token, box_id)
+            box = _operated_box(store, token, box_id)
             if not reaches_fleet_github(box.org):
                 raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
             _require_operator(token, "grant a repository")
@@ -2548,7 +2585,7 @@ def create_app(
         """
         store = store_factory()
         try:
-            box = _scoped_box(store, token, box_id)
+            box = _operated_box(store, token, box_id)
             had = store.revoke_repo(box.id, f"{owner}/{name}")
             if had:
                 store.add_event("box", box.id, "repo_revoked", {"repo": f"{owner}/{name}"})
@@ -2830,10 +2867,21 @@ def create_app(
         """
         from flotta.provision import ProvisionError, UpgradeFailed, upgrade_box
 
+        image = str((body or {}).get("image") or "").strip() or None
+        if image is not None and not _is_operator(token):
+            # Before any box is read. An image is code that boots with the
+            # fleet's secrets on the operator's account; an agency moves onto
+            # the fleet's own image by leaving this out.
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "only the fleet's operator may choose the image an agent runs. "
+                    "Leave `image` out to move onto the fleet's image."
+                ),
+            )
         store = store_factory()
         try:
-            box = _scoped_box(store, token, box_id)
-            image = str((body or {}).get("image") or "").strip() or None
+            box = _operated_box(store, token, box_id)
             if background:
                 return _upgrade_in_background(box, image)
             try:

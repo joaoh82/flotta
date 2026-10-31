@@ -115,9 +115,9 @@ SETTINGS: tuple[Setting, ...] = (
         label="Model for new agents",
         help=(
             "The model an agent is created with, unless it is given its own. "
-            "Changing this does not move agents that already exist — each one "
-            "runs what it was created with until you change it in its Info "
-            "panel."
+            "Changing this does not move agents that already exist, including "
+            "those on the old default: each one runs what it was given until "
+            "its model is changed on its agent page."
         ),
         kind="text",
         default="",
