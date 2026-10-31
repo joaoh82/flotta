@@ -71,17 +71,21 @@ METHOD_NOT_FOUND = -32601
 SESSION_NOT_FOUND = 4001
 
 
-def reply_to(text: str, *, name: str, turn: int, soul: str | None = None) -> str:
+def reply_to(
+    text: str, *, name: str, turn: int, soul: str | None = None, model: str | None = None
+) -> str:
     """The scripted answer: who said it, what it heard, and how far along.
 
     The turn number is what shows a conversation was kept: ask again after the
     agent has slept and the count carries on. `soul` is the instructions this
     session started with; their first line shows which ones it is following.
+    `model` is the one it was started with, which it never calls: it shows
+    that a change of model reached the agent (FLOTTA-85).
     """
-    said = (
-        f"This is {name}, a local stand-in with no model. "
-        f"You said: {text.strip()!r}. That is message {turn} in this conversation."
-    )
+    said = f"This is {name}, a local stand-in with no model"
+    if model:
+        said += f" (set to run {model})"
+    said += f". You said: {text.strip()!r}. That is message {turn} in this conversation."
     first = (soul or "").strip().splitlines()[:1]
     if first:
         said += f" My standing instructions begin: {first[0]!r}."
@@ -90,6 +94,8 @@ def reply_to(text: str, *, name: str, turn: int, soul: str | None = None) -> str
 
 #: Where a box's `$FLOTTA_INSTRUCTIONS` arrives, as on a real box.
 INSTRUCTIONS_ENV = "FLOTTA_INSTRUCTIONS"
+#: The model a box is set to run, read once at boot, as a real box's entrypoint does.
+MODEL_ENV = "FLOTTA_MODEL"
 
 
 def soul_path(home: Path) -> Path:
@@ -122,7 +128,15 @@ PROBE_COMMAND = "rm -rf /tmp/flotta-standin-probe"
 class Agent:
     """One stand-in's state: stored conversations, plus this process's live ids."""
 
-    def __init__(self, *, name: str, home: Path, credentials: tuple[str, str] | None) -> None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        home: Path,
+        credentials: tuple[str, str] | None,
+        model: str | None = None,
+    ) -> None:
+        self.model = model
         self.name = name
         self.store = home / "hermes" / "sessions.json"
         self.soul = soul_path(home)
@@ -406,7 +420,13 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
                 agent,
                 stored_id,
                 live_id,
-                reply_to(text, name=agent.name, turn=turn, soul=sessions[stored_id].get("soul")),
+                reply_to(
+                    text,
+                    name=agent.name,
+                    turn=turn,
+                    soul=sessions[stored_id].get("soul"),
+                    model=agent.model,
+                ),
             ),
         ]
 
@@ -415,9 +435,11 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
     return [_error(rid, METHOD_NOT_FOUND, f"the local stand-in does not serve {method!r}")]
 
 
-def build_app(*, name: str, home: Path, credentials: tuple[str, str] | None) -> web.Application:
+def build_app(
+    *, name: str, home: Path, credentials: tuple[str, str] | None, model: str | None = None
+) -> web.Application:
     app = web.Application()
-    app[AGENT] = Agent(name=name, home=home, credentials=credentials)
+    app[AGENT] = Agent(name=name, home=home, credentials=credentials, model=model)
     app.router.add_get("/", _ready)
     app.router.add_post(LOGIN_PATH, _login)
     app.router.add_post(TICKET_PATH, _ticket)
@@ -448,7 +470,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", required=True, type=int)
     args = parser.parse_args(argv)
     seed_soul(args.home, dict(os.environ))
-    app = build_app(name=args.name, home=args.home, credentials=credentials_from(dict(os.environ)))
+    app = build_app(
+        name=args.name,
+        home=args.home,
+        credentials=credentials_from(dict(os.environ)),
+        model=(os.environ.get(MODEL_ENV) or "").strip() or None,
+    )
     web.run_app(app, host="127.0.0.1", port=args.port, print=None, handle_signals=True)
 
 

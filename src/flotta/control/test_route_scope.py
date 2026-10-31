@@ -78,6 +78,12 @@ OPERATOR_ROUTES = frozenset(
     }
 )
 
+#: Routes that read the fleet's configuration, not any box, for anyone who can
+#: read the fleet: their answer is the same whoever asks, so they need not read
+#: their token. They still take one, so an unauthenticated caller is refused,
+#: and they may not reach a box any more than any other route.
+CONFIG_READS = frozenset({"list_models"})
+
 #: Routes with no principal at all, on purpose. They may not reach a box.
 #: The sign-in and sign-up routes are how a person without a credential gets one.
 OPEN_ROUTES = frozenset({"health", "request_link", "redeem_link", "sign_up"})
@@ -210,6 +216,7 @@ def _unscoped_routes(
     open_routes: frozenset[str] = OPEN_ROUTES,
     scope_functions: frozenset[str] = SCOPE_FUNCTIONS,
     operator_routes: frozenset[str] = OPERATOR_ROUTES,
+    config_reads: frozenset[str] = CONFIG_READS,
 ) -> dict[str, list[str]]:
     """Every route that is not scoped, with why. Empty means all of them are.
 
@@ -258,7 +265,7 @@ def _unscoped_routes(
                 reasons.append("takes no principal")
         elif principal == "_":
             reasons.append("discards its token as `_`")
-        elif principal not in _names_read(route):
+        elif principal not in _names_read(route) and route.name not in config_reads:
             reasons.append(f"never reads its token `{principal}`")
 
         if route.name in operator_routes:

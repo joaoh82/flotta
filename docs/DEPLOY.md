@@ -327,6 +327,14 @@ send the key to a host it was not issued for. A model id is checked against
 OpenRouter's catalogue before an agent is pointed at it; other endpoints are
 not checked.
 
+**Which models agents may be given is the operator's list** (FLOTTA-85):
+`FLOTTA_MODELS`, comma-separated, settable in the fleet settings
+(`PUT /api/settings`) or here. `FLOTTA_MODEL` is always on it, and with the
+list empty it is the only one. Every agent calls its model with this fleet's
+key, so any other model is refused before a machine is touched, for an agency
+and for the operator alike; `GET /api/models` is what a picker offers. Agents
+already running a model that is not on the list keep it until it is changed.
+
 **The model reaches Hermes through `config.yaml`, not the environment.** Hermes
 never read `FLOTTA_MODEL`; the box's boot step (`flotta.box.inference`) writes
 `model.default`, `provider` and `base_url` from it at every boot. For an

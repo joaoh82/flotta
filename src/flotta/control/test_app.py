@@ -1708,6 +1708,18 @@ def test_the_machine_endpoint_returns_the_row_and_the_substrate_unmerged(client,
     assert body["unavailable"] is None
 
 
+def test_the_machine_endpoint_says_when_the_agent_was_last_active(client, fleet, monkeypatch):
+    """From the timeline idle sleep reads (FLOTTA-85), so the page's "last
+    active" and the reason an agent went to sleep agree."""
+    from flotta.backend import MachineInfo
+
+    _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started"))
+    with FleetStore(fleet) as store:
+        newest = max(e.ts for e in store.get_box_timeline(store.get_box_by_name("eng-a").id))
+    seen = client.get("/api/boxes/eng-a/machine").json()["box"]["last_active_at"]
+    assert seen is not None and seen[:19] == newest.replace(" ", "T")[:19]
+
+
 def test_the_machine_endpoint_reports_a_substrate_failure_rather_than_500ing(client, monkeypatch):
     """A person clicked Info. `flyctl` being logged out is something to render,
     not a failed request — and the row must still arrive so the panel has
@@ -3043,6 +3055,7 @@ def test_create_passes_the_model_on(client, monkeypatch):
 
     monkeypatch.setattr(provision, "create_box", fake_create)
     monkeypatch.setattr("flotta.control.app._peek_for", lambda impl, name: None, raising=False)
+    monkeypatch.setenv("FLOTTA_MODELS", "z-ai/glm-5.2")
     client.post("/api/boxes", json={"name": "eng-z", "model": " z-ai/glm-5.2 "})
     assert seen.get("model") == "z-ai/glm-5.2"
 
@@ -3075,6 +3088,8 @@ def test_a_model_the_catalogue_does_not_have_is_422(fleet, monkeypatch):
     from flotta.model_catalog import Known
 
     monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    # On the fleet's list, so the catalogue is what refuses it (FLOTTA-85).
+    monkeypatch.setenv("FLOTTA_MODELS", "anthropic/claude-sonet")
     app = create_app(
         store_factory=lambda: FleetStore(fleet),
         run_loop=False,
@@ -3121,6 +3136,7 @@ def test_changing_a_model_goes_through_the_provision_verb(client, monkeypatch):
         return {"box_id": box_id, "name": "eng-a", "model": model, "source": "agent"}
 
     monkeypatch.setattr(provision, "set_model", fake_set)
+    monkeypatch.setenv("FLOTTA_MODELS", "anthropic/claude-sonnet-4.5")
     response = client.put("/api/boxes/eng-a/model", json={"model": "anthropic/claude-sonnet-4.5"})
     assert response.status_code == 200
     assert called["model"] == "anthropic/claude-sonnet-4.5"
@@ -3166,6 +3182,7 @@ def test_a_model_change_the_substrate_refused_is_a_502(client, monkeypatch):
         raise provision.UpgradeFailed("could not change eng-a's model: flyctl exploded")
 
     monkeypatch.setattr(provision, "set_model", broken)
+    monkeypatch.setenv("FLOTTA_MODELS", "z-ai/glm-5.2")
     assert client.put("/api/boxes/eng-a/model", json={"model": "z-ai/glm-5.2"}).status_code == 502
 
 

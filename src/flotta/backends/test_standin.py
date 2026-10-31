@@ -24,9 +24,9 @@ from flotta.backends.standin import (
 )
 
 
-def _run(test, tmp_path, *, credentials=("flotta", "the-box-password")):
+def _run(test, tmp_path, *, credentials=("flotta", "the-box-password"), model=None):
     async def go():
-        app = build_app(name="eng-a", home=tmp_path, credentials=credentials)
+        app = build_app(name="eng-a", home=tmp_path, credentials=credentials, model=model)
         async with TestClient(TestServer(app)) as http:
             await test(http)
 
@@ -339,3 +339,15 @@ def test_instructions_are_seeded_once_as_the_entrypoint_does(tmp_path):
     soul_path(tmp_path).write_text("edited\n")
     seed_soul(tmp_path, {INSTRUCTIONS_ENV: "first"})
     assert soul_path(tmp_path).read_text() == "edited\n"
+
+
+def test_it_says_which_model_it_was_started_with(tmp_path):
+    """FLOTTA-85: a change of model restarts an agent; the next reply shows it arrived."""
+
+    async def test(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        _, events = await _turn(ws, 2, live, "hello")
+        assert "(set to run anthropic/claude-sonnet-4.5)" in events[-1]["payload"]["text"]
+
+    _run(test, tmp_path, model="anthropic/claude-sonnet-4.5")

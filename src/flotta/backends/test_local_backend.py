@@ -376,3 +376,17 @@ def test_a_local_agents_instructions_are_written_where_it_reads_them(backend, tm
 
         set_instructions(box.id, None, store=store, backend=backend)
         assert not soul.exists()
+
+
+def test_a_change_of_model_reaches_a_local_agent(backend):
+    """The model's name is kept for a stand-in, and the provider key is not."""
+    handle = backend.create(
+        BoxSpec(
+            name="eng-a",
+            secrets={**LOGIN, "FLOTTA_MODEL": "z-ai/glm-5.2", "FLOTTA_API_KEY": "sk-x"},
+        )
+    )
+    backend.apply_secrets(handle.endpoint, {"FLOTTA_MODEL": "anthropic/claude-sonnet-4.5"})
+    kept = json.loads((backend.home / "eng-a" / "secrets.json").read_text())
+    assert kept["FLOTTA_MODEL"] == "anthropic/claude-sonnet-4.5"
+    assert "FLOTTA_API_KEY" not in kept

@@ -696,9 +696,7 @@ def reserve_box(
     # checked at the top of `store.create_box`.
     validate_box_meta(display_name, description, instructions)
     if model is not None:
-        from flotta.inference import validate_model
-
-        model = validate_model(model)
+        model = allowed_model(model, store)
     box = store.create_box(name, org=org, client=client)
     store.add_event("box", box.id, "provisioning", {"name": box.name, "backend": backend.scheme})
     if display_name or description or instructions:
@@ -817,10 +815,9 @@ def create_box(
         name = box_label(short, org=org, client=client)
     if model is not None:
         # Same reasoning as the name: a model id that can never work is refused
-        # before a substrate round trip, not after a machine exists.
-        from flotta.inference import validate_model
-
-        model = validate_model(model)
+        # before a substrate round trip, not after a machine exists. So is one
+        # that is not on the fleet's list (FLOTTA-85).
+        model = allowed_model(model, store)
 
     # A pending org's agent is refused before a substrate is resolved, let alone
     # probed. The store refuses the row too (`FleetStore.create_box`), and that
@@ -1570,6 +1567,42 @@ def fleet_model(store: FleetStore | None = None) -> str | None:
     return (env.get("FLOTTA_MODEL") or "").strip() or None
 
 
+def allowed_models(store: FleetStore | None = None) -> list[str]:
+    """The models an agent may be given (FLOTTA-85): the fleet's default first,
+    then `FLOTTA_MODELS`, each once.
+
+    The operator's list, because every agent calls its model with the fleet's
+    one key: whoever picks the model, the operator pays for it. Empty when the
+    fleet has neither, and then no agent can be given a model of its own.
+    """
+    from flotta.settings import layered
+
+    env = layered(store) if store is not None else os.environ
+    listed = (env.get("FLOTTA_MODELS") or "").replace("\n", ",").split(",")
+    models = [m for m in [fleet_model(store), *(p.strip() for p in listed)] if m]
+    return list(dict.fromkeys(models))
+
+
+def allowed_model(model: str, store: FleetStore) -> str:
+    """`model` validated and on the fleet's list, or `InvalidModel`.
+
+    Here rather than only in the API so that every path meets it: the routes,
+    `flotta create --model`, and any later caller of `set_model`. Called before
+    a substrate is touched, so a refused model costs nothing.
+    """
+    from flotta.inference import InvalidModel, validate_model
+
+    model = validate_model(model)
+    allowed = allowed_models(store)
+    if model not in allowed:
+        listed = ", ".join(allowed) or "none: the fleet has no models set"
+        raise InvalidModel(
+            f"{model} is not one of the fleet's models ({listed}). "
+            "The fleet's operator chooses which models agents may use."
+        )
+    return model
+
+
 def set_model(
     box_id: str,
     model: str | None,
@@ -1588,9 +1621,7 @@ def set_model(
     **Substrate first, row second.** If the machine cannot be updated, the
     store still says what the agent really runs.
     """
-    from flotta.inference import validate_model
-
-    wanted = None if model is None else validate_model(model)
+    wanted = None if model is None else allowed_model(model, store)
     box = _require_box(store, box_id)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to change.")
