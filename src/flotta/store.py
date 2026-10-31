@@ -1820,6 +1820,31 @@ class FleetStore:
         ).fetchall()
         return {str(r["box_id"]): str(r["model"]) for r in rows}
 
+    def models_given(self, box_ids: list[str]) -> dict[str, str]:
+        """The model each agent's machine was last given, from its timeline.
+
+        Not the same as `models_for_boxes` plus the fleet default (FLOTTA-86).
+        An agent that follows the default was given it when it was created or
+        reset, and changing the default afterwards writes nothing to its
+        machine, so only this says what it runs now. Absent for an agent with
+        no `model_set` event, which predates FLOTTA-39.
+        """
+        if not box_ids:
+            return {}
+        marks = ", ".join("?" for _ in box_ids)
+        rows = self._conn.execute(
+            "SELECT entity_id, payload_json FROM events "
+            f"WHERE entity_kind = 'box' AND type = 'model_set' AND entity_id IN ({marks}) "
+            "ORDER BY id",
+            tuple(box_ids),
+        ).fetchall()
+        given: dict[str, str] = {}
+        for row in rows:
+            model = json.loads(row["payload_json"] or "{}").get("model")
+            if isinstance(model, str) and model:
+                given[str(row["entity_id"])] = model
+        return given
+
     # -- builds -------------------------------------------------------------
 
     def start_build(self, hermes_ref: str, *, now: datetime | None = None) -> Build:

@@ -145,7 +145,9 @@ def test_only_the_operator_chooses_the_image_an_agent_boots(api, substrate, flee
     assert response.status_code == 403
     assert "image" in response.json()["detail"]
     # Moving onto the fleet's own image is still the agency's to do.
-    assert api.post(f"/api/boxes/{AGENCY_BOX}/upgrade", json={}, headers=agency_x).status_code == 200
+    assert (
+        api.post(f"/api/boxes/{AGENCY_BOX}/upgrade", json={}, headers=agency_x).status_code == 200
+    )
     assert substrate == [("upgrade", None)]
 
 

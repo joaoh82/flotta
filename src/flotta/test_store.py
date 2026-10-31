@@ -1118,3 +1118,14 @@ def test_the_model_table_appears_on_a_store_that_predates_it(tmp_path):
     reopened = FleetStore(path)
     reopened.set_box_model(box.id, "z-ai/glm-5.2")
     assert reopened.model_for_box(box.id) == "z-ai/glm-5.2"
+
+
+def test_models_given_is_the_newest_model_set_per_agent(store, box):
+    """FLOTTA-86: what each machine was last given, in one query for the list."""
+    other = store.create_box("eng-c")
+    store.add_event("box", box.id, "model_set", {"model": "z-ai/glm-5.2", "source": "fleet"})
+    store.add_event("box", box.id, "reimaged", {"image": "reg/x:1"})
+    store.add_event("box", box.id, "model_set", {"model": "openai/gpt-5", "source": "agent"})
+    store.add_event("box", other.id, "running")
+    assert store.models_given([box.id, other.id]) == {box.id: "openai/gpt-5"}
+    assert store.models_given([]) == {}

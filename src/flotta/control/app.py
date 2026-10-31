@@ -335,7 +335,12 @@ def _build_region() -> str:
 
 
 def _box_dict(
-    box: Any, meta: Any = None, *, model: str | None = None, fleet_model: str | None = None
+    box: Any,
+    meta: Any = None,
+    *,
+    model: str | None = None,
+    fleet_model: str | None = None,
+    given: str | None = None,
 ) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
@@ -358,8 +363,14 @@ def _box_dict(
     # What model the agent runs (FLOTTA-39), and whose choice that is: its
     # own, or the fleet's. `None` for both means the fleet has no model at
     # all, which the window should say rather than guess.
-    out["model"] = model or fleet_model
-    out["model_source"] = "agent" if model else ("fleet" if fleet_model else None)
+    #
+    # For one that follows the fleet, what its machine was `given` wins over
+    # the default (FLOTTA-86): a new default reaches no existing agent, and
+    # reporting it as what they run made the window wrong the moment the
+    # operator changed it. `fleet_model` is the default now, for comparing.
+    out["model"] = model or given or fleet_model
+    out["model_source"] = "agent" if model else ("fleet" if out["model"] else None)
+    out["fleet_model"] = fleet_model
     return out
 
 
@@ -371,6 +382,7 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         store.meta_for_box(box.id),
         model=store.model_for_box(box.id),
         fleet_model=fleet_model(store),
+        given=store.models_given([box.id]).get(box.id),
     )
 
 
@@ -1981,13 +1993,18 @@ def create_app(
         ids = [b.id for b in boxes]
         metas = store.meta_for_boxes(ids)
         models = store.models_for_boxes(ids)
+        given = store.models_given(ids)
         default = fleet_model(store)
         return {
             "boxes": [
                 _for_reader(
                     {
                         **_box_dict(
-                            b, metas.get(b.id), model=models.get(b.id), fleet_model=default
+                            b,
+                            metas.get(b.id),
+                            model=models.get(b.id),
+                            fleet_model=default,
+                            given=given.get(b.id),
                         ),
                         **summaries[b.id],
                     },
@@ -2336,7 +2353,11 @@ def create_app(
 
             return {
                 "box": _box_dict(
-                    box, meta, model=store.model_for_box(box.id), fleet_model=fleet_model(store)
+                    box,
+                    meta,
+                    model=store.model_for_box(box.id),
+                    fleet_model=fleet_model(store),
+                    given=store.models_given([box.id]).get(box.id),
                 )
             }
         finally:

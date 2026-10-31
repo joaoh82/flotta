@@ -3119,6 +3119,45 @@ def test_the_fleet_list_says_what_each_agent_runs_and_whose_it_is(client, fleet,
     )
 
 
+def test_a_new_fleet_default_is_not_reported_as_what_existing_agents_run(
+    client, fleet, monkeypatch
+):
+    """FLOTTA-86. Changing the default writes nothing to any machine, so an
+    agent given the old one still runs it, and the record must say so rather
+    than echo the setting. Found because the console makes changing it a form."""
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    store = FleetStore(fleet)
+    box = store.get_box_by_name("eng-a")
+    store.add_event("box", box.id, "model_set", {"model": "z-ai/glm-5.2", "source": "fleet"})
+    store.set_settings({"FLOTTA_MODEL": "anthropic/claude-sonnet-4.5"})
+    store.close()
+
+    for row in (
+        client.get("/api/boxes").json()["boxes"][0],
+        client.get("/api/boxes/eng-a").json()["box"],
+    ):
+        assert row["model"] == "z-ai/glm-5.2"
+        assert row["model_source"] == "fleet"
+        assert row["fleet_model"] == "anthropic/claude-sonnet-4.5"
+
+
+def test_an_agent_reset_to_the_default_reports_the_one_it_was_given(client, fleet, monkeypatch):
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    store = FleetStore(fleet)
+    box = store.get_box_by_name("eng-a")
+    store.add_event("box", box.id, "model_set", {"model": "z-ai/glm-5.2", "source": "fleet"})
+    store.add_event("box", box.id, "model_set", {"model": "openai/gpt-5", "source": "fleet"})
+    store.close()
+    assert client.get("/api/boxes/eng-a").json()["box"]["model"] == "openai/gpt-5"
+
+
+def test_an_agent_with_no_record_of_its_model_is_reported_on_the_default(client, monkeypatch):
+    """Older than FLOTTA-39's events: the default is the best there is."""
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    row = client.get("/api/boxes/eng-a").json()["box"]
+    assert (row["model"], row["model_source"]) == ("z-ai/glm-5.2", "fleet")
+
+
 def test_a_fleet_with_no_model_says_so_rather_than_guessing(client, monkeypatch):
     monkeypatch.delenv("FLOTTA_MODEL", raising=False)
     monkeypatch.setattr("flotta.settings.read_dotenv_value", lambda *a, **k: None, raising=False)
