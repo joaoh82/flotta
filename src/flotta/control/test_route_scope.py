@@ -53,6 +53,7 @@ SCOPE_FUNCTIONS: frozenset[str] = frozenset(
         "_scoped_box",  # one box, if the token's tenant may act on it
         "_scoped_boxes",  # the token's org's boxes, or its client's
         "_routable_box",  # `_scoped_box`, or any box for the door's `fleet:route`
+        "_operated_box",  # `_scoped_box`, or any box for the operator (FLOTTA-86)
         "_occupant",  # fleet-wide on purpose (a machine is held or not); names scoped
     }
 )
