@@ -2691,29 +2691,18 @@ def create_app(
         the fleet's key may be spent on, and the operator changes it in the
         settings rather than going around it.
         """
-        from flotta.inference import InvalidModel, validate_model
-        from flotta.provision import allowed_models
+        from flotta.inference import InvalidModel
+        from flotta.provision import allowed_model
 
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             return None
-        try:
-            model = validate_model(str(raw))
-        except InvalidModel as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
         store = store_factory()
         try:
-            allowed = allowed_models(store)
+            model = allowed_model(str(raw), store)
+        except InvalidModel as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             store.close()
-        if model not in allowed:
-            listed = ", ".join(allowed) or "none: the fleet has no models set"
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"{model} is not one of the fleet's models ({listed}). "
-                    "The fleet's operator chooses which models agents may use."
-                ),
-            )
         # The endpoint is the control plane's own configuration, not a stored
         # setting: it travels with the fleet's key, which never leaves the env.
         base_url = (os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip()

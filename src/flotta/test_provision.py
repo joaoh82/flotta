@@ -3367,10 +3367,14 @@ def test_a_failed_rotation_says_the_old_identity_still_holds(store, monkeypatch)
 
 # -- a model per agent (FLOTTA-39) -------------------------------------------
 
+#: What the operator lets agents be given besides the default (FLOTTA-85).
+LISTED_MODELS = "anthropic/claude-sonnet-4.5, z-ai/glm-5.2-air"
+
 
 def test_an_agent_created_with_a_model_boots_with_it(store, monkeypatch):
     for key, value in _fleet_env().items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("FLOTTA_MODELS", LISTED_MODELS)
     impl = Recording()
     out = create_box("eng-b", store=store, backend=impl, model="anthropic/claude-sonnet-4.5")
 
@@ -3406,6 +3410,7 @@ def test_a_model_reserved_by_the_api_reaches_the_machine_later(store, monkeypatc
 
     for key, value in _fleet_env().items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("FLOTTA_MODELS", LISTED_MODELS)
     impl = Recording()
     box = reserve_box("eng-b", store=store, backend=impl, model="z-ai/glm-5.2-air")
     create_box("eng-b", store=store, backend=impl, box=box)
@@ -3431,6 +3436,7 @@ def test_changing_a_model_writes_only_the_model_to_the_agents_machine(store, mon
     from flotta.provision import set_model
 
     monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("FLOTTA_MODELS", LISTED_MODELS)
     box = _live_agent(store)
     backend = Rotating()
     result = set_model(box.id, "anthropic/claude-sonnet-4.5", store=store, backend=backend)
@@ -3464,6 +3470,7 @@ def test_a_sleeping_agents_model_can_be_changed(store, monkeypatch):
     from flotta.provision import set_model
 
     monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("FLOTTA_MODELS", LISTED_MODELS)
     box = _live_agent(store, status="stopped")
     backend = Rotating()
     set_model(box.id, "anthropic/claude-sonnet-4.5", store=store, backend=backend)
@@ -3477,6 +3484,7 @@ def test_a_failed_change_leaves_the_record_saying_what_it_really_runs(store, mon
     from flotta.provision import UpgradeFailed, set_model
 
     monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("FLOTTA_MODELS", LISTED_MODELS)
 
     class Broken(FakeBackend):
         def apply_secrets(self, box_id, secrets):
@@ -3506,6 +3514,50 @@ def test_an_agent_still_being_created_cannot_have_its_model_changed(store, monke
     box = store.create_box("eng-new")
     with pytest.raises(ProvisionError, match="still being created"):
         set_model(box.id, "z-ai/glm-5.2", store=store, backend=Rotating())
+
+
+# The API refuses an off-list model before calling any of these, and its tests
+# patch them out (`control/test_model_allowlist.py`). These hold the list for
+# every other caller: `flotta create --model` reaches `create_box` directly.
+
+
+@pytest.fixture
+def listed_fleet(monkeypatch):
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("FLOTTA_MODELS", LISTED_MODELS)
+
+
+def test_creating_with_a_model_off_the_list_touches_no_substrate(store, listed_fleet):
+    from flotta.inference import InvalidModel
+
+    impl = Recording()
+    with pytest.raises(InvalidModel, match="not one of the fleet's models"):
+        create_box("eng-b", store=store, backend=impl, model="openai/o1-pro")
+    assert impl.calls == []
+    assert store.get_box_by_name("eng-b") is None
+
+
+def test_reserving_with_a_model_off_the_list_spends_no_name(store, listed_fleet):
+    from flotta.inference import InvalidModel
+    from flotta.provision import reserve_box
+
+    impl = Recording()
+    with pytest.raises(InvalidModel, match="not one of the fleet's models"):
+        reserve_box("eng-b", store=store, backend=impl, model="openai/o1-pro")
+    assert impl.calls == []
+    assert store.get_box_by_name("eng-b") is None
+
+
+def test_changing_to_a_model_off_the_list_touches_no_machine(store, listed_fleet):
+    from flotta.inference import InvalidModel
+    from flotta.provision import set_model
+
+    box = _live_agent(store)
+    backend = Rotating()
+    with pytest.raises(InvalidModel, match="z-ai/glm-5.2, anthropic/claude-sonnet-4.5"):
+        set_model(box.id, "openai/o1-pro", store=store, backend=backend)
+    assert backend.calls == []
+    assert store.model_for_box(box.id) is None
 
 
 # -- M11.5: creating a box in a client ----------------------------------------
