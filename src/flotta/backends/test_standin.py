@@ -378,10 +378,7 @@ def test_a_resumed_session_keeps_its_model_until_it_is_switched(tmp_path):
         assert "(set to run old/model)" in events[-1]["payload"]["text"]
 
         switched = await _call(
-            ws,
-            3,
-            "config.set",
-            {"session_id": live, "key": "model", "value": "new/model --provider standin"},
+            ws, 3, "config.set", {"session_id": live, "key": "model", "value": "new/model"}
         )
         assert switched["result"]["value"] == "new/model"
         _, events = await _turn(ws, 4, live, "and now?")
@@ -399,6 +396,77 @@ def test_a_resumed_session_keeps_its_model_until_it_is_switched(tmp_path):
     _run(on_the_old_model, tmp_path, model="old/model")
     _run(restarted_on_a_new_one, tmp_path, model="new/model")
     _run(and_the_switch_lasts, tmp_path, model="new/model")
+
+
+def _with_a_stored_session(tmp_path, test):
+    """`test(ws, live)` after a restart, on a session resumed from the old model."""
+    stored = {}
+
+    async def on_the_old_model(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        await _turn(ws, 2, live, "hello")
+        stored["id"] = (await _call(ws, 3, "session.most_recent"))["result"]["session_id"]
+
+    async def restarted(http):
+        ws = await _socket(http)
+        resumed = (await _call(ws, 1, "session.resume", {"session_id": stored["id"]}))["result"]
+        await test(ws, resumed["session_id"])
+
+    _run(on_the_old_model, tmp_path, model="old/model")
+    _run(restarted, tmp_path, model="new/model")
+
+
+async def _set_model(ws, rid, live, value):
+    """The reply to `config.set`, and the frames that came before it."""
+    params = {"session_id": live, "key": "model", "value": value}
+    await ws.send_str(
+        json.dumps({"jsonrpc": "2.0", "id": rid, "method": "config.set", "params": params})
+    )
+    before = []
+    while True:
+        frame = json.loads((await _receive(ws)).data)
+        if frame.get("id") == rid:
+            return frame, before
+        before.append(frame["params"])
+
+
+def test_a_provider_on_a_resume_with_no_agent_yet_moves_nothing(tmp_path):
+    """FLOTTA-101, from its review: the reply says success, and the agent stays."""
+
+    async def test(ws, live):
+        reply, before = await _set_model(ws, 1, live, "new/model --provider standin")
+        assert reply["result"]["value"] == "new/model"
+        assert before == []
+        _, events = await _turn(ws, 2, live, "which?")
+        assert "(set to run old/model)" in events[-1]["payload"]["text"]
+
+    _with_a_stored_session(tmp_path, test)
+
+
+def test_a_bare_model_waits_for_the_agent_and_says_it_moved(tmp_path):
+    async def test(ws, live):
+        reply, before = await _set_model(ws, 1, live, "new/model")
+        assert reply["result"]["value"] == "new/model"
+        assert [(e["type"], e["session_id"], e["payload"]) for e in before] == [
+            ("session.info", live, {"model": "old/model"}),
+            ("session.info", live, {"model": "new/model"}),
+        ]
+        _, events = await _turn(ws, 2, live, "which?")
+        assert "(set to run new/model)" in events[-1]["payload"]["text"]
+
+    _with_a_stored_session(tmp_path, test)
+
+
+def test_a_provider_moves_an_agent_that_exists(tmp_path):
+    async def test(ws, live):
+        await _turn(ws, 1, live, "builds it")
+        _, before = await _set_model(ws, 2, live, "new/model --provider standin")
+        assert [e["payload"] for e in before] == [{"model": "new/model"}]
+        _, events = await _turn(ws, 3, live, "which?")
+        assert "(set to run new/model)" in events[-1]["payload"]["text"]
+
+    _with_a_stored_session(tmp_path, test)
 
 
 def test_a_session_with_no_model_on_record_reports_none(tmp_path):

@@ -38,6 +38,13 @@ the model it started on across a restart, as Hermes's resume restores it, and
 only `config.set` moves it. A client that resumes without switching can be seen
 answering on the old model, for $0.
 
+**And `config.set` can answer success without moving it.** A resume answers
+before its agent exists, and Hermes's build then restores the stored model. Only
+a bare model waits for that build and switches the agent, announcing it in a
+`session.info`; `--provider` skips the wait, and what it writes the build ignores.
+Here an agent is unbuilt until something needs it, which is the longest that
+window can be, so a client that trusts the reply can be seen on the old model.
+
 Conversations are kept under `--home`, so stopping and starting the agent
 keeps them, as a real box's volume does. Live ids are not kept: like Hermes's,
 they belong to the process.
@@ -153,6 +160,8 @@ class Agent:
         self.tickets: dict[str, float] = {}
         #: live id -> stored id. Per process, as Hermes's are.
         self.live: dict[str, str] = {}
+        # Resumed, with no agent built yet: see the module docstring.
+        self.unbuilt: set[str] = set()
         #: An approval asked and not yet answered: its request id -> (live id, stored id).
         self.asked: dict[str, tuple[str, str]] = {}
 
@@ -179,6 +188,11 @@ class Agent:
     def attach(self, stored_id: str) -> str:
         live_id = f"live-{secrets.token_hex(6)}"
         self.live[live_id] = stored_id
+        return live_id
+
+    def resume(self, stored_id: str) -> str:
+        live_id = self.attach(stored_id)
+        self.unbuilt.add(live_id)
         return live_id
 
     # -- the handshake ----------------------------------------------------------
@@ -239,6 +253,10 @@ def _event(kind: str, payload: dict[str, Any], session_id: str | None = None) ->
     if session_id is not None:
         params["session_id"] = session_id
     return json.dumps({"jsonrpc": "2.0", "method": "event", "params": params})
+
+
+def _session_info(model: str | None, live_id: str) -> str:
+    return _event("session.info", {"model": model or ""}, live_id)
 
 
 def _result(rid: Any, result: dict[str, Any]) -> str:
@@ -376,7 +394,7 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             _result(
                 rid,
                 {
-                    "session_id": agent.attach(stored_id),
+                    "session_id": agent.resume(stored_id),
                     "resumed": stored_id,
                     "messages": sessions[stored_id]["messages"],
                     "info": {
@@ -395,16 +413,25 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
         if stored_id is None or stored_id not in sessions:
             return [_error(rid, SESSION_NOT_FOUND, f"session not found: {live_id}")]
         # `<model> --provider <name>`, as Hermes reads it.
-        model = str(params.get("value") or "").split(" --")[0].strip()
+        value = str(params.get("value") or "")
+        model = value.split(" --")[0].strip()
+        reply = _result(rid, {"key": "model", "value": model, "scope": "session"})
+        built = live_id not in agent.unbuilt
+        if not built and " --provider " in value:
+            return [reply]
+        agent.unbuilt.discard(live_id)
+        # A build announces the model it restored, and the switch then its own.
+        announced = [] if built else [_session_info(sessions[stored_id].get("model"), live_id)]
         sessions[stored_id]["model"] = model
         agent.save(sessions)
-        return [_result(rid, {"key": "model", "value": model, "scope": "session"})]
+        return [*announced, _session_info(model, live_id), reply]
 
     if method == "prompt.submit":
         live_id = str(params.get("session_id") or "")
         stored_id = agent.live.get(live_id)
         if stored_id is None or stored_id not in sessions:
             return [_error(rid, SESSION_NOT_FOUND, f"session not found: {live_id}")]
+        agent.unbuilt.discard(live_id)
         text = str(params.get("text") or "")
         messages = sessions[stored_id]["messages"]
         messages.append({"role": "user", "text": text, "timestamp": time.time()})
