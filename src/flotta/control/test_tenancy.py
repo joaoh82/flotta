@@ -159,6 +159,7 @@ BOX_ROUTES = [
     ("DELETE", "/api/boxes/{b}", SCOPE_BOX_DESTROY, None),
     ("GET", "/api/boxes/{b}/git-credential/repos", SCOPE_GIT_CREDENTIAL, None),
     ("POST", "/api/boxes/{b}/git-credential", SCOPE_GIT_CREDENTIAL, {"repo": "acme/secrets"}),
+    ("GET", "/api/boxes/{b}/github/repositories", SCOPE_FLEET_WRITE, None),
     ("GET", "/api/boxes/{b}/peers", SCOPE_FLEET_READ, None),
     ("POST", "/api/boxes/{b}/peer-blocks", SCOPE_FLEET_WRITE, {"peer": "eng-a"}),
     ("DELETE", "/api/boxes/{b}/peer-blocks/eng-a", SCOPE_FLEET_WRITE, None),

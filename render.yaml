@@ -72,6 +72,15 @@ projects:
               # Optional: GitHub identity for agents (step 7a).
               - key: FLOTTA_GITHUB_TOKEN
                 sync: false
+              # Optional: agencies connect their own GitHub (step 7d).
+              - key: FLOTTA_GITHUB_APP_SLUG
+                sync: false
+              - key: FLOTTA_GITHUB_APP_CLIENT_ID
+                sync: false
+              - key: FLOTTA_GITHUB_APP_CLIENT_SECRET
+                sync: false
+              - key: FLOTTA_GITHUB_APP_PRIVATE_KEY
+                sync: false
               # Optional: sign-in by emailed link (step 9). Without a Resend
               # key no link is made; the control plane never prints one here.
               - key: FLOTTA_RESEND_API_KEY
