@@ -872,6 +872,35 @@ def test_a_local_grant_to_an_agencys_agent_is_refused_without_a_traceback(tmp_pa
     assert "not available" in result.output
 
 
+def test_repo_grant_on_a_connected_account_is_not_the_fleet_tokens(tmp_path, monkeypatch):
+    """So disconnecting it ends the grant; on an account nobody connected, the operator chose."""
+    from typer.testing import CliRunner
+
+    from flotta.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    store = tmp_path / "fleet.db"
+    with FleetStore(store) as fleet:
+        box = fleet.create_box("eng-a")
+        fleet.connect_github(
+            "77",
+            org=box.org,
+            client=box.client,
+            account="acme-gh",
+            account_type="Organization",
+            connected_by="person-olivia",
+        )
+
+    for repo in ("Acme-GH/site", "joaoh82/flotta"):
+        result = CliRunner().invoke(app, ["repo", "grant", "eng-a", repo, "--store", str(store)])
+        assert result.exit_code == 0, result.output
+
+    with FleetStore(store) as fleet:
+        assert not fleet.may_spend_fleet_token(box.id, "acme-gh/site")
+        assert fleet.may_spend_fleet_token(box.id, "joaoh82/flotta")
+
+
 # -- `flotta create` refuses a name that cannot be an address ---------------
 
 

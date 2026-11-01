@@ -140,3 +140,80 @@ def test_a_link_clicked_twice_at_once_signs_in_once(pg_store):
     assert sorted(outcomes) == ["LookupError", "created"], (
         f"expected exactly one redemption, got {outcomes} — a link can sign in twice"
     )
+
+
+def test_two_agencies_claiming_one_installation_at_once_leaves_one_owner(pg_store):
+    """FLOTTA-22: `connect_github` rests on the primary key, not on a read before it."""
+    from flotta.store import GitHubAlreadyConnectedError
+
+    for org in ("agency-a", "agency-b"):
+        pg_store.create_org(org, org)
+    orgs = ("agency-a", "agency-b")
+
+    def claim(fleet, i):
+        fleet.connect_github(
+            "77",
+            org=orgs[i],
+            client=None,
+            account="acme",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+    outcomes = _race(pg_store, claim)
+
+    assert sorted(outcomes) == [GitHubAlreadyConnectedError.__name__, "created"], outcomes
+    held = [*pg_store.github_installations("agency-a"), *pg_store.github_installations("agency-b")]
+    assert len(held) == 1
+
+
+def test_a_clients_installation_comes_before_its_orgs_on_postgres(pg_store):
+    """`ORDER BY client IS NULL` sorts booleans there, where SQLite sorts integers."""
+    pg_store.create_org("agency-a", "agency-a")
+    pg_store.create_client("agency-a", "acme", "Acme")
+    for number, client in (("1", None), ("2", "acme")):
+        pg_store.connect_github(
+            number,
+            org="agency-a",
+            client=client,
+            account=f"account-{number}",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+    found = pg_store.github_installations_for("agency-a", "acme")
+    assert [i.installation_id for i in found] == ["2", "1"]
+
+
+def test_a_new_installation_replaces_the_old_one_on_postgres(pg_store):
+    pg_store.create_org("agency-a", "agency-a")
+    for number in ("1", "2"):
+        pg_store.connect_github(
+            number,
+            org="agency-a",
+            client=None,
+            account="same",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+    assert [i.installation_id for i in pg_store.github_installations("agency-a")] == ["2"]
+
+
+def test_a_grants_source_keeps_the_operators_word_on_postgres(pg_store):
+    """The upsert's CASE, and the column the migration adds, on the real engine."""
+    box = pg_store.create_box("source-box")
+    pg_store.grant_repo(box.id, "same/repo", fleet_token=True)
+    pg_store.connect_github(
+        "1",
+        org=box.org,
+        client=box.client,
+        account="same",
+        account_type="Organization",
+        connected_by="someone",
+    )
+    pg_store.grant_repo(box.id, "same/repo")
+    pg_store.grant_repo(box.id, "same/other")
+
+    assert pg_store.may_spend_fleet_token(box.id, "same/repo")
+    assert not pg_store.may_spend_fleet_token(box.id, "same/other")

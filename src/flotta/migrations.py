@@ -242,6 +242,16 @@ def _view_as() -> tuple[str, ...]:
     return ("ALTER TABLE sessions ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0",)
 
 
+def _grant_source() -> tuple[str, ...]:
+    """What a repository grant may spend (FLOTTA-22): `fleet_token` or `github_app`.
+
+    Every grant that exists already was made for `$FLOTTA_GITHUB_TOKEN`, the only
+    source there was, so that is the default. The credential path still refuses
+    that token to any org but the operator's, whatever a row says.
+    """
+    return ("ALTER TABLE box_repos ADD COLUMN source TEXT NOT NULL DEFAULT 'fleet_token'",)
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -269,6 +279,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         4,
         "view-as: a read-only session the operator holds in another org",
         _view_as(),
+    ),
+    Migration(
+        5,
+        "grant source: which GitHub credential a repository grant may spend",
+        _grant_source(),
     ),
 )
 

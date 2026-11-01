@@ -511,6 +511,10 @@ def create_app(
     #: real HTTPS call the moment `$FLOTTA_GITHUB_TOKEN` was set in the
     #: environment a test happened to inherit.
     reachable: Any = None,
+    #: The GitHub App agencies connect their own GitHub through (FLOTTA-22).
+    #: Injected for the reason `reachable` is. `None` reads the environment,
+    #: which may say this deployment has not registered one.
+    github_app: Any = None,
     #: Carries one message to another agent and returns its reply. Injected
     #: for the same reason as `reachable`, and with more at stake: the default
     #: opens a WebSocket to a live box through the front door and spends a
@@ -1084,6 +1088,214 @@ def create_app(
             return _box_listing(store, boxes, token)
         finally:
             store.close()
+
+    # -- an agency's own GitHub (FLOTTA-22) ----------------------------------
+    #
+    # Three steps, because GitHub's redirect proves nothing by itself. `connect`
+    # sends the person to GitHub's install screen. GitHub sends them back to the
+    # web app, whose cookie says who they are, with an installation id anyone
+    # could have typed. `authorize` sends them to GitHub again, to say who they
+    # are; `claim` checks GitHub's answer, and only then stores anything. See
+    # `flotta.github_app`.
+
+    def _github_app_or_none() -> Any:
+        if github_app is not None:
+            return github_app
+        from flotta.github_app import app_from_env
+
+        return app_from_env(os.environ)
+
+    def _configured_github_app() -> Any:
+        """The App, or 503 naming the settings this deployment still needs."""
+        app_ = _github_app_or_none()
+        if app_ is None:
+            from flotta.github_app import missing_settings
+
+            raise HTTPException(
+                status_code=503,
+                detail="this deployment has no GitHub App; it still needs "
+                + ", ".join(f"${name}" for name in missing_settings(os.environ)),
+            )
+        return app_
+
+    def _state_key() -> str:
+        """Signing a state needs the fleet's key, and an open control plane has none."""
+        if not key:
+            raise HTTPException(
+                status_code=503, detail="connecting GitHub needs $FLOTTA_SIGNING_KEY set"
+            )
+        return key
+
+    def _started_by_caller(token: Token | None, raw: Any) -> Any:
+        """The state of a connection this caller started, for an org they administer.
+
+        **The same person, not just the same org.** A state links an installation
+        to a tenant, so a link one person started and another finished is how a
+        GitHub admin gets tricked into giving an agency their account.
+        """
+        from flotta.github_app import BadState, read_state
+
+        try:
+            state = read_state(_state_key(), str(raw or ""))
+        except BadState as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if token is None or token.subject != state.subject:
+            raise HTTPException(
+                status_code=403,
+                detail="this connection was started by someone else; start again yourself",
+            )
+        _admin_of(token, state.org)
+        return state
+
+    def _connection(installation: Any, app_: Any) -> dict[str, Any]:
+        """One connection as the agency sees it, with GitHub's word on its state."""
+        from flotta.github_app import GitHubAppError, InstallationGone
+
+        status = "unknown"
+        if app_ is not None:
+            try:
+                suspended = app_.account(installation.installation_id).suspended
+                status = "suspended" if suspended else "active"
+            except InstallationGone:
+                status = "removed"
+            except GitHubAppError:
+                pass
+        where = (
+            f"organizations/{installation.account}/"
+            if installation.account_type == "Organization"
+            else ""
+        )
+        return {
+            "installation_id": installation.installation_id,
+            "account": installation.account,
+            "client": installation.client,
+            "connected_at": installation.connected_at,
+            "status": status,
+            "manage_url": (
+                f"https://github.com/{where}settings/installations/{installation.installation_id}"
+            ),
+        }
+
+    @app.get("/api/orgs/{org_id}/github")
+    def list_github(org_id: str, token: Token | None = needs_admin) -> Any:
+        """The GitHub accounts this org has connected, and whether it can connect one."""
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            installations = store.github_installations(org_id)
+        finally:
+            store.close()
+        app_ = _github_app_or_none()
+        return {
+            "available": app_ is not None,
+            "connections": [_connection(i, app_) for i in installations],
+        }
+
+    @app.post("/api/orgs/{org_id}/github/connect")
+    def connect_github(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Where to send a person to connect GitHub: `{"client": "acme"}`, or the whole org.
+
+        Nothing is stored until `claim`.
+        """
+        from flotta.github_app import State, sign_state
+
+        _admin_of(token, org_id)
+        client = str(body.get("client") or "").strip() or None
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            if client is not None and store.get_client(org_id, client) is None:
+                raise HTTPException(status_code=404, detail=f"no client {client!r}")
+        finally:
+            store.close()
+        app_ = _configured_github_app()
+        signing = _state_key()
+        assert token is not None
+        state = State(org=org_id, client=client, subject=token.subject)
+        return {"url": app_.install_url(sign_state(signing, state))}
+
+    @app.post("/api/github/authorize")
+    def authorize_github(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """GitHub came back with an installation: now ask it who this person is."""
+        from dataclasses import replace
+
+        from flotta.github_app import sign_state
+
+        state = _started_by_caller(token, body.get("state"))
+        installation = str(body.get("installation_id") or "").strip()
+        if not installation.isdigit():
+            raise HTTPException(status_code=422, detail="GitHub named no installation")
+        app_ = _configured_github_app()
+        return {
+            "url": app_.authorize_url(
+                sign_state(_state_key(), replace(state, installation=installation))
+            )
+        }
+
+    @app.post("/api/github/claim")
+    def claim_github(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Connect the installation, if GitHub says this person owns its account."""
+        from flotta.github_app import GitHubAppError, InstallationGone, NotProven
+        from flotta.store import GitHubAlreadyConnectedError
+
+        state = _started_by_caller(token, body.get("state"))
+        if not state.installation:
+            raise HTTPException(status_code=422, detail="this link names no installation")
+        app_ = _configured_github_app()
+        try:
+            account = app_.proven_account(state.installation, str(body.get("code") or ""))
+        except InstallationGone as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except NotProven as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except GitHubAppError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        assert token is not None
+        store = store_factory()
+        try:
+            _org_or_404(store, state.org)
+            if state.client is not None and store.get_client(state.org, state.client) is None:
+                raise HTTPException(status_code=404, detail=f"no client {state.client!r}")
+            held = store.connect_github(
+                state.installation,
+                org=state.org,
+                client=state.client,
+                account=account.login,
+                account_type=account.type,
+                connected_by=token.subject,
+            )
+        except GitHubAlreadyConnectedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {"org": held.org, "client": held.client, "account": held.account}
+
+    @app.delete("/api/orgs/{org_id}/github/{installation_id}")
+    def disconnect_github(
+        org_id: str, installation_id: str, token: Token | None = needs_admin
+    ) -> Any:
+        """Remove the App from that account on GitHub, and forget it here.
+
+        GitHub first, so a failure there leaves the connection showing rather
+        than access Flotta no longer mentions. Grants stay, and mint nothing
+        until the account is connected again.
+        """
+        from flotta.github_app import GitHubAppError
+
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            if store.github_installation(org_id, installation_id) is None:
+                raise HTTPException(status_code=404, detail="no such GitHub connection")
+            try:
+                _configured_github_app().uninstall(installation_id)
+            except GitHubAppError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            store.disconnect_github(org_id, installation_id)
+        finally:
+            store.close()
+        return {"disconnected": installation_id}
 
     @app.get("/api/orgs/{org_id}/members")
     def list_members(org_id: str, token: Token | None = needs_admin) -> Any:
@@ -2531,23 +2743,37 @@ def create_app(
         finally:
             store.close()
 
-    def _usable_repos(store: Any, box: Any) -> list[str]:
-        """`box`'s grants, or none for another org's agent (FLOTTA-83).
-
-        A row from before the rule mints nothing, so naming it would be a
-        repository the agent is told it has and is refused when it asks.
-        """
-        return store.repos_for_box(box.id) if reaches_fleet_github(box.org) else []
-
     @app.get("/api/boxes/{box_id}/repos")
     def list_repos(box_id: str, token: Token | None = needs_read) -> Any:
         """Which repositories a box may use."""
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
-            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
+            # A grant outlives its source: from before FLOTTA-83, or on a GitHub
+            # account since disconnected. It mints nothing, so naming it would be
+            # a repository the agent is told it has and is refused when it asks.
+            return {"box_id": box.id, "name": box.name, "repos": store.usable_repos(box.id)}
         finally:
             store.close()
+
+    def _check_installation_covers(installation: Any, repo: str) -> None:
+        """422 if GitHub says this installation does not cover `repo`.
+
+        Allowed when GitHub cannot say, as `grant_repo_endpoint` explains.
+        """
+        from flotta.github_app import GitHubAppError
+
+        app_ = _configured_github_app()
+        try:
+            covering = app_.installation_of(repo)
+        except GitHubAppError:
+            return
+        if covering != installation.installation_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{repo} is not among the repositories selected for Flotta on "
+                f"{installation.account}. Add it there on GitHub, then grant it here.",
+            )
 
     @app.post("/api/boxes/{box_id}/repos")
     def grant_repo_endpoint(
@@ -2571,19 +2797,25 @@ def create_app(
         a point-in-time answer regardless: a token's scope can change after the
         grant, so this removes a surprise rather than a possibility.
 
-        **The operator's alone, for the operator's agents** (FLOTTA-83). The
-        token every grant spends is the operator's own, so `fleet:write` in an
-        agency's org is not enough: that was an agency granting itself the
-        operator's repositories. Both refusals come before GitHub is asked.
+        **Whose call depends on whose GitHub it is.** On a GitHub account the
+        agency connected (FLOTTA-22), it is the agency's: that is its own code.
+        On `$FLOTTA_GITHUB_TOKEN` it is the operator's alone, for the operator's
+        agents, because that token is the operator's (FLOTTA-83) and `fleet:write`
+        in an agency's org was an agency granting itself the operator's
+        repositories. Every refusal comes before GitHub is asked.
+
+        **The grant remembers which it was.** One made on a connected account
+        never falls back to the fleet token when that account is disconnected,
+        because nobody with the right to spend that token authorised it.
         """
         from flotta.store import normalise_repo
 
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
-            if not reaches_fleet_github(box.org):
+            connected = store.github_installations_for(box.org, box.client)
+            if not connected and not reaches_fleet_github(box.org):
                 raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
-            _require_operator(token, "grant a repository")
             # Normalised first, because the check asks GitHub about a path: a
             # pasted URL or a `.git` suffix would ask about a repository that
             # does not exist and read as a denial.
@@ -2592,16 +2824,34 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-            check = reachable or _default_reachable
-            reach = check(wanted, token=(os.environ.get(GITHUB_TOKEN_ENV) or "").strip())
-            if reach.refuses:
-                raise HTTPException(status_code=422, detail=reach.detail)
+            installation = store.github_installation_for(box.org, box.client, wanted)
+            if installation is not None:
+                _check_installation_covers(installation, wanted)
+            elif not reaches_fleet_github(box.org):
+                accounts = ", ".join(i.account for i in connected)
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{wanted} is not on a GitHub account connected for this agent "
+                    f"({accounts}). Connect its owner first.",
+                )
+            else:
+                _require_operator(token, "grant a repository")
+                check = reachable or _default_reachable
+                reach = check(wanted, token=(os.environ.get(GITHUB_TOKEN_ENV) or "").strip())
+                if reach.refuses:
+                    raise HTTPException(status_code=422, detail=reach.detail)
 
+            fleet_token = installation is None
             try:
-                repo = store.grant_repo(box.id, wanted)
+                repo = store.grant_repo(box.id, wanted, fleet_token=fleet_token)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-            store.add_event("box", box.id, "repo_granted", {"repo": repo})
+            store.add_event(
+                "box",
+                box.id,
+                "repo_granted",
+                {"repo": repo, "source": "fleet_token" if fleet_token else "github_app"},
+            )
             return {"box_id": box.id, "repos": store.repos_for_box(box.id)}
         finally:
             store.close()
@@ -3167,7 +3417,7 @@ def create_app(
         try:
             box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "list the repositories of")
-            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
+            return {"box_id": box.id, "name": box.name, "repos": store.usable_repos(box.id)}
         finally:
             store.close()
 
@@ -3377,14 +3627,17 @@ def create_app(
         we have watched this agent act on instructions that came from a
         repository.
 
-        **What this does and does not enforce.** Flotta refuses to hand a
-        credential for a repository the box was not granted. It does *not*
-        constrain what the returned token can reach — the source is one fleet
-        token, so a box that extracted it could use it beyond its grants. That
-        is policy enforced here, not by GitHub, and closing it means minting
-        GitHub App installation tokens scoped to `repository_ids`. Stated
-        plainly because a soft boundary that reads as a hard one is worse than
-        no boundary at all.
+        **What this does and does not enforce depends on the source.** Flotta
+        refuses a credential for a repository the box was not granted either way.
+
+        - On a GitHub account its agency connected (FLOTTA-22), the credential
+          is a 1-hour token for that one repository. GitHub enforces that, so a
+          box that extracted it reaches nothing else.
+        - On `$FLOTTA_GITHUB_TOKEN`, for the operator's agents only, it is the
+          whole fleet token: a box that extracted it could use it beyond its
+          grants. That is policy enforced here, not by GitHub. Stated plainly
+          because a soft boundary that reads as a hard one is worse than no
+          boundary at all.
 
         **A box token may only ask about its own box.** Scopes say what a token
         may do, never to which box, and that gap became load-bearing the moment
@@ -3392,13 +3645,10 @@ def create_app(
         root. Without this check one box's token would reach every other box's
         grants, which is precisely the containment the grants exist to provide.
         """
-        source = (os.environ.get(GITHUB_TOKEN_ENV) or "").strip()
-        if not source:
-            raise HTTPException(
-                status_code=503,
-                detail=f"no ${GITHUB_TOKEN_ENV} configured on the control plane; "
-                f"boxes can read public repositories and nothing else",
-            )
+        from flotta.github_app import GitHubAppError, InstallationGone, RepositoryNotSelected
+        from flotta.store import normalise_repo
+
+        fleet_token = (os.environ.get(GITHUB_TOKEN_ENV) or "").strip()
 
         store = store_factory()
         try:
@@ -3408,11 +3658,6 @@ def create_app(
             # box? A non-box subject (an operator) is unrestricted — see
             # `auth.BOX_SUBJECT_PREFIX`.
             confine_to_box(token, box, "mint credentials for")
-            # Whatever the grants say: the credential is the operator's whole
-            # token, and a grant from before FLOTTA-83 must not hand it over.
-            if not reaches_fleet_github(box.org):
-                raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
-
             repo = str(body.get("repo") or "").strip()
             if not repo:
                 raise HTTPException(status_code=422, detail="which repository?")
@@ -3420,18 +3665,97 @@ def create_app(
                 if not store.may_use_repo(box.id, repo):
                     raise HTTPException(
                         status_code=403,
-                        detail=f"box {box.name!r} is not granted {repo!r}. "
-                        f"Grant it with `flotta repo grant {box.name} {repo}`.",
+                        detail=f"box {box.name!r} is not granted {repo!r}. Grant it on the "
+                        f"agent's page, or with `flotta repo grant {box.name} {repo}`.",
                     )
+                repo = normalise_repo(repo)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-            store.add_event("box", box.id, "git_credential", {"repo": repo})
+            installation = store.github_installation_for(box.org, box.client, repo)
+            if installation is None:
+                # Whatever the grants say: a grant from before FLOTTA-83 must
+                # not hand another org's agent the operator's token, and one made
+                # on an account since disconnected was never authorised to use it.
+                if not store.may_spend_fleet_token(box.id, repo):
+                    raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
+                if not fleet_token:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"no ${GITHUB_TOKEN_ENV} configured on the control plane; "
+                        f"boxes can read public repositories and nothing else",
+                    )
+                password, source = fleet_token, "fleet_token"
+            else:
+                try:
+                    password = _configured_github_app().token_for(
+                        installation.installation_id, repo.split("/")[1]
+                    )
+                except InstallationGone as exc:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"the GitHub connection to {installation.account} was removed "
+                        f"or suspended on GitHub. Connect it again to use {repo}.",
+                    ) from exc
+                except RepositoryNotSelected as exc:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"{repo} is no longer among the repositories selected for "
+                        f"Flotta on {installation.account}. Add it there on GitHub.",
+                    ) from exc
+                except GitHubAppError as exc:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                source = "github_app"
+
+            store.add_event("box", box.id, "git_credential", {"repo": repo, "source": source})
             # The username is ignored by GitHub when the password is a token;
             # `x-access-token` is the convention its own docs use.
-            return {"username": "x-access-token", "password": source, "repo": repo}
+            return {"username": "x-access-token", "password": password, "repo": repo}
         finally:
             store.close()
+
+    @app.get("/api/boxes/{box_id}/github/repositories")
+    def github_repositories(
+        box_id: str, suggest: bool = True, token: Token | None = needs_write
+    ) -> Any:
+        """What could be granted to this agent, to suggest while granting (FLOTTA-22).
+
+        Asks GitHub, per connected account, so a person picks a name rather than
+        remembering one. Only a suggestion: `problems` says which accounts could
+        not be asked, and a name missing here can still be typed and checked.
+        `suggest=false` skips GitHub, for a page redrawing itself on a timer.
+        """
+        from flotta.github_app import GitHubAppError
+
+        store = store_factory()
+        try:
+            box = _operated_box(store, token, box_id)
+            connected = store.github_installations_for(box.org, box.client)
+        finally:
+            store.close()
+        app_ = _github_app_or_none()
+        names: list[str] = []
+        truncated = False
+        problems: list[str] = []
+        for installation in connected if suggest else []:
+            if app_ is None:
+                problems.append(installation.account)
+                continue
+            try:
+                listed, more = app_.repositories(installation.installation_id)
+            except GitHubAppError:
+                problems.append(installation.account)
+                continue
+            names += listed
+            truncated = truncated or more
+        return {
+            "box_id": box.id,
+            "available": app_ is not None,
+            "connected": [i.account for i in connected],
+            "repositories": sorted(set(names)),
+            "truncated": truncated,
+            "problems": problems,
+        }
 
     @app.get("/api/boxes/{box_id}/address")
     def box_address(box_id: str, token: Token | None = needs_route) -> Any:

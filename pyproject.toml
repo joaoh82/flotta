@@ -32,6 +32,8 @@ postgres = ["psycopg[binary]>=3.1"]
 # instead — see the note there; keeping them only here made 16 tests vanish
 # from CI while it still reported green.
 control = [
+    # Signs as the GitHub App (RS256), which only the control plane does.
+    "cryptography>=42",
     "fastapi>=0.115",
     "httpx>=0.28.1",
     "uvicorn>=0.34",
@@ -81,6 +83,7 @@ dev = [
     #
     # `uvicorn` stays extra-only: only `serve()` needs it, and that is an
     # entrypoint with no test.
+    "cryptography>=42",
     "fastapi>=0.115",
     "httpx>=0.28.1",
     # The door's WS client, in `dev` for the same reason as the two above:

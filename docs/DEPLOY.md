@@ -484,9 +484,9 @@ legitimate state rather than a broken box.
 > credential for a repository it was not granted. It does *not* constrain what
 > the returned token can reach — the source is one fleet token, so a box that
 > extracted it could use it beyond its grants. Per-box isolation is policy
-> enforced by the control plane, not by GitHub. Closing that means GitHub App
-> installation tokens scoped to `repository_ids`; the box side would not
-> change. Scope the PAT to the repositories you are willing to lose.
+> enforced by the control plane, not by GitHub, and this token is for your own
+> agents only: another org's are refused it. Agencies use step 7d, where GitHub
+> does enforce it. Scope the PAT to the repositories you are willing to lose.
 
 ### 7b. Load the identity onto the box, and grant it repositories
 
@@ -579,6 +579,61 @@ helper passes the control plane's own words through rather than paraphrasing
 them.
 
 ---
+
+### 7d. Let agencies connect their own GitHub
+
+Optional, and only needed if other people's agents will use GitHub. Without it
+the agency's GitHub page says connecting is unavailable, and everything above
+keeps working. A box needs no change and no new image.
+
+Register one **GitHub App** (Settings → Developer settings → GitHub Apps → New),
+owned by whoever runs this deployment:
+
+| Field | Value |
+| --- | --- |
+| Homepage URL | The web app, e.g. `https://app.flotta.dev` |
+| Callback URL | `<web app>/github/callback` |
+| Request user authorization (OAuth) during installation | **Off** |
+| Setup URL | `<web app>/github/callback`, the same page |
+| Redirect on update | **On** |
+| Webhook | **Off** |
+| Repository permissions | Contents: read and write. Pull requests: read and write. Metadata: read (GitHub adds it). |
+| Organization permissions | Members: read |
+| Where can this App be installed | Any account |
+
+Each permission is there for a reason:
+
+- **Members: read** is how Flotta confirms the person connecting an organization
+  owns it. Without it nobody can connect an organization.
+- **Workflows is left off on purpose.** With it an agent could change what runs
+  in a customer's CI. Pushes touching `.github/workflows/` are refused by GitHub.
+- **Two URLs, one page, and OAuth off** because a connection takes two trips to
+  GitHub: installing, then saying who you are. An installation id alone proves
+  nothing, since anyone can type one into the redirect.
+
+Then generate a client secret and a private key on the App's page, and set these
+on the control plane, not the web app:
+
+```
+FLOTTA_GITHUB_APP_SLUG=the-name-in-the-apps-public-url
+FLOTTA_GITHUB_APP_CLIENT_ID=Iv23...
+FLOTTA_GITHUB_APP_CLIENT_SECRET=...
+FLOTTA_GITHUB_APP_PRIVATE_KEY=<the .pem file's contents>
+```
+
+A key whose line breaks were saved as the two characters `\n` still reads.
+
+**What each side enforces.** A box gets a 1-hour token for the one repository it
+asked for, so a box that extracted it reaches nothing else, and GitHub is what
+refuses. Removing the App on GitHub ends it at once. Which account's token a box
+gets is the installation on the repository's owner: its client's first, then its
+agency's. `FLOTTA_GITHUB_TOKEN` is used only for your own org's agents, and only
+for an owner nobody connected.
+
+**The limit worth knowing.** Whoever connects an account must be an owner of it
+on GitHub and an owner of the agency in Flotta, in one browser. If a client owns
+the GitHub organization and nobody at the agency is an owner of it, the client
+has to make someone one while connecting.
 
 ## Step 8 — A second agency (M11.7)
 
