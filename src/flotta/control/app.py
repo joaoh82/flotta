@@ -133,6 +133,34 @@ VIEW_AS_SCOPES = frozenset({SCOPE_FLEET_READ, SCOPE_ORG_ADMIN})
 #: Live provisioning threads, held so nothing collects them mid-flight.
 _provisioning: set[threading.Thread] = set()
 
+#: Agents whose model is being changed by a thread of this process (FLOTTA-99).
+#: The timeline says the same thing, but two requests can both read it before
+#: either writes; this is the check that holds between them.
+_model_changes_running: set[str] = set()
+_model_changes_lock = threading.Lock()
+
+
+def _record_unfinished_change(
+    store_factory: Any, box_id: str, model: str, error: Exception
+) -> None:
+    """Record that a started model change ended early, on a connection of its own.
+
+    The one it was using may be what failed. Best effort for the same reason:
+    if this fails too, `MODEL_CHANGE_STALE_S` ends the change on the timeline.
+    """
+    from flotta.provision import MODEL_CHANGE_FAILED
+
+    try:
+        store = store_factory()
+        try:
+            store.add_event(
+                "box", box_id, MODEL_CHANGE_FAILED, {"model": model, "error": str(error)[:400]}
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("could not record %s's unfinished model change: %s", box_id, exc)
+
 
 def _build() -> str:
     """Which commit is running.
@@ -341,6 +369,7 @@ def _box_dict(
     model: str | None = None,
     fleet_model: str | None = None,
     given: str | None = None,
+    model_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
@@ -371,18 +400,22 @@ def _box_dict(
     out["model"] = model or given or fleet_model
     out["model_source"] = "agent" if model else ("fleet" if out["model"] else None)
     out["fleet_model"] = fleet_model
+    # A change under way, or the last one failing (FLOTTA-99): what lets the
+    # window say "restarting" and an open conversation expect the drop.
+    out["model_change"] = model_change
     return out
 
 
 def _with_meta(store: Any, box: Any) -> dict[str, Any]:
-    from flotta.provision import fleet_model
+    from flotta.provision import fleet_model, model_changes, model_given_by_default
 
     return _box_dict(
         box,
         store.meta_for_box(box.id),
         model=store.model_for_box(box.id),
         fleet_model=fleet_model(store),
-        given=store.models_given([box.id]).get(box.id),
+        given=store.models_given([box.id]).get(box.id) or model_given_by_default(),
+        model_change=model_changes(store, [box.id]).get(box.id),
     )
 
 
@@ -1988,13 +2021,15 @@ def create_app(
                 # "no rate configured", a zero claims the box ran for free.
                 "cost_estimate": sum(costs) if costs else None,
             }
-        from flotta.provision import fleet_model
+        from flotta.provision import fleet_model, model_changes, model_given_by_default
 
         ids = [b.id for b in boxes]
         metas = store.meta_for_boxes(ids)
         models = store.models_for_boxes(ids)
         given = store.models_given(ids)
+        changes = model_changes(store, ids)
         default = fleet_model(store)
+        default_given = model_given_by_default()
         return {
             "boxes": [
                 _for_reader(
@@ -2004,7 +2039,8 @@ def create_app(
                             metas.get(b.id),
                             model=models.get(b.id),
                             fleet_model=default,
-                            given=given.get(b.id),
+                            given=given.get(b.id) or default_given,
+                            model_change=changes.get(b.id),
                         ),
                         **summaries[b.id],
                     },
@@ -2341,7 +2377,7 @@ def create_app(
             box = _scoped_box(store, token, box_id)
             current = store.meta_for_box(box.id)
             try:
-                meta = store.set_box_meta(
+                store.set_box_meta(
                     box.id,
                     display_name=body.get("display_name"),
                     description=body.get("description"),
@@ -2349,17 +2385,7 @@ def create_app(
                 )
             except InvalidBoxMetaError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-            from flotta.provision import fleet_model
-
-            return {
-                "box": _box_dict(
-                    box,
-                    meta,
-                    model=store.model_for_box(box.id),
-                    fleet_model=fleet_model(store),
-                    given=store.models_given([box.id]).get(box.id),
-                )
-            }
+            return {"box": _with_meta(store, box)}
         finally:
             store.close()
 
@@ -2784,8 +2810,22 @@ def create_app(
         Like renewing an identity: the value is written to the agent's own
         machine, a running agent restarts to take it, and a sleeping one stays
         asleep and takes it when it wakes. `fleet:write`, for the restart.
+
+        **`202`, then a thread** (FLOTTA-99). Writing the value waits for Fly
+        to restart a running agent, and the web app gives a call ten seconds:
+        answering afterwards made a change that worked arrive as "the control
+        plane did not answer". Refusals are answered first; the box's
+        `model_change` says it is under way, and the timeline's `model_set` or
+        `model_change_failed` how it ended.
         """
-        from flotta.provision import ProvisionError, UpgradeFailed, set_model
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import (
+            ProvisionError,
+            UpgradeFailed,
+            begin_model_change,
+            set_model,
+        )
 
         if "model" not in body:
             raise HTTPException(
@@ -2795,13 +2835,65 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            with _model_changes_lock:
+                if box.id in _model_changes_running:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{box.name} is already switching model; wait for that to finish.",
+                    )
+                try:
+                    started = begin_model_change(box.id, model, store=store)
+                except ProvisionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                _model_changes_running.add(box.id)
+
+            def change() -> None:
+                # The guard is released whatever happens here, opening the
+                # store included: only this thread releases it now, and a stuck
+                # one refuses every later change until the process restarts.
+                try:
+                    inner = store_factory()
+                    try:
+                        set_model(box.id, model, store=inner)
+                    except UpgradeFailed as exc:
+                        # `set_model` recorded it.
+                        _log.warning("changing %s's model failed: %s", box.name, exc)
+                    finally:
+                        inner.close()
+                except Exception as exc:  # noqa: BLE001
+                    # The box destroyed meanwhile, the store gone: recorded so
+                    # the window does not say "restarting" until it goes stale.
+                    _log.warning("changing %s's model failed: %s", box.name, exc)
+                    _record_unfinished_change(store_factory, box.id, started["model"], exc)
+                finally:
+                    _model_changes_running.discard(box.id)
+
+            handed_over = False
             try:
-                result = set_model(box.id, model, store=store)
-            except UpgradeFailed as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-            except ProvisionError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
+                if not background:
+                    try:
+                        result = set_model(box.id, model, store=store)
+                    except UpgradeFailed as exc:
+                        raise HTTPException(status_code=502, detail=str(exc)) from exc
+                    except ProvisionError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
+                answer = {**started, "started": True, "box": _with_meta(store, box)}
+                worker = threading.Thread(target=change, name=f"model-{box.name}", daemon=True)
+                _provisioning.add(worker)
+                worker.start()
+                handed_over = True
+                return JSONResponse(answer, status_code=202)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                # It will never run: say so, rather than leave a change that
+                # nothing is making showing as under way.
+                _record_unfinished_change(store_factory, box.id, started["model"], exc)
+                raise
+            finally:
+                if not handed_over:
+                    _model_changes_running.discard(box.id)
         finally:
             store.close()
 

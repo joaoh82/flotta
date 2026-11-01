@@ -1571,3 +1571,26 @@ def test_user_add_goes_through_the_control_plane(tmp_path, monkeypatch):
         )
     ]
     assert "client acme" in result.output
+
+
+# -- `flotta model` against a control plane that answers at once (FLOTTA-99) --
+
+
+def test_a_model_change_the_control_plane_accepted_is_not_reported_as_done(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    accepted = {"name": "eng-a", "model": "openai/gpt-5", "source": "agent", "started": True}
+
+    def fake(method, path, *, scopes, body=None, **kw):
+        return accepted if path.endswith("/model") else {"id": "b-1", "name": "eng-a"}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    result = CliRunner().invoke(cli.app, ["model", "set", "eng-a", "openai/gpt-5"])
+    assert result.exit_code == 0, result.output
+    assert "is switching to openai/gpt-5" in result.output
+    assert "now runs" not in result.output

@@ -1737,6 +1737,66 @@ def repair_connection(
 
 #: The event a model change writes.
 MODEL_SET = "model_set"
+#: A model change accepted and under way on a thread (FLOTTA-99), and one that
+#: could not be written to the machine. `MODEL_SET` is the success.
+MODEL_CHANGE_STARTED = "model_change_started"
+MODEL_CHANGE_FAILED = "model_change_failed"
+#: How long a started change counts as under way with no outcome recorded.
+#: A change takes a restart, a minute or two; one older than this was cut off
+#: by the control plane itself restarting, and saying "restarting" for ever
+#: would be the window lying the other way.
+MODEL_CHANGE_STALE_S = 10 * 60
+
+
+def model_given_by_default(env: Mapping[str, str] | None = None) -> str | None:
+    """What an agent with no `model_set` record was given: the environment's
+    `FLOTTA_MODEL`, not the stored setting (FLOTTA-99).
+
+    Such an agent predates FLOTTA-39, which first recorded the model at
+    creation, and the settings table (FLOTTA-41) came after that, so the
+    environment is the only default it can have been made with. Falling back
+    to the stored default instead claimed it ran whatever the operator chose
+    *later* — which is how "an earlier fleet default" never appeared.
+    """
+    env = os.environ if env is None else env
+    return (env.get("FLOTTA_MODEL") or "").strip() or None
+
+
+def model_change_of(event: Any, *, now: datetime | None = None) -> dict[str, Any] | None:
+    """Where an agent's latest model change stands, from its latest
+    `model_change_started` / `model_change_failed` / `model_set` event.
+
+    `{"state": "pending", ...}` while one is under way, `{"state": "failed",
+    ...}` when the last one could not be applied, and None when there is
+    nothing to say: no change, a finished one, or a start too old to still be
+    running (`MODEL_CHANGE_STALE_S`).
+    """
+    if event is None or event.type == MODEL_SET:
+        return None
+    payload = event.payload or {}
+    out = {"model": payload.get("model"), "at": event.ts}
+    if event.type == MODEL_CHANGE_FAILED:
+        return {**out, "state": "failed", "detail": payload.get("error")}
+    if event.type != MODEL_CHANGE_STARTED:
+        return None
+    try:
+        started = datetime.fromisoformat(event.ts)
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if ((now or datetime.now(UTC)) - started).total_seconds() > MODEL_CHANGE_STALE_S:
+        return None
+    return {**out, "state": "pending"}
+
+
+def model_changes(store: FleetStore, box_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """`model_change_of` for each of `box_ids` that has something to say."""
+    latest = store.latest_box_events(
+        box_ids, (MODEL_SET, MODEL_CHANGE_STARTED, MODEL_CHANGE_FAILED)
+    )
+    found = {box_id: model_change_of(event) for box_id, event in latest.items()}
+    return {box_id: change for box_id, change in found.items() if change}
 
 
 def fleet_model(store: FleetStore | None = None) -> str | None:
@@ -1783,6 +1843,54 @@ def allowed_model(model: str, store: FleetStore) -> str:
     return model
 
 
+def _model_plan(box_id: str, model: str | None, store: FleetStore) -> tuple[Any, str | None, str]:
+    """The box, the model it is to have of its own (None: the fleet's), and
+    the model its machine will be given — or the refusal, before anything is
+    touched."""
+    wanted = None if model is None else allowed_model(model, store)
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to change.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(
+            f"box {box_id} is still being created. Its model is set as part of that; "
+            "wait for it to settle."
+        )
+    effective = wanted or fleet_model(store)
+    if not effective:
+        raise ProvisionError(
+            "this fleet has no model configured (FLOTTA_MODEL on the control plane), "
+            "so there is no default to fall back to."
+        )
+    return box, wanted, effective
+
+
+def begin_model_change(box_id: str, model: str | None, *, store: FleetStore) -> dict[str, Any]:
+    """Accept a model change that `set_model` will then make on a thread
+    (FLOTTA-99), or refuse it now.
+
+    The change itself waits for Fly to restart a running agent, which is
+    longer than the web app gives a call: answering after it is how a change
+    that worked arrived as "the control plane did not answer". So every
+    refusal a caller can act on happens here, and `model_change_started`
+    tells the window a restart is coming — which is also what lets an open
+    conversation reconnect by itself instead of showing an error.
+
+    One change at a time per agent: a second started while the first is
+    under way would race it to the machine, and whichever `secrets import`
+    landed last would win regardless of which the store recorded.
+    """
+    box, wanted, effective = _model_plan(box_id, model, store)
+    under_way = model_changes(store, [box.id]).get(box.id)
+    if under_way and under_way["state"] == "pending":
+        raise ProvisionError(
+            f"{box.name} is already switching to {under_way['model']}; wait for that to finish."
+        )
+    source = "agent" if wanted else "fleet"
+    store.add_event("box", box.id, MODEL_CHANGE_STARTED, {"model": effective, "source": source})
+    return {"box_id": box.id, "name": box.name, "model": effective, "source": source}
+
+
 def set_model(
     box_id: str,
     model: str | None,
@@ -1799,29 +1907,21 @@ def set_model(
     at creation and stay the fleet's.
 
     **Substrate first, row second.** If the machine cannot be updated, the
-    store still says what the agent really runs.
+    store still says what the agent really runs, and `model_change_failed`
+    says why — which also ends a change `begin_model_change` started.
+
+    Synchronous: the control plane runs it on a thread (FLOTTA-99).
     """
-    wanted = None if model is None else allowed_model(model, store)
-    box = _require_box(store, box_id)
-    if is_terminal("box", box.status):
-        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to change.")
-    if box.status == "provisioning" or not box.endpoint:
-        raise ProvisionError(
-            f"box {box_id} is still being created. Its model is set as part of that; "
-            "wait for it to settle."
-        )
+    box, wanted, effective = _model_plan(box_id, model, store)
     default = fleet_model(store)
-    effective = wanted or default
-    if not effective:
-        raise ProvisionError(
-            "this fleet has no model configured (FLOTTA_MODEL on the control plane), "
-            "so there is no default to fall back to."
-        )
 
     impl = _resolve_backend(box, backend)
     try:
         impl.apply_secrets(box.endpoint, {"FLOTTA_MODEL": effective})
     except BackendError as exc:
+        store.add_event(
+            "box", box.id, MODEL_CHANGE_FAILED, {"model": effective, "error": str(exc)[:400]}
+        )
         raise UpgradeFailed(
             f"could not change {box.name}'s model: {exc}. It still runs "
             f"{store.model_for_box(box.id) or default}."

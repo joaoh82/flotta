@@ -55,6 +55,7 @@ import os
 import re
 import secrets
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1844,6 +1845,30 @@ class FleetStore:
             if isinstance(model, str) and model:
                 given[str(row["entity_id"])] = model
         return given
+
+    def latest_box_events(self, box_ids: list[str], types: Iterable[str]) -> dict[str, Event]:
+        """Each box's most recent event of any of `types`, keyed by box id.
+
+        For a question about where something *stands* — whether a model
+        change is still under way, say (FLOTTA-99) — which is the last of
+        several event types and not a count of any one. Boxes with none are
+        absent.
+        """
+        wanted = list(types)
+        if not box_ids or not wanted:
+            return {}
+        ids = ", ".join("?" for _ in box_ids)
+        kinds = ", ".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            "SELECT * FROM events "
+            f"WHERE entity_kind = 'box' AND entity_id IN ({ids}) AND type IN ({kinds}) "
+            "ORDER BY id",
+            (*box_ids, *wanted),
+        ).fetchall()
+        latest: dict[str, Event] = {}
+        for row in rows:
+            latest[str(row["entity_id"])] = _event_from_row(row)
+        return latest
 
     # -- builds -------------------------------------------------------------
 
