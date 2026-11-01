@@ -148,6 +148,7 @@ BOX_ROUTES = [
     ("DELETE", "/api/boxes/{b}/repos/acme/secrets", SCOPE_FLEET_WRITE, None),
     ("PUT", "/api/boxes/{b}/model", SCOPE_FLEET_WRITE, {"model": None}),
     ("POST", "/api/boxes/{b}/identity", SCOPE_FLEET_WRITE, None),
+    ("POST", "/api/boxes/{b}/connection", SCOPE_FLEET_WRITE, None),
     # No image: naming one is refused to anyone but the operator before a box
     # is read (`test_operator_reach.py`), and this sweep is about the box.
     ("POST", "/api/boxes/{b}/upgrade", SCOPE_FLEET_WRITE, {}),

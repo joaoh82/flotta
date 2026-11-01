@@ -66,6 +66,10 @@ def substrate(monkeypatch):
         calls.append(("upgrade", image))
         return {"box_id": box_id, "image": image or "fleet", "previous_image": "old"}
 
+    def repair_connection(box_id, *, store, **kwargs):
+        calls.append(("repair", box_id))
+        return {"box_id": box_id, "rewrote": []}
+
     class Fake:
         scheme = "fly"
 
@@ -74,6 +78,9 @@ def substrate(monkeypatch):
             return MachineInfo(state="started", region="ams", image="reg/x:tag")
 
     monkeypatch.setattr(provision, "upgrade_box", upgrade_box)
+    monkeypatch.setattr(provision, "repair_connection", repair_connection)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
     monkeypatch.setattr(backend_mod, "backend_for", lambda endpoint: Fake())
     return calls
 
@@ -103,6 +110,7 @@ ROUTES = (
     ("GET", f"/api/boxes/{AGENCY_BOX}/machine", None),
     ("GET", f"/api/boxes/{AGENCY_BOX}/events", None),
     ("POST", f"/api/boxes/{AGENCY_BOX}/upgrade", {}),
+    ("POST", f"/api/boxes/{AGENCY_BOX}/connection", None),
     ("GET", f"/api/boxes/{AGENCY_BOX}/repos", None),
     ("DELETE", f"/api/boxes/{AGENCY_BOX}/repos/joaoh82/flotta", None),
 )
@@ -157,3 +165,12 @@ def test_the_operator_may_name_an_image(api, substrate):
     )
     assert response.status_code == 200
     assert substrate == [("upgrade", "registry/flotta:new")]
+
+
+def test_the_operator_repairs_an_agency_agents_connection(api, substrate, fleet):
+    """FLOTTA-98: a broken connection is the fleet's to fix, whoever's agent."""
+    with FleetStore(fleet) as store:
+        (box_id,) = [b.id for b in store.list_boxes_in("agency-x", "acme")]
+    response = api.post(f"/api/boxes/{AGENCY_BOX}/connection", headers=OPERATOR)
+    assert response.status_code == 200, response.text
+    assert substrate == [("repair", box_id)]

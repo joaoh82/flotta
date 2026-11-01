@@ -342,6 +342,13 @@ class LocalBackend:
             self.stop(name)
             self.start(name)
 
+    def apply_env(self, box_id: str, env: dict[str, str]) -> None:
+        name = self._name(box_id)
+        self._write(name, "env.json", {**self._read(name, "env.json"), **env})
+        if self._probe(name) is not None:
+            self.stop(name)
+            self.start(name)
+
     def reimage(self, box_id: str, image: str) -> None:
         raise NotSupported("a local stand-in has no image to replace")
 
@@ -383,12 +390,15 @@ class LocalBackend:
 
     def inspect(self, box_id: str) -> MachineInfo:
         name = self._name(box_id)
+        env = self._read(name, "env.json")
         return MachineInfo(
             state=self.state(name),
             machine_id=name,
             app=SCHEME,
             region=SCHEME,
             volume_path=str(self._dir(name) / "hermes"),
+            control_url=(env.get("FLOTTA_CONTROL_URL") or None),
+            env_box_id=(env.get("FLOTTA_BOX_ID") or None),
         )
 
 
