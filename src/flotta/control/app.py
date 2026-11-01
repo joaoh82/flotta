@@ -140,6 +140,28 @@ _model_changes_running: set[str] = set()
 _model_changes_lock = threading.Lock()
 
 
+def _record_unfinished_change(
+    store_factory: Any, box_id: str, model: str, error: Exception
+) -> None:
+    """Record that a started model change ended early, on a connection of its own.
+
+    The one it was using may be what failed. Best effort for the same reason:
+    if this fails too, `MODEL_CHANGE_STALE_S` ends the change on the timeline.
+    """
+    from flotta.provision import MODEL_CHANGE_FAILED
+
+    try:
+        store = store_factory()
+        try:
+            store.add_event(
+                "box", box_id, MODEL_CHANGE_FAILED, {"model": model, "error": str(error)[:400]}
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("could not record %s's unfinished model change: %s", box_id, exc)
+
+
 def _build() -> str:
     """Which commit is running.
 
@@ -2799,7 +2821,6 @@ def create_app(
         from fastapi.responses import JSONResponse
 
         from flotta.provision import (
-            MODEL_CHANGE_FAILED,
             ProvisionError,
             UpgradeFailed,
             begin_model_change,
@@ -2825,44 +2846,56 @@ def create_app(
                 except ProvisionError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 _model_changes_running.add(box.id)
-            if not background:
+
+            def change() -> None:
+                # The guard is released whatever happens here, opening the
+                # store included: only this thread releases it now, and a stuck
+                # one refuses every later change until the process restarts.
                 try:
-                    result = set_model(box.id, model, store=store)
-                except UpgradeFailed as exc:
-                    raise HTTPException(status_code=502, detail=str(exc)) from exc
-                except ProvisionError as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    inner = store_factory()
+                    try:
+                        set_model(box.id, model, store=inner)
+                    except UpgradeFailed as exc:
+                        # `set_model` recorded it.
+                        _log.warning("changing %s's model failed: %s", box.name, exc)
+                    finally:
+                        inner.close()
+                except Exception as exc:  # noqa: BLE001
+                    # The box destroyed meanwhile, the store gone: recorded so
+                    # the window does not say "restarting" until it goes stale.
+                    _log.warning("changing %s's model failed: %s", box.name, exc)
+                    _record_unfinished_change(store_factory, box.id, started["model"], exc)
                 finally:
                     _model_changes_running.discard(box.id)
-                return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
-            answer = {**started, "started": True, "box": _with_meta(store, box)}
+
+            handed_over = False
+            try:
+                if not background:
+                    try:
+                        result = set_model(box.id, model, store=store)
+                    except UpgradeFailed as exc:
+                        raise HTTPException(status_code=502, detail=str(exc)) from exc
+                    except ProvisionError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
+                answer = {**started, "started": True, "box": _with_meta(store, box)}
+                worker = threading.Thread(target=change, name=f"model-{box.name}", daemon=True)
+                _provisioning.add(worker)
+                worker.start()
+                handed_over = True
+                return JSONResponse(answer, status_code=202)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                # It will never run: say so, rather than leave a change that
+                # nothing is making showing as under way.
+                _record_unfinished_change(store_factory, box.id, started["model"], exc)
+                raise
+            finally:
+                if not handed_over:
+                    _model_changes_running.discard(box.id)
         finally:
             store.close()
-
-        def change() -> None:
-            inner = store_factory()
-            try:
-                set_model(box.id, model, store=inner)
-            except Exception as exc:  # noqa: BLE001
-                # `set_model` records a failure to write the machine; anything
-                # else (the box destroyed meanwhile, say) is recorded here, so
-                # the window never says "restarting" until it goes stale.
-                if not isinstance(exc, UpgradeFailed):
-                    inner.add_event(
-                        "box",
-                        box.id,
-                        MODEL_CHANGE_FAILED,
-                        {"model": started["model"], "error": str(exc)[:400]},
-                    )
-                _log.warning("changing %s's model failed: %s", box.name, exc)
-            finally:
-                _model_changes_running.discard(box.id)
-                inner.close()
-
-        worker = threading.Thread(target=change, name=f"model-{box.name}", daemon=True)
-        _provisioning.add(worker)
-        worker.start()
-        return JSONResponse(answer, status_code=202)
 
     @app.post("/api/boxes/{box_id}/connection")
     def repair_connection_endpoint(box_id: str, token: Token | None = needs_write) -> Any:

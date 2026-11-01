@@ -139,6 +139,92 @@ def test_an_unexpected_failure_on_the_thread_still_ends_the_change(fleet, monkey
     assert "store went away" in box["model_change"]["detail"]
 
 
+def test_a_change_that_never_reached_its_thread_does_not_lock_the_agent(fleet, held, monkeypatch):
+    """A read failing after the agent was marked as changing: nothing is making
+    the change, so nothing may keep refusing the next one."""
+    import flotta.control.app as control
+
+    release, _ = held
+    release.set()
+    real = control._with_meta
+    broken = {"now": True}
+
+    def with_meta(store, box):
+        if broken["now"]:
+            raise RuntimeError("the database blinked")
+        return real(store, box)
+
+    monkeypatch.setattr(control, "_with_meta", with_meta)
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=True,
+        reachable=_unchecked,
+        known_model=_uncatalogued,
+    )
+    with TestClient(app, raise_server_exceptions=False) as api:
+        assert api.put("/api/boxes/eng-a/model", json={"model": OWN}).status_code == 500
+        assert control._model_changes_running == set()
+        broken["now"] = False
+        box = api.get("/api/boxes/eng-a").json()["box"]
+        assert box["model_change"]["state"] == "failed"
+        assert "database blinked" in box["model_change"]["detail"]
+        assert api.put("/api/boxes/eng-a/model", json={"model": OWN}).status_code == 202
+        _finish()
+
+
+def test_a_thread_that_cannot_open_the_store_does_not_lock_the_agent(fleet, monkeypatch):
+    """The request has answered 202 by then, so only the thread can release."""
+    import flotta.control.app as control
+
+    failures = {"left": 1}
+
+    def factory():
+        name = threading.current_thread().name
+        if name.startswith("model-") and failures["left"]:
+            failures["left"] -= 1
+            raise RuntimeError("no database")
+        return FleetStore(fleet)
+
+    app = create_app(
+        store_factory=factory,
+        run_loop=False,
+        background=True,
+        reachable=_unchecked,
+        known_model=_uncatalogued,
+    )
+    with TestClient(app) as api:
+        assert api.put("/api/boxes/eng-a/model", json={"model": OWN}).status_code == 202
+        _finish()
+        assert control._model_changes_running == set()
+        box = api.get("/api/boxes/eng-a").json()["box"]
+    assert box["model_change"]["state"] == "failed"
+    assert "no database" in box["model_change"]["detail"]
+
+
+def test_a_store_that_stays_down_still_releases_the_agent(fleet, monkeypatch):
+    """Nothing can be recorded, and the timeline's stale window ends the change;
+    the guard must not outlast it."""
+    import flotta.control.app as control
+
+    def factory():
+        if threading.current_thread().name.startswith("model-"):
+            raise RuntimeError("no database")
+        return FleetStore(fleet)
+
+    app = create_app(
+        store_factory=factory,
+        run_loop=False,
+        background=True,
+        reachable=_unchecked,
+        known_model=_uncatalogued,
+    )
+    with TestClient(app) as api:
+        assert api.put("/api/boxes/eng-a/model", json={"model": OWN}).status_code == 202
+        _finish()
+    assert control._model_changes_running == set()
+
+
 def test_an_agent_with_no_record_reports_the_environments_model_not_a_later_default(fleet):
     """The live check: the operator stored a new default, and every agent made
     before FLOTTA-39 claimed to run it."""
