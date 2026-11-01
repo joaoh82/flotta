@@ -1683,27 +1683,39 @@ class FleetStore:
 
     # -- repository grants --------------------------------------------
 
-    def grant_repo(self, box_id: str, repo: str) -> str:
+    def grant_repo(self, box_id: str, repo: str, *, fleet_token: bool = False) -> str:
         """Let a box use a repository. Idempotent.
 
         `repo` is normalised to `owner/name`: a grant recorded as a URL and a
         grant recorded as a slug would look like two different grants for the
         same repository, and the credential path compares them for equality.
 
-        Refused for another org's box unless a GitHub account it has connected
-        owns the repository, here so that every caller meets it: the control
-        plane, and the CLI writing the store directly.
+        Refused unless a GitHub account its org has connected owns the
+        repository, here so that every caller meets it: the control plane, and
+        the CLI writing the store directly.
+
+        `fleet_token=True` is the operator saying this grant may spend
+        `$FLOTTA_GITHUB_TOKEN`, for the operator's own agents only. It is recorded
+        because the account a grant was made on can later be disconnected, and
+        that must end the grant rather than move it to a credential nobody
+        authorised it to use. Nothing but an operator's own act sets it, and a
+        later grant through a connected account does not take it back.
         """
         box = self._get_box_or_raise(box_id)
         normalised = normalise_repo(repo)
-        if not self.github_reaches(box.org, box.client, normalised):
+        allowed = (
+            reaches_fleet_github(box.org)
+            if fleet_token
+            else self.github_installation_for(box.org, box.client, normalised) is not None
+        )
+        if not allowed:
             raise ValueError(AGENCY_GITHUB_UNAVAILABLE)
         self._conn.execute(
-            "INSERT OR REPLACE INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?)"
-            if not self.is_postgres
-            else "INSERT INTO box_repos (box_id, repo, granted_at) VALUES (?, ?, ?) "
-            "ON CONFLICT (box_id, repo) DO UPDATE SET granted_at = EXCLUDED.granted_at",
-            (box_id, normalised, _utcnow()),
+            "INSERT INTO box_repos (box_id, repo, granted_at, source) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (box_id, repo) DO UPDATE SET granted_at = EXCLUDED.granted_at, "
+            "source = CASE WHEN box_repos.source = 'fleet_token' THEN 'fleet_token' "
+            "ELSE EXCLUDED.source END",
+            (box_id, normalised, _utcnow(), "fleet_token" if fleet_token else "github_app"),
         )
         return normalised
 
@@ -2083,6 +2095,26 @@ class FleetStore:
         """
         return normalise_repo(repo) in self.repos_for_box(box_id)
 
+    def may_spend_fleet_token(self, box_id: str, repo: str) -> bool:
+        """Whether the operator authorised this grant to use `$FLOTTA_GITHUB_TOKEN`."""
+        if not reaches_fleet_github(self._get_box_or_raise(box_id).org):
+            return False
+        row = self._conn.execute(
+            "SELECT source FROM box_repos WHERE box_id = ? AND repo = ?",
+            (box_id, normalise_repo(repo)),
+        ).fetchone()
+        return row is not None and row["source"] == "fleet_token"
+
+    def usable_repos(self, box_id: str) -> list[str]:
+        """This box's grants that something can give it a credential for."""
+        box = self._get_box_or_raise(box_id)
+        return [
+            repo
+            for repo in self.repos_for_box(box_id)
+            if self.github_installation_for(box.org, box.client, repo) is not None
+            or self.may_spend_fleet_token(box_id, repo)
+        ]
+
     # -- connected GitHub accounts (FLOTTA-22) --------------------------------
 
     def connect_github(
@@ -2103,22 +2135,43 @@ class FleetStore:
 
         The caller has already had GitHub confirm this person owns the account;
         see `flotta.github_app`.
+
+        It also replaces any other installation this org recorded for that
+        account. GitHub keeps one installation of an App per account, so with this
+        one confirmed the older id is gone, and left here it would keep being
+        chosen for the account's repositories. Another org's row is left alone:
+        it is theirs, and their agents are refused by GitHub either way.
         """
-        self._conn.execute(
-            "INSERT INTO github_installations "
-            "(installation_id, org, client, account, account_type, connected_by, connected_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (installation_id) DO NOTHING",
-            (installation_id, org, client, account.lower(), account_type, connected_by, _utcnow()),
-        )
-        row = self._conn.execute(
-            "SELECT * FROM github_installations WHERE installation_id = ?", (installation_id,)
-        ).fetchone()
-        assert row is not None
-        held = _installation_from_row(row)
-        if (held.org, held.client) != (org, client):
-            raise GitHubAlreadyConnectedError(
-                f"that GitHub account's installation is already connected elsewhere "
-                f"(installation {installation_id})"
+        with self._conn.transaction(guard="github_installations"):
+            self._conn.execute(
+                "INSERT INTO github_installations "
+                "(installation_id, org, client, account, account_type, connected_by, "
+                "connected_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (installation_id) DO NOTHING",
+                (
+                    installation_id,
+                    org,
+                    client,
+                    account.lower(),
+                    account_type,
+                    connected_by,
+                    _utcnow(),
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM github_installations WHERE installation_id = ?", (installation_id,)
+            ).fetchone()
+            assert row is not None
+            held = _installation_from_row(row)
+            if (held.org, held.client) != (org, client):
+                raise GitHubAlreadyConnectedError(
+                    f"that GitHub account's installation is already connected elsewhere "
+                    f"(installation {installation_id})"
+                )
+            self._conn.execute(
+                "DELETE FROM github_installations "
+                "WHERE org = ? AND account = ? AND installation_id <> ?",
+                (org, held.account, installation_id),
             )
         return held
 
@@ -2170,12 +2223,6 @@ class FleetStore:
             if installation.account == owner:
                 return installation
         return None
-
-    def github_reaches(self, org: str, client: str, repo: str) -> bool:
-        """Whether anything could give this client's agents a credential for `repo`."""
-        return (
-            reaches_fleet_github(org) or self.github_installation_for(org, client, repo) is not None
-        )
 
     # -- colleagues ------------------------------------------------------
 

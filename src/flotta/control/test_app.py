@@ -1138,7 +1138,7 @@ def two_boxes(secured, fleet):
     store = FleetStore(fleet)
     other = store.create_box("eng-b")
     store.update_box_status(other.id, "running", endpoint="fly://app/m2")
-    store.grant_repo(other.id, "someone/secret")
+    store.grant_repo(other.id, "someone/secret", fleet_token=True)
     store.close()
     return _box_ids(secured)
 

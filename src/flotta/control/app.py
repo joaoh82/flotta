@@ -2743,26 +2743,16 @@ def create_app(
         finally:
             store.close()
 
-    def _usable_repos(store: Any, box: Any) -> list[str]:
-        """`box`'s grants that something can give it a credential for.
-
-        A grant outlives its source: from before FLOTTA-83, or on a GitHub
-        account since disconnected. It mints nothing, so naming it would be a
-        repository the agent is told it has and is refused when it asks.
-        """
-        return [
-            repo
-            for repo in store.repos_for_box(box.id)
-            if store.github_reaches(box.org, box.client, repo)
-        ]
-
     @app.get("/api/boxes/{box_id}/repos")
     def list_repos(box_id: str, token: Token | None = needs_read) -> Any:
         """Which repositories a box may use."""
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
-            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
+            # A grant outlives its source: from before FLOTTA-83, or on a GitHub
+            # account since disconnected. It mints nothing, so naming it would be
+            # a repository the agent is told it has and is refused when it asks.
+            return {"box_id": box.id, "name": box.name, "repos": store.usable_repos(box.id)}
         finally:
             store.close()
 
@@ -2813,6 +2803,10 @@ def create_app(
         agents, because that token is the operator's (FLOTTA-83) and `fleet:write`
         in an agency's org was an agency granting itself the operator's
         repositories. Every refusal comes before GitHub is asked.
+
+        **The grant remembers which it was.** One made on a connected account
+        never falls back to the fleet token when that account is disconnected,
+        because nobody with the right to spend that token authorised it.
         """
         from flotta.store import normalise_repo
 
@@ -2847,11 +2841,17 @@ def create_app(
                 if reach.refuses:
                     raise HTTPException(status_code=422, detail=reach.detail)
 
+            fleet_token = installation is None
             try:
-                repo = store.grant_repo(box.id, wanted)
+                repo = store.grant_repo(box.id, wanted, fleet_token=fleet_token)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-            store.add_event("box", box.id, "repo_granted", {"repo": repo})
+            store.add_event(
+                "box",
+                box.id,
+                "repo_granted",
+                {"repo": repo, "source": "fleet_token" if fleet_token else "github_app"},
+            )
             return {"box_id": box.id, "repos": store.repos_for_box(box.id)}
         finally:
             store.close()
@@ -3417,7 +3417,7 @@ def create_app(
         try:
             box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "list the repositories of")
-            return {"box_id": box.id, "name": box.name, "repos": _usable_repos(store, box)}
+            return {"box_id": box.id, "name": box.name, "repos": store.usable_repos(box.id)}
         finally:
             store.close()
 
@@ -3675,8 +3675,9 @@ def create_app(
             installation = store.github_installation_for(box.org, box.client, repo)
             if installation is None:
                 # Whatever the grants say: a grant from before FLOTTA-83 must
-                # not hand another org's agent the operator's token.
-                if not reaches_fleet_github(box.org):
+                # not hand another org's agent the operator's token, and one made
+                # on an account since disconnected was never authorised to use it.
+                if not store.may_spend_fleet_token(box.id, repo):
                     raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
                 if not fleet_token:
                     raise HTTPException(
@@ -3714,12 +3715,15 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/github/repositories")
-    def github_repositories(box_id: str, token: Token | None = needs_write) -> Any:
+    def github_repositories(
+        box_id: str, suggest: bool = True, token: Token | None = needs_write
+    ) -> Any:
         """What could be granted to this agent, to suggest while granting (FLOTTA-22).
 
         Asks GitHub, per connected account, so a person picks a name rather than
         remembering one. Only a suggestion: `problems` says which accounts could
         not be asked, and a name missing here can still be typed and checked.
+        `suggest=false` skips GitHub, for a page redrawing itself on a timer.
         """
         from flotta.github_app import GitHubAppError
 
@@ -3729,12 +3733,16 @@ def create_app(
             connected = store.github_installations_for(box.org, box.client)
         finally:
             store.close()
+        app_ = _github_app_or_none()
         names: list[str] = []
         truncated = False
         problems: list[str] = []
-        for installation in connected:
+        for installation in connected if suggest else []:
+            if app_ is None:
+                problems.append(installation.account)
+                continue
             try:
-                listed, more = _configured_github_app().repositories(installation.installation_id)
+                listed, more = app_.repositories(installation.installation_id)
             except GitHubAppError:
                 problems.append(installation.account)
                 continue
@@ -3742,6 +3750,7 @@ def create_app(
             truncated = truncated or more
         return {
             "box_id": box.id,
+            "available": app_ is not None,
             "connected": [i.account for i in connected],
             "repositories": sorted(set(names)),
             "truncated": truncated,

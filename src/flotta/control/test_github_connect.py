@@ -30,7 +30,7 @@ from flotta.auth import (
 )
 from flotta.control.app import create_app
 from flotta.control.test_app import _uncatalogued, _unchecked
-from flotta.github_app import GitHubApp, State, sign_state
+from flotta.github_app import GitHubApp, State, missing_settings, sign_state
 from flotta.store import AGENCY_GITHUB_UNAVAILABLE, FleetStore
 
 KEY = "a-signing-key-for-github-tests"
@@ -133,7 +133,14 @@ class FakeGitHub:
             if wanted is not None and not set(wanted) <= found["repos"]:
                 return 422, {}
             token = f"ghs_{len(self.issued)}"
-            self.issued.append({"token": token, "installation": number, "repositories": wanted})
+            self.issued.append(
+                {
+                    "token": token,
+                    "installation": number,
+                    "repositories": wanted,
+                    "permissions": (body or {}).get("permissions"),
+                }
+            )
             return 201, {"token": token}
         return 200, {
             "account": {"login": found["login"], "type": found["type"]},
@@ -548,7 +555,9 @@ def test_an_agent_gets_a_token_for_the_one_repository_it_asked_for(api, fleet, g
         "password": "ghs_0",
         "repo": "acme-gh/site",
     }
-    assert github.issued == [{"token": "ghs_0", "installation": "77", "repositories": ["site"]}]
+    assert github.issued == [
+        {"token": "ghs_0", "installation": "77", "repositories": ["site"], "permissions": None}
+    ]
 
 
 def test_the_record_of_it_has_the_repository_and_not_the_token(api, fleet):
@@ -581,19 +590,21 @@ def test_an_agency_account_reaches_every_one_of_its_clients_agents(api, fleet):
         assert _credential(api, fleet, name, "acme-gh/site").status_code == 200
 
 
-def test_a_client_account_is_chosen_ahead_of_the_agencys_for_its_owner(fleet, github):
+def test_a_clients_accounts_are_listed_ahead_of_the_agencys(fleet, github):
     with FleetStore(fleet) as store:
         for number, client in (("1", None), ("2", "acme")):
             store.connect_github(
                 number,
                 org="agency-x",
                 client=client,
-                account="same",
+                account=f"account-{number}",
                 account_type="Organization",
                 connected_by="x",
             )
-        assert store.github_installation_for("agency-x", "acme", "same/r").installation_id == "2"
-        assert store.github_installation_for("agency-x", "beta", "same/r").installation_id == "1"
+        found = store.github_installations_for("agency-x", "acme")
+        assert [i.installation_id for i in found] == ["2", "1"]
+        found = store.github_installations_for("agency-x", "beta")
+        assert [i.installation_id for i in found] == ["1"]
 
 
 def test_another_orgs_agent_never_reaches_it(api, fleet, github):
@@ -774,6 +785,176 @@ def test_the_operators_token_is_still_the_operators_to_spend(api, fleet):
     assert "only the fleet's operator" in refused.json()["detail"]
 
 
+# -- a grant keeps to the credential it was made for ---------------------------------
+
+
+def _disconnect(api, org="default", installation="77"):
+    response = api.delete(f"/api/orgs/{org}/github/{installation}", headers=_owner(org))
+    assert response.status_code == 200, response.text
+
+
+def _repos(api, fleet, name="eng-a", org="default"):
+    response = api.get(f"/api/boxes/{_box_id(fleet, name)}/repos", headers=_owner(org))
+    return response.json()["repos"]
+
+
+def test_disconnecting_never_hands_a_grant_the_operators_token(api, fleet, github):
+    """The grant's author could not have spent that token, so disconnecting must not."""
+    _connect(api, _owner("default"), org="default")
+    person = _bearer(SCOPE_FLEET_WRITE, org="default", client="default")
+    assert _grant(api, fleet, "eng-a", "acme-gh/site", person).status_code == 200
+    assert _credential(api, fleet, "eng-a", "acme-gh/site").json()["password"] == "ghs_0"
+
+    _disconnect(api)
+    response = _credential(api, fleet, "eng-a", "acme-gh/site")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == AGENCY_GITHUB_UNAVAILABLE
+    assert PAT not in response.text
+    assert _repos(api, fleet) == []
+
+
+def test_the_operators_grant_on_an_account_stays_on_that_account(api, fleet):
+    """Being the operator is not enough: it has to be the fleet token they chose."""
+    _connect(api, _owner("default"), org="default")
+    assert _grant(api, fleet, "eng-a", "acme-gh/site", _owner("default")).status_code == 200
+
+    _disconnect(api)
+
+    assert _credential(api, fleet, "eng-a", "acme-gh/site").status_code == 403
+
+
+def test_the_operator_can_move_such_a_grant_to_the_token_by_granting_it_again(api, fleet):
+    _connect(api, _owner("default"), org="default")
+    person = _bearer(SCOPE_FLEET_WRITE, org="default", client="default")
+    _grant(api, fleet, "eng-a", "acme-gh/site", person)
+    _disconnect(api)
+
+    assert _grant(api, fleet, "eng-a", "acme-gh/site", person).status_code == 403
+    assert _credential(api, fleet, "eng-a", "acme-gh/site").status_code == 403
+
+    assert _grant(api, fleet, "eng-a", "acme-gh/site", _owner("default")).status_code == 200
+    assert _credential(api, fleet, "eng-a", "acme-gh/site").json()["password"] == PAT
+    assert _repos(api, fleet) == ["acme-gh/site"]
+
+
+def test_granting_again_on_an_account_does_not_undo_the_operators_choice(api, fleet):
+    assert _grant(api, fleet, "eng-a", "acme-gh/site", _owner("default")).status_code == 200
+    _connect(api, _owner("default"), org="default")
+    person = _bearer(SCOPE_FLEET_WRITE, org="default", client="default")
+    assert _grant(api, fleet, "eng-a", "acme-gh/site", person).status_code == 200
+    assert _credential(api, fleet, "eng-a", "acme-gh/site").json()["password"] == "ghs_0"
+
+    _disconnect(api)
+
+    assert _credential(api, fleet, "eng-a", "acme-gh/site").json()["password"] == PAT
+
+
+def test_a_grant_from_before_grants_had_a_source_still_uses_the_token(api, fleet):
+    _grant_directly(fleet, "eng-a", "joaoh82/flotta")
+    assert _credential(api, fleet, "eng-a", "joaoh82/flotta").json()["password"] == PAT
+    assert _repos(api, fleet) == ["joaoh82/flotta"]
+
+
+def test_the_record_of_a_grant_says_what_it_may_spend(api, fleet):
+    _connect(api, _owner("default"), org="default")
+    _grant(api, fleet, "eng-a", "acme-gh/site", _owner("default"))
+    _grant(api, fleet, "eng-a", "joaoh82/flotta", _owner("default"))
+
+    with FleetStore(fleet) as store:
+        events = store.get_events("box", _box_id(fleet, "eng-a"))
+    granted = {e.payload["repo"]: e.payload["source"] for e in events if e.type == "repo_granted"}
+
+    assert granted == {"acme-gh/site": "github_app", "joaoh82/flotta": "fleet_token"}
+
+
+def test_the_store_needs_the_operators_word_to_spend_the_token(fleet):
+    with FleetStore(fleet) as store:
+        ours = store.get_box_by_name("eng-a").id
+        with pytest.raises(ValueError, match="not available"):
+            store.grant_repo(ours, "joaoh82/flotta")
+        assert store.grant_repo(ours, "joaoh82/flotta", fleet_token=True) == "joaoh82/flotta"
+        assert store.may_spend_fleet_token(ours, "joaoh82/flotta")
+        assert not store.may_spend_fleet_token(ours, "joaoh82/other")
+
+
+def test_the_store_never_gives_another_org_the_token_even_when_told_to(fleet):
+    box_id = _box_id(fleet, ACME_AGENT)
+    with FleetStore(fleet) as store, pytest.raises(ValueError, match="not available"):
+        store.grant_repo(box_id, "joaoh82/flotta", fleet_token=True)
+    _grant_directly(fleet, ACME_AGENT, "joaoh82/flotta")
+    with FleetStore(fleet) as store:
+        assert not store.may_spend_fleet_token(box_id, "joaoh82/flotta")
+
+
+# -- connecting an account again -------------------------------------------------------
+
+
+def _reinstall(github, old="77", new="177"):
+    """The owner removes the App on GitHub and installs it again: a new id."""
+    github.installations[new] = github.installations.pop(old)
+
+
+def test_reconnecting_after_removing_it_on_github_uses_the_new_installation(api, fleet, github):
+    _connect(api)
+    assert _grant(api, fleet, ACME_AGENT, "acme-gh/site", _member()).status_code == 200
+    _reinstall(github)
+    assert _credential(api, fleet, ACME_AGENT, "acme-gh/site").status_code == 403
+
+    assert _connect(api, installation="177").status_code == 200
+
+    assert [c.installation_id for c in _connections(fleet)] == ["177"]
+    assert _credential(api, fleet, ACME_AGENT, "acme-gh/site").status_code == 200
+    assert github.issued[-1]["installation"] == "177"
+    assert _grant(api, fleet, ACME_AGENT, "acme-gh/api", _member()).status_code == 200
+
+
+def test_reconnecting_for_the_whole_agency_replaces_a_clients_old_one(api, fleet, github):
+    """A client's own comes first, so an old one would hide the agency's new one."""
+    _connect(api, client="acme")
+    _grant(api, fleet, ACME_AGENT, "acme-gh/site", _member())
+    _reinstall(github)
+
+    assert _connect(api, installation="177").status_code == 200
+
+    assert [(c.installation_id, c.client) for c in _connections(fleet)] == [("177", None)]
+    assert _credential(api, fleet, ACME_AGENT, "acme-gh/site").status_code == 200
+
+
+def test_reconnecting_touches_no_other_account(api, fleet, github):
+    _connect(api)
+    _connect(api, installation="88")
+    _reinstall(github)
+
+    _connect(api, installation="177")
+
+    assert {c.installation_id for c in _connections(fleet)} == {"88", "177"}
+
+
+def test_reconnecting_touches_no_other_orgs_row(api, fleet, github):
+    _connect(api, _owner("agency-y"), org="agency-y")
+    _reinstall(github)
+
+    assert _connect(api, installation="177").status_code == 200
+
+    assert [c.installation_id for c in _connections(fleet, "agency-y")] == ["77"]
+    assert [c.installation_id for c in _connections(fleet)] == ["177"]
+
+
+def test_a_refused_connection_retires_nothing(api, fleet, github):
+    """Another tenant's installation is refused, and this org's own row stays."""
+    _connect(api)
+    github.installations["177"] = dict(github.installations["77"])
+    _connect(api, _owner("agency-y"), org="agency-y", installation="177")
+
+    assert _connect(api, installation="177").status_code == 409
+
+    assert [c.installation_id for c in _connections(fleet)] == ["77"]
+
+
+# -- suggesting what could be granted ------------------------------------------------
+
+
 def test_what_could_be_granted_is_suggested_from_each_account(api, fleet):
     _connect(api)
     response = api.get(
@@ -799,6 +980,65 @@ def test_an_account_github_cannot_list_is_named_rather_than_empty(api, fleet, gi
     response = api.get(
         f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories", headers=_member()
     )
+    assert response.json()["problems"] == ["acme-gh"]
+
+
+def test_a_page_redrawing_itself_does_not_ask_github(api, fleet, github):
+    _connect(api)
+    response = api.get(
+        f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories?suggest=false",
+        headers=_member(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["connected"] == ["acme-gh"]
+    assert response.json()["available"] is True
+    assert response.json()["repositories"] == []
+    assert response.json()["problems"] == []
+    assert github.issued == []
+
+
+def test_the_token_for_listing_can_only_read_metadata(api, fleet, github):
+    _connect(api)
+    api.get(f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories", headers=_member())
+    assert github.issued[-1]["permissions"] == {"metadata": "read"}
+
+
+def test_the_agents_token_is_not_limited_to_metadata(api, fleet, github):
+    _connect(api)
+    _grant(api, fleet, ACME_AGENT, "acme-gh/site", _member())
+    _credential(api, fleet, ACME_AGENT, "acme-gh/site")
+    assert github.issued[-1]["permissions"] is None
+
+
+def test_a_deployment_with_no_app_says_so_to_the_panel(fleet, monkeypatch):
+    for name in missing_settings({}):
+        monkeypatch.delenv(name, raising=False)
+    box_id = _box_id(fleet, ACME_AGENT)
+    with TestClient(_make_api(fleet, None)) as client:
+        answer = client.get(f"/api/boxes/{box_id}/github/repositories", headers=_member()).json()
+    assert answer["available"] is False
+    assert answer["connected"] == []
+
+
+def test_an_account_still_connected_after_the_app_is_unset_is_a_problem_not_an_error(
+    fleet, monkeypatch
+):
+    for name in missing_settings({}):
+        monkeypatch.delenv(name, raising=False)
+    with FleetStore(fleet) as store:
+        store.connect_github(
+            "77",
+            org="agency-x",
+            client=None,
+            account="acme-gh",
+            account_type="Organization",
+            connected_by="person-olivia",
+        )
+    box_id = _box_id(fleet, ACME_AGENT)
+    with TestClient(_make_api(fleet, None)) as client:
+        response = client.get(f"/api/boxes/{box_id}/github/repositories", headers=_member())
+    assert response.status_code == 200, response.text
+    assert response.json()["available"] is False
     assert response.json()["problems"] == ["acme-gh"]
 
 

@@ -1503,7 +1503,10 @@ def repo_grant(
     with _open_store(store) as fleet:
         box_row = _require_box(fleet, box_id)
         try:
-            granted = fleet.grant_repo(box_row.id, repo)
+            # Whoever holds the store is the operator, so with no connected
+            # account to use, this is them authorising the fleet token.
+            owned = fleet.github_installation_for(box_row.org, box_row.client, repo)
+            granted = fleet.grant_repo(box_row.id, repo, fleet_token=owned is None)
         except ValueError as exc:
             # Another org's agent (FLOTTA-83): refused by the store, as the
             # control plane refuses it with a 403.

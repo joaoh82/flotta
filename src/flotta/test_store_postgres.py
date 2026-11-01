@@ -176,12 +176,44 @@ def test_a_clients_installation_comes_before_its_orgs_on_postgres(pg_store):
             number,
             org="agency-a",
             client=client,
+            account=f"account-{number}",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+    found = pg_store.github_installations_for("agency-a", "acme")
+    assert [i.installation_id for i in found] == ["2", "1"]
+
+
+def test_a_new_installation_replaces_the_old_one_on_postgres(pg_store):
+    pg_store.create_org("agency-a", "agency-a")
+    for number in ("1", "2"):
+        pg_store.connect_github(
+            number,
+            org="agency-a",
+            client=None,
             account="same",
             account_type="Organization",
             connected_by="someone",
         )
 
-    found = pg_store.github_installation_for("agency-a", "acme", "same/repo")
-    assert found is not None and found.installation_id == "2"
-    other = pg_store.github_installation_for("agency-a", "beta", "same/repo")
-    assert other is not None and other.installation_id == "1"
+    assert [i.installation_id for i in pg_store.github_installations("agency-a")] == ["2"]
+
+
+def test_a_grants_source_keeps_the_operators_word_on_postgres(pg_store):
+    """The upsert's CASE, and the column the migration adds, on the real engine."""
+    box = pg_store.create_box("source-box")
+    pg_store.grant_repo(box.id, "same/repo", fleet_token=True)
+    pg_store.connect_github(
+        "1",
+        org=box.org,
+        client=box.client,
+        account="same",
+        account_type="Organization",
+        connected_by="someone",
+    )
+    pg_store.grant_repo(box.id, "same/repo")
+    pg_store.grant_repo(box.id, "same/other")
+
+    assert pg_store.may_spend_fleet_token(box.id, "same/repo")
+    assert not pg_store.may_spend_fleet_token(box.id, "same/other")

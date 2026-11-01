@@ -284,8 +284,11 @@ class GitHubApp:
         return self._installation_token(installation, {"repositories": [repository]})
 
     def repositories(self, installation: str) -> tuple[list[str], bool]:
-        """`owner/name` for what it covers, and whether there are more than these."""
-        token = self._installation_token(installation, {})
+        """`owner/name` for what it covers, and whether there are more than these.
+
+        The token only reads this list and is then dropped, so it can do nothing else.
+        """
+        token = self._installation_token(installation, {"permissions": {"metadata": "read"}})
         status, body = self._ask(
             "GET",
             f"{self.api_root}/installation/repositories?per_page={_REPOSITORIES_PER_PAGE}",
