@@ -17,6 +17,7 @@ from flotta.backends.standin import (
     INSTRUCTIONS_ENV,
     METHOD_NOT_FOUND,
     SESSION_NOT_FOUND,
+    UNKNOWN_CONFIG_KEY,
     build_app,
     credentials_from,
     seed_soul,
@@ -107,7 +108,8 @@ def test_the_stored_id_and_the_live_id_are_not_interchangeable(tmp_path):
             "result"
         ]
         assert resumed["session_id"] not in (created, stored["session_id"])
-        assert resumed["messages"][0] == {"role": "user", "text": "first"}
+        first = resumed["messages"][0]
+        assert (first["role"], first["text"]) == ("user", "first")
         _, events = await _turn(ws, 7, resumed["session_id"], "second")
         assert "message 2" in events[-1]["payload"]["text"]
 
@@ -281,9 +283,9 @@ def test_an_approval_is_asked_as_a_gateway_asks_and_the_answer_decides(
         messages = (await _call(ws, 4, "session.resume", {"session_id": stored}))["result"][
             "messages"
         ]
-        assert messages[-2:] == [
-            {"role": "user", "text": "!approve"},
-            {"role": "assistant", "text": reply},
+        assert [(m["role"], m["text"]) for m in messages[-2:]] == [
+            ("user", "!approve"),
+            ("assistant", reply),
         ]
 
     _run(test, tmp_path)
@@ -351,3 +353,165 @@ def test_it_says_which_model_it_was_started_with(tmp_path):
         assert "(set to run anthropic/claude-sonnet-4.5)" in events[-1]["payload"]["text"]
 
     _run(test, tmp_path, model="anthropic/claude-sonnet-4.5")
+
+
+def test_a_resumed_session_keeps_its_model_until_it_is_switched(tmp_path):
+    """FLOTTA-101: what Hermes does, and the page mistook for a finished change.
+
+    A restart gives a new model to new sessions. A resumed one reports and
+    answers on the model it had, until `config.set` moves it.
+    """
+    stored = {}
+
+    async def on_the_old_model(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        await _turn(ws, 2, live, "hello")
+        stored["id"] = (await _call(ws, 3, "session.most_recent"))["result"]["session_id"]
+
+    async def restarted_on_a_new_one(http):
+        ws = await _socket(http)
+        resumed = (await _call(ws, 1, "session.resume", {"session_id": stored["id"]}))["result"]
+        assert resumed["info"]["model"] == "old/model"
+        live = resumed["session_id"]
+        _, events = await _turn(ws, 2, live, "which?")
+        assert "(set to run old/model)" in events[-1]["payload"]["text"]
+
+        switched = await _call(
+            ws, 3, "config.set", {"session_id": live, "key": "model", "value": "new/model"}
+        )
+        assert switched["result"]["value"] == "new/model"
+        _, events = await _turn(ws, 4, live, "and now?")
+        assert "(set to run new/model)" in events[-1]["payload"]["text"]
+
+        fresh = (await _call(ws, 5, "session.create"))["result"]["session_id"]
+        _, events = await _turn(ws, 6, fresh, "hello")
+        assert "(set to run new/model)" in events[-1]["payload"]["text"]
+
+    async def and_the_switch_lasts(http):
+        ws = await _socket(http)
+        resumed = (await _call(ws, 1, "session.resume", {"session_id": stored["id"]}))["result"]
+        assert resumed["info"]["model"] == "new/model"
+
+    _run(on_the_old_model, tmp_path, model="old/model")
+    _run(restarted_on_a_new_one, tmp_path, model="new/model")
+    _run(and_the_switch_lasts, tmp_path, model="new/model")
+
+
+def _with_a_stored_session(tmp_path, test):
+    """`test(ws, live)` after a restart, on a session resumed from the old model."""
+    stored = {}
+
+    async def on_the_old_model(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        await _turn(ws, 2, live, "hello")
+        stored["id"] = (await _call(ws, 3, "session.most_recent"))["result"]["session_id"]
+
+    async def restarted(http):
+        ws = await _socket(http)
+        resumed = (await _call(ws, 1, "session.resume", {"session_id": stored["id"]}))["result"]
+        await test(ws, resumed["session_id"])
+
+    _run(on_the_old_model, tmp_path, model="old/model")
+    _run(restarted, tmp_path, model="new/model")
+
+
+async def _set_model(ws, rid, live, value):
+    """The reply to `config.set`, and the frames that came before it."""
+    params = {"session_id": live, "key": "model", "value": value}
+    await ws.send_str(
+        json.dumps({"jsonrpc": "2.0", "id": rid, "method": "config.set", "params": params})
+    )
+    before = []
+    while True:
+        frame = json.loads((await _receive(ws)).data)
+        if frame.get("id") == rid:
+            return frame, before
+        before.append(frame["params"])
+
+
+def test_a_provider_on_a_resume_with_no_agent_yet_moves_nothing(tmp_path):
+    """FLOTTA-101, from its review: the reply says success, and the agent stays."""
+
+    async def test(ws, live):
+        reply, before = await _set_model(ws, 1, live, "new/model --provider standin")
+        assert reply["result"]["value"] == "new/model"
+        assert before == []
+        _, events = await _turn(ws, 2, live, "which?")
+        assert "(set to run old/model)" in events[-1]["payload"]["text"]
+
+    _with_a_stored_session(tmp_path, test)
+
+
+def test_a_bare_model_waits_for_the_agent_and_says_it_moved(tmp_path):
+    async def test(ws, live):
+        reply, before = await _set_model(ws, 1, live, "new/model")
+        assert reply["result"]["value"] == "new/model"
+        assert [(e["type"], e["session_id"], e["payload"]) for e in before] == [
+            ("session.info", live, {"model": "old/model"}),
+            ("session.info", live, {"model": "new/model"}),
+        ]
+        _, events = await _turn(ws, 2, live, "which?")
+        assert "(set to run new/model)" in events[-1]["payload"]["text"]
+
+    _with_a_stored_session(tmp_path, test)
+
+
+def test_a_provider_moves_an_agent_that_exists(tmp_path):
+    async def test(ws, live):
+        await _turn(ws, 1, live, "builds it")
+        _, before = await _set_model(ws, 2, live, "new/model --provider standin")
+        assert [e["payload"] for e in before] == [{"model": "new/model"}]
+        _, events = await _turn(ws, 3, live, "which?")
+        assert "(set to run new/model)" in events[-1]["payload"]["text"]
+
+    _with_a_stored_session(tmp_path, test)
+
+
+def test_a_session_with_no_model_on_record_reports_none(tmp_path):
+    """Hermes's resume then has nothing to restore, so a client must not switch it."""
+    stored = {}
+
+    async def started_with_no_model(http):
+        ws = await _socket(http)
+        await _call(ws, 1, "session.create")
+        stored["id"] = (await _call(ws, 2, "session.most_recent"))["result"]["session_id"]
+
+    async def resumed_with_one(http):
+        ws = await _socket(http)
+        resumed = (await _call(ws, 1, "session.resume", {"session_id": stored["id"]}))["result"]
+        assert resumed["info"] == {"model": "", "provider": ""}
+
+    _run(started_with_no_model, tmp_path)
+    _run(resumed_with_one, tmp_path, model="new/model")
+
+
+def test_messages_carry_when_they_were_said(tmp_path):
+    """Hermes's do, and a page places a change of model among them by it."""
+
+    async def test(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        await _turn(ws, 2, live, "hello")
+        stored = (await _call(ws, 3, "session.most_recent"))["result"]["session_id"]
+        resumed = (await _call(ws, 4, "session.resume", {"session_id": stored}))["result"]
+        assert [type(m["timestamp"]) for m in resumed["messages"]] == [float, float]
+
+    _run(test, tmp_path)
+
+
+def test_only_the_model_can_be_set(tmp_path):
+    async def test(http):
+        ws = await _socket(http)
+        live = (await _call(ws, 1, "session.create"))["result"]["session_id"]
+        refused = await _call(
+            ws, 2, "config.set", {"session_id": live, "key": "yolo", "value": "1"}
+        )
+        assert refused["error"]["code"] == UNKNOWN_CONFIG_KEY
+        gone = await _call(
+            ws, 3, "config.set", {"session_id": "nope", "key": "model", "value": "m"}
+        )
+        assert gone["error"]["code"] == SESSION_NOT_FOUND
+
+    _run(test, tmp_path)

@@ -245,7 +245,8 @@ def test_the_whole_local_path_stays_on_the_machine(local_fleet, offline, caplog)
         with _conversation(door, ticket) as ws:
             stored = _rpc(ws, 1, "session.most_recent", {})["result"]["session_id"]
             resumed = _rpc(ws, 2, "session.resume", {"session_id": stored})["result"]
-            assert resumed["messages"][0] == {"role": "user", "text": "hi"}
+            first = resumed["messages"][0]
+            assert (first["role"], first["text"]) == ("user", "hi")
             reply, _ = _turn(ws, 3, resumed["session_id"], "still there?")
             assert "message 2" in reply["text"]
 

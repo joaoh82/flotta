@@ -14,7 +14,8 @@ and its replies are scripted.
   real box reads (`HERMES_DASHBOARD_BASIC_AUTH_*`), so a door holding the
   wrong password is refused here as it would be on Fly.
 - On the socket: `gateway.ready` first, then `session.create`,
-  `session.most_recent`, `session.resume` and `prompt.submit`. A turn streams
+  `session.most_recent`, `session.resume`, `config.set` for the model, and
+  `prompt.submit`. A turn streams
   `message.delta` events and ends with `message.complete`, and the submit's
   own reply is only an acknowledgement, as Hermes's is.
 
@@ -31,6 +32,18 @@ its system prompt once per session (FLOTTA-58). `SOUL.md` is seeded from
 `set_instructions` through `LocalBackend.exec`. Each session keeps the copy it
 started with and its replies quote it, so a client that resumes a session older
 than an edit can be seen doing so, for $0.
+
+**So is the model, until something switches it** (FLOTTA-101). A session keeps
+the model it started on across a restart, as Hermes's resume restores it, and
+only `config.set` moves it. A client that resumes without switching can be seen
+answering on the old model, for $0.
+
+**And `config.set` can answer success without moving it.** A resume answers
+before its agent exists, and Hermes's build then restores the stored model. Only
+a bare model waits for that build and switches the agent, announcing it in a
+`session.info`; `--provider` skips the wait, and what it writes the build ignores.
+Here an agent is unbuilt until something needs it, which is the longest that
+window can be, so a client that trusts the reply can be seen on the old model.
 
 Conversations are kept under `--home`, so stopping and starting the agent
 keeps them, as a real box's volume does. Live ids are not kept: like Hermes's,
@@ -69,6 +82,8 @@ TICKET_TTL_S = 30
 METHOD_NOT_FOUND = -32601
 #: What Hermes answers a `prompt.submit` naming a session it does not hold.
 SESSION_NOT_FOUND = 4001
+#: What Hermes's `config.set` answers a key it has no setter for.
+UNKNOWN_CONFIG_KEY = 4002
 
 
 def reply_to(
@@ -79,8 +94,8 @@ def reply_to(
     The turn number is what shows a conversation was kept: ask again after the
     agent has slept and the count carries on. `soul` is the instructions this
     session started with; their first line shows which ones it is following.
-    `model` is the one it was started with, which it never calls: it shows
-    that a change of model reached the agent (FLOTTA-85).
+    `model` is the one this session is on, which it never calls: it shows
+    whether a change of model reached the conversation (FLOTTA-85, FLOTTA-101).
     """
     said = f"This is {name}, a local stand-in with no model"
     if model:
@@ -145,6 +160,8 @@ class Agent:
         self.tickets: dict[str, float] = {}
         #: live id -> stored id. Per process, as Hermes's are.
         self.live: dict[str, str] = {}
+        # Resumed, with no agent built yet: see the module docstring.
+        self.unbuilt: set[str] = set()
         #: An approval asked and not yet answered: its request id -> (live id, stored id).
         self.asked: dict[str, tuple[str, str]] = {}
 
@@ -171,6 +188,11 @@ class Agent:
     def attach(self, stored_id: str) -> str:
         live_id = f"live-{secrets.token_hex(6)}"
         self.live[live_id] = stored_id
+        return live_id
+
+    def resume(self, stored_id: str) -> str:
+        live_id = self.attach(stored_id)
+        self.unbuilt.add(live_id)
         return live_id
 
     # -- the handshake ----------------------------------------------------------
@@ -231,6 +253,10 @@ def _event(kind: str, payload: dict[str, Any], session_id: str | None = None) ->
     if session_id is not None:
         params["session_id"] = session_id
     return json.dumps({"jsonrpc": "2.0", "method": "event", "params": params})
+
+
+def _session_info(model: str | None, live_id: str) -> str:
+    return _event("session.info", {"model": model or ""}, live_id)
 
 
 def _result(rid: Any, result: dict[str, Any]) -> str:
@@ -304,7 +330,9 @@ def _finish(agent: Agent, stored_id: str, live_id: str, answer: str) -> list[str
     """End a turn with `answer`, kept in the conversation."""
     sessions = agent.load()
     if stored_id in sessions:
-        sessions[stored_id]["messages"].append({"role": "assistant", "text": answer})
+        sessions[stored_id]["messages"].append(
+            {"role": "assistant", "text": answer, "timestamp": time.time()}
+        )
         agent.save(sessions)
     return [
         *_streamed(answer, live_id),
@@ -341,6 +369,8 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             "messages": [],
             # Fixed now, as a real session's system prompt is.
             "soul": agent.read_soul(),
+            # Kept with the session, as Hermes keeps it in the session's row.
+            "model": agent.model,
         }
         agent.save(sessions)
         return [_result(rid, {"session_id": agent.attach(stored_id)})]
@@ -364,21 +394,47 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             _result(
                 rid,
                 {
-                    "session_id": agent.attach(stored_id),
+                    "session_id": agent.resume(stored_id),
                     "resumed": stored_id,
                     "messages": sessions[stored_id]["messages"],
+                    "info": {
+                        "model": sessions[stored_id].get("model") or "",
+                        "provider": "standin" if sessions[stored_id].get("model") else "",
+                    },
                 },
             )
         ]
+
+    if method == "config.set":
+        if params.get("key") != "model":
+            return [_error(rid, UNKNOWN_CONFIG_KEY, f"unknown config key: {params.get('key')}")]
+        live_id = str(params.get("session_id") or "")
+        stored_id = agent.live.get(live_id)
+        if stored_id is None or stored_id not in sessions:
+            return [_error(rid, SESSION_NOT_FOUND, f"session not found: {live_id}")]
+        # `<model> --provider <name>`, as Hermes reads it.
+        value = str(params.get("value") or "")
+        model = value.split(" --")[0].strip()
+        reply = _result(rid, {"key": "model", "value": model, "scope": "session"})
+        built = live_id not in agent.unbuilt
+        if not built and " --provider " in value:
+            return [reply]
+        agent.unbuilt.discard(live_id)
+        # A build announces the model it restored, and the switch then its own.
+        announced = [] if built else [_session_info(sessions[stored_id].get("model"), live_id)]
+        sessions[stored_id]["model"] = model
+        agent.save(sessions)
+        return [*announced, _session_info(model, live_id), reply]
 
     if method == "prompt.submit":
         live_id = str(params.get("session_id") or "")
         stored_id = agent.live.get(live_id)
         if stored_id is None or stored_id not in sessions:
             return [_error(rid, SESSION_NOT_FOUND, f"session not found: {live_id}")]
+        agent.unbuilt.discard(live_id)
         text = str(params.get("text") or "")
         messages = sessions[stored_id]["messages"]
-        messages.append({"role": "user", "text": text})
+        messages.append({"role": "user", "text": text, "timestamp": time.time()})
         turn = sum(1 for m in messages if m["role"] == "user")
         agent.save(sessions)
         started = [_result(rid, {"status": "submitted"}), _event("message.start", {}, live_id)]
@@ -425,7 +481,9 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
                     name=agent.name,
                     turn=turn,
                     soul=sessions[stored_id].get("soul"),
-                    model=agent.model,
+                    # None on record: Hermes's resume restores nothing, and the
+                    # session runs what the config says.
+                    model=sessions[stored_id].get("model") or agent.model,
                 ),
             ),
         ]

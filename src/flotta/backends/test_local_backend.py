@@ -111,7 +111,8 @@ def test_its_conversations_survive_sleep(backend, tmp_path):
 
     stored = json.loads((tmp_path / "boxes" / "eng-a" / "hermes" / "sessions.json").read_text())
     (conversation,) = stored.values()
-    assert conversation["messages"][0] == {"role": "user", "text": "remember this"}
+    first = conversation["messages"][0]
+    assert (first["role"], first["text"]) == ("user", "remember this")
 
 
 def test_stopping_an_agent_ends_the_conversations_open_on_it(backend):
