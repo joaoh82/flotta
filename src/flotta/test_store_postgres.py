@@ -140,3 +140,48 @@ def test_a_link_clicked_twice_at_once_signs_in_once(pg_store):
     assert sorted(outcomes) == ["LookupError", "created"], (
         f"expected exactly one redemption, got {outcomes} — a link can sign in twice"
     )
+
+
+def test_two_agencies_claiming_one_installation_at_once_leaves_one_owner(pg_store):
+    """FLOTTA-22: `connect_github` rests on the primary key, not on a read before it."""
+    from flotta.store import GitHubAlreadyConnectedError
+
+    for org in ("agency-a", "agency-b"):
+        pg_store.create_org(org, org)
+    orgs = ("agency-a", "agency-b")
+
+    def claim(fleet, i):
+        fleet.connect_github(
+            "77",
+            org=orgs[i],
+            client=None,
+            account="acme",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+    outcomes = _race(pg_store, claim)
+
+    assert sorted(outcomes) == [GitHubAlreadyConnectedError.__name__, "created"], outcomes
+    held = [*pg_store.github_installations("agency-a"), *pg_store.github_installations("agency-b")]
+    assert len(held) == 1
+
+
+def test_a_clients_installation_comes_before_its_orgs_on_postgres(pg_store):
+    """`ORDER BY client IS NULL` sorts booleans there, where SQLite sorts integers."""
+    pg_store.create_org("agency-a", "agency-a")
+    pg_store.create_client("agency-a", "acme", "Acme")
+    for number, client in (("1", None), ("2", "acme")):
+        pg_store.connect_github(
+            number,
+            org="agency-a",
+            client=client,
+            account="same",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+    found = pg_store.github_installation_for("agency-a", "acme", "same/repo")
+    assert found is not None and found.installation_id == "2"
+    other = pg_store.github_installation_for("agency-a", "beta", "same/repo")
+    assert other is not None and other.installation_id == "1"

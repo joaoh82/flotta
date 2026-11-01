@@ -884,6 +884,16 @@ def test_another_orgs_owner_cannot_disconnect_it_or_remove_it_from_github(api, f
     assert len(_connections(fleet)) == 1
 
 
+def test_the_store_will_not_forget_another_orgs_installation(api, fleet):
+    """The route looks first, but this is where a forgotten check would become a delete."""
+    _connect(api)
+    with FleetStore(fleet) as store:
+        assert store.disconnect_github("agency-y", "77") is False
+        assert [i.org for i in store.github_installations("agency-x")] == ["agency-x"]
+        assert store.disconnect_github("agency-x", "77") is True
+        assert store.github_installations("agency-x") == []
+
+
 def test_a_grant_stops_being_listed_on_disconnect_and_returns_on_reconnect(api, fleet, github):
     """Named while it could not mint, it would be a repository the agent is refused."""
     _connect(api)

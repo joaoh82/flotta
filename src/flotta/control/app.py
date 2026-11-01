@@ -3665,8 +3665,8 @@ def create_app(
                 if not store.may_use_repo(box.id, repo):
                     raise HTTPException(
                         status_code=403,
-                        detail=f"box {box.name!r} is not granted {repo!r}. "
-                        f"Grant it with `flotta repo grant {box.name} {repo}`.",
+                        detail=f"box {box.name!r} is not granted {repo!r}. Grant it on the "
+                        f"agent's page, or with `flotta repo grant {box.name} {repo}`.",
                     )
                 repo = normalise_repo(repo)
             except ValueError as exc:
