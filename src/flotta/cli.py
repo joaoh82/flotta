@@ -2149,12 +2149,22 @@ def _set_model(box_id: str, model: str | None, as_json: bool) -> None:
             f"/api/boxes/{box['id']}/model",
             scopes=(SCOPE_FLEET_WRITE,),
             body={"model": model},
-            # A running agent restarts before this answers.
+            # A control plane from before FLOTTA-99 answers after the restart.
             timeout_s=180.0,
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     whose = "its own" if body["source"] == "agent" else "the fleet default"
+    if body.get("started"):
+        # Accepted, not done: the restart happens on the control plane's
+        # thread, and saying "now runs" here would be the lie FLOTTA-99 fixed.
+        emit(
+            body,
+            f"{body['name']} is switching to {body['model']} ({whose}). A running agent "
+            "restarts to take it; its timeline says how it went.",
+            as_json=as_json,
+        )
+        return
     emit(body, f"{body['name']} now runs {body['model']} ({whose})", as_json=as_json)
 
 

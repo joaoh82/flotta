@@ -3152,7 +3152,8 @@ def test_an_agent_reset_to_the_default_reports_the_one_it_was_given(client, flee
 
 
 def test_an_agent_with_no_record_of_its_model_is_reported_on_the_default(client, monkeypatch):
-    """Older than FLOTTA-39's events: the default is the best there is."""
+    """Older than FLOTTA-39's events: the environment's default is the best
+    there is (FLOTTA-99 — never a default stored after it was made)."""
     monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
     row = client.get("/api/boxes/eng-a").json()["box"]
     assert (row["model"], row["model_source"]) == ("z-ai/glm-5.2", "fleet")
@@ -3193,6 +3194,7 @@ def test_a_null_model_resets_to_the_fleet_default(client, monkeypatch):
         return {"box_id": box_id, "name": "eng-a", "model": "z-ai/glm-5.2", "source": "fleet"}
 
     monkeypatch.setattr(provision, "set_model", fake_set)
+    monkeypatch.setenv("FLOTTA_MODEL", "z-ai/glm-5.2")
     assert client.put("/api/boxes/eng-a/model", json={"model": None}).status_code == 200
     assert called["model"] is None
 
