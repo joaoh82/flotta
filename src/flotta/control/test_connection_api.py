@@ -84,6 +84,7 @@ def test_a_repair_answers_at_once_and_runs_on_a_thread(fleet, repairs, monkeypat
     """A running agent restarts twice, and the web app gives a call ten
     seconds: answering after the work is how a success arrives as a failure."""
     monkeypatch.setenv("FLOTTA_CONTROL_URL", HERE)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
     with _api(fleet, background=True) as api:
         response = api.post("/api/boxes/eng-d/connection", headers=WRITER)
         assert response.status_code == 202, response.text
@@ -101,6 +102,18 @@ def test_a_repair_is_refused_when_this_control_plane_has_no_address(fleet, repai
         response = api.post("/api/boxes/eng-d/connection", headers=WRITER)
     assert response.status_code == 409
     assert "FLOTTA_CONTROL_URL" in response.json()["detail"]
+    assert repairs == []
+
+
+def test_a_repair_is_refused_when_no_token_could_be_issued(fleet, repairs, monkeypatch):
+    """Refused before the thread starts: the repair would rewrite and restart
+    the machine, then fail at the token it cannot mint."""
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", HERE)
+    monkeypatch.delenv("FLOTTA_SIGNING_KEY", raising=False)
+    with _api(fleet, background=True) as api:
+        response = api.post("/api/boxes/eng-d/connection", headers=WRITER)
+    assert response.status_code == 409
+    assert "FLOTTA_SIGNING_KEY" in response.json()["detail"]
     assert repairs == []
 
 

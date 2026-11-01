@@ -80,6 +80,7 @@ def substrate(monkeypatch):
     monkeypatch.setattr(provision, "upgrade_box", upgrade_box)
     monkeypatch.setattr(provision, "repair_connection", repair_connection)
     monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
     monkeypatch.setattr(backend_mod, "backend_for", lambda endpoint: Fake())
     return calls
 

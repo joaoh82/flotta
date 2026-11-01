@@ -36,9 +36,10 @@ class Machine:
 
     scheme = "fake"
 
-    def __init__(self, env=None, *, env_fails=False):
+    def __init__(self, env=None, *, env_fails=False, secrets_fail=False):
         self.env = dict(env or {})
         self.env_fails = env_fails
+        self.secrets_fail = secrets_fail
         self.calls: list[tuple[str, object]] = []
 
     def inspect(self, box_id):
@@ -56,6 +57,8 @@ class Machine:
 
     def apply_secrets(self, box_id, secrets):
         self.calls.append(("apply_secrets", sorted(secrets)))
+        if self.secrets_fail:
+            raise BackendError("secrets import timed out")
         self.secrets = dict(secrets)
 
 
@@ -155,6 +158,37 @@ def test_a_control_plane_that_does_not_know_its_address_refuses_to_guess(store, 
     with pytest.raises(ProvisionError, match="FLOTTA_CONTROL_URL"):
         repair_connection(box.id, store=store, backend=machine)
     assert machine.calls == []
+
+
+def test_no_signing_key_refuses_before_the_machine_is_touched(store, box, monkeypatch):
+    """The token step would refuse anyway — after the environment had been
+    rewritten and a running agent restarted for it."""
+    from flotta.provision import ProvisionError, repair_connection
+
+    monkeypatch.delenv("FLOTTA_SIGNING_KEY", raising=False)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", HERE)
+    machine = Machine({"FLOTTA_CONTROL_URL": RAILWAY})
+
+    with pytest.raises(ProvisionError, match="FLOTTA_SIGNING_KEY"):
+        repair_connection(box.id, store=store, backend=machine)
+    assert machine.calls == []
+
+
+def test_a_failed_token_after_a_rewrite_says_the_address_was_fixed(store, box, monkeypatch):
+    """The token step's own error says "unchanged" about the token; without
+    `rewrote` the timeline reads as a machine nothing happened to."""
+    from flotta.provision import CONNECTION_REPAIR_FAILED, UpgradeFailed, repair_connection
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", HERE)
+    machine = Machine({"FLOTTA_CONTROL_URL": RAILWAY, "FLOTTA_BOX_ID": box.id}, secrets_fail=True)
+
+    with pytest.raises(UpgradeFailed):
+        repair_connection(box.id, store=store, backend=machine)
+    assert machine.env["FLOTTA_CONTROL_URL"] == HERE
+    failed = [e for e in store.get_events("box", box.id) if e.type == CONNECTION_REPAIR_FAILED]
+    assert failed[-1].payload["step"] == "token"
+    assert failed[-1].payload["rewrote"] == ["FLOTTA_BOX_NAME", "FLOTTA_CONTROL_URL"]
 
 
 def test_a_failed_rewrite_says_so_and_issues_no_token(store, box, monkeypatch):

@@ -2824,6 +2824,7 @@ def create_app(
         """
         from fastapi.responses import JSONResponse
 
+        from flotta.auth import resolve_signing_key
         from flotta.provision import ProvisionError, UpgradeFailed, repair_connection
 
         store = store_factory()
@@ -2840,6 +2841,14 @@ def create_app(
                     detail=(
                         "this control plane does not know its own address. Set "
                         "$FLOTTA_CONTROL_URL where it runs, then repair again."
+                    ),
+                )
+            if not resolve_signing_key():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "no signing key is configured, so there is no identity to issue. "
+                        "Set $FLOTTA_SIGNING_KEY where the control plane runs."
                     ),
                 )
             if not background:

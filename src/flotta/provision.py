@@ -1658,6 +1658,15 @@ def repair_connection(
             "this control plane does not know its own address. Set $FLOTTA_CONTROL_URL "
             "where it runs, then repair again."
         )
+    from flotta.auth import resolve_signing_key
+
+    if not resolve_signing_key():
+        # Checked before the machine is touched: the token step would refuse
+        # after the environment had already been rewritten and restarted.
+        raise ProvisionError(
+            "no signing key is configured, so there is no identity to issue. Set "
+            "$FLOTTA_SIGNING_KEY where the control plane runs, then repair again."
+        )
 
     impl = _resolve_backend(box, backend)
     try:
@@ -1700,8 +1709,13 @@ def repair_connection(
     try:
         identity = rotate_identity(box.id, store=store, backend=impl, reason="connection repair")
     except (UpgradeFailed, ProvisionError) as exc:
+        # The environment step has already happened by now, so say what it
+        # rewrote: "unchanged" in the token step's error is about the token.
         store.add_event(
-            "box", box.id, CONNECTION_REPAIR_FAILED, {"error": str(exc)[:400], "step": "token"}
+            "box",
+            box.id,
+            CONNECTION_REPAIR_FAILED,
+            {"error": str(exc)[:400], "step": "token", "rewrote": sorted(changed)},
         )
         raise
 
