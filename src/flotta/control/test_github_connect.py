@@ -62,9 +62,14 @@ class FakeGitHub:
         }
         #: A code proves a person: their login, and what they are an owner of.
         self.people = {
-            "owner-code": {"login": "olivia", "admin_of": {"acme-gh", "beta-gh"}},
-            "collaborator-code": {"login": "colin", "admin_of": set()},
-            "solo-code": {"login": "solo", "admin_of": set()},
+            "owner-code": {
+                "login": "olivia",
+                "id": 4242,
+                "name": "Olivia Owner",
+                "admin_of": {"acme-gh", "beta-gh"},
+            },
+            "collaborator-code": {"login": "colin", "id": 4343, "name": None, "admin_of": set()},
+            "solo-code": {"login": "solo", "id": 4444, "name": None, "admin_of": set()},
         }
         self.issued = []
         self.removed = []
@@ -104,7 +109,7 @@ class FakeGitHub:
 
     def _as_person(self, path, person):
         if path == "/user":
-            return 200, {"login": person["login"]}
+            return 200, {"login": person["login"], "id": person["id"], "name": person["name"]}
         org = path.removeprefix("/user/memberships/orgs/").lower()
         if org in person["admin_of"]:
             return 200, {"state": "active", "role": "admin"}
@@ -293,6 +298,22 @@ def test_an_owner_connects_an_account_for_the_whole_agency(api, fleet):
     [held] = _connections(fleet)
     assert (held.installation_id, held.client) == ("77", None)
     assert held.connected_by == "person-olivia"
+
+
+def test_the_person_who_connected_is_kept_as_who_its_agents_commit_as(api, fleet):
+    """FLOTTA-105: GitHub vouched for this person, so their agents' commits
+    carry the address GitHub issues for them, and the page says so."""
+    assert _connect(api).status_code == 200
+    [held] = _connections(fleet)
+    assert (held.connected_login, held.connected_user_id, held.connected_name) == (
+        "olivia",
+        "4242",
+        "Olivia Owner",
+    )
+    assert held.author == ("Olivia Owner", "4242+olivia@users.noreply.github.com")
+
+    listed = api.get("/api/orgs/agency-x/github", headers=_owner()).json()["connections"]
+    assert [c["commits_as"] for c in listed] == ["olivia"]
 
 
 def test_an_owner_connects_an_account_for_one_client(api, fleet):

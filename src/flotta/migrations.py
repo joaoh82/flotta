@@ -363,6 +363,23 @@ def _budgets() -> tuple[str, ...]:
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
 _NOW_POSTGRES = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00'"
 
+
+def _connected_person() -> tuple[str, ...]:
+    """Who connected a GitHub account, as GitHub knows them (FLOTTA-105).
+
+    Their agents author commits as `<id>+<login>@users.noreply.github.com`,
+    the address GitHub attributes to the account, so a deploy that checks the
+    author (Vercel does) sees a member of the team and not a box. All three
+    are nullable: a row from before this knows nobody, and its agents commit
+    as themselves, exactly as before.
+    """
+    return (
+        "ALTER TABLE github_installations ADD COLUMN connected_login TEXT",
+        "ALTER TABLE github_installations ADD COLUMN connected_user_id TEXT",
+        "ALTER TABLE github_installations ADD COLUMN connected_name TEXT",
+    )
+
+
 #: Every migration, in order. Append only.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
@@ -405,6 +422,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         8,
         "budgets: limits on spend per org, client or agent",
         _budgets(),
+    ),
+    Migration(
+        9,
+        "connected person: who connected a GitHub account, whom its agents commit as",
+        _connected_person(),
     ),
 )
 

@@ -16,6 +16,7 @@ no `flyctl`.
 from __future__ import annotations
 
 import importlib
+import os
 import pathlib
 import re
 
@@ -404,3 +405,98 @@ def test_fly_auth_sends_the_first_machine_its_own_login_and_nothing_else():
     for line in sends:
         assert line.startswith("uv run python -m flotta.fleet_key bootstrap |"), line
     assert "FLOTTA_BOX_PASSWORD" not in body
+
+
+def _author_block() -> str:
+    body = _ENTRYPOINT.read_text(encoding="utf-8")
+    start = body.index('if [ -n "${FLOTTA_GIT_AUTHOR_EMAIL:-}" ]; then')
+    return body[start : body.index("fi\n", start) + 3]
+
+
+def test_the_entrypoint_sets_the_author_and_leaves_the_committer_the_box(tmp_path):
+    """The author block as written, under `set -euo pipefail`, against a temp
+    HOME: a person named by the control plane becomes `author.*`, `user.*` is
+    untouched, and with nobody named `author.*` is unset rather than left over
+    (FLOTTA-105)."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("no git on this host")
+    home = tmp_path / "home"
+    home.mkdir()
+    base = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+    def run(env):
+        subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", _author_block()],
+            env={**base, **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def configured(key):
+        out = subprocess.run(
+            ["git", "config", "--global", "--get", key], env=base, capture_output=True, text=True
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    subprocess.run(
+        ["git", "config", "--global", "user.email", "eng-a@flotta.dev"], env=base, check=True
+    )
+
+    run(
+        {
+            "FLOTTA_GIT_AUTHOR_NAME": "João Henrique",
+            "FLOTTA_GIT_AUTHOR_EMAIL": "208517+joaoh82@users.noreply.github.com",
+        }
+    )
+    assert configured("author.name") == "João Henrique"
+    assert configured("author.email") == "208517+joaoh82@users.noreply.github.com"
+    assert configured("user.email") == "eng-a@flotta.dev", "the committer must stay the box"
+
+    run({"FLOTTA_GIT_AUTHOR_EMAIL": "7+josh@users.noreply.github.com"})
+    assert configured("author.name") == "7+josh@users.noreply.github.com", (
+        "a missing name is the address"
+    )
+
+    run({})
+    assert configured("author.name") is None
+    assert configured("author.email") is None
+    assert configured("user.email") == "eng-a@flotta.dev"
+
+
+def test_git_honours_a_configured_author_over_the_committer(tmp_path):
+    """The property the whole arrangement rests on: with `author.*` and
+    `user.*` set, a commit's author is the person and its committer the box."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("no git on this host")
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, env=env, check=True, capture_output=True, text=True
+        ).stdout
+
+    for key, value in {
+        "user.name": "eng-a",
+        "user.email": "eng-a@flotta.dev",
+        "author.name": "João Henrique",
+        "author.email": "208517+joaoh82@users.noreply.github.com",
+    }.items():
+        subprocess.run(["git", "config", "--global", key, value], env=env, check=True)
+    git("init", "-q")
+    (repo / "README").write_text("hi\n")
+    git("add", "README")
+    git("commit", "-q", "-m", "test")
+    assert git("log", "-1", "--format=%an <%ae>|%cn <%ce>").strip() == (
+        "João Henrique <208517+joaoh82@users.noreply.github.com>|eng-a <eng-a@flotta.dev>"
+    )

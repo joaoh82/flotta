@@ -4,7 +4,9 @@ Hermetic: every case injects `fetch`, so nothing here touches the network —
 the same discipline every Fly touchpoint follows.
 """
 
-from flotta.github import API_ROOT, repo_reachable
+import pytest
+
+from flotta.github import API_ROOT, Person, repo_reachable, token_owner
 
 
 def _answers(status, seen=None):
@@ -87,3 +89,56 @@ def test_nothing_but_a_status_code_comes_back():
     from flotta.github import _httpx_get
 
     assert inspect.signature(_httpx_get).return_annotation == "int"
+
+
+# -- whose token this is (FLOTTA-105) ---------------------------------------------
+
+
+def _user(status, body, seen=None):
+    def fetch(url, *, headers, timeout_s):
+        if seen is not None:
+            seen.append((url, headers))
+        return status, body
+
+    return fetch
+
+
+def test_the_tokens_owner_is_the_person_github_names():
+    seen = []
+    who = token_owner(
+        "github_pat_x", fetch=_user(200, {"login": "joaoh82", "id": 208517, "name": "João"}, seen)
+    )
+    assert who == Person(login="joaoh82", id="208517", name="João")
+    assert who.commit_email == "208517+joaoh82@users.noreply.github.com"
+    assert who.commit_name == "João"
+    assert seen[0][0] == f"{API_ROOT}/user"
+    assert seen[0][1]["Authorization"] == "Bearer github_pat_x"
+
+
+def test_a_name_github_does_not_have_falls_back_to_the_login():
+    who = token_owner("t", fetch=_user(200, {"login": "joaoh82", "id": 208517, "name": None}))
+    assert who.commit_name == "joaoh82"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [(401, {"message": "Bad credentials"}), (200, {"login": "x"}), (200, {}), (500, None)],
+    ids=["refused", "no-id", "empty", "broken"],
+)
+def test_an_answer_that_names_nobody_is_nobody(answer):
+    assert token_owner("t", fetch=_user(*answer)) is None
+
+
+def test_github_being_unreachable_is_nobody_rather_than_an_error():
+    def fetch(url, *, headers, timeout_s):
+        raise OSError("no route")
+
+    assert token_owner("t", fetch=fetch) is None
+
+
+def test_no_token_asks_nothing():
+    def fetch(url, *, headers, timeout_s):
+        raise AssertionError("asked GitHub with no token")
+
+    assert token_owner("", fetch=fetch) is None
+    assert token_owner(None, fetch=fetch) is None
