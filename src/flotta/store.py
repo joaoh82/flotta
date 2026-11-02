@@ -65,6 +65,7 @@ from typing import Any, Literal
 
 from flotta import address, db, migrations
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
+from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import Price, cost_nano, to_eur_nano
 
@@ -529,16 +530,24 @@ class GitHubInstallation:
     connected_name: str | None = None
 
     @property
+    def person(self) -> Person | None:
+        """Who connected this account, or None when nobody is recorded."""
+        if not self.connected_login or not self.connected_user_id:
+            return None
+        return Person(self.connected_login, self.connected_user_id, self.connected_name)
+
+    @property
     def author(self) -> tuple[str, str] | None:
         """`(name, email)` for a commit, or None when nobody is recorded.
 
-        The address is the one GitHub issues for the account, so GitHub links
-        the commit to the person and a deploy that checks the author passes.
+        The address is the one GitHub issues for the account (`Person` spells
+        it), so GitHub links the commit to the person and a deploy that checks
+        the author passes.
         """
-        if not self.connected_login or not self.connected_user_id:
+        person = self.person
+        if person is None:
             return None
-        name = (self.connected_name or "").strip() or self.connected_login
-        return name, f"{self.connected_user_id}+{self.connected_login}@users.noreply.github.com"
+        return person.commit_name, person.commit_email
 
 
 @dataclass(frozen=True, slots=True)
@@ -2562,8 +2571,9 @@ class FleetStore:
         see `flotta.github_app`. Who they are on GitHub (`connected_login`,
         `connected_user_id`, `connected_name`) is kept so the account's agents
         can commit as them (FLOTTA-105), and **the latest proof wins**: a scope
-        connected again by somebody else moves its agents' commits onto that
-        person, who is the one GitHub has most recently vouched for.
+        connected again by somebody else names that person, the one GitHub has
+        most recently vouched for, as the author for every box created from
+        then on. A box that already exists keeps the name in its machine env.
 
         It also replaces any other installation this org recorded for that
         account. GitHub keeps one installation of an App per account, so with this

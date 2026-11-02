@@ -75,6 +75,7 @@ from flotta.backend import (
 )
 from flotta.backend import backend_for as _backend_for
 from flotta.backend import pause as _pause
+from flotta.github import GITHUB_TOKEN_ENV
 from flotta.store import (
     INSTRUCTIONS_CHANGED,
     Box,
@@ -563,16 +564,27 @@ def build_identity(
 # had connected the account, with the committer still the box.
 #
 # So the author is a person and the committer is the box. The person is
-# whoever connected the GitHub account the box's repositories come from —
-# GitHub vouched for them at connect time, and `<id>+<login>@users.noreply`
-# is the address GitHub issues for the account — or, for the operator's own
-# agents on `$FLOTTA_GITHUB_TOKEN`, whose token that is. One author per box,
-# chosen in the order the credential is (its client's account, then its
-# org's, then the fleet token), and set when the machine is made.
+# whoever connected the GitHub account the box's client uses — GitHub vouched
+# for them at connect time, and `<id>+<login>@users.noreply` is the address
+# GitHub issues for the account — or, for the operator's own agents on
+# `$FLOTTA_GITHUB_TOKEN`, whose token that is.
+#
+# One author per box, not per repository, and that is a limit worth knowing:
+# the credential is picked by the repository's owner (`github_installation_for`),
+# the author is not. The nearest connection decides — the client's own account
+# if it connected one, else its org's, else the fleet token — and a box with
+# repositories from two accounts commits to both as the one person. A
+# connection that names nobody (made before migration 9) is not passed over
+# for somebody further out: a client's commits do not carry its agency's or
+# the operator's name because its own account predates this. It names nobody
+# until it is connected again, and the GitHub page says so. (`includeIf
+# "hasconfig:remote.*.url:…"` could set an author per owner if it ever has to.)
+#
+# Set when the machine is made, so connecting again or disconnecting reaches
+# only boxes created afterwards until a box's env is refreshed.
 
 GIT_AUTHOR_NAME_ENV = "FLOTTA_GIT_AUTHOR_NAME"
 GIT_AUTHOR_EMAIL_ENV = "FLOTTA_GIT_AUTHOR_EMAIL"
-GITHUB_TOKEN_ENV = "FLOTTA_GITHUB_TOKEN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,21 +610,30 @@ def commit_author_for(
 ) -> CommitAuthor | None:
     """Whom a box in `org`'s `client` should author its commits as, or None.
 
-    None means nobody connected GitHub for this client or org and the fleet
-    token is either not theirs to use or names nobody; the box then commits
-    as itself, as every box did before this.
+    None means the nearest GitHub connection names nobody, or there is none
+    and the fleet token is either not theirs to use or names nobody; the box
+    then commits as itself, as every box did before this.
     """
-    for installation in store.github_installations_for(org, client):
-        who = installation.author
-        if who is not None:
-            assert installation.connected_login is not None
-            return CommitAuthor(who[0], who[1], installation.connected_login, "github_app")
+    connections = store.github_installations_for(org, client)
+    if connections:
+        # The client's own connections if it has any, else the org's: never
+        # a wider tenant's name on a narrower one's commits.
+        nearest = connections[0].client
+        for installation in connections:
+            if installation.client != nearest:
+                break
+            person = installation.person
+            if person is not None:
+                return CommitAuthor(
+                    person.commit_name, person.commit_email, person.login, "github_app"
+                )
+        return None
     if not reaches_fleet_github(org):
         return None
     token = (env.get(GITHUB_TOKEN_ENV) or "").strip()
     if not token:
         return None
-    from flotta.github import token_owner
+    from flotta.github import token_owner  # at call time, so a test can stand in for it
 
     person = _FLEET_TOKEN_OWNERS.get(token)
     if person is None:

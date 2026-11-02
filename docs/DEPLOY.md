@@ -497,8 +497,21 @@ issues for that account (`<id>+<login>@users.noreply.github.com`). GitHub shows
 "authored by you, committed by the box", and a deploy service that checks the
 author against its team (Vercel does, with no way to turn it off) sees a member
 rather than a stranger. Agencies get the same from step 7d, with the person who
-connected the account. A box created before the PAT was set, or before this
-existed, keeps committing as itself: recreate it, or update its machine env.
+connected the account.
+
+**The author is set once, when the box is created.** A box created before the
+PAT was set, or before this existed, keeps committing as itself until it is
+recreated or its machine env is updated:
+
+```bash
+flyctl machine update <machine> -a <box app> \
+  --env FLOTTA_GIT_AUTHOR_NAME='<name>' \
+  --env FLOTTA_GIT_AUTHOR_EMAIL='<id>+<login>@users.noreply.github.com'
+```
+
+The same goes for a PAT that changes hands. The box image has to carry the
+entrypoint from FLOTTA-105 as well: an older image receives the env and reads
+none of it.
 
 ### 7b. Load the identity onto the box, and grant it repositories
 
@@ -649,12 +662,28 @@ has to make someone one while connecting.
 
 **And whoever connects it is whom its agents commit as.** The `/user` call that
 proves ownership also says who the person is, and that is kept with the
-installation: a box whose repositories come from this account authors its
-commits as them, at the address GitHub issues for their account, while the box
-stays the committer (FLOTTA-105; step 7a says why). The GitHub page shows it as
-"commits as". Connecting the same scope again as somebody else moves the
-agents' commits onto that person. A box picks its author when it is created,
-from its client's account first, then its agency's.
+installation: a box created for this client authors its commits as them, at
+the address GitHub issues for their account, while the box stays the committer
+(FLOTTA-105; step 7a says why). `GET /api/orgs/{org}/github` reports it as
+`commits_as` on each connection. A box picks one author when it is created,
+from its client's own account if it connected one, else its agency's, for
+every repository it works on.
+
+**Upgrading from before FLOTTA-105.** An account connected before it names
+nobody: `commits_as` is null, and its agents commit as themselves even when
+recreated, since a client's own connection is never passed over for its
+agency's or the operator's name. Connect the account again, as the person
+whose name the commits should carry (step 7d's "Redirect on update" lets the
+same installation be claimed again), and *then* recreate the box or update its
+machine env as in 7a.
+
+**What a reconnect or a disconnect does not do.** Both reach only boxes
+created afterwards. Connecting the same scope again as somebody else names
+that person for new boxes; disconnecting ends the grants at once, but a
+running box keeps the name in its env and anything it commits afterwards is
+still authored as the person who left. Until there is a verb for refreshing a
+box's identity, recreating the box or updating its machine env is the remedy,
+and only the operator can do the second.
 
 ## Step 8 — A second agency (M11.7)
 

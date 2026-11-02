@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from flotta.github import API_ROOT, Person, person_from
+from flotta.github import API_HEADERS, API_ROOT, Person, person_from
 
 WEB_ROOT = "https://github.com"
 
@@ -76,11 +76,6 @@ DEFAULT_TIMEOUT_S = 5.0
 
 #: Separates a state's signature from a token's, which share the signing key.
 _STATE_DOMAIN = b"flotta-github-state\0"
-
-_API_HEADERS = {
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
 
 
 class GitHubAppError(Exception):
@@ -263,7 +258,7 @@ class GitHubApp:
         then: the person's identity is kept, and a stranger's is not worth a
         call.
         """
-        headers = {**_API_HEADERS, "Authorization": f"Bearer {user_token}"}
+        headers = {**API_HEADERS, "Authorization": f"Bearer {user_token}"}
         if account.type == "Organization":
             status, body = self._ask(
                 "GET",
@@ -316,7 +311,7 @@ class GitHubApp:
         status, body = self._ask(
             "GET",
             f"{self.api_root}/installation/repositories?per_page={_REPOSITORIES_PER_PAGE}",
-            headers={**_API_HEADERS, "Authorization": f"Bearer {token}"},
+            headers={**API_HEADERS, "Authorization": f"Bearer {token}"},
         )
         if status != 200:
             raise GitHubAppError(f"GitHub answered {status} listing repositories")
@@ -353,7 +348,7 @@ class GitHubApp:
         raise GitHubAppError(f"GitHub answered {status} asked for a token")
 
     def _as_app(self, method: str, path: str, **kwargs: Any) -> tuple[int, Any]:
-        headers = {**_API_HEADERS, "Authorization": f"Bearer {self.jwt()}"}
+        headers = {**API_HEADERS, "Authorization": f"Bearer {self.jwt()}"}
         return self._ask(method, f"{self.api_root}{path}", headers=headers, **kwargs)
 
     def jwt(self) -> str:

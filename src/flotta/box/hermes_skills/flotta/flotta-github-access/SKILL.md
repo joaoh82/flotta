@@ -70,11 +70,12 @@ Git is already configured, and the configuration is deliberate. Do not change
 
 - The **committer** is this box (`<box-name>@<domain>`). That is the audit
   trail: anyone reading the history sees which commits an agent made.
-- The **author**, when the control plane has set one, is the person whose
-  GitHub this repository comes from, at the address GitHub issues for them.
-  Deploy services such as Vercel refuse commits whose author is not a member
-  of the team, and a box is not; a person is. `git config author.email` shows
-  whether one is set.
+- The **author**, when the control plane has set one, is the person who
+  connected the GitHub account this agent's client (or its agency) uses, at
+  the address GitHub issues for them. Deploy services such as Vercel refuse
+  commits whose author is not a member of the team, and a box is not; a
+  person is. It is one person for every repository you work on, whichever
+  account each belongs to. `git config author.email` shows whether one is set.
 
 Do not add a `Co-authored-by:` trailer naming yourself: the committer field
 already says it.

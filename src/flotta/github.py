@@ -22,7 +22,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-#: GitHub's own REST headers, shared by every call this module makes.
+#: Where the control plane finds the fleet's own token (FLOTTA-20). Held
+#: there and never on a box; `flotta.box.git_credential` says what that buys.
+GITHUB_TOKEN_ENV = "FLOTTA_GITHUB_TOKEN"
+
+#: GitHub's own REST headers, for every call Flotta makes to its API.
 API_HEADERS = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
@@ -89,11 +93,7 @@ def repo_reachable(
     try:
         status = caller(
             f"{API_ROOT}/repos/{repo}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+            headers={"Authorization": f"Bearer {token}", **API_HEADERS},
             timeout_s=timeout_s,
         )
     except Exception as exc:  # noqa: BLE001 - any transport failure is "could not ask"

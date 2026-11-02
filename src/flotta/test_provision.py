@@ -3676,8 +3676,8 @@ def test_padded_tenant_ids_name_the_row_the_probe_the_spec_and_the_token_alike(s
 # -- whom a box's commits are authored as (FLOTTA-105) ----------------------------
 #
 # Vercel refuses a commit whose author is not a member of the team, and a box
-# is not, so the author is the person whose GitHub the repositories come from
-# and the committer stays the box.
+# is not, so the author is the person who connected the GitHub account its
+# client uses, and the committer stays the box.
 
 
 def _connect(store, org, client, login, user_id, name=None, installation="77"):
@@ -3711,25 +3711,59 @@ def test_a_box_commits_as_the_person_who_connected_its_clients_github(store, mon
 
 
 def test_the_clients_own_connection_outranks_the_orgs(store, monkeypatch):
-    """The same order the credential is chosen in: a client's account first."""
+    """A client's own account names its agents' author; the org's is for
+    clients that connected none."""
     _connect(store, "default", None, "orgadmin", "1", installation="77")
     _connect(store, "default", "default", "clientowner", "2", installation="88")
     spec, _ = _created(store, monkeypatch)
     assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "2+clientowner@users.noreply.github.com"
 
 
-def test_a_connection_that_names_nobody_is_passed_over_for_one_that_does(store, monkeypatch):
+def _connect_nobody(store, org, client, installation):
+    """A row from before migration 9: connected, but GitHub's answer about
+    who did it was never kept."""
     store.connect_github(
-        "77",
-        org="default",
-        client="default",
-        account="gh-77",
+        installation,
+        org=org,
+        client=client,
+        account=f"gh-{installation}",
         account_type="Organization",
         connected_by="someone",
     )
+
+
+def test_a_clients_connection_that_names_nobody_is_not_passed_over_for_the_orgs(store, monkeypatch):
+    """The client's repositories come from its own account, and the agency's
+    person is not who they belong to. Nobody, until it is connected again."""
+    _connect_nobody(store, "default", "default", "77")
     _connect(store, "default", None, "orgadmin", "1", installation="88")
+    spec, box = _created(store, monkeypatch)
+    assert "FLOTTA_GIT_AUTHOR_EMAIL" not in spec.env
+    assert not [e for e in store.get_events("box", box.id) if e.type == "commit_author"]
+
+
+def test_a_clients_connection_that_names_nobody_is_not_passed_over_for_the_fleet_token(
+    store, monkeypatch
+):
+    """Nor for the operator's: the fleet token is a fallback for a client
+    with no GitHub of its own, not a name to put on one that has."""
+    from flotta import github
+
+    monkeypatch.setattr(
+        github, "token_owner", lambda token, **kw: github.Person(login="joaoh82", id="208517")
+    )
+    _connect_nobody(store, "default", "default", "77")
+    spec, _ = _created(store, monkeypatch, FLOTTA_GITHUB_TOKEN="github_pat_x")
+    assert "FLOTTA_GIT_AUTHOR_EMAIL" not in spec.env
+
+
+def test_among_a_clients_own_connections_the_one_that_names_somebody_is_used(store, monkeypatch):
+    """Two accounts connected by the same client, one from before migration 9:
+    the person the other names is still the client's own."""
+    _connect_nobody(store, "default", "default", "77")
+    _connect(store, "default", "default", "clientowner", "2", installation="88")
     spec, _ = _created(store, monkeypatch)
-    assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "1+orgadmin@users.noreply.github.com"
+    assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "2+clientowner@users.noreply.github.com"
 
 
 def test_the_operators_agents_commit_as_the_fleet_tokens_owner(store, monkeypatch):

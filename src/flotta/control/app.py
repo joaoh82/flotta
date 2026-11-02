@@ -74,6 +74,7 @@ from flotta.auth import (
 )
 from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loop
 from flotta.control.ratelimit import RateLimit, hit_all
+from flotta.github import GITHUB_TOKEN_ENV
 from flotta.relay import (
     DEFAULT_TIMEOUT_S as RELAY_TIMEOUT_S,
 )
@@ -249,9 +250,6 @@ def caller_address(peer: str | None, forwarded_for: list[str], hops: int) -> str
 
 
 INTERVAL_ENV = "FLOTTA_RECONCILE_INTERVAL_S"
-#: The credential boxes borrow. Held here, never on a box — see
-#: `git_credential` for what that does and does not buy.
-GITHUB_TOKEN_ENV = "FLOTTA_GITHUB_TOKEN"
 
 
 def _default_reachable(repo: str, *, token: str | None) -> Any:
@@ -1170,8 +1168,9 @@ def create_app(
             "account": installation.account,
             "client": installation.client,
             "connected_at": installation.connected_at,
-            # Whom this account's agents commit as (FLOTTA-105); None before
-            # migration 9, when they commit as themselves.
+            # Whom this account's agents commit as (FLOTTA-105). None for an
+            # account connected before migration 9: its agents commit as
+            # themselves until somebody connects it again.
             "commits_as": installation.connected_login,
             "status": status,
             "manage_url": (
