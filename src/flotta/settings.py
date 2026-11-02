@@ -152,11 +152,10 @@ SETTINGS: tuple[Setting, ...] = (
         key="FLOTTA_EUR_PER_USD",
         label="Euros per dollar",
         help=(
-            "The rate a model call priced in dollars is converted at when it is "
-            "metered, stored with the call. Changing it never changes a call "
-            "already recorded. With none set, a call's cost in euros is unknown "
-            "rather than a guess. Only reaches agents that call models through "
-            "the gateway."
+            "Set this only to override the rate. Otherwise the gateway fetches the "
+            "European Central Bank's rate every day. The rate is stored with each "
+            "call, so changing it never changes a call already recorded. Only "
+            "reaches agents that call models through the gateway."
         ),
         kind="money",
         default="",
@@ -368,6 +367,17 @@ def layered(store: Any, env: Mapping[str, str] | None = None) -> Mapping[str, st
     return _Layered(store.all_settings(), os.environ if env is None else env)
 
 
+def _help_now(setting: Setting, store: Any) -> str:
+    """A setting's help, plus the fetched rate: in the help rather than the field,
+    because a value in the field would be saved back as an override (FLOTTA-111)."""
+    if setting.key != "FLOTTA_EUR_PER_USD":
+        return setting.help
+    fetched = store.fetched_eur_rate()
+    if fetched is None:
+        return f"{setting.help} None has been fetched yet."
+    return f"{setting.help} Latest fetched: {fetched.eur_per_usd}, for {fetched.as_of}."
+
+
 def describe(store: Any, env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """The catalogue with current values, for the app to render.
 
@@ -392,7 +402,7 @@ def describe(store: Any, env: Mapping[str, str] | None = None) -> list[dict[str,
             {
                 "key": setting.key,
                 "label": setting.label,
-                "help": setting.help,
+                "help": _help_now(setting, store),
                 "kind": setting.kind,
                 "default": setting.default,
                 "value": value,

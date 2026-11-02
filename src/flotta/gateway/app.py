@@ -77,6 +77,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -93,7 +94,7 @@ from flotta.auth import (
     verify,
 )
 from flotta.inference import InvalidModel, is_openrouter, validate_model
-from flotta.pricing import Price, resolve_eur_per_usd
+from flotta.pricing import EurRate, Price, resolve_eur_per_usd
 from flotta.settings import layered
 from flotta.store import Box, FleetStore, is_terminal
 
@@ -455,6 +456,7 @@ def create_gateway(
     env: Mapping[str, str] | None = None,
     stored_keys: StoredKeys = _nothing_stored,
     price_source: Callable[[], Iterable[Price]] | None = None,
+    rate_source: Callable[[], EurRate] | None = None,
     settle_s: float = _SETTLE_S,
     write_backoff_s: float = 0.5,
     write_retry_s: float = _WRITE_RETRY_S,
@@ -465,10 +467,18 @@ def create_gateway(
     base_url = (environment.get(BASE_URL_ENV) or "").strip().rstrip("/")
     provider = "openrouter" if is_openrouter(base_url) else "custom"
 
+    def rate_in_force(store: FleetStore) -> Decimal | None:
+        """The override if there is one, otherwise the latest rate fetched."""
+        override = resolve_eur_per_usd(layered(store, environment))
+        if override is not None:
+            return override
+        fetched = store.fetched_eur_rate()
+        return fetched.eur_per_usd if fetched else None
+
     def write_row(*, box_id: str, **row: Any) -> None:
         store = store_factory()
         try:
-            rate = resolve_eur_per_usd(layered(store, environment))
+            rate = rate_in_force(store)
             store.record_usage(box_id, eur_per_usd=rate, **row)
         finally:
             store.close()
@@ -485,13 +495,30 @@ def create_gateway(
             store.close()
         _log.info("model prices refreshed: %d models, %d changed", len(prices), changed)
 
-    async def refresh_once() -> None:
+    def refresh_rate() -> None:
+        assert rate_source is not None
+        rate = rate_source()
+        store = store_factory()
         try:
-            await asyncio.to_thread(refresh_prices)
-        except Exception:
-            # The last prices stay in force. A model with none is unpriced, which
-            # a budget can see, and that beats a gateway that will not start.
-            _log.exception("model prices could not be refreshed")
+            store.record_eur_rate(rate)
+        finally:
+            store.close()
+        _log.info("euro rate: %s, %s for %s", rate.eur_per_usd, rate.source, rate.as_of)
+
+    async def refresh_once() -> None:
+        if price_source is not None:
+            try:
+                await asyncio.to_thread(refresh_prices)
+            except Exception:
+                # The last prices stay in force. A model with none is unpriced, which
+                # a budget can see, and that beats a gateway that will not start.
+                _log.exception("model prices could not be refreshed")
+        if rate_source is not None:
+            try:
+                await asyncio.to_thread(refresh_rate)
+            except Exception:
+                # Likewise the last rate. Separately, so neither failure costs the other.
+                _log.exception("the euro rate could not be refreshed")
 
     async def refresh_forever() -> None:
         while True:
@@ -504,7 +531,7 @@ def create_gateway(
             transport=transport, timeout=_TIMEOUT, trust_env=False
         )
         refresher = None
-        if price_source is not None:
+        if price_source is not None or rate_source is not None:
             await refresh_once()
             refresher = asyncio.create_task(refresh_forever())
         try:
@@ -558,7 +585,7 @@ def create_gateway(
     def check_budgets(box: Box, model: str, unsettled: list[Box]) -> budgets.Refusal | None:
         store = store_factory()
         try:
-            rate = resolve_eur_per_usd(layered(store, environment))
+            rate = rate_in_force(store)
             now = datetime.now(UTC)
             return budgets.check_budgets(
                 store, box, model=model, eur_per_usd=rate, now=now, unsettled=unsettled

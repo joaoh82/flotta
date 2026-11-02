@@ -1477,6 +1477,7 @@ def gateway(
     from flotta.db import DATABASE_URL_ENV
     from flotta.inference import is_openrouter
     from flotta.model_catalog import fetch_prices
+    from flotta.pricing import fetch_eur_rate
 
     if not resolve_signing_key():
         raise refuse(
@@ -1503,7 +1504,7 @@ def gateway(
             )
         # Only OpenRouter has a catalogue to read. Elsewhere a call stays unpriced.
         source = (lambda: fetch_prices()[0]) if is_openrouter(base_url) else None
-        app_ = create_gateway(price_source=source)
+        app_ = create_gateway(price_source=source, rate_source=fetch_eur_rate)
 
     try:
         import uvicorn

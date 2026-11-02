@@ -11,6 +11,7 @@ from flotta.pricing import (
     NANO,
     Price,
     cost_nano,
+    eur_rate_from_ecb,
     prices_from_catalogue,
     resolve_eur_per_usd,
     to_eur_nano,
@@ -146,3 +147,44 @@ def test_a_catalogue_with_entries_but_no_usable_price_is_a_broken_answer(monkeyp
     monkeypatch.setattr(model_catalog, "_entries", lambda timeout: [{"id": "m/no-pricing"}])
     with pytest.raises(model_catalog.CatalogueUnavailable, match="no usable price"):
         model_catalog.fetch_prices()
+
+
+# -- the rate looks after itself (FLOTTA-111) ------------------------------------
+
+ECB_FILE = """<?xml version="1.0" encoding="UTF-8"?>
+<gesmes:Envelope xmlns:gesmes="http://www.gesmes.org/xml/2002-08-01">
+  <gesmes:subject>Reference rates</gesmes:subject>
+  <Cube>
+    <Cube time='2026-11-02'>
+      <Cube currency='JPY' rate='171.44'/>
+      <Cube currency='USD' rate='1.1216'/>
+      <Cube currency='GBP' rate='0.8712'/>
+    </Cube>
+  </Cube>
+</gesmes:Envelope>
+"""
+
+
+def test_the_ecb_quotes_dollars_per_euro_and_the_rate_is_the_inverse():
+    rate = eur_rate_from_ecb(ECB_FILE)
+    assert rate.eur_per_usd == Decimal("0.891583")
+    assert rate.as_of == "2026-11-02"
+    assert rate.source == "ecb"
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "",
+        "<html>Service unavailable</html>",
+        ECB_FILE.replace("USD", "CHF"),
+        ECB_FILE.replace("time='2026-11-02'", ""),
+        ECB_FILE.replace("rate='1.1216'", "rate='0'"),
+        ECB_FILE.replace("rate='1.1216'", "rate='1.1.2'"),
+        ECB_FILE.replace("rate='1.1216'", "rate='112.16'"),
+        ECB_FILE.replace("rate='1.1216'", "rate='0.0011216'"),
+    ],
+)
+def test_a_file_without_a_sane_rate_is_refused(broken):
+    with pytest.raises(ValueError):
+        eur_rate_from_ecb(broken)

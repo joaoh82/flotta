@@ -28,7 +28,7 @@ from flotta.gateway.app import (
     resolve_key,
 )
 from flotta.gateway.fake import FAKE_MODEL, FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
-from flotta.pricing import NANO, Price
+from flotta.pricing import NANO, EurRate, Price
 from flotta.store import FleetStore
 
 SIGNING_KEY = "a-signing-key-for-these-tests"
@@ -686,6 +686,89 @@ def test_a_price_source_that_fails_does_not_stop_the_gateway(path, upstream):
 
     with _client(path, upstream, price_source=down) as client:
         assert client.post("/v1/chat/completions", json=CALL, headers=_auth()).status_code == 200
+
+
+# -- the rate looks after itself (FLOTTA-111) ------------------------------------
+
+NO_OVERRIDE = {k: v for k, v in ENV.items() if k != "FLOTTA_EUR_PER_USD"}
+FETCHED = EurRate(Decimal("0.25"), "2026-11-02", "ecb")
+
+
+def _down():
+    raise OSError("no answer")
+
+
+def test_with_no_override_a_call_is_priced_at_the_fetched_rate(path, upstream):
+    with _client(path, upstream, env=NO_OVERRIDE, rate_source=lambda: FETCHED) as client:
+        assert client.post("/v1/chat/completions", json=CALL, headers=_auth()).status_code == 200
+    row = _rows(path)[0]
+    assert row["eur_per_usd"] == "0.25"
+    assert row["cost_eur_nano"] == row["upstream_cost_nano"] // 4
+
+
+def test_the_override_wins_over_the_fetched_rate(path, upstream):
+    with _client(path, upstream, rate_source=lambda: FETCHED) as client:
+        client.post("/v1/chat/completions", json=CALL, headers=_auth())
+    assert _rows(path)[0]["eur_per_usd"] == "0.5"
+
+
+def test_a_saved_override_wins_over_the_fetched_rate(path, upstream):
+    with FleetStore(path) as fleet:
+        fleet.set_setting("FLOTTA_EUR_PER_USD", "1")
+    with _client(path, upstream, env=NO_OVERRIDE, rate_source=lambda: FETCHED) as client:
+        client.post("/v1/chat/completions", json=CALL, headers=_auth())
+    assert _rows(path)[0]["eur_per_usd"] == "1"
+
+
+def test_a_failed_fetch_keeps_the_last_rate_and_the_gateway_up(path, upstream):
+    with FleetStore(path) as fleet:
+        fleet.record_eur_rate(FETCHED)
+    with _client(path, upstream, env=NO_OVERRIDE, rate_source=_down) as client:
+        assert client.post("/v1/chat/completions", json=CALL, headers=_auth()).status_code == 200
+    assert _rows(path)[0]["eur_per_usd"] == "0.25"
+
+
+def test_with_no_rate_ever_fetched_a_call_is_written_unpriced(path, upstream):
+    with _client(path, upstream, env=NO_OVERRIDE, rate_source=_down) as client:
+        assert client.post("/v1/chat/completions", json=CALL, headers=_auth()).status_code == 200
+    assert _rows(path)[0]["cost_eur_nano"] is None
+
+
+def test_a_budget_is_checked_at_the_fetched_rate(path, upstream):
+    """Otherwise every budget refuses every call with `budget_no_rate`."""
+    with FleetStore(path) as fleet:
+        fleet.set_budget("studio-nord", period="month", limit_eur_nano=100 * NANO, action="pause")
+    with _client(path, upstream, env=NO_OVERRIDE, rate_source=lambda: FETCHED) as client:
+        assert client.post("/v1/chat/completions", json=CALL, headers=_auth()).status_code == 200
+
+
+def test_a_failed_price_fetch_does_not_cost_the_rate(tmp_path, upstream):
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    with _client(db, upstream, price_source=_down, rate_source=lambda: FETCHED):
+        pass
+    with FleetStore(db) as fleet:
+        assert fleet.fetched_eur_rate() == FETCHED
+
+
+def test_a_failed_rate_fetch_does_not_cost_the_prices(tmp_path, upstream):
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    price = Price("fresh/model", NANO, NANO, None, "USD", "test")
+    with _client(db, upstream, price_source=lambda: [price], rate_source=_down):
+        pass
+    with FleetStore(db) as fleet:
+        assert fleet.price_of("fresh/model", at=datetime.now(UTC)) is not None
+
+
+def test_the_rate_is_fetched_with_no_catalogue_to_read(tmp_path, upstream):
+    """An endpoint other than OpenRouter has no prices, and still has a rate."""
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    with _client(db, upstream, rate_source=lambda: FETCHED):
+        pass
+    with FleetStore(db) as fleet:
+        assert fleet.fetched_eur_rate() == FETCHED
 
 
 def test_a_write_that_fails_is_retried_with_the_same_key():

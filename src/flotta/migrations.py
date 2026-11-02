@@ -329,6 +329,20 @@ def _usage_outcome() -> tuple[str, ...]:
     )
 
 
+def _eur_rates() -> tuple[str, ...]:
+    """FLOTTA-111. One row per change. The rate is text, as in `usage`, so it stays exact."""
+    return (
+        """
+        CREATE TABLE eur_rates (
+            valid_from   TEXT PRIMARY KEY,
+            eur_per_usd  TEXT NOT NULL,
+            as_of        TEXT NOT NULL,
+            source       TEXT NOT NULL
+        )
+        """,
+    )
+
+
 def _budgets() -> tuple[str, ...]:
     """Limits on spend, checked before every model call (FLOTTA-89, M13.3).
 
@@ -427,6 +441,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         9,
         "connected person: who connected a GitHub account, whom its agents commit as",
         _connected_person(),
+    ),
+    Migration(
+        10,
+        "euro rates: the rate fetched for converting dollar-priced calls",
+        _eur_rates(),
     ),
 )
 

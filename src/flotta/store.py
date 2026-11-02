@@ -67,7 +67,7 @@ from flotta import address, db, migrations
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
 from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
-from flotta.pricing import Price, cost_nano, to_eur_nano
+from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -2249,6 +2249,36 @@ class FleetStore:
                 )
                 changed += 1
         return changed
+
+    def record_eur_rate(self, rate: EurRate, *, now: datetime | None = None) -> bool:
+        """Record a fetched rate if it differs from the latest. Returns whether it did."""
+        with self._conn.transaction(guard="eur_rates"):
+            current = self.fetched_eur_rate()
+            if current is not None and (current.eur_per_usd, current.as_of) == (
+                rate.eur_per_usd,
+                rate.as_of,
+            ):
+                return False
+            self._conn.execute(
+                "INSERT INTO eur_rates (valid_from, eur_per_usd, as_of, source) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _instant(now or datetime.now(UTC)),
+                    str(rate.eur_per_usd),
+                    rate.as_of,
+                    rate.source,
+                ),
+            )
+        return True
+
+    def fetched_eur_rate(self) -> EurRate | None:
+        """The latest rate fetched, however old: a failed fetch keeps it in force."""
+        row = self._conn.execute(
+            "SELECT * FROM eur_rates ORDER BY valid_from DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return EurRate(Decimal(row["eur_per_usd"]), row["as_of"], row["source"])
 
     def price_of(self, model: str, *, at: datetime) -> Price | None:
         """The price of `model` in force at `at`, if it had one yet."""
