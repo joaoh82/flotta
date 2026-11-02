@@ -499,19 +499,21 @@ author against its team (Vercel does, with no way to turn it off) sees a member
 rather than a stranger. Agencies get the same from step 7d, with the person who
 connected the account.
 
-**The author is set once, when the box is created.** A box created before the
-PAT was set, or before this existed, keeps committing as itself until it is
-recreated or its machine env is updated:
+**The author is set when the box is created, and refreshed on request.** A
+box created before the PAT was set, or before this existed, keeps committing
+as itself until its machine env is rewritten, which is a verb rather than a
+`flyctl` command (FLOTTA task 108):
 
 ```bash
-flyctl machine update <machine> -a <box app> \
-  --env FLOTTA_GIT_AUTHOR_NAME='<name>' \
-  --env FLOTTA_GIT_AUTHOR_EMAIL='<id>+<login>@users.noreply.github.com'
+uv run flotta author refresh <box>      # or: just box-author <box>
 ```
 
-The same goes for a PAT that changes hands. The box image has to carry the
-entrypoint from FLOTTA-105 as well: an older image receives the env and reads
-none of it.
+It re-decides the author with the same rule creation uses and rewrites the
+two env keys only when the machine says something else; an awake box restarts
+to read them, an asleep one stays asleep and reads them when it next wakes.
+The same goes for a PAT that changes hands: run it per agent. The box image
+has to carry the entrypoint from FLOTTA-105 as well: an older image receives
+the env and reads none of it.
 
 ### 7b. Load the identity onto the box, and grant it repositories
 
@@ -673,21 +675,27 @@ every repository it works on.
 nobody: `commits_as` is null, and its agents commit as themselves even when
 recreated, since a client's own connection is never passed over for its
 agency's or the operator's name. Press **Reconnect** on the connection, as the
-person whose name the commits should carry, and *then* recreate the box or
-update its machine env as in 7a. Reconnect goes straight to GitHub's "who are
+person whose name the commits should carry; every existing agent of that
+scope is renamed with it (below). Reconnect goes straight to GitHub's "who are
 you" step (`POST /api/orgs/{org}/github/{installation}/reconnect`, FLOTTA-110):
 the Connect flow cannot be reused for an account the App is already on, since
 GitHub answers its install screen with the installation's settings page and
 drops the state. The same button is how an agency moves its agents' commits
 onto a different owner: whoever presses it and proves ownership is named.
 
-**What a reconnect or a disconnect does not do.** Both reach only boxes
-created afterwards. Connecting the same scope again as somebody else names
-that person for new boxes; disconnecting ends the grants at once, but a
-running box keeps the name in its env and anything it commits afterwards is
-still authored as the person who left. Until there is a verb for refreshing a
-box's identity (FLOTTA task 108), recreating the box or updating its machine
-env is the remedy, and only the operator can do the second.
+**What a connect, a reconnect or a disconnect does to existing agents.** Each
+one refreshes every settled box of its scope afterwards, on a thread (FLOTTA
+task 108): the org's boxes for an org-wide account, the client's for its own.
+A box re-decides its author with the rule above, so a client with its own
+account is unchanged by its agency's reconnect. A box whose machine already
+says the right name is left alone; one that is awake restarts to read the new
+one; one that is asleep stays asleep and reads it when it next wakes. A
+disconnect writes the name out as empty, since `flyctl machine update --env`
+cannot remove a key and the entrypoint reads an empty address as none. The
+outcome is on each box's timeline as `commit_author` (with `reason`
+`connected` or `disconnected`) or `commit_author_refresh_failed`, and
+`flotta author refresh <box>` (`POST /api/boxes/{box}/author`, `fleet:write`)
+does one box by hand, which an agency owner may run on their own agents.
 
 ## Step 8 — A second agency (M11.7)
 

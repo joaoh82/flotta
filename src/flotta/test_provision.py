@@ -144,6 +144,10 @@ class FakeBackend:
         self.commands: list[str] = []
         self.addressed: list[str] = []
         self.exec_result = exec_result
+        #: Plain environment on the machine, as `apply_env` leaves it and
+        #: `inspect` reads it back (FLOTTA task 108).
+        self.env: dict[str, str] = {}
+        self.apply_env_fails = False
 
     def suspend(self, box_id):
         self.calls.append("suspend")
@@ -176,7 +180,18 @@ class FakeBackend:
         one of them care whether a panel had been opened."""
         from flotta.backend import MachineInfo
 
-        return MachineInfo(state=self.machine_state, image=self.image)
+        return MachineInfo(
+            state=self.machine_state,
+            image=self.image,
+            git_author_name=self.env.get("FLOTTA_GIT_AUTHOR_NAME") or None,
+            git_author_email=self.env.get("FLOTTA_GIT_AUTHOR_EMAIL") or None,
+        )
+
+    def apply_env(self, box_id, env):
+        self.calls.append("apply_env")
+        if self.apply_env_fails:
+            raise BackendError("the substrate refused")
+        self.env.update(env)
 
     def destroy(self, box_id):
         self.calls.append("destroy")
@@ -3831,3 +3846,189 @@ def test_with_nobody_connected_and_no_fleet_token_a_box_commits_as_itself(store,
     assert "FLOTTA_GIT_AUTHOR_EMAIL" not in spec.env
     assert "FLOTTA_GIT_AUTHOR_NAME" not in spec.env
     assert not [e for e in store.get_events("box", box.id) if e.type == "commit_author"]
+
+
+# -- refreshing the author on a box that exists (FLOTTA task 108) ----------------
+#
+# `create_box` decides the author once; these are about the same decision made
+# again for a box that is already there, and written to its machine only when
+# the machine says something else.
+
+OLIVIA_EMAIL = "4242+olivia@users.noreply.github.com"
+
+
+def _settled(store, name="eng-a", org="default", client="default", **kwargs):
+    box = store.create_box(name, org=org, client=client, **kwargs)
+    store.update_box_status(box.id, "running", endpoint=f"fake://app/{name}")
+    return store.get_box(box.id)
+
+
+def _author_events(store, box_id):
+    return [e for e in store.get_events("box", box_id) if e.type == "commit_author"]
+
+
+def test_refreshing_names_the_person_now_connected(store, monkeypatch):
+    """The upgrade from before FLOTTA-105: the account is reconnected, and a
+    box made before that is given the name without being recreated."""
+    from flotta.provision import refresh_author
+
+    box = _settled(store)
+    _connect(store, "default", "default", "olivia", "4242", "Olivia O")
+    impl = FakeBackend()
+    result = refresh_author(box.id, store=store, backend=impl, reason="connected")
+    assert result["changed"] is True
+    assert result["login"] == "olivia"
+    assert impl.env == {
+        "FLOTTA_GIT_AUTHOR_NAME": "Olivia O",
+        "FLOTTA_GIT_AUTHOR_EMAIL": OLIVIA_EMAIL,
+    }
+    [event] = _author_events(store, box.id)
+    assert event.payload == {
+        "login": "olivia",
+        "email": OLIVIA_EMAIL,
+        "source": "github_app",
+        "reason": "connected",
+        "was": None,
+    }
+
+
+def test_refreshing_takes_the_name_off_when_nobody_is_connected_any_more(store):
+    """A disconnect ends the grants at once; this is what ends the name. The
+    keys are written empty rather than removed, which is what Fly allows and
+    what the entrypoint reads as none."""
+    from flotta.provision import refresh_author
+
+    box = _settled(store)
+    impl = FakeBackend()
+    impl.env = {"FLOTTA_GIT_AUTHOR_NAME": "Olivia O", "FLOTTA_GIT_AUTHOR_EMAIL": OLIVIA_EMAIL}
+    result = refresh_author(box.id, store=store, backend=impl, reason="disconnected")
+    assert result == {
+        "box_id": box.id,
+        "name": "eng-a",
+        "login": None,
+        "email": None,
+        "source": None,
+        "changed": True,
+    }
+    assert impl.env == {"FLOTTA_GIT_AUTHOR_NAME": "", "FLOTTA_GIT_AUTHOR_EMAIL": ""}
+    [event] = _author_events(store, box.id)
+    assert event.payload["login"] is None
+    assert event.payload["was"] == OLIVIA_EMAIL
+
+
+def test_refreshing_rewrites_nothing_when_the_machine_already_says_so(store):
+    """A reconnect as the same person restarts nobody: the rewrite is a
+    restart of every awake box in the scope, and the fleet is mostly asleep
+    because restarts are not free."""
+    from flotta.provision import refresh_author
+
+    box = _settled(store)
+    _connect(store, "default", "default", "olivia", "4242", "Olivia O")
+    impl = FakeBackend()
+    impl.env = {"FLOTTA_GIT_AUTHOR_NAME": "Olivia O", "FLOTTA_GIT_AUTHOR_EMAIL": OLIVIA_EMAIL}
+    result = refresh_author(box.id, store=store, backend=impl)
+    assert result["changed"] is False
+    assert result["login"] == "olivia"
+    assert "apply_env" not in impl.calls
+    assert _author_events(store, box.id) == []
+
+
+def test_a_box_that_never_had_a_name_and_still_gets_none_is_left_alone(store):
+    """Nobody then, nobody now: an absent key and an empty one mean the same
+    thing to the entrypoint, so there is nothing to restart for."""
+    from flotta.provision import refresh_author
+
+    box = _settled(store)
+    impl = FakeBackend()
+    assert refresh_author(box.id, store=store, backend=impl)["changed"] is False
+    assert "apply_env" not in impl.calls
+
+
+def test_a_machine_that_cannot_be_read_counts_as_stale(store):
+    from flotta.backend import BackendError
+    from flotta.provision import refresh_author
+
+    class Unreadable(FakeBackend):
+        def inspect(self, box_id):
+            raise BackendError("flyctl is having a bad minute")
+
+    box = _settled(store)
+    _connect(store, "default", "default", "olivia", "4242")
+    impl = Unreadable()
+    assert refresh_author(box.id, store=store, backend=impl)["changed"] is True
+    assert impl.env["FLOTTA_GIT_AUTHOR_EMAIL"] == OLIVIA_EMAIL
+
+
+def test_a_refresh_the_substrate_refuses_writes_the_failure_and_raises(store):
+    from flotta.provision import UpgradeFailed, refresh_author
+
+    box = _settled(store)
+    _connect(store, "default", "default", "olivia", "4242")
+    impl = FakeBackend()
+    impl.apply_env_fails = True
+    with pytest.raises(UpgradeFailed, match="unchanged"):
+        refresh_author(box.id, store=store, backend=impl, reason="connected")
+    [event] = [
+        e for e in store.get_events("box", box.id) if e.type == "commit_author_refresh_failed"
+    ]
+    assert event.payload["login"] == "olivia"
+    assert event.payload["reason"] == "connected"
+    assert _author_events(store, box.id) == []
+
+
+def test_a_refresh_is_refused_for_a_box_with_no_machine(store):
+    from flotta.provision import ProvisionError, refresh_author
+
+    made = store.create_box("eng-a")
+    with pytest.raises(ProvisionError, match="still being created"):
+        refresh_author(made.id, store=store, backend=FakeBackend())
+    gone = _settled(store, name="eng-b")
+    store.update_box_status(gone.id, "torn_down")
+    with pytest.raises(ProvisionError, match="no machine"):
+        refresh_author(gone.id, store=store, backend=FakeBackend())
+
+
+def test_refreshing_a_scope_reaches_its_settled_boxes_and_each_decides_for_itself(store):
+    """An org-wide reconnect: the org's boxes are renamed, except a client's
+    whose own account names somebody else, and one still being created is
+    named by its creation. One failure does not stop the rest."""
+    from flotta.provision import refresh_authors_in
+
+    store.create_org("agency-x", "Agency X")
+    store.create_client("agency-x", "acme", "Acme")
+    store.create_client("agency-x", "beta", "Beta")
+    acme = _settled(store, name="support-acme", org="agency-x", client="acme")
+    beta = _settled(store, name="support-beta", org="agency-x", client="beta")
+    store.create_box("new-beta", org="agency-x", client="beta")
+    _connect(store, "agency-x", None, "olivia", "4242", installation="77")
+    _connect(store, "agency-x", "acme", "clientowner", "2", installation="88")
+
+    impl = FakeBackend()
+    done = refresh_authors_in(store, "agency-x", None, reason="connected", backend=impl)
+
+    assert {d["name"]: d["login"] for d in done} == {
+        acme.name: "clientowner",
+        beta.name: "olivia",
+    }
+    # One fake machine stands in for both, so the last write wins; what
+    # matters is which boxes were reached and what each decided.
+    assert impl.calls.count("apply_env") == 2
+    assert [e.payload["login"] for e in _author_events(store, acme.id)] == ["clientowner"]
+    assert [e.payload["login"] for e in _author_events(store, beta.id)] == ["olivia"]
+
+
+def test_refreshing_a_scope_carries_on_past_a_box_the_substrate_refuses(store):
+    from flotta.provision import refresh_authors_in
+
+    first = _settled(store, name="eng-a")
+    second = _settled(store, name="eng-b")
+    _connect(store, "default", "default", "olivia", "4242")
+    impl = FakeBackend()
+    impl.apply_env_fails = True
+    done = refresh_authors_in(store, "default", "default", reason="connected", backend=impl)
+    assert sorted(d["name"] for d in done) == ["eng-a", "eng-b"]
+    assert all("error" in d for d in done)
+    for box in (first, second):
+        assert [e.type for e in store.get_events("box", box.id) if "author" in e.type] == [
+            "commit_author_refresh_failed"
+        ]

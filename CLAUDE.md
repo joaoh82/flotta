@@ -779,9 +779,14 @@ conventions, and the sharp edges below.
   accounts: `POST /api/orgs/{org}/github/{installation}/reconnect` (FLOTTA-110)
   goes straight to GitHub's authorize step, because for an account the App is
   already on GitHub answers the install screen with its settings page and
-  drops the state. A box from before this keeps committing as itself, and a
-  reconnect or disconnect reaches only boxes created afterwards, until the box
-  is recreated or its machine env is updated.
+  drops the state. **A connect, a reconnect or a disconnect then refreshes
+  every settled box of its scope** (`refresh_author`, FLOTTA task 108): the
+  same rule run against the box as it is now, the two env keys rewritten only
+  when the machine says otherwise, an awake box restarted and an asleep one
+  left asleep. Nobody is written as an empty value, because `flyctl machine
+  update --env` cannot remove a key and the entrypoint reads an empty address
+  as none. `POST /api/boxes/{id}/author` and `flotta author refresh` do one
+  box by hand, for a PAT that changed hands or a box from before FLOTTA-105.
 
 - **The meter's ledger is appended to, and money in it is whole nanos (FLOTTA-87,
   migration 6).** `record_usage` works a call's cost out once, from the price in

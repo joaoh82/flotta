@@ -196,8 +196,41 @@ def _make_api(fleet, app):
     )
 
 
+class FakeMachine:
+    """Every settled box's machine, as a connect or a disconnect reaches it
+    (FLOTTA task 108): the env it was given, read back by the next refresh."""
+
+    scheme = "fly"
+
+    def __init__(self):
+        self.env: dict[str, str] = {}
+        self.applied: list[tuple[str, dict[str, str]]] = []
+
+    def inspect(self, endpoint):
+        from flotta.backend import MachineInfo
+
+        return MachineInfo(
+            state="stopped",
+            git_author_name=self.env.get("FLOTTA_GIT_AUTHOR_NAME") or None,
+            git_author_email=self.env.get("FLOTTA_GIT_AUTHOR_EMAIL") or None,
+        )
+
+    def apply_env(self, endpoint, env):
+        self.applied.append((endpoint, dict(env)))
+        self.env.update(env)
+
+
 @pytest.fixture
-def api(fleet, github, monkeypatch):
+def machine(monkeypatch):
+    import flotta.provision as provision
+
+    fake = FakeMachine()
+    monkeypatch.setattr(provision, "_backend_for", lambda endpoint: fake)
+    return fake
+
+
+@pytest.fixture
+def api(fleet, github, machine, monkeypatch):
     monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", PAT)
     app = GitHubApp(
         slug="flotta-test",
@@ -562,6 +595,83 @@ def _reconnect(api, headers=None, *, org="agency-x", installation="77", code="ow
         json={"state": _state_from(asked.json()["url"]), "code": code},
         headers=headers,
     )
+
+
+def _settle(fleet, org, client):
+    """The one box of that client gets a machine, so a refresh can reach it."""
+    with FleetStore(fleet) as store:
+        [box] = store.list_boxes_in(org, client)
+        store.update_box_status(box.id, "running", endpoint=f"fly://{org}-{client}/m")
+        return box
+
+
+def _author_events(fleet, box_id):
+    with FleetStore(fleet) as store:
+        return [e.payload for e in store.get_events("box", box_id) if e.type == "commit_author"]
+
+
+def test_a_reconnect_renames_every_settled_agent_of_its_scope(api, fleet, machine):
+    """The whole point of task 108: the upgrade from before FLOTTA-105 reaches
+    the agents that already exist, not only the ones made afterwards."""
+    _connected_by_nobody(fleet)
+    acme = _settle(fleet, "agency-x", "acme")
+    # beta's box has no machine yet: it is named by its creation, not here.
+
+    assert _reconnect(api).status_code == 200
+
+    assert [(e.split("/")[2], env) for e, env in machine.applied] == [
+        (
+            "agency-x-acme",
+            {
+                "FLOTTA_GIT_AUTHOR_NAME": "Olivia Owner",
+                "FLOTTA_GIT_AUTHOR_EMAIL": "4242+olivia@users.noreply.github.com",
+            },
+        )
+    ]
+    [event] = _author_events(fleet, acme.id)
+    assert event["login"] == "olivia"
+    assert event["reason"] == "connected"
+
+
+def test_a_reconnect_as_somebody_else_moves_existing_agents_onto_them(api, fleet, machine):
+    _settle(fleet, "agency-x", "acme")
+    assert _connect(api).status_code == 200
+    assert machine.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "4242+olivia@users.noreply.github.com"
+
+    assert (
+        _reconnect(api, _owner(subject="person-oscar"), code="other-owner-code").status_code == 200
+    )
+
+    assert machine.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "5151+oscar@users.noreply.github.com"
+
+
+def test_a_disconnect_takes_the_name_off_every_settled_agent(api, fleet, machine):
+    """The grants end with the row; without this the box kept committing as
+    a person who had left the agency."""
+    acme = _settle(fleet, "agency-x", "acme")
+    assert _connect(api).status_code == 200
+    assert machine.env["FLOTTA_GIT_AUTHOR_EMAIL"]
+
+    response = api.delete("/api/orgs/agency-x/github/77", headers=_owner())
+    assert response.status_code == 200, response.text
+
+    assert machine.env == {"FLOTTA_GIT_AUTHOR_NAME": "", "FLOTTA_GIT_AUTHOR_EMAIL": ""}
+    assert [e["login"] for e in _author_events(fleet, acme.id)] == ["olivia", None]
+    assert _author_events(fleet, acme.id)[-1]["reason"] == "disconnected"
+
+
+def test_a_clients_own_account_is_untouched_by_its_agencys_reconnect(api, fleet, machine):
+    """Each box decides for itself: the client's own connection outranks the
+    org's, so the org-wide reconnect finds nothing to rewrite on its box."""
+    _settle(fleet, "agency-x", "acme")
+    assert _connect(api, client="acme", installation="88").status_code == 200
+    assert machine.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "4242+olivia@users.noreply.github.com"
+    before = len(machine.applied)
+
+    assert _connect(api, installation="77", code="other-owner-code").status_code == 200
+
+    assert len(machine.applied) == before
+    assert machine.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "4242+olivia@users.noreply.github.com"
 
 
 def test_reconnecting_names_the_person_on_a_connection_that_named_nobody(api, fleet):

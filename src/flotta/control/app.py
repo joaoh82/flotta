@@ -1312,7 +1312,37 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
+        _refresh_authors(held.org, held.client, "connected")
         return {"org": held.org, "client": held.client, "account": held.account}
+
+    def _refresh_authors(org: str, client: str | None, reason: str) -> None:
+        """Rename every settled box a connection could name, after it changed.
+
+        The author is written into a machine when the box is created, so
+        without this a reconnect as somebody else or a disconnect reached only
+        boxes made afterwards (FLOTTA task 108). On a thread, for the reason
+        repairs are: a box that is awake restarts, and the request that
+        changed the connection has already been answered by the store. Each
+        box's outcome is its own timeline's `commit_author` or
+        `commit_author_refresh_failed`.
+        """
+        from flotta.provision import refresh_authors_in
+
+        def run() -> None:
+            inner = store_factory()
+            try:
+                refresh_authors_in(inner, org, client, reason=reason)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("refreshing %s's authors failed: %s: %s", org, type(exc).__name__, exc)
+            finally:
+                inner.close()
+
+        if not background:
+            run()
+            return
+        worker = threading.Thread(target=run, name=f"authors-{org}", daemon=True)
+        _provisioning.add(worker)
+        worker.start()
 
     @app.delete("/api/orgs/{org_id}/github/{installation_id}")
     def disconnect_github(
@@ -1329,7 +1359,8 @@ def create_app(
         _admin_of(token, org_id)
         store = store_factory()
         try:
-            if store.github_installation(org_id, installation_id) is None:
+            held = store.github_installation(org_id, installation_id)
+            if held is None:
                 raise HTTPException(status_code=404, detail="no such GitHub connection")
             try:
                 _configured_github_app().uninstall(installation_id)
@@ -1338,6 +1369,8 @@ def create_app(
             store.disconnect_github(org_id, installation_id)
         finally:
             store.close()
+        # The grants ended with the row; the name on its boxes ends here.
+        _refresh_authors(org_id, held.client, "disconnected")
         return {"disconnected": installation_id}
 
     @app.get("/api/orgs/{org_id}/members")
@@ -3462,6 +3495,37 @@ def create_app(
             box = _scoped_box(store, token, box_id)
             try:
                 return rotate_identity(box.id, store=store)
+            except UpgradeFailed as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/author")
+    def refresh_author_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
+        """Re-decide whose name goes on an agent's commits, on its machine.
+
+        A connect, a reconnect or a disconnect does this for every box of its
+        scope by itself (`_refresh_authors`); this is the verb for the rest —
+        a fleet PAT that changed hands, an agent from before FLOTTA-105 — and
+        the one an agency owner has, since the runbook's `flyctl machine
+        update` is the operator's. See `provision.refresh_author`.
+
+        `fleet:write`, like renewing an identity: a running agent restarts.
+        The operator reaches any org's agent (`_operated_box`). Synchronous,
+        for the reason renewing an identity is: a sleeping agent, which is
+        most of them, answers in seconds, and nothing is rewritten when the
+        machine already says what the rule decides. A button in front of this
+        should background it first, the way upgrades were.
+        """
+        from flotta.provision import ProvisionError, UpgradeFailed, refresh_author
+
+        store = store_factory()
+        try:
+            box = _operated_box(store, token, box_id)
+            try:
+                return refresh_author(box.id, store=store)
             except UpgradeFailed as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             except ProvisionError as exc:

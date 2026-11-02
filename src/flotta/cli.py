@@ -2353,6 +2353,69 @@ def prices_refresh(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> Non
     emit(body, line, as_json=as_json)
 
 
+# -- commit author (FLOTTA-105, task 108) ------------------------------------
+
+author_app = typer.Typer(
+    name="author",
+    help="Whose name goes on an agent's commits.",
+    no_args_is_help=True,
+)
+app.add_typer(author_app)
+
+
+@author_app.command("refresh")
+def author_refresh(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Re-decide whose name goes on an agent's commits, and write it to its machine.
+
+    The author is chosen when an agent is created: the person who connected
+    the GitHub account its client (or its agency) uses, else the owner of the
+    fleet's PAT. Connecting, reconnecting or disconnecting an account refreshes
+    every agent of that scope by itself; this is for the rest, such as a PAT
+    that changed hands or an agent from before FLOTTA-105.
+
+    Asks the control plane, which knows where each agent lives. A sleeping
+    agent stays asleep; a running one restarts to pick the name up, and one
+    whose machine already says so is left alone.
+    """
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if not control_url():
+        raise _fail(
+            ControlPlaneError(
+                "the author is written to the agent's own machine, which only the "
+                "control plane can reach. Set $FLOTTA_CONTROL_URL."
+            ),
+            code=2,
+        )
+    try:
+        box = _remote_box(box_id)
+        body = control_request(
+            "POST",
+            f"/api/boxes/{box['id']}/author",
+            scopes=(SCOPE_FLEET_WRITE,),
+            # A running agent restarts before this answers.
+            timeout_s=300.0,
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    name = body.get("name") or box.get("name") or box_id
+    login = body.get("login")
+    if not body.get("changed"):
+        said = (
+            f"already authored as {login}"
+            if login
+            else "already commits as itself: nobody is named"
+        )
+    elif login:
+        said = f"commits are now authored as {login} <{body.get('email')}>"
+    else:
+        said = "commits as itself again: nobody is named for its repositories"
+    emit(body, f"{name}  {said}", as_json=as_json)
+
+
 # -- tokens (M5) ------------------------------------------------------------
 
 token_app = typer.Typer(
