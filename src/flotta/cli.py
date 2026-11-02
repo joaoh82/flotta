@@ -1462,27 +1462,21 @@ def gateway(
     a priced usage row per call. Refuses to start without a signing key, because
     its whole job is to tell whose call this is.
     """
-    try:
-        import uvicorn
-
-        from flotta.gateway import create_gateway
-    except ImportError as exc:
-        typer.secho(
-            "the gateway needs its extra: `uv sync --extra control`",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=2) from exc
-    from flotta.auth import SIGNING_KEY_ENV, resolve_signing_key
-    from flotta.db import DATABASE_URL_ENV
-    from flotta.gateway.app import BASE_URL_ENV, FLEET_KEY_ENV
-    from flotta.gateway.fake import FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
-    from flotta.inference import is_openrouter
-    from flotta.model_catalog import fetch_prices
 
     def refuse(message: str) -> typer.Exit:
         typer.secho(message, fg=typer.colors.RED, err=True)
         return typer.Exit(code=2)
+
+    try:
+        from flotta.gateway import create_gateway
+        from flotta.gateway.app import BASE_URL_ENV, FLEET_KEY_ENV
+        from flotta.gateway.fake import FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
+    except ImportError as exc:
+        raise refuse("the gateway needs its extra: `uv sync --extra control`") from exc
+    from flotta.auth import SIGNING_KEY_ENV, resolve_signing_key
+    from flotta.db import DATABASE_URL_ENV
+    from flotta.inference import is_openrouter
+    from flotta.model_catalog import fetch_prices
 
     if not resolve_signing_key():
         raise refuse(
@@ -1510,6 +1504,11 @@ def gateway(
         # Only OpenRouter has a catalogue to read. Elsewhere a call stays unpriced.
         source = (lambda: fetch_prices()[0]) if is_openrouter(base_url) else None
         app_ = create_gateway(price_source=source)
+
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise refuse("the gateway needs its extra: `uv sync --extra control`") from exc
 
     typer.secho(f"model gateway on {host}:{port}", fg=typer.colors.BRIGHT_BLACK, err=True)
     uvicorn.run(app_, host=host, port=port)
