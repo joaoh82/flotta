@@ -22,6 +22,11 @@ overruns by more. Reserving against an estimate would close that, and would
 refuse calls that fit. A failed call whose output is unknown can undercount too
 (`flotta.gateway.app`).
 
+**A finished call whose row has not reached the store is not overshoot, it is a
+sum that cannot be trusted.** Every budget that row would count against refuses
+until it is written (`unsettled`), so a store that can be read and not written
+cannot wave calls through.
+
 ## What cannot be priced
 
 With a budget covering the box, a model with no price, or no exchange rate, is a
@@ -35,6 +40,7 @@ Periods are in UTC. Until M13.5 every action refuses when the limit is reached.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -146,6 +152,15 @@ def unchecked(*key: str) -> Refusal:
     )
 
 
+def _counts_against(budget: Budget, box: Box) -> bool:
+    """Whether a call by `box` counts against `budget`."""
+    return (
+        budget.org == box.org
+        and (budget.client is None or budget.client == box.client)
+        and (budget.box is None or budget.box == box.id)
+    )
+
+
 def check_budgets(
     store: FleetStore,
     box: Box,
@@ -153,11 +168,26 @@ def check_budgets(
     model: str,
     eur_per_usd: Decimal | None,
     now: datetime,
+    unsettled: Iterable[Box] = (),
 ) -> Refusal | None:
-    """Why this box may not call `model` now, or `None` if it may."""
+    """Why this box may not call `model` now, or `None` if it may.
+
+    `unsettled` is the boxes with a finished call whose row is not in the store.
+    """
     covering = store.budgets_covering(box)
     if not covering:
         return None
+
+    missing = list(unsettled)
+    for budget in covering:
+        if any(_counts_against(budget, other) for other in missing):
+            return Refusal(
+                "budget_unchecked",
+                "The budget could not be checked, because the cost of an earlier call has not "
+                "been recorded yet, so this call was refused.",
+                budget_dict(budget),
+                key=("budget_unsettled", budget.id, period_start(budget.period, now).isoformat()),
+            )
 
     first = covering[0]
     price = store.price_of(model, at=now)

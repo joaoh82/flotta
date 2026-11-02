@@ -787,6 +787,11 @@ conventions, and the sharp edges below.
   one agent in a loop overruns by one call, and overall by at most one call per call
   in flight when the limit is crossed. An unpriced row in the period stops that
   budget until the period rolls over, since its sum is short by an unknown amount.
+  **So does a finished call whose row has not reached the store:** a store that can be
+  read and not written would otherwise show a sum that never moves. The gateway keeps
+  such rows and retries them with their original moment; every budget they count
+  against refuses until they land. That is in one process's memory, so a restart
+  loses them (logged) and a second gateway instance would not see them.
   The limit is whole nanos and periods are UTC. Until M13.5 every action refuses.
 
 ## Source of truth

@@ -8,6 +8,7 @@ to end in a refusal, with the upstream never called.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -63,9 +64,16 @@ def _auth(box="b-one", org="studio-nord", client="acme"):
     return {"Authorization": f"Bearer {token}"}
 
 
-def _client(path, upstream, env=ENV):
-    app = create_gateway(store_factory=lambda: FleetStore(path), transport=upstream, env=env)
+def _client(path, upstream, env=ENV, **kwargs):
+    app = create_gateway(
+        store_factory=lambda: FleetStore(path), transport=upstream, env=env, **kwargs
+    )
     return TestClient(app)
+
+
+def _spent(path, org="studio-nord"):
+    with FleetStore(path) as fleet:
+        return fleet.spend(org=org, since=EARLIER).eur_nano
 
 
 def _budget(path, *, org="studio-nord", client=None, box=None, nano=NANO, period="day"):
@@ -212,6 +220,198 @@ def test_another_orgs_spend_does_not_count(path, upstream):
         _call(client, box="b-four", org="other")
         _call(client, box="b-four", org="other")
         assert _call(client).status_code == 200
+
+
+# -- a row that has not reached the store ------------------------------------------
+
+
+def _quick(path, upstream, **kwargs):
+    return _client(path, upstream, settle_s=0.05, write_backoff_s=0.0, write_retry_s=0.0, **kwargs)
+
+
+@pytest.fixture
+def writes_fail(monkeypatch):
+    """A store that can be read and not written: the case a short sum hides."""
+
+    def broken(self, *args, **kwargs):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(FleetStore, "record_usage", broken)
+
+
+def test_a_row_that_cannot_be_written_stops_the_budget_it_counts_against(
+    path, upstream, writes_fail
+):
+    """The guard. Four 200s here is the bug: the sum never moves, so nothing stops."""
+    _budget(path, box="b-one", nano=ONE_CALL)
+    with _quick(path, upstream) as client:
+        answers = [_call(client) for _ in range(4)]
+    assert [a.status_code for a in answers] == [200, 402, 402, 402]
+    assert answers[1].json()["error"]["code"] == "budget_unchecked"
+    assert answers[1].json()["error"]["budget"]["limit_eur"]
+    assert len(upstream.requests) == 1
+
+
+def test_a_write_still_running_past_the_wait_stops_the_budget_too(path, upstream, monkeypatch):
+    budget_nano = 100 * ONE_CALL
+    _budget(path, box="b-one", nano=budget_nano)
+    release = threading.Event()
+    real = FleetStore.record_usage
+
+    def held(self, *args, **kwargs):
+        release.wait(timeout=10)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", held)
+    with _quick(path, upstream) as client:
+        try:
+            outcomes = [_call(client).status_code for _ in range(3)]
+        finally:
+            release.set()
+    assert outcomes == [200, 402, 402]
+    assert len(upstream.requests) == 1
+
+
+def test_once_the_row_is_written_calls_go_through_again(path, upstream, monkeypatch):
+    _budget(path, box="b-one", nano=100 * ONE_CALL)
+    real = FleetStore.record_usage
+    broken = {"now": True}
+
+    def flaky(self, *args, **kwargs):
+        if broken["now"]:
+            raise OSError("the disk is full")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", flaky)
+    with _quick(path, upstream) as client:
+        assert _call(client).status_code == 200
+        assert _call(client).status_code == 402
+        broken["now"] = False
+        # The next call tries the row again; it may need one more to see it land.
+        outcomes = [_call(client).status_code for _ in range(3)]
+    assert outcomes[-1] == 200
+    assert _spent(path) >= ONE_CALL
+
+
+def test_a_row_written_late_keeps_the_moment_of_its_call(path, upstream, monkeypatch):
+    """A retry after midnight must not move yesterday's spend into today."""
+    _budget(path, box="b-one", nano=100 * ONE_CALL)
+    real = FleetStore.record_usage
+    seen = []
+
+    def flaky(self, *args, **kwargs):
+        seen.append(kwargs["now"])
+        if len(seen) <= 3:
+            raise OSError("the disk is full")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", flaky)
+    with _quick(path, upstream) as client:
+        _call(client)
+        _call(client)
+    assert len(seen) > 3
+    assert len({moment for moment in seen[:4]}) == 1
+
+
+def test_an_unwritten_row_stops_every_budget_it_counts_against_and_no_other(
+    path, upstream, monkeypatch
+):
+    """Whether b-two's missing row stops another agent depends on the budget."""
+    real = FleetStore.record_usage
+
+    def only_for_others(self, box_id, **kwargs):
+        if box_id == "b-two":
+            raise OSError("the disk is full")
+        return real(self, box_id, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", only_for_others)
+    _budget(path, client="acme", nano=100 * ONE_CALL)
+    _budget(path, client="bravo", nano=100 * ONE_CALL)
+    _budget(path, box="b-four", org="other", nano=100 * ONE_CALL)
+    with _quick(path, upstream) as client:
+        assert _call(client, box="b-two").status_code == 200
+        # Its client's budget counts b-two's call, so a sibling is stopped.
+        assert _call(client).status_code == 402
+        # Another client's, and another org's, do not.
+        assert _call(client, box="b-three", client="bravo").status_code == 200
+        assert _call(client, box="b-four", org="other").status_code == 200
+
+
+def test_an_unwritten_row_does_not_stop_the_same_client_id_in_another_org(
+    path, upstream, monkeypatch
+):
+    real = FleetStore.record_usage
+
+    def only_for_others(self, box_id, **kwargs):
+        if box_id == "b-two":
+            raise OSError("the disk is full")
+        return real(self, box_id, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", only_for_others)
+    _budget(path, org="other", client="acme", nano=100 * ONE_CALL)
+    with _quick(path, upstream) as client:
+        assert _call(client, box="b-two").status_code == 200
+        assert _call(client, box="b-four", org="other").status_code == 200
+
+
+def test_a_siblings_unwritten_row_does_not_stop_an_agents_own_budget(path, upstream, monkeypatch):
+    real = FleetStore.record_usage
+
+    def only_for_others(self, box_id, **kwargs):
+        if box_id == "b-two":
+            raise OSError("the disk is full")
+        return real(self, box_id, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", only_for_others)
+    _budget(path, box="b-one", nano=100 * ONE_CALL)
+    with _quick(path, upstream) as client:
+        assert _call(client, box="b-two").status_code == 200
+        assert _call(client).status_code == 200
+
+
+def test_with_no_budget_a_failed_write_stops_nothing(path, upstream, writes_fail):
+    with _quick(path, upstream) as client:
+        assert [_call(client).status_code for _ in range(3)] == [200, 200, 200]
+
+
+def test_with_no_budget_the_row_still_gets_written_when_it_can(path, upstream, monkeypatch):
+    real = FleetStore.record_usage
+    broken = {"now": True}
+
+    def flaky(self, *args, **kwargs):
+        if broken["now"]:
+            raise OSError("the disk is full")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(FleetStore, "record_usage", flaky)
+    with _quick(path, upstream) as client:
+        _call(client)
+        _call(client)
+        broken["now"] = False
+    # The way out of the block above shuts the gateway down, which tries once more.
+    assert _spent(path) == 2 * ONE_CALL
+
+
+def test_a_settlement_that_raises_refuses_and_does_not_forward(path, upstream, monkeypatch):
+    from flotta.gateway.app import _Ledger
+
+    async def broken(self, *, timeout):
+        raise RuntimeError("the secret reason")
+
+    monkeypatch.setattr(_Ledger, "settle", broken)
+    with _quick(path, upstream) as client:
+        response = _call(client)
+    assert response.status_code == 402
+    assert "secret" not in response.text
+    assert upstream.requests == []
+
+
+def test_a_row_that_is_never_written_is_logged_as_lost_at_shutdown(
+    path, upstream, writes_fail, caplog
+):
+    with _quick(path, upstream) as client:
+        _call(client)
+    assert "a usage row is lost" in caplog.text
 
 
 # -- which budgets cover a box ---------------------------------------------------

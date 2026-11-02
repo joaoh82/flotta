@@ -52,9 +52,14 @@ After the response ends, however it ends:
 
 The write goes on a thread of its own and nothing awaits it, because a client
 that disconnects cancels this request's task, and with it any `await`. Shutdown
-waits for those threads. A write that fails is retried with the same idempotency
-key, then logged with its numbers: the reply has already gone, so there is
-nothing left to refuse.
+waits for those threads.
+
+**A row is unsettled until it is in the store.** One that cannot be written is
+kept and tried again with the same idempotency key and its original moment, while
+every budget it would count against refuses calls: otherwise a store that can be
+read but not written would show a sum that never moves, and every call would pass.
+This is in memory, so one gateway process sees its own rows only, and a restart
+loses any it could not write. That loss is logged with the numbers.
 """
 
 from __future__ import annotations
@@ -136,6 +141,9 @@ PRICE_REFRESH_S = 24 * 60 * 60
 #: How long a budget check waits for rows still being written, so a loop's next
 #: call sees its last one. A database in trouble must not hold every call for long.
 _SETTLE_S = 2.0
+
+#: How long before a row that could not be written is tried again.
+_WRITE_RETRY_S = 5.0
 
 #: Not text the model wrote, so not counted towards an estimate.
 _NOT_TEXT = frozenset({"role", "type", "id", "index"})
@@ -280,46 +288,109 @@ class _Events:
         return keep
 
 
+@dataclass(eq=False, slots=True)
+class _Entry:
+    """A row on its way to the store."""
+
+    box: Box | None
+    row: dict[str, Any]
+    running: bool = True
+    retry_at: float = 0.0
+    failed_before: bool = False
+
+
 class _Ledger:
-    """Writes rows on threads that a cancelled request cannot take with it."""
+    """Writes rows on threads that a cancelled request cannot take with it.
+
+    A row stays here until it is written, however long that takes. `settle` says
+    which are still missing, because that is what a budget has to know.
+    """
 
     def __init__(
-        self, write: Callable[..., Any], *, attempts: int = 3, backoff_s: float = 0.5
+        self,
+        write: Callable[..., Any],
+        *,
+        attempts: int = 3,
+        backoff_s: float = 0.5,
+        retry_s: float = _WRITE_RETRY_S,
     ) -> None:
         self._write = write
         self._attempts = attempts
         self._backoff_s = backoff_s
+        self._retry_s = retry_s
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="flotta-ledger")
         self._pending: set[Future[None]] = set()
+        self._lock = threading.Lock()
+        self._unsettled: set[_Entry] = set()
 
-    def write(self, **row: Any) -> None:
+    def write(self, *, box: Box | None = None, **row: Any) -> None:
+        entry = _Entry(box, row)
+        with self._lock:
+            self._unsettled.add(entry)
+        self._submit(entry)
+
+    def _submit(self, entry: _Entry) -> None:
         try:
-            future = self._pool.submit(self._attempt, row)
+            future = self._pool.submit(self._attempt, entry)
         except RuntimeError:
             # Shutting down, with a stream that ended after the pool closed.
-            self._attempt(row)
+            self._attempt(entry)
             return
         self._pending.add(future)
         future.add_done_callback(self._pending.discard)
 
-    def _attempt(self, row: dict[str, Any]) -> None:
+    def _attempt(self, entry: _Entry) -> None:
         for attempt in range(1, self._attempts + 1):
             try:
-                self._write(**row)
-                return
+                self._write(**entry.row)
             except Exception:
                 if attempt == self._attempts:
-                    _log.exception("a usage row could not be written: %s", row)
+                    if not entry.failed_before:
+                        _log.exception("a usage row could not be written: %s", entry.row)
+                    with self._lock:
+                        entry.running = False
+                        entry.failed_before = True
+                        entry.retry_at = time.monotonic() + self._retry_s
                 else:
                     time.sleep(self._backoff_s * attempt)
+            else:
+                with self._lock:
+                    self._unsettled.discard(entry)
+                return
 
-    async def drain(self, *, timeout: float | None = None) -> None:
+    def _retry_due(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            due = [e for e in self._unsettled if not e.running and now >= e.retry_at]
+            for entry in due:
+                entry.running = True
+        for entry in due:
+            self._submit(entry)
+
+    async def settle(self, *, timeout: float) -> list[Box]:
+        """Try again what is due, wait a moment, and name the boxes still missing rows."""
+        self._retry_due()
         pending = set(self._pending)
         if pending:
             await asyncio.to_thread(wait, pending, timeout)
+        with self._lock:
+            return [entry.box for entry in self._unsettled if entry.box is not None]
+
+    async def drain(self) -> None:
+        pending = set(self._pending)
+        if pending:
+            await asyncio.to_thread(wait, pending)
 
     def close(self) -> None:
+        """One last try at what is left, and say what could not be saved."""
         self._pool.shutdown(wait=True)
+        with self._lock:
+            left = list(self._unsettled)
+        for entry in left:
+            try:
+                self._write(**entry.row)
+            except Exception:
+                _log.exception("a usage row is lost: %s", entry.row)
 
 
 _closing: set[asyncio.Future[None]] = set()
@@ -384,6 +455,9 @@ def create_gateway(
     env: Mapping[str, str] | None = None,
     stored_keys: StoredKeys = _nothing_stored,
     price_source: Callable[[], Iterable[Price]] | None = None,
+    settle_s: float = _SETTLE_S,
+    write_backoff_s: float = 0.5,
+    write_retry_s: float = _WRITE_RETRY_S,
 ) -> FastAPI:
     """Build the gateway's ASGI app. The upstream and the store are injected."""
     environment: Mapping[str, str] = os.environ if env is None else env
@@ -399,7 +473,7 @@ def create_gateway(
         finally:
             store.close()
 
-    ledger = _Ledger(write_row)
+    ledger = _Ledger(write_row, backoff_s=write_backoff_s, retry_s=write_retry_s)
 
     def refresh_prices() -> None:
         assert price_source is not None
@@ -481,12 +555,14 @@ def create_gateway(
             raise _Refused(403, reason)
         return box
 
-    def check_budgets(box: Box, model: str) -> budgets.Refusal | None:
+    def check_budgets(box: Box, model: str, unsettled: list[Box]) -> budgets.Refusal | None:
         store = store_factory()
         try:
             rate = resolve_eur_per_usd(layered(store, environment))
             now = datetime.now(UTC)
-            return budgets.check_budgets(store, box, model=model, eur_per_usd=rate, now=now)
+            return budgets.check_budgets(
+                store, box, model=model, eur_per_usd=rate, now=now, unsettled=unsettled
+            )
         finally:
             store.close()
 
@@ -522,9 +598,9 @@ def create_gateway(
 
     async def refused_by_budget(box: Box, model: str) -> JSONResponse | None:
         """The 402 if this call may not go out. Anything unexpected is one too."""
-        await ledger.drain(timeout=_SETTLE_S)
         try:
-            refusal = await asyncio.to_thread(check_budgets, box, model)
+            unsettled = await ledger.settle(timeout=settle_s)
+            refusal = await asyncio.to_thread(check_budgets, box, model, unsettled)
         except Exception:
             _log.exception("a budget check failed")
             # Keyed by the minute: an outage is worth more than one event, not thousands.
@@ -613,7 +689,9 @@ def create_gateway(
             else:
                 tokens = (_estimated_tokens(len(raw)), _estimated_tokens(chars), 0)
             ledger.write(
+                box=box,
                 **call,
+                now=datetime.now(UTC),
                 tokens_in=tokens[0],
                 tokens_out=tokens[1],
                 tokens_cached=tokens[2],
