@@ -1722,3 +1722,37 @@ def test_the_gateway_refuses_what_it_cannot_do_safely(tmp_path, monkeypatch, arg
 
     assert result.exit_code == 2, result.output
     assert said in result.output
+
+
+@pytest.mark.parametrize(("command", "method"), [("gateway", "POST"), ("direct", "DELETE")])
+def test_moving_an_agent_goes_through_the_fleet_api(tmp_path, monkeypatch, command, method):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    calls = []
+
+    def fake(verb, path, *, scopes, body=None, **kw):
+        calls.append((verb, path))
+        if path.endswith("/gateway"):
+            return {"box_id": "b-1", "name": "eng-a", "started": True}
+        return {"id": "b-1", "name": "eng-a"}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    result = CliRunner().invoke(cli.app, ["model", command, "eng-a"])
+    assert result.exit_code == 0, result.output
+    assert calls[-1] == (method, "/api/boxes/b-1/gateway")
+    assert "restarts twice" in result.output
+
+
+def test_moving_an_agent_needs_a_control_plane(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli.app, ["model", "gateway", "eng-a"])
+    assert result.exit_code == 2
+    assert "FLOTTA_CONTROL_URL" in result.output

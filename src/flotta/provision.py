@@ -384,14 +384,84 @@ def _require_task(store: FleetStore, task_id: str) -> Task:
 #: Rotation is still the answer, not a longer number: `just box-identity`.
 BOX_TOKEN_TTL_S = 90 * 24 * 3600
 
+#: How long the token an agent calls models with lasts: years, unlike its identity.
+#: Nothing renews it, and when it expires the agent can no longer think. It carries
+#: only `model:call`, and the gateway refuses a destroyed agent, so a long life does
+#: not reach far: at worst, spend metered against the agent it names.
+MODEL_TOKEN_TTL_S = 5 * 365 * 24 * 3600
+
+GATEWAY_URL_ENV = "FLOTTA_GATEWAY_URL"
+
+#: A move onto the gateway, or back off it (FLOTTA-90).
+GATEWAY_JOINED = "gateway_joined"
+GATEWAY_LEFT = "gateway_left"
+GATEWAY_MOVE_FAILED = "gateway_move_failed"
+
 
 #: The box's dashboard user. Constant, because the door logs in as it — the
 #: username was never the secret, the password is.
 BOX_AUTH_USER = "flotta"
 
 
+def gateway_url(env: Mapping[str, str] | None = None) -> str | None:
+    """The base URL Hermes appends `/chat/completions` to, if there is a gateway.
+
+    **This variable is the switch.** With it unset, boxes call the provider directly,
+    exactly as before. Environment only, like the endpoint: it decides where a token
+    goes, so it is not a setting that can be changed over HTTP.
+    """
+    source = os.environ if env is None else env
+    url = (source.get(GATEWAY_URL_ENV) or "").strip().rstrip("/")
+    if not url:
+        return None
+    return url if url.endswith("/v1") else f"{url}/v1"
+
+
+def gateway_secrets(
+    box_id: str,
+    model: str,
+    *,
+    env: Mapping[str, str],
+    org: str | None = None,
+    client: str | None = None,
+) -> dict[str, str]:
+    """What a box needs to call models through the gateway. Raises `AuthError`.
+
+    Its own token where a provider's key would be, and **the fleet's key nowhere**.
+    The same three names as ever, so an image from before this works too: only the
+    `providers:` entry in `flotta.box.inference` needs a newer one.
+    """
+    from flotta.auth import SCOPE_MODEL_CALL, box_subject, mint
+    from flotta.inference import is_openrouter, provider_secrets
+
+    url = gateway_url(env)
+    assert url is not None
+    token = mint(
+        subject=box_subject(box_id),
+        scopes={SCOPE_MODEL_CALL},
+        ttl_s=MODEL_TOKEN_TTL_S,
+        env=dict(env),
+        **_tenant_claims(org, client),
+    )
+    secrets = provider_secrets(model, url, token)
+    if is_openrouter((env.get("FLOTTA_MODEL_BASE_URL") or "").strip()):
+        secrets["FLOTTA_GATEWAY_UPSTREAM"] = "openrouter"
+    return secrets
+
+
+def _tenant_claims(org: str | None, client: str | None) -> dict[str, str]:
+    """A token's tenancy, absent for the default org's default client (M11.5)."""
+    if (org or DEFAULT_ORG, client or DEFAULT_CLIENT) == (DEFAULT_ORG, DEFAULT_CLIENT):
+        return {}
+    return {"org": org or DEFAULT_ORG, "client": client or DEFAULT_CLIENT}
+
+
 def fleet_secrets(
-    env: dict[str, str] | None = None, *, box_id: str
+    env: dict[str, str] | None = None,
+    *,
+    box_id: str,
+    org: str | None = None,
+    client: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """What every box in this fleet needs to boot, and what is missing.
 
@@ -433,7 +503,18 @@ def fleet_secrets(
     model = (source.get("FLOTTA_MODEL") or "").strip()
     base_url = (source.get("FLOTTA_MODEL_BASE_URL") or "").strip()
     api_key = (source.get("FLOTTA_API_KEY") or "").strip()
-    if model and base_url and api_key:
+    if gateway_url(source):
+        from flotta.auth import AuthError
+
+        if not model:
+            missing.append("FLOTTA_MODEL")
+            return secrets, missing
+        try:
+            secrets.update(gateway_secrets(box_id, model, env=source, org=org, client=client))
+        except AuthError:
+            # Without a token, the agent would boot with no way to call a model.
+            missing.append("FLOTTA_SIGNING_KEY (the gateway needs a token for this agent)")
+    elif model and base_url and api_key:
         # **Two consumers, two vocabularies.** `flotta.box.run` reads the
         # FLOTTA_* names; `hermes serve` — the surface the app talks to —
         # reads neither them nor, on this path, `OPENAI_BASE_URL`. It reads
@@ -521,16 +602,13 @@ def build_identity(
     if email_domain:
         box_env["FLOTTA_GIT_EMAIL_DOMAIN"] = email_domain
 
-    tenant: dict[str, str] = {}
-    if (org or DEFAULT_ORG, client or DEFAULT_CLIENT) != (DEFAULT_ORG, DEFAULT_CLIENT):
-        tenant = {"org": org or DEFAULT_ORG, "client": client or DEFAULT_CLIENT}
     try:
         token = mint(
             subject=box_subject(box_id),
             scopes={SCOPE_GIT_CREDENTIAL, SCOPE_BOX_PEER},
             ttl_s=ttl_s,
             env=source,
-            **tenant,
+            **_tenant_claims(org, client),
         )
     except AuthError:
         # No signing key is a legitimate state — it is the whole loopback
@@ -928,7 +1006,7 @@ def create_box(
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
-    fleet, missing_fleet = fleet_secrets(source, box_id=box.id)
+    fleet, missing_fleet = fleet_secrets(source, box_id=box.id, org=box.org, client=box.client)
     # This agent's own model, if it has one — from the store for the reason
     # `meta` is. Only the model is overridden: the endpoint and key stay the
     # fleet's (see the `box_models` table).
@@ -1733,6 +1811,133 @@ def repair_connection(
         {"control_url": wanted, "rewrote": result["rewrote"], "was": current["FLOTTA_CONTROL_URL"]},
     )
     return result
+
+
+def _movable(box_id: str, store: FleetStore) -> tuple[Box, str]:
+    """A box with a settled machine, and the model it runs."""
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to update.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(f"box {box_id} is still being created; wait for it to settle.")
+    model = store.model_for_box(box.id) or fleet_model(store)
+    if not model:
+        raise ProvisionError(f"no model is known for {box.name}; set the fleet's first.")
+    return box, model
+
+
+def _rewrite_provider(
+    box: Box,
+    impl: Backend,
+    store: FleetStore,
+    *,
+    write: dict[str, str],
+    remove: list[str],
+    write_failed: str,
+    remove_failed: str,
+) -> None:
+    """Write, then remove, in that order.
+
+    The other order would leave an agent on OpenRouter with no key to call it with.
+    A running agent restarts for each, and a sleeping one stays asleep and takes it
+    when it next wakes, as with `rotate_identity`.
+    """
+    try:
+        impl.apply_secrets(box.endpoint, write)
+    except BackendError as exc:
+        store.add_event(
+            "box", box.id, GATEWAY_MOVE_FAILED, {"step": "write", "error": str(exc)[:400]}
+        )
+        raise UpgradeFailed(f"{write_failed}: {exc}") from exc
+    remover = getattr(impl, "remove_secrets", None)
+    try:
+        if remover is None:
+            raise NotSupported(f"{type(impl).__name__} cannot remove a machine's secrets")
+        remover(box.endpoint, remove)
+    except (BackendError, NotSupported) as exc:
+        store.add_event(
+            "box", box.id, GATEWAY_MOVE_FAILED, {"step": "remove", "error": str(exc)[:400]}
+        )
+        raise UpgradeFailed(f"{remove_failed}: {exc}") from exc
+
+
+def join_gateway(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Move an existing agent onto the gateway, and take the fleet's key off it.
+
+    One agent at a time, because Hermes behaves differently off OpenRouter's URL
+    (`inference.gateway_provider`), and that has to be measured on one before the
+    rest. `leave_gateway` is the way back. Synchronous: the control plane runs it on
+    a thread, as `set_model`.
+    """
+    from flotta.auth import AuthError
+    from flotta.settings import layered
+
+    source = layered(store)
+    if not gateway_url(source):
+        raise ProvisionError(
+            f"there is no gateway to move to. Set ${GATEWAY_URL_ENV} where the control plane runs."
+        )
+    box, model = _movable(box_id, store)
+    try:
+        secrets = gateway_secrets(box.id, model, env=source, org=box.org, client=box.client)
+    except AuthError as exc:
+        raise ProvisionError(
+            "no signing key is configured, so there is no token to give this agent. Set "
+            "$FLOTTA_SIGNING_KEY where the control plane runs."
+        ) from exc
+    _rewrite_provider(
+        box,
+        _resolve_backend(box, backend),
+        store,
+        write=secrets,
+        remove=["OPENROUTER_API_KEY"],
+        write_failed=f"could not move {box.name}, which still calls its provider directly",
+        remove_failed=f"{box.name} now calls the gateway, and still holds the provider's key",
+    )
+    via = secrets["FLOTTA_MODEL_BASE_URL"]
+    store.add_event("box", box.id, GATEWAY_JOINED, {"via": via, "model": model})
+    return {"box_id": box.id, "name": box.name, "model": model, "via": via}
+
+
+def leave_gateway(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Put an agent back on the provider directly: the way back from `join_gateway`.
+
+    Needs the control plane to still hold the key, so it has to outlive the last
+    agent's move.
+    """
+    from flotta.inference import provider_secrets
+    from flotta.settings import layered
+
+    source = layered(store)
+    base_url = (source.get("FLOTTA_MODEL_BASE_URL") or "").strip()
+    api_key = (source.get("FLOTTA_API_KEY") or "").strip()
+    box, model = _movable(box_id, store)
+    if not (base_url and api_key):
+        raise ProvisionError(
+            "there is no provider to go back to. Set $FLOTTA_MODEL_BASE_URL and "
+            "$FLOTTA_API_KEY where the control plane runs."
+        )
+    _rewrite_provider(
+        box,
+        _resolve_backend(box, backend),
+        store,
+        write=provider_secrets(model, base_url, api_key),
+        remove=["FLOTTA_GATEWAY_UPSTREAM"],
+        write_failed=f"could not move {box.name}, which still calls the gateway",
+        remove_failed=f"{box.name} calls its provider directly, with a stale gateway setting",
+    )
+    store.add_event("box", box.id, GATEWAY_LEFT, {"via": base_url, "model": model})
+    return {"box_id": box.id, "name": box.name, "model": model, "via": base_url}
 
 
 #: The event a model change writes.

@@ -207,6 +207,7 @@ def test_the_backend_satisfies_the_protocol():
         # Both of these were added to the protocol without being listed here,
         # which is how a list like this quietly stops being the protocol.
         "apply_secrets",
+        "remove_secrets",
         "apply_env",
         "reimage",
         "exec",
@@ -1101,6 +1102,23 @@ def test_a_rotated_secret_goes_to_the_app_the_endpoint_names():
     assert stdin == "FLOTTA_BOX_TOKEN=t\n"
     # The value travels on stdin, never argv, where `ps` would show it.
     assert not any("FLOTTA_BOX_TOKEN" in part for part in cmd)
+
+
+def test_removing_secrets_is_deployed_and_on_the_boxs_own_app():
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    FlyBackend(config=_offline_config(), runner=runner).remove_secrets(
+        "fly://joaoh82-flotta-eng-g/m1", ["OPENROUTER_API_KEY"]
+    )
+    assert issued[0][:4] == ["flyctl", "secrets", "unset", "OPENROUTER_API_KEY"]
+    assert issued[0][issued[0].index("--app") + 1] == "joaoh82-flotta-eng-g"
+    assert "--stage" not in issued[0]
 
 
 def test_a_rotation_is_deployed_rather_than_merely_staged():

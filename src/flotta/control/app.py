@@ -3327,6 +3327,76 @@ def create_app(
         worker.start()
         return JSONResponse({"box_id": box.id, "name": box.name, "started": True}, status_code=202)
 
+    def _move_provider(box_id: str, token: Token | None, *, join: bool) -> Any:
+        """The two routes below. `202`, then a thread: a running agent restarts twice."""
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import (
+            ProvisionError,
+            UpgradeFailed,
+            gateway_url,
+            join_gateway,
+            leave_gateway,
+        )
+
+        move = join_gateway if join else leave_gateway
+        store = store_factory()
+        try:
+            box = _operated_box(store, token, box_id)
+            if not _is_operator(token):
+                raise HTTPException(
+                    status_code=403, detail="only the fleet's operator may move an agent"
+                )
+            if is_terminal("box", box.status) or box.status == "provisioning" or not box.endpoint:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"box {box.name} has no settled machine to move ({box.status}).",
+                )
+            if join and not gateway_url():
+                raise HTTPException(
+                    status_code=409,
+                    detail="there is no gateway. Set $FLOTTA_GATEWAY_URL where this runs.",
+                )
+            if not background:
+                try:
+                    return move(box.id, store=store)
+                except UpgradeFailed as exc:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                except ProvisionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+        def run() -> None:
+            inner = store_factory()
+            try:
+                move(box.id, store=inner)
+            except Exception as exc:  # noqa: BLE001
+                # A failed write leaves an event first; a refusal is why it was refused.
+                _log.warning("moving %s failed: %s: %s", box.name, type(exc).__name__, exc)
+            finally:
+                inner.close()
+
+        worker = threading.Thread(target=run, name=f"move-{box.name}", daemon=True)
+        _provisioning.add(worker)
+        worker.start()
+        return JSONResponse({"box_id": box.id, "name": box.name, "started": True}, status_code=202)
+
+    @app.post("/api/boxes/{box_id}/gateway")
+    def join_gateway_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
+        """Move an agent onto the model gateway, and take the fleet's key off it.
+
+        The operator's: this is the fleet's bill and the fleet's key. Its outcome is
+        the timeline's `gateway_joined` or `gateway_move_failed`. See
+        `provision.join_gateway`.
+        """
+        return _move_provider(box_id, token, join=True)
+
+    @app.delete("/api/boxes/{box_id}/gateway")
+    def leave_gateway_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
+        """Put an agent back on the provider directly: the way back."""
+        return _move_provider(box_id, token, join=False)
+
     @app.post("/api/boxes/{box_id}/identity")
     def rotate_identity_endpoint(box_id: str, token: Token | None = needs_write) -> Any:
         """Give an agent a fresh identity token, written to its own machine.

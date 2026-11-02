@@ -25,7 +25,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from flotta.inference import MANAGED_KEYS, hermes_model_config
+from flotta.inference import (
+    GATEWAY_PROVIDER,
+    MANAGED_KEYS,
+    gateway_provider,
+    hermes_model_config,
+)
 
 
 def settle_model(
@@ -59,6 +64,24 @@ def settle_model(
     return config, True
 
 
+def settle_gateway(config: dict[str, Any], wanted: dict[str, Any] | None) -> dict[str, Any]:
+    """The config with Flotta's `providers:` entry as `wanted`, or gone. Pure.
+
+    Only that entry: any other provider is whoever set it's.
+    """
+    config = dict(config)
+    current = config.get("providers")
+    providers = dict(current) if isinstance(current, dict) else {}
+    providers.pop(GATEWAY_PROVIDER, None)
+    if wanted is not None:
+        providers[GATEWAY_PROVIDER] = wanted
+    if providers:
+        config["providers"] = providers
+    else:
+        config.pop("providers", None)
+    return config
+
+
 def apply(home: Path, env: dict[str, str] | None = None) -> str:
     """Settle `<home>/config.yaml`. Returns a boot-log line; never raises.
 
@@ -85,6 +108,10 @@ def apply(home: Path, env: dict[str, str] | None = None) -> str:
         return f"model left alone: {path} is not a mapping"
 
     settled, changed = settle_model(loaded, wanted)
+    # Only for a gateway in front of OpenRouter: see `gateway_provider`.
+    through = (source.get("FLOTTA_GATEWAY_UPSTREAM") or "").strip() == "openrouter"
+    settled = settle_gateway(settled, gateway_provider(model, base_url) if through else None)
+    changed = changed or settled != (loaded or {})
     described = f"{model} via {wanted['provider']}"
     if not changed:
         return f"model: already {described}"
