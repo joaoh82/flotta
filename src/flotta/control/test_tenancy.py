@@ -266,6 +266,7 @@ def test_without_a_signing_key_the_caller_is_the_operator_over_everything(fleet)
 OPERATOR_ROUTES = [
     ("GET", "/api/settings", SCOPE_FLEET_READ, None),
     ("PUT", "/api/settings", SCOPE_FLEET_WRITE, {"values": {"FLOTTA_FLY_REGION": "ams"}}),
+    ("POST", "/api/prices/refresh", SCOPE_FLEET_WRITE, None),
     ("GET", "/api/hermes", SCOPE_FLEET_READ, None),
     ("GET", "/api/hermes/builds", SCOPE_FLEET_READ, None),
     ("POST", "/api/hermes/update", SCOPE_FLEET_WRITE, {"hermes_ref": "v0.22.5"}),

@@ -212,6 +212,10 @@ SETTINGS: tuple[Setting, ...] = (
 # caller at all and needs the gate built. Add each here in the change that gives
 # it something to do.
 #
+# `FLOTTA_EUR_PER_USD` (`flotta.pricing`) waits for the same reason: only
+# `record_usage` reads it, and nothing calls that until the gateway (M13.2),
+# which catalogues it.
+#
 BY_KEY: dict[str, Setting] = {s.key: s for s in SETTINGS}
 
 

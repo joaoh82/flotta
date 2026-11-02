@@ -1623,3 +1623,74 @@ def test_a_model_change_the_control_plane_accepted_is_not_reported_as_done(tmp_p
     assert result.exit_code == 0, result.output
     assert "is switching to openai/gpt-5" in result.output
     assert "now runs" not in result.output
+
+
+def test_prices_refresh_writes_to_a_local_store(tmp_path, monkeypatch):
+    """With no control plane, the store this machine has."""
+    from typer.testing import CliRunner
+
+    from flotta import cli, model_catalog
+
+    monkeypatch.chdir(tmp_path)
+    db = str(tmp_path / "fleet.db")
+    FleetStore(db).close()
+    monkeypatch.setattr(
+        model_catalog,
+        "_entries",
+        lambda timeout: [{"id": "m/x", "pricing": {"prompt": "0.000003", "completion": "0"}}],
+    )
+
+    result = CliRunner().invoke(cli.app, ["prices", "refresh", "--store", db, "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"models": 1, "changed": 1, "skipped": []}
+    with FleetStore(db) as fleet:
+        assert fleet.price_of("m/x", at=datetime.now(UTC)) is not None
+
+
+def test_prices_refresh_goes_through_the_fleet_api_when_there_is_one(tmp_path, monkeypatch):
+    """A deployed fleet's prices are in its own store. Writing a laptop's and
+    saying it worked is the mistake `repo` and `token box` were fixed for."""
+    from typer.testing import CliRunner
+
+    from flotta import cli, model_catalog
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    calls = []
+
+    def fake(method, path, **kwargs):
+        calls.append((method, path))
+        return {"models": 2, "changed": 1, "skipped": ["openrouter/auto"]}
+
+    def never(timeout):
+        raise AssertionError("the catalogue is the control plane's to read")
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    monkeypatch.setattr(model_catalog, "_entries", never)
+
+    result = CliRunner().invoke(cli.app, ["prices", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("POST", "/api/prices/refresh")]
+    assert "2 models priced, 1 changed; no price for openrouter/auto" in result.output
+
+
+def test_prices_refresh_says_when_the_catalogue_cannot_be_read(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli, model_catalog
+
+    monkeypatch.chdir(tmp_path)
+
+    def down(timeout):
+        raise OSError("no route")
+
+    monkeypatch.setattr(model_catalog, "_entries", down)
+
+    result = CliRunner().invoke(
+        cli.app, ["prices", "refresh", "--store", str(tmp_path / "fleet.db")]
+    )
+
+    assert result.exit_code == 1
+    assert "no route" in result.output
