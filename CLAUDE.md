@@ -775,10 +775,13 @@ conventions, and the sharp edges below.
   connection decides:** the client's own account if it connected one, else the
   org's, else the fleet token, one person for every repository the box works
   on. A connection from before migration 9 names nobody and is not passed over
-  for somebody further out, so an upgraded fleet has to connect its accounts
-  again. A box from before this keeps committing as itself, and a reconnect or
-  disconnect reaches only boxes created afterwards, until the box is recreated
-  or its machine env is updated.
+  for somebody further out, so an upgraded fleet has to reconnect its
+  accounts: `POST /api/orgs/{org}/github/{installation}/reconnect` (FLOTTA-110)
+  goes straight to GitHub's authorize step, because for an account the App is
+  already on GitHub answers the install screen with its settings page and
+  drops the state. A box from before this keeps committing as itself, and a
+  reconnect or disconnect reaches only boxes created afterwards, until the box
+  is recreated or its machine env is updated.
 
 - **The meter's ledger is appended to, and money in it is whole nanos (FLOTTA-87,
   migration 6).** `record_usage` works a call's cost out once, from the price in

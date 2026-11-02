@@ -1217,6 +1217,44 @@ def create_app(
         state = State(org=org_id, client=client, subject=token.subject)
         return {"url": app_.install_url(sign_state(signing, state))}
 
+    @app.post("/api/orgs/{org_id}/github/{installation_id}/reconnect")
+    def reconnect_github(
+        org_id: str, installation_id: str, token: Token | None = needs_admin
+    ) -> Any:
+        """Where to send a person to prove, again, that they own a connected account.
+
+        An account the App is already installed on never reaches `authorize`
+        by way of `connect`: GitHub answers the install screen with the
+        installation's own settings page and drops the state, and an update
+        made there carries none either. So this starts at the step after it.
+        The state names the installation and the scope it is held under, and
+        whoever finishes it is the one GitHub then vouches for: the person
+        the account's agents commit as (FLOTTA-105), for a connection from
+        before that was kept, or for a new person taking it over.
+
+        Nothing changes until `claim`, as with `connect`.
+        """
+        from flotta.github_app import State, sign_state
+
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            installation = store.github_installation(org_id, installation_id)
+        finally:
+            store.close()
+        if installation is None:
+            raise HTTPException(status_code=404, detail="no such GitHub connection")
+        app_ = _configured_github_app()
+        signing = _state_key()
+        assert token is not None
+        state = State(
+            org=org_id,
+            client=installation.client,
+            subject=token.subject,
+            installation=installation_id,
+        )
+        return {"url": app_.authorize_url(sign_state(signing, state))}
+
     @app.post("/api/github/authorize")
     def authorize_github(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
         """GitHub came back with an installation: now ask it who this person is."""

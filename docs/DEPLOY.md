@@ -672,10 +672,14 @@ every repository it works on.
 **Upgrading from before FLOTTA-105.** An account connected before it names
 nobody: `commits_as` is null, and its agents commit as themselves even when
 recreated, since a client's own connection is never passed over for its
-agency's or the operator's name. Connect the account again, as the person
-whose name the commits should carry (step 7d's "Redirect on update" lets the
-same installation be claimed again), and *then* recreate the box or update its
-machine env as in 7a.
+agency's or the operator's name. Press **Reconnect** on the connection, as the
+person whose name the commits should carry, and *then* recreate the box or
+update its machine env as in 7a. Reconnect goes straight to GitHub's "who are
+you" step (`POST /api/orgs/{org}/github/{installation}/reconnect`, FLOTTA-110):
+the Connect flow cannot be reused for an account the App is already on, since
+GitHub answers its install screen with the installation's settings page and
+drops the state. The same button is how an agency moves its agents' commits
+onto a different owner: whoever presses it and proves ownership is named.
 
 **What a reconnect or a disconnect does not do.** Both reach only boxes
 created afterwards. Connecting the same scope again as somebody else names
