@@ -94,6 +94,9 @@ def test_every_catalogued_setting_actually_changes_something():
         # make somebody check that wiring; a setting nobody reads is a field
         # that decides nothing.
         "FLOTTA_WORKDIR",
+        # Read by the gateway's `write_row`, through `layered`, for every call it
+        # meters (FLOTTA-88). Nothing else reads it.
+        "FLOTTA_EUR_PER_USD",
     }, (
         "a setting was added or removed — confirm the new one is read by "
         "something that runs, the way idle sleep and the sweep interval are"

@@ -241,6 +241,23 @@ def test_a_price_already_in_euros_needs_no_rate(agency):
     assert row.cost_eur_nano == 2 * NANO
 
 
+def test_a_call_that_used_no_tokens_cost_nothing_whatever_its_model(agency):
+    """An upstream's refusal must not stop a budget that fails closed on unpriced."""
+    row = _call(
+        agency, model="nobody/knows", tokens_in=0, tokens_out=0, eur_per_usd=None, status=429
+    )
+    assert row.cost_eur_nano == 0
+    assert row.status == 429
+    assert agency.spend(org="studio-nord", since=EARLIER).unpriced == 0
+
+
+def test_an_estimate_is_priced_and_says_it_is_one(agency):
+    row = _call(agency, estimated=True, status=200)
+    assert row.estimated is True
+    assert row.cost_eur_nano == 9 * NANO
+    assert _call(agency, key="reported").estimated is False
+
+
 # -- prices ------------------------------------------------------------------
 
 

@@ -191,6 +191,20 @@ db-migrate:
 prices-refresh:
     uv run flotta prices refresh
 
+# M13.2 — the model gateway on 127.0.0.1:8083, calling the real provider with
+# $FLOTTA_API_KEY. A call through it costs money; nothing points at it by itself.
+gateway port="8083":
+    uv run --extra control flotta gateway --port {{port}}
+
+# M13.2 — the gateway with a stand-in upstream: free, and needs no key but a signing key
+gateway-fake port="8083":
+    uv run --extra control flotta gateway --fake-upstream --port {{port}}
+
+# M13.2 — a real gateway process, a stand-in upstream and a throwaway store: one
+# whole stream, one the client hangs up on, and the rows they leave. $0, offline.
+gateway-smoke:
+    uv run --extra control python scripts/gateway_smoke.py
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key
