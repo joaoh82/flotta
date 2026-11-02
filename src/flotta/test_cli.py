@@ -12,6 +12,7 @@ a stopped box — hiding your idle fleet would hide the point of the fleet.
 """
 
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1732,7 +1733,8 @@ def test_the_real_gateway_fetches_the_rate_whatever_it_fronts(
     tmp_path, monkeypatch, base_url, has_prices
 ):
     """Nothing tests this wiring otherwise, and without it every call goes unpriced."""
-    uvicorn = pytest.importorskip("uvicorn")
+    from types import SimpleNamespace
+
     from typer.testing import CliRunner
 
     from flotta import cli, gateway
@@ -1744,7 +1746,8 @@ def test_the_real_gateway_fetches_the_rate_whatever_it_fronts(
     monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", base_url)
     monkeypatch.setenv("FLOTTA_API_KEY", "a-key")
     monkeypatch.setattr(gateway, "create_gateway", lambda **kwargs: built.update(kwargs))
-    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+    # Stood in for, since CI installs no `uvicorn` and this must not skip there.
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **k: None))
 
     result = CliRunner().invoke(cli.app, ["gateway"])
 
