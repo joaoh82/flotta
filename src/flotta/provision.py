@@ -1813,16 +1813,38 @@ def repair_connection(
     return result
 
 
-def _movable(box_id: str, store: FleetStore) -> tuple[Box, str]:
-    """A box with a settled machine, and the model it runs."""
+def movable_box(box_id: str, store: FleetStore) -> tuple[Box, str]:
+    """A box with a settled machine, and the model that machine already runs.
+
+    Not `fleet_model`: a new default reaches no existing agent (FLOTTA-86), and a
+    move changes the provider only. Resolved in the order the fleet API reports it
+    (`control.app._box_dict`), so the two agree, except that this never falls back
+    to today's default: writing a guess would be the model change it must not make.
+
+    Public because the control plane asks before answering `202`: after that, a
+    refusal would reach only a log.
+    """
     box = _require_box(store, box_id)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to update.")
     if box.status == "provisioning" or not box.endpoint:
         raise ProvisionError(f"box {box_id} is still being created; wait for it to settle.")
-    model = store.model_for_box(box.id) or fleet_model(store)
+    # Both write `FLOTTA_MODEL`, so a move landing last would undo the change while
+    # the store recorded it.
+    under_way = model_changes(store, [box.id]).get(box.id)
+    if under_way and under_way["state"] == "pending":
+        raise ProvisionError(
+            f"{box.name} is switching to {under_way['model']}; wait for that to finish."
+        )
+    model = (
+        store.model_for_box(box.id)
+        or store.models_given([box.id]).get(box.id)
+        or model_given_by_default()
+    )
     if not model:
-        raise ProvisionError(f"no model is known for {box.name}; set the fleet's first.")
+        raise ProvisionError(
+            f"nothing records which model {box.name} runs; set its model, then move it."
+        )
     return box, model
 
 
@@ -1882,7 +1904,7 @@ def join_gateway(
         raise ProvisionError(
             f"there is no gateway to move to. Set ${GATEWAY_URL_ENV} where the control plane runs."
         )
-    box, model = _movable(box_id, store)
+    box, model = movable_box(box_id, store)
     try:
         secrets = gateway_secrets(box.id, model, env=source, org=box.org, client=box.client)
     except AuthError as exc:
@@ -1921,7 +1943,7 @@ def leave_gateway(
     source = layered(store)
     base_url = (source.get("FLOTTA_MODEL_BASE_URL") or "").strip()
     api_key = (source.get("FLOTTA_API_KEY") or "").strip()
-    box, model = _movable(box_id, store)
+    box, model = movable_box(box_id, store)
     if not (base_url and api_key):
         raise ProvisionError(
             "there is no provider to go back to. Set $FLOTTA_MODEL_BASE_URL and "

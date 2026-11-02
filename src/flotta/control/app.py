@@ -3337,6 +3337,7 @@ def create_app(
             gateway_url,
             join_gateway,
             leave_gateway,
+            movable_box,
         )
 
         move = join_gateway if join else leave_gateway
@@ -3347,16 +3348,15 @@ def create_app(
                 raise HTTPException(
                     status_code=403, detail="only the fleet's operator may move an agent"
                 )
-            if is_terminal("box", box.status) or box.status == "provisioning" or not box.endpoint:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"box {box.name} has no settled machine to move ({box.status}).",
-                )
             if join and not gateway_url():
                 raise HTTPException(
                     status_code=409,
                     detail="there is no gateway. Set $FLOTTA_GATEWAY_URL where this runs.",
                 )
+            try:
+                movable_box(box.id, store)
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             if not background:
                 try:
                     return move(box.id, store=store)

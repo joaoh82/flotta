@@ -8,10 +8,14 @@ from fastapi.testclient import TestClient
 from flotta.auth import SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, mint, scopes_for_role
 from flotta.control.app import create_app
 from flotta.control.test_app import _uncatalogued, _unchecked
+from flotta.provision import MODEL_CHANGE_STARTED, MODEL_SET, join_gateway, leave_gateway
 from flotta.store import FleetStore
+from flotta.test_gateway_move import _Machine
 
 KEY = "a-signing-key-for-gateway-moves"
 GATEWAY = "https://gateway.example"
+GIVEN = "z-ai/glm-5.2"
+LATER_DEFAULT = "openai/gpt-6"
 
 
 @pytest.fixture
@@ -64,6 +68,7 @@ def moves(monkeypatch):
     monkeypatch.setattr(provision, "join_gateway", join)
     monkeypatch.setattr(provision, "leave_gateway", leave)
     monkeypatch.setenv("FLOTTA_GATEWAY_URL", GATEWAY)
+    monkeypatch.setenv("FLOTTA_MODEL", GIVEN)
     return calls
 
 
@@ -131,3 +136,66 @@ def test_an_agent_with_no_settled_machine_is_a_409(fleet, moves):
     with _api(fleet) as api:
         assert api.post("/api/boxes/new/gateway", headers=OPERATOR).status_code == 409
     assert moves == []
+
+
+def test_a_model_change_under_way_is_a_409_not_a_202(fleet, moves):
+    """On a thread the refusal would reach only a log, after saying it had started."""
+    with FleetStore(fleet) as store:
+        box_id = store.get_box_by_name("eng-d").id
+        store.add_event("box", box_id, MODEL_CHANGE_STARTED, {"model": "openai/gpt-5"})
+    with _api(fleet, background=True) as api:
+        response = api.post("/api/boxes/eng-d/gateway", headers=OPERATOR)
+    assert response.status_code == 409
+    assert "openai/gpt-5" in response.json()["detail"]
+    assert moves == []
+
+
+def test_an_agent_whose_model_nothing_records_is_a_409_not_a_202(fleet, moves, monkeypatch):
+    monkeypatch.delenv("FLOTTA_MODEL")
+    with FleetStore(fleet) as store:
+        store.set_setting("FLOTTA_MODEL", LATER_DEFAULT)
+    with _api(fleet, background=True) as api:
+        assert api.delete("/api/boxes/eng-d/gateway", headers=OPERATOR).status_code == 409
+    assert moves == []
+
+
+def _agrees(api, machine, box_id, model):
+    """The machine was written what the API says it runs, by the box and by the list."""
+    assert machine.calls[-2][2]["FLOTTA_MODEL"] == model
+    assert api.get(f"/api/boxes/{box_id}", headers=OPERATOR).json()["box"]["model"] == model
+    listed = api.get("/api/boxes", headers=OPERATOR).json()["boxes"]
+    assert next(b for b in listed if b["id"] == box_id)["model"] == model
+
+
+@pytest.mark.parametrize(
+    ("own", "recorded", "environment", "wanted"),
+    [
+        pytest.param(None, GIVEN, "openai/gpt-5", GIVEN, id="follows-the-default"),
+        pytest.param(None, None, GIVEN, GIVEN, id="older-than-the-record"),
+        pytest.param(GIVEN, GIVEN, "openai/gpt-5", GIVEN, id="its-own"),
+        pytest.param(GIVEN, "openai/gpt-5", "openai/gpt-5", GIVEN, id="its-own-over-the-record"),
+    ],
+)
+def test_after_each_move_the_machine_and_the_api_agree(
+    fleet, monkeypatch, own, recorded, environment, wanted
+):
+    """What the review of #157 found: a move wrote today's default, and the API kept
+    reporting what the agent was given."""
+    monkeypatch.setenv("FLOTTA_GATEWAY_URL", GATEWAY)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
+    monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("FLOTTA_API_KEY", "sk-or-the-fleets-own-key")
+    monkeypatch.setenv("FLOTTA_MODEL", environment)
+    machine = _Machine()
+    with FleetStore(fleet) as store:
+        box_id = store.get_box_by_name("eng-d").id
+        if own:
+            store.set_box_model(box_id, own)
+        if recorded:
+            store.add_event("box", box_id, MODEL_SET, {"model": recorded, "source": "fleet"})
+        store.set_setting("FLOTTA_MODEL", LATER_DEFAULT)
+        with _api(fleet) as api:
+            join_gateway(box_id, store=store, backend=machine)
+            _agrees(api, machine, box_id, wanted)
+            leave_gateway(box_id, store=store, backend=machine)
+            _agrees(api, machine, box_id, wanted)

@@ -813,6 +813,10 @@ it when it next wakes.
    hold the key. **Remove `FLOTTA_API_KEY` from the control plane only after the last
    agent has moved** and you no longer want that way back. The gateway keeps its own.
 
+A move changes the provider and never the model: the agent keeps the one it was last
+given, whatever the fleet's default is now. It waits for a model change under way, and
+refuses an agent whose model nothing records until you set one.
+
 Once agents use the gateway, its outage or the database's stops their model calls.
 
 ---

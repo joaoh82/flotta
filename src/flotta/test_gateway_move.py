@@ -19,6 +19,9 @@ from flotta.provision import (
     GATEWAY_JOINED,
     GATEWAY_LEFT,
     GATEWAY_MOVE_FAILED,
+    MODEL_CHANGE_FAILED,
+    MODEL_CHANGE_STARTED,
+    MODEL_SET,
     MODEL_TOKEN_TTL_S,
     ProvisionError,
     UpgradeFailed,
@@ -373,6 +376,94 @@ def test_leaving_needs_a_key_to_go_back_to(fleet, monkeypatch):
     with pytest.raises(ProvisionError, match="FLOTTA_API_KEY"):
         leave_gateway("b-1", store=fleet, backend=machine)
     assert machine.calls == []
+
+
+# -- a move changes the provider, and never the model ---------------------------
+
+
+GIVEN = "z-ai/glm-5.2"
+LATER_DEFAULT = "openai/gpt-6"
+
+
+@pytest.fixture
+def follower(fleet):
+    """An agent that follows the fleet's default, given `GIVEN` when it was made."""
+    box = fleet.create_box("follower", box_id="b-2", org="studio-nord", client="acme")
+    fleet.update_box_status(box.id, "running", endpoint="fly://app/m2")
+    fleet.add_event("box", box.id, MODEL_SET, {"model": GIVEN, "source": "fleet"})
+    fleet.set_setting("FLOTTA_MODEL", LATER_DEFAULT)
+    return box
+
+
+@pytest.mark.parametrize("verb", [join_gateway, leave_gateway])
+def test_a_new_fleet_default_does_not_arrive_with_a_move(fleet, follower, verb):
+    """A new default reaches no existing agent, and a move must not be how it does."""
+    machine = _Machine()
+    moved = verb(follower.id, store=fleet, backend=machine)
+    assert machine.calls[0][2]["FLOTTA_MODEL"] == GIVEN
+    assert moved["model"] == GIVEN
+    assert fleet.models_given([follower.id]) == {follower.id: GIVEN}
+
+
+@pytest.mark.parametrize(
+    ("verb", "event"), [(join_gateway, GATEWAY_JOINED), (leave_gateway, GATEWAY_LEFT)]
+)
+def test_the_timeline_names_the_model_it_kept(fleet, follower, verb, event):
+    verb(follower.id, store=fleet, backend=_Machine())
+    (moved,) = [e for e in fleet.get_events("box", follower.id) if e.type == event]
+    assert moved.payload["model"] == GIVEN
+
+
+def test_the_latest_model_given_is_the_one_kept(fleet, follower):
+    fleet.add_event("box", follower.id, MODEL_SET, {"model": "openai/gpt-5", "source": "fleet"})
+    machine = _Machine()
+    join_gateway(follower.id, store=fleet, backend=machine)
+    assert machine.calls[0][2]["FLOTTA_MODEL"] == "openai/gpt-5"
+
+
+@pytest.mark.parametrize("verb", [join_gateway, leave_gateway])
+def test_an_agent_older_than_the_record_keeps_the_environments_model(fleet, monkeypatch, verb):
+    """It predates FLOTTA-39, so `model_given_by_default` is what it was made with."""
+    box = fleet.create_box("old", box_id="b-3", org="studio-nord", client="acme")
+    fleet.update_box_status(box.id, "running", endpoint="fly://app/m3")
+    monkeypatch.setenv("FLOTTA_MODEL", GIVEN)
+    fleet.set_setting("FLOTTA_MODEL", LATER_DEFAULT)
+    machine = _Machine()
+    verb(box.id, store=fleet, backend=machine)
+    assert machine.calls[0][2]["FLOTTA_MODEL"] == GIVEN
+
+
+@pytest.mark.parametrize("verb", [join_gateway, leave_gateway])
+def test_an_agent_whose_model_nothing_records_is_not_given_a_guess(fleet, monkeypatch, verb):
+    box = fleet.create_box("old", box_id="b-3", org="studio-nord", client="acme")
+    fleet.update_box_status(box.id, "running", endpoint="fly://app/m3")
+    monkeypatch.delenv("FLOTTA_MODEL")
+    fleet.set_setting("FLOTTA_MODEL", LATER_DEFAULT)
+    machine = _Machine()
+    with pytest.raises(ProvisionError, match="set its model"):
+        verb(box.id, store=fleet, backend=machine)
+    assert machine.calls == []
+
+
+@pytest.mark.parametrize("verb", [join_gateway, leave_gateway])
+def test_a_move_waits_for_a_model_change_under_way(fleet, follower, verb):
+    """Both write `FLOTTA_MODEL`, so a move landing last would undo the change."""
+    fleet.add_event("box", follower.id, MODEL_CHANGE_STARTED, {"model": "openai/gpt-5"})
+    machine = _Machine()
+    with pytest.raises(ProvisionError, match="openai/gpt-5"):
+        verb(follower.id, store=fleet, backend=machine)
+    assert machine.calls == []
+
+
+def test_a_model_change_that_failed_does_not_block_a_move(fleet, follower):
+    """The machine never took it, so it still runs what it was last given."""
+    fleet.add_event("box", follower.id, MODEL_CHANGE_FAILED, {"model": "openai/gpt-5"})
+    machine = _Machine()
+    join_gateway(follower.id, store=fleet, backend=machine)
+    assert machine.calls[0][2]["FLOTTA_MODEL"] == GIVEN
+
+
+# -- the moves ------------------------------------------------------------------
 
 
 def test_a_new_agent_is_created_through_the_gateway(fleet):
