@@ -164,6 +164,28 @@ git config --global --replace-all user.name "$BOX_NAME"
 git config --global --replace-all user.email "${BOX_NAME}@${FLOTTA_GIT_EMAIL_DOMAIN}"
 git config --global --replace-all init.defaultBranch main
 
+# ## The author is a person; the committer stays the box (FLOTTA-105)
+#
+# An address nobody holds is exactly what Vercel refuses: before it deploys a
+# commit it checks that the *author* is a member of the team, and a box is
+# not. So the control plane names the person whose GitHub the box's
+# repositories come from — whoever connected the account, or the owner of the
+# fleet token — at the address GitHub issues for them,
+# `<id>+<login>@users.noreply.github.com`. Not a guess this time: it is what
+# GitHub answered for that person's own token.
+#
+# `author.*` is the author and `user.*` the committer, so GitHub shows
+# "authored by <person>, committed by <box>" and Vercel sees a member. Unset
+# when absent rather than left over, so a box the control plane named nobody
+# for commits as itself, as every box did before this.
+if [ -n "${FLOTTA_GIT_AUTHOR_EMAIL:-}" ]; then
+  git config --global --replace-all author.name "${FLOTTA_GIT_AUTHOR_NAME:-$FLOTTA_GIT_AUTHOR_EMAIL}"
+  git config --global --replace-all author.email "$FLOTTA_GIT_AUTHOR_EMAIL"
+else
+  git config --global --unset-all author.name || true
+  git config --global --unset-all author.email || true
+fi
+
 # The repository path is what makes per-box grants possible at all. Without it
 # git asks for "a credential for github.com" and a grant has nothing to key on.
 git config --global --replace-all credential.useHttpPath true
@@ -175,6 +197,11 @@ git config --global --replace-all credential.useHttpPath true
 if [ -n "${FLOTTA_CONTROL_URL:-}" ] && [ -n "${FLOTTA_BOX_TOKEN:-}" ]; then
   git config --global --replace-all credential.helper flotta
   echo "[flotta-box] git: $BOX_NAME <${BOX_NAME}@${FLOTTA_GIT_EMAIL_DOMAIN}>, credentials via control plane"
+  if [ -n "${FLOTTA_GIT_AUTHOR_EMAIL:-}" ]; then
+    echo "[flotta-box] git: commits authored as ${FLOTTA_GIT_AUTHOR_NAME:-$FLOTTA_GIT_AUTHOR_EMAIL} <${FLOTTA_GIT_AUTHOR_EMAIL}>"
+  else
+    echo "[flotta-box] git: commits authored as the box — no person is connected for its repositories"
+  fi
 else
   # Unset rather than left over: a helper configured with nothing behind it
   # costs a failed round trip on every fetch and reports it as a credential

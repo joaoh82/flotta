@@ -1129,3 +1129,55 @@ def test_models_given_is_the_newest_model_set_per_agent(store, box):
     store.add_event("box", other.id, "running")
     assert store.models_given([box.id, other.id]) == {box.id: "openai/gpt-5"}
     assert store.models_given([]) == {}
+
+
+# -- whom a connected account's agents commit as (FLOTTA-105) ---------------------
+
+
+def _connected(store, box, **person):
+    return store.connect_github(
+        "77",
+        org=box.org,
+        client=box.client,
+        account="acme-gh",
+        account_type="Organization",
+        connected_by="person-olivia",
+        **person,
+    )
+
+
+def test_a_connection_keeps_who_made_it_and_names_the_commit_author(store, box):
+    held = _connected(
+        store, box, connected_login="olivia", connected_user_id="4242", connected_name="Olivia O"
+    )
+    assert held.author == ("Olivia O", "4242+olivia@users.noreply.github.com")
+    [again] = store.github_installations_for(box.org, box.client)
+    assert again == held
+
+
+def test_a_person_with_no_display_name_is_their_login_on_a_commit(store, box):
+    held = _connected(store, box, connected_login="olivia", connected_user_id="4242")
+    assert held.author == ("olivia", "4242+olivia@users.noreply.github.com")
+
+
+def test_a_connection_from_before_the_person_was_kept_names_nobody(store, box):
+    """Rows from before migration 9: their agents commit as themselves, as before."""
+    held = _connected(store, box)
+    assert held.connected_login is None
+    assert held.author is None
+
+
+def test_connecting_again_moves_the_commits_onto_whoever_proved_it_last(store, box):
+    _connected(store, box, connected_login="olivia", connected_user_id="4242")
+    held = _connected(
+        store, box, connected_login="oscar", connected_user_id="5151", connected_name="Oscar"
+    )
+    assert held.author == ("Oscar", "5151+oscar@users.noreply.github.com")
+    [again] = store.github_installations_for(box.org, box.client)
+    assert again.connected_login == "oscar"
+
+
+def test_connecting_again_with_nobody_named_keeps_the_person_already_kept(store, box):
+    """An idempotent re-claim that names nobody must not erase whom it has."""
+    _connected(store, box, connected_login="olivia", connected_user_id="4242")
+    assert _connected(store, box).connected_login == "olivia"

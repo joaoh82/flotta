@@ -60,7 +60,7 @@ import os
 import secrets as secrets_module
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -75,6 +75,7 @@ from flotta.backend import (
 )
 from flotta.backend import backend_for as _backend_for
 from flotta.backend import pause as _pause
+from flotta.github import GITHUB_TOKEN_ENV
 from flotta.store import (
     INSTRUCTIONS_CHANGED,
     Box,
@@ -83,6 +84,7 @@ from flotta.store import (
     UnknownEntityError,
     box_label,
     is_terminal,
+    reaches_fleet_github,
     validate_box_meta,
     validate_box_name,
     validate_tenant_id,
@@ -463,6 +465,7 @@ def build_identity(
     instructions: str | None = None,
     ttl_s: int = BOX_TOKEN_TTL_S,
     env: dict[str, str] | None = None,
+    author: CommitAuthor | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """A box's own identity, split by what may be read off the machine.
 
@@ -470,7 +473,9 @@ def build_identity(
 
     - **env** — `FLOTTA_BOX_ID`, `FLOTTA_BOX_NAME`, and where to reach the
       control plane and what domain to sign commits under. All of it appears in
-      `fly machine status`, and none of it is a secret.
+      `fly machine status`, and none of it is a secret. With `author`, also
+      whom the box's commits are *authored* as (FLOTTA-105): the box stays the
+      committer, which the entrypoint sets from the name and domain.
     - **secrets** — `FLOTTA_BOX_TOKEN`, and nothing else. It authenticates as
       the box, so it must never be in the machine's configuration.
 
@@ -521,6 +526,12 @@ def build_identity(
     if email_domain:
         box_env["FLOTTA_GIT_EMAIL_DOMAIN"] = email_domain
 
+    # Omitted rather than guessed, like the rest: with no author the
+    # entrypoint leaves `author.*` unset and the box commits as itself.
+    if author is not None:
+        box_env[GIT_AUTHOR_NAME_ENV] = author.name
+        box_env[GIT_AUTHOR_EMAIL_ENV] = author.email
+
     tenant: dict[str, str] = {}
     if (org or DEFAULT_ORG, client or DEFAULT_CLIENT) != (DEFAULT_ORG, DEFAULT_CLIENT):
         tenant = {"org": org or DEFAULT_ORG, "client": client or DEFAULT_CLIENT}
@@ -540,6 +551,97 @@ def build_identity(
         return box_env, {}
 
     return box_env, {"FLOTTA_BOX_TOKEN": token}
+
+
+# -- whom a box's commits are authored as (FLOTTA-105) ---------------------------
+#
+# A box commits as itself — `<box>@<domain>`, an address that resolves to no
+# GitHub account on purpose — and that is where Vercel stops it: before
+# creating a deployment it checks that the commit *author* is a member of the
+# team, with no setting to turn that off, and `developer--…@flotta.dev` is
+# nobody. Proven live on 2026-11-02: PR #118 on a client's Vercel-connected
+# repository was refused, then built the moment the author was the person who
+# had connected the account, with the committer still the box.
+#
+# So the author is a person and the committer is the box. The person is
+# whoever connected the GitHub account the box's client uses — GitHub vouched
+# for them at connect time, and `<id>+<login>@users.noreply` is the address
+# GitHub issues for the account — or, for the operator's own agents on
+# `$FLOTTA_GITHUB_TOKEN`, whose token that is.
+#
+# One author per box, not per repository, and that is a limit worth knowing:
+# the credential is picked by the repository's owner (`github_installation_for`),
+# the author is not. The nearest connection decides — the client's own account
+# if it connected one, else its org's, else the fleet token — and a box with
+# repositories from two accounts commits to both as the one person. A
+# connection that names nobody (made before migration 9) is not passed over
+# for somebody further out: a client's commits do not carry its agency's or
+# the operator's name because its own account predates this. It names nobody
+# until it is connected again, and the GitHub page says so. (`includeIf
+# "hasconfig:remote.*.url:…"` could set an author per owner if it ever has to.)
+#
+# Set when the machine is made, so connecting again or disconnecting reaches
+# only boxes created afterwards until a box's env is refreshed.
+
+GIT_AUTHOR_NAME_ENV = "FLOTTA_GIT_AUTHOR_NAME"
+GIT_AUTHOR_EMAIL_ENV = "FLOTTA_GIT_AUTHOR_EMAIL"
+
+
+@dataclass(frozen=True, slots=True)
+class CommitAuthor:
+    """Who a box's commits are authored as, and where that came from."""
+
+    name: str
+    email: str
+    #: The GitHub login the address resolves to.
+    login: str
+    #: `github_app` (a connected account) or `fleet_token` (the operator's PAT).
+    source: str
+
+
+#: `/user` answers for the fleet token, by token, so creating agents does not
+#: ask GitHub the same question every time. Only answers are kept: a blip is
+#: asked again next time rather than remembered.
+_FLEET_TOKEN_OWNERS: dict[str, Any] = {}
+
+
+def commit_author_for(
+    store: FleetStore, org: str, client: str, env: Mapping[str, str]
+) -> CommitAuthor | None:
+    """Whom a box in `org`'s `client` should author its commits as, or None.
+
+    None means the nearest GitHub connection names nobody, or there is none
+    and the fleet token is either not theirs to use or names nobody; the box
+    then commits as itself, as every box did before this.
+    """
+    connections = store.github_installations_for(org, client)
+    if connections:
+        # The client's own connections if it has any, else the org's: never
+        # a wider tenant's name on a narrower one's commits.
+        nearest = connections[0].client
+        for installation in connections:
+            if installation.client != nearest:
+                break
+            person = installation.person
+            if person is not None:
+                return CommitAuthor(
+                    person.commit_name, person.commit_email, person.login, "github_app"
+                )
+        return None
+    if not reaches_fleet_github(org):
+        return None
+    token = (env.get(GITHUB_TOKEN_ENV) or "").strip()
+    if not token:
+        return None
+    from flotta.github import token_owner  # at call time, so a test can stand in for it
+
+    person = _FLEET_TOKEN_OWNERS.get(token)
+    if person is None:
+        person = token_owner(token)
+        if person is None:
+            return None
+        _FLEET_TOKEN_OWNERS[token] = person
+    return CommitAuthor(person.commit_name, person.commit_email, person.login, "fleet_token")
 
 
 #: How long a box may sit in `provisioning` before it is presumed abandoned.
@@ -903,6 +1005,7 @@ def create_box(
     from flotta.workdir import resolve_workdir
 
     source = layered(store)
+    author = commit_author_for(store, box.org, box.client, source)
     identity_env, identity_secrets = build_identity(
         box.id,
         name,
@@ -910,7 +1013,17 @@ def create_box(
         client=box.client,
         instructions=meta.instructions if meta else None,
         env=source,
+        author=author,
     )
+    if author is not None:
+        # On the timeline, so "whose name is on this agent's commits" is
+        # answered where the agent is, not by reading a machine's env.
+        store.add_event(
+            "box",
+            box.id,
+            "commit_author",
+            {"login": author.login, "email": author.email, "source": author.source},
+        )
     # Always, including the default. `build_identity` already puts a value
     # in, but it does not validate; this is the cleaned path the setting
     # actually means, and the one the Info panel will read back off the
