@@ -68,6 +68,12 @@ class FakeGitHub:
                 "name": "Olivia Owner",
                 "admin_of": {"acme-gh", "beta-gh"},
             },
+            "other-owner-code": {
+                "login": "oscar",
+                "id": 5151,
+                "name": "Oscar",
+                "admin_of": {"acme-gh"},
+            },
             "collaborator-code": {"login": "colin", "id": 4343, "name": None, "admin_of": set()},
             "solo-code": {"login": "solo", "id": 4444, "name": None, "admin_of": set()},
         }
@@ -471,6 +477,7 @@ def test_a_state_signed_with_another_key_is_refused(api, fleet):
         ("POST", "/api/orgs/agency-x/github/connect", {}),
         ("GET", "/api/orgs/agency-x/github", None),
         ("DELETE", "/api/orgs/agency-x/github/77", None),
+        ("POST", "/api/orgs/agency-x/github/77/reconnect", None),
     ],
 )
 def test_another_orgs_owner_finds_no_org(api, method, path, body):
@@ -484,6 +491,7 @@ def test_another_orgs_owner_finds_no_org(api, method, path, body):
         ("POST", "/api/orgs/agency-x/github/connect", {}),
         ("GET", "/api/orgs/agency-x/github", None),
         ("DELETE", "/api/orgs/agency-x/github/77", None),
+        ("POST", "/api/orgs/agency-x/github/77/reconnect", None),
         ("POST", "/api/github/authorize", {}),
         ("POST", "/api/github/claim", {}),
     ],
@@ -521,6 +529,100 @@ def test_connecting_again_for_the_same_scope_is_fine(api, fleet):
     assert _connect(api).status_code == 200
     assert _connect(api).status_code == 200
     assert len(_connections(fleet)) == 1
+
+
+# -- reconnecting an account the App is already on (FLOTTA-110) --------------------
+#
+# GitHub answers the install screen for such an account with its settings page
+# and drops the state, so `connect` never reaches `authorize`. `reconnect`
+# starts there.
+
+
+def _connected_by_nobody(fleet, org="agency-x", client=None, installation="77"):
+    """A row from before migration 9: the account is connected, but who did
+    it was never kept, so its agents commit as themselves."""
+    with FleetStore(fleet) as store:
+        store.connect_github(
+            installation,
+            org=org,
+            client=client,
+            account="acme-gh",
+            account_type="Organization",
+            connected_by="someone",
+        )
+
+
+def _reconnect(api, headers=None, *, org="agency-x", installation="77", code="owner-code"):
+    headers = headers or _owner(org)
+    asked = api.post(f"/api/orgs/{org}/github/{installation}/reconnect", headers=headers)
+    assert asked.status_code == 200, asked.text
+    assert "/login/oauth/authorize?" in asked.json()["url"]
+    return api.post(
+        "/api/github/claim",
+        json={"state": _state_from(asked.json()["url"]), "code": code},
+        headers=headers,
+    )
+
+
+def test_reconnecting_names_the_person_on_a_connection_that_named_nobody(api, fleet):
+    """The upgrade from before FLOTTA-105, without uninstalling anything."""
+    _connected_by_nobody(fleet)
+    assert [c["commits_as"] for c in _listed(api)] == [None]
+
+    assert _reconnect(api).status_code == 200
+
+    [connection] = _listed(api)
+    assert connection["installation_id"] == "77"
+    assert connection["client"] is None
+    assert connection["commits_as"] == "olivia"
+    assert len(_connections(fleet)) == 1
+
+
+def test_reconnecting_keeps_the_scope_the_account_was_connected_under(api, fleet):
+    """The state is made from the row, not from a body: one client's account
+    stays that client's."""
+    _connected_by_nobody(fleet, client="acme")
+    assert _reconnect(api).status_code == 200
+    [connection] = _listed(api)
+    assert (connection["client"], connection["commits_as"]) == ("acme", "olivia")
+
+
+def test_reconnecting_as_somebody_else_moves_the_name_to_them(api, fleet):
+    """How an agency hands its agents' commits to a different owner: the
+    latest person GitHub vouched for is named, on the same installation."""
+    assert _connect(api, code="owner-code").status_code == 200
+    assert [c["commits_as"] for c in _listed(api)] == ["olivia"]
+
+    assert (
+        _reconnect(api, _owner(subject="person-oscar"), code="other-owner-code").status_code == 200
+    )
+
+    [connection] = _listed(api)
+    assert (connection["installation_id"], connection["commits_as"]) == ("77", "oscar")
+    assert len(_connections(fleet)) == 1
+
+
+def test_reconnecting_what_is_not_connected_is_nothing_to_reconnect(api):
+    response = api.post("/api/orgs/agency-x/github/77/reconnect", headers=_owner())
+    assert response.status_code == 404, response.text
+
+
+def test_a_reconnect_someone_else_started_is_refused_at_the_claim(api, fleet):
+    _connected_by_nobody(fleet)
+    asked = api.post("/api/orgs/agency-x/github/77/reconnect", headers=_owner())
+    refused = api.post(
+        "/api/github/claim",
+        json={"state": _state_from(asked.json()["url"]), "code": "owner-code"},
+        headers=_owner(subject="person-colleague"),
+    )
+    assert refused.status_code == 403, refused.text
+    assert [c["commits_as"] for c in _listed(api)] == [None]
+
+
+def test_a_person_who_does_not_own_the_account_reconnects_nothing(api, fleet):
+    _connected_by_nobody(fleet)
+    assert _reconnect(api, code="collaborator-code").status_code == 403
+    assert [c["commits_as"] for c in _listed(api)] == [None]
 
 
 # -- a deployment with no App -------------------------------------------------------
