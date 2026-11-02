@@ -65,6 +65,7 @@ from typing import Any, Literal
 
 from flotta import address, db, migrations
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
+from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import Price, cost_nano, to_eur_nano
 
 EntityKind = Literal["box", "workspace", "task"]
@@ -434,6 +435,10 @@ class NotOperatorError(StoreError):
     """
 
 
+class InvalidBudgetError(StoreError):
+    """A budget that cannot be one."""
+
+
 class LastOwnerError(StoreError):
     """Raised when removing an org's last owner would leave nobody to run it."""
 
@@ -518,7 +523,7 @@ class GitHubInstallation:
     connected_by: str
     connected_at: str
     #: Who connected it, as GitHub knows them (FLOTTA-105): the person its
-    #: agents author commits as. All None on a row from before migration 8.
+    #: agents author commits as. All None on a row from before migration 9.
     connected_login: str | None = None
     connected_user_id: str | None = None
     connected_name: str | None = None
@@ -612,6 +617,9 @@ ORG_STATUSES = ("pending", "active", "declined")
 
 #: Which level's key paid for a model call (D19).
 KEY_SCOPES = frozenset({"fleet", "org", "client"})
+
+BUDGET_PERIODS = frozenset({"day", "month"})
+BUDGET_ACTIONS = frozenset({"notify", "downgrade", "pause", "kill"})
 
 #: An invite waits for someone who is not expecting it, so it lives for a
 #: week, not the quarter-hour a sign-in link does.
@@ -713,6 +721,22 @@ class Usage:
     idempotency_key: str
     status: int | None = None
     estimated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Budget:
+    """A limit on spend. See `migrations._budgets` and `flotta.budgets`."""
+
+    id: str
+    org: str
+    client: str | None
+    box: str | None
+    period: str
+    limit_eur_nano: int
+    soft_pct: float
+    action: str
+    fallback_model: str | None
+    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -2384,6 +2408,136 @@ class FleetStore:
         ).fetchone()
         # Postgres sums a BIGINT into a NUMERIC, which arrives as a Decimal.
         return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
+
+    # -- budgets (FLOTTA-89, M13.3) --------------------------------------------
+
+    @staticmethod
+    def _budget_id(org: str, client: str | None, box: str | None, period: str) -> str:
+        key = "\0".join((org, client or "", box or "", period))
+        return f"bgt-{hashlib.sha256(key.encode()).hexdigest()[:24]}"
+
+    @staticmethod
+    def _budget_from(row: Any) -> Budget:
+        return Budget(
+            id=row["id"],
+            org=row["org_id"],
+            client=row["client_id"],
+            box=row["box_id"],
+            period=row["period"],
+            limit_eur_nano=row["limit_eur_nano"],
+            soft_pct=row["soft_pct"],
+            action=row["action"],
+            fallback_model=row["fallback_model"],
+            updated_at=row["updated_at"],
+        )
+
+    def _budget_scope(
+        self, org: str, client: str | None, box: str | None
+    ) -> tuple[str | None, str | None]:
+        """The client and box id a budget names, once they are known to be `org`'s.
+
+        Another org's agent reads the same as no agent. A box brings its client.
+        """
+        if self.get_org(org) is None:
+            raise UnknownEntityError(f"no org {org!r}")
+        if box is not None:
+            found = self.get_box(box) or self.get_box_by_name(box)
+            if found is None or found.org != org:
+                raise UnknownEntityError(f"org {org!r} has no agent {box!r}")
+            if client is not None and client != found.client:
+                raise InvalidBudgetError(f"agent {box!r} is not client {client!r}'s")
+            return found.client, found.id
+        if client is not None and self.get_client(org, client) is None:
+            raise UnknownEntityError(f"org {org!r} has no client {client!r}")
+        return client, None
+
+    def set_budget(
+        self,
+        org: str,
+        *,
+        period: str,
+        limit_eur_nano: int,
+        action: str,
+        client: str | None = None,
+        box: str | None = None,
+        soft_pct: float = 0.8,
+        fallback_model: str | None = None,
+    ) -> Budget:
+        """Set the budget for this scope and period, replacing any that is there.
+
+        `client` and `box` both `None` is the whole org; `client` alone is that
+        client; `box`, by id or name, is that agent.
+        """
+        if period not in BUDGET_PERIODS:
+            raise InvalidBudgetError(f"a budget's period is one of {sorted(BUDGET_PERIODS)}")
+        if action not in BUDGET_ACTIONS:
+            raise InvalidBudgetError(f"a budget's action is one of {sorted(BUDGET_ACTIONS)}")
+        if limit_eur_nano <= 0:
+            raise InvalidBudgetError("a budget's limit must be more than zero")
+        if not 0 < soft_pct <= 1:
+            raise InvalidBudgetError("a budget's soft limit is a fraction of it, above 0, up to 1")
+        if action == "downgrade" and not fallback_model:
+            raise InvalidBudgetError("a budget that downgrades has to name a model to fall back to")
+        if fallback_model is not None:
+            try:
+                fallback_model = validate_model(fallback_model)
+            except InvalidModel as exc:
+                raise InvalidBudgetError(str(exc)) from exc
+        client, box = self._budget_scope(org, client, box)
+        budget_id = self._budget_id(org, client, box, period)
+        self._conn.execute(
+            "INSERT INTO budgets (id, org_id, client_id, box_id, period, limit_eur_nano, "
+            "soft_pct, action, fallback_model, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET limit_eur_nano = excluded.limit_eur_nano, "
+            "soft_pct = excluded.soft_pct, action = excluded.action, "
+            "fallback_model = excluded.fallback_model, updated_at = excluded.updated_at",
+            (
+                budget_id,
+                org,
+                client,
+                box,
+                period,
+                limit_eur_nano,
+                soft_pct,
+                action,
+                fallback_model,
+                _utcnow(),
+            ),
+        )
+        row = self._conn.execute("SELECT * FROM budgets WHERE id = ?", (budget_id,)).fetchone()
+        return self._budget_from(row)
+
+    def delete_budget(
+        self, org: str, *, period: str, client: str | None = None, box: str | None = None
+    ) -> bool:
+        """Remove the budget for this scope and period. Returns whether there was one."""
+        try:
+            client, box = self._budget_scope(org, client, box)
+        except (UnknownEntityError, InvalidBudgetError):
+            return False
+        budget_id = self._budget_id(org, client, box, period)
+        found = self._conn.execute("SELECT id FROM budgets WHERE id = ?", (budget_id,)).fetchone()
+        self._conn.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
+        return found is not None
+
+    def budgets_for_org(self, org: str) -> list[Budget]:
+        rows = self._conn.execute(
+            "SELECT * FROM budgets WHERE org_id = ? ORDER BY client_id, box_id, period", (org,)
+        ).fetchall()
+        return [self._budget_from(row) for row in rows]
+
+    def budgets_covering(self, box: Box) -> list[Budget]:
+        """Every budget a call by `box` counts against: its org's, client's and own.
+
+        A box budget always names its client, so "this client, no box" and "this
+        client, this box" are the only client-level rows that match.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM budgets WHERE org_id = ? AND (client_id IS NULL OR "
+            "(client_id = ? AND (box_id IS NULL OR box_id = ?))) ORDER BY id",
+            (box.org, box.client, box.id),
+        ).fetchall()
+        return [self._budget_from(row) for row in rows]
 
     def connect_github(
         self,

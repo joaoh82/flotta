@@ -758,7 +758,7 @@ conventions, and the sharp edges below.
   that belonged to a real stranger's GitHub account. Write the guard *and*
   verify it by reintroducing the bug.
 - **A box's commits are authored as a person and committed by the box
-  (FLOTTA-105, migration 8).** Vercel checks the commit *author* against the
+  (FLOTTA-105, migration 9).** Vercel checks the commit *author* against the
   team before it deploys, with no setting to turn that off, and
   `<box>@flotta.dev` is nobody: every PR an agent opened on a Vercel-connected
   repository was refused. So `create_box` names an author in the box env
@@ -797,6 +797,19 @@ conventions, and the sharp edges below.
   the request's task, and any `await` with it, which only a real socket shows
   (`just gateway-smoke`). **Moving a box onto it moves Hermes off OpenRouter's URL**,
   and Hermes gates some behaviour on that URL (FLOTTA-90 has the list).
+
+- **A budget check that fails open is the bug M13.3 exists not to have (FLOTTA-89).**
+  The gateway turns any exception from `flotta.budgets.check_budgets`, and any store
+  it cannot read, into a 402; nothing forwards on an error. **It is not cached,** so
+  one agent in a loop overruns by one call, and overall by at most one call per call
+  in flight when the limit is crossed. An unpriced row in the period stops that
+  budget until the period rolls over, since its sum is short by an unknown amount.
+  **So does a finished call whose row has not reached the store:** a store that can be
+  read and not written would otherwise show a sum that never moves. The gateway keeps
+  such rows and retries them with their original moment; every budget they count
+  against refuses until they land. That is in one process's memory, so a restart
+  loses them (logged) and a second gateway instance would not see them.
+  The limit is whole nanos and periods are UTC. Until M13.5 every action refuses.
 
 ## Source of truth
 
