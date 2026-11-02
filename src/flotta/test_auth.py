@@ -190,7 +190,7 @@ def test_destroy_is_not_implied_by_write():
     assert not claims.allows(SCOPE_BOX_DESTROY)
 
 
-def test_the_known_scopes_are_exactly_these_eight():
+def test_the_known_scopes_are_exactly_these():
     """A new scope should be a deliberate act, visible in a diff.
 
     This test earned its keep on the first change: adding `box:chat` for M5b
@@ -202,7 +202,9 @@ def test_the_known_scopes_are_exactly_these_eight():
     the door is the one caller that must find a box before it knows whose —
     and for M11.7's `org:admin`, so an agency can run its own clients and
     people without the operator holding its hand — and for M12.3's
-    `auth:relay`, because the web app is one caller for every browser.
+    `auth:relay`, because the web app is one caller for every browser — and for
+    M13.2's `model:call`, so a box's token can spend on models only if it was
+    given that, and a token that leaks from anywhere else cannot.
     """
     assert {
         "fleet:read",
@@ -214,6 +216,7 @@ def test_the_known_scopes_are_exactly_these_eight():
         "fleet:route",
         "org:admin",
         "auth:relay",
+        "model:call",
     } == SCOPES
 
 

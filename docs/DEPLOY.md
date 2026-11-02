@@ -755,6 +755,37 @@ page's content security policy, so set it on both or neither.
 
 ---
 
+## Step 10 — The model gateway (M13.2)
+
+Every model call a box makes goes through this once M13.4 points boxes at it. **Until
+then nothing calls it, and nothing needs it running.** It is deliberately not in
+`render.yaml`, because a Blueprint can create a billed service on its own.
+
+**A separate service from the same image,** not a route on the control plane. Streams
+last minutes, and a model call must not queue behind the control plane's work, or the
+reverse. It also restarts on its own schedule, without taking the reconcile loop with it.
+
+On Render, in `virginia` beside the database:
+
+| Setting | Value |
+|---|---|
+| Runtime and image | Docker, this repo's `./Dockerfile` |
+| Docker command | `flotta gateway --host 0.0.0.0 --port $PORT` |
+| Health check path | `/health` |
+| `FLOTTA_DATABASE_URL` | The internal URL of the same database as the control plane |
+| `FLOTTA_SIGNING_KEY` | The **same** value as the control plane, or no box token verifies |
+| `FLOTTA_API_KEY`, `FLOTTA_MODEL_BASE_URL` | The provider's key and endpoint |
+
+It has to be reachable from Fly, so it takes a public address. Every route but
+`/health` needs a box's own token carrying `model:call`.
+
+**Before calls are worth anything, set the rate:** Euros per dollar, on the operator's
+Fleet page, or `FLOTTA_EUR_PER_USD`. With none, a call's euro cost is unknown. The
+gateway refreshes prices from OpenRouter's catalogue when it starts and daily; on any
+other endpoint there is no catalogue, so calls stay unpriced.
+
+Locally, for $0: `just gateway-smoke`, or `just gateway-fake` to leave one running.
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would

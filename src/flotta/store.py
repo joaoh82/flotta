@@ -694,6 +694,8 @@ class Usage:
     run_id: str | None
     at: str
     idempotency_key: str
+    status: int | None = None
+    estimated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2231,6 +2233,8 @@ class FleetStore:
         key_scope: str = "fleet",
         latency_ms: int | None = None,
         run_id: str | None = None,
+        status: int | None = None,
+        estimated: bool = False,
         now: datetime | None = None,
     ) -> Usage:
         """Write one model call to the ledger, with its cost worked out now.
@@ -2239,7 +2243,9 @@ class FleetStore:
         worked out again. Whose call it was comes from the box's row, so no
         caller can say it wrongly. A call with no price or no rate is still
         written, because the money is spent: its costs are NULL and `spend`
-        counts it. A retry with the same key returns the row already there.
+        counts it. A call that used no tokens cost nothing whatever its model, so
+        a refused call is never unpriced. A retry with the same key returns the
+        row already there.
 
         No transaction, on purpose: a guard is a table lock on Postgres, this
         runs after every model call, and one `INSERT … ON CONFLICT` is atomic.
@@ -2256,23 +2262,28 @@ class FleetStore:
         box = self._get_box_or_raise(box_id)
         moment = now or datetime.now(UTC)
         price = self.price_of(model, at=moment)
-        upstream_cost = (
-            None
-            if price is None
-            else cost_nano(
+        upstream_cost: int | None
+        cost_eur: int | None
+        if tokens_in == 0 and tokens_out == 0:
+            upstream_cost, cost_eur = 0, 0
+        elif price is None:
+            upstream_cost, cost_eur = None, None
+        else:
+            upstream_cost = cost_nano(
                 price, tokens_in=tokens_in, tokens_out=tokens_out, tokens_cached=tokens_cached
             )
-        )
-        cost_eur = (
-            None if price is None else to_eur_nano(upstream_cost, price.currency, eur_per_usd)
-        )
+            cost_eur = to_eur_nano(upstream_cost, price.currency, eur_per_usd)
         # The rate only if it was the one used: a price in euros used none.
-        rate = str(eur_per_usd) if cost_eur is not None and price.currency == "USD" else None
+        rate = (
+            str(eur_per_usd)
+            if upstream_cost and cost_eur is not None and price and price.currency == "USD"
+            else None
+        )
         self._conn.execute(
             "INSERT INTO usage (id, org_id, client_id, box_id, kind, model, upstream, key_scope, "
             "tokens_in, tokens_out, tokens_cached, latency_ms, currency, upstream_cost_nano, "
-            "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key) "
-            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key, status, estimated) "
+            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (box_id, idempotency_key) DO NOTHING",
             (
                 f"u-{uuid.uuid4().hex}",
@@ -2293,6 +2304,8 @@ class FleetStore:
                 run_id,
                 _instant(moment),
                 idempotency_key,
+                status,
+                1 if estimated else 0,
             ),
         )
         row = self._conn.execute(
@@ -2319,6 +2332,8 @@ class FleetStore:
             run_id=row["run_id"],
             at=row["at"],
             idempotency_key=row["idempotency_key"],
+            status=row["status"],
+            estimated=bool(row["estimated"]),
         )
 
     def spend(

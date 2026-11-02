@@ -1448,6 +1448,73 @@ def door(
     uvicorn.run(create_door(), host=host, port=port)
 
 
+@app.command()
+def gateway(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address"),
+    port: int = typer.Option(8083, "--port", help="Port to listen on"),
+    fake_upstream: bool = typer.Option(
+        False, "--fake-upstream", help="Answer every call from a stand-in, for $0. Loopback only."
+    ),
+) -> None:
+    """Run the model gateway: every model call a box makes, metered (M13.2).
+
+    Takes the box's own token, calls the provider with the fleet's key, and writes
+    a priced usage row per call. Refuses to start without a signing key, because
+    its whole job is to tell whose call this is.
+    """
+    try:
+        import uvicorn
+
+        from flotta.gateway import create_gateway
+    except ImportError as exc:
+        typer.secho(
+            "the gateway needs its extra: `uv sync --extra control`",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2) from exc
+    from flotta.auth import SIGNING_KEY_ENV, resolve_signing_key
+    from flotta.db import DATABASE_URL_ENV
+    from flotta.gateway.app import BASE_URL_ENV, FLEET_KEY_ENV
+    from flotta.gateway.fake import FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
+    from flotta.inference import is_openrouter
+    from flotta.model_catalog import fetch_prices
+
+    def refuse(message: str) -> typer.Exit:
+        typer.secho(message, fg=typer.colors.RED, err=True)
+        return typer.Exit(code=2)
+
+    if not resolve_signing_key():
+        raise refuse(
+            f"the gateway will not start without ${SIGNING_KEY_ENV}: it could not tell "
+            "whose call is whose. Generate one with `flotta token key`."
+        )
+    if fake_upstream:
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise refuse(f"--fake-upstream answers anyone; bind 127.0.0.1, not {host!r}.")
+        if os.environ.get(DATABASE_URL_ENV):
+            raise refuse(
+                f"--fake-upstream would write made-up spend into ${DATABASE_URL_ENV}. "
+                "Unset it, so this uses a local store."
+            )
+        env = {**os.environ, BASE_URL_ENV: FAKE_UPSTREAM_URL, FLEET_KEY_ENV: "fake"}
+        app_ = create_gateway(
+            transport=FakeUpstream(chunk_delay_s=0.2), env=env, price_source=lambda: [FAKE_PRICE]
+        )
+    else:
+        base_url = (os.environ.get(BASE_URL_ENV) or "").strip()
+        if not base_url or not (os.environ.get(FLEET_KEY_ENV) or "").strip():
+            raise refuse(
+                f"the gateway needs ${BASE_URL_ENV} and ${FLEET_KEY_ENV}, or --fake-upstream."
+            )
+        # Only OpenRouter has a catalogue to read. Elsewhere a call stays unpriced.
+        source = (lambda: fetch_prices()[0]) if is_openrouter(base_url) else None
+        app_ = create_gateway(price_source=source)
+
+    typer.secho(f"model gateway on {host}:{port}", fg=typer.colors.BRIGHT_BLACK, err=True)
+    uvicorn.run(app_, host=host, port=port)
+
+
 # -- repository grants ------------------------------------------------------
 
 repo_app = typer.Typer(

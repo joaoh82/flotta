@@ -149,6 +149,19 @@ SETTINGS: tuple[Setting, ...] = (
         editable=False,
     ),
     Setting(
+        key="FLOTTA_EUR_PER_USD",
+        label="Euros per dollar",
+        help=(
+            "The rate a model call priced in dollars is converted at when it is "
+            "metered, stored with the call. Changing it never changes a call "
+            "already recorded. With none set, a call's cost in euros is unknown "
+            "rather than a guess. Only reaches agents that call models through "
+            "the gateway."
+        ),
+        kind="money",
+        default="",
+    ),
+    Setting(
         key="FLOTTA_FLY_VOLUME_GB",
         label="Disk per agent",
         help=(
@@ -212,10 +225,6 @@ SETTINGS: tuple[Setting, ...] = (
 # caller at all and needs the gate built. Add each here in the change that gives
 # it something to do.
 #
-# `FLOTTA_EUR_PER_USD` (`flotta.pricing`) waits for the same reason: only
-# `record_usage` reads it, and nothing calls that until the gateway (M13.2),
-# which catalogues it.
-#
 BY_KEY: dict[str, Setting] = {s.key: s for s in SETTINGS}
 
 
@@ -273,6 +282,8 @@ def validate(key: str, value: str) -> str:
             raise ValueError(f"{setting.label} must be a real number, got {text!r}")
         if number < 0:
             raise ValueError(f"{setting.label} cannot be negative, got {text!r}")
+        if key == "FLOTTA_EUR_PER_USD" and number == 0:
+            raise ValueError(f"{setting.label} must be greater than zero, got {text!r}")
     elif key == "FLOTTA_MODEL":
         from flotta.inference import InvalidModel, validate_model
 

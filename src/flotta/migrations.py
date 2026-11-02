@@ -316,6 +316,19 @@ def _usage() -> tuple[str, ...]:
     )
 
 
+def _usage_outcome() -> tuple[str, ...]:
+    """How a metered call ended (FLOTTA-88, M13.2).
+
+    `usage.status` is the upstream's HTTP status, or the gateway's 502 if it could
+    not be reached. `usage.estimated` is 1 when nothing reported the tokens, as
+    when a stream is cut, so the counts are the gateway's estimate.
+    """
+    return (
+        "ALTER TABLE usage ADD COLUMN status BIGINT",
+        "ALTER TABLE usage ADD COLUMN estimated BIGINT NOT NULL DEFAULT 0",
+    )
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -353,6 +366,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         6,
         "usage: the meter's ledger, and model prices",
         _usage(),
+    ),
+    Migration(
+        7,
+        "usage outcome: a call's status, and whether its tokens are estimated",
+        _usage_outcome(),
     ),
 )
 

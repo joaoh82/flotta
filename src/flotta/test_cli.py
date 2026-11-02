@@ -1694,3 +1694,31 @@ def test_prices_refresh_says_when_the_catalogue_cannot_be_read(tmp_path, monkeyp
 
     assert result.exit_code == 1
     assert "no route" in result.output
+
+
+@pytest.mark.parametrize(
+    ("args", "env", "said"),
+    [
+        (["--fake-upstream"], {}, "FLOTTA_SIGNING_KEY"),
+        (["--fake-upstream", "--host", "0.0.0.0"], {"FLOTTA_SIGNING_KEY": "k"}, "bind 127.0.0.1"),
+        (
+            ["--fake-upstream"],
+            {"FLOTTA_SIGNING_KEY": "k", "FLOTTA_DATABASE_URL": "postgresql://real/fleet"},
+            "made-up spend",
+        ),
+        ([], {"FLOTTA_SIGNING_KEY": "k"}, "FLOTTA_MODEL_BASE_URL"),
+    ],
+)
+def test_the_gateway_refuses_what_it_cannot_do_safely(tmp_path, monkeypatch, args, env, said):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    result = CliRunner().invoke(cli.app, ["gateway", *args])
+
+    assert result.exit_code == 2, result.output
+    assert said in result.output

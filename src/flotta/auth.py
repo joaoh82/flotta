@@ -146,6 +146,7 @@ SCOPE_BOX_PEER = "box:peer"
 SCOPE_FLEET_ROUTE = "fleet:route"
 SCOPE_ORG_ADMIN = "org:admin"
 SCOPE_AUTH_RELAY = "auth:relay"
+SCOPE_MODEL_CALL = "model:call"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -157,13 +158,14 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_FLEET_ROUTE,
         SCOPE_ORG_ADMIN,
         SCOPE_AUTH_RELAY,
+        SCOPE_MODEL_CALL,
     }
 )
 
 #: What a person may do, by role (M11.7). Mapped to scopes at mint time, so a
 #: token is still a flat list and nothing on the hot path knows roles exist.
-#: No box scopes (`git:credential`, `box:peer`), no `fleet:route` and no
-#: `auth:relay`: those are
+#: No box scopes (`git:credential`, `box:peer`, `model:call`), no `fleet:route`
+#: and no `auth:relay`: those are
 #: held by machines, never handed to a person.
 ROLES: dict[str, frozenset[str]] = {
     "owner": frozenset(

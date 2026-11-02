@@ -766,10 +766,20 @@ conventions, and the sharp edges below.
   is spent: its euro cost is NULL and `spend()` reports it as `unpriced`, so its
   sum can be short and **a budget check must read `unpriced`**. No transaction
   there, on purpose: a guard is a Postgres table lock and this runs after every
-  model call. `FLOTTA_EUR_PER_USD` has no default and is not in the settings
-  catalogue until the gateway gives it a caller. `flotta prices refresh` goes
-  through `POST /api/prices/refresh` when `$FLOTTA_CONTROL_URL` is set; nothing
-  refreshes prices on a timer yet.
+  model call. `FLOTTA_EUR_PER_USD` has no default. `flotta prices refresh` goes
+  through `POST /api/prices/refresh` when `$FLOTTA_CONTROL_URL` is set; the
+  gateway also refreshes them when it starts and daily.
+- **The model gateway only has the routes Hermes calls (FLOTTA-88).** Hermes's
+  source says `POST /chat/completions` and `GET /models` on `provider: custom`;
+  anything else is a 404, so it cannot be an unmetered way to spend. Headers to the
+  upstream are an **allowlist**, because a blocklist would have to know every header
+  a provider ever took a key in. A person's token is refused even with `model:call`.
+  **A stream cut part-way is priced from an estimate and says `estimated`**, because
+  an unpriced row would stop a fail-closed budget whenever someone interrupts a turn.
+  The row is written on a thread and never awaited: a client that disconnects cancels
+  the request's task, and any `await` with it, which only a real socket shows
+  (`just gateway-smoke`). **Moving a box onto it moves Hermes off OpenRouter's URL**,
+  and Hermes gates some behaviour on that URL (FLOTTA-90 has the list).
 
 ## Source of truth
 

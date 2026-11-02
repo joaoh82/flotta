@@ -1,0 +1,611 @@
+"""The model gateway: a streaming proxy that writes a usage row per call (M13.2).
+
+**Why a proxy and not a log scraper** (spec §3.2): a log proves the number after
+the money is spent, and a budget that acts has to be in the request path. M13.3
+adds that check here.
+
+## What Hermes calls
+
+Read from its source rather than assumed. On `provider: custom` it speaks
+`POST /chat/completions`, and it reads `GET /models` for a context length. It
+only uses `/messages` when the URL ends in `/anthropic`, and its embeddings live
+in a proxy of its own. So those two routes are all there is; anything else is a
+404, which reaches nothing and cannot be an unmetered way to spend.
+
+## Who a call belongs to
+
+**The box's own token, and nothing else in the request.** The subject names the
+box, and `record_usage` reads the org and client off the box's row, so no box
+can meter against another. A person's token is refused even with the scope: a
+call is metered against a box, so it must come from one.
+
+## What reaches the upstream
+
+Request headers are an **allowlist**. A blocklist would have to know the name of
+every header a provider ever accepted a key in. The query string is dropped. The
+body goes as it came, byte for byte, unless a stream did not ask for usage: then
+usage is asked for on the box's behalf, and the chunk that carries it is kept from
+a client that would not expect a chunk with no choices in it.
+
+## When the row is written
+
+After the response ends, however it ends:
+
+- **The upstream reports usage:** those are the tokens.
+- **A stream is cut, or the box walks away:** nothing will report them, so they
+  are estimated from what was sent and seen, at four characters a token, and the
+  row says `estimated`. The money was spent, and an unpriced row would stop a
+  budget that fails closed for what is usually a person interrupting a turn. The
+  upstream is closed so it stops generating.
+- **The upstream refuses or cannot be reached:** a row at no cost, with the status.
+
+The write goes on a thread of its own and nothing awaits it, because a client
+that disconnects cancels this request's task, and with it any `await`. Shutdown
+waits for those threads. A write that fails is retried with the same idempotency
+key, then logged with its numbers: the reply has already gone, so there is
+nothing left to refuse.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from flotta.auth import (
+    SCOPE_MODEL_CALL,
+    AuthError,
+    admits,
+    resolve_signing_key,
+    subject_box,
+    verify,
+)
+from flotta.inference import InvalidModel, is_openrouter, validate_model
+from flotta.pricing import Price, resolve_eur_per_usd
+from flotta.settings import layered
+from flotta.store import Box, FleetStore, is_terminal
+
+_log = logging.getLogger(__name__)
+
+BASE_URL_ENV = "FLOTTA_MODEL_BASE_URL"
+FLEET_KEY_ENV = "FLOTTA_API_KEY"
+
+#: The only request headers that reach the upstream. See the module docstring.
+_FORWARDED = frozenset({"content-type", "accept", "user-agent", "http-referer", "x-title"})
+
+#: Response headers that describe this connection, or the upstream's own session.
+_DROPPED = frozenset(
+    {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "set-cookie",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+#: Models can think for a long time between chunks. A short read timeout would
+#: cut exactly the expensive calls.
+_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+
+_RUN_ID = re.compile(r"^[A-Za-z0-9._:\-]{1,64}$")
+_EVENT_END = re.compile(rb"\r?\n\r?\n")
+
+#: Characters to a token, for a call nothing reported the tokens of.
+_CHARS_PER_TOKEN = 4
+
+PRICE_REFRESH_S = 24 * 60 * 60
+
+#: Not text the model wrote, so not counted towards an estimate.
+_NOT_TEXT = frozenset({"role", "type", "id", "index"})
+
+
+@dataclass(frozen=True, slots=True)
+class UpstreamKey:
+    key: str
+    #: Which level paid: `fleet`, `org` or `client` (D19).
+    scope: str
+
+
+StoredKeys = Callable[[str, str, str | None], str | None]
+
+
+def _nothing_stored(provider: str, org: str, client: str | None) -> str | None:
+    """Until `provider_keys` exists (FLOTTA-102), only the fleet has a key."""
+    return None
+
+
+def resolve_key(
+    provider: str,
+    *,
+    org: str,
+    client: str,
+    env: Mapping[str, str],
+    stored: StoredKeys = _nothing_stored,
+) -> UpstreamKey | None:
+    """Whose key a call goes out on: the client's, the org's, then the fleet's (D19)."""
+    own = stored(provider, org, client)
+    if own:
+        return UpstreamKey(own, "client")
+    own = stored(provider, org, None)
+    if own:
+        return UpstreamKey(own, "org")
+    fleet = (env.get(FLEET_KEY_ENV) or "").strip()
+    return UpstreamKey(fleet, "fleet") if fleet else None
+
+
+class _Refused(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _error(status: int, message: str) -> JSONResponse:
+    """The shape an OpenAI client reads, so an agent's log says what happened."""
+    return JSONResponse(
+        {"error": {"message": message, "type": "flotta_gateway"}}, status_code=status
+    )
+
+
+def _text_length(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(_text_length(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_text_length(v) for k, v in value.items() if k not in _NOT_TEXT)
+    return 0
+
+
+def _estimated_tokens(chars: int) -> int:
+    return (chars + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+
+def _count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _reported(usage: Any) -> tuple[int, int, int] | None:
+    """Tokens in, out and cached, if `usage` really says."""
+    if not isinstance(usage, dict):
+        return None
+    tokens_in = _count(usage.get("prompt_tokens"))
+    tokens_out = _count(usage.get("completion_tokens"))
+    if tokens_in is None or tokens_out is None:
+        return None
+    details = usage.get("prompt_tokens_details")
+    cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
+    return tokens_in, tokens_out, cached or 0
+
+
+class _Events:
+    """Reads a server-sent stream as it passes through.
+
+    Forwards whole events, in order and unchanged: a part of an event is no use
+    to the client, and holding it back until the rest arrives costs nothing.
+    """
+
+    def __init__(self, *, strip_usage: bool) -> None:
+        self._strip_usage = strip_usage
+        self._buffer = b""
+        self.usage: Any = None
+        self.chars = 0
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._buffer += chunk
+        out: list[bytes] = []
+        while True:
+            found = _EVENT_END.search(self._buffer)
+            if found is None:
+                return b"".join(out)
+            event = self._buffer[: found.end()]
+            self._buffer = self._buffer[found.end() :]
+            if self._read(event):
+                out.append(event)
+
+    def flush(self) -> bytes:
+        """What was left after the last whole event, which a cut stream can leave."""
+        rest, self._buffer = self._buffer, b""
+        return rest if rest and self._read(rest) else b""
+
+    def _read(self, event: bytes) -> bool:
+        """Take what it says. Returns whether the client should see it."""
+        keep = True
+        for line in event.splitlines():
+            if not line.startswith(b"data:"):
+                continue
+            try:
+                payload = json.loads(line[len(b"data:") :])
+            except ValueError:
+                continue  # `[DONE]`, or something only the client can judge.
+            if not isinstance(payload, dict):
+                continue
+            choices = payload.get("choices")
+            if payload.get("usage") is not None:
+                self.usage = payload["usage"]
+                if self._strip_usage and not choices:
+                    keep = False
+            if isinstance(choices, list):
+                self.chars += sum(
+                    _text_length(c.get("delta")) for c in choices if isinstance(c, dict)
+                )
+        return keep
+
+
+class _Ledger:
+    """Writes rows on threads that a cancelled request cannot take with it."""
+
+    def __init__(
+        self, write: Callable[..., Any], *, attempts: int = 3, backoff_s: float = 0.5
+    ) -> None:
+        self._write = write
+        self._attempts = attempts
+        self._backoff_s = backoff_s
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="flotta-ledger")
+        self._pending: set[Future[None]] = set()
+
+    def write(self, **row: Any) -> None:
+        try:
+            future = self._pool.submit(self._attempt, row)
+        except RuntimeError:
+            # Shutting down, with a stream that ended after the pool closed.
+            self._attempt(row)
+            return
+        self._pending.add(future)
+        future.add_done_callback(self._pending.discard)
+
+    def _attempt(self, row: dict[str, Any]) -> None:
+        for attempt in range(1, self._attempts + 1):
+            try:
+                self._write(**row)
+                return
+            except Exception:
+                if attempt == self._attempts:
+                    _log.exception("a usage row could not be written: %s", row)
+                else:
+                    time.sleep(self._backoff_s * attempt)
+
+    async def drain(self) -> None:
+        pending = set(self._pending)
+        if pending:
+            await asyncio.to_thread(wait, pending)
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True)
+
+
+_closing: set[asyncio.Future[None]] = set()
+
+
+class _MeteredStream(StreamingResponse):
+    """A stream whose row is written even if the generator never ran.
+
+    A generator that was never started has no `finally` to run, which is what a
+    client that hangs up before the first chunk would leave.
+    """
+
+    def __init__(self, content: AsyncIterator[bytes], finish: Callable[[], None], **kw: Any):
+        super().__init__(content, **kw)
+        self._finish = finish
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._finish()
+
+
+async def _relay(
+    response: httpx.Response, events: _Events, end: Callable[..., None]
+) -> AsyncIterator[bytes]:
+    """The upstream's stream, then the row, however the stream ended."""
+    try:
+        async for chunk in response.aiter_raw():
+            out = events.feed(chunk)
+            if out:
+                yield out
+        rest = events.flush()
+        if rest:
+            yield rest
+    except httpx.HTTPError as exc:
+        # The client sees a stream with no `[DONE]`, which is what happened.
+        _log.warning("the upstream's stream ended early: %s", exc)
+    finally:
+        # The row first, with no `await` before it: see the module docstring.
+        end(usage=events.usage, chars=events.chars)
+        # On its own task, so being cancelled does not leave a model generating.
+        closing = asyncio.ensure_future(response.aclose())
+        _closing.add(closing)
+        closing.add_done_callback(_closing.discard)
+        await asyncio.shield(closing)
+
+
+def _response_headers(response: httpx.Response) -> dict[str, str]:
+    return {k: v for k, v in response.headers.items() if k.lower() not in _DROPPED}
+
+
+def create_gateway(
+    *,
+    store_factory: Callable[[], FleetStore] = FleetStore,
+    transport: httpx.AsyncBaseTransport | None = None,
+    env: Mapping[str, str] | None = None,
+    stored_keys: StoredKeys = _nothing_stored,
+    price_source: Callable[[], Iterable[Price]] | None = None,
+) -> FastAPI:
+    """Build the gateway's ASGI app. The upstream and the store are injected."""
+    environment: Mapping[str, str] = os.environ if env is None else env
+    signing_key = resolve_signing_key(dict(environment))
+    base_url = (environment.get(BASE_URL_ENV) or "").strip().rstrip("/")
+    provider = "openrouter" if is_openrouter(base_url) else "custom"
+
+    def write_row(*, box_id: str, **row: Any) -> None:
+        store = store_factory()
+        try:
+            rate = resolve_eur_per_usd(layered(store, environment))
+            store.record_usage(box_id, eur_per_usd=rate, **row)
+        finally:
+            store.close()
+
+    ledger = _Ledger(write_row)
+
+    def refresh_prices() -> None:
+        assert price_source is not None
+        prices = list(price_source())
+        store = store_factory()
+        try:
+            changed = store.refresh_prices(prices)
+        finally:
+            store.close()
+        _log.info("model prices refreshed: %d models, %d changed", len(prices), changed)
+
+    async def refresh_once() -> None:
+        try:
+            await asyncio.to_thread(refresh_prices)
+        except Exception:
+            # The last prices stay in force. A model with none is unpriced, which
+            # a budget can see, and that beats a gateway that will not start.
+            _log.exception("model prices could not be refreshed")
+
+    async def refresh_forever() -> None:
+        while True:
+            await asyncio.sleep(PRICE_REFRESH_S)
+            await refresh_once()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.upstream = httpx.AsyncClient(
+            transport=transport, timeout=_TIMEOUT, trust_env=False
+        )
+        refresher = None
+        if price_source is not None:
+            await refresh_once()
+            refresher = asyncio.create_task(refresh_forever())
+        try:
+            yield
+        finally:
+            if refresher is not None:
+                refresher.cancel()
+            await app.state.upstream.aclose()
+            await ledger.drain()
+            ledger.close()
+
+    app = FastAPI(title="Flotta model gateway", lifespan=lifespan)
+
+    def find_box(box_id: str) -> Box | None:
+        store = store_factory()
+        try:
+            return store.get_box(box_id)
+        finally:
+            store.close()
+
+    async def caller(request: Request) -> Box:
+        """The box this request is from, or `_Refused`. Nothing is spent before it."""
+        if not signing_key:
+            raise _Refused(503, "the gateway has no signing key, so it cannot check a token")
+        scheme, _, presented = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not presented.strip():
+            raise _Refused(401, "this gateway takes a Flotta token as a bearer token")
+        try:
+            token = verify(presented.strip(), key=signing_key)
+        except AuthError as exc:
+            raise _Refused(401, str(exc)) from exc
+        if not token.allows(SCOPE_MODEL_CALL):
+            raise _Refused(403, f"this token does not carry {SCOPE_MODEL_CALL}")
+        box_id = subject_box(token.subject)
+        if box_id is None:
+            raise _Refused(403, "only an agent's own token may call a model through this gateway")
+        try:
+            box = await asyncio.to_thread(find_box, box_id)
+        except Exception as exc:
+            # No check, no call: the rule M13.3's budgets rest on.
+            _log.exception("the store could not be read")
+            raise _Refused(503, "the gateway cannot read the fleet right now") from exc
+        if box is None or is_terminal("box", box.status):
+            raise _Refused(403, "this agent no longer exists")
+        reason = admits(token, box_id=box.id, org=box.org, client=box.client)
+        if reason is not None:
+            raise _Refused(403, reason)
+        return box
+
+    def upstream_headers(request: Request, key: str) -> dict[str, str]:
+        headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARDED}
+        headers["authorization"] = f"Bearer {key}"
+        # Usage is read out of the body, so it has to arrive readable.
+        headers["accept-encoding"] = "identity"
+        return headers
+
+    @app.get("/health")
+    def health() -> Any:
+        """The gateway's own liveness. Open, and says nothing about the fleet."""
+        return {"status": "ok"}
+
+    @app.get("/v1/models")
+    async def models(request: Request) -> Response:
+        """Passed through and not metered: it costs nothing upstream."""
+        try:
+            box = await caller(request)
+        except _Refused as refused:
+            return _error(refused.status, refused.message)
+        key = resolve_key(
+            provider, org=box.org, client=box.client, env=environment, stored=stored_keys
+        )
+        if key is None or not base_url:
+            return _error(503, "the gateway has no upstream configured")
+        try:
+            reply = await request.app.state.upstream.get(
+                f"{base_url}/models", headers=upstream_headers(request, key.key)
+            )
+        except httpx.HTTPError as exc:
+            _log.warning("the upstream's model list could not be read: %s", exc)
+            return _error(502, "the model provider could not be reached")
+        return Response(reply.content, reply.status_code, _response_headers(reply))
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Response:
+        started = time.monotonic()
+        try:
+            box = await caller(request)
+        except _Refused as refused:
+            return _error(refused.status, refused.message)
+
+        raw = await request.body()
+        try:
+            payload = json.loads(raw)
+            model = validate_model(payload["model"])
+        except (ValueError, KeyError, TypeError, AttributeError, InvalidModel):
+            return _error(400, "expected a JSON body naming a model")
+
+        key = resolve_key(
+            provider, org=box.org, client=box.client, env=environment, stored=stored_keys
+        )
+        if key is None or not base_url:
+            return _error(503, "the gateway has no upstream configured")
+
+        run_id = request.headers.get("x-flotta-run", "").strip()
+        call = {
+            "box_id": box.id,
+            "model": model,
+            "upstream": provider,
+            "key_scope": key.scope,
+            "idempotency_key": uuid.uuid4().hex,
+            "run_id": run_id if _RUN_ID.match(run_id) else None,
+        }
+
+        def write(status: int, *, usage: Any = None, chars: int | None = None) -> None:
+            """`chars` is `None` when no tokens were spent at all."""
+            reported = _reported(usage)
+            if reported is not None:
+                tokens = reported
+            elif chars is None:
+                tokens = (0, 0, 0)
+            else:
+                tokens = (_estimated_tokens(len(raw)), _estimated_tokens(chars), 0)
+            ledger.write(
+                **call,
+                tokens_in=tokens[0],
+                tokens_out=tokens[1],
+                tokens_cached=tokens[2],
+                status=status,
+                estimated=reported is None and chars is not None,
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+
+        streaming = isinstance(payload, dict) and payload.get("stream") is True
+        options = payload.get("stream_options")
+        asked = isinstance(options, dict) and options.get("include_usage") is True
+        content = raw
+        if streaming and not asked:
+            given = options if isinstance(options, dict) else {}
+            payload["stream_options"] = {**given, "include_usage": True}
+            content = json.dumps(payload).encode()
+
+        client: httpx.AsyncClient = request.app.state.upstream
+        outgoing = client.build_request(
+            "POST",
+            f"{base_url}/chat/completions",
+            headers=upstream_headers(request, key.key),
+            content=content,
+        )
+        try:
+            reply = await client.send(outgoing, stream=True)
+        except httpx.HTTPError as exc:
+            _log.warning("the model provider could not be reached: %s", exc)
+            write(502)
+            return _error(502, "the model provider could not be reached")
+
+        if reply.headers.get("content-type", "").startswith("text/event-stream") and (
+            reply.status_code < 400
+        ):
+            events = _Events(strip_usage=streaming and not asked)
+            written = False
+
+            def end(*, usage: Any, chars: int) -> None:
+                nonlocal written
+                if not written:
+                    written = True
+                    write(reply.status_code, usage=usage, chars=chars)
+
+            def finish() -> None:
+                end(usage=events.usage, chars=events.chars)
+                closing = asyncio.ensure_future(reply.aclose())
+                _closing.add(closing)
+                closing.add_done_callback(_closing.discard)
+
+            return _MeteredStream(
+                _relay(reply, events, end),
+                finish,
+                status_code=reply.status_code,
+                headers=_response_headers(reply),
+            )
+
+        try:
+            body = await reply.aread()
+        except httpx.HTTPError as exc:
+            _log.warning("the upstream's reply ended early: %s", exc)
+            # It may have worked, and nothing says what it used.
+            write(502, chars=0 if reply.status_code < 400 else None)
+            return _error(502, "the model provider's reply ended early")
+        finally:
+            await reply.aclose()
+
+        if reply.status_code >= 400:
+            write(reply.status_code)
+            # A provider's complaint about a key can quote it, and a box holds none.
+            scrubbed = body.replace(key.key.encode(), b"[the upstream key]")
+            return Response(scrubbed, reply.status_code, _response_headers(reply))
+
+        try:
+            answer = json.loads(body)
+        except ValueError:
+            answer = {}
+        answer = answer if isinstance(answer, dict) else {}
+        choices = answer.get("choices")
+        seen = (
+            sum(_text_length(c.get("message")) for c in choices if isinstance(c, dict))
+            if isinstance(choices, list)
+            else 0
+        )
+        write(reply.status_code, usage=answer.get("usage"), chars=seen)
+        return Response(body, reply.status_code, _response_headers(reply))
+
+    return app
