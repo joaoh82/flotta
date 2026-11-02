@@ -342,6 +342,14 @@ class LocalBackend:
             self.stop(name)
             self.start(name)
 
+    def remove_secrets(self, box_id: str, names: list[str]) -> None:
+        name = self._name(box_id)
+        kept = {k: v for k, v in self._read(name, "secrets.json").items() if k not in names}
+        self._write(name, "secrets.json", kept, private=True)
+        if self._probe(name) is not None:
+            self.stop(name)
+            self.start(name)
+
     def apply_env(self, box_id: str, env: dict[str, str]) -> None:
         name = self._name(box_id)
         self._write(name, "env.json", {**self._read(name, "env.json"), **env})

@@ -843,6 +843,34 @@ unwritten rows are in its memory, so a second instance would not see them.
 
 Locally, for $0: `just gateway-smoke`, or `just gateway-fake` to leave one running.
 
+### Moving agents onto it (M13.4)
+
+Nothing moves until you say so. **`FLOTTA_GATEWAY_URL` on the control plane is the
+switch**: set to the gateway's address, new agents are created through it, and existing
+ones move one at a time. Each move restarts a running agent twice. A sleeping one takes
+it when it next wakes.
+
+1. Run the gateway, set **Euros per dollar**, and check `/health`.
+2. Set `FLOTTA_GATEWAY_URL` on the control plane.
+3. `just agent-gateway <agent>` for **one** agent, and talk to it.
+4. **Measure before moving more.** Hermes behaves differently off OpenRouter's URL
+   (`flotta.inference.gateway_provider`), and the image has to be new enough to write
+   the setting that keeps prompt caching. Compare `tokens_cached` in `usage` with what
+   you expect, and read what the conversation does at a budget's 402.
+5. Prove the key is gone: `printenv` on the machine shows no `OPENROUTER_API_KEY`, and
+   `FLOTTA_API_KEY` is a `flotta_` token.
+6. `just agent-direct <agent>` is the way back, and needs the control plane to still
+   hold the key. **Remove `FLOTTA_API_KEY` from the control plane only after the last
+   agent has moved** and you no longer want that way back. The gateway keeps its own.
+
+A move changes the provider and never the model: the agent keeps the one it was last
+given, whatever the fleet's default is now. It waits for a model change under way, and
+refuses an agent whose model nothing records until you set one.
+
+Once agents use the gateway, its outage or the database's stops their model calls.
+
+---
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would

@@ -2237,6 +2237,56 @@ def _set_model(box_id: str, model: str | None, as_json: bool) -> None:
     emit(body, f"{body['name']} now runs {body['model']} ({whose})", as_json=as_json)
 
 
+def _move_provider(box_id: str, method: str, as_json: bool) -> None:
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if not control_url():
+        raise _fail(
+            ControlPlaneError(
+                "this writes to the agent's own machine, which only the control plane can "
+                "reach. Set $FLOTTA_CONTROL_URL."
+            ),
+            code=2,
+        )
+    try:
+        box = _remote_box(box_id)
+        body = control_request(
+            method,
+            f"/api/boxes/{box['id']}/gateway",
+            scopes=(SCOPE_FLEET_WRITE,),
+            timeout_s=180.0,
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    emit(
+        body,
+        f"{body['name']} is moving. A running agent restarts twice; its timeline says how it went.",
+        as_json=as_json,
+    )
+
+
+@model_app.command("gateway")
+def model_gateway(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Move an agent onto the model gateway, and take the fleet's key off it.
+
+    Operator only. Measure one agent before moving the rest: `flotta model direct`
+    is the way back.
+    """
+    _move_provider(box_id, "POST", as_json)
+
+
+@model_app.command("direct")
+def model_direct(
+    box_id: str = typer.Argument(..., help="Box name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Put an agent back on the provider directly, with the fleet's key."""
+    _move_provider(box_id, "DELETE", as_json)
+
+
 @model_app.command("set")
 def model_set(
     box_id: str = typer.Argument(..., help="Box name or id"),

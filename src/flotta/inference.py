@@ -37,6 +37,7 @@ writes.
 from __future__ import annotations
 
 import re
+from typing import Any
 from urllib.parse import urlparse
 
 #: A model id as OpenRouter and most gateways spell it: `vendor/name`,
@@ -98,6 +99,35 @@ def hermes_model_config(model: str, base_url: str, api_key: str) -> dict[str, st
     if is_openrouter(base_url):
         return {"default": model, "provider": "openrouter", "base_url": base_url}
     return {"default": model, "provider": "custom", "base_url": base_url, "api_key": api_key}
+
+
+#: What Flotta calls the gateway among Hermes's `providers:`.
+GATEWAY_PROVIDER = "flotta-gateway"
+
+#: Model families Hermes puts prompt-cache markers on when it is on OpenRouter's URL
+#: (`agent_runtime_helpers`, at v0.22.5).
+_CACHED_FAMILIES = ("claude", "kimi", "moonshot")
+
+
+def gateway_provider(model: str, base_url: str) -> dict[str, Any]:
+    """The `providers:` entry for a gateway in front of OpenRouter (FLOTTA-90).
+
+    **Hermes gates behaviour on the URL being openrouter.ai**, and the gateway's is
+    not. On any other URL it stops putting prompt-cache markers on Claude and Kimi,
+    which its own comments say re-bills the whole prompt every turn, and it stops
+    sending reasoning parameters. So those are asked for here, for the families it
+    would have sent them for. Reasoning only for Claude: Hermes checks OpenRouter's
+    live catalogue for the rest, and says some routes answer 400 to it.
+
+    This is a copy of Hermes's rule, so it can drift: re-check at a Hermes bump.
+    """
+    provider: dict[str, Any] = {"api": base_url, "transport": "openai_chat"}
+    name = model.lower()
+    if any(family in name for family in _CACHED_FAMILIES):
+        provider["models"] = {model: {"prompt_caching": True}}
+    if "claude" in name:
+        provider["extra_body"] = {"reasoning": {"enabled": True, "effort": "medium"}}
+    return provider
 
 
 #: Keys in `model:` that Flotta decides. Anything else in the block — an

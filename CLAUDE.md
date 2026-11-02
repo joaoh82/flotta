@@ -816,6 +816,17 @@ conventions, and the sharp edges below.
   loses them (logged) and a second gateway instance would not see them.
   The limit is whole nanos and periods are UTC. Until M13.5 every action refuses.
 
+- **`FLOTTA_GATEWAY_URL` is the switch that moves agents onto the gateway (FLOTTA-90).**
+  Unset, nothing changes. Set, a new box gets `FLOTTA_MODEL_BASE_URL` = the gateway and
+  `FLOTTA_API_KEY` = a token carrying only `model:call`, and no provider key. The names
+  are the old ones on purpose, so an old image works; only the `providers:` entry needs
+  a new one. **That token lasts five years** because nothing renews it and an expired one
+  stops an agent thinking; the gateway refuses a destroyed agent, so a long life does not
+  reach far. **`inference.gateway_provider` copies a rule from Hermes** (prompt caching for
+  Claude and Kimi, reasoning for Claude, both gated on OpenRouter's URL), so re-check it at
+  a Hermes bump. Existing agents move one at a time: `join_gateway` writes before it
+  removes, because the other order strands an agent with no key.
+
 ## Source of truth
 
 The living planning docs live in the **parent** repo (`../docs/`):

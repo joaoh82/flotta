@@ -205,6 +205,14 @@ gateway-fake port="8083":
 gateway-smoke:
     uv run --extra control python scripts/gateway_smoke.py
 
+# M13.4 — move one agent onto the gateway, or back. Restarts it twice if it is
+# running. Goes through $FLOTTA_CONTROL_URL. Measure one before moving the rest.
+agent-gateway BOX:
+    uv run flotta model gateway {{BOX}}
+
+agent-direct BOX:
+    uv run flotta model direct {{BOX}}
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key

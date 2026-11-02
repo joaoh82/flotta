@@ -258,6 +258,10 @@ class Backend(Protocol):
         """
         ...
 
+    def remove_secrets(self, box_id: str, names: list[str]) -> None:
+        """Take secrets off an **existing** box, which restarts it as `apply_secrets` does."""
+        ...
+
     def apply_env(self, box_id: str, env: dict[str, str]) -> None:
         """Rewrite plain environment on an **existing** box, keeping its disk.
 

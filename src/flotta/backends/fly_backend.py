@@ -232,6 +232,13 @@ class FlyBackend:
             stdin="".join(f"{k}={v}\n" for k, v in secrets.items()),
         )
 
+    def remove_secrets(self, box_id: str, names: list[str]) -> None:
+        """`flyctl secrets unset`: deployed, like `apply_secrets`, for the same reason."""
+        if not names:
+            return
+        app, _ = self._addr(box_id)
+        self._flyctl("secrets", "unset", *names, app=app)
+
     def apply_env(self, box_id: str, env: dict[str, str]) -> None:
         """`flyctl machine update --env`, which keeps everything it does not name.
 
