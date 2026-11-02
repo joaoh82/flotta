@@ -1171,7 +1171,7 @@ def create_app(
             "client": installation.client,
             "connected_at": installation.connected_at,
             # Whom this account's agents commit as (FLOTTA-105); None before
-            # migration 8, when they commit as themselves.
+            # migration 9, when they commit as themselves.
             "commits_as": installation.connected_login,
             "status": status,
             "manage_url": (

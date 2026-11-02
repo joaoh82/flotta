@@ -1161,7 +1161,7 @@ def test_a_person_with_no_display_name_is_their_login_on_a_commit(store, box):
 
 
 def test_a_connection_from_before_the_person_was_kept_names_nobody(store, box):
-    """Rows from before migration 8: their agents commit as themselves, as before."""
+    """Rows from before migration 9: their agents commit as themselves, as before."""
     held = _connected(store, box)
     assert held.connected_login is None
     assert held.author is None
