@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from flotta.github import API_ROOT
+from flotta.github import API_ROOT, Person, person_from
 
 WEB_ROOT = "https://github.com"
 
@@ -111,6 +111,10 @@ class Account:
     #: GitHub's `User` or `Organization`.
     type: str
     suspended: bool = False
+    #: Who proved they own it, when this came from `proven_account`. The
+    #: agents of whoever connected an account author their commits as this
+    #: person (FLOTTA-105), so it is kept with the installation.
+    person: Person | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,15 +223,20 @@ class GitHubApp:
         """The account `installation` is on, if the person behind `code` owns it.
 
         The user token ends with this call: it is never stored or returned.
+        What is kept of the person is who they are on GitHub (`Account.person`),
+        because their agents will commit as them.
         """
         account = self.account(installation)
         user_token = self._user_token(code)
-        if not self._is_owner(user_token, account):
+        person = self._prove_owner(user_token, account)
+        if person is None:
             raise NotProven(
                 f"GitHub does not say you are an owner of {account.login}. Only an owner "
                 f"of a GitHub account can connect it here."
             )
-        return account
+        return Account(
+            login=account.login, type=account.type, suspended=account.suspended, person=person
+        )
 
     def _user_token(self, code: str) -> str:
         # GitHub answers 200 with an `error` field for a bad code.
@@ -246,22 +255,37 @@ class GitHubApp:
             raise NotProven("GitHub did not confirm who you are; start connecting again")
         return str(token)
 
-    def _is_owner(self, user_token: str, account: Account) -> bool:
+    def _prove_owner(self, user_token: str, account: Account) -> Person | None:
+        """The person behind `user_token` if they own `account`, else None.
+
+        A personal account is proven by `/user` naming it. An organization is
+        proven by an active admin membership first, and `/user` is asked only
+        then: the person's identity is kept, and a stranger's is not worth a
+        call.
+        """
         headers = {**_API_HEADERS, "Authorization": f"Bearer {user_token}"}
-        if account.type == "User":
-            status, body = self._ask("GET", f"{self.api_root}/user", headers=headers)
-            if status != 200:
-                raise NotProven("GitHub did not confirm who you are; start connecting again")
-            return str(body.get("login") or "").lower() == account.login.lower()
-        if account.type != "Organization":
-            return False
-        status, body = self._ask(
-            "GET",
-            f"{self.api_root}/user/memberships/orgs/{quote(account.login)}",
-            headers=headers,
-        )
-        # 403 and 404 both mean GitHub will not say they are a member.
-        return status == 200 and body.get("state") == "active" and body.get("role") == "admin"
+        if account.type == "Organization":
+            status, body = self._ask(
+                "GET",
+                f"{self.api_root}/user/memberships/orgs/{quote(account.login)}",
+                headers=headers,
+            )
+            # 403 and 404 both mean GitHub will not say they are a member.
+            if not (
+                status == 200 and body.get("state") == "active" and body.get("role") == "admin"
+            ):
+                return None
+        elif account.type != "User":
+            return None
+        status, body = self._ask("GET", f"{self.api_root}/user", headers=headers)
+        if status != 200:
+            raise NotProven("GitHub did not confirm who you are; start connecting again")
+        person = person_from(body)
+        if person is None:
+            raise NotProven("GitHub did not confirm who you are; start connecting again")
+        if account.type == "User" and person.login.lower() != account.login.lower():
+            return None
+        return person
 
     # -- as the App ------------------------------------------------------------
 

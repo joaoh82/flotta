@@ -757,6 +757,23 @@ conventions, and the sharp edges below.
   store a deployed fleet does not use, and a box committing under an address
   that belonged to a real stranger's GitHub account. Write the guard *and*
   verify it by reintroducing the bug.
+- **A box's commits are authored as a person and committed by the box
+  (FLOTTA-105, migration 8).** Vercel checks the commit *author* against the
+  team before it deploys, with no setting to turn that off, and
+  `<box>@flotta.dev` is nobody: every PR an agent opened on a Vercel-connected
+  repository was refused. So `create_box` names an author in the box env
+  (`FLOTTA_GIT_AUTHOR_NAME` / `_EMAIL`) and the entrypoint sets `author.*`
+  from it while `user.*` stays the box. The person is whoever connected the
+  GitHub account the repositories come from — kept on `github_installations`
+  from the `/user` call that proved ownership — or, for the operator's agents,
+  the owner of `$FLOTTA_GITHUB_TOKEN`, asked of GitHub once per token. The
+  address is `<id>+<login>@users.noreply.github.com`, which GitHub issues and
+  attributes unconditionally: the opposite of the guessed noreply address above,
+  because it is GitHub's own answer for that person's token. Proven live on PR
+  #118 of a client's repository: refused as the box, built with the author
+  changed and the committer untouched. Set at creation, so a box from before
+  this keeps committing as itself until it is recreated or its machine env is
+  updated.
 
 - **The meter's ledger is appended to, and money in it is whole nanos (FLOTTA-87,
   migration 6).** `record_usage` works a call's cost out once, from the price in

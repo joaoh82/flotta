@@ -22,6 +22,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+#: GitHub's own REST headers, shared by every call this module makes.
+API_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
 #: GitHub's REST root. Not configurable: Enterprise would need more than a host
 #: swap (auth, API version), and a half-supported option is worse than none.
 API_ROOT = "https://api.github.com"
@@ -116,3 +122,84 @@ def _httpx_get(url: str, *, headers: dict[str, str], timeout_s: float) -> int:
     import httpx
 
     return httpx.get(url, headers=headers, timeout=timeout_s).status_code
+
+
+# -- who a token belongs to (FLOTTA-105) ----------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Person:
+    """A GitHub user, as much of one as a commit needs.
+
+    `id` and `login` make the address GitHub itself issues,
+    `<id>+<login>@users.noreply.github.com`, which GitHub attributes to the
+    account whatever its email settings say. That is what makes it safe to
+    write on a commit: it is GitHub's answer for this token, not a guess at
+    an address somebody might hold. (A box once guessed
+    `<name>@users.noreply.github.com` and was attributed to a stranger; see
+    `fly/box_entrypoint.sh`.)
+    """
+
+    login: str
+    id: str
+    #: The profile's display name; GitHub allows none.
+    name: str | None = None
+
+    @property
+    def commit_email(self) -> str:
+        return f"{self.id}+{self.login}@users.noreply.github.com"
+
+    @property
+    def commit_name(self) -> str:
+        return (self.name or "").strip() or self.login
+
+
+def person_from(body: Any) -> Person | None:
+    """`Person` from GitHub's `/user` answer, or None if it names nobody."""
+    if not isinstance(body, dict):
+        return None
+    login = str(body.get("login") or "").strip()
+    user_id = body.get("id")
+    if not login or user_id is None or isinstance(user_id, bool):
+        return None
+    name = body.get("name")
+    return Person(login=login, id=str(user_id), name=str(name).strip() if name else None)
+
+
+def token_owner(
+    token: str | None,
+    *,
+    fetch: Callable[..., Any] | None = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> Person | None:
+    """Whose token this is: GitHub's `/user` for it, or None.
+
+    For the operator's `$FLOTTA_GITHUB_TOKEN`, the person a box's commits
+    are authored as (FLOTTA-105). **None on any failure**, so a GitHub blip
+    while creating an agent costs the author line, which the box's log says,
+    rather than the agent. `fetch(url, headers=, timeout_s=)` returns
+    `(status, body)` and is injected so the suite never reaches the network.
+    """
+    if not (token or "").strip():
+        return None
+    caller = fetch or _httpx_get_json
+    try:
+        status, body = caller(
+            f"{API_ROOT}/user",
+            headers={"Authorization": f"Bearer {token}", **API_HEADERS},
+            timeout_s=timeout_s,
+        )
+    except Exception:  # noqa: BLE001 - any transport failure is "could not ask"
+        return None
+    return person_from(body) if status == 200 else None
+
+
+def _httpx_get_json(url: str, *, headers: dict[str, str], timeout_s: float) -> tuple[int, Any]:
+    import httpx
+
+    response = httpx.get(url, headers=headers, timeout=timeout_s)
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    return response.status_code, body

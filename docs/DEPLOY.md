@@ -488,6 +488,18 @@ legitimate state rather than a broken box.
 > agents only: another org's are refused it. Agencies use step 7d, where GitHub
 > does enforce it. Scope the PAT to the repositories you are willing to lose.
 
+**Whose name goes on the commits.** A box is the *committer* of everything it
+writes, under `<box>@<domain>`, an address that resolves to no GitHub account.
+The *author* is the owner of this PAT (FLOTTA-105): the control plane asks
+GitHub `/user` for it once and gives every box it creates
+`FLOTTA_GIT_AUTHOR_NAME` / `FLOTTA_GIT_AUTHOR_EMAIL`, with the address GitHub
+issues for that account (`<id>+<login>@users.noreply.github.com`). GitHub shows
+"authored by you, committed by the box", and a deploy service that checks the
+author against its team (Vercel does, with no way to turn it off) sees a member
+rather than a stranger. Agencies get the same from step 7d, with the person who
+connected the account. A box created before the PAT was set, or before this
+existed, keeps committing as itself: recreate it, or update its machine env.
+
 ### 7b. Load the identity onto the box, and grant it repositories
 
 **A box created after this shipped already has an identity** — `flotta create`
@@ -634,6 +646,15 @@ for an owner nobody connected.
 on GitHub and an owner of the agency in Flotta, in one browser. If a client owns
 the GitHub organization and nobody at the agency is an owner of it, the client
 has to make someone one while connecting.
+
+**And whoever connects it is whom its agents commit as.** The `/user` call that
+proves ownership also says who the person is, and that is kept with the
+installation: a box whose repositories come from this account authors its
+commits as them, at the address GitHub issues for their account, while the box
+stays the committer (FLOTTA-105; step 7a says why). The GitHub page shows it as
+"commits as". Connecting the same scope again as somebody else moves the
+agents' commits onto that person. A box picks its author when it is created,
+from its client's account first, then its agency's.
 
 ## Step 8 — A second agency (M11.7)
 

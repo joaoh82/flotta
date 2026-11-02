@@ -22,6 +22,7 @@ from flotta.github_app import (
     GitHubAppError,
     InstallationGone,
     NotProven,
+    Person,
     RepositoryNotSelected,
     State,
     app_from_env,
@@ -231,10 +232,16 @@ def _installation(login="acme", kind="Organization"):
 TOKEN = (200, {"access_token": "ghu_person"})
 
 
-def test_an_organizations_owner_may_connect_it():
-    app, seen = _app(_installation(), TOKEN, (200, {"state": "active", "role": "admin"}))
+OLIVIA = (200, {"login": "olivia", "id": 4242, "name": "Olivia Owner"})
 
-    assert app.proven_account("77", "the-code").login == "acme"
+
+def test_an_organizations_owner_may_connect_it():
+    app, seen = _app(_installation(), TOKEN, (200, {"state": "active", "role": "admin"}), OLIVIA)
+
+    proven = app.proven_account("77", "the-code")
+    assert proven.login == "acme"
+    # Who they are is kept with the account: their agents commit as them (FLOTTA-105).
+    assert proven.person == Person(login="olivia", id="4242", name="Olivia Owner")
 
     assert seen[1]["url"] == "https://github.com/login/oauth/access_token"
     assert seen[1]["json"] == {
@@ -244,6 +251,25 @@ def test_an_organizations_owner_may_connect_it():
     }
     assert seen[2]["url"] == "https://api.github.com/user/memberships/orgs/acme"
     assert seen[2]["headers"]["Authorization"] == "Bearer ghu_person"
+    assert seen[3]["url"] == "https://api.github.com/user"
+    assert seen[3]["headers"]["Authorization"] == "Bearer ghu_person"
+
+
+def test_who_an_owner_is_on_github_is_asked_only_once_they_are_proven():
+    """A stranger's identity is not worth a call: the membership check comes
+    first, and `/user` is asked only after it says admin."""
+    app, seen = _app(_installation(), TOKEN, (404, {}))
+    with pytest.raises(NotProven):
+        app.proven_account("77", "the-code")
+    assert [s["url"] for s in seen[2:]] == ["https://api.github.com/user/memberships/orgs/acme"]
+
+
+def test_an_owner_github_will_not_name_proves_nothing():
+    """`/user` without an id is an answer that makes no commit address, and a
+    person who cannot be named cannot be the one the account's agents commit as."""
+    app, _ = _app(_installation(), TOKEN, (200, {"state": "active", "role": "admin"}), (200, {}))
+    with pytest.raises(NotProven, match="did not confirm"):
+        app.proven_account("77", "the-code")
 
 
 @pytest.mark.parametrize(
@@ -265,13 +291,17 @@ def test_nobody_else_in_or_near_an_organization_may(membership):
 
 
 def test_a_personal_account_is_its_own_owner():
-    app, seen = _app(_installation("Josh", "User"), TOKEN, (200, {"login": "josh"}))
-    assert app.proven_account("77", "the-code").login == "Josh"
+    app, seen = _app(_installation("Josh", "User"), TOKEN, (200, {"login": "josh", "id": 7}))
+    proven = app.proven_account("77", "the-code")
+    assert proven.login == "Josh"
+    assert proven.person == Person(login="josh", id="7", name=None)
+    assert proven.person.commit_email == "7+josh@users.noreply.github.com"
+    assert proven.person.commit_name == "josh"
     assert seen[2]["url"] == "https://api.github.com/user"
 
 
 def test_someone_elses_personal_account_is_refused():
-    app, _ = _app(_installation("victim", "User"), TOKEN, (200, {"login": "attacker"}))
+    app, _ = _app(_installation("victim", "User"), TOKEN, (200, {"login": "attacker", "id": 9}))
     with pytest.raises(NotProven):
         app.proven_account("77", "the-code")
 

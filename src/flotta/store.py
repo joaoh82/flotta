@@ -517,6 +517,23 @@ class GitHubInstallation:
     account_type: str
     connected_by: str
     connected_at: str
+    #: Who connected it, as GitHub knows them (FLOTTA-105): the person its
+    #: agents author commits as. All None on a row from before migration 8.
+    connected_login: str | None = None
+    connected_user_id: str | None = None
+    connected_name: str | None = None
+
+    @property
+    def author(self) -> tuple[str, str] | None:
+        """`(name, email)` for a commit, or None when nobody is recorded.
+
+        The address is the one GitHub issues for the account, so GitHub links
+        the commit to the person and a deploy that checks the author passes.
+        """
+        if not self.connected_login or not self.connected_user_id:
+            return None
+        name = (self.connected_name or "").strip() or self.connected_login
+        return name, f"{self.connected_user_id}+{self.connected_login}@users.noreply.github.com"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2377,6 +2394,9 @@ class FleetStore:
         account: str,
         account_type: str,
         connected_by: str,
+        connected_login: str | None = None,
+        connected_user_id: str | None = None,
+        connected_name: str | None = None,
     ) -> GitHubInstallation:
         """Record whose an installation is. Idempotent for the same scope.
 
@@ -2385,7 +2405,11 @@ class FleetStore:
         someone trying ids.
 
         The caller has already had GitHub confirm this person owns the account;
-        see `flotta.github_app`.
+        see `flotta.github_app`. Who they are on GitHub (`connected_login`,
+        `connected_user_id`, `connected_name`) is kept so the account's agents
+        can commit as them (FLOTTA-105), and **the latest proof wins**: a scope
+        connected again by somebody else moves its agents' commits onto that
+        person, who is the one GitHub has most recently vouched for.
 
         It also replaces any other installation this org recorded for that
         account. GitHub keeps one installation of an App per account, so with this
@@ -2397,8 +2421,8 @@ class FleetStore:
             self._conn.execute(
                 "INSERT INTO github_installations "
                 "(installation_id, org, client, account, account_type, connected_by, "
-                "connected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (installation_id) DO NOTHING",
+                "connected_at, connected_login, connected_user_id, connected_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (installation_id) DO NOTHING",
                 (
                     installation_id,
                     org,
@@ -2407,6 +2431,9 @@ class FleetStore:
                     account_type,
                     connected_by,
                     _utcnow(),
+                    connected_login,
+                    connected_user_id,
+                    connected_name,
                 ),
             )
             row = self._conn.execute(
@@ -2418,6 +2445,33 @@ class FleetStore:
                 raise GitHubAlreadyConnectedError(
                     f"that GitHub account's installation is already connected elsewhere "
                     f"(installation {installation_id})"
+                )
+            if (
+                connected_login
+                and connected_user_id
+                and (
+                    held.connected_login != connected_login
+                    or held.connected_user_id != connected_user_id
+                    or held.connected_name != connected_name
+                )
+            ):
+                self._conn.execute(
+                    "UPDATE github_installations SET connected_by = ?, connected_login = ?, "
+                    "connected_user_id = ?, connected_name = ? WHERE installation_id = ?",
+                    (
+                        connected_by,
+                        connected_login,
+                        connected_user_id,
+                        connected_name,
+                        installation_id,
+                    ),
+                )
+                held = replace(
+                    held,
+                    connected_by=connected_by,
+                    connected_login=connected_login,
+                    connected_user_id=connected_user_id,
+                    connected_name=connected_name,
                 )
             self._conn.execute(
                 "DELETE FROM github_installations "
@@ -3098,6 +3152,9 @@ def _installation_from_row(row: db.Row) -> GitHubInstallation:
         account_type=row["account_type"],
         connected_by=row["connected_by"],
         connected_at=row["connected_at"],
+        connected_login=row["connected_login"],
+        connected_user_id=row["connected_user_id"],
+        connected_name=row["connected_name"],
     )
 
 

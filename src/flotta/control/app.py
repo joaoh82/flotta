@@ -1170,6 +1170,9 @@ def create_app(
             "account": installation.account,
             "client": installation.client,
             "connected_at": installation.connected_at,
+            # Whom this account's agents commit as (FLOTTA-105); None before
+            # migration 8, when they commit as themselves.
+            "commits_as": installation.connected_login,
             "status": status,
             "manage_url": (
                 f"https://github.com/{where}settings/installations/{installation.installation_id}"
@@ -1264,6 +1267,9 @@ def create_app(
                 account=account.login,
                 account_type=account.type,
                 connected_by=token.subject,
+                connected_login=account.person.login if account.person else None,
+                connected_user_id=account.person.id if account.person else None,
+                connected_name=account.person.name if account.person else None,
             )
         except GitHubAlreadyConnectedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

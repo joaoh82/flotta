@@ -3671,3 +3671,129 @@ def test_padded_tenant_ids_name_the_row_the_probe_the_spec_and_the_token_alike(s
     assert backend.specs[0].env["FLOTTA_BOX_NAME"] == label
     token = verify(backend.specs[0].secrets["FLOTTA_BOX_TOKEN"])
     assert (token.org, token.client) == ("agency-x", "acme")
+
+
+# -- whom a box's commits are authored as (FLOTTA-105) ----------------------------
+#
+# Vercel refuses a commit whose author is not a member of the team, and a box
+# is not, so the author is the person whose GitHub the repositories come from
+# and the committer stays the box.
+
+
+def _connect(store, org, client, login, user_id, name=None, installation="77"):
+    store.connect_github(
+        installation,
+        org=org,
+        client=client,
+        account=f"gh-{installation}",
+        account_type="Organization",
+        connected_by="someone",
+        connected_login=login,
+        connected_user_id=user_id,
+        connected_name=name,
+    )
+
+
+def test_a_box_commits_as_the_person_who_connected_its_clients_github(store, monkeypatch):
+    _connect(store, "default", "default", "olivia", "4242", "Olivia O")
+    spec, box = _created(store, monkeypatch)
+    assert spec.env["FLOTTA_GIT_AUTHOR_NAME"] == "Olivia O"
+    assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "4242+olivia@users.noreply.github.com"
+    # The committer is still the box: nothing here renames it.
+    assert spec.env["FLOTTA_BOX_NAME"] == "eng-a"
+    assert "user.name" not in spec.env
+    [event] = [e for e in store.get_events("box", box.id) if e.type == "commit_author"]
+    assert event.payload == {
+        "login": "olivia",
+        "email": "4242+olivia@users.noreply.github.com",
+        "source": "github_app",
+    }
+
+
+def test_the_clients_own_connection_outranks_the_orgs(store, monkeypatch):
+    """The same order the credential is chosen in: a client's account first."""
+    _connect(store, "default", None, "orgadmin", "1", installation="77")
+    _connect(store, "default", "default", "clientowner", "2", installation="88")
+    spec, _ = _created(store, monkeypatch)
+    assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "2+clientowner@users.noreply.github.com"
+
+
+def test_a_connection_that_names_nobody_is_passed_over_for_one_that_does(store, monkeypatch):
+    store.connect_github(
+        "77",
+        org="default",
+        client="default",
+        account="gh-77",
+        account_type="Organization",
+        connected_by="someone",
+    )
+    _connect(store, "default", None, "orgadmin", "1", installation="88")
+    spec, _ = _created(store, monkeypatch)
+    assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "1+orgadmin@users.noreply.github.com"
+
+
+def test_the_operators_agents_commit_as_the_fleet_tokens_owner(store, monkeypatch):
+    """`$FLOTTA_GITHUB_TOKEN` is one person's, so that person is the author —
+    asked of GitHub once per token, not once per agent."""
+    from flotta import github
+    from flotta.provision import _FLEET_TOKEN_OWNERS
+
+    _FLEET_TOKEN_OWNERS.clear()
+    asked = []
+
+    def owner(token, **kwargs):
+        asked.append(token)
+        return github.Person(login="joaoh82", id="208517", name="João")
+
+    monkeypatch.setattr(github, "token_owner", owner)
+    spec, box = _created(store, monkeypatch, FLOTTA_GITHUB_TOKEN="github_pat_x")
+    assert spec.env["FLOTTA_GIT_AUTHOR_NAME"] == "João"
+    assert spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "208517+joaoh82@users.noreply.github.com"
+    [event] = [e for e in store.get_events("box", box.id) if e.type == "commit_author"]
+    assert event.payload["source"] == "fleet_token"
+
+    again = Recording()
+    create_box("eng-b", store=store, backend=again)
+    assert again.spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == spec.env["FLOTTA_GIT_AUTHOR_EMAIL"]
+    assert asked == ["github_pat_x"]
+
+
+def test_a_fleet_token_github_will_not_name_is_asked_again_next_time(store, monkeypatch):
+    """A blip is not remembered: only an answer is cached."""
+    from flotta import github
+    from flotta.provision import _FLEET_TOKEN_OWNERS
+
+    _FLEET_TOKEN_OWNERS.clear()
+    answers = [None, github.Person(login="joaoh82", id="208517")]
+    monkeypatch.setattr(github, "token_owner", lambda token, **kw: answers.pop(0))
+
+    first, _ = _created(store, monkeypatch, FLOTTA_GITHUB_TOKEN="github_pat_y")
+    assert "FLOTTA_GIT_AUTHOR_EMAIL" not in first.env
+    second = Recording()
+    create_box("eng-b", store=store, backend=second)
+    assert second.spec.env["FLOTTA_GIT_AUTHOR_EMAIL"] == "208517+joaoh82@users.noreply.github.com"
+
+
+def test_an_agencys_agents_never_commit_as_the_fleet_tokens_owner(store, monkeypatch):
+    """The fleet token is the operator's (FLOTTA-83), and so is its name."""
+    from flotta import github
+
+    monkeypatch.setattr(
+        github, "token_owner", lambda token, **kw: github.Person(login="joaoh82", id="208517")
+    )
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", "github_pat_x")
+    store.create_org("agency-x", "Agency X")
+    store.create_client("agency-x", "acme", "Acme")
+    impl = Recording()
+    create_box("eng-a", store=store, backend=impl, org="agency-x", client="acme")
+    assert "FLOTTA_GIT_AUTHOR_EMAIL" not in impl.spec.env
+    assert "FLOTTA_GIT_AUTHOR_NAME" not in impl.spec.env
+
+
+def test_with_nobody_connected_and_no_fleet_token_a_box_commits_as_itself(store, monkeypatch):
+    """The state every box was in before this: omitted, not guessed."""
+    spec, box = _created(store, monkeypatch)
+    assert "FLOTTA_GIT_AUTHOR_EMAIL" not in spec.env
+    assert "FLOTTA_GIT_AUTHOR_NAME" not in spec.env
+    assert not [e for e in store.get_events("box", box.id) if e.type == "commit_author"]
