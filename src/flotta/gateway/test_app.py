@@ -387,6 +387,56 @@ def test_a_gateway_with_no_signing_key_refuses_every_call(path, upstream):
     assert upstream.requests == []
 
 
+def _raises(error):
+    def handler(request):
+        raise error("the upstream")
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout])
+def test_a_request_that_never_got_out_costs_nothing(path, error):
+    with _client(path, _raises(error)) as client:
+        response = client.post("/v1/chat/completions", json=CALL, headers=_auth())
+    assert response.status_code == 502
+    row = _rows(path)[0]
+    assert row["cost_eur_nano"] == 0
+    assert row["estimated"] == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout,
+        httpx.ReadError,
+        httpx.RemoteProtocolError,
+        httpx.WriteTimeout,
+        httpx.WriteError,
+    ],
+)
+def test_a_failure_after_the_request_may_have_got_out_is_not_called_free(path, error):
+    """The provider may have the prompt and be generating, so no proof of zero."""
+    with _client(path, _raises(error)) as client:
+        response = client.post("/v1/chat/completions", json=CALL, headers=_auth())
+    assert response.status_code == 502
+    row = _rows(path)[0]
+    assert row["status"] == 502
+    assert row["estimated"] == 1
+    assert row["tokens_in"] > 0
+    assert row["cost_eur_nano"] > 0
+
+
+def test_a_provider_complaint_that_quotes_the_key_does_not_reach_the_box_from_the_model_list(path):
+    def complains(request):
+        return httpx.Response(401, json={"error": {"message": f"bad key: {FLEET_KEY}"}})
+
+    with _client(path, httpx.MockTransport(complains)) as client:
+        response = client.get("/v1/models", headers=_auth())
+    assert response.status_code == 401
+    assert FLEET_KEY not in response.text
+    assert "bad key" in response.text
+
+
 def test_a_run_id_is_recorded_and_not_forwarded(path, upstream):
     with _client(path, upstream) as client:
         client.post(

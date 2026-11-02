@@ -37,7 +37,12 @@ After the response ends, however it ends:
   row says `estimated`. The money was spent, and an unpriced row would stop a
   budget that fails closed for what is usually a person interrupting a turn. The
   upstream is closed so it stops generating.
-- **The upstream refuses or cannot be reached:** a row at no cost, with the status.
+- **The upstream refuses, or the request never got out:** a row at no cost, with
+  the status.
+- **It failed after the request may have got out:** a read timeout can mean the
+  provider accepted the prompt and is generating, so this is not proof of zero
+  spend. The input is estimated and the row says so. The output is unknown, so
+  this can undercount, which beats calling a possibly paid call free.
 
 The write goes on a thread of its own and nothing awaits it, because a client
 that disconnects cancels this request's task, and with it any `await`. Shutdown
@@ -106,6 +111,10 @@ _DROPPED = frozenset(
 #: Models can think for a long time between chunks. A short read timeout would
 #: cut exactly the expensive calls.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+
+#: Failures that prove the request never reached the provider: there was no
+#: connection to send it on. Anything else may have got there, so it is not free.
+_NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9._:\-]{1,64}$")
 _EVENT_END = re.compile(rb"\r?\n\r?\n")
@@ -340,6 +349,11 @@ async def _relay(
         await asyncio.shield(closing)
 
 
+def _scrubbed(body: bytes, key: str) -> bytes:
+    """A provider's complaint about a key can quote it, and a box holds none."""
+    return body.replace(key.encode(), b"[the upstream key]")
+
+
 def _response_headers(response: httpx.Response) -> dict[str, str]:
     return {k: v for k, v in response.headers.items() if k.lower() not in _DROPPED}
 
@@ -478,7 +492,8 @@ def create_gateway(
         except httpx.HTTPError as exc:
             _log.warning("the upstream's model list could not be read: %s", exc)
             return _error(502, "the model provider could not be reached")
-        return Response(reply.content, reply.status_code, _response_headers(reply))
+        body = _scrubbed(reply.content, key.key) if reply.status_code >= 400 else reply.content
+        return Response(body, reply.status_code, _response_headers(reply))
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -550,7 +565,10 @@ def create_gateway(
             reply = await client.send(outgoing, stream=True)
         except httpx.HTTPError as exc:
             _log.warning("the model provider could not be reached: %s", exc)
-            write(502)
+            if isinstance(exc, _NEVER_SENT):
+                write(502)
+            else:
+                write(502, chars=0)
             return _error(502, "the model provider could not be reached")
 
         if reply.headers.get("content-type", "").startswith("text/event-stream") and (
@@ -590,9 +608,7 @@ def create_gateway(
 
         if reply.status_code >= 400:
             write(reply.status_code)
-            # A provider's complaint about a key can quote it, and a box holds none.
-            scrubbed = body.replace(key.key.encode(), b"[the upstream key]")
-            return Response(scrubbed, reply.status_code, _response_headers(reply))
+            return Response(_scrubbed(body, key.key), reply.status_code, _response_headers(reply))
 
         try:
             answer = json.loads(body)
