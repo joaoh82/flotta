@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
+from flotta.pricing import EurRate
 from flotta.settings import (
     BY_KEY,
     SETTINGS,
@@ -285,3 +288,26 @@ def test_a_model_set_in_the_app_is_what_a_new_agent_is_created_with(store, monke
 
     secrets, _ = fleet_secrets(layered(store), box_id="b-1")
     assert secrets["FLOTTA_MODEL"] == "anthropic/claude-sonnet-4.5"
+
+
+def _rate_setting(store, env=None):
+    return next(s for s in describe(store, env or {}) if s["key"] == "FLOTTA_EUR_PER_USD")
+
+
+def test_the_fetched_rate_is_shown_and_not_put_in_the_field(store):
+    """In the field, saving the form would turn it into an override that never moves."""
+    store.record_eur_rate(EurRate(Decimal("0.891583"), "2026-11-02", "ecb"))
+    setting = _rate_setting(store)
+    assert setting["value"] == ""
+    assert "0.891583" in setting["help"]
+    assert "2026-11-02" in setting["help"]
+
+
+def test_with_no_rate_fetched_it_says_so(store):
+    assert "None has been fetched" in _rate_setting(store)["help"]
+
+
+def test_only_the_rate_setting_mentions_a_fetched_rate(store):
+    store.record_eur_rate(EurRate(Decimal("0.891583"), "2026-11-02", "ecb"))
+    others = [s for s in describe(store, {}) if s["key"] != "FLOTTA_EUR_PER_USD"]
+    assert not [s["key"] for s in others if "0.891583" in s["help"]]

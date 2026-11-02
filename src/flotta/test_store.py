@@ -9,9 +9,12 @@ hand-wrote each tier would let one drift without anyone noticing.
 import itertools
 import os
 import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
+from flotta.pricing import EurRate
 from flotta.store import (
     BOX_ACTIVE,
     BOX_STATUSES,
@@ -1181,3 +1184,39 @@ def test_connecting_again_with_nobody_named_keeps_the_person_already_kept(store,
     """An idempotent re-claim that names nobody must not erase whom it has."""
     _connected(store, box, connected_login="olivia", connected_user_id="4242")
     assert _connected(store, box).connected_login == "olivia"
+
+
+# -- the fetched euro rate (FLOTTA-111) ------------------------------------------
+
+
+def _rate(value="0.89", day="2026-11-02"):
+    return EurRate(Decimal(value), day, "ecb")
+
+
+def test_no_rate_has_been_fetched_on_a_new_store(store):
+    assert store.fetched_eur_rate() is None
+
+
+def test_the_latest_rate_fetched_is_the_one_in_force(store):
+    assert store.record_eur_rate(_rate("0.89", "2026-11-02"), now=datetime(2026, 11, 2, tzinfo=UTC))
+    assert store.record_eur_rate(_rate("0.91", "2026-11-03"), now=datetime(2026, 11, 3, tzinfo=UTC))
+    assert store.fetched_eur_rate() == _rate("0.91", "2026-11-03")
+
+
+def test_a_rate_keeps_every_digit(store):
+    store.record_eur_rate(_rate("0.891583"))
+    assert str(store.fetched_eur_rate().eur_per_usd) == "0.891583"
+
+
+def test_an_unchanged_rate_writes_nothing(store):
+    first = datetime(2026, 11, 2, tzinfo=UTC)
+    assert store.record_eur_rate(_rate(), now=first)
+    assert not store.record_eur_rate(_rate(), now=datetime(2026, 11, 3, tzinfo=UTC))
+    rows = store._conn.execute("SELECT COUNT(*) AS n FROM eur_rates").fetchone()
+    assert rows["n"] == 1
+
+
+def test_the_same_rate_on_a_new_day_is_recorded(store):
+    assert store.record_eur_rate(_rate("0.89", "2026-11-02"), now=datetime(2026, 11, 2, tzinfo=UTC))
+    assert store.record_eur_rate(_rate("0.89", "2026-11-03"), now=datetime(2026, 11, 3, tzinfo=UTC))
+    assert store.fetched_eur_rate().as_of == "2026-11-03"

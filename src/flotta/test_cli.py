@@ -12,6 +12,7 @@ a stopped box — hiding your idle fleet would hide the point of the fleet.
 """
 
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1722,6 +1723,37 @@ def test_the_gateway_refuses_what_it_cannot_do_safely(tmp_path, monkeypatch, arg
 
     assert result.exit_code == 2, result.output
     assert said in result.output
+
+
+@pytest.mark.parametrize(
+    ("base_url", "has_prices"),
+    [("https://openrouter.ai/api/v1", True), ("https://other.example/v1", False)],
+)
+def test_the_real_gateway_fetches_the_rate_whatever_it_fronts(
+    tmp_path, monkeypatch, base_url, has_prices
+):
+    """Nothing tests this wiring otherwise, and without it every call goes unpriced."""
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from flotta import cli, gateway
+    from flotta.pricing import fetch_eur_rate
+
+    built = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "a-signing-key-for-these-tests")
+    monkeypatch.setenv("FLOTTA_MODEL_BASE_URL", base_url)
+    monkeypatch.setenv("FLOTTA_API_KEY", "a-key")
+    monkeypatch.setattr(gateway, "create_gateway", lambda **kwargs: built.update(kwargs))
+    # Stood in for, since CI installs no `uvicorn` and this must not skip there.
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **k: None))
+
+    result = CliRunner().invoke(cli.app, ["gateway"])
+
+    assert result.exit_code == 0, result.output
+    assert built["rate_source"] is fetch_eur_rate
+    assert (built["price_source"] is not None) == has_prices
 
 
 @pytest.mark.parametrize(("command", "method"), [("gateway", "POST"), ("direct", "DELETE")])

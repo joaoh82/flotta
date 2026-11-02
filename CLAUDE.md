@@ -791,7 +791,8 @@ conventions, and the sharp edges below.
   is spent: its euro cost is NULL and `spend()` reports it as `unpriced`, so its
   sum can be short and **a budget check must read `unpriced`**. No transaction
   there, on purpose: a guard is a Postgres table lock and this runs after every
-  model call. `FLOTTA_EUR_PER_USD` has no default. `flotta prices refresh` goes
+  model call. The euro rate is fetched from the ECB by the gateway when it starts and
+  daily (FLOTTA-111); `FLOTTA_EUR_PER_USD` overrides it and has no default. `flotta prices refresh` goes
   through `POST /api/prices/refresh` when `$FLOTTA_CONTROL_URL` is set; the
   gateway also refreshes them when it starts and daily.
 - **The model gateway only has the routes Hermes calls (FLOTTA-88).** Hermes's

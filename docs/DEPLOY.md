@@ -833,10 +833,12 @@ On Render, in `virginia` beside the database:
 It has to be reachable from Fly, so it takes a public address. Every route but
 `/health` needs a box's own token carrying `model:call`.
 
-**Before calls are worth anything, set the rate:** Euros per dollar, on the operator's
-Fleet page, or `FLOTTA_EUR_PER_USD`. With none, a call's euro cost is unknown. The
-gateway refreshes prices from OpenRouter's catalogue when it starts and daily; on any
-other endpoint there is no catalogue, so calls stay unpriced.
+**The euro rate looks after itself:** the gateway fetches the European Central Bank's
+daily rate when it starts and daily, free and with no key, and a failed fetch keeps the
+last one. Euros per dollar on the operator's Fleet page, or `FLOTTA_EUR_PER_USD`, is an
+override, and only needed to pin a rate. The gateway refreshes prices from OpenRouter's
+catalogue on the same schedule; on any other endpoint there is no catalogue, so calls
+stay unpriced.
 
 **Budgets are checked here, before every call,** and refuse with a 402 when used up
 (`PUT /api/orgs/{org}/budgets`). With the database unreachable every call is refused,
@@ -854,7 +856,7 @@ switch**: set to the gateway's address, new agents are created through it, and e
 ones move one at a time. Each move restarts a running agent twice. A sleeping one takes
 it when it next wakes.
 
-1. Run the gateway, set **Euros per dollar**, and check `/health`.
+1. Run the gateway and check `/health`.
 2. Set `FLOTTA_GATEWAY_URL` on the control plane.
 3. `just agent-gateway <agent>` for **one** agent, and talk to it.
 4. **Measure before moving more.** Hermes behaves differently off OpenRouter's URL
