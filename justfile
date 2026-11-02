@@ -200,8 +200,8 @@ gateway port="8083":
 gateway-fake port="8083":
     uv run --extra control flotta gateway --fake-upstream --port {{port}}
 
-# M13.2 — a real gateway process, a stand-in upstream and a throwaway store: one
-# whole stream, one the client hangs up on, and the rows they leave. $0, offline.
+# M13.2/M13.3 — a real gateway process, a stand-in upstream and a throwaway store:
+# a stream, a hang-up, a budget that stops a loop, and a store that goes. $0, offline.
 gateway-smoke:
     uv run --extra control python scripts/gateway_smoke.py
 

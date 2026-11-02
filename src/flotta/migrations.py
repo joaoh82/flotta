@@ -329,6 +329,35 @@ def _usage_outcome() -> tuple[str, ...]:
     )
 
 
+def _budgets() -> tuple[str, ...]:
+    """Limits on spend, checked before every model call (FLOTTA-89, M13.3).
+
+    `client_id` NULL is org-wide, and `box_id` NULL is the whole client. One
+    budget per scope and period: `id` is derived from them by the store, because a
+    `UNIQUE` over nullable columns treats every NULL as different. The limit is
+    whole nanos, because spend is compared against it exactly.
+    """
+    return (
+        """
+        CREATE TABLE budgets (
+            id              TEXT PRIMARY KEY,
+            org_id          TEXT NOT NULL REFERENCES orgs(id),
+            client_id       TEXT,
+            box_id          TEXT REFERENCES boxes(id),
+            period          TEXT NOT NULL CHECK (period IN ('day', 'month')),
+            limit_eur_nano  BIGINT NOT NULL CHECK (limit_eur_nano > 0),
+            soft_pct        DOUBLE PRECISION NOT NULL DEFAULT 0.8,
+            action          TEXT NOT NULL
+                            CHECK (action IN ('notify', 'downgrade', 'pause', 'kill')),
+            fallback_model  TEXT,
+            updated_at      TEXT NOT NULL,
+            FOREIGN KEY (org_id, client_id) REFERENCES clients(org_id, id)
+        )
+        """,
+        "CREATE INDEX idx_budgets_org ON budgets(org_id)",
+    )
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -371,6 +400,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         7,
         "usage outcome: a call's status, and whether its tokens are estimated",
         _usage_outcome(),
+    ),
+    Migration(
+        8,
+        "budgets: limits on spend per org, client or agent",
+        _budgets(),
     ),
 )
 

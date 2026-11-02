@@ -781,6 +781,14 @@ conventions, and the sharp edges below.
   (`just gateway-smoke`). **Moving a box onto it moves Hermes off OpenRouter's URL**,
   and Hermes gates some behaviour on that URL (FLOTTA-90 has the list).
 
+- **A budget check that fails open is the bug M13.3 exists not to have (FLOTTA-89).**
+  The gateway turns any exception from `flotta.budgets.check_budgets`, and any store
+  it cannot read, into a 402; nothing forwards on an error. **It is not cached,** so
+  one agent in a loop overruns by one call, and overall by at most one call per call
+  in flight when the limit is crossed. An unpriced row in the period stops that
+  budget until the period rolls over, since its sum is short by an unknown amount.
+  The limit is whole nanos and periods are UTC. Until M13.5 every action refuses.
+
 ## Source of truth
 
 The living planning docs live in the **parent** repo (`../docs/`):

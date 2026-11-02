@@ -12,6 +12,12 @@ only uses `/messages` when the URL ends in `/anthropic`, and its embeddings live
 in a proxy of its own. So those two routes are all there is; anything else is a
 404, which reaches nothing and cannot be an unmetered way to spend.
 
+## Budgets come first
+
+After the token and the model, and before anything goes out, `flotta.budgets`
+decides. **Anything that stops it answering is a 402**: a store that cannot be
+read, or a check that raises. Never a forward.
+
 ## Who a call belongs to
 
 **The box's own token, and nothing else in the request.** The subject names the
@@ -58,18 +64,21 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from flotta import budgets
 from flotta.auth import (
     SCOPE_MODEL_CALL,
     AuthError,
@@ -124,6 +133,10 @@ _CHARS_PER_TOKEN = 4
 
 PRICE_REFRESH_S = 24 * 60 * 60
 
+#: How long a budget check waits for rows still being written, so a loop's next
+#: call sees its last one. A database in trouble must not hold every call for long.
+_SETTLE_S = 2.0
+
 #: Not text the model wrote, so not counted towards an estimate.
 _NOT_TEXT = frozenset({"role", "type", "id", "index"})
 
@@ -163,10 +176,16 @@ def resolve_key(
 
 
 class _Refused(Exception):
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, body: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.body = body
+
+    def response(self) -> JSONResponse:
+        if self.body is not None:
+            return JSONResponse(self.body, status_code=self.status)
+        return _error(self.status, self.message)
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -294,10 +313,10 @@ class _Ledger:
                 else:
                     time.sleep(self._backoff_s * attempt)
 
-    async def drain(self) -> None:
+    async def drain(self, *, timeout: float | None = None) -> None:
         pending = set(self._pending)
         if pending:
-            await asyncio.to_thread(wait, pending)
+            await asyncio.to_thread(wait, pending, timeout)
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
@@ -451,15 +470,69 @@ def create_gateway(
         try:
             box = await asyncio.to_thread(find_box, box_id)
         except Exception as exc:
-            # No check, no call: the rule M13.3's budgets rest on.
+            # No check, no call. There is nowhere to put an event: only this log.
             _log.exception("the store could not be read")
-            raise _Refused(503, "the gateway cannot read the fleet right now") from exc
+            refusal = budgets.unchecked()
+            raise _Refused(402, refusal.message, refusal.body()) from exc
         if box is None or is_terminal("box", box.status):
             raise _Refused(403, "this agent no longer exists")
         reason = admits(token, box_id=box.id, org=box.org, client=box.client)
         if reason is not None:
             raise _Refused(403, reason)
         return box
+
+    def check_budgets(box: Box, model: str) -> budgets.Refusal | None:
+        store = store_factory()
+        try:
+            rate = resolve_eur_per_usd(layered(store, environment))
+            now = datetime.now(UTC)
+            return budgets.check_budgets(store, box, model=model, eur_per_usd=rate, now=now)
+        finally:
+            store.close()
+
+    noted: set[tuple[str, ...]] = set()
+    noted_lock = threading.Lock()
+
+    def note_refusal(box: Box, refusal: budgets.Refusal) -> None:
+        """One event per refusal per period, so a loop does not fill the timeline.
+
+        In memory: a restart may add one more, which is harmless. Failing to write
+        it changes nothing about the refusal.
+        """
+        key = (box.id, *refusal.key)
+        with noted_lock:
+            if key in noted:
+                return
+            if len(noted) > 10_000:
+                noted.clear()
+            noted.add(key)
+        try:
+            store = store_factory()
+            try:
+                store.add_event(
+                    "box",
+                    box.id,
+                    "budget_refused",
+                    {"code": refusal.code, "message": refusal.message, "budget": refusal.budget},
+                )
+            finally:
+                store.close()
+        except Exception:
+            _log.exception("a budget refusal could not be recorded: %s", refusal.code)
+
+    async def refused_by_budget(box: Box, model: str) -> JSONResponse | None:
+        """The 402 if this call may not go out. Anything unexpected is one too."""
+        await ledger.drain(timeout=_SETTLE_S)
+        try:
+            refusal = await asyncio.to_thread(check_budgets, box, model)
+        except Exception:
+            _log.exception("a budget check failed")
+            # Keyed by the minute: an outage is worth more than one event, not thousands.
+            refusal = budgets.unchecked(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M"))
+        if refusal is None:
+            return None
+        await asyncio.to_thread(note_refusal, box, refusal)
+        return JSONResponse(refusal.body(), status_code=402)
 
     def upstream_headers(request: Request, key: str) -> dict[str, str]:
         headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARDED}
@@ -479,7 +552,7 @@ def create_gateway(
         try:
             box = await caller(request)
         except _Refused as refused:
-            return _error(refused.status, refused.message)
+            return refused.response()
         key = resolve_key(
             provider, org=box.org, client=box.client, env=environment, stored=stored_keys
         )
@@ -501,7 +574,7 @@ def create_gateway(
         try:
             box = await caller(request)
         except _Refused as refused:
-            return _error(refused.status, refused.message)
+            return refused.response()
 
         raw = await request.body()
         try:
@@ -509,6 +582,10 @@ def create_gateway(
             model = validate_model(payload["model"])
         except (ValueError, KeyError, TypeError, AttributeError, InvalidModel):
             return _error(400, "expected a JSON body naming a model")
+
+        refusal = await refused_by_budget(box, model)
+        if refusal is not None:
+            return refusal
 
         key = resolve_key(
             provider, org=box.org, client=box.client, env=environment, stored=stored_keys
