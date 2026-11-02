@@ -682,8 +682,8 @@ created afterwards. Connecting the same scope again as somebody else names
 that person for new boxes; disconnecting ends the grants at once, but a
 running box keeps the name in its env and anything it commits afterwards is
 still authored as the person who left. Until there is a verb for refreshing a
-box's identity, recreating the box or updating its machine env is the remedy,
-and only the operator can do the second.
+box's identity (FLOTTA task 108), recreating the box or updating its machine
+env is the remedy, and only the operator can do the second.
 
 ## Step 8 — A second agency (M11.7)
 
