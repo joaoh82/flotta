@@ -252,6 +252,70 @@ def _grant_source() -> tuple[str, ...]:
     return ("ALTER TABLE box_repos ADD COLUMN source TEXT NOT NULL DEFAULT 'fleet_token'",)
 
 
+def _usage() -> tuple[str, ...]:
+    """The meter's ledger and what it prices with (FLOTTA-87, M13.1).
+
+    **`usage` is appended to and never rewritten**, so an invoice does not change
+    when a price does. `cost_eur_nano` is NULL when a call could not be priced:
+    the money is spent, so the row is kept, and `FleetStore.spend` counts it.
+    Money is whole nanos (`flotta.pricing` says why). `currency` and
+    `upstream_cost_nano` are what the call really cost, `eur_per_usd` the rate it
+    was converted at, as text because a float would not be the rate it was.
+
+    `key_scope` is which level's key paid (D19). `seconds` is for `machine` rows
+    (M13.6) and `run_id` for M14. The idempotency key is one box's, so sharing
+    one cannot lose another box's call.
+
+    The client's index leads with the org, because a client id is only unique
+    within its org. **`model_prices` is one row per change**, so "the price in
+    force then" is the newest row no later than then.
+    """
+    return (
+        """
+        CREATE TABLE usage (
+            id                  TEXT PRIMARY KEY,
+            org_id              TEXT NOT NULL,
+            client_id           TEXT NOT NULL,
+            box_id              TEXT NOT NULL REFERENCES boxes(id),
+            kind                TEXT NOT NULL CHECK (kind IN ('model', 'machine')),
+            model               TEXT,
+            upstream            TEXT,
+            key_scope           TEXT NOT NULL DEFAULT 'fleet'
+                                CHECK (key_scope IN ('fleet', 'org', 'client')),
+            tokens_in           BIGINT NOT NULL DEFAULT 0,
+            tokens_out          BIGINT NOT NULL DEFAULT 0,
+            tokens_cached       BIGINT NOT NULL DEFAULT 0,
+            latency_ms          BIGINT,
+            seconds             BIGINT,
+            currency            TEXT,
+            upstream_cost_nano  BIGINT,
+            eur_per_usd         TEXT,
+            cost_eur_nano       BIGINT,
+            run_id              TEXT,
+            at                  TEXT NOT NULL,
+            idempotency_key     TEXT NOT NULL,
+            UNIQUE (box_id, idempotency_key),
+            FOREIGN KEY (org_id, client_id) REFERENCES clients(org_id, id)
+        )
+        """,
+        "CREATE INDEX idx_usage_org ON usage(org_id, at)",
+        "CREATE INDEX idx_usage_client ON usage(org_id, client_id, at)",
+        "CREATE INDEX idx_usage_box ON usage(box_id, at)",
+        """
+        CREATE TABLE model_prices (
+            model              TEXT NOT NULL,
+            valid_from         TEXT NOT NULL,
+            input_nano_per_m   BIGINT NOT NULL,
+            output_nano_per_m  BIGINT NOT NULL,
+            cached_nano_per_m  BIGINT,
+            currency           TEXT NOT NULL,
+            source             TEXT NOT NULL,
+            PRIMARY KEY (model, valid_from)
+        )
+        """,
+    )
+
+
 # The shape `store._utcnow()` writes (`isoformat()` in UTC), spelled in each
 # dialect, so a timestamp written here reads like every other one.
 _NOW_SQLITE = "strftime('%Y-%m-%dT%H:%M:%f', 'now') || '+00:00'"
@@ -284,6 +348,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         5,
         "grant source: which GitHub credential a repository grant may spend",
         _grant_source(),
+    ),
+    Migration(
+        6,
+        "usage: the meter's ledger, and model prices",
+        _usage(),
     ),
 )
 

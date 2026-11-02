@@ -185,6 +185,12 @@ db-status:
 db-migrate:
     uv run flotta db migrate
 
+# FLOTTA-87 — bring model prices up to date with OpenRouter's catalogue. Costs
+# already recorded do not change. Through the fleet API when $FLOTTA_CONTROL_URL
+# is set, else the local store. Reads a public URL; needs no key.
+prices-refresh:
+    uv run flotta prices refresh
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key

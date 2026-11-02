@@ -2194,6 +2194,48 @@ def model_reset(
     _set_model(box_id, None, as_json)
 
 
+prices_app = typer.Typer(
+    name="prices",
+    help="What models cost, which the meter prices calls with.",
+    no_args_is_help=True,
+)
+app.add_typer(prices_app)
+
+
+@prices_app.command("refresh")
+def prices_refresh(store: str | None = StoreOpt, as_json: bool = JsonOpt) -> None:
+    """Bring the prices up to date with OpenRouter's catalogue.
+
+    Costs already recorded do not change. Through the fleet API when
+    $FLOTTA_CONTROL_URL is set, since that is where the deployed prices live.
+    """
+    from flotta.auth import SCOPE_FLEET_WRITE
+    from flotta.model_catalog import CatalogueUnavailable, fetch_prices
+
+    if control_url():
+        try:
+            body = control_request(
+                "POST",
+                "/api/prices/refresh",
+                scopes=(SCOPE_FLEET_WRITE,),
+                timeout_s=60.0,
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        try:
+            prices, skipped = fetch_prices()
+        except CatalogueUnavailable as exc:
+            raise _fail(exc) from exc
+        with _open_store(store) as fleet:
+            changed = fleet.refresh_prices(prices)
+        body = {"models": len(prices), "changed": changed, "skipped": skipped}
+    line = f"{body['models']} models priced, {body['changed']} changed"
+    if body["skipped"]:
+        line += f"; no price for {', '.join(body['skipped'])}"
+    emit(body, line, as_json=as_json)
+
+
 # -- tokens (M5) ------------------------------------------------------------
 
 token_app = typer.Typer(

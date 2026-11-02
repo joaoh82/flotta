@@ -56,14 +56,16 @@ import re
 import secrets
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
 from flotta import address, db, migrations
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
+from flotta.pricing import Price, cost_nano, to_eur_nano
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -591,6 +593,9 @@ LINK_PURPOSES = frozenset({"sign_in", "invite", "sign_up"})
 #: operator starts `active`.
 ORG_STATUSES = ("pending", "active", "declined")
 
+#: Which level's key paid for a model call (D19).
+KEY_SCOPES = frozenset({"fleet", "org", "client"})
+
 #: An invite waits for someone who is not expecting it, so it lives for a
 #: week, not the quarter-hour a sign-in link does.
 INVITE_TTL_S = 7 * 24 * 3600
@@ -666,6 +671,40 @@ class Event:
 BUILD_STALE_S = 3600
 
 
+@dataclass(frozen=True, slots=True)
+class Usage:
+    """One row of the meter's ledger. See `migrations._usage`."""
+
+    id: str
+    org: str
+    client: str
+    box: str
+    kind: str
+    model: str | None
+    upstream: str | None
+    key_scope: str
+    tokens_in: int
+    tokens_out: int
+    tokens_cached: int
+    latency_ms: int | None
+    currency: str | None
+    upstream_cost_nano: int | None
+    eur_per_usd: str | None
+    cost_eur_nano: int | None
+    run_id: str | None
+    at: str
+    idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class Spend:
+    """A sum over the ledger. `unpriced` counts rows with no euro cost, which
+    `eur_nano` is short by: a budget check has to treat that as unknown."""
+
+    eur_nano: int
+    unpriced: int
+
+
 class BuildInProgressError(RuntimeError):
     """Another update is already running."""
 
@@ -735,6 +774,13 @@ class Build:
 
 def _utcnow() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _instant(moment: datetime) -> str:
+    """`moment` the way `_utcnow` writes one, so timestamps compare as text."""
+    if moment.tzinfo is None:
+        raise ValueError(f"{moment!r} has no timezone, so it is no particular moment")
+    return moment.astimezone(UTC).isoformat()
 
 
 def _check_status(kind: EntityKind, status: str) -> None:
@@ -2116,6 +2162,196 @@ class FleetStore:
         ]
 
     # -- connected GitHub accounts (FLOTTA-22) --------------------------------
+
+    # -- the meter (FLOTTA-87, M13.1) -----------------------------------------
+
+    def refresh_prices(self, prices: Iterable[Price], *, now: datetime | None = None) -> int:
+        """Record the prices that differ from the ones in force. Returns how many.
+
+        One row per change, so an unchanged catalogue writes nothing. A model
+        the catalogue no longer lists keeps its last price: it may still be
+        running, and no price would leave its calls unpriced.
+        """
+        moment = now or datetime.now(UTC)
+        changed = 0
+        with self._conn.transaction(guard="model_prices"):
+            for price in prices:
+                current = self.price_of(price.model, at=moment)
+                if current is not None and replace(current, valid_from="", source="") == replace(
+                    price, valid_from="", source=""
+                ):
+                    continue
+                self._conn.execute(
+                    "INSERT INTO model_prices (model, valid_from, input_nano_per_m, "
+                    "output_nano_per_m, cached_nano_per_m, currency, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        price.model,
+                        _instant(moment),
+                        price.input_nano_per_m,
+                        price.output_nano_per_m,
+                        price.cached_nano_per_m,
+                        price.currency,
+                        price.source,
+                    ),
+                )
+                changed += 1
+        return changed
+
+    def price_of(self, model: str, *, at: datetime) -> Price | None:
+        """The price of `model` in force at `at`, if it had one yet."""
+        row = self._conn.execute(
+            "SELECT * FROM model_prices WHERE model = ? AND valid_from <= ? "
+            "ORDER BY valid_from DESC LIMIT 1",
+            (model, _instant(at)),
+        ).fetchone()
+        if row is None:
+            return None
+        return Price(
+            model=row["model"],
+            input_nano_per_m=row["input_nano_per_m"],
+            output_nano_per_m=row["output_nano_per_m"],
+            cached_nano_per_m=row["cached_nano_per_m"],
+            currency=row["currency"],
+            source=row["source"],
+            valid_from=row["valid_from"],
+        )
+
+    def record_usage(
+        self,
+        box_id: str,
+        *,
+        model: str,
+        upstream: str,
+        tokens_in: int,
+        tokens_out: int,
+        idempotency_key: str,
+        eur_per_usd: Decimal | None,
+        tokens_cached: int = 0,
+        key_scope: str = "fleet",
+        latency_ms: int | None = None,
+        run_id: str | None = None,
+        now: datetime | None = None,
+    ) -> Usage:
+        """Write one model call to the ledger, with its cost worked out now.
+
+        The cost comes from the price in force at this moment and is never
+        worked out again. Whose call it was comes from the box's row, so no
+        caller can say it wrongly. A call with no price or no rate is still
+        written, because the money is spent: its costs are NULL and `spend`
+        counts it. A retry with the same key returns the row already there.
+
+        No transaction, on purpose: a guard is a table lock on Postgres, this
+        runs after every model call, and one `INSERT … ON CONFLICT` is atomic.
+        """
+        for name, count in (
+            ("tokens_in", tokens_in),
+            ("tokens_out", tokens_out),
+            ("tokens_cached", tokens_cached),
+        ):
+            if count < 0:
+                raise ValueError(f"{name} cannot be negative, got {count}")
+        if key_scope not in KEY_SCOPES:
+            raise ValueError(f"key_scope must be one of {sorted(KEY_SCOPES)}, got {key_scope!r}")
+        box = self._get_box_or_raise(box_id)
+        moment = now or datetime.now(UTC)
+        price = self.price_of(model, at=moment)
+        upstream_cost = (
+            None
+            if price is None
+            else cost_nano(
+                price, tokens_in=tokens_in, tokens_out=tokens_out, tokens_cached=tokens_cached
+            )
+        )
+        cost_eur = (
+            None if price is None else to_eur_nano(upstream_cost, price.currency, eur_per_usd)
+        )
+        # The rate only if it was the one used: a price in euros used none.
+        rate = str(eur_per_usd) if cost_eur is not None and price.currency == "USD" else None
+        self._conn.execute(
+            "INSERT INTO usage (id, org_id, client_id, box_id, kind, model, upstream, key_scope, "
+            "tokens_in, tokens_out, tokens_cached, latency_ms, currency, upstream_cost_nano, "
+            "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key) "
+            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (box_id, idempotency_key) DO NOTHING",
+            (
+                f"u-{uuid.uuid4().hex}",
+                box.org,
+                box.client,
+                box.id,
+                model,
+                upstream,
+                key_scope,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                latency_ms,
+                None if price is None else price.currency,
+                upstream_cost,
+                rate,
+                cost_eur,
+                run_id,
+                _instant(moment),
+                idempotency_key,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM usage WHERE box_id = ? AND idempotency_key = ?",
+            (box.id, idempotency_key),
+        ).fetchone()
+        return Usage(
+            id=row["id"],
+            org=row["org_id"],
+            client=row["client_id"],
+            box=row["box_id"],
+            kind=row["kind"],
+            model=row["model"],
+            upstream=row["upstream"],
+            key_scope=row["key_scope"],
+            tokens_in=row["tokens_in"],
+            tokens_out=row["tokens_out"],
+            tokens_cached=row["tokens_cached"],
+            latency_ms=row["latency_ms"],
+            currency=row["currency"],
+            upstream_cost_nano=row["upstream_cost_nano"],
+            eur_per_usd=row["eur_per_usd"],
+            cost_eur_nano=row["cost_eur_nano"],
+            run_id=row["run_id"],
+            at=row["at"],
+            idempotency_key=row["idempotency_key"],
+        )
+
+    def spend(
+        self,
+        *,
+        org: str,
+        since: datetime,
+        client: str | None = None,
+        box: str | None = None,
+    ) -> Spend:
+        """What an org, or a client or box within it, has spent since `since`.
+
+        One indexed sum, because a budget check runs it before every model call.
+        `org` is always required: a client's id is only unique within its org,
+        and asking for a box must not reach another org's.
+        """
+        where = ["org_id = ?"]
+        params: list[Any] = [org]
+        if client is not None:
+            where.append("client_id = ?")
+            params.append(client)
+        if box is not None:
+            where.append("box_id = ?")
+            params.append(box)
+        params.append(_instant(since))
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced "
+            f"FROM usage WHERE {' AND '.join(where)} AND at >= ?",
+            params,
+        ).fetchone()
+        # Postgres sums a BIGINT into a NUMERIC, which arrives as a Decimal.
+        return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
 
     def connect_github(
         self,

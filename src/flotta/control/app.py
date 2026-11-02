@@ -2013,6 +2013,27 @@ def create_app(
         finally:
             store.close()
 
+    @app.post("/api/prices/refresh")
+    def refresh_prices(token: Token | None = needs_write) -> Any:
+        """Bring `model_prices` up to date with OpenRouter's catalogue (FLOTTA-87).
+
+        Here because the prices live in the deployed store, which a laptop has
+        no way to reach. A catalogue that cannot be read changes nothing.
+        """
+        _require_operator(token, "refresh the model prices")
+        from flotta.model_catalog import CatalogueUnavailable, fetch_prices
+
+        try:
+            prices, skipped = fetch_prices()
+        except CatalogueUnavailable as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            changed = store.refresh_prices(prices)
+        finally:
+            store.close()
+        return {"models": len(prices), "changed": changed, "skipped": skipped}
+
     @app.get("/api/hermes")
     def hermes_versions(token: Token | None = needs_read) -> Any:
         """Which Hermes the fleet would build next, and whether a newer exists.

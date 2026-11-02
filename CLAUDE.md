@@ -758,6 +758,19 @@ conventions, and the sharp edges below.
   that belonged to a real stranger's GitHub account. Write the guard *and*
   verify it by reintroducing the bug.
 
+- **The meter's ledger is appended to, and money in it is whole nanos (FLOTTA-87,
+  migration 6).** `record_usage` works a call's cost out once, from the price in
+  force at that moment, and stores the upstream's currency and amount, the rate,
+  and the euros (D19); a source-reading test refuses any `UPDATE` or `DELETE` of
+  `usage`. **A call with no price or no rate is still written**, because the money
+  is spent: its euro cost is NULL and `spend()` reports it as `unpriced`, so its
+  sum can be short and **a budget check must read `unpriced`**. No transaction
+  there, on purpose: a guard is a Postgres table lock and this runs after every
+  model call. `FLOTTA_EUR_PER_USD` has no default and is not in the settings
+  catalogue until the gateway gives it a caller. `flotta prices refresh` goes
+  through `POST /api/prices/refresh` when `$FLOTTA_CONTROL_URL` is set; nothing
+  refreshes prices on a timer yet.
+
 ## Source of truth
 
 The living planning docs live in the **parent** repo (`../docs/`):

@@ -64,6 +64,7 @@ OPERATOR_ROUTES = frozenset(
     {
         "get_settings",
         "put_settings",
+        "refresh_prices",
         "hermes_versions",
         "list_builds",
         "update_hermes",

@@ -22,13 +22,19 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 from flotta.inference import is_openrouter
+from flotta.pricing import Price, prices_from_catalogue
 
 CATALOGUE_URL = "https://openrouter.ai/api/v1/models"
 
 #: The catalogue changes when a provider launches something, not per request.
 CACHE_S = 600.0
+
+
+class CatalogueUnavailable(Exception):
+    """OpenRouter's catalogue could not be read, or gave nothing usable."""
 
 
 @dataclass(frozen=True)
@@ -47,14 +53,16 @@ _lock = threading.Lock()
 _cache: tuple[float, frozenset[str]] | None = None
 
 
-def _fetch(timeout: float) -> frozenset[str]:
+def _entries(timeout: float) -> list[Any]:
     request = urllib.request.Request(CATALOGUE_URL, headers={"Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode())
+    return list(payload.get("data", []))
+
+
+def _fetch(timeout: float) -> frozenset[str]:
     return frozenset(
-        str(item["id"])
-        for item in payload.get("data", [])
-        if isinstance(item, dict) and "id" in item
+        str(item["id"]) for item in _entries(timeout) if isinstance(item, dict) and "id" in item
     )
 
 
@@ -88,3 +96,22 @@ def known_model(model: str, base_url: str, *, timeout: float = 5.0) -> Known:
         f"OpenRouter has no model {model!r}.{hint} Model ids are listed at "
         "https://openrouter.ai/models.",
     )
+
+
+def fetch_prices(*, timeout: float = 15.0) -> tuple[list[Price], list[str]]:
+    """Today's prices, and the models the catalogue gives no price for.
+
+    Unlike `known_model` this refuses on an uncertain answer: an empty list is a
+    broken answer, not proof that nothing has a price. Not cached, since a
+    refresh is asked for on purpose.
+    """
+    try:
+        entries = _entries(timeout)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        raise CatalogueUnavailable(f"could not read OpenRouter's catalogue: {exc}") from exc
+    if not entries:
+        raise CatalogueUnavailable("OpenRouter's catalogue came back empty")
+    prices, skipped = prices_from_catalogue(entries)
+    if not prices:
+        raise CatalogueUnavailable("OpenRouter's catalogue had no usable price")
+    return prices, skipped
