@@ -16,6 +16,8 @@ from flotta.box.inference import main, unpin_sessions
 
 OPENROUTER = "https://openrouter.ai/api/v1"
 GATEWAY = "https://gateway.example/v1"
+OLD_GATEWAY = "https://old-gateway.example/v1"
+OLLAMA = "http://localhost:11434/v1"
 TOKEN = "flotta_a-model-token"
 ON_GATEWAY = {
     "FLOTTA_MODEL": "z-ai/glm-5.3-flash",
@@ -97,34 +99,135 @@ def test_a_url_with_no_provider_follows_too(tmp_path):
     assert "base_url" not in _config(_row(tmp_path))
 
 
+def _was_on_the_gateway(home):
+    """The boot that recorded it. `_db` comes after, as its rows are what a later boot finds."""
+    unpin_sessions(home, ON_GATEWAY)
+
+
 def test_leaving_the_gateway_brings_its_conversations_back(tmp_path):
     """The way back must work too, and a stale route would send the fleet's key to the gateway."""
+    _was_on_the_gateway(tmp_path)
     _db(
         tmp_path,
         {"id": "bare", "billing": "custom", "billing_url": GATEWAY},
         {"id": "named", "config": {"provider": "custom:flotta-gateway"}},
         {"id": "full", "config": {"provider": "custom", "base_url": GATEWAY}},
+        {"id": "slash", "config": {"provider": "custom", "base_url": f"{GATEWAY}/"}},
     )
-    unpin_sessions(tmp_path, DIRECT)
+    assert "4 conversation" in unpin_sessions(tmp_path, DIRECT)
     assert _row(tmp_path, "bare")["billing_provider"] is None
     assert _row(tmp_path, "bare")["billing_base_url"] is None
     assert "provider" not in _config(_row(tmp_path, "named"))
     assert "base_url" not in _config(_row(tmp_path, "full"))
+    assert "base_url" not in _config(_row(tmp_path, "slash"))
 
 
 def test_a_moved_gateway_brings_its_conversations_along(tmp_path):
+    unpin_sessions(tmp_path, {**ON_GATEWAY, "FLOTTA_MODEL_BASE_URL": OLD_GATEWAY})
     _db(
         tmp_path,
-        {"id": "s", "config": {"provider": "custom", "base_url": "https://old.example/v1"}},
+        {"id": "s", "config": {"provider": "custom", "base_url": OLD_GATEWAY}},
+        {"id": "billed", "billing": "custom", "billing_url": OLD_GATEWAY},
     )
     unpin_sessions(tmp_path, ON_GATEWAY)
+    assert "provider" not in _config(_row(tmp_path, "s"))
+    assert _row(tmp_path, "billed")["billing_provider"] is None
+
+
+def test_the_gateways_address_outlives_the_gateway(tmp_path):
+    """A second boot off it must still know, and its address has left the machine."""
+    _was_on_the_gateway(tmp_path)
+    unpin_sessions(tmp_path, DIRECT)
+    _db(tmp_path, {"id": "s", "billing": "custom", "billing_url": GATEWAY})
+    unpin_sessions(tmp_path, DIRECT)
+    assert _row(tmp_path)["billing_provider"] is None
+
+
+def test_a_name_hermes_healed_a_gateways_route_to_comes_along(tmp_path):
+    """Hermes can turn a route into `custom:<name>` from its URL, and the URL is what is ours."""
+    _was_on_the_gateway(tmp_path)
+    _db(tmp_path, {"id": "s", "config": {"provider": "custom:its-name", "base_url": GATEWAY}})
+    unpin_sessions(tmp_path, DIRECT)
     assert "provider" not in _config(_row(tmp_path))
 
 
-def test_one_only_billed_to_a_moved_gateway_comes_along_too(tmp_path):
-    _db(tmp_path, {"id": "s", "billing": "custom", "billing_url": "https://old.example/v1"})
-    unpin_sessions(tmp_path, ON_GATEWAY)
+def test_every_earlier_gateway_is_remembered(tmp_path):
+    unpin_sessions(tmp_path, {**ON_GATEWAY, "FLOTTA_MODEL_BASE_URL": OLD_GATEWAY})
+    _was_on_the_gateway(tmp_path)
+    _db(tmp_path, {"id": "s", "billing": "custom", "billing_url": OLD_GATEWAY})
+    unpin_sessions(tmp_path, DIRECT)
     assert _row(tmp_path)["billing_provider"] is None
+
+
+def test_what_it_keeps_on_the_volume_holds_no_token(tmp_path):
+    _was_on_the_gateway(tmp_path)
+    kept = (tmp_path / "flotta-model-urls").read_text()
+    assert GATEWAY in kept
+    assert TOKEN not in kept
+
+
+def test_openrouter_is_not_recorded_as_an_endpoint_flotta_gave(tmp_path):
+    unpin_sessions(tmp_path, DIRECT)
+    assert not (tmp_path / "flotta-model-urls").exists()
+
+
+def test_a_volume_it_cannot_write_to_never_stops_a_boot(tmp_path):
+    (tmp_path / "flotta-model-urls").mkdir()
+    assert unpin_sessions(tmp_path, ON_GATEWAY) == ""
+
+
+# -- a person's own choice is not Flotta's to undo (review of #161) ----------------
+
+
+@pytest.mark.parametrize("boot", [DIRECT, ON_GATEWAY], ids=["direct", "on-the-gateway"])
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param({"config": {"provider": "custom:ollama", "base_url": OLLAMA}}, id="named"),
+        pytest.param({"config": {"provider": "custom", "base_url": OLLAMA}}, id="by-url"),
+        pytest.param({"billing": "custom", "billing_url": OLLAMA}, id="billed"),
+        pytest.param({"config": {"provider": "custom:ollama"}}, id="named-with-no-url"),
+        pytest.param(
+            {"config": {"gateway_runtime": {"provider": "custom:ollama", "base_url": OLLAMA}}},
+            id="nested",
+        ),
+    ],
+)
+def test_a_persons_own_endpoint_survives_an_ordinary_boot(tmp_path, boot, row):
+    _db(tmp_path, {"id": "s", **row, "model": "llama3"})
+    before = _row(tmp_path)
+    assert unpin_sessions(tmp_path, boot) == ""
+    assert _row(tmp_path) == before
+
+
+def test_a_persons_own_endpoint_survives_a_move_and_back(tmp_path):
+    _db(tmp_path, {"id": "s", "config": {"provider": "custom:ollama", "base_url": OLLAMA}})
+    before = _row(tmp_path)
+    unpin_sessions(tmp_path, ON_GATEWAY)
+    unpin_sessions(tmp_path, DIRECT)
+    assert _row(tmp_path) == before
+
+
+def test_openrouter_with_its_key_still_there_is_left_alone(tmp_path):
+    """Moving writes, then removes: the boot between the two still has a working route."""
+    _db(tmp_path, {"id": "s", "billing": "openrouter"})
+    env = {**ON_GATEWAY, "OPENROUTER_API_KEY": "sk-or-still-here"}
+    assert unpin_sessions(tmp_path, env) == ""
+    assert _row(tmp_path)["billing_provider"] == "openrouter"
+
+
+@pytest.mark.parametrize("line", ["OPENROUTER_API_KEY=sk-or-mine", "export OPENROUTER_API_KEY=x"])
+def test_a_key_of_their_own_in_hermess_env_file_keeps_it_too(tmp_path, line):
+    (tmp_path / ".env").write_text(f"# mine\n{line}\n")
+    _db(tmp_path, {"id": "s", "billing": "openrouter"})
+    assert unpin_sessions(tmp_path, ON_GATEWAY) == ""
+
+
+@pytest.mark.parametrize("text", ["OPENROUTER_API_KEY=\n", "OTHER_KEY=sk-or-mine\n"])
+def test_an_env_file_without_that_key_does_not_count(tmp_path, text):
+    (tmp_path / ".env").write_text(text)
+    _db(tmp_path, {"id": "s", "billing": "openrouter"})
+    assert "1 conversation" in unpin_sessions(tmp_path, ON_GATEWAY)
 
 
 def test_the_rest_of_a_conversations_record_is_kept(tmp_path):
@@ -200,11 +303,13 @@ def test_with_no_settled_model_it_touches_nothing(tmp_path, gone):
     before = _row(tmp_path)
     assert unpin_sessions(tmp_path, {k: v for k, v in ON_GATEWAY.items() if k != gone}) == ""
     assert _row(tmp_path) == before
+    assert not (tmp_path / "flotta-model-urls").exists()
 
 
 def test_a_new_agent_has_no_database_and_gets_none(tmp_path):
     assert unpin_sessions(tmp_path, ON_GATEWAY) == ""
     assert not (tmp_path / "state.db").exists()
+    assert GATEWAY in (tmp_path / "flotta-model-urls").read_text()
 
 
 @pytest.mark.parametrize(

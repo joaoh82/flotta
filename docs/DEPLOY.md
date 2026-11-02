@@ -876,7 +876,10 @@ refuses an agent whose model nothing records until you set one.
 **Conversations follow the agent, on an image with FLOTTA-112.** Hermes restores the
 route a conversation last used, and a move takes that route's key away, so a conversation
 from before the move answers "No LLM provider configured" until the agent boots on such
-an image. Each boot clears any stored route the agent has moved off, in `state.db`.
+an image. Each boot clears, in `state.db`, stored routes to OpenRouter with its key gone
+and to endpoints Flotta gave the agent and no longer does (kept in `flotta-model-urls` on
+its volume). A person's own custom endpoint is left alone. An agent moved back *before*
+booting on such an image can't tell its gateway conversations apart: start those over.
 
 Once agents use the gateway, its outage or the database's stops their model calls.
 
