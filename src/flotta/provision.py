@@ -1974,8 +1974,9 @@ def _rewrite_provider(
     """Write, then remove, in that order.
 
     The other order would leave an agent on OpenRouter with no key to call it with.
-    A running agent restarts for each, and a sleeping one stays asleep and takes it
-    when it next wakes, as with `rotate_identity`.
+    A running agent restarts for each. A sleeping one can wake for it: `eng-d` did on
+    2 Nov 2026, and idle sleep put it back. `rotate_identity`'s write alone does not, so
+    the removal is the likely cause.
     """
     try:
         impl.apply_secrets(box.endpoint, write)

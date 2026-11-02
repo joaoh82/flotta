@@ -16,11 +16,19 @@ and restarts the machine, and this is what turns that into Hermes's config.
 
 See `flotta.inference` for why the file and not `HERMES_MODEL`, and for the
 key leak the custom-endpoint arrangement closes.
+
+**A conversation is told too (FLOTTA-112).** Hermes restores the route a conversation
+last used, so once an agent changes provider, every older conversation still calls the
+old one, whose key is gone. `unpin_sessions` writes to Hermes's own `state.db`, before
+Hermes is running. That is a copy of `_stored_session_runtime_overrides` and
+`session_gateway_runtime` as of v0.22.5, so re-check it at every Hermes bump.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,6 +38,7 @@ from flotta.inference import (
     MANAGED_KEYS,
     gateway_provider,
     hermes_model_config,
+    is_openrouter,
 )
 
 
@@ -127,10 +136,92 @@ def apply(home: Path, env: dict[str, str] | None = None) -> str:
     return f"model: {described}"
 
 
+#: Where a conversation's route is kept in its `model_config`.
+_ROUTE_KEYS = ("provider", "base_url", "api_mode", "gateway_runtime")
+
+
+def _stored_route(config: dict[str, Any], billing: str, billing_url: str) -> tuple[str, str]:
+    """A session row's provider and URL, in the order Hermes reads them."""
+    nested = config.get("gateway_runtime")
+    if isinstance(nested, dict) and nested.get("provider"):
+        return str(nested["provider"]), str(nested.get("base_url") or "")
+    provider = str(config.get("provider") or "") or billing
+    return provider, str(config.get("base_url") or "") or billing_url
+
+
+def _stranded(provider: str, url: str, wanted: dict[str, str]) -> bool:
+    """Whether a stored route goes somewhere this agent has moved off.
+
+    Only OpenRouter and custom endpoints, the two Flotta moves an agent between. Any
+    other provider is somebody's own choice. `auto` is one Hermes already routes by
+    the config, and a custom route with no URL names an entry the config still has.
+    """
+    name = provider.strip().lower()
+    leaving = wanted["provider"] == "openrouter"
+    if name == "openrouter" or is_openrouter(url):
+        return not leaving
+    if name == "custom" or name.startswith("custom:"):
+        return leaving or (bool(url) and url.rstrip("/") != wanted["base_url"].rstrip("/"))
+    return False
+
+
+def unpin_sessions(home: Path, env: dict[str, str] | None = None) -> str:
+    """Clear stored routes this agent has moved off, so they follow `config.yaml`.
+
+    The model a conversation was using stays its own. Returns a boot-log line, or ""
+    with nothing to say; never raises, because a box must boot whatever this finds.
+    """
+    source = os.environ if env is None else env
+    model = (source.get("FLOTTA_MODEL") or "").strip()
+    base_url = (source.get("FLOTTA_MODEL_BASE_URL") or "").strip()
+    api_key = (source.get("FLOTTA_API_KEY") or "").strip()
+    path = home / "state.db"
+    if not (model and base_url and api_key and path.exists()):
+        return ""
+    wanted = hermes_model_config(model, base_url, api_key)
+    moved = 0
+    try:
+        conn = sqlite3.connect(path, timeout=5.0)
+        try:
+            rows = conn.execute(
+                "SELECT id, model_config, billing_provider, billing_base_url FROM sessions"
+            ).fetchall()
+            with conn:
+                for session, raw, billing, billing_url in rows:
+                    try:
+                        parsed = json.loads(raw) if raw else {}
+                    except (ValueError, TypeError):
+                        parsed = None
+                    config = parsed if isinstance(parsed, dict) else {}
+                    if not _stranded(
+                        *_stored_route(config, billing or "", billing_url or ""), wanted
+                    ):
+                        continue
+                    # `billing_provider` too: Hermes routes by it, and fills it in again
+                    # on the conversation's next call.
+                    kept = {k: v for k, v in config.items() if k not in _ROUTE_KEYS}
+                    conn.execute(
+                        "UPDATE sessions SET model_config = ?, billing_provider = NULL, "
+                        "billing_base_url = NULL WHERE id = ?",
+                        (raw if parsed is None else (json.dumps(kept) if kept else None), session),
+                    )
+                    moved += 1
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return f"conversations left alone: could not update {path}: {exc}"
+    if not moved:
+        return ""
+    return f"{moved} conversation(s) now follow this agent's provider"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     home = Path(args[0]) if args else Path("/data/hermes")
     print(f"[flotta-box] {apply(home)}")
+    moved = unpin_sessions(home)
+    if moved:
+        print(f"[flotta-box] {moved}")
     return 0
 
 
