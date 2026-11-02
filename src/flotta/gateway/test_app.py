@@ -553,7 +553,7 @@ def test_a_store_that_cannot_be_read_refuses_rather_than_forwards(upstream):
     app = create_gateway(store_factory=down, transport=upstream, env=ENV)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=CALL, headers=_auth())
-    assert response.status_code == 503
+    assert response.status_code == 402
     assert upstream.requests == []
 
 

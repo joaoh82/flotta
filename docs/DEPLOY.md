@@ -784,6 +784,13 @@ Fleet page, or `FLOTTA_EUR_PER_USD`. With none, a call's euro cost is unknown. T
 gateway refreshes prices from OpenRouter's catalogue when it starts and daily; on any
 other endpoint there is no catalogue, so calls stay unpriced.
 
+**Budgets are checked here, before every call,** and refuse with a 402 when used up
+(`PUT /api/orgs/{org}/budgets`). With the database unreachable every call is refused,
+budget or no budget: the gateway cannot tell which it is, so its outage stops the
+agents' model calls. A budget also refuses calls on a model with no price, or with no
+rate set, and while a finished call's row cannot be written. **Run one instance:** those
+unwritten rows are in its memory, so a second instance would not see them.
+
 Locally, for $0: `just gateway-smoke`, or `just gateway-fake` to leave one running.
 
 ## What is not automated yet

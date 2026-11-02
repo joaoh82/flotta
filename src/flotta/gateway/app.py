@@ -12,6 +12,12 @@ only uses `/messages` when the URL ends in `/anthropic`, and its embeddings live
 in a proxy of its own. So those two routes are all there is; anything else is a
 404, which reaches nothing and cannot be an unmetered way to spend.
 
+## Budgets come first
+
+After the token and the model, and before anything goes out, `flotta.budgets`
+decides. **Anything that stops it answering is a 402**: a store that cannot be
+read, or a check that raises. Never a forward.
+
 ## Who a call belongs to
 
 **The box's own token, and nothing else in the request.** The subject names the
@@ -46,9 +52,14 @@ After the response ends, however it ends:
 
 The write goes on a thread of its own and nothing awaits it, because a client
 that disconnects cancels this request's task, and with it any `await`. Shutdown
-waits for those threads. A write that fails is retried with the same idempotency
-key, then logged with its numbers: the reply has already gone, so there is
-nothing left to refuse.
+waits for those threads.
+
+**A row is unsettled until it is in the store.** One that cannot be written is
+kept and tried again with the same idempotency key and its original moment, while
+every budget it would count against refuses calls: otherwise a store that can be
+read but not written would show a sum that never moves, and every call would pass.
+This is in memory, so one gateway process sees its own rows only, and a restart
+loses any it could not write. That loss is logged with the numbers.
 """
 
 from __future__ import annotations
@@ -58,18 +69,21 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from flotta import budgets
 from flotta.auth import (
     SCOPE_MODEL_CALL,
     AuthError,
@@ -124,6 +138,13 @@ _CHARS_PER_TOKEN = 4
 
 PRICE_REFRESH_S = 24 * 60 * 60
 
+#: How long a budget check waits for rows still being written, so a loop's next
+#: call sees its last one. A database in trouble must not hold every call for long.
+_SETTLE_S = 2.0
+
+#: How long before a row that could not be written is tried again.
+_WRITE_RETRY_S = 5.0
+
 #: Not text the model wrote, so not counted towards an estimate.
 _NOT_TEXT = frozenset({"role", "type", "id", "index"})
 
@@ -163,10 +184,16 @@ def resolve_key(
 
 
 class _Refused(Exception):
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, body: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.body = body
+
+    def response(self) -> JSONResponse:
+        if self.body is not None:
+            return JSONResponse(self.body, status_code=self.status)
+        return _error(self.status, self.message)
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -261,38 +288,93 @@ class _Events:
         return keep
 
 
+@dataclass(eq=False, slots=True)
+class _Entry:
+    """A row on its way to the store."""
+
+    box: Box | None
+    row: dict[str, Any]
+    running: bool = True
+    retry_at: float = 0.0
+    failed_before: bool = False
+
+
 class _Ledger:
-    """Writes rows on threads that a cancelled request cannot take with it."""
+    """Writes rows on threads that a cancelled request cannot take with it.
+
+    A row stays here until it is written, however long that takes. `settle` says
+    which are still missing, because that is what a budget has to know.
+    """
 
     def __init__(
-        self, write: Callable[..., Any], *, attempts: int = 3, backoff_s: float = 0.5
+        self,
+        write: Callable[..., Any],
+        *,
+        attempts: int = 3,
+        backoff_s: float = 0.5,
+        retry_s: float = _WRITE_RETRY_S,
     ) -> None:
         self._write = write
         self._attempts = attempts
         self._backoff_s = backoff_s
+        self._retry_s = retry_s
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="flotta-ledger")
         self._pending: set[Future[None]] = set()
+        self._lock = threading.Lock()
+        self._unsettled: set[_Entry] = set()
 
-    def write(self, **row: Any) -> None:
+    def write(self, *, box: Box | None = None, **row: Any) -> None:
+        entry = _Entry(box, row)
+        with self._lock:
+            self._unsettled.add(entry)
+        self._submit(entry)
+
+    def _submit(self, entry: _Entry) -> None:
         try:
-            future = self._pool.submit(self._attempt, row)
+            future = self._pool.submit(self._attempt, entry)
         except RuntimeError:
             # Shutting down, with a stream that ended after the pool closed.
-            self._attempt(row)
+            self._attempt(entry)
             return
         self._pending.add(future)
         future.add_done_callback(self._pending.discard)
 
-    def _attempt(self, row: dict[str, Any]) -> None:
+    def _attempt(self, entry: _Entry) -> None:
         for attempt in range(1, self._attempts + 1):
             try:
-                self._write(**row)
-                return
+                self._write(**entry.row)
             except Exception:
                 if attempt == self._attempts:
-                    _log.exception("a usage row could not be written: %s", row)
+                    if not entry.failed_before:
+                        _log.exception("a usage row could not be written: %s", entry.row)
+                    with self._lock:
+                        entry.running = False
+                        entry.failed_before = True
+                        entry.retry_at = time.monotonic() + self._retry_s
                 else:
                     time.sleep(self._backoff_s * attempt)
+            else:
+                with self._lock:
+                    self._unsettled.discard(entry)
+                return
+
+    def _retry_due(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            due = [e for e in self._unsettled if not e.running and now >= e.retry_at]
+            for entry in due:
+                entry.running = True
+        for entry in due:
+            self._submit(entry)
+
+    async def settle(self, *, timeout: float) -> list[Box]:
+        """Try again what is due, wait a moment, and name the boxes still missing rows."""
+        self._retry_due()
+        pending = set(self._pending)
+        if pending:
+            await asyncio.to_thread(wait, pending, timeout)
+        with self._lock:
+            return [entry.box for entry in self._unsettled if entry.box is not None]
 
     async def drain(self) -> None:
         pending = set(self._pending)
@@ -300,7 +382,15 @@ class _Ledger:
             await asyncio.to_thread(wait, pending)
 
     def close(self) -> None:
+        """One last try at what is left, and say what could not be saved."""
         self._pool.shutdown(wait=True)
+        with self._lock:
+            left = list(self._unsettled)
+        for entry in left:
+            try:
+                self._write(**entry.row)
+            except Exception:
+                _log.exception("a usage row is lost: %s", entry.row)
 
 
 _closing: set[asyncio.Future[None]] = set()
@@ -365,6 +455,9 @@ def create_gateway(
     env: Mapping[str, str] | None = None,
     stored_keys: StoredKeys = _nothing_stored,
     price_source: Callable[[], Iterable[Price]] | None = None,
+    settle_s: float = _SETTLE_S,
+    write_backoff_s: float = 0.5,
+    write_retry_s: float = _WRITE_RETRY_S,
 ) -> FastAPI:
     """Build the gateway's ASGI app. The upstream and the store are injected."""
     environment: Mapping[str, str] = os.environ if env is None else env
@@ -380,7 +473,7 @@ def create_gateway(
         finally:
             store.close()
 
-    ledger = _Ledger(write_row)
+    ledger = _Ledger(write_row, backoff_s=write_backoff_s, retry_s=write_retry_s)
 
     def refresh_prices() -> None:
         assert price_source is not None
@@ -451,15 +544,71 @@ def create_gateway(
         try:
             box = await asyncio.to_thread(find_box, box_id)
         except Exception as exc:
-            # No check, no call: the rule M13.3's budgets rest on.
+            # No check, no call. There is nowhere to put an event: only this log.
             _log.exception("the store could not be read")
-            raise _Refused(503, "the gateway cannot read the fleet right now") from exc
+            refusal = budgets.unchecked()
+            raise _Refused(402, refusal.message, refusal.body()) from exc
         if box is None or is_terminal("box", box.status):
             raise _Refused(403, "this agent no longer exists")
         reason = admits(token, box_id=box.id, org=box.org, client=box.client)
         if reason is not None:
             raise _Refused(403, reason)
         return box
+
+    def check_budgets(box: Box, model: str, unsettled: list[Box]) -> budgets.Refusal | None:
+        store = store_factory()
+        try:
+            rate = resolve_eur_per_usd(layered(store, environment))
+            now = datetime.now(UTC)
+            return budgets.check_budgets(
+                store, box, model=model, eur_per_usd=rate, now=now, unsettled=unsettled
+            )
+        finally:
+            store.close()
+
+    noted: set[tuple[str, ...]] = set()
+    noted_lock = threading.Lock()
+
+    def note_refusal(box: Box, refusal: budgets.Refusal) -> None:
+        """One event per refusal per period, so a loop does not fill the timeline.
+
+        In memory: a restart may add one more, which is harmless. Failing to write
+        it changes nothing about the refusal.
+        """
+        key = (box.id, *refusal.key)
+        with noted_lock:
+            if key in noted:
+                return
+            if len(noted) > 10_000:
+                noted.clear()
+            noted.add(key)
+        try:
+            store = store_factory()
+            try:
+                store.add_event(
+                    "box",
+                    box.id,
+                    "budget_refused",
+                    {"code": refusal.code, "message": refusal.message, "budget": refusal.budget},
+                )
+            finally:
+                store.close()
+        except Exception:
+            _log.exception("a budget refusal could not be recorded: %s", refusal.code)
+
+    async def refused_by_budget(box: Box, model: str) -> JSONResponse | None:
+        """The 402 if this call may not go out. Anything unexpected is one too."""
+        try:
+            unsettled = await ledger.settle(timeout=settle_s)
+            refusal = await asyncio.to_thread(check_budgets, box, model, unsettled)
+        except Exception:
+            _log.exception("a budget check failed")
+            # Keyed by the minute: an outage is worth more than one event, not thousands.
+            refusal = budgets.unchecked(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M"))
+        if refusal is None:
+            return None
+        await asyncio.to_thread(note_refusal, box, refusal)
+        return JSONResponse(refusal.body(), status_code=402)
 
     def upstream_headers(request: Request, key: str) -> dict[str, str]:
         headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARDED}
@@ -479,7 +628,7 @@ def create_gateway(
         try:
             box = await caller(request)
         except _Refused as refused:
-            return _error(refused.status, refused.message)
+            return refused.response()
         key = resolve_key(
             provider, org=box.org, client=box.client, env=environment, stored=stored_keys
         )
@@ -501,7 +650,7 @@ def create_gateway(
         try:
             box = await caller(request)
         except _Refused as refused:
-            return _error(refused.status, refused.message)
+            return refused.response()
 
         raw = await request.body()
         try:
@@ -509,6 +658,10 @@ def create_gateway(
             model = validate_model(payload["model"])
         except (ValueError, KeyError, TypeError, AttributeError, InvalidModel):
             return _error(400, "expected a JSON body naming a model")
+
+        refusal = await refused_by_budget(box, model)
+        if refusal is not None:
+            return refusal
 
         key = resolve_key(
             provider, org=box.org, client=box.client, env=environment, stored=stored_keys
@@ -536,7 +689,9 @@ def create_gateway(
             else:
                 tokens = (_estimated_tokens(len(raw)), _estimated_tokens(chars), 0)
             ledger.write(
+                box=box,
                 **call,
+                now=datetime.now(UTC),
                 tokens_in=tokens[0],
                 tokens_out=tokens[1],
                 tokens_cached=tokens[2],

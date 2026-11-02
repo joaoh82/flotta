@@ -1442,6 +1442,94 @@ def create_app(
             store.close()
         return {"client": asdict(client)}
 
+    def _budget_reader(token: Token | None, org_id: str) -> None:
+        """The org's own, or the operator: not a client's viewer, or an agent.
+
+        What an agency allows a client's agents is the agency's business.
+        """
+        if _is_operator(token):
+            return
+        assert token is not None
+        if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+        if token.client is not None:
+            raise HTTPException(status_code=403, detail="budgets are the agency's to see")
+
+    @app.get("/api/orgs/{org_id}/budgets")
+    def list_budgets(org_id: str, token: Token | None = needs_read) -> Any:
+        """An org's budgets. Owners and members read; see `flotta.budgets`."""
+        _budget_reader(token, org_id)
+        from flotta.budgets import budget_dict
+
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            return {
+                "org": org_id,
+                "budgets": [budget_dict(b) for b in store.budgets_for_org(org_id)],
+            }
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/budgets")
+    def put_budget(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Set the budget for a scope and period, replacing any that is there.
+
+        `{"period": "day", "limit_eur": "20", "action": "pause"}`, for the whole
+        org, or with `"client"`, or with `"box"` for one agent. Optional:
+        `"soft_pct"`, `"fallback_model"`. Until M13.5 every action refuses calls
+        when the limit is reached.
+        """
+        _admin_of(token, org_id)
+        from flotta.budgets import budget_dict, parse_limit
+        from flotta.store import InvalidBudgetError, UnknownEntityError
+
+        for field in ("client", "box", "fallback_model"):
+            if body.get(field) is not None and not isinstance(body[field], str):
+                raise HTTPException(status_code=422, detail=f"{field} must be text")
+        soft_pct = body.get("soft_pct", 0.8)
+        if isinstance(soft_pct, bool) or not isinstance(soft_pct, int | float):
+            raise HTTPException(status_code=422, detail="soft_pct must be a fraction, like 0.8")
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            budget = store.set_budget(
+                org_id,
+                client=body.get("client"),
+                box=body.get("box"),
+                period=str(body.get("period")),
+                limit_eur_nano=parse_limit(body.get("limit_eur")),
+                action=str(body.get("action")),
+                soft_pct=float(soft_pct),
+                fallback_model=body.get("fallback_model"),
+            )
+            return budget_dict(budget)
+        except InvalidBudgetError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+    @app.delete("/api/orgs/{org_id}/budgets")
+    def delete_budget(
+        org_id: str,
+        period: str,
+        client: str | None = None,
+        box: str | None = None,
+        token: Token | None = needs_admin,
+    ) -> Any:
+        """Remove the budget for a scope and period, named as `PUT` names it."""
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            if not store.delete_budget(org_id, period=period, client=client, box=box):
+                raise HTTPException(status_code=404, detail="no such budget")
+            return {"deleted": True}
+        finally:
+            store.close()
+
     @app.post("/api/orgs/{org_id}/tokens", status_code=201)
     def mint_org_token(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
         """A token for one of an org's people: `{"subject", "role", "client"?, "days"?}`.
