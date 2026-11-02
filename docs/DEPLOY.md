@@ -672,10 +672,16 @@ every repository it works on.
 **Upgrading from before FLOTTA-105.** An account connected before it names
 nobody: `commits_as` is null, and its agents commit as themselves even when
 recreated, since a client's own connection is never passed over for its
-agency's or the operator's name. Connect the account again, as the person
-whose name the commits should carry (step 7d's "Redirect on update" lets the
-same installation be claimed again), and *then* recreate the box or update its
-machine env as in 7a.
+agency's or the operator's name. The account has to be connected again by the
+person whose name the commits should carry, and *then* the box recreated or
+its machine env updated as in 7a. **Today that is not possible from the
+GitHub page** (FLOTTA task 110): for an account that already has the App
+installed, GitHub answers the install step with its settings page and drops
+the state, so the person never reaches the step that proves who they are.
+"Redirect on update" does not help, since an update carries no state either.
+Until the Reconnect action exists, set the author on each box by hand as in
+7a: the person is whoever the account belongs to, and `gh api users/<login>`
+gives the id for the address.
 
 **What a reconnect or a disconnect does not do.** Both reach only boxes
 created afterwards. Connecting the same scope again as somebody else names
