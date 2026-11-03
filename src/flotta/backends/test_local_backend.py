@@ -391,3 +391,71 @@ def test_a_change_of_model_reaches_a_local_agent(backend):
     kept = json.loads((backend.home / "eng-a" / "secrets.json").read_text())
     assert kept["FLOTTA_MODEL"] == "anthropic/claude-sonnet-4.5"
     assert "FLOTTA_API_KEY" not in kept
+
+
+def test_files_sent_with_a_message_are_kept_as_hermes_keeps_them(backend):
+    """A client's history has to read what Hermes stores, not what was typed."""
+
+    async def run(endpoint: str) -> tuple[list[dict], dict, dict]:
+        base = _base(endpoint)
+        async with client.new_session() as session:
+            await client.login(session, base, "flotta", "the-box-password")
+            ticket = await client.ws_ticket(session, base)
+            ws = await client.open_agent_socket(session, base, ticket)
+            try:
+                await client.await_ready(ws)
+                live = (await client.create_session(ws))["session_id"]
+
+                async def call(rid: int, method: str, params: dict) -> dict:
+                    await ws.send_json(
+                        {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+                    )
+                    while True:
+                        frame = await ws.receive_json()
+                        if frame.get("id") == rid:
+                            return frame["result"]
+
+                stored = await call(
+                    1,
+                    "file.attach",
+                    {
+                        "session_id": live,
+                        "name": "my notes.md",
+                        "data_url": "data:text/markdown;base64,IyBoZWxsbw==",
+                    },
+                )
+                image = await call(
+                    2,
+                    "image.attach_bytes",
+                    {
+                        "session_id": live,
+                        "filename": "a.png",
+                        "content_base64": "data:image/png;base64,AAAA",
+                    },
+                )
+                dropped = await call(
+                    3,
+                    "image.attach_bytes",
+                    {
+                        "session_id": live,
+                        "filename": "b.png",
+                        "content_base64": "data:image/png;base64,AAAA",
+                    },
+                )
+                await call(4, "image.detach", {"session_id": live, "path": dropped["path"]})
+                await client.send_turn(ws, live, f"read\n\n{stored['ref_text']}", timeout_s=10)
+                stored_id = (await call(5, "session.most_recent", {}))["session_id"]
+                history = await call(6, "session.resume", {"session_id": stored_id})
+                return history["messages"], stored, image
+            finally:
+                await ws.close()
+
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    messages, stored, image = asyncio.run(run(handle.endpoint))
+
+    assert stored["ref_text"].startswith('@file:"') and stored["uploaded"] is True
+    assert image["text"] == "[User attached image: a.png]"
+    kept = messages[0]["text"]
+    assert "--- Attached Context ---\n\n# hello" in kept
+    assert f"@image:{image['path']}" in kept and "b.png" not in kept

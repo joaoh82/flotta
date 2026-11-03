@@ -57,8 +57,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
+import re
 import secrets
 import time
 import weakref
@@ -137,6 +139,11 @@ def seed_soul(home: Path, env: dict[str, str]) -> None:
 #: asks first. The frames are the shapes captured off a live gateway (v2026.9.14).
 TOOL_TRIGGER = "!tool"
 APPROVE_TRIGGER = "!approve"
+#: A reference in a prompt, quoted when the path has a space, as Hermes writes one.
+FILE_REF = re.compile(r"""@file:(?:"([^"\n]+)"|(\S+))""")
+#: uvicorn's default `ws_max_size`, which is what the door runs with.
+DOOR_FRAME_LIMIT = 16 * 1024 * 1024
+
 PROBE_COMMAND = "rm -rf /tmp/flotta-standin-probe"
 
 
@@ -164,6 +171,9 @@ class Agent:
         self.unbuilt: set[str] = set()
         #: An approval asked and not yet answered: its request id -> (live id, stored id).
         self.asked: dict[str, tuple[str, str]] = {}
+        self.attachments = home / "hermes" / "attachments"
+        #: Images waiting for the next `prompt.submit`: live id -> paths.
+        self.images: dict[str, list[str]] = {}
 
     # -- stored conversations -------------------------------------------------
 
@@ -271,7 +281,8 @@ async def _socket(request: web.Request) -> web.StreamResponse:
     agent = request.app[AGENT]
     if not agent.take_ticket(request.query.get("ticket")):
         return web.json_response({"detail": "Unauthorized"}, status=401)
-    ws = web.WebSocketResponse()
+    # What a browser may send through the door, which is what a real box takes.
+    ws = web.WebSocketResponse(max_msg_size=DOOR_FRAME_LIMIT)
     await ws.prepare(request)
     request.app[SOCKETS].add(ws)
     await ws.send_str(_event("gateway.ready", {"skin": {}, "change_events": True, "standin": True}))
@@ -350,6 +361,37 @@ def _answered(agent: Agent, rid: str, result: Any) -> list[str]:
             *_finish(agent, stored_id, live_id, f"Approved ({choice}), so I ran it."),
         ]
     return _finish(agent, stored_id, live_id, f"Not approved ({choice}), so I did not run it.")
+
+
+def _keep_upload(agent: Agent, name: str, data_url: str) -> Path:
+    """Decode an upload onto this agent's disk, under the name's last part only."""
+    agent.attachments.mkdir(parents=True, exist_ok=True)
+    path = agent.attachments / (Path(name).name or "attachment")
+    path.write_bytes(base64.b64decode(data_url.partition("base64,")[2] or data_url))
+    return path
+
+
+def _contents(path: Path) -> str:
+    """What Hermes inlines for a reference: the text, or a line about a binary file."""
+    try:
+        return path.read_text()
+    except UnicodeDecodeError:
+        return f"{path.name} is a binary file on disk."
+
+
+def _kept_prompt(agent: Agent, live_id: str, text: str) -> str:
+    """
+    A prompt as Hermes stores it: a referenced file's contents appended, then a
+    line per image. A client reading its history has to cope with this, so a
+    stand-in that kept the prompt clean would hide it.
+    """
+    files = [quoted or plain for quoted, plain in FILE_REF.findall(text)]
+    blocks = [_contents(Path(f)) for f in files if Path(f).is_file()]
+    kept = f"{text}\n\n--- Attached Context ---\n\n" + "\n\n".join(blocks) if blocks else text
+    images = agent.images.pop(live_id, [])
+    if images:
+        kept = "\n".join([kept, *(f"@image:{path}" for path in images), "[image]"])
+    return kept
 
 
 def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
@@ -434,7 +476,9 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
         agent.unbuilt.discard(live_id)
         text = str(params.get("text") or "")
         messages = sessions[stored_id]["messages"]
-        messages.append({"role": "user", "text": text, "timestamp": time.time()})
+        messages.append(
+            {"role": "user", "text": _kept_prompt(agent, live_id, text), "timestamp": time.time()}
+        )
         turn = sum(1 for m in messages if m["role"] == "user")
         agent.save(sessions)
         started = [_result(rid, {"status": "submitted"}), _event("message.start", {}, live_id)]
@@ -487,6 +531,47 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
                 ),
             ),
         ]
+
+    if method == "file.attach":
+        name = str(params.get("name") or "attachment")
+        path = _keep_upload(agent, name, str(params.get("data_url") or ""))
+        return [
+            _result(
+                rid,
+                {
+                    "attached": True,
+                    "name": path.name,
+                    "path": str(path),
+                    "ref_path": str(path),
+                    "ref_text": f'@file:"{path}"' if " " in str(path) else f"@file:{path}",
+                    "uploaded": True,
+                },
+            )
+        ]
+
+    if method == "image.attach_bytes":
+        name = str(params.get("filename") or "image.png")
+        path = _keep_upload(agent, name, str(params.get("content_base64") or ""))
+        queued = agent.images.setdefault(str(params.get("session_id") or ""), [])
+        queued.append(str(path))
+        return [
+            _result(
+                rid,
+                {
+                    "attached": True,
+                    "path": str(path),
+                    "count": len(queued),
+                    "text": f"[User attached image: {path.name}]",
+                },
+            )
+        ]
+
+    if method == "image.detach":
+        queued = agent.images.get(str(params.get("session_id") or ""), [])
+        kept = [path for path in queued if path != params.get("path")]
+        detached = len(kept) != len(queued)
+        agent.images[str(params.get("session_id") or "")] = kept
+        return [_result(rid, {"detached": detached, "count": len(kept)})]
 
     if rid is None:
         return []
