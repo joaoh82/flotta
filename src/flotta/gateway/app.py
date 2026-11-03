@@ -94,7 +94,7 @@ from flotta.auth import (
     verify,
 )
 from flotta.inference import InvalidModel, is_openrouter, validate_model
-from flotta.pricing import EurRate, Price, resolve_eur_per_usd
+from flotta.pricing import EurRate, Price, dollars_to_nano, resolve_eur_per_usd
 from flotta.settings import layered
 from flotta.store import Box, FleetStore, is_terminal
 
@@ -233,6 +233,21 @@ def _reported(usage: Any) -> tuple[int, int, int] | None:
     details = usage.get("prompt_tokens_details")
     cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
     return tokens_in, tokens_out, cached or 0
+
+
+def _reported_cost(usage: Any) -> int | None:
+    """What OpenRouter's reply says a call cost, in nanos of a dollar, if it says.
+
+    Its catalogue lists the cheapest provider, while a call is billed at the
+    price of the provider that served it, so only the reply knows. On a brought
+    key the figure is OpenRouter's fee, with the call billed elsewhere.
+    """
+    if not isinstance(usage, dict) or usage.get("is_byok") is True:
+        return None
+    cost = usage.get("cost")
+    if not isinstance(cost, int | float):
+        return None
+    return dollars_to_nano(cost)
 
 
 class _Events:
@@ -724,6 +739,8 @@ def create_gateway(
                 tokens_cached=tokens[2],
                 status=status,
                 estimated=reported is None and chars is not None,
+                # Only OpenRouter's: nothing says what another endpoint's field means.
+                reported_cost_nano=_reported_cost(usage) if provider == "openrouter" else None,
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
 

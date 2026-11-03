@@ -848,6 +848,12 @@ override, and only needed to pin a rate. The gateway refreshes prices from OpenR
 catalogue on the same schedule; on any other endpoint there is no catalogue, so calls
 stay unpriced.
 
+**A call costs what OpenRouter's reply says it cost.** Its catalogue lists a model's
+cheapest provider, and a call is billed at the price of the provider that served it,
+which can be several times that. The listed price only prices a call whose reply said
+nothing, such as a cut stream, so that figure can be too low. `usage.cost_reported`
+says which one a row holds; rows from before this are all listed prices.
+
 **Budgets are checked here, before every call,** and refuse with a 402 when used up
 (`PUT /api/orgs/{org}/budgets`). With the database unreachable every call is refused,
 budget or no budget: the gateway cannot tell which it is, so its outage stops the
