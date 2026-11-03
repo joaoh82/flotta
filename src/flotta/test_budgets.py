@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from flotta.budgets import eur_text, parse_limit, period_start, resets_at
-from flotta.pricing import NANO
+from flotta.pricing import NANO, Price
 from flotta.store import FleetStore, InvalidBudgetError, UnknownEntityError
 from flotta.test_migrations import target  # noqa: F401
 
@@ -131,6 +131,7 @@ def test_what_cannot_be_a_budget_is_refused(fleet, bad):
 
 
 def test_a_downgrade_takes_a_fallback(fleet):
+    fleet.refresh_prices([Price("fake/cheap", NANO, NANO, None, "USD", "test")])
     budget = _set(fleet, action="downgrade", fallback_model="fake/cheap")
     assert budget.fallback_model == "fake/cheap"
 

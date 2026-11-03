@@ -86,7 +86,9 @@ STORE_ENV_VAR = "FLOTTA_STORE"
 # No `failed`. A box is a machine; machines get destroyed, they do not fail —
 # a provision that dies goes straight to `torn_down` with the reason in its
 # event. `stopped` is the pivot: non-terminal, expected to come back.
-BOX_STATUSES: frozenset[str] = frozenset({"provisioning", "running", "stopped", "torn_down"})
+BOX_STATUSES: frozenset[str] = frozenset(
+    {"provisioning", "running", "stopped", "paused", "torn_down"}
+)
 BOX_TERMINAL: frozenset[str] = frozenset({"torn_down"})
 BOX_TRANSITIONS: dict[str, frozenset[str]] = {
     # `provisioning -> stopped` exists because `create` can legitimately return
@@ -96,8 +98,11 @@ BOX_TRANSITIONS: dict[str, frozenset[str]] = {
     # `running` would be a lie and `torn_down` would throw away a machine that
     # exists. `stopped` is exactly true, and `start_box` can recover from it.
     "provisioning": frozenset({"running", "stopped", "torn_down"}),
-    "running": frozenset({"stopped", "torn_down"}),
-    "stopped": frozenset({"running", "torn_down"}),
+    "running": frozenset({"stopped", "paused", "torn_down"}),
+    "stopped": frozenset({"running", "paused", "torn_down"}),
+    # `paused` is a budget's (FLOTTA-91), and it leaves by `stopped`: never straight
+    # to `running`, so nothing can wake a paused box by moving its row.
+    "paused": frozenset({"stopped", "torn_down"}),
     "torn_down": frozenset(),
 }
 
@@ -731,6 +736,22 @@ class Usage:
     status: int | None = None
     estimated: bool = False
     cost_reported: bool = False
+    requested_model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetEvent:
+    """Something a budget did, on its client's timeline. See `flotta.budgets`."""
+
+    id: str
+    org: str
+    client: str | None
+    box: str | None
+    budget: str
+    type: str
+    period_start: str
+    payload: dict[str, Any]
+    ts: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -2317,6 +2338,7 @@ class FleetStore:
         status: int | None = None,
         estimated: bool = False,
         reported_cost_nano: int | None = None,
+        requested_model: str | None = None,
         now: datetime | None = None,
     ) -> Usage:
         """Write one model call to the ledger, with its cost settled now.
@@ -2379,8 +2401,8 @@ class FleetStore:
             "INSERT INTO usage (id, org_id, client_id, box_id, kind, model, upstream, key_scope, "
             "tokens_in, tokens_out, tokens_cached, latency_ms, currency, upstream_cost_nano, "
             "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key, status, estimated, "
-            "cost_reported) "
-            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "cost_reported, requested_model) "
+            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (box_id, idempotency_key) DO NOTHING",
             (
                 f"u-{uuid.uuid4().hex}",
@@ -2404,6 +2426,7 @@ class FleetStore:
                 status,
                 1 if estimated else 0,
                 1 if reported_cost_nano else 0,
+                requested_model,
             ),
         )
         row = self._conn.execute(
@@ -2433,6 +2456,7 @@ class FleetStore:
             status=row["status"],
             estimated=bool(row["estimated"]),
             cost_reported=bool(row["cost_reported"]),
+            requested_model=row["requested_model"],
         )
 
     def spend(
@@ -2541,6 +2565,10 @@ class FleetStore:
                 fallback_model = validate_model(fallback_model)
             except InvalidModel as exc:
                 raise InvalidBudgetError(str(exc)) from exc
+            if self.price_of(fallback_model, at=datetime.now(UTC)) is None:
+                raise InvalidBudgetError(
+                    f"{fallback_model} is not in the catalogue, so a call on it could not be priced"
+                )
         client, box = self._budget_scope(org, client, box)
         budget_id = self._budget_id(org, client, box, period)
         self._conn.execute(
@@ -2583,6 +2611,68 @@ class FleetStore:
             "SELECT * FROM budgets WHERE org_id = ? ORDER BY client_id, box_id, period", (org,)
         ).fetchall()
         return [self._budget_from(row) for row in rows]
+
+    def all_budgets(self) -> list[Budget]:
+        """Every org's, for the sweep that acts on them."""
+        rows = self._conn.execute("SELECT * FROM budgets ORDER BY id").fetchall()
+        return [self._budget_from(row) for row in rows]
+
+    def record_budget_event(
+        self,
+        budget: Budget,
+        kind: str,
+        *,
+        period_start: datetime,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Note what `budget` did this period. Returns whether this is the first time."""
+        moment = _instant(period_start)
+        found = self._conn.execute(
+            "SELECT id FROM budget_events WHERE budget_id = ? AND type = ? AND period_start = ?",
+            (budget.id, kind, moment),
+        ).fetchone()
+        if found is not None:
+            return False
+        self._conn.execute(
+            "INSERT INTO budget_events (id, org_id, client_id, box_id, budget_id, type, "
+            "period_start, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (budget_id, type, period_start) DO NOTHING",
+            (
+                f"be-{uuid.uuid4().hex}",
+                budget.org,
+                budget.client,
+                budget.box,
+                budget.id,
+                kind,
+                moment,
+                json.dumps(payload),
+                _utcnow(),
+            ),
+        )
+        return True
+
+    def budget_events(self, org: str, *, client: str | None = None) -> list[BudgetEvent]:
+        """What `org`'s budgets did, oldest first. For a client, an org-wide budget's too."""
+        query = "SELECT * FROM budget_events WHERE org_id = ?"
+        params: tuple[str, ...] = (org,)
+        if client is not None:
+            query += " AND (client_id = ? OR client_id IS NULL)"
+            params = (org, client)
+        rows = self._conn.execute(f"{query} ORDER BY ts, id", params).fetchall()
+        return [
+            BudgetEvent(
+                id=row["id"],
+                org=row["org_id"],
+                client=row["client_id"],
+                box=row["box_id"],
+                budget=row["budget_id"],
+                type=row["type"],
+                period_start=row["period_start"],
+                payload=json.loads(row["payload"]),
+                ts=row["ts"],
+            )
+            for row in rows
+        ]
 
     def budgets_covering(self, box: Box) -> list[Budget]:
         """Every budget a call by `box` counts against: its org's, client's and own.

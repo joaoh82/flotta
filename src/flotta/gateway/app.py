@@ -597,7 +597,9 @@ def create_gateway(
             raise _Refused(403, reason)
         return box
 
-    def check_budgets(box: Box, model: str, unsettled: list[Box]) -> budgets.Refusal | None:
+    def check_budgets(
+        box: Box, model: str, unsettled: list[Box]
+    ) -> budgets.Refusal | budgets.Downgrade | None:
         store = store_factory()
         try:
             rate = rate_in_force(store)
@@ -638,19 +640,22 @@ def create_gateway(
         except Exception:
             _log.exception("a budget refusal could not be recorded: %s", refusal.code)
 
-    async def refused_by_budget(box: Box, model: str) -> JSONResponse | None:
-        """The 402 if this call may not go out. Anything unexpected is one too."""
+    async def budget_verdict(box: Box, model: str) -> JSONResponse | budgets.Downgrade | None:
+        """The 402 if this call may not go out, or the model it has to go to instead.
+
+        Anything unexpected is a 402 too.
+        """
         try:
             unsettled = await ledger.settle(timeout=settle_s)
-            refusal = await asyncio.to_thread(check_budgets, box, model, unsettled)
+            verdict = await asyncio.to_thread(check_budgets, box, model, unsettled)
         except Exception:
             _log.exception("a budget check failed")
             # Keyed by the minute: an outage is worth more than one event, not thousands.
-            refusal = budgets.unchecked(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M"))
-        if refusal is None:
-            return None
-        await asyncio.to_thread(note_refusal, box, refusal)
-        return JSONResponse(refusal.body(), status_code=402)
+            verdict = budgets.unchecked(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M"))
+        if not isinstance(verdict, budgets.Refusal):
+            return verdict
+        await asyncio.to_thread(note_refusal, box, verdict)
+        return JSONResponse(verdict.body(), status_code=402)
 
     def upstream_headers(request: Request, key: str) -> dict[str, str]:
         headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARDED}
@@ -701,9 +706,14 @@ def create_gateway(
         except (ValueError, KeyError, TypeError, AttributeError, InvalidModel):
             return _error(400, "expected a JSON body naming a model")
 
-        refusal = await refused_by_budget(box, model)
-        if refusal is not None:
-            return refusal
+        verdict = await budget_verdict(box, model)
+        if isinstance(verdict, JSONResponse):
+            return verdict
+        requested = None
+        if verdict is not None:
+            requested, model = model, verdict.model
+            payload["model"] = model
+            raw = json.dumps(payload).encode()
 
         key = resolve_key(
             provider, org=box.org, client=box.client, env=environment, stored=stored_keys
@@ -715,6 +725,7 @@ def create_gateway(
         call = {
             "box_id": box.id,
             "model": model,
+            "requested_model": requested,
             "upstream": provider,
             "key_scope": key.scope,
             "idempotency_key": uuid.uuid4().hex,

@@ -1547,14 +1547,28 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/orgs/{org_id}/budget-events")
+    def list_budget_events(
+        org_id: str, client: str | None = None, token: Token | None = needs_read
+    ) -> Any:
+        """What an org's budgets did, or one client's: its own and the org-wide ones."""
+        _budget_reader(token, org_id)
+        from dataclasses import asdict
+
+        store = store_factory()
+        try:
+            return {"events": [asdict(e) for e in store.budget_events(org_id, client=client)]}
+        finally:
+            store.close()
+
     @app.put("/api/orgs/{org_id}/budgets")
     def put_budget(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
         """Set the budget for a scope and period, replacing any that is there.
 
         `{"period": "day", "limit_eur": "20", "action": "pause"}`, for the whole
         org, or with `"client"`, or with `"box"` for one agent. Optional:
-        `"soft_pct"`, `"fallback_model"`. Until M13.5 every action refuses calls
-        when the limit is reached.
+        `"soft_pct"`, `"fallback_model"`. What each action does at the limit is in
+        `flotta.budgets`.
         """
         _admin_of(token, org_id)
         from flotta.budgets import budget_dict, parse_limit
@@ -4101,14 +4115,24 @@ def create_app(
         row that disagrees with the substrate. Fly stops machines on its own
         during a host drain.
         """
-        from flotta.provision import ProvisionError, wake_box
+        from datetime import UTC
+
+        from flotta.budgets import paused_message
+        from flotta.provision import BoxPaused, ProvisionError, wake_box
 
         store = store_factory()
         try:
             box = _routable_box(store, token, box_id)
+            # Before the activity: a tab left open must not hold a paused machine awake.
+            if box.status == "paused":
+                raise HTTPException(
+                    status_code=402, detail=paused_message(store, box, datetime.now(UTC))
+                )
             _record_activity(store, box.id)
             try:
                 result = wake_box(box.id, store=store, reason="front-door")
+            except BoxPaused as exc:
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 # 409 for an illegal state (a torn-down box cannot be woken),
                 # 502 for the substrate failing to start it. The caller can act
@@ -4116,6 +4140,28 @@ def create_app(
                 status = 409 if "only a running or stopped box" in str(exc) else 502
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
             return {"box": _box_dict(_routable_box(store, token, box.id)), **result}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/unpause")
+    def unpause_box_endpoint(box_id: str, token: Token | None = needs_admin) -> Any:
+        """Let a box a budget paused be woken again, now rather than a sweep later.
+
+        409 while a budget still holds it, naming the budget: the sweep would only
+        pause it again, so the answer is to raise the limit. See `flotta.budgets`.
+        """
+        from flotta.provision import BudgetHolds, ProvisionError, unpause_box
+
+        store = store_factory()
+        try:
+            box = _operated_box(store, token, box_id)
+            try:
+                result = unpause_box(box.id, store=store)
+            except BudgetHolds as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ProvisionError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            return {"box": _box_dict(_operated_box(store, token, box.id)), **result}
         finally:
             store.close()
 

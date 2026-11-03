@@ -854,12 +854,30 @@ which can be several times that. The listed price only prices a call whose reply
 nothing, such as a cut stream, so that figure can be too low. `usage.cost_reported`
 says which one a row holds; rows from before this are all listed prices.
 
-**Budgets are checked here, before every call,** and refuse with a 402 when used up
-(`PUT /api/orgs/{org}/budgets`). With the database unreachable every call is refused,
-budget or no budget: the gateway cannot tell which it is, so its outage stops the
-agents' model calls. A budget also refuses calls on a model with no price, or with no
-rate set, and while a finished call's row cannot be written. **Run one instance:** those
-unwritten rows are in its memory, so a second instance would not see them.
+**Budgets are checked here, before every call** (`PUT /api/orgs/{org}/budgets`). With the
+database unreachable every call is refused, budget or no budget: the gateway cannot tell
+which it is, so its outage stops the agents' model calls. A budget also refuses calls on a
+model with no price, or with no rate set, and while a finished call's row cannot be
+written. **Run one instance:** those unwritten rows are in its memory, so a second instance
+would not see them.
+
+**What a budget does at its limit is its action:**
+
+| Action | Calls | The agent |
+|---|---|---|
+| `notify` | carry on | nothing changes; events only |
+| `downgrade` | go to `fallback_model`, which has to be in the catalogue | nothing changes |
+| `pause` | 402 | `paused`, and its machine sleeps once it is quiet |
+| `kill` | 402 | `paused`, and its machine is stopped at once, ending the turn |
+
+The gateway acts on the next call. The control plane's loop changes the agents, so that
+part comes up to a sweep later (60 seconds by default). A `paused` agent is not woken by
+the door, which answers 402 "paused by budget", nor by anything else. It comes back when
+nothing holds it: the period rolls over, the limit is raised or the budget is removed. It
+comes back asleep. `POST /api/boxes/{id}/unpause` does that at once for an owner, and
+answers 409 while a budget still holds it. A person already in a conversation keeps the
+socket when an agent is paused, but its model calls get a 402. Every threshold writes an
+event on each agent covered and one for the client (`GET /api/orgs/{org}/budget-events`).
 
 Locally, for $0: `just gateway-smoke`, or `just gateway-fake` to leave one running.
 

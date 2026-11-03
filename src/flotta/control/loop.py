@@ -175,6 +175,7 @@ async def run_reconcile_loop(
     reconcile: Callable[..., list[dict[str, Any]]] | None = None,
     sleeper: Callable[..., list[dict[str, Any]]] | None = None,
     box_sweeper: Callable[..., list[dict[str, Any]]] | None = None,
+    budget_enforcer: Callable[..., list[dict[str, Any]]] | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep,
     max_sweeps: int | None = None,
 ) -> None:
@@ -201,6 +202,10 @@ async def run_reconcile_loop(
         from flotta.provision import reconcile_boxes
 
         box_sweeper = reconcile_boxes
+    if budget_enforcer is None:
+        from flotta.provision import enforce_budgets
+
+        budget_enforcer = enforce_budgets
 
     state.started_at = state._clock()
     _log.info("reconcile loop started, interval=%.0fs", state.interval_s)
@@ -247,6 +252,15 @@ async def run_reconcile_loop(
                             _log.info("corrected %d box row(s)", len(corrected))
                     except Exception as exc:
                         _log.warning("box sweep failed: %s: %s", type(exc).__name__, exc)
+
+                # Budgets, last: it can stop a machine, and the sweeps above
+                # shouldn't depend on it. The gateway refuses whether or not this runs.
+                try:
+                    acted = budget_enforcer(store)
+                    if acted:
+                        _log.info("acted on budgets for %d box(es)", len(acted))
+                except Exception as exc:
+                    _log.warning("budget sweep failed: %s: %s", type(exc).__name__, exc)
                 return stranded, slept
             finally:
                 store.close()
