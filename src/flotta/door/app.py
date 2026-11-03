@@ -136,6 +136,11 @@ LOCAL_BOXES_ENV = "FLOTTA_DOOR_LOCAL"
 
 #: The one path a ticket opens: Hermes's agent socket.
 AGENT_SOCKET_PATH = "api/ws"
+#: The largest frame taken from a box. A resume is one frame holding the whole
+#: conversation, and `websockets` would otherwise close the socket at 1 MiB,
+#: which leaves an agent with a long history unreachable. Bounded because a box
+#: runs whatever its agent decides to.
+BOX_FRAME_LIMIT = 64 * 1024 * 1024
 #: Hermes's own handshake, which the door does for a browser.
 HERMES_TICKET_PATH = "/api/auth/ws-ticket"
 
@@ -832,7 +837,10 @@ def create_door(
 
         try:
             async with websockets.connect(
-                upstream_url, additional_headers=headers, proxy=None
+                upstream_url,
+                additional_headers=headers,
+                proxy=None,
+                max_size=BOX_FRAME_LIMIT,
             ) as upstream:
 
                 async def downstream_to_box() -> None:

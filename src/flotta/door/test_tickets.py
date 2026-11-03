@@ -305,6 +305,8 @@ def hermes():
             # Gone with no close frame: a killed process, a vanished machine.
             request.transport.abort()
             return ws
+        if seen.get("long_resume"):
+            await ws.send_str("x" * seen["long_resume"])
         message = await ws.receive()
         await ws.send_str(f"echo:{message.data}")
         await ws.close()
@@ -331,6 +333,25 @@ def hermes():
         thread.join(timeout=5)
         loop.run_until_complete(runner.cleanup())
         loop.close()
+
+
+def test_a_long_history_reaches_the_browser(hermes):
+    """
+    A resume is one frame with the whole conversation in it, a file's contents
+    included. Past `websockets`'s default of 1 MiB the door closed the socket
+    on every attempt, so the agent could never be opened again.
+    """
+    port, seen = hermes
+    seen["long_resume"] = 2 * 1024 * 1024
+    app, _ = _door(port, box_credentials=("flotta", "the-box-password"))
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/api/ws", headers={**HOST, "Origin": WEB_APP}, subprotocols=_protocols(_ticket())
+        ) as ws,
+    ):
+        assert "gateway.ready" in ws.receive_text()
+        assert len(ws.receive_text()) == seen["long_resume"]
 
 
 def _converse(app, ticket):
