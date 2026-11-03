@@ -364,10 +364,24 @@ def _answered(agent: Agent, rid: str, result: Any) -> list[str]:
 
 
 def _keep_upload(agent: Agent, name: str, data_url: str) -> Path:
-    """Decode an upload onto this agent's disk, under the name's last part only."""
+    """
+    Decode an upload onto this agent's disk, under the name's last part only.
+    A name already taken gets a number, as on Hermes: the path is the upload's
+    identity, so two `report.txt`s must not be one file.
+    """
     agent.attachments.mkdir(parents=True, exist_ok=True)
-    path = agent.attachments / (Path(name).name or "attachment")
-    path.write_bytes(base64.b64decode(data_url.partition("base64,")[2] or data_url))
+    wanted = Path(Path(name).name or "attachment")
+    path = agent.attachments / wanted
+    number = 2
+    while True:
+        try:
+            upload = path.open("xb")
+            break
+        except FileExistsError:
+            path = agent.attachments / f"{wanted.stem}-{number}{wanted.suffix}"
+            number += 1
+    with upload:
+        upload.write(base64.b64decode(data_url.partition("base64,")[2] or data_url))
     return path
 
 

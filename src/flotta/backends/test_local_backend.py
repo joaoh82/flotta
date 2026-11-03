@@ -11,6 +11,7 @@ import asyncio
 import http.server
 import json
 import os
+import secrets
 import stat
 import threading
 import time
@@ -459,3 +460,62 @@ def test_files_sent_with_a_message_are_kept_as_hermes_keeps_them(backend):
     kept = messages[0]["text"]
     assert "--- Attached Context ---\n\n# hello" in kept
     assert f"@image:{image['path']}" in kept and "b.png" not in kept
+
+
+def test_two_uploads_with_one_name_stay_two(backend):
+    """The path is an upload's identity: a second `report.txt` must not replace the first."""
+
+    async def run(endpoint: str) -> tuple[list[dict], dict, dict, dict]:
+        base = _base(endpoint)
+        async with client.new_session() as session:
+            await client.login(session, base, "flotta", "the-box-password")
+            ticket = await client.ws_ticket(session, base)
+            ws = await client.open_agent_socket(session, base, ticket)
+            try:
+                await client.await_ready(ws)
+                live = (await client.create_session(ws))["session_id"]
+
+                async def call(method: str, **params: str) -> dict:
+                    rid = secrets.token_hex(4)
+                    await ws.send_json(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "method": method,
+                            "params": {"session_id": live, **params},
+                        }
+                    )
+                    while True:
+                        frame = await ws.receive_json()
+                        if frame.get("id") == rid:
+                            return frame["result"]
+
+                first = await call(
+                    "file.attach", name="report.txt", data_url="data:text/plain;base64,Rmlyc3Q="
+                )
+                second = await call(
+                    "file.attach", name="report.txt", data_url="data:text/plain;base64,U2Vjb25k"
+                )
+                image = "data:image/png;base64,AAAA"
+                await call("image.attach_bytes", filename="image.png", content_base64=image)
+                other = await call("image.attach_bytes", filename="image.png", content_base64=image)
+                detached = await call("image.detach", path=other["path"])
+                await client.send_turn(
+                    ws, live, f"read\n\n{first['ref_text']}\n{second['ref_text']}", timeout_s=10
+                )
+                stored = (await call("session.most_recent"))["session_id"]
+                history = await call("session.resume", session_id=stored)
+                return history["messages"], first, second, detached
+            finally:
+                await ws.close()
+
+    handle = backend.create(BoxSpec(name="eng-a", secrets=LOGIN))
+    backend.start(handle.endpoint)
+    messages, first, second, detached = asyncio.run(run(handle.endpoint))
+
+    assert first["path"] != second["path"]
+    assert second["name"] == "report-2.txt"
+    kept = messages[0]["text"]
+    assert "First" in kept and "Second" in kept
+    assert detached == {"detached": True, "count": 1}
+    assert "@image:" in kept and "image-2.png" not in kept
