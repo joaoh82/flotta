@@ -11,6 +11,7 @@ from flotta.pricing import (
     NANO,
     Price,
     cost_nano,
+    dollars_to_nano,
     eur_rate_from_ecb,
     prices_from_catalogue,
     resolve_eur_per_usd,
@@ -188,3 +189,14 @@ def test_the_ecb_quotes_dollars_per_euro_and_the_rate_is_the_inverse():
 def test_a_file_without_a_sane_rate_is_refused(broken):
     with pytest.raises(ValueError):
         eur_rate_from_ecb(broken)
+
+
+def test_dollars_become_nanos_exactly_and_round_half_up():
+    assert dollars_to_nano(0.000755174) == 755_174
+    assert dollars_to_nano(2) == 2 * NANO
+    assert dollars_to_nano(0.0000000015) == 2
+
+
+@pytest.mark.parametrize("amount", ["soon", None, -1, float("nan"), float("inf")])
+def test_what_is_not_an_amount_of_dollars_has_no_nanos(amount):
+    assert dollars_to_nano(amount) is None

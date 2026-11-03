@@ -48,6 +48,10 @@ class Price:
 
     `cached_nano_per_m` is `None` when the upstream names no cached price; those
     tokens are billed as input, never as free.
+
+    For a model on OpenRouter this is what its catalogue lists: its cheapest
+    provider, not the one a call lands on. So it only prices a call whose reply
+    didn't say what it cost, and it can be too low (FLOTTA-115).
     """
 
     model: str
@@ -91,6 +95,14 @@ def to_eur_nano(amount_nano: int, currency: str, eur_per_usd: Decimal | None) ->
     if currency == "USD" and eur_per_usd is not None:
         return int((amount_nano * eur_per_usd).quantize(Decimal(1), rounding=ROUND_HALF_UP))
     return None
+
+
+def dollars_to_nano(amount: Any) -> int | None:
+    """`amount` dollars in nanos, or `None` if that isn't an amount."""
+    number = _positive(amount)
+    if number is None:
+        return None
+    return int((number * NANO).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 def _positive(text: Any) -> Decimal | None:

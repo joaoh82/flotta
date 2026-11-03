@@ -24,6 +24,7 @@ from flotta.gateway.app import (
     _Ledger,
     _MeteredStream,
     _relay,
+    _reported_cost,
     create_gateway,
     resolve_key,
 )
@@ -854,3 +855,109 @@ def test_the_fake_price_is_what_these_numbers_assume():
     assert FAKE_PRICE.cached_nano_per_m == NANO
     assert FAKE_PRICE.output_nano_per_m == 8 * NANO
     assert Decimal(ENV["FLOTTA_EUR_PER_USD"]) == Decimal("0.5")
+
+
+# -- what OpenRouter says a call cost (FLOTTA-115) ---------------------------
+#
+# Its catalogue lists the cheapest provider. A call is billed at the price of
+# the provider that served it, which only the reply can say.
+
+OPENROUTER_ENV = {**ENV, "FLOTTA_MODEL_BASE_URL": "https://openrouter.ai/api/v1"}
+#: What FAKE_PRICE would make of the fake upstream's usage, nowhere near the cost below.
+LISTED_NANO = 2_440_000
+
+
+def _charged(cost, *, env=OPENROUTER_ENV, stream=False, **extra):
+    upstream = FakeUpstream()
+    upstream.usage = {**upstream.usage, "cost": cost, **extra}
+    return upstream, env, {**CALL, "stream": stream}
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["whole", "stream"])
+def test_a_call_costs_what_openrouter_says_it_cost(path, stream):
+    upstream, env, body = _charged(0.000755174, stream=stream)
+    with _client(path, upstream, env=env) as client:
+        assert client.post("/v1/chat/completions", json=body, headers=_auth()).status_code == 200
+    row = _rows(path)[0]
+    assert row["upstream_cost_nano"] == 755_174
+    assert row["cost_eur_nano"] == 377_587
+    assert row["currency"] == "USD"
+    assert row["eur_per_usd"] == "0.5"
+    assert row["cost_reported"] == 1
+    assert _spent(path, "b-one") == 377_587
+
+
+def test_a_call_openrouter_says_nothing_about_costs_the_listed_price(path):
+    upstream = FakeUpstream()
+    with _client(path, upstream, env=OPENROUTER_ENV) as client:
+        client.post("/v1/chat/completions", json=CALL, headers=_auth())
+    row = _rows(path)[0]
+    assert row["upstream_cost_nano"] == LISTED_NANO
+    assert row["cost_reported"] == 0
+
+
+def test_another_endpoints_cost_is_not_believed(path):
+    """Nothing says what its field is, or what currency it is in."""
+    upstream, env, body = _charged(12.5, env=ENV)
+    with _client(path, upstream, env=env) as client:
+        client.post("/v1/chat/completions", json=body, headers=_auth())
+    row = _rows(path)[0]
+    assert row["upstream_cost_nano"] == LISTED_NANO
+    assert row["cost_reported"] == 0
+
+
+@pytest.mark.parametrize(
+    "cost",
+    ["0.5", True, -0.5, None, [1], {"usd": 1}, 0, 0.0],
+    ids=["text", "bool", "negative", "null", "list", "object", "zero", "zero.0"],
+)
+def test_a_cost_that_cannot_be_one_falls_back_to_the_listed_price(path, cost):
+    """A reported zero included: a free model's listed price says zero by itself,
+    and believing one on a paid model would let it through a budget for nothing."""
+    upstream, env, body = _charged(cost)
+    with _client(path, upstream, env=env) as client:
+        assert client.post("/v1/chat/completions", json=body, headers=_auth()).status_code == 200
+    row = _rows(path)[0]
+    assert row["upstream_cost_nano"] == LISTED_NANO
+    assert row["cost_reported"] == 0
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_a_number_that_is_not_one_is_not_a_cost(cost):
+    """Python's JSON reader lets these through, so they can arrive."""
+    assert _reported_cost({"cost": cost}) is None
+
+
+def test_a_brought_key_is_billed_elsewhere_so_its_fee_is_not_the_cost(path):
+    upstream, env, body = _charged(0.95, is_byok=True)
+    with _client(path, upstream, env=env) as client:
+        client.post("/v1/chat/completions", json=body, headers=_auth())
+    row = _rows(path)[0]
+    assert row["upstream_cost_nano"] == LISTED_NANO
+    assert row["cost_reported"] == 0
+
+
+def test_a_cost_too_small_to_be_a_nano_is_not_a_reported_cost(path):
+    upstream, env, body = _charged(0.0000000001)
+    with _client(path, upstream, env=env) as client:
+        client.post("/v1/chat/completions", json=body, headers=_auth())
+    assert _rows(path)[0]["cost_reported"] == 0
+
+
+def test_a_cost_on_a_model_with_no_listed_price_still_prices_the_call(path):
+    upstream, env, _ = _charged(0.002)
+    body = {**CALL, "model": "somebody/unlisted"}
+    with _client(path, upstream, env=env) as client:
+        client.post("/v1/chat/completions", json=body, headers=_auth())
+    row = _rows(path)[0]
+    assert row["upstream_cost_nano"] == 2_000_000
+    assert row["cost_eur_nano"] == 1_000_000
+    assert row["currency"] == "USD"
+    assert row["cost_reported"] == 1
+
+
+def test_the_agent_still_sees_the_reply_unchanged(path):
+    upstream, env, body = _charged(0.000755174)
+    with _client(path, upstream, env=env) as client:
+        reply = client.post("/v1/chat/completions", json=body, headers=_auth())
+    assert reply.json()["usage"]["cost"] == 0.000755174

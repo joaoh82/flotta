@@ -730,6 +730,7 @@ class Usage:
     idempotency_key: str
     status: int | None = None
     estimated: bool = False
+    cost_reported: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2315,9 +2316,17 @@ class FleetStore:
         run_id: str | None = None,
         status: int | None = None,
         estimated: bool = False,
+        reported_cost_nano: int | None = None,
         now: datetime | None = None,
     ) -> Usage:
-        """Write one model call to the ledger, with its cost worked out now.
+        """Write one model call to the ledger, with its cost settled now.
+
+        `reported_cost_nano` is what the upstream's reply said the call cost, in
+        US dollars, and it wins. A listed price is what's left when it said
+        nothing, because a call may land on a dearer provider than the one
+        listed. A reported zero isn't believed, since a free model's listed price
+        says zero by itself and one on a paid model would pass a budget for
+        nothing (FLOTTA-115).
 
         The cost comes from the price in force at this moment and is never
         worked out again. Whose call it was comes from the box's row, so no
@@ -2337,14 +2346,21 @@ class FleetStore:
         ):
             if count < 0:
                 raise ValueError(f"{name} cannot be negative, got {count}")
+        if reported_cost_nano is not None and reported_cost_nano < 0:
+            raise ValueError(f"reported_cost_nano cannot be negative, got {reported_cost_nano}")
         if key_scope not in KEY_SCOPES:
             raise ValueError(f"key_scope must be one of {sorted(KEY_SCOPES)}, got {key_scope!r}")
         box = self._get_box_or_raise(box_id)
         moment = now or datetime.now(UTC)
         price = self.price_of(model, at=moment)
+        currency = None if price is None else price.currency
         upstream_cost: int | None
         cost_eur: int | None
-        if tokens_in == 0 and tokens_out == 0:
+        if reported_cost_nano:
+            currency = "USD"
+            upstream_cost = reported_cost_nano
+            cost_eur = to_eur_nano(reported_cost_nano, currency, eur_per_usd)
+        elif tokens_in == 0 and tokens_out == 0:
             upstream_cost, cost_eur = 0, 0
         elif price is None:
             upstream_cost, cost_eur = None, None
@@ -2356,14 +2372,15 @@ class FleetStore:
         # The rate only if it was the one used: a price in euros used none.
         rate = (
             str(eur_per_usd)
-            if upstream_cost and cost_eur is not None and price and price.currency == "USD"
+            if upstream_cost and cost_eur is not None and currency == "USD"
             else None
         )
         self._conn.execute(
             "INSERT INTO usage (id, org_id, client_id, box_id, kind, model, upstream, key_scope, "
             "tokens_in, tokens_out, tokens_cached, latency_ms, currency, upstream_cost_nano, "
-            "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key, status, estimated) "
-            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key, status, estimated, "
+            "cost_reported) "
+            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (box_id, idempotency_key) DO NOTHING",
             (
                 f"u-{uuid.uuid4().hex}",
@@ -2377,7 +2394,7 @@ class FleetStore:
                 tokens_out,
                 tokens_cached,
                 latency_ms,
-                None if price is None else price.currency,
+                currency,
                 upstream_cost,
                 rate,
                 cost_eur,
@@ -2386,6 +2403,7 @@ class FleetStore:
                 idempotency_key,
                 status,
                 1 if estimated else 0,
+                1 if reported_cost_nano else 0,
             ),
         )
         row = self._conn.execute(
@@ -2414,6 +2432,7 @@ class FleetStore:
             idempotency_key=row["idempotency_key"],
             status=row["status"],
             estimated=bool(row["estimated"]),
+            cost_reported=bool(row["cost_reported"]),
         )
 
     def spend(

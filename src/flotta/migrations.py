@@ -329,6 +329,12 @@ def _usage_outcome() -> tuple[str, ...]:
     )
 
 
+def _usage_cost_reported() -> tuple[str, ...]:
+    """FLOTTA-115. 1 when the upstream's reply said what the call cost, 0 when the
+    cost was worked out from a listed price, which can be too low."""
+    return ("ALTER TABLE usage ADD COLUMN cost_reported BIGINT NOT NULL DEFAULT 0",)
+
+
 def _eur_rates() -> tuple[str, ...]:
     """FLOTTA-111. One row per change. The rate is text, as in `usage`, so it stays exact."""
     return (
@@ -446,6 +452,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         10,
         "euro rates: the rate fetched for converting dollar-priced calls",
         _eur_rates(),
+    ),
+    Migration(
+        11,
+        "usage: whether a call's cost was reported by the upstream",
+        _usage_cost_reported(),
     ),
 )
 

@@ -329,3 +329,65 @@ def test_spend_is_one_indexed_query(tmp_path, monkeypatch, scope, index):
         params = ["studio-nord", *scope.values(), T0.isoformat()]
         plan = fleet._conn.execute(f"EXPLAIN QUERY PLAN {queries[0]}", params).fetchall()
         assert index in " ".join(str(row["detail"]) for row in plan)
+
+
+# -- what the upstream says a call cost (FLOTTA-115) -------------------------
+
+
+def test_a_reported_cost_beats_the_listed_price(agency):
+    row = _call(agency, reported_cost_nano=7 * NANO)
+    assert row.upstream_cost_nano == 7 * NANO
+    assert row.cost_eur_nano == 3_500_000_000
+    assert row.currency == "USD"
+    assert row.eur_per_usd == "0.5"
+    assert row.cost_reported is True
+    assert agency.spend(org="studio-nord", since=EARLIER).eur_nano == 3_500_000_000
+
+
+def test_a_listed_price_says_it_is_not_a_reported_cost(agency):
+    row = _call(agency)
+    assert row.upstream_cost_nano == 18 * NANO
+    assert row.cost_reported is False
+
+
+def test_a_reported_cost_prices_a_model_with_no_listed_price(agency):
+    row = _call(agency, model="nobody/knows", reported_cost_nano=2 * NANO)
+    assert (row.upstream_cost_nano, row.cost_eur_nano) == (2 * NANO, NANO)
+    assert row.currency == "USD"
+    assert agency.spend(org="studio-nord", since=EARLIER).unpriced == 0
+
+
+def test_a_reported_cost_is_in_dollars_whatever_the_list_is_in(agency):
+    agency.refresh_prices(
+        [Price(MODEL, 3 * NANO, 15 * NANO, None, "EUR", "test")], now=EARLIER + timedelta(hours=1)
+    )
+    row = _call(agency, reported_cost_nano=2 * NANO)
+    assert row.currency == "USD"
+    assert row.eur_per_usd == "0.5"
+    assert row.cost_eur_nano == NANO
+
+
+def test_a_reported_cost_with_no_rate_is_counted_as_unpriced(agency):
+    row = _call(agency, reported_cost_nano=2 * NANO, eur_per_usd=None)
+    assert row.upstream_cost_nano == 2 * NANO
+    assert row.cost_eur_nano is None
+    assert row.eur_per_usd is None
+    assert agency.spend(org="studio-nord", since=EARLIER).unpriced == 1
+
+
+def test_a_retry_keeps_the_cost_first_written(agency):
+    first = _call(agency, reported_cost_nano=2 * NANO)
+    again = _call(agency, reported_cost_nano=5 * NANO)
+    assert again.id == first.id
+    assert again.upstream_cost_nano == 2 * NANO
+
+
+def test_a_reported_zero_is_not_believed(agency):
+    row = _call(agency, reported_cost_nano=0)
+    assert row.upstream_cost_nano == 18 * NANO
+    assert row.cost_reported is False
+
+
+def test_a_negative_reported_cost_is_refused(agency):
+    with pytest.raises(ValueError, match="reported_cost_nano"):
+        _call(agency, reported_cost_nano=-1)
