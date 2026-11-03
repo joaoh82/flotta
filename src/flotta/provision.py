@@ -3195,6 +3195,10 @@ def _settle_paused_machine(
     seen = last_activity_at(store, box.id)
     if idle_after <= 0 or seen is None or (current - seen).total_seconds() < idle_after:
         return
+    # A live task means occupied, as in `idle_boxes`, however quiet the timeline is:
+    # suspending under it strands the watcher holding its call. Tried again next sweep.
+    if any(not is_terminal("task", t.status) for t in store.list_tasks(box_id=box.id)):
+        return
     if _observed_state(impl, target, assume="unknown") != "started":
         return
     method = _pause(impl, target, prefer_suspend=True)

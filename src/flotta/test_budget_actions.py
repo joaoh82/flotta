@@ -598,6 +598,32 @@ def test_a_paused_machine_goes_to_sleep_once_quiet(fleet, machine):
     assert "budget_machine_slept" in _types(fleet)
 
 
+def test_a_paused_machine_with_a_live_task_is_not_put_to_sleep(fleet, machine):
+    """However quiet its timeline: that would strand the watcher holding the call.
+    Once the task has finished, the next sweep puts it to sleep."""
+    _budget(fleet, action="pause", box="b-one")
+    today = datetime.now(UTC)
+    _spend(fleet, now=today)
+    task = fleet.create_task("b-one", "a long one")
+    fleet.update_task_status(task.id, "running")
+    later = today + timedelta(seconds=1801)
+    _sweep(fleet, now=later, idle_after_s=1800)
+    assert _status(fleet) == "paused"
+    assert machine.calls == []
+    fleet.update_task_status(task.id, "done")
+    _sweep(fleet, now=later + timedelta(seconds=1801), idle_after_s=1800)
+    assert machine.calls == ["suspend"]
+
+
+def test_a_kill_cuts_a_live_task_short(fleet, machine):
+    _budget(fleet, action="kill", box="b-one")
+    _spend(fleet)
+    task = fleet.create_task("b-one", "a long one")
+    fleet.update_task_status(task.id, "running")
+    _sweep(fleet)
+    assert machine.calls == ["stop"]
+
+
 def test_a_paused_machine_that_is_already_asleep_is_left_alone(fleet, machine):
     machine.machine_state = "suspended"
     _budget(fleet, action="pause")
