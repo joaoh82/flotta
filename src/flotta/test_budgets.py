@@ -200,3 +200,30 @@ def test_money_reads_back_without_float_noise():
     assert eur_text(20 * NANO) == "20"
     assert eur_text(1_220_000) == "0.00122"
     assert Decimal(eur_text(123_456_789)) == Decimal("0.123456789")
+
+
+# -- what a budget did, on every engine (FLOTTA-91) --------------------------
+
+
+def test_a_budget_event_is_recorded_once_a_period_and_read_by_client(fleet):
+    budget = _set(fleet)
+    day = datetime(2026, 11, 2, tzinfo=UTC)
+    payload = {"budget": {"id": budget.id}}
+    assert fleet.record_budget_event(budget, "budget_limit", period_start=day, payload=payload)
+    assert not fleet.record_budget_event(budget, "budget_limit", period_start=day, payload=payload)
+    assert fleet.record_budget_event(
+        budget,
+        "budget_limit",
+        period_start=day.replace(day=3),
+        payload=payload,
+    )
+    events = fleet.budget_events("studio-nord")
+    assert [e.type for e in events] == ["budget_limit", "budget_limit"]
+    assert events[0].payload == payload
+    assert fleet.budget_events("studio-nord", client=budget.client or "acme") != []
+    assert fleet.budget_events("other") == []
+
+
+def test_every_orgs_budgets_are_swept(fleet):
+    budget = _set(fleet)
+    assert budget.id in [b.id for b in fleet.all_budgets()]
