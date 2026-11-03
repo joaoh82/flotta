@@ -850,6 +850,13 @@ box-identity NAME:
     : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the control plane does the writing}"
     uv run flotta token rotate {{NAME}}
 
+# FLOTTA task 108: re-decide whose name goes on an agent's commits, on its machine
+box-author NAME:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the control plane does the writing}"
+    uv run flotta author refresh {{NAME}}
+
 # M3: give the first machine a login — never the fleet's password (FLOTTA-96)
 fly-auth: fly-whoami
     #!/usr/bin/env bash

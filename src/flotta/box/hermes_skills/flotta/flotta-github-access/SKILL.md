@@ -75,7 +75,9 @@ Git is already configured, and the configuration is deliberate. Do not change
   the address GitHub issues for them. Deploy services such as Vercel refuse
   commits whose author is not a member of the team, and a box is not; a
   person is. It is one person for every repository you work on, whichever
-  account each belongs to. `git config author.email` shows whether one is set.
+  account each belongs to, and it can change: when the agency reconnects or
+  disconnects the account, the control plane rewrites it and restarts you if
+  you are awake. `git config author.email` shows whether one is set.
 
 Do not add a `Co-authored-by:` trailer naming yourself: the committer field
 already says it.

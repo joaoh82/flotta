@@ -658,8 +658,8 @@ def build_identity(
 # until it is connected again, and the GitHub page says so. (`includeIf
 # "hasconfig:remote.*.url:…"` could set an author per owner if it ever has to.)
 #
-# Set when the machine is made, so connecting again or disconnecting reaches
-# only boxes created afterwards until a box's env is refreshed.
+# Set when the machine is made, and rewritten by `refresh_author` when the
+# connection it came from changes (FLOTTA task 108).
 
 GIT_AUTHOR_NAME_ENV = "FLOTTA_GIT_AUTHOR_NAME"
 GIT_AUTHOR_EMAIL_ENV = "FLOTTA_GIT_AUTHOR_EMAIL"
@@ -720,6 +720,142 @@ def commit_author_for(
             return None
         _FLEET_TOKEN_OWNERS[token] = person
     return CommitAuthor(person.commit_name, person.commit_email, person.login, "fleet_token")
+
+
+#: The events a commit-author refresh writes (FLOTTA task 108). The success
+#: event is the one `create_box` writes, so one event type answers "whose
+#: name is on this agent's commits" wherever it was decided.
+COMMIT_AUTHOR = "commit_author"
+COMMIT_AUTHOR_REFRESH_FAILED = "commit_author_refresh_failed"
+
+
+def refresh_author(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    reason: str = "requested",
+) -> dict[str, Any]:
+    """Re-decide whom an existing box's commits are authored as, and apply it.
+
+    `create_box` decides the author once and writes it into the machine env,
+    so a reconnect as somebody else, a disconnect, or an account from before
+    migration 9 being connected again reached only boxes created afterwards
+    (FLOTTA task 108). This runs the same rule, `commit_author_for`, against
+    the box as it is now, and rewrites the two env keys when they differ from
+    what the machine carries.
+
+    **Nobody is an empty value, not an absent key.** `flyctl machine update
+    --env` sets keys and has no way to remove one, and the entrypoint reads an
+    empty `FLOTTA_GIT_AUTHOR_EMAIL` as none (`${...:-}`), so writing "" takes
+    a person's name off a box exactly as a key that was never set leaves it.
+
+    Costs a restart of a running box, which is inherent: the entrypoint reads
+    its environment once, at boot. An asleep box stays asleep and boots with
+    the new name, which is `apply_env`'s promise. Nothing is rewritten when
+    the machine already says what the rule decides, so a reconnect as the
+    same person restarts nobody. A machine that cannot be read counts as
+    stale, for the reason `repair_connection` gives: a restart it did not
+    need costs a minute, a name it should have lost costs every commit after.
+    """
+    from flotta.settings import layered
+
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to update.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(
+            f"box {box_id} is still being created and is named as part of that; "
+            "wait for it to settle."
+        )
+    author = commit_author_for(store, box.org, box.client, layered(store))
+    wanted = {
+        GIT_AUTHOR_NAME_ENV: author.name if author is not None else "",
+        GIT_AUTHOR_EMAIL_ENV: author.email if author is not None else "",
+    }
+    impl = _resolve_backend(box, backend)
+    try:
+        info = impl.inspect(box.endpoint)
+    except (BackendError, NotSupported, NotImplementedError, AttributeError):
+        info = None
+    current = (
+        None
+        if info is None
+        else {
+            GIT_AUTHOR_NAME_ENV: getattr(info, "git_author_name", None) or "",
+            GIT_AUTHOR_EMAIL_ENV: getattr(info, "git_author_email", None) or "",
+        }
+    )
+    result = {
+        "box_id": box.id,
+        "name": box.name,
+        "login": author.login if author is not None else None,
+        "email": author.email if author is not None else None,
+        "source": author.source if author is not None else None,
+        "changed": current != wanted,
+    }
+    if current == wanted:
+        return result
+    applier = getattr(impl, "apply_env", None)
+    try:
+        if applier is None:
+            raise NotSupported(f"{type(impl).__name__} cannot rewrite a machine's environment")
+        applier(box.endpoint, wanted)
+    except (BackendError, NotSupported) as exc:
+        store.add_event(
+            "box",
+            box.id,
+            COMMIT_AUTHOR_REFRESH_FAILED,
+            {"error": str(exc)[:400], "login": result["login"], "reason": reason},
+        )
+        raise UpgradeFailed(
+            f"could not change whose name is on {box.name}'s commits: {exc}. "
+            "Its machine is unchanged."
+        ) from exc
+    store.add_event(
+        "box",
+        box.id,
+        COMMIT_AUTHOR,
+        {
+            "login": result["login"],
+            "email": result["email"],
+            "source": result["source"],
+            "reason": reason,
+            "was": (current or {}).get(GIT_AUTHOR_EMAIL_ENV) or None,
+        },
+    )
+    return result
+
+
+def refresh_authors_in(
+    store: FleetStore,
+    org: str,
+    client: str | None = None,
+    *,
+    reason: str,
+    backend: Backend | None = None,
+) -> list[dict[str, Any]]:
+    """`refresh_author` for every settled box a connection could name.
+
+    What a connect, a reconnect or a disconnect runs afterwards: the org's
+    boxes for an org-wide account, one client's for its own. Each box decides
+    for itself, so a client with its own account is reached by an org-wide
+    change and finds nothing to rewrite. One box's failure is its own
+    timeline's, and the next box is still refreshed.
+    """
+    import logging
+
+    done: list[dict[str, Any]] = []
+    for box in store.list_boxes_in(org, client):
+        if is_terminal("box", box.status) or box.status == "provisioning" or not box.endpoint:
+            continue
+        try:
+            done.append(refresh_author(box.id, store=store, backend=backend, reason=reason))
+        except (ProvisionError, UpgradeFailed) as exc:
+            # The failure event is already on the box's timeline.
+            logging.getLogger(__name__).warning("refreshing %s's author failed: %s", box.name, exc)
+            done.append({"box_id": box.id, "name": box.name, "error": str(exc)})
+    return done
 
 
 #: How long a box may sit in `provisioning` before it is presumed abandoned.

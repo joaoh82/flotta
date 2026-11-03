@@ -404,6 +404,8 @@ class FlyBackend:
                 workdir=workdir,
                 control_url=_env_str(env, "FLOTTA_CONTROL_URL"),
                 env_box_id=_env_str(env, "FLOTTA_BOX_ID"),
+                git_author_name=_env_str(env, "FLOTTA_GIT_AUTHOR_NAME"),
+                git_author_email=_env_str(env, "FLOTTA_GIT_AUTHOR_EMAIL"),
             )
         return MachineInfo(state="gone", machine_id=machine_id, app=app)
 

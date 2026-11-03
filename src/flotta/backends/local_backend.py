@@ -407,6 +407,8 @@ class LocalBackend:
             volume_path=str(self._dir(name) / "hermes"),
             control_url=(env.get("FLOTTA_CONTROL_URL") or None),
             env_box_id=(env.get("FLOTTA_BOX_ID") or None),
+            git_author_name=(env.get("FLOTTA_GIT_AUTHOR_NAME") or None),
+            git_author_email=(env.get("FLOTTA_GIT_AUTHOR_EMAIL") or None),
         )
 
 

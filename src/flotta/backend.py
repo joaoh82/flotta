@@ -199,6 +199,12 @@ class MachineInfo:
     #: nothing anywhere showed it (FLOTTA-98).
     control_url: str | None = None
     env_box_id: str | None = None
+    #: Whom the machine authors its commits as (`FLOTTA_GIT_AUTHOR_NAME` /
+    #: `_EMAIL` in its environment, FLOTTA-105). `None` when unset or blank,
+    #: which the entrypoint reads the same way: the box commits as itself.
+    #: Read so a refresh can tell "already says so" from "needs a restart".
+    git_author_name: str | None = None
+    git_author_email: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

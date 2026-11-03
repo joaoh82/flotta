@@ -113,6 +113,7 @@ def no_substrate(monkeypatch):
         "upgrade_box",
         "set_model",
         "rotate_identity",
+        "refresh_author",
         "set_instructions",
         "create_box",
     ):
@@ -149,6 +150,7 @@ BOX_ROUTES = [
     ("PUT", "/api/boxes/{b}/model", SCOPE_FLEET_WRITE, {"model": None}),
     ("POST", "/api/boxes/{b}/identity", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/connection", SCOPE_FLEET_WRITE, None),
+    ("POST", "/api/boxes/{b}/author", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/gateway", SCOPE_FLEET_WRITE, None),
     ("DELETE", "/api/boxes/{b}/gateway", SCOPE_FLEET_WRITE, None),
     # No image: naming one is refused to anyone but the operator before a box
