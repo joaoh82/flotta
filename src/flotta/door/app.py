@@ -422,9 +422,20 @@ class ControlPlane:
                 response.status_code,
             )
             raise BoxUnavailable("the door is not authorised to reach the fleet", status=500)
+        if response.status_code == 402:
+            # A budget paused it (FLOTTA-91). The control plane's words, and the
+            # caller has already shown it may talk to this agent.
+            raise BoxUnavailable(_detail(response), status=402)
         if response.status_code >= 400:
             raise BoxUnavailable(f"could not {verb} {name!r}: {response.text[:200]}", status=502)
         return response
+
+
+def _detail(response: httpx.Response) -> str:
+    try:
+        return str(response.json()["detail"])
+    except (ValueError, KeyError, TypeError):
+        return response.text[:200]
 
 
 def authority(host: str, port: int) -> str:

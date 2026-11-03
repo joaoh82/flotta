@@ -27,6 +27,7 @@ from flotta.auth import (
     SCOPE_FLEET_ROUTE,
     SCOPE_FLEET_WRITE,
     SCOPE_GIT_CREDENTIAL,
+    SCOPE_ORG_ADMIN,
     mint,
 )
 from flotta.control.app import create_app
@@ -159,6 +160,7 @@ BOX_ROUTES = [
     ("GET", "/api/boxes/{b}/address", SCOPE_BOX_CHAT, None),
     ("POST", "/api/boxes/{b}/wake", SCOPE_BOX_CHAT, None),
     ("POST", "/api/boxes/{b}/sleep", SCOPE_FLEET_WRITE, None),
+    ("POST", "/api/boxes/{b}/unpause", SCOPE_ORG_ADMIN, None),
     ("POST", "/api/boxes/{b}/ticket", SCOPE_BOX_CHAT, None),
     ("DELETE", "/api/boxes/{b}", SCOPE_BOX_DESTROY, None),
     ("GET", "/api/boxes/{b}/git-credential/repos", SCOPE_GIT_CREDENTIAL, None),
@@ -198,7 +200,9 @@ def test_org_a_cannot_touch_org_b_box(
     route is refused for the scope before the box is looked at.
     """
     target = X if ref == "name" else _ids(fleet)[X]
-    headers = credential(scope, org="agency-y", client="acme")
+    # `org:admin` is the whole org's, so no token confined to a client can hold it.
+    whose = None if scope == SCOPE_ORG_ADMIN else "acme"
+    headers = credential(scope, org="agency-y", client=whose)
     expected = (404, {"detail": f"no box {target!r}"})
     if headers is None:
         headers = credential(SCOPE_FLEET_READ, org="agency-y", client="acme")

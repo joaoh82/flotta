@@ -35,7 +35,42 @@ unpriced this period also stops the check, since the sum is short by an unknown
 amount: it clears when the period rolls over or the budget is removed. With no
 budget covering the box none of this applies, and the call goes through.
 
-Periods are in UTC. Until M13.5 every action refuses when the limit is reached.
+Periods are in UTC.
+
+## What each action does at the limit (FLOTTA-91, M13.5)
+
+The gateway decides about a call, at once, and needs no substrate. The control
+plane's sweep (`provision.enforce_budgets`) changes boxes, because it is what can
+reach them (D10), so it acts up to one sweep later. By then the gateway has been
+refusing for that long, and refusing is what stops the spending.
+
+- **notify:** events only. Calls carry on.
+- **downgrade:** the gateway sends calls to `fallback_model` for the rest of the
+  period, and the row keeps both models. A fallback that has lost its price is a
+  refusal, never the original model.
+- **pause:** the gateway refuses, and the sweep marks the covered boxes `paused`.
+  A turn in progress ends at its next model call, and the machine sleeps once it
+  is quiet.
+- **kill:** as pause, and the sweep **stops** the machine at once. A stop and not a
+  suspend: a suspended machine keeps the turn in memory and would carry on with it
+  on waking. `session.interrupt` would be gentler, but it needs the box's socket,
+  and the control plane has no route to one.
+
+A sum with an unpriced call in it refuses for every action (above). It pauses
+nobody new unless it is already over, and it releases nobody.
+
+## How a paused box comes back
+
+**Nothing holds it, and that's the only rule.** The sweep releases a box when no
+pause or kill budget covering it is reached: the period rolled over, the limit was
+raised, or the budget was removed. So a daily limit doesn't need a person every
+morning, which matches the "resets at" a refusal already promises. An owner's
+unpause does the same at once rather than a sweep later, and is refused while a
+budget still holds the box, since the sweep would only pause it again: raise the
+limit instead. It comes back asleep, and wakes the usual way.
+
+Every threshold writes an event on each box covered and one on the client, once a
+period (`store.budget_events`).
 """
 
 from __future__ import annotations
@@ -48,6 +83,9 @@ from typing import Any
 
 from flotta.pricing import NANO, to_eur_nano
 from flotta.store import Box, Budget, FleetStore, InvalidBudgetError
+
+#: The actions that stop calls at the limit, and so pause the boxes they cover.
+STOPPING_ACTIONS = frozenset({"pause", "kill"})
 
 #: Well inside a `BIGINT` of nanos, and more than anyone means.
 _MOST_EUR = Decimal(10**9)
@@ -152,13 +190,83 @@ def unchecked(*key: str) -> Refusal:
     )
 
 
-def _counts_against(budget: Budget, box: Box) -> bool:
+def counts_against(budget: Budget, box: Box) -> bool:
     """Whether a call by `box` counts against `budget`."""
     return (
         budget.org == box.org
         and (budget.client is None or budget.client == box.client)
         and (budget.box is None or budget.box == box.id)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class Standing:
+    """Where a budget is this period."""
+
+    budget: Budget
+    spent_nano: int
+    unpriced: int
+    since: datetime
+    resets: datetime
+
+    @property
+    def reached(self) -> bool:
+        return self.spent_nano >= self.budget.limit_eur_nano
+
+    @property
+    def soft_reached(self) -> bool:
+        return self.spent_nano >= self.budget.limit_eur_nano * self.budget.soft_pct
+
+    @property
+    def stops(self) -> bool:
+        """Whether it stops calls now."""
+        return self.reached and self.budget.action in STOPPING_ACTIONS
+
+    def details(self) -> dict[str, Any]:
+        return {
+            **budget_dict(self.budget),
+            "spent_eur": eur_text(self.spent_nano),
+            "resets_at": self.resets.isoformat(),
+        }
+
+    def sentence(self) -> str:
+        details = self.details()
+        return (
+            f"{_whose(self.budget)} budget of EUR {details['limit_eur']} a {self.budget.period} "
+            f"is used up: EUR {details['spent_eur']} spent. It resets at {details['resets_at']}."
+        )
+
+
+def standing(store: FleetStore, budget: Budget, now: datetime) -> Standing:
+    since = period_start(budget.period, now)
+    spent = store.spend(org=budget.org, client=budget.client, box=budget.box, since=since)
+    return Standing(budget, spent.eur_nano, spent.unpriced, since, resets_at(budget.period, now))
+
+
+def holding(store: FleetStore, box: Box, now: datetime) -> list[Standing]:
+    """The budgets that keep `box` paused now, most severe first."""
+    found = [standing(store, b, now) for b in store.budgets_covering(box)]
+    stopping = [s for s in found if s.stops]
+    return sorted(stopping, key=lambda s: s.budget.action != "kill")
+
+
+def paused_message(store: FleetStore, box: Box, now: datetime) -> str:
+    """What someone trying to reach a paused box is told."""
+    held = holding(store, box, now)
+    reason = f" {held[0].sentence()}" if held else ""
+    return f"{box.name} is paused by budget, so it was not woken.{reason}"
+
+
+@dataclass(frozen=True, slots=True)
+class Downgrade:
+    """Send this call to `model` instead of the one it named."""
+
+    model: str
+    budget: dict[str, Any]
+
+
+def _narrowest_first(found: Standing) -> tuple[bool, bool]:
+    return (found.budget.box is None, found.budget.client is None)
 
 
 def check_budgets(
@@ -169,8 +277,8 @@ def check_budgets(
     eur_per_usd: Decimal | None,
     now: datetime,
     unsettled: Iterable[Box] = (),
-) -> Refusal | None:
-    """Why this box may not call `model` now, or `None` if it may.
+) -> Refusal | Downgrade | None:
+    """Why this box may not call `model` now, the model to call instead, or `None`.
 
     `unsettled` is the boxes with a finished call whose row is not in the store.
     """
@@ -180,7 +288,7 @@ def check_budgets(
 
     missing = list(unsettled)
     for budget in covering:
-        if any(_counts_against(budget, other) for other in missing):
+        if any(counts_against(budget, other) for other in missing):
             return Refusal(
                 "budget_unchecked",
                 "The budget could not be checked, because the cost of an earlier call has not "
@@ -189,14 +297,42 @@ def check_budgets(
                 key=("budget_unsettled", budget.id, period_start(budget.period, now).isoformat()),
             )
 
+    standings = [standing(store, budget, now) for budget in covering]
+    for found in standings:
+        if found.unpriced:
+            return Refusal(
+                "budget_unpriced",
+                f"{_whose(found.budget)} budget cannot be trusted this {found.budget.period}: "
+                f"{found.unpriced} call(s) in it have no known cost. It clears at "
+                f"{found.resets.isoformat()}.",
+                found.details(),
+                key=("budget_unpriced", found.budget.id, found.since.isoformat()),
+            )
+    for found in standings:
+        if found.stops or (found.reached and _downgrades_to_nothing(found.budget)):
+            return Refusal(
+                "budget_exceeded",
+                found.sentence(),
+                found.details(),
+                key=("budget_exceeded", found.budget.id, found.since.isoformat()),
+            )
+
+    downgrades = sorted(
+        (s for s in standings if s.reached and s.budget.action == "downgrade"),
+        key=_narrowest_first,
+    )
+    fallback = downgrades[0].budget.fallback_model if downgrades else None
+    calling = fallback or model
+
     first = covering[0]
-    price = store.price_of(model, at=now)
+    price = store.price_of(calling, at=now)
     if price is None:
         return Refusal(
             "budget_no_price",
-            f"A budget covers this agent and {model} has no known price, so the call was refused.",
+            f"A budget covers this agent and {calling} has no known price, "
+            "so the call was refused.",
             budget_dict(first),
-            key=("budget_no_price", model),
+            key=("budget_no_price", calling),
         )
     if to_eur_nano(NANO, price.currency, eur_per_usd) is None:
         return Refusal(
@@ -206,30 +342,13 @@ def check_budgets(
             budget_dict(first),
             key=("budget_no_rate", price.currency),
         )
-
-    for budget in covering:
-        since = period_start(budget.period, now)
-        spent = store.spend(org=budget.org, client=budget.client, box=budget.box, since=since)
-        resets = resets_at(budget.period, now).isoformat()
-        details = {
-            **budget_dict(budget),
-            "spent_eur": eur_text(spent.eur_nano),
-            "resets_at": resets,
-        }
-        if spent.unpriced:
-            return Refusal(
-                "budget_unpriced",
-                f"{_whose(budget)} budget cannot be trusted this {budget.period}: "
-                f"{spent.unpriced} call(s) in it have no known cost. It clears at {resets}.",
-                details,
-                key=("budget_unpriced", budget.id, since.isoformat()),
-            )
-        if spent.eur_nano >= budget.limit_eur_nano:
-            return Refusal(
-                "budget_exceeded",
-                f"{_whose(budget)} budget of EUR {details['limit_eur']} a {budget.period} is "
-                f"used up: EUR {details['spent_eur']} spent. It resets at {resets}.",
-                details,
-                key=("budget_exceeded", budget.id, since.isoformat()),
-            )
+    if fallback and fallback != model:
+        return Downgrade(fallback, downgrades[0].details())
     return None
+
+
+def _downgrades_to_nothing(budget: Budget) -> bool:
+    """A downgrade that names no fallback, which `set_budget` refuses to save, has
+    nothing to send a call to. Refused, because the original model is the one thing
+    it may not send."""
+    return budget.action == "downgrade" and not budget.fallback_model

@@ -55,6 +55,7 @@ with fakes and the base `flotta` package keeps no hard Modal dependency.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import secrets as secrets_module
@@ -64,6 +65,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from flotta import budgets as budget_rules
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, box_password
 from flotta.backend import (
     Backend,
@@ -89,6 +91,8 @@ from flotta.store import (
     validate_box_name,
     validate_tenant_id,
 )
+
+_log = logging.getLogger("flotta.provision")
 
 # How long a task may run before it is considered overdue. Lived in
 # `worker/config.py` — a container's watchdog — until the shard tier was cut.
@@ -1609,7 +1613,9 @@ def set_instructions(
         raise ProvisionError(f"no box {box_id!r}")
     # `stopped` is allowed on purpose: an agent is asleep most of the time, and
     # `exec` starts the machine itself. Only a torn-down box has no volume to
-    # write to — refusing a sleeping one would refuse the normal case.
+    # write to — refusing a sleeping one would refuse the normal case. A paused
+    # one is another matter, since that start would wake it.
+    _refuse_paused(box)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
 
@@ -2076,6 +2082,8 @@ def movable_box(box_id: str, store: FleetStore) -> tuple[Box, str]:
     box = _require_box(store, box_id)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to update.")
+    # Removing a secret on Fly seems to start a stopped machine (FLOTTA-112).
+    _refuse_paused(box)
     if box.status == "provisioning" or not box.endpoint:
         raise ProvisionError(f"box {box_id} is still being created; wait for it to settle.")
     # Both write `FLOTTA_MODEL`, so a move landing last would undo the change while
@@ -2613,6 +2621,20 @@ def start_box(
     return {"box_id": box_id, "status": "running", "already_running": False}
 
 
+class BoxPaused(ProvisionError):
+    """A budget has paused this box, and nothing may wake it (FLOTTA-91)."""
+
+
+class BudgetHolds(ProvisionError):
+    """A budget still keeps this box paused, so it can't be unpaused yet."""
+
+
+def _refuse_paused(box: Box) -> None:
+    """For anything that would start a paused box's machine as a side effect."""
+    if box.status == "paused":
+        raise BoxPaused(f"{box.name} is paused by budget, so it was not woken.")
+
+
 def wake_box(
     box_id: str,
     *,
@@ -2650,6 +2672,7 @@ def wake_box(
     box = _require_box(store, box_id)
 
     # Legality first, before anything can happen to the machine.
+    _refuse_paused(box)
     if box.status not in ("running", "stopped"):
         raise ProvisionError(
             f"box {box_id} is {box.status!r}; only a running or stopped box can be addressed"
@@ -3100,6 +3123,144 @@ def idle_boxes(
         if quiet_for >= threshold:
             idle.append((box, quiet_for))
     return idle
+
+
+def _release_paused(store: FleetStore, box: Box, impl: Backend, reason: str) -> str:
+    """Out of `paused`, by `stopped`, and to `running` only if the machine is up."""
+    observed = _observed_state(impl, box.endpoint or box.id, assume="stopped")
+    store.add_event("box", box.id, "budget_released", {"reason": reason})
+    store.update_box_status(box.id, "stopped")
+    if observed != "started":
+        return "stopped"
+    # Or the idle sweep, which only looks at `running`, would never put it to sleep.
+    store.add_event("box", box.id, "running", {"reason": reason, "previous_status": "stopped"})
+    store.update_box_status(box.id, "running")
+    return "running"
+
+
+def unpause_box(
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """An owner's way out of `paused`. See `flotta.budgets`. Wakes nothing."""
+    box = _require_box(store, box_id)
+    if box.status != "paused":
+        return {"box_id": box.id, "status": box.status, "already_unpaused": True}
+    current = now or datetime.now(UTC)
+    held = budget_rules.holding(store, box, current)
+    if held:
+        raise BudgetHolds(
+            f"{held[0].sentence()} Raise the limit or remove the budget to unpause {box.name}."
+        )
+    status = _release_paused(store, box, _resolve_backend(box, backend), "unpaused")
+    return {"box_id": box.id, "status": status, "already_unpaused": False}
+
+
+def _tell_thresholds(store: FleetStore, found: budget_rules.Standing, boxes: list[Box]) -> None:
+    """Each threshold once a period, on the client and on every box it covers."""
+    crossed = []
+    if found.soft_reached:
+        crossed.append("budget_soft_limit")
+    if found.reached:
+        crossed.append("budget_limit")
+    for kind in crossed:
+        payload = {"budget": found.details()}
+        if store.record_budget_event(found.budget, kind, period_start=found.since, payload=payload):
+            for box in boxes:
+                if budget_rules.counts_against(found.budget, box):
+                    store.add_event("box", box.id, kind, payload)
+
+
+def _settle_paused_machine(
+    store: FleetStore,
+    box: Box,
+    impl: Backend,
+    held: list[budget_rules.Standing],
+    *,
+    current: datetime,
+    idle_after: float,
+) -> None:
+    """A kill stops the machine now. A pause lets it sleep once it is quiet."""
+    target = box.endpoint or box.id
+    top = held[0]
+    if top.budget.action == "kill":
+        if _observed_state(impl, target, assume="unknown") in ("stopped", "suspended", "gone"):
+            return
+        impl.stop(target)
+        store.add_event("box", box.id, "budget_killed", {"budget": top.details()})
+        return
+    seen = last_activity_at(store, box.id)
+    if idle_after <= 0 or seen is None or (current - seen).total_seconds() < idle_after:
+        return
+    # A live task means occupied, as in `idle_boxes`, however quiet the timeline is:
+    # suspending under it strands the watcher holding its call. Tried again next sweep.
+    if any(not is_terminal("task", t.status) for t in store.list_tasks(box_id=box.id)):
+        return
+    if _observed_state(impl, target, assume="unknown") != "started":
+        return
+    method = _pause(impl, target, prefer_suspend=True)
+    store.add_event(
+        "box", box.id, "budget_machine_slept", {"budget": top.details(), "method": method}
+    )
+
+
+def enforce_budgets(
+    store: FleetStore,
+    *,
+    backend: Backend | None = None,
+    now: datetime | None = None,
+    idle_after_s: float | None = None,
+) -> list[dict[str, Any]]:
+    """Act on every budget: the sweep half of `flotta.budgets`.
+
+    The gateway has already been refusing by the time this runs. What this adds is
+    what only something that can reach a machine can do, plus the events. One box
+    the substrate refuses doesn't stop the rest, and comes round again next sweep.
+    The row moves before the machine does, the reverse of `stop_box`, so a
+    substrate that is failing can't leave a box anyone may still wake.
+    """
+    current = now or datetime.now(UTC)
+    idle_after = resolve_idle_after(idle_after_s, _settings_env(store))
+    standings = [budget_rules.standing(store, b, current) for b in store.all_budgets()]
+    boxes = [b for b in store.list_boxes() if b.status in ("running", "stopped", "paused")]
+    for found in standings:
+        _tell_thresholds(store, found, boxes)
+
+    outcomes: list[dict[str, Any]] = []
+    for box in boxes:
+        covering = [s for s in standings if budget_rules.counts_against(s.budget, box)]
+        held = sorted((s for s in covering if s.stops), key=lambda s: s.budget.action != "kill")
+        try:
+            if held:
+                if box.status != "paused":
+                    store.add_event(
+                        "box",
+                        box.id,
+                        "budget_paused",
+                        {"budget": held[0].details(), "previous_status": box.status},
+                    )
+                    store.update_box_status(box.id, "paused")
+                    outcomes.append({"box_id": box.id, "paused": True})
+                _settle_paused_machine(
+                    store,
+                    box,
+                    _resolve_backend(box, backend),
+                    held,
+                    current=current,
+                    idle_after=idle_after,
+                )
+            elif box.status == "paused" and not any(
+                s.unpriced and s.budget.action in budget_rules.STOPPING_ACTIONS for s in covering
+            ):
+                _release_paused(store, box, _resolve_backend(box, backend), "budget")
+                outcomes.append({"box_id": box.id, "released": True})
+        except (ProvisionError, BackendError) as exc:
+            _log.warning("budget action on %s failed: %s", box.name, exc)
+            outcomes.append({"box_id": box.id, "error": str(exc)})
+    return outcomes
 
 
 def sleep_idle_boxes(

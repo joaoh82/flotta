@@ -856,7 +856,7 @@ In **this** repo:
 One durable store is the single source of truth for fleet state; everything else reads from or writes to it. The laptop is a client — `src/flotta/client.py` has a test asserting it never imports an agent or a model client, because if it does, the laptop has started thinking again and the pivot has reversed.
 
 - **`src/flotta/store.py`** — fleet state, thin SQL and no ORM (D8). **Four tables plus events:**
-  - `boxes` (id, **name** — unique, it is the address — status `provisioning|running|stopped|torn_down`, endpoint, created_at, destroyed_at). No `failed`: machines get destroyed, they do not fail, so a dead provision goes straight to `torn_down` with the reason in its event.
+  - `boxes` (id, **name** — unique, it is the address — status `provisioning|running|stopped|paused|torn_down`, endpoint, created_at, destroyed_at). No `failed`: machines get destroyed, they do not fail, so a dead provision goes straight to `torn_down` with the reason in its event.
   - `workspaces` (id, box_id, status, endpoint, repo, …) — schema only until the workspace tier (M6) is built.
   - `tasks` (id, box_id, **nullable** workspace_id, prompt, status `pending|running|done|failed`, started_at, finished_at, result_json, cost_estimate). `done`/`failed` live here, on the work, not the machine. No `torn_down`: interrupted work did not happen, and `failed` says so.
   - `box_repos` (box_id, repo) — which repositories a box may use, normalised to lowercase `owner/name` by `normalise_repo` so a slug, an https URL and an ssh URL are one grant rather than three.

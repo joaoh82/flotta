@@ -335,6 +335,34 @@ def _usage_cost_reported() -> tuple[str, ...]:
     return ("ALTER TABLE usage ADD COLUMN cost_reported BIGINT NOT NULL DEFAULT 0",)
 
 
+def _budget_actions() -> tuple[str, ...]:
+    """What a budget did (FLOTTA-91, M13.5).
+
+    `usage.requested_model` is the model a call asked for when a downgrade sent it
+    to another, which `usage.model` then names. `budget_events` is the client's
+    timeline of it, and its key is what makes a threshold fire once a period. No
+    foreign key to `budgets`: a budget can be removed and what it did stays.
+    """
+    return (
+        "ALTER TABLE usage ADD COLUMN requested_model TEXT",
+        """
+        CREATE TABLE budget_events (
+            id            TEXT PRIMARY KEY,
+            org_id        TEXT NOT NULL REFERENCES orgs(id),
+            client_id     TEXT,
+            box_id        TEXT,
+            budget_id     TEXT NOT NULL,
+            type          TEXT NOT NULL,
+            period_start  TEXT NOT NULL,
+            payload       TEXT NOT NULL,
+            ts            TEXT NOT NULL,
+            UNIQUE (budget_id, type, period_start)
+        )
+        """,
+        "CREATE INDEX idx_budget_events_org ON budget_events(org_id, ts)",
+    )
+
+
 def _eur_rates() -> tuple[str, ...]:
     """FLOTTA-111. One row per change. The rate is text, as in `usage`, so it stays exact."""
     return (
@@ -457,6 +485,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         11,
         "usage: whether a call's cost was reported by the upstream",
         _usage_cost_reported(),
+    ),
+    Migration(
+        12,
+        "budget actions: the model a call asked for, and what a budget did",
+        _budget_actions(),
     ),
 )
 
