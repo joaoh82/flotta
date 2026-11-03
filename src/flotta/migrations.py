@@ -363,6 +363,24 @@ def _budget_actions() -> tuple[str, ...]:
     )
 
 
+def _machine_meter_marks() -> tuple[str, ...]:
+    """How far each box's machine time has been metered (FLOTTA-92, M13.6).
+
+    With what it was, since a destroyed machine can't be asked. `flotta.metering`.
+    """
+    return (
+        """
+        CREATE TABLE machine_meter_marks (
+            box_id         TEXT PRIMARY KEY REFERENCES boxes(id),
+            metered_to     TEXT NOT NULL,
+            machine_label  TEXT NOT NULL,
+            region         TEXT,
+            volume_gb      BIGINT
+        )
+        """,
+    )
+
+
 def _eur_rates() -> tuple[str, ...]:
     """FLOTTA-111. One row per change. The rate is text, as in `usage`, so it stays exact."""
     return (
@@ -490,6 +508,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         12,
         "budget actions: the model a call asked for, and what a budget did",
         _budget_actions(),
+    ),
+    Migration(
+        13,
+        "machine time: how far each box has been metered",
+        _machine_meter_marks(),
     ),
 )
 

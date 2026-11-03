@@ -740,6 +740,17 @@ class Usage:
 
 
 @dataclass(frozen=True, slots=True)
+class MachineMark:
+    """How far a box's machine time is metered, and what it was. `flotta.metering`."""
+
+    box_id: str
+    metered_to: str
+    machine_label: str
+    region: str | None
+    volume_gb: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetEvent:
     """Something a budget did, on its client's timeline. See `flotta.budgets`."""
 
@@ -2458,6 +2469,99 @@ class FleetStore:
             cost_reported=bool(row["cost_reported"]),
             requested_model=row["requested_model"],
         )
+
+    def record_machine_usage(
+        self,
+        box_id: str,
+        *,
+        label: str,
+        seconds: int,
+        cost_nano: int | None,
+        eur_per_usd: Decimal | None,
+        upstream: str | None,
+        idempotency_key: str,
+        at: datetime,
+    ) -> None:
+        """Write one slice of machine time or storage. See `flotta.metering`.
+
+        Settled now and never worked out again, like a model call. `cost_nano` `None`
+        is a size with no price: kept, and counted by `spend` as unpriced. A key
+        already written does nothing, which is what makes a sweep safe to repeat.
+        """
+        if seconds < 0:
+            raise ValueError(f"seconds cannot be negative, got {seconds}")
+        box = self._get_box_or_raise(box_id)
+        cost_eur = 0 if cost_nano == 0 else None
+        if cost_nano:
+            cost_eur = to_eur_nano(cost_nano, "USD", eur_per_usd)
+        self._conn.execute(
+            "INSERT INTO usage (id, org_id, client_id, box_id, kind, model, upstream, seconds, "
+            "currency, upstream_cost_nano, eur_per_usd, cost_eur_nano, at, idempotency_key) "
+            "VALUES (?, ?, ?, ?, 'machine', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (box_id, idempotency_key) DO NOTHING",
+            (
+                f"u-{uuid.uuid4().hex}",
+                box.org,
+                box.client,
+                box.id,
+                label,
+                upstream,
+                seconds,
+                None if cost_nano is None else "USD",
+                cost_nano,
+                str(eur_per_usd) if cost_nano and cost_eur is not None else None,
+                cost_eur,
+                _instant(at),
+                idempotency_key,
+            ),
+        )
+
+    def machine_mark(self, box_id: str) -> MachineMark | None:
+        row = self._conn.execute(
+            "SELECT * FROM machine_meter_marks WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return MachineMark(
+            box_id=row["box_id"],
+            metered_to=row["metered_to"],
+            machine_label=row["machine_label"],
+            region=row["region"],
+            volume_gb=row["volume_gb"],
+        )
+
+    def set_machine_mark(self, mark: MachineMark) -> None:
+        self._conn.execute(
+            "INSERT INTO machine_meter_marks (box_id, metered_to, machine_label, region, "
+            "volume_gb) VALUES (?, ?, ?, ?, ?) ON CONFLICT (box_id) DO UPDATE SET "
+            "metered_to = excluded.metered_to, machine_label = excluded.machine_label, "
+            "region = excluded.region, volume_gb = excluded.volume_gb",
+            (mark.box_id, mark.metered_to, mark.machine_label, mark.region, mark.volume_gb),
+        )
+
+    def drop_machine_mark(self, box_id: str) -> None:
+        self._conn.execute("DELETE FROM machine_meter_marks WHERE box_id = ?", (box_id,))
+
+    def lifecycle_events(
+        self, box_id: str, kinds: Iterable[str], *, since: datetime
+    ) -> list[Event]:
+        """`kinds` of event on a box since `since`, oldest first, with the last before it.
+
+        That last one is what says whether the machine was up when `since` began.
+        """
+        names = sorted(kinds)
+        marks = ",".join("?" * len(names))
+        where = f"entity_kind = 'box' AND entity_id = ? AND type IN ({marks})"
+        moment = _instant(since)
+        before = self._conn.execute(
+            f"SELECT * FROM events WHERE {where} AND ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",
+            (box_id, *names, moment),
+        ).fetchall()
+        after = self._conn.execute(
+            f"SELECT * FROM events WHERE {where} AND ts > ? ORDER BY ts, id",
+            (box_id, *names, moment),
+        ).fetchall()
+        return [_event_from_row(r) for r in [*before, *after]]
 
     def spend(
         self,

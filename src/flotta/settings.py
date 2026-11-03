@@ -111,6 +111,25 @@ SETTINGS: tuple[Setting, ...] = (
         default="60",
     ),
     Setting(
+        key="FLOTTA_MACHINE_PRICES",
+        label="Machine prices",
+        help=(
+            "US dollars for 30 days of a machine, for sizes Fly's published prices "
+            "here don't cover or that you pay differently for, as "
+            "shared-1x-1024=6.96, shared-1x-512=3.83. Used for machine time from "
+            "now on. A size with no price stops any budget covering it."
+        ),
+        kind="text",
+        default="",
+    ),
+    Setting(
+        key="FLOTTA_VOLUME_USD_GB_MONTH",
+        label="Storage price",
+        help="US dollars per GB for 30 days of a volume. Used for storage from now on.",
+        kind="money",
+        default="0.15",
+    ),
+    Setting(
         key="FLOTTA_MODEL",
         label="Model for new agents",
         help=(

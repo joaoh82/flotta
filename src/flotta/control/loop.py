@@ -176,6 +176,7 @@ async def run_reconcile_loop(
     sleeper: Callable[..., list[dict[str, Any]]] | None = None,
     box_sweeper: Callable[..., list[dict[str, Any]]] | None = None,
     budget_enforcer: Callable[..., list[dict[str, Any]]] | None = None,
+    machine_meter: Callable[..., list[dict[str, Any]]] | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep,
     max_sweeps: int | None = None,
 ) -> None:
@@ -206,6 +207,10 @@ async def run_reconcile_loop(
         from flotta.provision import enforce_budgets
 
         budget_enforcer = enforce_budgets
+    if machine_meter is None:
+        from flotta.metering import meter_machines
+
+        machine_meter = meter_machines
 
     state.started_at = state._clock()
     _log.info("reconcile loop started, interval=%.0fs", state.interval_s)
@@ -252,6 +257,15 @@ async def run_reconcile_loop(
                             _log.info("corrected %d box row(s)", len(corrected))
                     except Exception as exc:
                         _log.warning("box sweep failed: %s: %s", type(exc).__name__, exc)
+
+                # Machine time, before budgets so they read it. A failure here loses
+                # nothing: the hours wait for the next sweep.
+                try:
+                    metered = machine_meter(store)
+                    if metered:
+                        _log.info("metered machine time for %d box(es)", len(metered))
+                except Exception as exc:
+                    _log.warning("machine metering failed: %s: %s", type(exc).__name__, exc)
 
                 # Budgets, last: it can stop a machine, and the sweeps above
                 # shouldn't depend on it. The gateway refuses whether or not this runs.
