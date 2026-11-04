@@ -233,7 +233,7 @@ def alert_message(to: str, event: BudgetEvent, *, app_url: str) -> Message:
     subject = f"{_whose(event)} budget {'reached its limit' if limit else 'is nearly used'}"
     sentence = what_happened(event)
     resets = f"It resets at {budget['resets_at']}."
-    link = f"{app_url.rstrip('/')}/"
+    link = f"{app_url.rstrip('/')}/usage"
     return Message(
         to=to,
         subject=subject,

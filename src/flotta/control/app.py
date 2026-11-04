@@ -38,7 +38,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from flotta import db
@@ -335,7 +335,6 @@ def _record_activity(store: Any, box_id: str) -> bool:
     Rate-limited by reading the newest event first, which costs one query on a
     path that is already making an HTTP round trip.
     """
-    from datetime import UTC, datetime
 
     from flotta.provision import ADDRESSED_EVENT, last_activity_at
 
@@ -547,7 +546,7 @@ def create_app(
     Rotating the key means restarting the process, which is also what makes
     rotation a real revocation.
     """
-    from fastapi import Depends, FastAPI, Header, HTTPException
+    from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
     from flotta.mail import (
         invite_message,
@@ -1551,17 +1550,63 @@ def create_app(
 
     @app.get("/api/orgs/{org_id}/budgets")
     def list_budgets(org_id: str, token: Token | None = needs_read) -> Any:
-        """An org's budgets. Owners and members read; see `flotta.budgets`."""
-        _budget_reader(token, org_id)
-        from flotta.budgets import budget_dict
+        """An org's budgets, and how far each has got this period. See `flotta.budgets`.
 
+        Owners and members read. Each sums the ledger, as a budget check does.
+        """
+        _budget_reader(token, org_id)
+        from flotta.budgets import standing
+
+        now = datetime.now(UTC)
         store = store_factory()
         try:
             _org_or_404(store, org_id)
+            standings = [standing(store, b, now) for b in store.budgets_for_org(org_id)]
             return {
                 "org": org_id,
-                "budgets": [budget_dict(b) for b in store.budgets_for_org(org_id)],
+                "budgets": [
+                    {
+                        **s.details(),
+                        "unpriced": s.unpriced,
+                        "reached": s.reached,
+                        "soft_reached": s.soft_reached,
+                    }
+                    for s in standings
+                ],
             }
+        finally:
+            store.close()
+
+    @app.get("/api/orgs/{org_id}/usage")
+    def org_usage(
+        org_id: str,
+        client: str | None = None,
+        box: str | None = None,
+        group: str | None = None,
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        token: Token | None = needs_read,
+    ) -> Any:
+        """What an org has spent, added up, for whoever may read its budgets.
+
+        `?group=day,client,box,kind,model,requested_model`, any of them, and `from` and
+        `to` as days or moments, this month so far if not named. Never the ledger's rows:
+        see `flotta.usage_report`.
+        """
+        _budget_reader(token, org_id)
+        from flotta.usage_report import BadReport, parse_group, parse_window, report
+
+        try:
+            groups = parse_group(group)
+            since, until = parse_window(from_, to, datetime.now(UTC))
+        except BadReport as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            return report(
+                store, org_id, since=since, until=until, group=groups, client=client, box=box
+            )
         finally:
             store.close()
 

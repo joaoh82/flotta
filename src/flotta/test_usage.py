@@ -391,3 +391,44 @@ def test_a_reported_zero_is_not_believed(agency):
 def test_a_negative_reported_cost_is_refused(agency):
     with pytest.raises(ValueError, match="reported_cost_nano"):
         _call(agency, reported_cost_nano=-1)
+
+
+def test_a_summary_groups_and_filters_on_every_engine(agency):
+    """FLOTTA-94. Grouped by position, with a `LIKE`, and read through `flotta.usage_report`."""
+    _call(agency, "b-one", key="a")
+    _call(agency, "b-three", key="b", requested_model="m-asked")
+    _call(agency, "b-four", key="c")
+    agency.record_machine_usage(
+        "b-one",
+        label="volume:10gb",
+        seconds=3600,
+        cost_nano=NANO,
+        eur_per_usd=RATE,
+        upstream="ams",
+        idempotency_key="v",
+        at=T0,
+    )
+    agency.record_machine_usage(
+        "b-one",
+        label="shared-cpu-1x:1024MB",
+        seconds=1800,
+        cost_nano=NANO,
+        eur_per_usd=RATE,
+        upstream="ams",
+        idempotency_key="m",
+        at=T0,
+    )
+    window = {"since": T0 - timedelta(days=1), "until": T0 + timedelta(days=1)}
+    total = agency.usage_summary("studio-nord", **window)[0]
+    assert total.calls == 2
+    assert total.machine_seconds == 1800
+    assert total.eur_nano == total.machine_eur_nano + 18 * NANO
+    rows = agency.usage_summary(
+        "studio-nord", group=("day", "client", "box", "kind", "model", "requested_model"), **window
+    )
+    assert sorted(r.group["box"] for r in rows) == ["b-one", "b-one", "b-one", "b-three"]
+    assert all(r.group["day"] == T0.date().isoformat() for r in rows)
+    one = agency.usage_summary("studio-nord", group=("model",), box="b-three", **window)
+    assert one[0].group == {"model": MODEL}
+    assert agency.usage_summary("studio-nord", client="bravo", **window)[0].calls == 1
+    assert set(agency.box_names("other")) == {"b-four"}

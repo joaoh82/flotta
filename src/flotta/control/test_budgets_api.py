@@ -67,7 +67,7 @@ def test_an_owner_sets_lists_and_deletes_a_budget(api):
     assert budget["soft_pct"] == 0.8
 
     listed = api.get(ROUTE, headers=_as("owner")).json()
-    assert listed["budgets"] == [budget]
+    assert [{k: b[k] for k in budget} for b in listed["budgets"]] == [budget]
 
     gone = api.delete(ROUTE, params={"client": "acme", "period": "day"}, headers=_as("owner"))
     assert gone.status_code == 200
