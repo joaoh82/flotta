@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import threading
 import time
 
@@ -21,15 +22,20 @@ import pytest
 from starlette.testclient import TestClient
 
 from flotta.door import app as door
-from flotta.door.app import BUSY_ID, Liveness, is_keepalive, read_working
+from flotta.door.app import BUSY_ID_PREFIX, Liveness, is_keepalive, read_working
 from flotta.door.test_tickets import HOST, WEB_APP, _door, _protocols, _ticket
 
 PING = '{"jsonrpc":"2.0","id":7,"method":"gateway.ping","params":{}}'
+PROMPT = '{"id":8,"method":"prompt.submit","params":{"text":"hi"}}'
+BUSY_ID = f"{BUSY_ID_PREFIX}1"
+#: As shipped, before `quick_beats` shortens it.
+SHIPPED_TOUCH_GAP_S = door.TOUCH_GAP_S
 
 
 @pytest.fixture(autouse=True)
 def quick_beats(monkeypatch):
     monkeypatch.setattr(door, "HEARTBEAT_S", 0.03)
+    monkeypatch.setattr(door, "TOUCH_GAP_S", 0)
 
 
 @pytest.fixture
@@ -98,6 +104,16 @@ def _until(condition, *, within=5.0):
     pytest.fail("it never happened")
 
 
+def _receive(ws, *, within=4.0):
+    """A frame from the door, failing rather than waiting for ever."""
+    frames = queue.Queue()
+    threading.Thread(target=lambda: frames.put(ws.receive_text()), daemon=True).start()
+    try:
+        return frames.get(timeout=within)
+    except queue.Empty:
+        pytest.fail("nothing came back")
+
+
 class _Open:
     """A browser with a conversation open."""
 
@@ -119,7 +135,7 @@ class _Open:
 
     @property
     def touches(self):
-        return len(self.plane.woken_ids)
+        return len(self.plane.touched)
 
     def asked_again(self, times=3):
         """Let this many more of the door's questions go by."""
@@ -174,7 +190,7 @@ def test_someone_saying_something_counts_once_and_then_it_is_quiet_again(box):
     with _Open(box) as tab:
         tab.asked_again(1)
         settled = tab.touches
-        tab.ws.send_text('{"id":8,"method":"prompt.submit","params":{"text":"hi"}}')
+        tab.ws.send_text(PROMPT)
         _until(lambda: tab.touches == settled + 1)
         tab.asked_again(4)
         assert tab.touches == settled + 1
@@ -235,29 +251,241 @@ def test_what_the_agent_says_reaches_the_browser_even_if_it_names_the_question(b
         assert tab.ws.receive_text() == f"echo:{said}"
 
 
+# -- someone speaking moves the deadline at once (FLOTTA-120) -----------------
+
+
+def test_saying_something_touches_without_waiting_for_a_beat(box, monkeypatch):
+    """The sweep reads `addressed`. A prompt that waits for a beat can lose its turn."""
+    monkeypatch.setattr(door, "HEARTBEAT_S", 60.0)
+    with _Open(box) as tab:
+        assert tab.touches == 0
+        tab.ws.send_text(PROMPT)
+        _until(lambda: tab.touches == 1)
+
+
+def test_a_ping_does_not_bring_a_beat_forward(box, monkeypatch):
+    monkeypatch.setattr(door, "HEARTBEAT_S", 60.0)
+    with _Open(box) as tab:
+        tab.ws.send_text(PING)
+        assert tab.ws.receive_text() == f"echo:{PING}"
+        tab.ws.send_text(PROMPT)
+        _until(lambda: tab.touches == 1)
+        assert tab.seen["asked"] == 0
+
+
+def test_saying_something_while_the_door_waits_on_hermes_touches_at_once(box, monkeypatch):
+    """A question Hermes takes its time over must not hold the prompt back."""
+    monkeypatch.setattr(door, "BUSY_TIMEOUT_S", 60.0)
+    box[1]["answer"] = "silent"
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        assert tab.touches == 0
+        tab.ws.send_text(PROMPT)
+        _until(lambda: tab.touches == 1)
+
+
+def test_touching_does_not_hold_up_what_someone_said(box):
+    """The control plane can be slow. The prompt goes first."""
+    with _Open(box) as tab:
+        stuck = threading.Event()
+
+        async def slow(_box):
+            stuck.set()
+            await asyncio.sleep(8)
+
+        tab.plane.touch = slow
+        tab.ws.send_text(PROMPT)
+        _until(stuck.is_set)
+        tab.ws.send_text("again")
+        assert _receive(tab.ws) == f"echo:{PROMPT}"
+        assert _receive(tab.ws) == "echo:again"
+
+
+def test_a_burst_of_frames_is_one_touch_until_the_gap_is_over(box, monkeypatch):
+    """Each touch asks the substrate about the machine, and sooner moves nothing."""
+    monkeypatch.setattr(door, "TOUCH_GAP_S", 0.3)
+    with _Open(box) as tab:
+        for _ in range(5):
+            tab.ws.send_text(PROMPT)
+            assert tab.ws.receive_text() == f"echo:{PROMPT}"
+        _until(lambda: tab.touches >= 1)
+        assert tab.touches == 1
+        _until(lambda: tab.touches == 2)
+
+
+def test_what_is_said_during_the_gap_still_counts_when_it_ends(box, monkeypatch):
+    monkeypatch.setattr(door, "HEARTBEAT_S", 60.0)
+    monkeypatch.setattr(door, "TOUCH_GAP_S", 0.2)
+    with _Open(box) as tab:
+        tab.ws.send_text(PROMPT)
+        _until(lambda: tab.touches == 1)
+        tab.ws.send_text(PROMPT)
+        _until(lambda: tab.touches == 2)
+
+
+def test_the_gap_is_no_longer_than_what_the_control_plane_would_write_anyway():
+    """A touch inside the floor can't move `addressed`, so waiting that long costs nothing."""
+    from flotta.control.app import ACTIVITY_FLOOR_S
+
+    assert 0 < SHIPPED_TOUCH_GAP_S <= ACTIVITY_FLOOR_S
+
+
 # -- one conversation's state -------------------------------------------------
 
 
-def test_opening_a_conversation_counts_as_someone_arriving():
+def test_opening_a_conversation_touches_nothing_itself(box, monkeypatch):
+    """The wake that opened it has just been counted, so the first beat asks Hermes."""
+    with _Open(box) as tab:
+        tab.asked_again(3)
+        assert tab.plane.touched == []
+        assert tab.plane.woken_ids == ["b-1"]
+
+
+async def _asking(liveness, sent):
+    """A beat under way, with the door's question sent and not yet answered."""
+    beat = asyncio.create_task(liveness.needs_box())
+    asked = len(sent)
+    for _ in range(100):
+        if len(sent) > asked:
+            return beat, json.loads(sent[-1])["id"]
+        await asyncio.sleep(0)
+    beat.cancel()
+    pytest.fail("the door never asked")
+
+
+def _liveness():
     sent = []
 
     async def send(frame):
         sent.append(frame)
 
+    liveness = Liveness("eng-a")
+    liveness.connected(send)
+    return liveness, sent
+
+
+def _idle(rid):
+    return json.dumps({"id": rid, "result": {"sessions": []}})
+
+
+def _working(rid):
+    return json.dumps({"id": rid, "result": {"sessions": [{"status": "working"}]}})
+
+
+def test_an_idle_answer_with_nothing_said_lets_the_box_sleep():
     async def go():
-        liveness = Liveness("eng-a")
-        liveness.connected(send)
-        assert await liveness.needs_box()
+        liveness, sent = _liveness()
+        beat, rid = await _asking(liveness, sent)
+        assert liveness.take_answer(_idle(rid))
+        assert await beat is False
 
     asyncio.run(go())
-    assert sent == []
+
+
+def test_something_said_while_asking_counts_on_this_beat():
+    async def go():
+        liveness, sent = _liveness()
+        beat, _ = await _asking(liveness, sent)
+        liveness.heard(PROMPT)
+        assert await asyncio.wait_for(beat, 1) is True
+
+    asyncio.run(go())
+
+
+def test_something_said_just_after_an_idle_answer_still_counts_on_this_beat():
+    """The answer has settled the question and the beat hasn't run yet."""
+
+    async def go():
+        liveness, sent = _liveness()
+        beat, rid = await _asking(liveness, sent)
+        liveness.take_answer(_idle(rid))
+        liveness.heard(PROMPT)
+        assert await beat is True
+
+    asyncio.run(go())
+
+
+def test_something_said_once_counts_once():
+    async def go():
+        liveness, sent = _liveness()
+        beat, _ = await _asking(liveness, sent)
+        liveness.heard(PROMPT)
+        await beat
+        beat, rid = await _asking(liveness, sent)
+        liveness.take_answer(_idle(rid))
+        assert await beat is False
+
+    asyncio.run(go())
+
+
+def test_a_ping_while_asking_settles_nothing():
+    async def go():
+        liveness, sent = _liveness()
+        beat, rid = await _asking(liveness, sent)
+        liveness.heard(PING)
+        await asyncio.sleep(0)
+        assert not beat.done()
+        liveness.take_answer(_idle(rid))
+        assert await beat is False
+
+    asyncio.run(go())
+
+
+def test_a_beat_waits_for_someone_to_say_something_or_for_its_time(monkeypatch):
+    monkeypatch.setattr(door, "HEARTBEAT_S", 60.0)
+
+    async def go():
+        liveness = Liveness("eng-a")
+        waiting = asyncio.create_task(liveness.beat())
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        liveness.heard(PING)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        liveness.heard(PROMPT)
+        await asyncio.wait_for(waiting, 1)
+
+    asyncio.run(go())
+
+
+def test_every_question_has_its_own_id():
+    async def go():
+        liveness, sent = _liveness()
+        first, one = await _asking(liveness, sent)
+        liveness.take_answer(_idle(one))
+        await first
+        second, other = await _asking(liveness, sent)
+        liveness.take_answer(_idle(other))
+        await second
+        assert one != other
+        assert one.startswith(BUSY_ID_PREFIX) and other.startswith(BUSY_ID_PREFIX)
+
+    asyncio.run(go())
+
+
+def test_a_late_answer_does_not_decide_a_newer_question():
+    """An idle from before can't let the box sleep under what Hermes says now."""
+
+    async def go():
+        liveness, sent = _liveness()
+        first, stale = await _asking(liveness, sent)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        beat, fresh = await _asking(liveness, sent)
+        assert liveness.take_answer(_idle(stale)), "a late answer still stops at the door"
+        await asyncio.sleep(0)
+        assert not beat.done()
+        assert liveness.take_answer(_working(fresh))
+        assert await beat is True
+
+    asyncio.run(go())
 
 
 def test_a_beat_before_the_box_is_connected_holds_it_awake():
     async def go():
-        liveness = Liveness("eng-a")
-        await liveness.needs_box()
-        assert await liveness.needs_box()
+        assert await Liveness("eng-a").needs_box()
 
     asyncio.run(go())
 
@@ -272,6 +500,8 @@ def test_an_answer_after_the_door_gave_up_still_stops_at_the_door():
     [
         "echo:hello",
         f"not json {BUSY_ID}",
+        json.dumps({"id": f"someone-elses-{BUSY_ID}", "result": {"sessions": []}}),
+        json.dumps({"id": 1, "result": {"text": BUSY_ID}}),
         f'["{BUSY_ID}"]',
         json.dumps({"method": "event", "params": {"payload": {"text": BUSY_ID}}}),
     ],
