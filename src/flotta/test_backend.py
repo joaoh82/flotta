@@ -750,6 +750,37 @@ def test_inspect_reports_the_projects_folder_from_the_machine_env():
     assert _inspecting([machine]).workdir == "/mnt/src"
 
 
+def test_inspect_reports_when_fly_last_saw_it_go_down_and_come_up():
+    """The shape of `machines list` on a live machine, newest first (FLOTTA-92)."""
+    machine = {
+        **_LIVE_MACHINE,
+        "events": [
+            {"type": "start", "status": "started", "source": "flyd", "timestamp": 1793828835000},
+            {"type": "start", "status": "starting", "source": "user", "timestamp": 1793828835000},
+            {
+                "type": "suspension",
+                "status": "suspended",
+                "source": "flyd",
+                "timestamp": 1793827181000,
+            },
+            {"type": "start", "status": "started", "source": "flyd", "timestamp": 1793825363000},
+        ],
+    }
+    info = _inspecting([machine])
+    assert info.last_up_at == "2026-11-04T21:47:15+00:00"
+    assert info.last_down_at == "2026-11-04T21:19:41+00:00"
+
+
+@pytest.mark.parametrize(
+    "events",
+    [None, [], "nonsense", [{"status": "started"}], [{"status": "started", "timestamp": "soon"}]],
+)
+def test_inspect_survives_events_it_cannot_read(events):
+    info = _inspecting([{**_LIVE_MACHINE, "events": events}])
+    assert info.last_up_at is None
+    assert info.last_down_at is None
+
+
 def test_inspect_reports_which_control_plane_the_machine_calls():
     """FLOTTA-98: every agent kept the Railway address after the move, and
     nothing could show it. The machine's own environment is the only answer."""

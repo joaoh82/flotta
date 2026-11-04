@@ -184,6 +184,10 @@ class MachineInfo:
     volume_id: str | None = None
     volume_gb: int | None = None
     volume_path: str | None = None
+    #: When the substrate last saw it go down and come up, as ISO timestamps.
+    #: What `flotta.metering` trusts over a log that missed one.
+    last_down_at: str | None = None
+    last_up_at: str | None = None
     private_ip: str | None = None
     created_at: str | None = None
     updated_at: str | None = None

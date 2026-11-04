@@ -113,6 +113,18 @@ def _positive(text: Any) -> Decimal | None:
     return number if number.is_finite() and number >= 0 else None
 
 
+def rate_in_force(store: Any, env: Mapping[str, str] | None) -> Decimal | None:
+    """The override if there is one, otherwise the latest rate fetched.
+
+    Pass `settings.layered(store)` as `env`.
+    """
+    override = resolve_eur_per_usd(env or {})
+    if override is not None:
+        return override
+    fetched = store.fetched_eur_rate()
+    return fetched.eur_per_usd if fetched else None
+
+
 def resolve_eur_per_usd(env: Mapping[str, str]) -> Decimal | None:
     """The rate in force, or `None` if there is none that could be one.
 
@@ -192,3 +204,95 @@ def prices_from_catalogue(entries: Iterable[Any]) -> tuple[list[Price], list[str
             )
         )
     return prices, skipped
+
+
+# -- machines and volumes (FLOTTA-92) ---------------------------------------
+#
+# Fly's published prices, from docs.fly.io/about/pricing on 3 Nov 2026, which quotes
+# 30 days of a machine in `iad` and a markup per region. A settings override is an
+# operator's own figure, for what this table lacks or a price Fly has since changed.
+
+MACHINE_PRICES_ENV = "FLOTTA_MACHINE_PRICES"
+VOLUME_PRICE_ENV = "FLOTTA_VOLUME_USD_GB_MONTH"
+#: Fly's month, which its monthly prices assume.
+_MONTH_S = 30 * 24 * 60 * 60
+_LOCAL = "machine:local"
+UNKNOWN_MACHINE = "machine:unknown"
+_FLY_MACHINE_USD_MONTH = {
+    "shared-1x-256": Decimal("2.19"),
+    "shared-1x-512": Decimal("3.69"),
+    "shared-1x-1024": Decimal("6.70"),
+}
+_FLY_REGION_MARKUP = {
+    "ams": Decimal("1.038461538"),
+    "arn": Decimal("1.038461538"),
+    "cdg": Decimal("1.134615385"),
+    "dfw": Decimal("1.25"),
+    "ewr": Decimal("1"),
+    "fra": Decimal("1.153846154"),
+    "gru": Decimal("1.615384615"),
+    "iad": Decimal("1"),
+    "jnb": Decimal("1.302884615"),
+    "lax": Decimal("1.199519231"),
+    "lhr": Decimal("1.134615385"),
+    "nrt": Decimal("1.307692308"),
+    "ord": Decimal("1.25"),
+    "sin": Decimal("1.269230769"),
+    "sjc": Decimal("1.192307692"),
+    "syd": Decimal("1.269230769"),
+    "yyz": Decimal("1.115384615"),
+}
+_FLY_VOLUME_USD_GB_MONTH = Decimal("0.15")
+
+
+def machine_label(info: Any) -> str:
+    """What a machine is, as `usage.model` and the prices name it."""
+    if info.region == "local":
+        return _LOCAL
+    if info.cpu_kind and info.cpus and info.memory_mb:
+        return f"machine:{info.cpu_kind}-{info.cpus}x-{info.memory_mb}"
+    return UNKNOWN_MACHINE
+
+
+def _configured_machine_prices(env: Mapping[str, str] | None) -> dict[str, Decimal]:
+    """`shared-1x-1024=6.70, shared-1x-512=3.69`. An entry that makes no sense is ignored."""
+    prices: dict[str, Decimal] = {}
+    for entry in ((env or {}).get(MACHINE_PRICES_ENV) or "").split(","):
+        size, _, text = entry.partition("=")
+        price = _positive(text) if text.strip() else None
+        if size.strip() and price is not None:
+            prices[size.strip()] = price
+        elif entry.strip():
+            _log.warning("%s has %r, which is not a size and a price", MACHINE_PRICES_ENV, entry)
+    return prices
+
+
+def machine_usd_per_month(
+    label: str, region: str | None, env: Mapping[str, str] | None
+) -> Decimal | None:
+    """What this machine costs for Fly's month, or `None` if nothing says."""
+    if label == _LOCAL:
+        return Decimal(0)
+    size = label.removeprefix("machine:")
+    configured = _configured_machine_prices(env).get(size)
+    if configured is not None:
+        return configured
+    published = _FLY_MACHINE_USD_MONTH.get(size)
+    if published is None:
+        return None
+    return published * _FLY_REGION_MARKUP.get(region or "", Decimal(1))
+
+
+def volume_usd_per_gb_month(env: Mapping[str, str] | None) -> Decimal:
+    configured = _positive((env or {}).get(VOLUME_PRICE_ENV) or "")
+    return configured if configured is not None else _FLY_VOLUME_USD_GB_MONTH
+
+
+def monthly_cost_nano(
+    usd_per_month: Decimal | None, seconds: int, *, quantity: int = 1
+) -> int | None:
+    """`seconds` of something priced by Fly's month, in nanos of a dollar."""
+    if usd_per_month is None:
+        return None
+    amount = usd_per_month * quantity * seconds * NANO / _MONTH_S
+    return int(amount.quantize(Decimal(1), rounding=ROUND_HALF_UP))

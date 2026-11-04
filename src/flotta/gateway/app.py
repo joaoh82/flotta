@@ -94,7 +94,8 @@ from flotta.auth import (
     verify,
 )
 from flotta.inference import InvalidModel, is_openrouter, validate_model
-from flotta.pricing import EurRate, Price, dollars_to_nano, resolve_eur_per_usd
+from flotta.pricing import EurRate, Price, dollars_to_nano
+from flotta.pricing import rate_in_force as pricing_rate_in_force
 from flotta.settings import layered
 from flotta.store import Box, FleetStore, is_terminal
 
@@ -484,11 +485,7 @@ def create_gateway(
 
     def rate_in_force(store: FleetStore) -> Decimal | None:
         """The override if there is one, otherwise the latest rate fetched."""
-        override = resolve_eur_per_usd(layered(store, environment))
-        if override is not None:
-            return override
-        fetched = store.fetched_eur_rate()
-        return fetched.eur_per_usd if fetched else None
+        return pricing_rate_in_force(store, layered(store, environment))
 
     def write_row(*, box_id: str, **row: Any) -> None:
         store = store_factory()

@@ -861,6 +861,14 @@ model with no price, or with no rate set, and while a finished call's row cannot
 written. **Run one instance:** those unwritten rows are in its memory, so a second instance
 would not see them.
 
+**Machine time and storage are in `usage` too,** as `kind = 'machine'` rows the control
+plane's loop writes for each hour once it is over (`model` is `machine:shared-1x-1024` or
+`volume:1gb`). They come from the agent's lifecycle events, checked against what Fly
+reports, and they count from an agent's first sweep. They use Fly's published prices, or
+yours on the Fleet page. A size with no price stops any budget covering it. They count
+towards budgets, so a budget has to be larger than its agents' storage alone. The root
+filesystem of a sleeping machine isn't counted (Fly charges $0.15 a GB a month for it).
+
 **What a budget does at its limit is its action:**
 
 | Action | Calls | The agent |

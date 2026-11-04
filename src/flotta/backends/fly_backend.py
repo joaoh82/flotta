@@ -24,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from datetime import UTC, datetime
 
 from flotta.backend import (
     BackendError,
@@ -60,6 +61,25 @@ def parse_endpoint(endpoint: str) -> tuple[str, str]:
     if not app or not machine_id:
         raise BackendError(f"malformed fly endpoint: {endpoint!r}")
     return app, machine_id
+
+
+#: `status` on the events in `machines list`, which Fly keeps a few of.
+_DOWN_EVENT_STATUSES = frozenset({"stopped", "suspended", "destroyed"})
+_UP_EVENT_STATUSES = frozenset({"started"})
+
+
+def _last_event_at(machine: dict, statuses: frozenset[str]) -> str | None:
+    """When Fly last says this happened, or None. Defensive like the rest of `inspect`."""
+    stamps = [
+        event["timestamp"]
+        for event in machine.get("events") or []
+        if isinstance(event, dict)
+        and event.get("status") in statuses
+        and isinstance(event.get("timestamp"), int | float)
+    ]
+    if not stamps:
+        return None
+    return datetime.fromtimestamp(max(stamps) / 1000, UTC).isoformat()
 
 
 class FlyBackend:
@@ -397,6 +417,8 @@ class FlyBackend:
                 volume_id=mount.get("volume"),
                 volume_gb=mount.get("size_gb"),
                 volume_path=mount.get("path"),
+                last_down_at=_last_event_at(machine, _DOWN_EVENT_STATUSES),
+                last_up_at=_last_event_at(machine, _UP_EVENT_STATUSES),
                 private_ip=machine.get("private_ip"),
                 created_at=machine.get("created_at"),
                 updated_at=machine.get("updated_at"),

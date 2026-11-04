@@ -55,6 +55,7 @@ with fakes and the base `flotta` package keeps no hard Modal dependency.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -968,7 +969,14 @@ def _correct_running(
     # `gone` means the machine was destroyed outside Flotta; anything else
     # settled means it is simply not up. Neither is `running`.
     status = "torn_down" if observed == "gone" else "stopped"
-    store.add_event("box", box.id, status, {"reason": f"substrate says {observed!r}"})
+    detail = {"reason": f"substrate says {observed!r}"}
+    # When it really went down, for `flotta.metering`: a control plane that was
+    # down corrects this late, and shouldn't bill for the hours it wasn't looking.
+    with contextlib.suppress(Exception):
+        down_at = resolve(box.endpoint).inspect(box.endpoint).last_down_at
+        if down_at:
+            detail["machine_down_at"] = down_at
+    store.add_event("box", box.id, status, detail)
     store.update_box_status(box.id, status)
     return {"box_id": box.id, "name": box.name, "action": "corrected", "observed": observed}
 

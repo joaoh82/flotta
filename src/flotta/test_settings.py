@@ -100,6 +100,10 @@ def test_every_catalogued_setting_actually_changes_something():
         # Read by the gateway's `write_row`, through `layered`, for every call it
         # meters (FLOTTA-88). Nothing else reads it.
         "FLOTTA_EUR_PER_USD",
+        # Both read by `flotta.metering` through `layered`, on the loop's sweep, and
+        # stored on each row of machine time and storage it writes (FLOTTA-92).
+        "FLOTTA_MACHINE_PRICES",
+        "FLOTTA_VOLUME_USD_GB_MONTH",
     }, (
         "a setting was added or removed — confirm the new one is read by "
         "something that runs, the way idle sleep and the sweep interval are"
