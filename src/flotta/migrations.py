@@ -363,6 +363,47 @@ def _budget_actions() -> tuple[str, ...]:
     )
 
 
+def _budget_alerts() -> tuple[str, ...]:
+    """Telling an org what its budgets did (FLOTTA-93, M13.7). See `flotta.alerts`.
+
+    What is already on the timeline counts as told, so a deploy sends nothing about
+    the past. `next_attempt_at` is whole seconds, so it compares as a number on any
+    collation. `webhook_nonce` isn't a secret: the secret is derived from it and the
+    signing key.
+    """
+    return (
+        "ALTER TABLE budget_events ADD COLUMN alerts_queued_at TEXT",
+        "UPDATE budget_events SET alerts_queued_at = ts",
+        """
+        CREATE TABLE org_alerts (
+            org_id         TEXT PRIMARY KEY REFERENCES orgs(id),
+            alert_email    TEXT,
+            webhook_url    TEXT,
+            webhook_nonce  TEXT,
+            updated_at     TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE alert_deliveries (
+            id               TEXT PRIMARY KEY,
+            org_id           TEXT NOT NULL REFERENCES orgs(id),
+            event_id         TEXT NOT NULL REFERENCES budget_events(id),
+            channel          TEXT NOT NULL,
+            target           TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at  BIGINT NOT NULL,
+            last_error       TEXT,
+            created_at       TEXT NOT NULL,
+            finished_at      TEXT,
+            UNIQUE (event_id, channel, target)
+        )
+        """,
+        "CREATE INDEX idx_alert_deliveries_due ON alert_deliveries(status, next_attempt_at)",
+        "CREATE INDEX idx_alert_deliveries_org ON alert_deliveries(org_id, created_at)",
+    )
+
+
 def _machine_meter_marks() -> tuple[str, ...]:
     """How far each box's machine time has been metered (FLOTTA-92, M13.6).
 
@@ -513,6 +554,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         13,
         "machine time: how far each box has been metered",
         _machine_meter_marks(),
+    ),
+    Migration(
+        14,
+        "budget alerts: where they go, and what has been sent",
+        _budget_alerts(),
     ),
 )
 

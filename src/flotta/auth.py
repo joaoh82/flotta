@@ -466,6 +466,19 @@ def _sign(payload: str, key: str) -> str:
     return _b64(hmac.new(key.encode(), payload.encode(), hashlib.sha256).digest())
 
 
+#: So a webhook's secret is never the signature of anything else under the same key.
+WEBHOOK_SECRET_DOMAIN = "flotta-webhook-secret:"
+
+
+def webhook_secret(signing_key: str | None, org: str, nonce: str) -> str:
+    """The secret an org's webhook is signed with (FLOTTA-93).
+
+    Derived, so the database holds no secret a reader could use, only the nonce that
+    changes when the webhook is set again. A keyless control plane is on loopback.
+    """
+    return _sign(f"{WEBHOOK_SECRET_DOMAIN}{org}:{nonce}", signing_key or "")
+
+
 #: Prefixed to a box id before it is signed, so a box's password is never the
 #: signature some other use of the fleet's password would produce.
 BOX_PASSWORD_DOMAIN = "flotta-box-password:"

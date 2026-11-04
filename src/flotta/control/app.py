@@ -43,6 +43,7 @@ from typing import Any
 
 from flotta import db
 from flotta.address import parse as parse_address
+from flotta.alerts import WebhookRefused, allow_local_webhooks, check_webhook_url, run_alert_loop
 from flotta.auth import (
     CHAT_PROTOCOL,
     DEFAULT_CLIENT,
@@ -588,6 +589,7 @@ def create_app(
             "to this log on a machine whose log only you can read."
         )
     link_base = app_url if app_url is not None else resolve_app_url()
+    local_webhooks = allow_local_webhooks(keyless=not key)
     # Where tickets send a browser: refused now, not in a ticket nobody can use.
     from flotta.client import browser_door
 
@@ -875,6 +877,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: Any):
         task: asyncio.Task | None = None
+        alerts: asyncio.Task | None = None
         if run_loop:
             # `loop_runner` makes the *interesting* failure testable: a loop
             # that is configured and supposed to be running, but is not
@@ -883,6 +886,16 @@ def create_app(
             # real loop cannot test it, because a real loop sweeps.
             runner = loop_runner or run_reconcile_loop
             task = asyncio.create_task(runner(state, store_factory=store_factory))
+            # Its own task, so that a webhook can never hold up a sweep.
+            alerts = asyncio.create_task(
+                run_alert_loop(
+                    store_factory,
+                    mailer=deliver_link,
+                    app_url=link_base,
+                    signing_key=key,
+                    allow_local=local_webhooks,
+                )
+            )
         try:
             yield
         finally:
@@ -890,6 +903,10 @@ def create_app(
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            if alerts is not None:
+                alerts.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await alerts
 
     app = FastAPI(title="Flotta control plane", lifespan=lifespan)
     app.state.loop_state = state
@@ -1558,6 +1575,70 @@ def create_app(
         store = store_factory()
         try:
             return {"events": [asdict(e) for e in store.budget_events(org_id, client=client)]}
+        finally:
+            store.close()
+
+    @app.get("/api/orgs/{org_id}/alerts")
+    def get_alerts(org_id: str, token: Token | None = needs_read) -> Any:
+        """Where an org's alerts go, and how the latest went. Never the webhook's secret."""
+        _budget_reader(token, org_id)
+        from dataclasses import asdict
+
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            settings = store.org_alerts(org_id)
+            return {
+                "alert_email": settings.alert_email if settings else None,
+                "webhook_url": settings.webhook_url if settings else None,
+                "deliveries": [asdict(d) for d in store.alert_deliveries(org_id)],
+            }
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/alerts")
+    def put_alerts(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Where an org's alerts go, besides its owners, and only what the body names.
+
+        `{"alert_email": "ops@example.com", "webhook_url": "https://example.com/hook"}`,
+        and `null` removes either. **Setting a webhook answers with `webhook_secret`, this
+        once:** setting it again, even to the same URL, makes a new one. A new URL takes
+        over any alert still being tried. `docs/ALERTS.md`.
+        """
+        _admin_of(token, org_id)
+        import secrets
+
+        from flotta.auth import webhook_secret
+
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            current = store.org_alerts(org_id)
+            email = current.alert_email if current else None
+            url = current.webhook_url if current else None
+            nonce = current.webhook_nonce if current else None
+            if "alert_email" in body:
+                raw = body["alert_email"]
+                try:
+                    email = normalize_email(str(raw)) if raw else None
+                except InvalidAccountError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+            minted = False
+            if "webhook_url" in body:
+                raw = body["webhook_url"]
+                if raw:
+                    try:
+                        url = check_webhook_url(str(raw), allow_local=local_webhooks)
+                    except WebhookRefused as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                    nonce, minted = secrets.token_hex(16), True
+                else:
+                    url, nonce = None, None
+            store.set_org_alerts(org_id, alert_email=email, webhook_url=url, nonce=nonce)
+            answer: dict[str, Any] = {"alert_email": email, "webhook_url": url}
+            if minted:
+                answer["webhook_secret"] = webhook_secret(key, org_id, nonce)
+            return answer
         finally:
             store.close()
 

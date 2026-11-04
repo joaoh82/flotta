@@ -765,6 +765,38 @@ class BudgetEvent:
     ts: str
 
 
+#: The budget events an org is told about (`flotta.alerts`).
+ALERT_THRESHOLDS = ("budget_soft_limit", "budget_limit")
+
+
+@dataclass(frozen=True, slots=True)
+class OrgAlerts:
+    """Where an org's alerts go, besides its owners. See `flotta.alerts`."""
+
+    org: str
+    alert_email: str | None
+    webhook_url: str | None
+    webhook_nonce: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class AlertDelivery:
+    """One alert to one place, and how it went. See `flotta.alerts`."""
+
+    id: str
+    org: str
+    event_id: str
+    channel: str
+    target: str
+    status: str
+    attempts: int
+    next_attempt_at: int
+    last_error: str | None
+    created_at: str
+    finished_at: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class Budget:
     """A limit on spend. See `migrations._budgets` and `flotta.budgets`."""
@@ -2763,20 +2795,168 @@ class FleetStore:
             query += " AND (client_id = ? OR client_id IS NULL)"
             params = (org, client)
         rows = self._conn.execute(f"{query} ORDER BY ts, id", params).fetchall()
-        return [
-            BudgetEvent(
-                id=row["id"],
-                org=row["org_id"],
-                client=row["client_id"],
-                box=row["box_id"],
-                budget=row["budget_id"],
-                type=row["type"],
-                period_start=row["period_start"],
-                payload=json.loads(row["payload"]),
-                ts=row["ts"],
+        return [_budget_event_from_row(row) for row in rows]
+
+    def get_budget_event(self, event_id: str) -> BudgetEvent | None:
+        row = self._conn.execute("SELECT * FROM budget_events WHERE id = ?", (event_id,)).fetchone()
+        return _budget_event_from_row(row) if row is not None else None
+
+    def record_alert_failure(
+        self, event: BudgetEvent, channel: str, payload: dict[str, Any]
+    ) -> None:
+        """On the timeline, that an alert about `event` never arrived. Once per channel."""
+        self._conn.execute(
+            "INSERT INTO budget_events (id, org_id, client_id, box_id, budget_id, type, "
+            "period_start, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (budget_id, type, period_start) DO NOTHING",
+            (
+                f"be-{uuid.uuid4().hex}",
+                event.org,
+                event.client,
+                event.box,
+                event.budget,
+                f"alert_failed:{event.type}:{channel}",
+                event.period_start,
+                json.dumps(payload),
+                _utcnow(),
+            ),
+        )
+
+    def org_alerts(self, org: str) -> OrgAlerts | None:
+        row = self._conn.execute("SELECT * FROM org_alerts WHERE org_id = ?", (org,)).fetchone()
+        return _org_alerts_from_row(row) if row is not None else None
+
+    def set_org_alerts(
+        self, org: str, *, alert_email: str | None, webhook_url: str | None, nonce: str | None
+    ) -> OrgAlerts:
+        """Replace where `org`'s alerts go, and move what a webhook is still trying to send.
+
+        In the transaction `queue_budget_alerts` takes, so neither can miss the other.
+        """
+        now = _utcnow()
+        with self._conn.transaction(guard="alert_deliveries"):
+            self._conn.execute(
+                "INSERT INTO org_alerts "
+                "(org_id, alert_email, webhook_url, webhook_nonce, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id) DO UPDATE SET "
+                "alert_email = excluded.alert_email, webhook_url = excluded.webhook_url, "
+                "webhook_nonce = excluded.webhook_nonce, updated_at = excluded.updated_at",
+                (org, alert_email, webhook_url, nonce, now),
             )
-            for row in rows
-        ]
+            if webhook_url:
+                self._move_queued_webhooks(org, webhook_url, now)
+        found = self.org_alerts(org)
+        assert found is not None
+        return found
+
+    def _move_queued_webhooks(self, org: str, url: str, now: str) -> None:
+        """A row for `url` with all its tries, for each alert still being tried elsewhere.
+
+        Fixing a wrong URL is what the retries wait for. A row of its own, since the old
+        one says truly where it was going, and `url` may have one from being set before.
+        """
+        rows = self._conn.execute(
+            "SELECT id, event_id FROM alert_deliveries WHERE org_id = ? AND channel = 'webhook' "
+            "AND status = 'pending' AND target <> ?",
+            (org, url),
+        ).fetchall()
+        for row in rows:
+            self._conn.execute(
+                "UPDATE alert_deliveries SET status = 'replaced', finished_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            self._conn.execute(
+                "INSERT INTO alert_deliveries (id, org_id, event_id, channel, target, status, "
+                "next_attempt_at, created_at) VALUES (?, ?, ?, 'webhook', ?, 'pending', 0, ?) "
+                "ON CONFLICT (event_id, channel, target) DO UPDATE SET status = 'pending', "
+                "attempts = 0, next_attempt_at = 0, last_error = NULL, finished_at = NULL "
+                "WHERE alert_deliveries.status = 'replaced'",
+                (f"ad-{uuid.uuid4().hex}", org, row["event_id"], url, now),
+            )
+
+    def _alert_targets(self, org: str) -> list[tuple[str, str]]:
+        settings = self.org_alerts(org)
+        emails = []
+        for member in self.members_of(org):
+            user = self.get_user(member.user_id) if member.role == "owner" else None
+            if user is not None:
+                emails.append(user.email)
+        if settings is not None and settings.alert_email:
+            emails.append(settings.alert_email)
+        targets = [("email", email) for email in dict.fromkeys(emails)]
+        if settings is not None and settings.webhook_url:
+            targets.append(("webhook", settings.webhook_url))
+        return targets
+
+    def queue_budget_alerts(self) -> int:
+        """A delivery per place for each threshold not yet queued, with the mark that says so.
+
+        In one transaction: a restart can't lose them, and two sweeps can't queue twice.
+        """
+        marks = ", ".join("?" for _ in ALERT_THRESHOLDS)
+        now = _utcnow()
+        queued = 0
+        with self._conn.transaction(guard="alert_deliveries"):
+            rows = self._conn.execute(
+                f"SELECT id, org_id FROM budget_events WHERE alerts_queued_at IS NULL "
+                f"AND type IN ({marks}) ORDER BY ts, id",
+                ALERT_THRESHOLDS,
+            ).fetchall()
+            for row in rows:
+                for channel, target in self._alert_targets(row["org_id"]):
+                    self._conn.execute(
+                        "INSERT INTO alert_deliveries (id, org_id, event_id, channel, target, "
+                        "status, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, 'pending', "
+                        "0, ?) ON CONFLICT (event_id, channel, target) DO NOTHING",
+                        (f"ad-{uuid.uuid4().hex}", row["org_id"], row["id"], channel, target, now),
+                    )
+                    queued += 1
+                self._conn.execute(
+                    "UPDATE budget_events SET alerts_queued_at = ? WHERE id = ?", (now, row["id"])
+                )
+        return queued
+
+    def due_alert_deliveries(self, now: int, *, limit: int) -> list[AlertDelivery]:
+        rows = self._conn.execute(
+            "SELECT * FROM alert_deliveries WHERE status = 'pending' AND next_attempt_at <= ? "
+            "ORDER BY next_attempt_at, id LIMIT ?",
+            (now, limit),
+        ).fetchall()
+        return [_alert_delivery_from_row(row) for row in rows]
+
+    def claim_alert_delivery(self, delivery: AlertDelivery, *, next_attempt_at: int) -> bool:
+        """Take it for this try. False if someone else already has it."""
+        taken = self._conn.execute(
+            "UPDATE alert_deliveries SET next_attempt_at = ? WHERE id = ? AND status = 'pending' "
+            "AND attempts = ? AND next_attempt_at = ? RETURNING id",
+            (next_attempt_at, delivery.id, delivery.attempts, delivery.next_attempt_at),
+        ).fetchone()
+        return taken is not None
+
+    def note_alert_failure(self, delivery_id: str, error: str) -> None:
+        """A try that failed, with another to come at the time its claim set."""
+        self._conn.execute(
+            "UPDATE alert_deliveries SET attempts = attempts + 1, last_error = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (error, delivery_id),
+        )
+
+    def finish_alert_delivery(self, delivery_id: str, *, status: str, error: str | None) -> bool:
+        """False if it was replaced while this try was under way, which then says nothing."""
+        finished = self._conn.execute(
+            "UPDATE alert_deliveries SET status = ?, attempts = attempts + 1, last_error = ?, "
+            "finished_at = ? WHERE id = ? AND status = 'pending' RETURNING id",
+            (status, error, _utcnow(), delivery_id),
+        ).fetchone()
+        return finished is not None
+
+    def alert_deliveries(self, org: str, *, limit: int = 50) -> list[AlertDelivery]:
+        """`org`'s newest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM alert_deliveries WHERE org_id = ? ORDER BY created_at DESC, id LIMIT ?",
+            (org, limit),
+        ).fetchall()
+        return [_alert_delivery_from_row(row) for row in rows]
 
     def budgets_covering(self, box: Box) -> list[Budget]:
         """Every budget a call by `box` counts against: its org's, client's and own.
@@ -3297,6 +3477,46 @@ def _user_from_row(row: db.Row) -> User:
         name=row["name"],
         created_at=row["created_at"],
         disabled_at=row["disabled_at"],
+    )
+
+
+def _budget_event_from_row(row: db.Row) -> BudgetEvent:
+    return BudgetEvent(
+        id=row["id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        box=row["box_id"],
+        budget=row["budget_id"],
+        type=row["type"],
+        period_start=row["period_start"],
+        payload=json.loads(row["payload"]),
+        ts=row["ts"],
+    )
+
+
+def _org_alerts_from_row(row: db.Row) -> OrgAlerts:
+    return OrgAlerts(
+        org=row["org_id"],
+        alert_email=row["alert_email"],
+        webhook_url=row["webhook_url"],
+        webhook_nonce=row["webhook_nonce"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _alert_delivery_from_row(row: db.Row) -> AlertDelivery:
+    return AlertDelivery(
+        id=row["id"],
+        org=row["org_id"],
+        event_id=row["event_id"],
+        channel=row["channel"],
+        target=row["target"],
+        status=row["status"],
+        attempts=row["attempts"],
+        next_attempt_at=row["next_attempt_at"],
+        last_error=row["last_error"],
+        created_at=row["created_at"],
+        finished_at=row["finished_at"],
     )
 
 
