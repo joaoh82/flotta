@@ -2688,7 +2688,7 @@ class FleetStore:
             "COALESCE(SUM(tokens_in), 0) AS tokens_in, "
             "COALESCE(SUM(tokens_out), 0) AS tokens_out, "
             "COALESCE(SUM(tokens_cached), 0) AS tokens_cached, "
-            "COALESCE(SUM(CASE WHEN kind = 'machine' AND model NOT LIKE 'volume:%' "
+            "COALESCE(SUM(CASE WHEN kind = 'machine' AND substr(model, 1, 7) <> 'volume:' "
             "THEN seconds END), 0) AS machine_seconds "
             f"FROM usage WHERE {' AND '.join(where)}"
             + (f" GROUP BY {positions} ORDER BY {positions}" if group else ""),
