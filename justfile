@@ -223,7 +223,7 @@ token-mint SUBJECT SCOPE:
 
 # With $FLOTTA_CONTROL_URL set the control plane mints it, so an org's owner can
 # run this holding only their own token in $FLOTTA_CONTROL_TOKEN.
-# M11.7 — a person's token by role (owner | member | client_viewer), e.g. `just token-role sam member agency-x acme`
+# M11.7 — a person's token by role (owner | member | client_viewer | client_user), e.g. `just token-role sam member agency-x acme`
 token-role SUBJECT ROLE ORG CLIENT="":
     uv run flotta token mint "{{SUBJECT}}" --role {{ROLE}} --org {{ORG}} {{ if CLIENT == "" { "" } else { "--client " + CLIENT } }}
 

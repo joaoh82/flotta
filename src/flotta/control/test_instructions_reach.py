@@ -186,6 +186,18 @@ def test_a_client_viewer_reads_no_route_that_carries_the_instructions(api, viewe
     assert answered >= 3, "the viewer was refused everything, so the sweep proved nothing"
 
 
+def test_a_client_user_reads_no_route_that_carries_the_instructions(api, fleet):
+    """Talking to an agent is not reading how the agency runs it."""
+    user = _person(fleet, "someone-else@acme.test", "agency-x", "client_user", client="acme")[1]
+    answered = 0
+    for path in _reads(api) + ["/api/boxes?all_=true"]:
+        response = api.get(path, headers=user)
+        answered += response.status_code == 200
+        for plan in (PLAN, OLD_PLAN):
+            assert plan not in response.text, f"GET {path} gave a client user the instructions"
+    assert answered >= 3, "the client user was refused everything, so the sweep proved nothing"
+
+
 def test_a_client_viewer_still_reads_who_the_agent_is(api, viewer):
     box = api.get(f"/api/boxes/{X}", headers=viewer).json()["box"]
     assert (box["display_name"], box["description"]) == ("Support", ABOUT)

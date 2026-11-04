@@ -721,7 +721,8 @@ and mints their people's tokens themselves, without the signing key:
 ```bash
 just client-create agency-x globex "Globex"
 just token-role sam member agency-x acme      # one client's agents, read and write
-just token-role peter client_viewer agency-x acme
+just token-role peter client_viewer agency-x acme   # one client's agents, read-only
+just token-role cy client_user agency-x acme        # one client's agents, talks to them, changes nothing
 ```
 
 Roles map to scopes when minted (`flotta.auth.ROLES`). Revocation is still

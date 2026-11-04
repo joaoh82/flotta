@@ -79,10 +79,12 @@ MEMBERSHIPS = [
     ("default", "member", None),
     ("default", "member", "acme"),
     ("default", "client_viewer", "acme"),
+    ("default", "client_user", "acme"),
     ("agency-x", "owner", None),
     ("agency-x", "member", None),
     ("agency-x", "member", "acme"),
     ("agency-x", "client_viewer", "acme"),
+    ("agency-x", "client_user", "acme"),
 ]
 
 

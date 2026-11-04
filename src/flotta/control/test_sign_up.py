@@ -358,11 +358,19 @@ def test_the_invite_names_the_org_safely(api, fleet, outbox):
     [
         ({"email": "cy@example.com", "role": "admiral"}, 422),
         ({"email": "cy@example.com", "role": "client_viewer"}, 422),
+        ({"email": "cy@example.com", "role": "client_user"}, 422),
         ({"email": "cy@example.com", "role": "client_viewer", "client": "nope"}, 404),
         ({"email": "bo@example.com", "role": "member"}, 409),
         ({"email": "nope", "role": "member"}, 422),
     ],
-    ids=["role", "viewer-without-client", "no-client", "already-in", "address"],
+    ids=[
+        "role",
+        "viewer-without-client",
+        "user-without-client",
+        "no-client",
+        "already-in",
+        "address",
+    ],
 )
 def test_an_invite_that_could_not_stand_is_refused_before_it_is_sent(api, outbox, body, status):
     ana = _signed_in(api, outbox, "ana@example.com")

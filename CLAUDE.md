@@ -707,7 +707,8 @@ conventions, and the sharp edges below.
   `org:admin` on that org — the operator, or the org's own owner — and
   another org is the 404 of no org. **People get tokens by role** (`ROLES`
   in `auth.py`: `owner` = `member` + `org:admin`, `member` = read, write,
-  chat, destroy, `client_viewer` = `fleet:read` in one client), mapped at
+  chat, destroy, `client_viewer` = `fleet:read` in one client, `client_user` =
+  `fleet:read` and `box:chat` in one client), mapped at
   mint time so a token is still a flat scope list. No role holds a machine's
   scope (`git:credential`, `box:peer`, `fleet:route`), and `mint` refuses
   `org:admin` on a client-confined token. `flotta token mint --role` goes
@@ -909,7 +910,7 @@ just hermes-check           # Hermes version drift: pinned vs. latest vs. your l
 just fly-build              # COSTS MONEY: build + release the fleet image, leaving nothing running
 just fly-doctor             # what is true about a live box (starts it first)
 just org-create <id> <name> # M11.7: an agency (operator); `just client-create <org> <id> <name>` for its customers
-just token-role <who> <role> <org> [client]  # a person's token: owner | member | client_viewer
+just token-role <who> <role> <org> [client]  # a person's token: owner | member | client_viewer | client_user
 ```
 
 **Run `just check` in the main checkout, not only in a worktree** — it loads `.env`, and code under test may re-read that file at run time.

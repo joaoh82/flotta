@@ -8,6 +8,8 @@ with a ticket is `door/test_tickets.py`.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -42,6 +44,7 @@ def fleet(tmp_path):
             ("ana@example.com", "owner", None),
             ("vi@example.com", "client_viewer", "acme"),
             ("mo@example.com", "member", "acme"),
+            ("cu@example.com", "client_user", "acme"),
         ]:
             user = store.create_user(email)
             store.add_membership(user.id, "agency-x", role, client_id=client)
@@ -129,6 +132,46 @@ def test_a_member_of_one_client_gets_none_for_another(api, fleet):
 def test_a_client_viewer_cannot_open_a_conversation(api, fleet):
     """`fleet:read` lists agents; a conversation is everything they were told."""
     assert _ticket(api, "b-support", _as(fleet, "vi@example.com")).status_code == 403
+
+
+def test_a_client_user_talks_to_their_clients_agents_and_no_one_elses(api, fleet):
+    cu = _as(fleet, "cu@example.com")
+    assert _ticket(api, "b-support", cu).status_code == 200
+    assert _ticket(api, "b-billing", cu).status_code == 200
+    assert _ticket(api, "b-sales", cu).status_code == 404
+    assert _ticket(api, "b-theirs", cu).status_code == 404
+
+
+def test_a_client_user_lists_only_their_clients_agents(api, fleet):
+    boxes = api.get("/api/boxes", headers=_as(fleet, "cu@example.com")).json()["boxes"]
+    assert {box["id"] for box in boxes} == {"b-support", "b-billing"}
+
+
+def test_a_client_user_changes_nothing_about_an_agent(api, fleet):
+    """Every route that changes an agent, or makes one, and not just the ones
+    written down: a new one is held to this without anyone listing it. Asking
+    for a ticket and waking are what talking is."""
+    cu = _as(fleet, "cu@example.com")
+    talking = {"/api/boxes/{box_id}/ticket", "/api/boxes/{box_id}/wake"}
+    tried = 0
+    for route in api.app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/boxes") or path in talking:
+            continue
+        for method in getattr(route, "methods", set()) - {"GET", "HEAD", "OPTIONS"}:
+            url = re.sub(r"\{box_id\}", "b-support", path)
+            url = re.sub(r"\{[^}]+\}", "x", url)
+            response = api.request(method, url, headers=cu, json={"name": "another"})
+            assert response.status_code == 403, f"{method} {path}: {response.status_code}"
+            tried += 1
+    assert tried >= 10, "the sweep found almost nothing to try"
+    with FleetStore(fleet) as store:
+        assert {box.id for box in store.list_boxes()} == {
+            "b-support",
+            "b-billing",
+            "b-sales",
+            "b-theirs",
+        }
 
 
 def test_an_agents_own_token_gets_no_ticket_for_a_colleague(api):
