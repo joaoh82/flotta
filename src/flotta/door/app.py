@@ -154,14 +154,18 @@ DEFAULT_READY_TIMEOUT_S = 90.0
 #: Comfortably under the default 30-minute idle threshold: this only has to
 #: beat the sweep, and a chattier heartbeat would write more events for no gain.
 HEARTBEAT_S = 120.0
+#: Least time between two touches from one conversation. The control plane writes
+#: `addressed` at most once a minute, so a sooner touch moves nothing, and each one
+#: asks the substrate about the machine.
+TOUCH_GAP_S = 60.0
 #: What a page sends to keep its socket through Cloudflare. Nobody is behind it.
 KEEPALIVE_METHOD = "gateway.ping"
 #: Longest frame read as a keepalive. A ping is short, and an upload needn't be parsed.
 _KEEPALIVE_MAX_CHARS = 256
 #: How Hermes says what its sessions are doing. Its own liveness signal.
 BUSY_METHOD = "session.active_list"
-#: The door's own id, so its answer can be taken out of what the client is sent.
-BUSY_ID = "flotta-door-busy"
+#: How the door's own ids start, so an answer can be taken out of what the client is sent.
+BUSY_ID_PREFIX = "flotta-door-busy-"
 #: A status with nothing at work. Any other, known or not, holds the box awake.
 QUIET_STATUS = "idle"
 #: How long Hermes has to answer. Well under a beat, and no answer holds it awake.
@@ -201,13 +205,18 @@ class Liveness:
 
     **Anything short of Hermes saying it is idle holds the box awake.** That costs
     what the door has always cost, and sleeping under a turn loses the work.
+
+    **Someone saying something brings the beat forward** (FLOTTA-120). The prompt is
+    on the box already, and the sweep only reads `addressed`, so waiting for a beat
+    could put the box to sleep under a turn that has just started. Opening a
+    conversation needs none of this: the wake that opened it has just been counted.
     """
 
     def __init__(self, name: str) -> None:
         self._name = name
-        # Opening a conversation is someone arriving.
-        self._spoke = True
+        self._spoke = asyncio.Event()
         self._send: Callable[[str], Awaitable[None]] | None = None
+        self._asked = 0
         self._answer: asyncio.Future[bool | None] | None = None
         self._warned = False
 
@@ -217,42 +226,64 @@ class Liveness:
     def heard(self, frame: str | bytes) -> None:
         """A frame from the client, on its way to the box."""
         if isinstance(frame, bytes) or not is_keepalive(frame):
-            self._spoke = True
+            self._spoke.set()
+            # This beat counts now, whatever Hermes has yet to say.
+            self._settle(True)
 
     def take_answer(self, frame: str) -> bool:
         """Whether a frame from the box answers the door, and so stops here."""
-        if BUSY_ID not in frame:
+        if BUSY_ID_PREFIX not in frame:
             return False
         try:
             parsed = json.loads(frame)
         except ValueError:
             return False
-        if not isinstance(parsed, dict) or parsed.get("id") != BUSY_ID:
+        rid = parsed.get("id") if isinstance(parsed, dict) else None
+        if not isinstance(rid, str) or not rid.startswith(BUSY_ID_PREFIX):
             return False
-        if self._answer is not None and not self._answer.done():
-            self._answer.set_result(read_working(parsed))
+        # An answer to an older question stops here too, and decides nothing.
+        if rid == self._busy_id():
+            self._settle(read_working(parsed))
         return True
+
+    def _busy_id(self) -> str:
+        return f"{BUSY_ID_PREFIX}{self._asked}"
+
+    def _settle(self, working: bool | None) -> None:
+        if self._answer is not None and not self._answer.done():
+            self._answer.set_result(working)
+
+    def _took_speech(self) -> bool:
+        spoke = self._spoke.is_set()
+        self._spoke.clear()
+        return spoke
 
     async def _working(self) -> bool | None:
         if self._send is None:
             return None
+        self._asked += 1
         self._answer = asyncio.get_running_loop().create_future()
+        question = {"jsonrpc": "2.0", "id": self._busy_id(), "method": BUSY_METHOD, "params": {}}
         try:
-            await self._send(
-                json.dumps({"jsonrpc": "2.0", "id": BUSY_ID, "method": BUSY_METHOD, "params": {}})
-            )
+            await self._send(json.dumps(question))
             return await asyncio.wait_for(self._answer, BUSY_TIMEOUT_S)
         except Exception:
             return None
         finally:
             self._answer = None
 
+    async def beat(self) -> None:
+        """Until the next beat is due, or someone says something."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._spoke.wait(), HEARTBEAT_S)
+
     async def needs_box(self) -> bool:
         """Whether this beat should hold the box awake."""
-        spoke, self._spoke = self._spoke, False
-        if spoke:
+        if self._took_speech():
             return True
         working = await self._working()
+        if self._took_speech():
+            return True
         if working is None and not self._warned:
             self._warned = True
             _log.warning("%s did not say whether it is working; holding it awake", self._name)
@@ -933,11 +964,15 @@ def create_door(
             suspend a box someone is mid-sentence with. The interval is well
             under the idle threshold so a single missed beat is survivable.
             An open socket with nobody on it holds nothing: see `Liveness`.
+
+            One task, off the relay, so a slow control plane never holds up what
+            someone said and a burst of frames can't become a burst of requests.
             """
             while True:
-                await asyncio.sleep(HEARTBEAT_S)
+                await liveness.beat()
                 if await liveness.needs_box():
                     await plane.touch(target.box_id)
+                    await asyncio.sleep(TOUCH_GAP_S)
 
         heartbeat = asyncio.create_task(keep_awake())
 

@@ -347,13 +347,14 @@ def _door_for(
             self.resolved = []
             self.woken = []
             self.woken_ids = []
+            self.touched = []
 
         async def resolve(self, name):
             self.resolved.append(name)
             return Address(box_id=box_id, name=name, org=box_org, client=box_client)
 
         async def touch(self, box):
-            await self.wake(box, box_id=box)
+            self.touched.append(box)
 
         async def wake(self, name, *, box_id=None):
             self.woken.append(name)
