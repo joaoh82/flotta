@@ -479,7 +479,7 @@ local control="8080" door="8081":
     [ -s "$DIR/box-password" ] || (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > "$DIR/box-password")
     export FLOTTA_BACKEND=local FLOTTA_LOCAL_HOME="$DIR/boxes" FLOTTA_STORE="$DIR/fleet.db"
     export FLOTTA_SIGNING_KEY="$(cat "$DIR/signing-key")" FLOTTA_BOX_PASSWORD="$(cat "$DIR/box-password")"
-    export FLOTTA_PRINT_SIGN_IN_LINKS=1 FLOTTA_DOMAIN=localhost FLOTTA_DOOR_ORIGINS=http://localhost:3001
+    export FLOTTA_PRINT_SIGN_IN_LINKS=1 FLOTTA_ALLOW_LOCAL_WEBHOOKS=1 FLOTTA_DOMAIN=localhost FLOTTA_DOOR_ORIGINS=http://localhost:3001
     # A browser reaches this door as `ws://<agent>.localhost:<port>`, not TLS on 443.
     export FLOTTA_DOOR_URL="ws://localhost:{{door}}"
     export FLOTTA_CONTROL_URL="http://127.0.0.1:{{control}}"
@@ -491,6 +491,12 @@ local control="8080" door="8081":
     FLOTTA_DOOR_LOCAL=1 uv run --extra door flotta door --host 127.0.0.1 --port {{door}} & DOOR=$!
     echo "local fleet: control plane http://127.0.0.1:{{control}}, agents at http://<agent>.localhost:{{door}}, state in $DIR"
     wait
+
+# Prints each alert it gets and whether its signature checks. `secret` is what
+# setting the webhook answered with: see docs/ALERTS.md.
+# M13.7: receive budget alerts locally, on http://127.0.0.1:8184
+webhook-receiver secret port="8184":
+    uv run python -m flotta.webhook_receiver --secret {{secret}} --port {{port}}
 
 # Port 3001 is baked into dashboard/package.json rather than passed here: 3000
 # is reserved for another local service and a flag is too easy to forget.

@@ -45,6 +45,8 @@ class Message:
     html: str
     #: The link the message carries, for a mailer that prints rather than sends.
     link: str
+    #: What a mailer that prints calls it.
+    kind: str = "sign-in link"
 
 
 #: Delivers one message, or raises. Injected into the control plane so the
@@ -137,7 +139,8 @@ def invite_message(to: str, url: str, org_name: str, role: str) -> Message:
 def print_mailer(message: Message) -> None:
     """Local development: the message goes to the log, link and all."""
     _log.warning(
-        "sign-in link for %s (printed, not emailed; no $%s): %s",
+        "%s for %s (printed, not emailed; no $%s): %s",
+        message.kind,
         message.to,
         RESEND_API_KEY_ENV,
         message.link,
