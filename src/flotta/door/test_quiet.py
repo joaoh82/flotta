@@ -1,0 +1,313 @@
+"""An open conversation holds an agent awake only while it needs to (FLOTTA-117).
+
+The door used to touch the box every beat for as long as a socket was open, so a
+forgotten tab kept a machine billing for ever. Now a beat counts only if someone
+said something since the last one, or Hermes says something is at work.
+
+The guards come first. **A quiet open socket lets the agent sleep, and a turn with
+no frames at all doesn't.** The second is the costly one to get wrong, so anything
+Hermes doesn't plainly answer holds the agent awake.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import threading
+import time
+
+import pytest
+from starlette.testclient import TestClient
+
+from flotta.door import app as door
+from flotta.door.app import BUSY_ID, Liveness, is_keepalive, read_working
+from flotta.door.test_tickets import HOST, WEB_APP, _door, _protocols, _ticket
+
+PING = '{"jsonrpc":"2.0","id":7,"method":"gateway.ping","params":{}}'
+
+
+@pytest.fixture(autouse=True)
+def quick_beats(monkeypatch):
+    monkeypatch.setattr(door, "HEARTBEAT_S", 0.03)
+
+
+@pytest.fixture
+def box():
+    """Hermes's socket on a real port: it answers `session.active_list` as `seen` says."""
+    from aiohttp import WSMsgType, web
+
+    seen: dict = {"asked": 0, "frames": [], "statuses": ["idle"], "answer": "statuses"}
+
+    async def ready(_request):
+        return web.json_response({"ok": True})
+
+    async def agent(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str('{"method":"event","params":{"type":"gateway.ready"}}')
+        async for message in ws:
+            if message.type is not WSMsgType.TEXT:
+                continue
+            if door.BUSY_METHOD not in message.data:
+                seen["frames"].append(message.data)
+                await ws.send_str(f"echo:{message.data}")
+                continue
+            seen["asked"] += 1
+            rid = json.loads(message.data)["id"]
+            match seen["answer"]:
+                case "statuses":
+                    rows = [{"status": status} for status in seen["statuses"]]
+                    await ws.send_str(json.dumps({"id": rid, "result": {"sessions": rows}}))
+                case "error":
+                    error = {"code": -32601, "message": "unknown method"}
+                    await ws.send_str(json.dumps({"id": rid, "error": error}))
+                case "garbled":
+                    await ws.send_str(json.dumps({"id": rid, "result": {"sessions": "many"}}))
+                case "silent":
+                    pass
+        return ws
+
+    application = web.Application()
+    application.router.add_get("/", ready)
+    application.router.add_get("/api/ws", agent)
+
+    loop = asyncio.new_event_loop()
+    runner = web.AppRunner(application)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    loop.run_until_complete(site.start())
+    port = site._server.sockets[0].getsockname()[1]
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        yield port, seen
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.run_until_complete(runner.cleanup())
+        loop.close()
+
+
+def _until(condition, *, within=5.0):
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.005)
+    pytest.fail("it never happened")
+
+
+class _Open:
+    """A browser with a conversation open."""
+
+    def __init__(self, box):
+        self.port, self.seen = box
+        self.app, self.plane = _door(self.port)
+
+    def __enter__(self):
+        self.client = TestClient(self.app).__enter__()
+        self.ws = self.client.websocket_connect(
+            "/api/ws", headers={**HOST, "Origin": WEB_APP}, subprotocols=_protocols(_ticket())
+        ).__enter__()
+        assert "gateway.ready" in self.ws.receive_text()
+        return self
+
+    def __exit__(self, *exc):
+        self.ws.__exit__(*exc)
+        self.client.__exit__(*exc)
+
+    @property
+    def touches(self):
+        return len(self.plane.woken_ids)
+
+    def asked_again(self, times=3):
+        """Let this many more of the door's questions go by."""
+        target = self.seen["asked"] + times
+        _until(lambda: self.seen["asked"] >= target)
+
+
+# -- the guards --------------------------------------------------------------
+
+
+def test_a_quiet_open_socket_stops_holding_the_agent_awake(box):
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        settled = tab.touches
+        tab.asked_again(4)
+        assert tab.touches == settled
+
+
+def test_a_page_keeping_its_socket_alive_is_not_a_person(box):
+    """It pings every 15 seconds so Cloudflare keeps the socket, with nobody there."""
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        settled = tab.touches
+        for _ in range(4):
+            tab.ws.send_text(PING)
+            tab.asked_again(1)
+        assert tab.touches == settled
+        assert PING in tab.seen["frames"]
+
+
+@pytest.mark.parametrize("status", ["working", "starting", "waiting", "something-new"])
+def test_a_turn_with_no_frames_holds_the_agent_awake(box, status):
+    """A long tool sends nothing, and an agent waiting on a person must not vanish."""
+    box[1]["statuses"] = [status]
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        before = tab.touches
+        tab.asked_again(3)
+        assert tab.touches > before
+
+
+def test_one_session_at_work_among_idle_ones_holds_it(box):
+    box[1]["statuses"] = ["idle", "working", "idle"]
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        before = tab.touches
+        tab.asked_again(3)
+        assert tab.touches > before
+
+
+def test_someone_saying_something_counts_once_and_then_it_is_quiet_again(box):
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        settled = tab.touches
+        tab.ws.send_text('{"id":8,"method":"prompt.submit","params":{"text":"hi"}}')
+        _until(lambda: tab.touches == settled + 1)
+        tab.asked_again(4)
+        assert tab.touches == settled + 1
+
+
+def test_a_binary_frame_counts_as_someone_saying_something(box):
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        settled = tab.touches
+        tab.ws.send_bytes(b"gateway.ping")
+        _until(lambda: tab.touches == settled + 1)
+
+
+@pytest.mark.parametrize("answer", ["error", "garbled", "silent"])
+def test_no_plain_answer_holds_the_agent_awake(box, answer, monkeypatch):
+    """Staying up costs cents. Sleeping under a turn loses the work."""
+    monkeypatch.setattr(door, "BUSY_TIMEOUT_S", 0.03)
+    box[1]["answer"] = answer
+    with _Open(box) as tab:
+        tab.asked_again(1)
+        before = tab.touches
+        tab.asked_again(3)
+        assert tab.touches > before
+
+
+def test_no_answer_is_logged_once_for_the_conversation(box, caplog):
+    box[1]["answer"] = "error"
+    with caplog.at_level(logging.WARNING, logger=door._log.name), _Open(box) as tab:
+        tab.asked_again(4)
+    said = [r for r in caplog.records if "did not say" in r.getMessage()]
+    assert len(said) == 1
+
+
+def test_a_closed_socket_stops_asking(box):
+    with _Open(box) as tab:
+        tab.asked_again(1)
+    asked = box[1]["asked"]
+    time.sleep(0.15)
+    assert box[1]["asked"] == asked
+
+
+# -- nothing the door asks reaches the browser --------------------------------
+
+
+def test_the_browser_never_sees_the_doors_question_answered(box):
+    with _Open(box) as tab:
+        tab.asked_again(3)
+        tab.ws.send_text("hello")
+        assert tab.ws.receive_text() == "echo:hello"
+
+
+def test_what_the_agent_says_reaches_the_browser_even_if_it_names_the_question(box):
+    """Only an answer with the door's id is the door's."""
+    said = json.dumps({"method": "event", "params": {"payload": {"text": BUSY_ID}}})
+    with _Open(box) as tab:
+        tab.ws.send_text(said)
+        tab.ws.send_text("and then")  # So a frame kept back fails here, and doesn't hang.
+        assert tab.ws.receive_text() == f"echo:{said}"
+
+
+# -- one conversation's state -------------------------------------------------
+
+
+def test_opening_a_conversation_counts_as_someone_arriving():
+    sent = []
+
+    async def send(frame):
+        sent.append(frame)
+
+    async def go():
+        liveness = Liveness("eng-a")
+        liveness.connected(send)
+        assert await liveness.needs_box()
+
+    asyncio.run(go())
+    assert sent == []
+
+
+def test_a_beat_before_the_box_is_connected_holds_it_awake():
+    async def go():
+        liveness = Liveness("eng-a")
+        await liveness.needs_box()
+        assert await liveness.needs_box()
+
+    asyncio.run(go())
+
+
+def test_an_answer_after_the_door_gave_up_still_stops_at_the_door():
+    answer = json.dumps({"id": BUSY_ID, "result": {"sessions": []}})
+    assert Liveness("eng-a").take_answer(answer)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        "echo:hello",
+        f"not json {BUSY_ID}",
+        f'["{BUSY_ID}"]',
+        json.dumps({"method": "event", "params": {"payload": {"text": BUSY_ID}}}),
+    ],
+)
+def test_anything_else_goes_on_to_the_client(frame):
+    assert not Liveness("eng-a").take_answer(frame)
+
+
+# -- reading the frames ------------------------------------------------------
+
+
+def test_only_a_ping_is_a_keepalive():
+    assert is_keepalive(PING)
+    assert not is_keepalive('{"id":8,"method":"prompt.submit","params":{"text":"gateway.ping"}}')
+    assert not is_keepalive("gateway.ping")
+    assert not is_keepalive('["gateway.ping"]')
+    assert not is_keepalive(json.dumps({"method": "gateway.ping", "params": {"pad": "x" * 2000}}))
+
+
+@pytest.mark.parametrize(
+    ("frame", "working"),
+    [
+        ({"id": BUSY_ID, "result": {"sessions": []}}, False),
+        ({"id": BUSY_ID, "result": {"sessions": [{"status": "idle"}]}}, False),
+        ({"id": BUSY_ID, "result": {"sessions": [{"status": "working"}]}}, True),
+        (
+            {"id": BUSY_ID, "result": {"sessions": [{"status": "idle"}, {"status": "waiting"}]}},
+            True,
+        ),
+        ({"id": BUSY_ID, "result": {"sessions": [{}]}}, None),
+        ({"id": BUSY_ID, "result": {"sessions": ["idle"]}}, None),
+        ({"id": BUSY_ID, "result": {"sessions": "many"}}, None),
+        ({"id": BUSY_ID, "result": {}}, None),
+        ({"id": BUSY_ID, "result": "idle"}, None),
+        ({"id": BUSY_ID, "error": {"code": -32601}}, None),
+    ],
+)
+def test_what_an_answer_says(frame, working):
+    assert read_working(frame) is working

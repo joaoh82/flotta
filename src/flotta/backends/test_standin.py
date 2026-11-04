@@ -236,6 +236,40 @@ def test_a_tool_turn_reports_the_tool_as_a_gateway_does(tmp_path):
     _run(test, tmp_path)
 
 
+def test_it_says_what_its_sessions_are_doing_as_the_door_asks(tmp_path):
+    """Idle unless an approval is waiting, so an open tab lets `just dev` sleep too."""
+
+    async def statuses(ws, rid):
+        answer = await _call(ws, rid, "session.active_list")
+        return [row["status"] for row in answer["result"]["sessions"]]
+
+    async def test(http):
+        ws = await _socket(http)
+        assert await statuses(ws, 1) == []
+        live = (await _call(ws, 2, "session.create"))["result"]["session_id"]
+        assert await statuses(ws, 3) == ["idle"]
+        await ws.send_str(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "prompt.submit",
+                    "params": {"session_id": live, "text": "!approve"},
+                }
+            )
+        )
+        before = await _frames_until(ws, lambda f: f.get("method") == "approval")
+        assert await statuses(ws, 5) == ["waiting"]
+        await ws.send_str(
+            json.dumps({"jsonrpc": "2.0", "id": before[-1]["id"], "result": {"choice": "deny"}})
+        )
+        await _frames_until(ws, _complete)
+        assert await statuses(ws, 6) == ["idle"]
+        await ws.close()
+
+    _run(test, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("choice", "ran", "reply"),
     [

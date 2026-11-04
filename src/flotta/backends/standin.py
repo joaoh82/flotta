@@ -587,6 +587,15 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
         agent.images[str(params.get("session_id") or "")] = kept
         return [_result(rid, {"detached": detached, "count": len(kept)})]
 
+    if method == "session.active_list":
+        # A turn ends in the frame that starts it here, unless it asked for an approval.
+        waiting = {live_id for live_id, _stored_id in agent.asked.values()}
+        rows = [
+            {"id": live_id, "status": "waiting" if live_id in waiting else "idle"}
+            for live_id in agent.live
+        ]
+        return [_result(rid, {"sessions": rows})]
+
     if rid is None:
         return []
     return [_error(rid, METHOD_NOT_FOUND, f"the local stand-in does not serve {method!r}")]
