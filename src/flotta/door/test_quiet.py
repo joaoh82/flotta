@@ -20,6 +20,7 @@ import time
 
 import pytest
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from flotta.door import app as door
 from flotta.door.app import BUSY_ID_PREFIX, Liveness, is_keepalive, read_working
@@ -112,6 +113,23 @@ def _receive(ws, *, within=4.0):
         return frames.get(timeout=within)
     except queue.Empty:
         pytest.fail("nothing came back")
+
+
+def _closes(ws, *, within=4.0):
+    """Whether the door closes this socket, rather than keeping it or sending something."""
+    ended = queue.Queue()
+
+    def wait():
+        try:
+            ended.put(ws.receive_text())
+        except WebSocketDisconnect as closed:
+            ended.put(closed)
+
+    threading.Thread(target=wait, daemon=True).start()
+    try:
+        return isinstance(ended.get(timeout=within), WebSocketDisconnect)
+    except queue.Empty:
+        return False
 
 
 class _Open:
@@ -330,6 +348,68 @@ def test_the_gap_is_no_longer_than_what_the_control_plane_would_write_anyway():
     assert 0 < SHIPPED_TOUCH_GAP_S <= ACTIVITY_FLOOR_S
 
 
+# -- a socket to an agent that has gone to sleep (FLOTTA-121) ------------------
+
+
+@pytest.mark.parametrize("status", ["stopped", "paused", "torn_down"])
+def test_no_answer_from_a_box_that_is_not_running_does_not_wake_it(box, status, monkeypatch):
+    """A suspended machine can leave the socket open and silent, and a touch is a wake."""
+    monkeypatch.setattr(door, "BUSY_TIMEOUT_S", 0.02)
+    box[1]["answer"] = "silent"
+    with _Open(box) as tab:
+        tab.plane.status = status
+        assert _closes(tab.ws), "the page has to be told, so it can offer to reconnect"
+        assert tab.plane.touched == []
+        assert tab.plane.woken_ids == ["b-1"]
+
+
+def test_no_answer_from_a_running_box_still_holds_it(box, monkeypatch):
+    """A Hermes too busy to answer is the case failing open exists for."""
+    monkeypatch.setattr(door, "BUSY_TIMEOUT_S", 0.02)
+    box[1]["answer"] = "silent"
+    with _Open(box) as tab:
+        tab.plane.status = "running"
+        _until(lambda: tab.touches >= 2)
+
+
+def test_no_answer_when_the_fleet_cant_say_either_still_holds_it(box, monkeypatch):
+    monkeypatch.setattr(door, "BUSY_TIMEOUT_S", 0.02)
+    box[1]["answer"] = "silent"
+    with _Open(box) as tab:
+        real = tab.plane.resolve
+
+        async def down(_name):
+            raise door.BoxUnavailable("cannot reach the control plane", status=503)
+
+        tab.plane.resolve = down
+        _until(lambda: tab.touches >= 2)
+        tab.plane.resolve = real
+
+
+def test_someone_speaking_to_a_sleeping_box_still_wakes_it(box, monkeypatch):
+    """They are there, and what they said is waiting on the socket."""
+    monkeypatch.setattr(door, "HEARTBEAT_S", 60.0)
+    with _Open(box) as tab:
+        tab.plane.status = "stopped"
+        tab.ws.send_text(PROMPT)
+        _until(lambda: tab.touches == 1)
+        assert _receive(tab.ws) == f"echo:{PROMPT}"
+
+
+def test_a_box_that_answers_is_up_whatever_the_fleet_last_wrote(box):
+    box[1]["statuses"] = ["working"]
+    with _Open(box) as tab:
+        tab.plane.status = "stopped"
+        _until(lambda: tab.touches >= 2)
+
+
+def test_a_plain_answer_never_asks_the_fleet(box):
+    with _Open(box) as tab:
+        resolved = len(tab.plane.resolved)
+        tab.asked_again(4)
+        assert len(tab.plane.resolved) == resolved
+
+
 # -- one conversation's state -------------------------------------------------
 
 
@@ -445,6 +525,20 @@ def test_a_beat_waits_for_someone_to_say_something_or_for_its_time(monkeypatch):
         assert not waiting.done()
         liveness.heard(PROMPT)
         await asyncio.wait_for(waiting, 1)
+
+    asyncio.run(go())
+
+
+def test_no_answer_last_beat_says_nothing_about_this_one():
+    """Speech on the next beat has to wake the box, not end the conversation over a stale flag."""
+
+    async def go():
+        liveness = Liveness("eng-a")
+        assert await liveness.needs_box()
+        assert liveness.unanswered
+        liveness.heard(PROMPT)
+        assert await liveness.needs_box()
+        assert not liveness.unanswered
 
     asyncio.run(go())
 
