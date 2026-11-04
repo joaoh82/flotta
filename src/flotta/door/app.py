@@ -219,6 +219,8 @@ class Liveness:
         self._asked = 0
         self._answer: asyncio.Future[bool | None] | None = None
         self._warned = False
+        #: Whether the last beat held the box only because Hermes gave no plain answer.
+        self.unanswered = False
 
     def connected(self, send: Callable[[str], Awaitable[None]]) -> None:
         self._send = send
@@ -279,15 +281,24 @@ class Liveness:
 
     async def needs_box(self) -> bool:
         """Whether this beat should hold the box awake."""
+        self.unanswered = False
         if self._took_speech():
             return True
         working = await self._working()
         if self._took_speech():
             return True
+        self.unanswered = working is None
         if working is None and not self._warned:
             self._warned = True
             _log.warning("%s did not say whether it is working; holding it awake", self._name)
         return working is not False
+
+
+async def _is_down(plane: Any, box: str) -> bool:
+    """Whether the fleet says a box isn't running. Never wakes it, and not knowing isn't down."""
+    with contextlib.suppress(Exception):
+        return (await plane.resolve(box)).status not in (None, "running")
+    return False
 
 
 class BoxUnavailable(Exception):
@@ -312,6 +323,8 @@ class Address:
     name: str
     org: str = DEFAULT_ORG
     client: str = DEFAULT_CLIENT
+    #: What the fleet says it is doing. `None` from a control plane that doesn't say.
+    status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +541,7 @@ class ControlPlane:
             # token: a control plane that predates tenancy has one org.
             org=box.get("org") or DEFAULT_ORG,
             client=box.get("client") or DEFAULT_CLIENT,
+            status=box.get("status"),
         )
 
     async def _call(self, method: str, path: str, *, name: str, verb: str) -> Any:
@@ -967,10 +981,18 @@ def create_door(
 
             One task, off the relay, so a slow control plane never holds up what
             someone said and a burst of frames can't become a burst of requests.
+
+            Returning ends the conversation. A suspended machine may leave this
+            socket open and silent, and a touch is a wake, so holding it awake
+            on no answer would start the box it had just let sleep (FLOTTA-121).
+            Someone saying something still wakes it: they are there.
             """
             while True:
                 await liveness.beat()
                 if await liveness.needs_box():
+                    if liveness.unanswered and await _is_down(plane, target.box_id):
+                        _log.info("%s is asleep; closing its quiet conversation", target.name)
+                        return
                     await plane.touch(target.box_id)
                     await asyncio.sleep(TOUCH_GAP_S)
 
@@ -1026,6 +1048,7 @@ def create_door(
                     [
                         asyncio.create_task(downstream_to_box()),
                         asyncio.create_task(box_to_downstream()),
+                        heartbeat,
                     ],
                     return_when=asyncio.FIRST_COMPLETED,
                 )

@@ -348,10 +348,13 @@ def _door_for(
             self.woken = []
             self.woken_ids = []
             self.touched = []
+            self.status = None
 
         async def resolve(self, name):
             self.resolved.append(name)
-            return Address(box_id=box_id, name=name, org=box_org, client=box_client)
+            return Address(
+                box_id=box_id, name=name, org=box_org, client=box_client, status=self.status
+            )
 
         async def touch(self, box):
             self.touched.append(box)
@@ -987,6 +990,19 @@ def test_a_control_plane_that_predates_tenancy_means_the_default_org(stub_plane)
     address = asyncio.run(plane.resolve("eng-a"))
 
     assert (address.org, address.client) == ("default", "default")
+
+
+def test_resolving_says_what_the_fleet_says_the_box_is_doing(stub_plane):
+    """No `status` is a control plane that doesn't say, which isn't a box that's down."""
+    import asyncio
+
+    plane, replies, _ = stub_plane
+    box = {"id": "b-1", "name": "eng-a"}
+    replies["/api/boxes/eng-a/address"] = (200, {"box": {**box, "status": "stopped"}})
+    assert asyncio.run(plane.resolve("eng-a")).status == "stopped"
+
+    replies["/api/boxes/eng-a/address"] = (200, {"box": box})
+    assert asyncio.run(plane.resolve("eng-a")).status is None
 
 
 def test_resolving_an_unknown_box_is_the_same_404_as_waking_one(stub_plane):
