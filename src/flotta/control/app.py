@@ -1602,7 +1602,8 @@ def create_app(
 
         `{"alert_email": "ops@example.com", "webhook_url": "https://example.com/hook"}`,
         and `null` removes either. **Setting a webhook answers with `webhook_secret`, this
-        once:** setting it again, even to the same URL, makes a new one. `docs/ALERTS.md`.
+        once:** setting it again, even to the same URL, makes a new one. A new URL takes
+        over any alert still being tried. `docs/ALERTS.md`.
         """
         _admin_of(token, org_id)
         import secrets

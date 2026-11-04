@@ -167,6 +167,49 @@ def test_two_agencies_claiming_one_installation_at_once_leaves_one_owner(pg_stor
     assert len(held) == 1
 
 
+def test_a_webhook_changed_while_alerts_are_queued_still_gets_them(pg_store, monkeypatch):
+    """FLOTTA-93: without the shared guard, the change misses the row being queued for
+    the old URL, and that alert is then never delivered anywhere."""
+    from datetime import UTC, datetime
+
+    from flotta.pricing import NANO
+    from flotta.store import FleetStore
+
+    old, new = "https://old.example.com/hook", "https://new.example.com/hook"
+    pg_store.create_org("studio", "Studio")
+    pg_store.create_client("studio", "acme", "Acme")
+    pg_store.set_org_alerts("studio", alert_email=None, webhook_url=old, nonce="one")
+    budget = pg_store.set_budget(
+        "studio", period="day", limit_eur_nano=20 * NANO, action="pause", client="acme"
+    )
+    pg_store.record_budget_event(
+        budget, "budget_limit", period_start=datetime(2026, 11, 4, tzinfo=UTC), payload={}
+    )
+
+    def change():
+        with FleetStore(pg_store._url) as fleet:
+            fleet.set_org_alerts("studio", alert_email=None, webhook_url=new, nonce="two")
+
+    changer = threading.Thread(target=change)
+    targets = pg_store._alert_targets
+
+    def change_midway(org):
+        found = targets(org)
+        changer.start()
+        changer.join(timeout=1.0)  # With the guard it is still waiting after this.
+        return found
+
+    monkeypatch.setattr(pg_store, "_alert_targets", change_midway)
+    pg_store.queue_budget_alerts()
+    changer.join(timeout=15)
+    assert not changer.is_alive()
+
+    webhooks = {
+        d.target: d.status for d in pg_store.alert_deliveries("studio") if d.channel == "webhook"
+    }
+    assert webhooks == {old: "replaced", new: "pending"}
+
+
 def test_a_clients_installation_comes_before_its_orgs_on_postgres(pg_store):
     """`ORDER BY client IS NULL` sorts booleans there, where SQLite sorts integers."""
     pg_store.create_org("agency-a", "agency-a")

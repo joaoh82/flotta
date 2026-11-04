@@ -217,6 +217,12 @@ def test_a_restart_before_a_send_loses_nothing(fleet):
         "https://[fe80::1]/hook",
         "https://[fdaa:0:1::2]/hook",
         "https://[::ffff:10.0.0.8]/hook",
+        "https://224.0.0.1/hook",
+        "https://239.255.255.250/hook",
+        "https://[ff02::1]/hook",
+        "https://[ff0e::1]/hook",
+        "https://[fec0::1]/hook",
+        "https://[5f00::1]/hook",
         "https://localhost/hook",
         "https://box.localhost/hook",
         "https://eng-a.internal/hook",
@@ -252,6 +258,11 @@ def test_a_public_https_url_is_a_webhook():
         ["2002:5db8:d822::"],
         ["2001:0:4136:e378:8000:63bf:3fff:fdd2"],
         ["93.184.216.34", "10.0.0.8"],
+        ["224.0.0.1"],
+        ["ff02::1"],
+        ["fec0::1"],
+        ["4000::1"],
+        ["93.184.216.34", "ff02::1"],
         ["fe80::1%eth0"],
         ["not an address"],
     ],
@@ -464,15 +475,237 @@ def test_a_webhook_removed_after_it_was_queued_is_not_called(fleet):
     assert sends.posts == []
 
 
-def test_a_webhook_changed_after_it_was_queued_does_not_get_a_secret_it_never_saw(fleet):
+NEW_HOOK = "https://elsewhere.example.com/flotta"
+
+
+def _webhooks(store):
+    return {d.target: d for d in store.alert_deliveries("studio-nord") if d.channel == "webhook"}
+
+
+def _failures(store):
+    events = store.budget_events("studio-nord")
+    return [e.type for e in events if e.type.startswith("alert_failed")]
+
+
+def test_a_webhook_changed_before_its_first_try_gets_the_alert_at_the_new_url(fleet):
     store, db = fleet
     _webhook(store)
     _cross(store, _budget(store))
     store.queue_budget_alerts()
-    _webhook(store, url="https://elsewhere.example.com/", nonce="nonce-2")
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    sends = _Sends()
+    sends.sweep(db)
+    assert [post[0] for post in sends.posts] == [NEW_HOOK], "and never the old URL"
+    url, _, body, headers = sends.posts[0]
+    secret = webhook_secret(KEY, "studio-nord", "nonce-2")
+    assert verify_signature(secret, headers["Flotta-Signature"], body, now=sends.now)
+    assert json.loads(body)["type"] == "budget.limit"
+    found = _webhooks(store)
+    assert found[HOOK].status == "replaced"
+    assert found[NEW_HOOK].status == "sent"
+    assert headers["Flotta-Delivery"] == found[NEW_HOOK].id
+    assert _failures(store) == [], "the alert did not fail: it moved"
+
+
+def test_fixing_a_webhook_after_a_failed_try_delivers_the_alert_straight_away(fleet):
+    """The case the retries are for: the endpoint was wrong, and someone fixed it."""
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    broken = _Sends(status=500)
+    broken.sweep(db)
+    assert _webhooks(store)[HOOK].attempts == 1
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    fixed = _Sends()
+    fixed.now = broken.now + 1  # Long before the old URL's next try.
+    fixed.sweep(db)
+    assert [post[0] for post in fixed.posts] == [NEW_HOOK]
+    found = _webhooks(store)[NEW_HOOK]
+    assert (found.status, found.attempts) == ("sent", 1)
+    assert _failures(store) == []
+
+
+def test_a_fix_that_fails_too_has_all_its_tries(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    sends = _Sends(status=500)
+    sends.sweep(db)
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    sends.sweep(db)
+    found = _webhooks(store)[NEW_HOOK]
+    assert (found.status, found.attempts, found.last_error) == (
+        "pending",
+        1,
+        "the endpoint answered 500",
+    )
+
+
+def test_changing_a_webhook_and_changing_it_back_delivers_once(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    broken = _Sends(status=500)
+    broken.sweep(db)
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    _webhook(store, url=HOOK, nonce="nonce-3")
+    back = _webhooks(store)[HOOK]
+    assert (back.status, back.attempts, back.next_attempt_at) == ("pending", 0, 0)
+    assert (back.last_error, back.finished_at) == (None, None)
+    sends = _Sends()
+    sends.now = broken.now + 1
+    sends.sweep(db)
+    assert [post[0] for post in sends.posts] == [HOOK]
+    secret = webhook_secret(KEY, "studio-nord", "nonce-3")
+    assert verify_signature(
+        secret, sends.posts[0][3]["Flotta-Signature"], sends.posts[0][2], now=sends.now
+    )
+    found = _webhooks(store)
+    assert found[HOOK].status == "sent"
+    assert found[NEW_HOOK].status == "replaced"
+
+
+def test_an_alert_that_failed_for_good_stays_failed_when_the_webhook_changes(fleet):
+    """Its tries are over, and a threshold from last month isn't news. It is on the timeline."""
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    sends = _Sends(status=500)
+    for _ in range(alerts.MAX_ATTEMPTS):
+        sends.sweep(db)
+        sends.now += max(alerts.RETRY_AFTER_S)
+    assert _webhooks(store)[HOOK].status == "failed"
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    assert NEW_HOOK not in _webhooks(store)
+
+
+def test_an_alert_already_sent_is_not_sent_again_when_the_webhook_changes(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    sends = _Sends()
+    sends.sweep(db)
+    assert len(sends.posts) == 1
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    later = _Sends()
+    later.sweep(db)
+    assert later.posts == []
+    assert _webhooks(store)[HOOK].status == "sent"
+
+
+def test_setting_the_same_url_again_keeps_the_delivery_and_signs_with_the_new_secret(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    sends = _Sends(status=500)
+    sends.sweep(db)
+    before = _webhooks(store)[HOOK]
+    _webhook(store, nonce="nonce-2")
+    assert _webhooks(store)[HOOK] == before, "its tries and its id carry on"
+    sends.status = 200
+    sends.now += alerts.RETRY_AFTER_S[1]
+    sends.sweep(db)
+    url, _, body, headers = sends.posts[-1]
+    assert url == HOOK
+    assert headers["Flotta-Delivery"] == before.id
+    secret = webhook_secret(KEY, "studio-nord", "nonce-2")
+    assert verify_signature(secret, headers["Flotta-Signature"], body, now=sends.now)
+
+
+def test_a_webhook_removed_and_set_again_before_a_sweep_keeps_the_alert(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    store.queue_budget_alerts()
+    store.set_org_alerts("studio-nord", alert_email=None, webhook_url=None, nonce=None)
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    sends = _Sends()
+    sends.sweep(db)
+    assert [post[0] for post in sends.posts] == [NEW_HOOK]
+    assert _failures(store) == []
+
+
+def test_changing_only_the_alert_address_leaves_a_queued_webhook_alone(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    store.queue_budget_alerts()
+    before = _webhooks(store)
+    store.set_org_alerts(
+        "studio-nord", alert_email="ops@example.com", webhook_url=HOOK, nonce="nonce-1"
+    )
+    assert _webhooks(store) == before
+
+
+def test_changing_a_webhook_leaves_another_orgs_alerts_alone(fleet):
+    store, db = fleet
+    store.create_org("other", "Other Agency")
+    store.create_client("other", "acme", "Acme")
+    theirs = "https://other.example.com/hook"
+    store.set_org_alerts("other", alert_email=None, webhook_url=theirs, nonce="theirs")
+    _cross(store, store.set_budget("other", period="day", limit_eur_nano=NANO, action="pause"))
+    store.queue_budget_alerts()
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    assert [(d.target, d.status) for d in store.alert_deliveries("other")] == [(theirs, "pending")]
+
+
+def test_changing_a_webhook_leaves_a_queued_email_alone(fleet):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    store.queue_budget_alerts()
+    _webhook(store, url=NEW_HOOK, nonce="nonce-2")
+    emails = [d for d in store.alert_deliveries("studio-nord") if d.channel == "email"]
+    assert [(d.target, d.status) for d in emails] == [("owner@example.com", "pending")]
+    assert set(_webhooks(store)) == {HOOK, NEW_HOOK}
+
+
+@pytest.mark.parametrize(
+    "answer", [WebhookRefused("this endpoint is refused"), ConnectionError("no answer")]
+)
+def test_a_webhook_changed_during_a_send_does_not_report_a_failure(fleet, answer):
+    """The try that was under way answers for a row that has already moved on."""
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+
+    async def changed_meanwhile(url, address, body, headers):
+        with FleetStore(db) as other:
+            other.set_org_alerts(
+                "studio-nord", alert_email=None, webhook_url=NEW_HOOK, nonce="nonce-2"
+            )
+        raise answer
+
+    _Sends().sweep(db, post=changed_meanwhile)
+    found = _webhooks(store)
+    assert (found[HOOK].status, found[HOOK].attempts) == ("replaced", 0)
+    assert found[NEW_HOOK].status == "pending"
+    assert _failures(store) == []
+    sends = _Sends()
+    sends.sweep(db)
+    assert [post[0] for post in sends.posts] == [NEW_HOOK]
+
+
+def test_a_webhook_changed_between_the_claim_and_the_read_says_nothing_failed(fleet, monkeypatch):
+    store, db = fleet
+    _webhook(store)
+    _cross(store, _budget(store))
+    real = FleetStore.claim_alert_delivery
+
+    def claim_then_change(self, delivery, *, next_attempt_at):
+        taken = real(self, delivery, next_attempt_at=next_attempt_at)
+        if delivery.channel == "webhook":
+            self.set_org_alerts(
+                "studio-nord", alert_email=None, webhook_url=NEW_HOOK, nonce="nonce-2"
+            )
+        return taken
+
+    monkeypatch.setattr(FleetStore, "claim_alert_delivery", claim_then_change)
     sends = _Sends()
     sends.sweep(db)
     assert sends.posts == []
+    assert _webhooks(store)[HOOK].status == "replaced"
+    assert _failures(store) == []
 
 
 def test_the_gateway_knows_nothing_about_alerts():

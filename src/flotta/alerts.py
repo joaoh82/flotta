@@ -106,11 +106,13 @@ def _is_public(address: str) -> bool:
     except ValueError:
         return False
     # An IPv4 address carried in an IPv6 one reaches the IPv4 one, and no webhook needs it.
+    # Site-local is private, whatever `is_global` says of it.
     if isinstance(ip, ipaddress.IPv6Address) and (
-        ip.ipv4_mapped or ip.sixtofour or ip.teredo or ip in _NAT64
+        ip.ipv4_mapped or ip.sixtofour or ip.teredo or ip in _NAT64 or ip.is_site_local
     ):
         return False
-    return ip.is_global
+    # `is_global` says yes to these. `ff02::1` is every node on the link.
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
 
 
 def check_webhook_url(url: str, *, allow_local: bool = False) -> str:
@@ -320,7 +322,7 @@ def _claim_due(store: FleetStore, now: float) -> list[_Work]:
         if event is None:
             store.finish_alert_delivery(delivery.id, status="failed", error="the event is gone")
             continue
-        # A webhook set again since has a new secret, which the old URL never saw.
+        # Moved or removed since this was read: the old URL never saw a new secret.
         current = settings is not None and settings.webhook_url == delivery.target
         claimed.append(_Work(delivery, event, settings.webhook_nonce if current else None))
     return claimed
@@ -343,7 +345,8 @@ def _note(store: FleetStore, outcome: _Outcome) -> None:
     if not outcome.final and tried < MAX_ATTEMPTS:
         store.note_alert_failure(delivery.id, outcome.error)
         return
-    store.finish_alert_delivery(delivery.id, status="failed", error=outcome.error)
+    if not store.finish_alert_delivery(delivery.id, status="failed", error=outcome.error):
+        return  # It moved to a new URL while this was under way, so it hasn't failed.
     event = outcome.work.event
     store.record_alert_failure(
         event,

@@ -2798,9 +2798,7 @@ class FleetStore:
         return [_budget_event_from_row(row) for row in rows]
 
     def get_budget_event(self, event_id: str) -> BudgetEvent | None:
-        row = self._conn.execute(
-            "SELECT * FROM budget_events WHERE id = ?", (event_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM budget_events WHERE id = ?", (event_id,)).fetchone()
         return _budget_event_from_row(row) if row is not None else None
 
     def record_alert_failure(
@@ -2831,17 +2829,50 @@ class FleetStore:
     def set_org_alerts(
         self, org: str, *, alert_email: str | None, webhook_url: str | None, nonce: str | None
     ) -> OrgAlerts:
-        """Replace where `org`'s alerts go. What's queued goes where it was queued for."""
-        self._conn.execute(
-            "INSERT INTO org_alerts (org_id, alert_email, webhook_url, webhook_nonce, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id) DO UPDATE SET "
-            "alert_email = excluded.alert_email, webhook_url = excluded.webhook_url, "
-            "webhook_nonce = excluded.webhook_nonce, updated_at = excluded.updated_at",
-            (org, alert_email, webhook_url, nonce, _utcnow()),
-        )
+        """Replace where `org`'s alerts go, and move what a webhook is still trying to send.
+
+        In the transaction `queue_budget_alerts` takes, so neither can miss the other.
+        """
+        now = _utcnow()
+        with self._conn.transaction(guard="alert_deliveries"):
+            self._conn.execute(
+                "INSERT INTO org_alerts "
+                "(org_id, alert_email, webhook_url, webhook_nonce, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id) DO UPDATE SET "
+                "alert_email = excluded.alert_email, webhook_url = excluded.webhook_url, "
+                "webhook_nonce = excluded.webhook_nonce, updated_at = excluded.updated_at",
+                (org, alert_email, webhook_url, nonce, now),
+            )
+            if webhook_url:
+                self._move_queued_webhooks(org, webhook_url, now)
         found = self.org_alerts(org)
         assert found is not None
         return found
+
+    def _move_queued_webhooks(self, org: str, url: str, now: str) -> None:
+        """A row for `url` with all its tries, for each alert still being tried elsewhere.
+
+        Fixing a wrong URL is what the retries wait for. A row of its own, since the old
+        one says truly where it was going, and `url` may have one from being set before.
+        """
+        rows = self._conn.execute(
+            "SELECT id, event_id FROM alert_deliveries WHERE org_id = ? AND channel = 'webhook' "
+            "AND status = 'pending' AND target <> ?",
+            (org, url),
+        ).fetchall()
+        for row in rows:
+            self._conn.execute(
+                "UPDATE alert_deliveries SET status = 'replaced', finished_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            self._conn.execute(
+                "INSERT INTO alert_deliveries (id, org_id, event_id, channel, target, status, "
+                "next_attempt_at, created_at) VALUES (?, ?, ?, 'webhook', ?, 'pending', 0, ?) "
+                "ON CONFLICT (event_id, channel, target) DO UPDATE SET status = 'pending', "
+                "attempts = 0, next_attempt_at = 0, last_error = NULL, finished_at = NULL "
+                "WHERE alert_deliveries.status = 'replaced'",
+                (f"ad-{uuid.uuid4().hex}", org, row["event_id"], url, now),
+            )
 
     def _alert_targets(self, org: str) -> list[tuple[str, str]]:
         settings = self.org_alerts(org)
@@ -2905,16 +2936,19 @@ class FleetStore:
     def note_alert_failure(self, delivery_id: str, error: str) -> None:
         """A try that failed, with another to come at the time its claim set."""
         self._conn.execute(
-            "UPDATE alert_deliveries SET attempts = attempts + 1, last_error = ? WHERE id = ?",
+            "UPDATE alert_deliveries SET attempts = attempts + 1, last_error = ? "
+            "WHERE id = ? AND status = 'pending'",
             (error, delivery_id),
         )
 
-    def finish_alert_delivery(self, delivery_id: str, *, status: str, error: str | None) -> None:
-        self._conn.execute(
+    def finish_alert_delivery(self, delivery_id: str, *, status: str, error: str | None) -> bool:
+        """False if it was replaced while this try was under way, which then says nothing."""
+        finished = self._conn.execute(
             "UPDATE alert_deliveries SET status = ?, attempts = attempts + 1, last_error = ?, "
-            "finished_at = ? WHERE id = ?",
+            "finished_at = ? WHERE id = ? AND status = 'pending' RETURNING id",
             (status, error, _utcnow(), delivery_id),
-        )
+        ).fetchone()
+        return finished is not None
 
     def alert_deliveries(self, org: str, *, limit: int = 50) -> list[AlertDelivery]:
         """`org`'s newest first."""

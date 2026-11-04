@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from fastapi.testclient import TestClient
 
 from flotta.auth import scopes_for_role, webhook_secret
 from flotta.control.app import create_app
 from flotta.control.test_app import _uncatalogued, _unchecked
+from flotta.pricing import NANO
 from flotta.store import FleetStore
 
 SIGNING_KEY = "a-signing-key-for-these-tests"
@@ -91,6 +94,26 @@ def test_changing_only_the_address_keeps_the_webhook_and_its_secret(api, fleet):
     assert answer == {"alert_email": "ops@example.com", "webhook_url": HOOK}
     with FleetStore(fleet) as store:
         assert store.org_alerts("studio-nord").webhook_nonce == nonce
+
+
+def test_a_url_fixed_through_the_api_moves_what_is_queued(api, fleet):
+    api.put(PATH, json={"webhook_url": HOOK}, headers=_as("owner"))
+    with FleetStore(fleet) as store:
+        budget = store.set_budget(
+            "studio-nord", period="day", limit_eur_nano=20 * NANO, action="pause", client="acme"
+        )
+        store.record_budget_event(
+            budget,
+            "budget_limit",
+            period_start=datetime(2026, 11, 4, tzinfo=UTC),
+            payload={"budget": {"id": budget.id}},
+        )
+        store.queue_budget_alerts()
+    fixed = "https://elsewhere.example.com/flotta"
+    assert api.put(PATH, json={"webhook_url": fixed}, headers=_as("owner")).status_code == 200
+    deliveries = api.get(PATH, headers=_as("owner")).json()["deliveries"]
+    webhooks = {d["target"]: d["status"] for d in deliveries if d["channel"] == "webhook"}
+    assert webhooks == {HOOK: "replaced", fixed: "pending"}
 
 
 def test_null_removes_either(api):

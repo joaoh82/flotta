@@ -49,6 +49,8 @@ Headers:
 
 Answer with a `2xx` within 10 seconds. Anything else counts as a failure, including a redirect. A delivery is tried 5 times in all, after waits of about 1 minute, 5 minutes, 30 minutes and 2 hours. If it still fails, a `budget_events` row of type `alert_failed:<threshold>:<channel>` records it.
 
+**Changing the URL moves what is waiting.** An alert still being tried goes to the new URL at the next sweep, with all its tries and a new `Flotta-Delivery`, and the old URL isn't called again. The old delivery shows as `replaced`. An alert that has already failed for good stays failed, and one that was sent isn't sent again. Setting the same URL again keeps its deliveries, which are then signed with the new secret. Removing the webhook fails what is waiting.
+
 **A receiver can occasionally get the same alert twice,** if the control plane restarts between sending it and recording that it went. Use `Flotta-Delivery` to ignore a repeat.
 
 ## Checking the signature
