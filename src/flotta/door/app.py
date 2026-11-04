@@ -85,6 +85,7 @@ import contextlib
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -153,6 +154,109 @@ DEFAULT_READY_TIMEOUT_S = 90.0
 #: Comfortably under the default 30-minute idle threshold: this only has to
 #: beat the sweep, and a chattier heartbeat would write more events for no gain.
 HEARTBEAT_S = 120.0
+#: What a page sends to keep its socket through Cloudflare. Nobody is behind it.
+KEEPALIVE_METHOD = "gateway.ping"
+#: Longest frame read as a keepalive. A ping is short, and an upload needn't be parsed.
+_KEEPALIVE_MAX_CHARS = 256
+#: How Hermes says what its sessions are doing. Its own liveness signal.
+BUSY_METHOD = "session.active_list"
+#: The door's own id, so its answer can be taken out of what the client is sent.
+BUSY_ID = "flotta-door-busy"
+#: A status with nothing at work. Any other, known or not, holds the box awake.
+QUIET_STATUS = "idle"
+#: How long Hermes has to answer. Well under a beat, and no answer holds it awake.
+BUSY_TIMEOUT_S = 30.0
+
+
+def is_keepalive(frame: str) -> bool:
+    """Whether a frame from the client only keeps the socket open."""
+    if len(frame) > _KEEPALIVE_MAX_CHARS or KEEPALIVE_METHOD not in frame:
+        return False
+    try:
+        parsed = json.loads(frame)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("method") == KEEPALIVE_METHOD
+
+
+def read_working(frame: dict[str, Any]) -> bool | None:
+    """Whether an answer to `BUSY_METHOD` says anything is at work. `None` if it doesn't say."""
+    result = frame.get("result")
+    sessions = result.get("sessions") if isinstance(result, dict) else None
+    if not isinstance(sessions, list):
+        return None
+    statuses = [row.get("status") if isinstance(row, dict) else None for row in sessions]
+    if not all(isinstance(status, str) for status in statuses):
+        return None
+    return any(status != QUIET_STATUS for status in statuses)
+
+
+class Liveness:
+    """Whether one open conversation still needs its box awake (FLOTTA-117).
+
+    An open socket isn't someone talking: a forgotten tab pings for ever, and that
+    used to keep a machine billing for ever. A beat now counts if the client said
+    something since the last one, or if Hermes says something is at work. Frames
+    from the box can't tell: a long tool sends none, and an idle Hermes sends some.
+
+    **Anything short of Hermes saying it is idle holds the box awake.** That costs
+    what the door has always cost, and sleeping under a turn loses the work.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        # Opening a conversation is someone arriving.
+        self._spoke = True
+        self._send: Callable[[str], Awaitable[None]] | None = None
+        self._answer: asyncio.Future[bool | None] | None = None
+        self._warned = False
+
+    def connected(self, send: Callable[[str], Awaitable[None]]) -> None:
+        self._send = send
+
+    def heard(self, frame: str | bytes) -> None:
+        """A frame from the client, on its way to the box."""
+        if isinstance(frame, bytes) or not is_keepalive(frame):
+            self._spoke = True
+
+    def take_answer(self, frame: str) -> bool:
+        """Whether a frame from the box answers the door, and so stops here."""
+        if BUSY_ID not in frame:
+            return False
+        try:
+            parsed = json.loads(frame)
+        except ValueError:
+            return False
+        if not isinstance(parsed, dict) or parsed.get("id") != BUSY_ID:
+            return False
+        if self._answer is not None and not self._answer.done():
+            self._answer.set_result(read_working(parsed))
+        return True
+
+    async def _working(self) -> bool | None:
+        if self._send is None:
+            return None
+        self._answer = asyncio.get_running_loop().create_future()
+        try:
+            await self._send(
+                json.dumps({"jsonrpc": "2.0", "id": BUSY_ID, "method": BUSY_METHOD, "params": {}})
+            )
+            return await asyncio.wait_for(self._answer, BUSY_TIMEOUT_S)
+        except Exception:
+            return None
+        finally:
+            self._answer = None
+
+    async def needs_box(self) -> bool:
+        """Whether this beat should hold the box awake."""
+        spoke, self._spoke = self._spoke, False
+        if spoke:
+            return True
+        working = await self._working()
+        if working is None and not self._warned:
+            self._warned = True
+            _log.warning("%s did not say whether it is working; holding it awake", self._name)
+        return working is not False
 
 
 class BoxUnavailable(Exception):
@@ -341,6 +445,7 @@ class ControlPlane:
         sleep runs on the event log, and a *long conversation writes nothing*:
         the WebSocket is open, the agent is thinking, and without a heartbeat
         the sweep would read the box as quiet and suspend it mid-thought.
+        `Liveness` decides when a conversation is still in use.
 
         Failures are swallowed. Losing a heartbeat costs an unnecessary wake
         later; raising here would drop a live conversation over bookkeeping.
@@ -818,6 +923,8 @@ def create_door(
 
         await websocket.accept(subprotocol=answer)
 
+        liveness = Liveness(target.name)
+
         async def keep_awake() -> None:
             """Hold the box awake for as long as someone is talking to it.
 
@@ -825,10 +932,12 @@ def create_door(
             open and nothing is written — so without this the idle sweep would
             suspend a box someone is mid-sentence with. The interval is well
             under the idle threshold so a single missed beat is survivable.
+            An open socket with nobody on it holds nothing: see `Liveness`.
             """
             while True:
                 await asyncio.sleep(HEARTBEAT_S)
-                await plane.touch(target.box_id)
+                if await liveness.needs_box():
+                    await plane.touch(target.box_id)
 
         heartbeat = asyncio.create_task(keep_awake())
 
@@ -853,6 +962,7 @@ def create_door(
                 proxy=None,
                 max_size=BOX_FRAME_LIMIT,
             ) as upstream:
+                liveness.connected(upstream.send)
 
                 async def downstream_to_box() -> None:
                     while True:
@@ -861,14 +971,17 @@ def create_door(
                             await upstream.close()
                             return
                         if (text := message.get("text")) is not None:
+                            liveness.heard(text)
                             await upstream.send(text)
                         elif (data := message.get("bytes")) is not None:
+                            liveness.heard(data)
                             await upstream.send(data)
 
                 async def box_to_downstream() -> None:
                     async for message in upstream:
                         if isinstance(message, str):
-                            await websocket.send_text(message)
+                            if not liveness.take_answer(message):
+                                await websocket.send_text(message)
                         else:
                             await websocket.send_bytes(message)
 

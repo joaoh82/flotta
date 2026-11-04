@@ -419,10 +419,11 @@ Suspend rather than stop, where the substrate offers it: a suspend restores the
 machine's memory, which is worth little when PID 1 is `sleep infinity` and worth
 a great deal when it is a Hermes that takes seconds to import itself.
 
-**A box in a conversation is never suspended.** The sweep skips any box with a
-live task, and the door reports a heartbeat while a WebSocket is open — a long
-conversation writes nothing to the fleet on its own, so without that the agent
-you are mid-sentence with would look idle.
+**A box in a conversation is not suspended.** The sweep skips any box with a live
+task, and the door reports a heartbeat while someone is saying something or Hermes
+says it is at work — a long conversation writes nothing to the fleet on its own, so
+without that the agent you are mid-sentence with would look idle. An open socket
+with nobody on it holds nothing: a forgotten tab lets its agent sleep.
 
 ## Limitations
 

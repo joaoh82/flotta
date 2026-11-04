@@ -352,6 +352,9 @@ def _door_for(
             self.resolved.append(name)
             return Address(box_id=box_id, name=name, org=box_org, client=box_client)
 
+        async def touch(self, box):
+            await self.wake(box, box_id=box)
+
         async def wake(self, name, *, box_id=None):
             self.woken.append(name)
             started = box_id or name_now_holds or _resolved_id
