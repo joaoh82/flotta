@@ -560,6 +560,20 @@ MIGRATIONS: tuple[Migration, ...] = (
         "budget alerts: where they go, and what has been sent",
         _budget_alerts(),
     ),
+    Migration(
+        15,
+        "client conversations: which of an agent's sessions are a client's",
+        (
+            """
+            CREATE TABLE client_conversations (
+                box_id      TEXT NOT NULL REFERENCES boxes(id),
+                session_id  TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (box_id, session_id)
+            )
+            """,
+        ),
+    ),
 )
 
 

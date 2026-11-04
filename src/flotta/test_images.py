@@ -131,7 +131,7 @@ def test_a_failed_deploy_raises_with_flyctls_own_reason(monkeypatch):
 
 
 def test_a_deploy_that_leaves_no_release_is_a_failure(monkeypatch):
-    """"It said success" is not evidence. `create` already refuses an app with
+    """ "It said success" is not evidence. `create` already refuses an app with
     no completed release; a build that produced none is the same lie earlier."""
     fly = Fly(released="")
     monkeypatch.setenv("FLOTTA_FLY_APP", "build-app")
@@ -272,7 +272,7 @@ def test_the_deployed_control_plane_names_its_context(tmp_path):
 
 
 def test_a_wrong_context_setting_says_which_path_it_tried(tmp_path):
-    """"Missing pyproject.toml" is only useful with the path that was looked
+    """ "Missing pyproject.toml" is only useful with the path that was looked
     in and how it was chosen — that is the difference between fixing an ENV
     line and going to look for a file that exists."""
     with pytest.raises(BuildError, match=r"\$FLOTTA_BUILD_CONTEXT") as err:

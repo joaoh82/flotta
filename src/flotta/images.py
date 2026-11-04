@@ -145,9 +145,7 @@ def _machine_ids(app: str, runner: Runner | None, *, strict: bool) -> set[str]:
     here. Two parameters rather than two functions so the call sites have to
     say which they mean.
     """
-    result = _flyctl(
-        "machines", "list", "--app", app, "--json", runner=runner, check=False
-    )
+    result = _flyctl("machines", "list", "--app", app, "--json", runner=runner, check=False)
     if result.returncode != 0:
         if strict:
             raise BuildError(

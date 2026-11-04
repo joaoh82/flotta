@@ -764,6 +764,7 @@ def create_app(
     needs_anyone = Depends(require())
     # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
     needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
+    needs_fleet_route = Depends(require(SCOPE_FLEET_ROUTE))
     # Called, not a dependency: only a request naming its caller needs it.
     check_relay = require(SCOPE_AUTH_RELAY)
 
@@ -4173,6 +4174,42 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/boxes/{box_id}/client-conversations")
+    def client_conversations(box_id: str, token: Token | None = needs_fleet_route) -> Any:
+        """Which of this agent's sessions are its client's (FLOTTA-126).
+
+        For the front door alone, which decides with this what a ticket may open.
+        A person who could read it would learn the ids of sessions they may not
+        open, and has no need to: the door answers them.
+        """
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            return {
+                "conversations": [
+                    {"id": session_id, "started_at": datetime.fromisoformat(at).timestamp()}
+                    for session_id, at in store.client_conversations(box.id)
+                ]
+            }
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/client-conversations", status_code=201)
+    def add_client_conversation(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
+    ) -> Any:
+        """A session the door just saw a client make."""
+        session_id = body.get("session_id")
+        if not isinstance(session_id, str) or not 0 < len(session_id) <= 200:
+            raise HTTPException(status_code=422, detail="session_id is the session's stored id")
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            store.add_client_conversation(box.id, session_id)
+            return {"id": session_id}
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/wake")
     def wake_box_endpoint(box_id: str, token: Token | None = needs_route) -> Any:
         """Ensure a box is up so it can be addressed. Idempotent.
@@ -4313,6 +4350,9 @@ def create_app(
             org=box.org,
             client=box.client,
             key=key,
+            # Someone who can change the agent anyway. Anyone else gets a
+            # conversation and no more, which is what a ticket says by default.
+            full_access=token is None or token.allows(SCOPE_FLEET_WRITE),
         )
         from flotta.client import ticket_url
 

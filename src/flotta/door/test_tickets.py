@@ -371,7 +371,7 @@ def test_a_browser_with_a_ticket_talks_to_its_agent(hermes):
     port, seen = hermes
     app, plane = _door(port, box_credentials=("flotta", "the-box-password"))
 
-    answered, ready, echoed = _converse(app, _ticket())
+    answered, ready, echoed = _converse(app, _ticket(full_access=True))
 
     assert answered == CHAT_PROTOCOL
     assert "gateway.ready" in ready
