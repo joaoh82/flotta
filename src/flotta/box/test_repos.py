@@ -63,9 +63,7 @@ def test_a_box_with_no_identity_says_so_without_asking_anyone():
 def test_it_asks_about_the_box_its_token_names_not_its_environment(monkeypatch):
     """`$FLOTTA_BOX_ID` once disagreed with the token on an adopted machine.
     The token is the one source that cannot disagree with itself."""
-    token = mint(
-        subject=box_subject("b-real"), scopes={SCOPE_GIT_CREDENTIAL}, key="k", ttl_s=60
-    )
+    token = mint(subject=box_subject("b-real"), scopes={SCOPE_GIT_CREDENTIAL}, key="k", ttl_s=60)
     asked = {}
 
     def fake_get(url, *, token, timeout):

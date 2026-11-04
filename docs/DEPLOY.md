@@ -725,6 +725,9 @@ just token-role peter client_viewer agency-x acme   # one client's agents, read-
 just token-role cy client_user agency-x acme        # one client's agents, talks to them, changes nothing
 ```
 
+A `client_user` talks through the web app, by chat ticket. The door refuses that
+role's token on its header and query path, which reach all of Hermes.
+
 Roles map to scopes when minted (`flotta.auth.ROLES`). Revocation is still
 rotating the one signing key, which revokes every token in every org — keep
 lifetimes short (`--days`).

@@ -118,6 +118,10 @@ cannot call the fleet API or open the door's `Authorization` and
 cannot be passed off as a ticket. A verifier built before tickets existed
 refuses them too, on the signature, rather than reading one as a token that
 reaches every box in its tenant.
+
+A ticket opens a conversation, and no more, unless it says `"access": "full"`
+(FLOTTA-123). Only the control plane says so, and only for a caller who can
+change the agent anyway. See `flotta.door.conversation`.
 """
 
 from __future__ import annotations
@@ -318,9 +322,27 @@ class Token:
     #: The one box this token may address, or `None`. Only a chat ticket
     #: carries one.
     box: str | None = None
+    #: A chat ticket whose holder may send the agent anything. Absent means a
+    #: conversation and no more, so a ticket that says nothing is the narrow one.
+    full_access: bool = False
 
     def allows(self, scope: str) -> bool:
         return scope in self.scopes
+
+
+def is_client_person(token: Token) -> bool:
+    """Whether a token talks to agents and can't change them: a client user's.
+
+    It gets a conversation through a ticket and nothing else. The door's header
+    and query path reach all of Hermes, including over plain HTTP, with no frame
+    it could read. A relay's token and an operator's `box:chat` token hold no
+    `fleet:read`, so they aren't this.
+    """
+    return (
+        token.allows(SCOPE_BOX_CHAT)
+        and token.allows(SCOPE_FLEET_READ)
+        and not token.allows(SCOPE_FLEET_WRITE)
+    )
 
 
 def admits(
@@ -568,6 +590,7 @@ def mint_ticket(
     key: str | None = None,
     env: dict[str, str] | None = None,
     now: int | None = None,
+    full_access: bool = False,
 ) -> str:
     """A chat ticket: `box:chat` on `box_id` alone, for minutes (M12.5).
 
@@ -593,6 +616,7 @@ def mint_ticket(
             "client": client.strip(),
             "iat": issued,
             "exp": issued + ttl_s,
+            **({"access": "full"} if full_access else {}),
         }
     )
     return f"{TICKET_PREFIX}{payload}.{_sign(_TICKET_DOMAIN + payload, signing_key)}"
@@ -628,6 +652,7 @@ def verify_ticket(
         org=token.org,
         client=token.client,
         box=box,
+        full_access=claims.get("access") == "full",
     )
 
 

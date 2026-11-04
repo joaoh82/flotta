@@ -106,9 +106,11 @@ from flotta.auth import (
     admits,
     admits_tenant,
     box_password,
+    is_client_person,
     verify,
     verify_ticket,
 )
+from flotta.door.conversation import ConversationGate
 
 # Imported at module level, not lazily inside `create_door`, and the reason is
 # a bug rather than a preference: `from __future__ import annotations` turns
@@ -403,6 +405,8 @@ def authorize(
         raise BoxUnavailable(
             f"token for {token.subject!r} lacks scope: {SCOPE_BOX_CHAT}", status=403
         )
+    if is_client_person(token):
+        raise BoxUnavailable("a client's people talk to an agent through the web app", status=403)
     return token
 
 
@@ -544,7 +548,24 @@ class ControlPlane:
             status=box.get("status"),
         )
 
-    async def _call(self, method: str, path: str, *, name: str, verb: str) -> Any:
+    async def client_conversations(self, box_id: str) -> list[dict[str, Any]]:
+        """This box's client conversations, newest first (FLOTTA-126)."""
+        response = await self._call(
+            "GET", f"/api/boxes/{box_id}/client-conversations", name=box_id, verb="read"
+        )
+        return list(response.json().get("conversations") or [])
+
+    async def record_client_conversation(self, box_id: str, session_id: str) -> None:
+        """A session a client just made is the client's from now on."""
+        await self._call(
+            "POST",
+            f"/api/boxes/{box_id}/client-conversations",
+            name=box_id,
+            verb="record",
+            json={"session_id": session_id},
+        )
+
+    async def _call(self, method: str, path: str, *, name: str, verb: str, json: Any = None) -> Any:
         """One request to the fleet API, with the door's errors mapped once."""
         import httpx
 
@@ -553,7 +574,7 @@ class ControlPlane:
             async with httpx.AsyncClient(
                 timeout=self.timeout_s, transport=self.transport
             ) as client:
-                response = await client.request(method, url, headers=self._headers())
+                response = await client.request(method, url, headers=self._headers(), json=json)
         except Exception as exc:
             # The control plane being unreachable is the door's own outage, not
             # the box's. Say which one is down.
@@ -969,6 +990,13 @@ def create_door(
         await websocket.accept(subprotocol=answer)
 
         liveness = Liveness(target.name)
+        gate = ConversationGate(
+            box_id=target.box_id,
+            subject=token.subject,
+            plane=plane,
+            # Tokens that reach this far aren't a client's: see `authorize`.
+            conversation_only=ticketed and not token.full_access,
+        )
 
         async def keep_awake() -> None:
             """Hold the box awake for as long as someone is talking to it.
@@ -1027,18 +1055,26 @@ def create_door(
                         if message["type"] == "websocket.disconnect":
                             await upstream.close()
                             return
-                        if (text := message.get("text")) is not None:
-                            liveness.heard(text)
-                            await upstream.send(text)
-                        elif (data := message.get("bytes")) is not None:
-                            liveness.heard(data)
-                            await upstream.send(data)
+                        frame = message.get("text")
+                        if frame is None:
+                            frame = message.get("bytes")
+                        if frame is None:
+                            continue
+                        step = await gate.from_client(frame)
+                        if step.to_box is not None:
+                            liveness.heard(step.to_box)
+                            await upstream.send(step.to_box)
+                        if step.to_client is not None:
+                            await websocket.send_text(step.to_client)
 
                 async def box_to_downstream() -> None:
                     async for message in upstream:
                         if isinstance(message, str):
-                            if not liveness.take_answer(message):
-                                await websocket.send_text(message)
+                            if liveness.take_answer(message):
+                                continue
+                            answer = await gate.from_box(message)
+                            if answer is not None:
+                                await websocket.send_text(answer)
                         else:
                             await websocket.send_bytes(message)
 

@@ -429,7 +429,9 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             "model": agent.model,
         }
         agent.save(sessions)
-        return [_result(rid, {"session_id": agent.attach(stored_id)})]
+        return [
+            _result(rid, {"session_id": agent.attach(stored_id), "stored_session_id": stored_id})
+        ]
 
     if method == "session.most_recent":
         if not sessions:
@@ -439,6 +441,28 @@ def _answer(agent: Agent, frame: dict[str, Any]) -> list[str]:
             _result(
                 rid,
                 {"session_id": stored_id, "title": row["title"], "started_at": row["started_at"]},
+            )
+        ]
+
+    if method == "session.list":
+        # Newest first, and only once something was said, as Hermes's listing is.
+        rows = sorted(sessions.items(), key=lambda item: item[1]["started_at"], reverse=True)
+        return [
+            _result(
+                rid,
+                {
+                    "sessions": [
+                        {
+                            "id": stored_id,
+                            "title": row["title"],
+                            "started_at": row["started_at"],
+                            "source": "tui",
+                            "_lineage_root_id": None,
+                        }
+                        for stored_id, row in rows
+                        if row["messages"]
+                    ]
+                },
             )
         ]
 

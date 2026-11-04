@@ -2250,6 +2250,29 @@ class FleetStore:
         )
         return [str(r["repo"]) for r in rows]
 
+    def add_client_conversation(self, box_id: str, session_id: str) -> None:
+        """A session on this box is its client's (FLOTTA-126). Idempotent.
+
+        Hermes's stored id, the one it began under: a compressed conversation
+        keeps answering to it. Anything not listed here is the agency's, so a
+        session from before this table is never shown to a client.
+        """
+        self._get_box_or_raise(box_id)
+        self._conn.execute(
+            "INSERT INTO client_conversations (box_id, session_id, created_at) "
+            "VALUES (?, ?, ?) ON CONFLICT (box_id, session_id) DO NOTHING",
+            (box_id, session_id, _utcnow()),
+        )
+
+    def client_conversations(self, box_id: str) -> list[tuple[str, str]]:
+        """This box's client conversations as (session id, when), newest first."""
+        rows = self._conn.execute(
+            "SELECT session_id, created_at FROM client_conversations WHERE box_id = ? "
+            "ORDER BY created_at DESC, session_id",
+            (box_id,),
+        )
+        return [(str(r["session_id"]), str(r["created_at"])) for r in rows]
+
     def may_use_repo(self, box_id: str, repo: str) -> bool:
         """Whether a box has been granted a repository.
 

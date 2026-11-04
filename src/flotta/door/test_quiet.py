@@ -142,7 +142,9 @@ class _Open:
     def __enter__(self):
         self.client = TestClient(self.app).__enter__()
         self.ws = self.client.websocket_connect(
-            "/api/ws", headers={**HOST, "Origin": WEB_APP}, subprotocols=_protocols(_ticket())
+            "/api/ws",
+            headers={**HOST, "Origin": WEB_APP},
+            subprotocols=_protocols(_ticket(full_access=True)),
         ).__enter__()
         assert "gateway.ready" in self.ws.receive_text()
         return self
