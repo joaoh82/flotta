@@ -890,6 +890,13 @@ answers 409 while a budget still holds it. A person already in a conversation ke
 socket when an agent is paused, but its model calls get a 402. Every threshold writes an
 event on each agent covered and one for the client (`GET /api/orgs/{org}/budget-events`).
 
+**Reading what was spent:** `GET /api/orgs/{org}/budgets` says how far each budget has got
+this period, and `GET /api/orgs/{org}/usage` adds up the ledger, by any of `day`, `client`,
+`box`, `kind`, `model` and `requested_model` (`?group=day,client`), `from` and `to` as dates,
+up to a year at a time. Both are for an owner or a member of the whole org, and both answer
+exact euros as text. A row's `unpriced` counts calls with no known cost, which its euros are
+short by. Days are UTC.
+
 Locally, for $0: `just gateway-smoke`, or `just gateway-fake` to leave one running.
 
 ### Moving agents onto it (M13.4)

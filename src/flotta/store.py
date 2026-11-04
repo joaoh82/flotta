@@ -55,7 +55,7 @@ import os
 import re
 import secrets
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -820,6 +820,32 @@ class Spend:
 
     eur_nano: int
     unpriced: int
+
+
+#: What usage can be summed by, as the SQL for each. Only ever these strings reach a query.
+USAGE_GROUPS: dict[str, str] = {
+    "day": "substr(at, 1, 10)",
+    "client": "client_id",
+    "box": "box_id",
+    "kind": "kind",
+    "model": "model",
+    "requested_model": "requested_model",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class UsageSum:
+    """The ledger added up, for one value of whatever it was grouped by. `flotta.usage_report`."""
+
+    group: dict[str, str | None]
+    eur_nano: int
+    machine_eur_nano: int
+    unpriced: int
+    calls: int
+    tokens_in: int
+    tokens_out: int
+    tokens_cached: int
+    machine_seconds: int
 
 
 class BuildInProgressError(RuntimeError):
@@ -2626,6 +2652,72 @@ class FleetStore:
         ).fetchone()
         # Postgres sums a BIGINT into a NUMERIC, which arrives as a Decimal.
         return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
+
+    def usage_summary(
+        self,
+        org: str,
+        *,
+        since: datetime,
+        until: datetime,
+        group: Sequence[str] = (),
+        client: str | None = None,
+        box: str | None = None,
+    ) -> list[UsageSum]:
+        """`org`'s usage from `since` up to `until`, summed by `group`.
+
+        One row with zeroes for no group and nothing spent, and no row for a group
+        with nothing in it. Machine seconds leave out a volume's, whose row is for
+        the same hours as the machine's. `org` is always required, as in `spend`.
+        """
+        columns = [f"{USAGE_GROUPS[name]} AS {name}" for name in group]
+        where = ["org_id = ?", "at >= ?", "at < ?"]
+        params: list[Any] = [org, _instant(since), _instant(until)]
+        if client is not None:
+            where.append("client_id = ?")
+            params.append(client)
+        if box is not None:
+            where.append("box_id = ?")
+            params.append(box)
+        positions = ", ".join(str(n + 1) for n in range(len(group)))
+        rows = self._conn.execute(
+            f"SELECT {''.join(c + ', ' for c in columns)}"
+            "COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COALESCE(SUM(CASE WHEN kind = 'machine' THEN cost_eur_nano END), 0) AS machine_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, "
+            "COALESCE(SUM(CASE WHEN kind = 'model' THEN 1 ELSE 0 END), 0) AS calls, "
+            "COALESCE(SUM(tokens_in), 0) AS tokens_in, "
+            "COALESCE(SUM(tokens_out), 0) AS tokens_out, "
+            "COALESCE(SUM(tokens_cached), 0) AS tokens_cached, "
+            "COALESCE(SUM(CASE WHEN kind = 'machine' AND model NOT LIKE 'volume:%' "
+            "THEN seconds END), 0) AS machine_seconds "
+            f"FROM usage WHERE {' AND '.join(where)}"
+            + (f" GROUP BY {positions} ORDER BY {positions}" if group else ""),
+            params,
+        ).fetchall()
+        # Postgres sums a BIGINT into a NUMERIC, which arrives as a Decimal.
+        return [
+            UsageSum(
+                group={name: row[name] for name in group},
+                eur_nano=int(row["eur_nano"]),
+                machine_eur_nano=int(row["machine_nano"]),
+                unpriced=int(row["unpriced"]),
+                calls=int(row["calls"]),
+                tokens_in=int(row["tokens_in"]),
+                tokens_out=int(row["tokens_out"]),
+                tokens_cached=int(row["tokens_cached"]),
+                machine_seconds=int(row["machine_seconds"]),
+            )
+            for row in rows
+        ]
+
+    def box_names(self, org: str) -> dict[str, tuple[str, str | None]]:
+        """`org`'s boxes by id: the name, as it was before any destroying, and the display name."""
+        rows = self._conn.execute(
+            "SELECT b.id, b.name, m.display_name FROM boxes b "
+            "LEFT JOIN box_meta m ON m.box_id = b.id WHERE b.org_id = ?",
+            (org,),
+        ).fetchall()
+        return {r["id"]: (r["name"].removesuffix(f"@{r['id']}"), r["display_name"]) for r in rows}
 
     # -- budgets (FLOTTA-89, M13.3) --------------------------------------------
 

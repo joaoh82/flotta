@@ -783,7 +783,7 @@ def test_it_says_which_budget_how_much_and_what_happened(fleet, kind, action, sa
     for part in (message.text, message.html):
         assert says in part
         assert "EUR 20.01 of EUR 20 a day" in part
-        assert "https://app.flotta.dev/" in part
+        assert "https://app.flotta.dev/usage" in part
 
 
 def test_what_an_email_quotes_is_escaped(fleet):
