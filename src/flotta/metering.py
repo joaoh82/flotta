@@ -14,9 +14,10 @@ real money, so before closing an hour this reads the machine once:
   stops counting when Fly says it went down, and `machine_down_observed` records
   the gap, so it can't bill for ever.
 - **Reported up while the log says down**, as when removing a Fly secret starts a
-  machine. It counts from when Fly says it came up, and `machine_up_observed`
-  records that. A `stopped` row moves to `running`, or the idle sweep, which only
-  looks at `running`, would leave that machine billing for ever.
+  machine. It counts from when Fly says it came up, or from the last down if Fly's
+  latest start is older than that, so time already closed isn't counted twice, and
+  `machine_up_observed` records that. A `stopped` row moves to `running`, or the idle
+  sweep, which only looks at `running`, would leave that machine billing for ever.
 
 A substrate that can't be read closes nothing and loses nothing: the hours wait.
 
@@ -104,7 +105,7 @@ def _spans(events: list[Any], *, end: datetime) -> list[tuple[datetime, datetime
     for event in events:
         moment = _when(event)
         if event.type in UP_EVENTS and up_since is None:
-            up_since = moment
+            up_since = max(moment, spans[-1][1]) if spans else moment
         elif event.type in DOWN_EVENTS and up_since is not None:
             if moment > up_since:
                 spans.append((up_since, moment))
@@ -143,6 +144,8 @@ def _correct_from_substrate(
         )
     elif not thinks_up and info.state == "started":
         reported = _parse_ts(info.last_up_at or "")
+        if reported and last is not None:
+            reported = max(reported, _when(last))
         up_at = min(reported, now) if reported else now
         store.add_event(
             "box",

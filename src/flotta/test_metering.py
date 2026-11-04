@@ -197,6 +197,29 @@ def test_a_machine_awake_with_no_event_is_noticed_and_counted(fleet, machine):
     assert "machine_up_observed" in [e.type for e in fleet.get_events("box", "b-one")]
 
 
+def test_a_start_older_than_the_last_stop_does_not_count_that_time_twice(fleet, machine):
+    """The log says stopped, Fly says started, and Fly's latest start is the original."""
+    _started(fleet, machine)
+    _at(fleet, "stopped", T0 + timedelta(minutes=30))
+    machine.machine_state = "started"
+    machine.last_up_at = T0.isoformat()
+    _sweep(fleet, T0 + HOUR)
+    assert [r["seconds"] for r in _machine_rows(fleet)] == [3600]
+    observed = fleet.get_events("box", "b-one")[-1]
+    assert observed.type == "machine_up_observed"
+    assert observed.payload["machine_up_at"] == (T0 + timedelta(minutes=30)).isoformat()
+
+
+def test_an_hour_never_counts_more_than_an_hour_whatever_the_log_says(fleet, machine):
+    """A stop can land between reading the log and writing the observation."""
+    _started(fleet, machine)
+    _at(fleet, "stopped", T0 + timedelta(minutes=30))
+    _at(fleet, "machine_up_observed", T0 + timedelta(minutes=40), machine_up_at=T0.isoformat())
+    machine.machine_state = "started"
+    _sweep(fleet, T0 + HOUR)
+    assert [r["seconds"] for r in _machine_rows(fleet)] == [3600]
+
+
 def test_a_stopped_row_with_a_machine_up_becomes_running_so_it_can_sleep(fleet, machine):
     """The idle sweep only looks at `running`, so this machine would bill for ever."""
     _sweep(fleet, T0)
