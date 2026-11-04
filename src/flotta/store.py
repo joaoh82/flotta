@@ -568,7 +568,7 @@ class User:
 
 @dataclass(frozen=True, slots=True)
 class Membership:
-    """A user's role in one org, and in one client for a client viewer.
+    """A user's role in one org, and in one client for a client viewer or user.
 
     The role is one of `auth.ROLES`, and a session acting as this membership
     becomes the token that role would mint (M12.2).

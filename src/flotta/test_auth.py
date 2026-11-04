@@ -438,6 +438,7 @@ def test_role_maps_to_scopes_at_mint():
     assert owner == member | {SCOPE_ORG_ADMIN}
     assert {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY} == member
     assert viewer == {SCOPE_FLEET_READ}
+    assert scopes_for_role("client_user", client="acme") == {SCOPE_FLEET_READ, SCOPE_BOX_CHAT}
     token = verify(mint(subject="alice", scopes=owner, key=KEY, org="agency-x"), key=KEY)
     assert token.scopes == owner
 
@@ -456,6 +457,7 @@ def test_no_role_holds_a_machines_scope():
     [
         ("owner", "acme", "whole org"),
         ("client_viewer", None, "name the client"),
+        ("client_user", None, "name the client"),
         ("admin", None, "unknown role"),
     ],
 )

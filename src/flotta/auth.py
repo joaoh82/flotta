@@ -174,14 +174,17 @@ ROLES: dict[str, frozenset[str]] = {
     "member": frozenset({SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY}),
     # A client's own view of its agents: one client, read-only.
     "client_viewer": frozenset({SCOPE_FLEET_READ}),
+    # Someone at a client who uses its agents: one client, talks to them, and
+    # creates, changes and destroys nothing.
+    "client_user": frozenset({SCOPE_FLEET_READ, SCOPE_BOX_CHAT}),
 }
 
 
 def scopes_for_role(role: str, *, client: str | None = None) -> frozenset[str]:
     """The scopes `role` is, or a refusal naming what is wrong.
 
-    An owner is the whole org's, so it takes no client; a client viewer is one
-    client's, so it must name one. A member may be either.
+    An owner is the whole org's, so it takes no client; a client viewer or a
+    client user is one client's, so it must name one. A member may be either.
     """
     if role not in ROLES:
         raise AuthError(f"unknown role {role!r}. Known: {', '.join(ROLES)}")
@@ -189,6 +192,8 @@ def scopes_for_role(role: str, *, client: str | None = None) -> frozenset[str]:
         raise AuthError("an owner is the whole org's; mint a member to confine one to a client")
     if role == "client_viewer" and client is None:
         raise AuthError("a client viewer sees one client's agents; name the client")
+    if role == "client_user" and client is None:
+        raise AuthError("a client user talks to one client's agents; name the client")
     return ROLES[role]
 
 

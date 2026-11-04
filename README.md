@@ -42,8 +42,8 @@ control plane, which outlives it, owns the verdict. That one rule shapes most of
 - **Agencies and clients.** An **org** is an agency and a **client** is one of its customers. Every
   agent belongs to one client and is addressed as `<agent>--<client>--<org>.flotta.dev`; a
   single-operator fleet is the default org and keeps bare names (`<agent>.flotta.dev`). The
-  operator creates orgs; an org's owner adds clients and mints `member` and `client_viewer`
-  tokens (`flotta org`, `flotta client`, `flotta token mint --role`).
+  operator creates orgs; an org's owner adds clients and mints `member`, `client_viewer` and
+  `client_user` tokens (`flotta org`, `flotta client`, `flotta token mint --role`).
 - **Isolation enforced where requests arrive.** The front door refuses another tenant's address
   before anything is woken, every fleet-API route is scoped by tenant, and a test reads the source
   to fail the build if a route is not. Another tenant's agent is a 404, the same answer as one

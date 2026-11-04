@@ -1885,7 +1885,7 @@ app.add_typer(user_app)
 @user_app.command("add")
 def user_add(
     email: str = typer.Argument(..., help="Their address: where sign-in links go"),
-    role: str = typer.Option(..., "--role", help="owner | member | client_viewer"),
+    role: str = typer.Option(..., "--role", help="owner | member | client_viewer | client_user"),
     org_id: str = typer.Option("default", "--org", help="Which org; the default is yours"),
     client: str | None = typer.Option(None, "--client", help="The client a viewer sees"),
     name: str | None = typer.Option(None, "--name", help="What to call them"),
@@ -2453,7 +2453,9 @@ def token_mint(
     subject: str = typer.Argument(..., help="Who this token is for, e.g. dashboard"),
     scope: list[str] = ScopeOpt,
     role: str | None = typer.Option(
-        None, "--role", help="owner | member | client_viewer — a person's scopes, by role"
+        None,
+        "--role",
+        help="owner | member | client_viewer | client_user — a person's scopes, by role",
     ),
     org: str | None = typer.Option(None, "--org", help="The org it acts in [default org]"),
     client: str | None = typer.Option(None, "--client", help="Confine it to one client"),
@@ -2476,7 +2478,8 @@ def token_mint(
 
     if bool(scope) == bool(role):
         typer.secho(
-            "name a --role (owner, member, client_viewer) or at least one --scope, not both. "
+            "name a --role (owner, member, client_viewer, client_user) "
+            "or at least one --scope, not both. "
             f"Known scopes: {', '.join(sorted(SCOPES))}",
             fg=typer.colors.RED,
             err=True,
