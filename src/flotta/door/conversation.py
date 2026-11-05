@@ -31,6 +31,11 @@ snapshot. So the door keeps the question from this socket and accepts an answer
 only to something the box asked this socket. An approval nobody answers is denied
 when `approvals.timeout` runs out, which is `flotta.box.approvals`'s rule.
 
+The agency can allow it per agent, which the ticket says. Such a socket hears the
+question and may answer it, but only with `CLIENT_APPROVAL_CHOICES`, and the
+answer is rebuilt so that only the choice reaches the box: "all" in it would settle
+every approval waiting, and "always" outlives the person who said it.
+
 **Not Hermes's `source`.** It would be the natural place for this mark, except
 Hermes also reads it as the agent's platform, which decides its tools and part of
 its system prompt. A client would then talk to a different agent from the one the
@@ -67,8 +72,16 @@ CONVERSATION_METHODS: dict[str, frozenset[str]] = {
     "request.answer": frozenset({"id", "result"}),
 }
 
+#: The extra method of a ticket that may answer approvals.
+APPROVAL_RESPOND = "approval.respond"
+_APPROVAL_RESPOND_PARAMS = frozenset({"session_id", "choice", "request_id"})
+#: Never "always": see the module's note.
+CLIENT_APPROVAL_CHOICES = frozenset({"once", "session", "deny"})
+
 #: The ones that act on a session, and so must name a live id of this socket's.
-_ON_A_SESSION = frozenset({"prompt.submit", "image.attach_bytes", "file.attach", "image.detach"})
+_ON_A_SESSION = frozenset(
+    {"prompt.submit", "image.attach_bytes", "file.attach", "image.detach", APPROVAL_RESPOND}
+)
 
 #: What the box may ask a client and be told. It may decline anything else it was
 #: asked, which is what the web app's page does with `secret` and `sudo`, so the
@@ -156,11 +169,13 @@ class ConversationGate:
         subject: str,
         plane: Conversations,
         conversation_only: bool,
+        answers_approvals: bool = False,
     ) -> None:
         self._box_id = box_id
         self._subject = subject
         self._plane = plane
         self.conversation_only = conversation_only
+        self.answers_approvals = answers_approvals
         #: The live ids this socket was given.
         self._live: set[str] = set()
         #: The client's requests whose answers the door has to read.
@@ -215,7 +230,7 @@ class ConversationGate:
         method = parsed.get("method")
         if method is None:
             return self._answer(parsed)
-        allowed = CONVERSATION_METHODS.get(method) if isinstance(method, str) else None
+        allowed = self._allowed_params(method)
         if allowed is None:
             self._note(f"the method {str(method)[:80]!r}")
             return Step(to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket"))
@@ -223,8 +238,16 @@ class ConversationGate:
         params = {k: v for k, v in raw.items() if k in allowed} if isinstance(raw, dict) else {}
         if method == "session.most_recent":
             return await self._client_latest(rid)
-        if method == "request.answer" and not self._takes_answer(params.get("id")):
-            self._note("an answer to something this socket wasn't asked")
+        if method == "request.answer":
+            result = self._kept_result(params.get("id"), params.get("result"))
+            if result is None:
+                self._note("an answer to something this socket wasn't asked")
+                return Step(
+                    to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket")
+                )
+            params["result"] = result
+        if method == APPROVAL_RESPOND and params.get("choice") not in CLIENT_APPROVAL_CHOICES:
+            self._note("a choice a client can't make")
             return Step(to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket"))
         if method == "session.resume" and not await self._may_resume(params.get("session_id")):
             self._note("a session that is not this client's")
@@ -244,19 +267,36 @@ class ConversationGate:
     def _answer(self, parsed: dict[str, Any]) -> Step:
         """A response frame. Rebuilt, so what reaches the box can't be read as a request."""
         rid = parsed.get("id")
-        if self._takes_answer(rid):
-            keys = ("id", "result", "error")
-        elif isinstance(rid, str) and rid in self._open and "error" in parsed:
-            keys = ("id", "error")
+        asked = self._open.get(rid) if isinstance(rid, str) else None
+        answer: dict[str, Any] | None = None
+        if "error" in parsed:
+            # A decline. An approval is answered, or left to time out as a no.
+            if asked is not None and asked != APPROVAL_METHOD:
+                answer = {"error": parsed["error"]}
         else:
+            result = self._kept_result(rid, parsed.get("result"))
+            if result is not None:
+                answer = {"result": result}
+        if answer is None:
             self._note("an answer to something this socket wasn't asked")
             return Step()
         self._open.pop(rid, None)
-        answer = {k: parsed[k] for k in keys if k in parsed}
-        return Step(to_box=json.dumps({"jsonrpc": "2.0", **answer}))
+        return Step(to_box=json.dumps({"jsonrpc": "2.0", "id": rid, **answer}))
 
-    def _takes_answer(self, rid: Any) -> bool:
-        return isinstance(rid, str) and self._open.get(rid) in ANSWERED_BY_A_CLIENT
+    def _kept_result(self, rid: Any, result: Any) -> Any:
+        """What of `result` may answer the box's request `rid`, or None for nothing."""
+        asked = self._open.get(rid) if isinstance(rid, str) else None
+        if asked == APPROVAL_METHOD:
+            choice = result.get("choice") if isinstance(result, dict) else None
+            return {"choice": choice} if choice in CLIENT_APPROVAL_CHOICES else None
+        return result if asked in ANSWERED_BY_A_CLIENT else None
+
+    def _allowed_params(self, method: Any) -> frozenset[str] | None:
+        if not isinstance(method, str):
+            return None
+        if method == APPROVAL_RESPOND and self.answers_approvals:
+            return _APPROVAL_RESPOND_PARAMS
+        return CONVERSATION_METHODS.get(method)
 
     async def _client_latest(self, rid: Any) -> Step:
         try:
@@ -308,9 +348,10 @@ class ConversationGate:
             return frame
         method, rid = parsed.get("method"), parsed.get("id")
         if method == "event":
-            return None if _is_about_an_approval(parsed.get("params")) else frame
+            hidden = not self.answers_approvals and _is_about_an_approval(parsed.get("params"))
+            return None if hidden else frame
         if isinstance(method, str) and isinstance(rid, str):
-            if method == APPROVAL_METHOD:
+            if method == APPROVAL_METHOD and not self.answers_approvals:
                 return None
             self._open[rid] = method
             return frame
@@ -325,11 +366,13 @@ class ConversationGate:
         """A resume's answer: what's still waiting there is asked again by it."""
         waiting = result.get("open_requests")
         requests = [r for r in waiting if isinstance(r, dict)] if isinstance(waiting, list) else []
-        kept = [r for r in requests if r.get("method") != APPROVAL_METHOD]
+        kept = [r for r in requests if self.answers_approvals or r.get("method") != APPROVAL_METHOD]
         for request in kept:
             if isinstance(request.get("id"), str) and isinstance(request.get("method"), str):
                 self._open[request["id"]] = request["method"]
-        if len(kept) == len(requests) and "pending_approval" not in result:
+        if self.answers_approvals or (
+            len(kept) == len(requests) and "pending_approval" not in result
+        ):
             return frame
         cleaned = {k: v for k, v in result.items() if k != "pending_approval"}
         if isinstance(waiting, list):

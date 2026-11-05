@@ -325,6 +325,9 @@ class Token:
     #: A chat ticket whose holder may send the agent anything. Absent means a
     #: conversation and no more, so a ticket that says nothing is the narrow one.
     full_access: bool = False
+    #: A conversation-only ticket whose holder may also answer the agent's
+    #: approvals, because the agency allows it for this agent (FLOTTA-124).
+    answers_approvals: bool = False
 
     def allows(self, scope: str) -> bool:
         return scope in self.scopes
@@ -591,6 +594,7 @@ def mint_ticket(
     env: dict[str, str] | None = None,
     now: int | None = None,
     full_access: bool = False,
+    answers_approvals: bool = False,
 ) -> str:
     """A chat ticket: `box:chat` on `box_id` alone, for minutes (M12.5).
 
@@ -617,6 +621,7 @@ def mint_ticket(
             "iat": issued,
             "exp": issued + ttl_s,
             **({"access": "full"} if full_access else {}),
+            **({"approvals": "answer"} if answers_approvals else {}),
         }
     )
     return f"{TICKET_PREFIX}{payload}.{_sign(_TICKET_DOMAIN + payload, signing_key)}"
@@ -653,6 +658,7 @@ def verify_ticket(
         client=token.client,
         box=box,
         full_access=claims.get("access") == "full",
+        answers_approvals=claims.get("approvals") == "answer",
     )
 
 

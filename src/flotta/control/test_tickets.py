@@ -206,3 +206,54 @@ def test_without_a_signing_key_there_are_no_tickets(fleet):
     signature for the door to check."""
     with TestClient(_app(fleet, signing_key=None)) as api:
         assert api.post("/api/boxes/b-support/ticket").status_code == 503
+
+
+def _set_approvals(api, headers, allowed, box="b-support"):
+    return api.put(f"/api/boxes/{box}/client-approvals", json={"allowed": allowed}, headers=headers)
+
+
+def _client_ticket(api, fleet, box="b-support"):
+    answer = _ticket(api, box, _as(fleet, "cu@example.com"))
+    return verify_ticket(answer.json()["ticket"], key=KEY)
+
+
+def test_a_clients_people_dont_answer_approvals_until_the_agency_says_so(api, fleet):
+    ana = _as(fleet, "ana@example.com")
+    assert not _client_ticket(api, fleet).answers_approvals
+    agent = api.get("/api/boxes/b-support", headers=ana).json()["box"]
+    assert agent["clients_answer_approvals"] is False
+
+    answer = _set_approvals(api, ana, True)
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["box"]["clients_answer_approvals"] is True
+    assert _client_ticket(api, fleet).answers_approvals
+    assert not _client_ticket(api, fleet, "b-billing").answers_approvals
+    listed = api.get("/api/boxes", headers=ana).json()["boxes"]
+    assert {b["id"] for b in listed if b["clients_answer_approvals"]} == {"b-support"}
+
+    assert _set_approvals(api, ana, False).status_code == 200
+    assert not _client_ticket(api, fleet).answers_approvals
+    with FleetStore(fleet) as store:
+        said = [
+            e.payload["allowed"]
+            for e in store.get_events("box", "b-support")
+            if e.type == "client_approvals_set"
+        ]
+    assert said == [True, False]
+
+
+@pytest.mark.parametrize("body", [{}, {"allowed": "yes"}, {"allowed": 1}, {"allowed": None}])
+def test_the_setting_is_a_yes_or_a_no(api, fleet, body):
+    answer = api.put(
+        "/api/boxes/b-support/client-approvals", json=body, headers=_as(fleet, "ana@example.com")
+    )
+    assert answer.status_code == 422
+    assert not _client_ticket(api, fleet).answers_approvals
+
+
+def test_only_the_agency_sets_it_and_only_for_its_own_agents(api, fleet):
+    for email, code in (("cu@example.com", 403), ("vi@example.com", 403)):
+        assert _set_approvals(api, _as(fleet, email), True).status_code == code, email
+    ana = _as(fleet, "ana@example.com")
+    assert _set_approvals(api, ana, True, box="b-theirs").status_code == 404
+    assert not _client_ticket(api, fleet).answers_approvals
