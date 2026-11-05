@@ -1470,7 +1470,7 @@ def gateway(
     try:
         from flotta.gateway import create_gateway
         from flotta.gateway.app import BASE_URL_ENV, FLEET_KEY_ENV
-        from flotta.gateway.fake import FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
+        from flotta.gateway.fake import FAKE_MODEL, FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
     except ImportError as exc:
         raise refuse("the gateway needs its extra: `uv sync --extra control`") from exc
     from flotta.auth import SIGNING_KEY_ENV, resolve_signing_key
@@ -1492,7 +1492,12 @@ def gateway(
                 f"--fake-upstream would write made-up spend into ${DATABASE_URL_ENV}. "
                 "Unset it, so this uses a local store."
             )
-        env = {**os.environ, BASE_URL_ENV: FAKE_UPSTREAM_URL, FLEET_KEY_ENV: "fake"}
+        env = {
+            **os.environ,
+            BASE_URL_ENV: FAKE_UPSTREAM_URL,
+            FLEET_KEY_ENV: "fake",
+            "FLOTTA_MODELS": FAKE_MODEL,
+        }
         app_ = create_gateway(
             transport=FakeUpstream(chunk_delay_s=0.2), env=env, price_source=lambda: [FAKE_PRICE]
         )

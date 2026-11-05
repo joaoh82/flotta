@@ -79,6 +79,9 @@ def _run(db: str) -> int:
         print("second stream: read one chunk and hung up")
         refused = httpx.post(f"{URL}/v1/chat/completions", json=CALL, trust_env=False)
         print(f"no token: {refused.status_code}")
+        off_list = client.post("/v1/chat/completions", json={**CALL, "model": "pricey/opus-max"})
+        print(f"a model off the list: {off_list.status_code}")
+        print(f"a model off the list: {off_list.json()['error']['message']}")
 
     for _ in range(50):
         with FleetStore(db) as fleet:
@@ -98,6 +101,7 @@ def _run(db: str) -> int:
     ok = (
         whole.status_code == 200
         and refused.status_code == 401
+        and off_list.status_code == 404
         and [bool(row["estimated"]) for row in rows] == [False, True]
     )
     return 0 if _budget(db) and ok else _failed()

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from flotta.auth import scopes_for_role
 from flotta.control.app import create_app
 from flotta.control.test_app import _uncatalogued, _unchecked
+from flotta.pricing import NANO, Price
 from flotta.store import FleetStore
 
 SIGNING_KEY = "a-signing-key-for-these-tests"
@@ -175,3 +176,19 @@ def test_an_org_that_does_not_exist_is_a_404_to_the_operator(api):
     assert (
         api.get("/api/orgs/nobody/budgets", headers=_as("owner", org="default")).status_code == 404
     )
+
+
+def test_a_fallback_off_the_fleets_list_cannot_be_saved(api, fleet):
+    """FLOTTA-106. The gateway would refuse it at the limit: say so when it's chosen."""
+    with FleetStore(fleet) as store:
+        store.refresh_prices([Price("fake/cheap", NANO, NANO, None, "USD", "test")])
+        store.set_setting("FLOTTA_MODELS", "fake/other")
+    body = {**BODY, "action": "downgrade", "fallback_model": "fake/cheap"}
+    url = "/api/orgs/studio-nord/budgets"
+    refused = api.put(url, json=body, headers=_as("owner"))
+    assert refused.status_code == 422
+    assert "fake/other" in refused.json()["detail"]
+
+    with FleetStore(fleet) as store:
+        store.set_setting("FLOTTA_MODELS", "fake/cheap")
+    assert api.put(url, json=body, headers=_as("owner")).status_code == 200

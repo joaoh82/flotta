@@ -844,6 +844,11 @@ On Render, in `virginia` beside the database:
 | `FLOTTA_SIGNING_KEY` | The **same** value as the control plane, or no box token verifies |
 | `FLOTTA_API_KEY`, `FLOTTA_MODEL_BASE_URL` | The provider's key and endpoint |
 
+**Which models a call may name** is the Fleet page's two model settings, and whatever
+an agent already runs. The gateway reads them from the database, so set them there. A
+value kept only in the control plane's environment doesn't reach it, and its agents' calls
+are refused, each with a 404 that lists what it could read.
+
 It has to be reachable from Fly, so it takes a public address. Every route but
 `/health` needs a box's own token carrying `model:call`.
 
