@@ -40,6 +40,7 @@ ENV = {
     "FLOTTA_API_KEY": FLEET_KEY,
     "FLOTTA_MODEL_BASE_URL": FAKE_UPSTREAM_URL,
     "FLOTTA_EUR_PER_USD": "0.5",
+    "FLOTTA_MODELS": FAKE_MODEL,
 }
 EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 CALL = {"model": FAKE_MODEL, "messages": [{"role": "user", "content": "hello"}]}
@@ -947,6 +948,7 @@ def test_a_cost_too_small_to_be_a_nano_is_not_a_reported_cost(path):
 def test_a_cost_on_a_model_with_no_listed_price_still_prices_the_call(path):
     upstream, env, _ = _charged(0.002)
     body = {**CALL, "model": "somebody/unlisted"}
+    env = {**env, "FLOTTA_MODELS": "somebody/unlisted"}
     with _client(path, upstream, env=env) as client:
         client.post("/v1/chat/completions", json=body, headers=_auth())
     row = _rows(path)[0]
@@ -961,3 +963,151 @@ def test_the_agent_still_sees_the_reply_unchanged(path):
     with _client(path, upstream, env=env) as client:
         reply = client.post("/v1/chat/completions", json=body, headers=_auth())
     assert reply.json()["usage"]["cost"] == 0.000755174
+
+
+# -- which models a call may name (FLOTTA-106) --------------------------------
+
+OFF_LIST = "pricey/opus-max"
+
+
+def _named(path, upstream, model, *, box="b-one", env=ENV):
+    with _client(path, upstream, env=env) as client:
+        return client.post(
+            "/v1/chat/completions", json={**CALL, "model": model}, headers=_auth(_token(box))
+        )
+
+
+def test_a_model_not_on_the_list_is_refused_and_the_upstream_is_never_called(path, upstream):
+    response = _named(path, upstream, OFF_LIST)
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "model_not_found"
+    # Hermes shows this message, and only stops retrying on these words.
+    assert "model not found" in error["message"].lower()
+    assert OFF_LIST in error["message"] and FAKE_MODEL in error["message"]
+    assert upstream.requests == []
+    assert _rows(path) == []
+
+
+def test_a_variant_of_a_listed_model_has_to_be_listed_itself(path, upstream):
+    assert _named(path, upstream, f"{FAKE_MODEL}:online").status_code == 404
+    assert upstream.requests == []
+
+
+def test_a_refused_model_is_on_the_agents_timeline_once(path, upstream):
+    with _client(path, upstream) as client:
+        for _ in range(3):
+            client.post("/v1/chat/completions", json={**CALL, "model": OFF_LIST}, headers=_auth())
+    with FleetStore(path) as fleet:
+        events = [e for e in fleet.get_events("box", "b-one") if e.type == "model_refused"]
+    assert [e.payload["model"] for e in events] == [OFF_LIST]
+
+
+def test_an_agents_own_model_is_allowed_after_it_leaves_the_list(path, upstream):
+    with FleetStore(path) as fleet:
+        fleet.set_box_model("b-one", OFF_LIST)
+    assert _named(path, upstream, OFF_LIST).status_code == 200
+    assert json.loads(upstream.requests[0].content)["model"] == OFF_LIST
+
+
+def test_the_model_a_machine_was_given_is_allowed_after_it_leaves_the_list(path, upstream):
+    """An agent on the fleet's default has no model of its own, only this record."""
+    with FleetStore(path) as fleet:
+        fleet.add_event("box", "b-one", "model_set", {"model": OFF_LIST})
+    assert _named(path, upstream, OFF_LIST).status_code == 200
+
+
+def test_another_agents_model_is_not_this_agents(path, upstream):
+    with FleetStore(path) as fleet:
+        fleet.set_box_model("b-two", OFF_LIST)
+        fleet.add_event("box", "b-two", "model_set", {"model": OFF_LIST})
+    assert _named(path, upstream, OFF_LIST, box="b-one").status_code == 404
+    assert _named(path, upstream, OFF_LIST, box="b-two").status_code == 200
+
+
+def test_the_list_is_read_for_every_call(path, upstream):
+    """Taking a model off the list has to work without restarting the gateway."""
+    with _client(path, upstream) as client:
+        ask = lambda: client.post(  # noqa: E731
+            "/v1/chat/completions", json={**CALL, "model": OFF_LIST}, headers=_auth()
+        )
+        assert ask().status_code == 404
+        with FleetStore(path) as fleet:
+            fleet.set_setting("FLOTTA_MODELS", OFF_LIST)
+        assert ask().status_code == 200
+        with FleetStore(path) as fleet:
+            fleet.set_setting("FLOTTA_MODELS", FAKE_MODEL)
+        assert ask().status_code == 404
+
+
+def test_the_fleets_default_is_allowed_with_nothing_else_listed(path, upstream):
+    env = {k: v for k, v in ENV.items() if k != "FLOTTA_MODELS"} | {"FLOTTA_MODEL": FAKE_MODEL}
+    assert _named(path, upstream, FAKE_MODEL, env=env).status_code == 200
+
+
+def test_a_fleet_with_no_models_refuses_every_call(path, upstream):
+    """Refused, not open: no list has to mean nobody chose, not that anything goes."""
+    env = {k: v for k, v in ENV.items() if k != "FLOTTA_MODELS"}
+    response = _named(path, upstream, FAKE_MODEL, env=env)
+    assert response.status_code == 404
+    assert "none are set" in response.json()["error"]["message"]
+    assert upstream.requests == []
+
+
+def test_a_list_that_cannot_be_read_refuses_the_call(path, upstream, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("the settings could not be read")
+
+    monkeypatch.setattr("flotta.gateway.app.models_for_box", broken)
+    response = _named(path, upstream, FAKE_MODEL)
+    assert response.status_code == 503
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"models": [OFF_LIST]},
+        {"models": []},
+        {"Models": [OFF_LIST]},
+        {"route": "fallback"},
+        {"MODEL": OFF_LIST},
+    ],
+)
+def test_a_body_cannot_reach_a_model_it_does_not_name(path, upstream, extra):
+    with _client(path, upstream) as client:
+        response = client.post("/v1/chat/completions", json={**CALL, **extra}, headers=_auth())
+    assert response.status_code == 400
+    assert next(iter(extra)) in response.json()["error"]["message"]
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f'{{"model": "{FAKE_MODEL}", "model": "{OFF_LIST}", "messages": []}}',
+        f'{{"model": "{OFF_LIST}", "model": "{FAKE_MODEL}", "messages": []}}',
+    ],
+)
+def test_a_repeated_key_cannot_show_the_check_one_model_and_the_upstream_another(
+    path, upstream, body
+):
+    with _client(path, upstream) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=body,
+            headers={**_auth(), "Content-Type": "application/json"},
+        )
+    assert response.status_code == 400
+    assert upstream.requests == []
+
+
+def test_provider_routing_stays_because_it_is_the_same_model(path, upstream):
+    with _client(path, upstream) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={**CALL, "provider": {"order": ["somewhere"]}},
+            headers=_auth(),
+        )
+    assert response.status_code == 200
+    assert json.loads(upstream.requests[0].content)["provider"] == {"order": ["somewhere"]}

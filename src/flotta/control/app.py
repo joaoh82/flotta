@@ -1699,6 +1699,8 @@ def create_app(
         """
         _admin_of(token, org_id)
         from flotta.budgets import budget_dict, parse_limit
+        from flotta.inference import InvalidModel
+        from flotta.provision import allowed_model
         from flotta.store import InvalidBudgetError, UnknownEntityError
 
         for field in ("client", "box", "fallback_model"):
@@ -1710,6 +1712,9 @@ def create_app(
         store = store_factory()
         try:
             _org_or_404(store, org_id)
+            if body.get("fallback_model") is not None:
+                # The gateway would refuse it at the limit: say so now, not then.
+                allowed_model(body["fallback_model"], store)
             budget = store.set_budget(
                 org_id,
                 client=body.get("client"),
@@ -1721,7 +1726,7 @@ def create_app(
                 fallback_model=body.get("fallback_model"),
             )
             return budget_dict(budget)
-        except InvalidBudgetError as exc:
+        except (InvalidBudgetError, InvalidModel) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except UnknownEntityError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

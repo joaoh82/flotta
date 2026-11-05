@@ -2292,15 +2292,19 @@ def model_changes(store: FleetStore, box_ids: list[str]) -> dict[str, dict[str, 
     return {box_id: change for box_id, change in found.items() if change}
 
 
-def fleet_model(store: FleetStore | None = None) -> str | None:
+def fleet_model(
+    store: FleetStore | None = None, env: Mapping[str, str] | None = None
+) -> str | None:
     """The model an agent without its own runs, or None if the fleet has none."""
     from flotta.settings import layered
 
-    env = layered(store) if store is not None else os.environ
-    return (env.get("FLOTTA_MODEL") or "").strip() or None
+    source = layered(store, env) if store is not None else (os.environ if env is None else env)
+    return (source.get("FLOTTA_MODEL") or "").strip() or None
 
 
-def allowed_models(store: FleetStore | None = None) -> list[str]:
+def allowed_models(
+    store: FleetStore | None = None, env: Mapping[str, str] | None = None
+) -> list[str]:
     """The models an agent may be given (FLOTTA-85): the fleet's default first,
     then `FLOTTA_MODELS`, each once.
 
@@ -2310,10 +2314,25 @@ def allowed_models(store: FleetStore | None = None) -> list[str]:
     """
     from flotta.settings import layered
 
-    env = layered(store) if store is not None else os.environ
-    listed = (env.get("FLOTTA_MODELS") or "").replace("\n", ",").split(",")
-    models = [m for m in [fleet_model(store), *(p.strip() for p in listed)] if m]
+    source = layered(store, env) if store is not None else (os.environ if env is None else env)
+    listed = (source.get("FLOTTA_MODELS") or "").replace("\n", ",").split(",")
+    models = [m for m in [fleet_model(store, env), *(p.strip() for p in listed)] if m]
     return list(dict.fromkeys(models))
+
+
+def models_for_box(
+    box_id: str, store: FleetStore, env: Mapping[str, str] | None = None
+) -> list[str]:
+    """The models a call from this agent may name (FLOTTA-106): the fleet's, and
+    whatever it already runs, since taking a model off the list changes nobody on it.
+
+    Compared exactly, so `:online` or any other variant has to be listed itself.
+    """
+    runs = [
+        store.model_for_box(box_id),
+        store.models_given([box_id]).get(box_id) or model_given_by_default(env),
+    ]
+    return list(dict.fromkeys([*allowed_models(store, env), *(m for m in runs if m)]))
 
 
 def allowed_model(model: str, store: FleetStore) -> str:

@@ -61,6 +61,7 @@ GATEWAY_ENV = {
     "FLOTTA_API_KEY": "fleet-provider-key",
     "FLOTTA_MODEL_BASE_URL": FAKE_UPSTREAM_URL,
     "FLOTTA_EUR_PER_USD": "0.5",
+    "FLOTTA_MODELS": f"{FAKE_MODEL},{CHEAP}",
 }
 NOON = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
 EARLIER = NOON - timedelta(days=30)
@@ -336,9 +337,9 @@ def test_the_door_only_tells_someone_who_may_talk_to_the_agent(paused, machine, 
 # -- notify ------------------------------------------------------------------
 
 
-def _gateway(path, upstream):
+def _gateway(path, upstream, env=GATEWAY_ENV):
     return TestClient(
-        create_gateway(store_factory=lambda: FleetStore(path), transport=upstream, env=GATEWAY_ENV)
+        create_gateway(store_factory=lambda: FleetStore(path), transport=upstream, env=env)
     )
 
 
@@ -1034,3 +1035,17 @@ def test_a_killed_agent_can_be_destroyed(path, fleet, machine):
     _end_to_end(path, fleet, machine, "kill")
     provision.teardown_box("b-one", store=fleet)
     assert _status(fleet) == "torn_down"
+
+
+def test_a_fallback_off_the_list_refuses_the_call_and_never_goes_out(downgraded):
+    """FLOTTA-106. A budget is the owner's and the bill is the operator's, so neither
+    the original model nor the one the budget names may go out."""
+    upstream = FakeUpstream()
+    with _gateway(
+        downgraded, upstream, env={**GATEWAY_ENV, "FLOTTA_MODELS": FAKE_MODEL}
+    ) as gateway:
+        reply = gateway.post("/v1/chat/completions", json=CALL, headers=_box_auth())
+    assert reply.status_code == 402
+    assert reply.json()["error"]["code"] == "fallback_not_allowed"
+    assert CHEAP in reply.json()["error"]["message"]
+    assert _forwarded(upstream) == []

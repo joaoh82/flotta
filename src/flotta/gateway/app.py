@@ -18,6 +18,29 @@ After the token and the model, and before anything goes out, `flotta.budgets`
 decides. **Anything that stops it answering is a 402**: a store that cannot be
 read, or a check that raises. Never a forward.
 
+## Which models a call may name (FLOTTA-106)
+
+Whoever holds a box's token can ask for anything, and an agent has root on the
+machine that holds it. So a call names a model on `provision.models_for_box`, read
+for every call, or it is refused before anything goes out. Hermes's auxiliary calls
+(titles, compression, approvals) name the conversation's own model unless someone
+configures another, and `usage` agrees.
+
+**A 404 whose message says "model not found"**, because of what Hermes does with
+it, read from its `error_classifier` at v0.22.5: it doesn't retry, compress or
+rotate a key, and it shows this message. A 403 reads as a bad API key, a 402 as
+billing. **A conversation still on a refused model** that reaches its compression
+threshold loses its middle turns to a placeholder, since a 404 there isn't one of
+the failures Hermes aborts on. The turn itself is refused either way.
+
+**A body has to mean one thing here and upstream.** The check reads one parser's
+idea of the body and the provider reads another's, so a repeated key is refused,
+and so is `Model`, which some parsers read as `model`. `models` and `route` are
+refused and not stripped: OpenRouter's fallback list could answer from a model that
+isn't the one on the row, and an agent would believe its list had been honoured.
+`provider` stays. It picks who hosts the same model, and the reply says what that
+cost.
+
 ## Who a call belongs to
 
 **The box's own token, and nothing else in the request.** The subject names the
@@ -96,6 +119,7 @@ from flotta.auth import (
 from flotta.inference import InvalidModel, is_openrouter, validate_model
 from flotta.pricing import EurRate, Price, dollars_to_nano
 from flotta.pricing import rate_in_force as pricing_rate_in_force
+from flotta.provision import models_for_box
 from flotta.settings import layered
 from flotta.store import Box, FleetStore, is_terminal
 
@@ -146,6 +170,9 @@ _SETTLE_S = 2.0
 
 #: How long before a row that could not be written is tried again.
 _WRITE_RETRY_S = 5.0
+
+#: Body fields that could send a call to a model other than the one it names.
+_REROUTES = frozenset({"models", "route"})
 
 #: Not text the model wrote, so not counted towards an estimate.
 _NOT_TEXT = frozenset({"role", "type", "id", "index"})
@@ -203,6 +230,23 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse(
         {"error": {"message": message, "type": "flotta_gateway"}}, status_code=status
     )
+
+
+def _no_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse a repeated key: see the module docstring."""
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ValueError("a key appears twice")
+    return found
+
+
+def _reroutes(payload: dict[str, Any]) -> str | None:
+    """The field that could send this call to another model, if there is one."""
+    for key in payload:
+        name = key.casefold()
+        if name in _REROUTES or (name == "model" and key != "model"):
+            return key
+    return None
 
 
 def _text_length(value: Any) -> int:
@@ -610,13 +654,13 @@ def create_gateway(
     noted: set[tuple[str, ...]] = set()
     noted_lock = threading.Lock()
 
-    def note_refusal(box: Box, refusal: budgets.Refusal) -> None:
+    def note_once(box: Box, key: tuple[str, ...], kind: str, payload: dict[str, Any]) -> None:
         """One event per refusal per period, so a loop does not fill the timeline.
 
         In memory: a restart may add one more, which is harmless. Failing to write
         it changes nothing about the refusal.
         """
-        key = (box.id, *refusal.key)
+        key = (box.id, *key)
         with noted_lock:
             if key in noted:
                 return
@@ -626,21 +670,34 @@ def create_gateway(
         try:
             store = store_factory()
             try:
-                store.add_event(
-                    "box",
-                    box.id,
-                    "budget_refused",
-                    {"code": refusal.code, "message": refusal.message, "budget": refusal.budget},
-                )
+                store.add_event("box", box.id, kind, payload)
             finally:
                 store.close()
         except Exception:
-            _log.exception("a budget refusal could not be recorded: %s", refusal.code)
+            _log.exception("a refusal could not be recorded: %s", kind)
 
-    async def budget_verdict(box: Box, model: str) -> JSONResponse | budgets.Downgrade | None:
+    def note_refusal(box: Box, refusal: budgets.Refusal) -> None:
+        note_once(
+            box,
+            refusal.key,
+            "budget_refused",
+            {"code": refusal.code, "message": refusal.message, "budget": refusal.budget},
+        )
+
+    def read_models(box: Box) -> list[str]:
+        store = store_factory()
+        try:
+            return models_for_box(box.id, store, environment)
+        finally:
+            store.close()
+
+    async def budget_verdict(
+        box: Box, model: str, allowed: list[str]
+    ) -> JSONResponse | budgets.Downgrade | None:
         """The 402 if this call may not go out, or the model it has to go to instead.
 
-        Anything unexpected is a 402 too.
+        Anything unexpected is a 402 too. A fallback off the list is a refusal, never
+        the original model: an owner chooses a budget, and the operator pays for it.
         """
         try:
             unsettled = await ledger.settle(timeout=settle_s)
@@ -649,6 +706,14 @@ def create_gateway(
             _log.exception("a budget check failed")
             # Keyed by the minute: an outage is worth more than one event, not thousands.
             verdict = budgets.unchecked(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M"))
+        if isinstance(verdict, budgets.Downgrade) and verdict.model not in allowed:
+            verdict = budgets.Refusal(
+                "fallback_not_allowed",
+                f"This budget falls back to {verdict.model}, which isn't one of the fleet's "
+                "models, so this call was refused.",
+                budget=verdict.budget,
+                key=("fallback_not_allowed", verdict.model),
+            )
         if not isinstance(verdict, budgets.Refusal):
             return verdict
         await asyncio.to_thread(note_refusal, box, verdict)
@@ -698,12 +763,48 @@ def create_gateway(
 
         raw = await request.body()
         try:
-            payload = json.loads(raw)
+            payload = json.loads(raw, object_pairs_hook=_no_repeats)
             model = validate_model(payload["model"])
         except (ValueError, KeyError, TypeError, AttributeError, InvalidModel):
-            return _error(400, "expected a JSON body naming a model")
+            return _error(400, "expected a JSON body naming one model, with no repeated keys")
+        rerouting = _reroutes(payload)
+        if rerouting is not None:
+            return _error(
+                400,
+                f"this gateway calls the one model a request names, so it refuses {rerouting!r}",
+            )
 
-        verdict = await budget_verdict(box, model)
+        try:
+            allowed = await asyncio.to_thread(read_models, box)
+        except Exception:
+            # No list, no call. A 503 and not a 402: Hermes tries it again, and this is
+            # nothing to do with anyone's money.
+            _log.exception("the models this agent may use could not be read")
+            return _error(
+                503, "the models this agent may use could not be read, so nothing was sent"
+            )
+        if model not in allowed:
+            listed = ", ".join(allowed) or "none are set"
+            await asyncio.to_thread(
+                note_once,
+                box,
+                ("model_refused", model),
+                "model_refused",
+                {"model": model, "allowed": allowed},
+            )
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": f"Model not found here: {model} isn't one this agent may use "
+                        f"({listed}). The fleet's operator chooses them.",
+                        "type": "flotta_gateway",
+                        "code": "model_not_found",
+                    }
+                },
+                status_code=404,
+            )
+
+        verdict = await budget_verdict(box, model, allowed)
         if isinstance(verdict, JSONResponse):
             return verdict
         requested = None

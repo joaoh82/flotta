@@ -27,6 +27,7 @@ ENV = {
     "FLOTTA_API_KEY": "fleet-provider-key",
     "FLOTTA_MODEL_BASE_URL": FAKE_UPSTREAM_URL,
     "FLOTTA_EUR_PER_USD": "0.5",
+    "FLOTTA_MODELS": f"{FAKE_MODEL},nobody/knows",
 }
 EARLIER = datetime(2026, 1, 1, tzinfo=UTC)
 CALL = {"model": FAKE_MODEL, "messages": [{"role": "user", "content": "hello"}]}
