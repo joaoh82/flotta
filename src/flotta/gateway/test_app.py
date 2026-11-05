@@ -1017,6 +1017,15 @@ def test_the_model_a_machine_was_given_is_allowed_after_it_leaves_the_list(path,
     assert _named(path, upstream, OFF_LIST).status_code == 200
 
 
+def test_a_default_left_on_the_gateways_environment_is_not_allowed(path, upstream):
+    """The stored default hides it, and this agent has no `model_set` record to keep it."""
+    env = ENV | {"FLOTTA_MODEL": OFF_LIST}
+    with FleetStore(path) as fleet:
+        fleet.set_setting("FLOTTA_MODEL", FAKE_MODEL)
+    assert _named(path, upstream, OFF_LIST, env=env).status_code == 404
+    assert upstream.requests == []
+
+
 def test_another_agents_model_is_not_this_agents(path, upstream):
     with FleetStore(path) as fleet:
         fleet.set_box_model("b-two", OFF_LIST)
@@ -1100,6 +1109,48 @@ def test_a_repeated_key_cannot_show_the_check_one_model_and_the_upstream_another
         )
     assert response.status_code == 400
     assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"plugins": [{"id": "web"}]},
+        {"Plugins": [{"id": "web"}]},
+        {"plugins": []},
+        {"web_search_options": {"search_context_size": "high"}},
+        {"x_search_filter": {"enabled": True}},
+        {"preset": "@preset/anything"},
+    ],
+)
+def test_a_body_cannot_buy_more_than_the_model_it_names(path, upstream, extra):
+    with _client(path, upstream) as client:
+        response = client.post("/v1/chat/completions", json={**CALL, **extra}, headers=_auth())
+    assert response.status_code == 400
+    assert next(iter(extra)) in response.json()["error"]["message"]
+    assert upstream.requests == []
+    assert _rows(path) == []
+
+
+@pytest.mark.parametrize("kind", ["openrouter:web_search", "OpenRouter:datetime"])
+def test_a_server_tool_is_refused_next_to_a_function(path, upstream, kind):
+    tools = [{"type": "function", "function": {"name": "f"}}, {"type": kind}]
+    with _client(path, upstream) as client:
+        response = client.post(
+            "/v1/chat/completions", json={**CALL, "tools": tools}, headers=_auth()
+        )
+    assert response.status_code == 400
+    assert kind in response.json()["error"]["message"]
+    assert upstream.requests == []
+
+
+def test_a_function_tool_still_goes_out(path, upstream):
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    with _client(path, upstream) as client:
+        response = client.post(
+            "/v1/chat/completions", json={**CALL, "tools": tools}, headers=_auth()
+        )
+    assert response.status_code == 200
+    assert json.loads(upstream.requests[0].content)["tools"] == tools
 
 
 def test_provider_routing_stays_because_it_is_the_same_model(path, upstream):

@@ -2327,11 +2327,13 @@ def models_for_box(
     whatever it already runs, since taking a model off the list changes nobody on it.
 
     Compared exactly, so `:online` or any other variant has to be listed itself.
+
+    Not `model_given_by_default`: `env` is the gateway's, not the control plane's that
+    such an agent was made with, and a `FLOTTA_MODEL` left on it would be a model the
+    fleet page can't remove. So an agent with no `model_set` record, on a default
+    that has since left the list, is refused until it is given a model.
     """
-    runs = [
-        store.model_for_box(box_id),
-        store.models_given([box_id]).get(box_id) or model_given_by_default(env),
-    ]
+    runs = [store.model_for_box(box_id), store.models_given([box_id]).get(box_id)]
     return list(dict.fromkeys([*allowed_models(store, env), *(m for m in runs if m)]))
 
 

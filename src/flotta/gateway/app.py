@@ -41,6 +41,13 @@ isn't the one on the row, and an agent would believe its list had been honoured.
 `provider` stays. It picks who hosts the same model, and the reply says what that
 cost.
 
+**A body can't buy more than the model it names, either.** `:online` on a model is
+refused for not being on the list, and `plugins: [{"id": "web"}]` is OpenRouter's
+other spelling of it, billed per search. So `plugins`, `web_search_options` and
+`x_search_filter` are refused, along with `preset`, which can bring any of these
+with it, and `openrouter:` server tools. Other `tools` stay: Hermes's function calls
+are in that array. Hermes sends none of the refused ones to a custom endpoint.
+
 ## Who a call belongs to
 
 **The box's own token, and nothing else in the request.** The subject names the
@@ -171,8 +178,10 @@ _SETTLE_S = 2.0
 #: How long before a row that could not be written is tried again.
 _WRITE_RETRY_S = 5.0
 
-#: Body fields that could send a call to a model other than the one it names.
-_REROUTES = frozenset({"models", "route"})
+#: Body fields that could send a call to another model, or add a paid extra to it.
+_REFUSED_FIELDS = frozenset(
+    {"models", "route", "plugins", "web_search_options", "x_search_filter", "preset"}
+)
 
 #: Not text the model wrote, so not counted towards an estimate.
 _NOT_TEXT = frozenset({"role", "type", "id", "index"})
@@ -240,12 +249,17 @@ def _no_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return found
 
 
-def _reroutes(payload: dict[str, Any]) -> str | None:
-    """The field that could send this call to another model, if there is one."""
-    for key in payload:
+def _refused_field(payload: dict[str, Any]) -> str | None:
+    """What makes this call more than the one model it names, if anything does."""
+    for key, value in payload.items():
         name = key.casefold()
-        if name in _REROUTES or (name == "model" and key != "model"):
+        if name in _REFUSED_FIELDS or (name == "model" and key != "model"):
             return key
+        if name == "tools" and isinstance(value, list):
+            for tool in value:
+                kind = tool.get("type") if isinstance(tool, dict) else None
+                if isinstance(kind, str) and kind.casefold().startswith("openrouter:"):
+                    return kind
     return None
 
 
@@ -767,11 +781,12 @@ def create_gateway(
             model = validate_model(payload["model"])
         except (ValueError, KeyError, TypeError, AttributeError, InvalidModel):
             return _error(400, "expected a JSON body naming one model, with no repeated keys")
-        rerouting = _reroutes(payload)
-        if rerouting is not None:
+        refused = _refused_field(payload)
+        if refused is not None:
             return _error(
                 400,
-                f"this gateway calls the one model a request names, so it refuses {rerouting!r}",
+                f"this gateway calls the one model a request names and adds nothing to it, "
+                f"so it refuses {refused!r}",
             )
 
         try:
