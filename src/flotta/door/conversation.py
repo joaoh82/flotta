@@ -36,6 +36,12 @@ question and may answer it, but only with `CLIENT_APPROVAL_CHOICES`, and the
 answer is rebuilt so that only the choice reaches the box: "all" in it would settle
 every approval waiting, and "always" outlives the person who said it.
 
+`approval.respond` names its approval, and it must be one this socket was asked,
+in the session it was asked in. A live id alone isn't enough: when it has gone
+stale Hermes looks for the `request_id` in *every* live session, so an id
+learned elsewhere would settle the agency's approval. With no `request_id` it
+settles the oldest, which this socket may never have seen.
+
 **Not Hermes's `source`.** It would be the natural place for this mark, except
 Hermes also reads it as the agent's platform, which decides its tools and part of
 its system prompt. A client would then talk to a different agent from the one the
@@ -186,6 +192,10 @@ class ConversationGate:
         self._asked = 0
         #: What the box has asked this socket and not been answered: id -> method.
         self._open: dict[str, str] = {}
+        #: The approvals asked here: Hermes's `request_id` -> the live id it was
+        #: asked in, and a request's `srq-` id -> its `request_id`.
+        self._approvals: dict[str, str] = {}
+        self._approval_of: dict[str, str] = {}
 
     # -- from the client ---------------------------------------------------------
 
@@ -246,9 +256,21 @@ class ConversationGate:
                     to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket")
                 )
             params["result"] = result
-        if method == APPROVAL_RESPOND and params.get("choice") not in CLIENT_APPROVAL_CHOICES:
-            self._note("a choice a client can't make")
-            return Step(to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket"))
+            self._answered(params.get("id"))
+        if method == APPROVAL_RESPOND:
+            if params.get("choice") not in CLIENT_APPROVAL_CHOICES:
+                self._note("a choice a client can't make")
+                return Step(
+                    to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket")
+                )
+            request_id = params.get("request_id")
+            if not isinstance(request_id, str) or (
+                self._approvals.get(request_id) != params.get("session_id")
+            ):
+                self._note("an answer to an approval this socket wasn't asked")
+                return Step(
+                    to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket")
+                )
         if method == "session.resume" and not await self._may_resume(params.get("session_id")):
             self._note("a session that is not this client's")
             return Step(to_client=_error(rid, SESSION_NOT_FOUND, "session not found"))
@@ -259,6 +281,8 @@ class ConversationGate:
             self._creating.add(rid)
         elif method == "session.resume":
             self._resuming.add(rid)
+        if method == APPROVAL_RESPOND:
+            self._settled(params["request_id"])
         rebuilt: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
         if rid is not None:
             rebuilt["id"] = rid
@@ -281,6 +305,7 @@ class ConversationGate:
             self._note("an answer to something this socket wasn't asked")
             return Step()
         self._open.pop(rid, None)
+        self._answered(rid)
         return Step(to_box=json.dumps({"jsonrpc": "2.0", "id": rid, **answer}))
 
     def _kept_result(self, rid: Any, result: Any) -> Any:
@@ -348,11 +373,17 @@ class ConversationGate:
             return frame
         method, rid = parsed.get("method"), parsed.get("id")
         if method == "event":
-            hidden = not self.answers_approvals and _is_about_an_approval(parsed.get("params"))
-            return None if hidden else frame
-        if isinstance(method, str) and isinstance(rid, str):
-            if method == APPROVAL_METHOD and not self.answers_approvals:
+            if not _is_about_an_approval(parsed.get("params")):
+                return frame
+            if not self.answers_approvals:
                 return None
+            self._hear_approval_event(parsed.get("params"))
+            return frame
+        if isinstance(method, str) and isinstance(rid, str):
+            if method == APPROVAL_METHOD:
+                if not self.answers_approvals:
+                    return None
+                self._hear_approval(parsed.get("params"), rid)
             self._open[rid] = method
             return frame
         result = parsed.get("result")
@@ -370,6 +401,12 @@ class ConversationGate:
         for request in kept:
             if isinstance(request.get("id"), str) and isinstance(request.get("method"), str):
                 self._open[request["id"]] = request["method"]
+                if request["method"] == APPROVAL_METHOD:
+                    self._hear_approval(request.get("params"), request["id"])
+        if self.answers_approvals and isinstance(result.get("pending_approval"), dict):
+            self._hear_approval(
+                {**result["pending_approval"], "session_id": result.get("session_id")}
+            )
         if self.answers_approvals or (
             len(kept) == len(requests) and "pending_approval" not in result
         ):
@@ -411,6 +448,39 @@ class ConversationGate:
         live = result.get("session_id") if isinstance(result, dict) else None
         if isinstance(live, str) and live:
             self._live.add(live)
+
+    def _hear_approval(self, params: Any, srq: str | None = None) -> None:
+        """An approval this socket was asked, by its `request_id` and live id."""
+        if not isinstance(params, dict):
+            return
+        request_id, live = params.get("request_id"), params.get("session_id")
+        if not (isinstance(request_id, str) and request_id and isinstance(live, str) and live):
+            return
+        self._approvals[request_id] = live
+        if srq is not None:
+            self._approval_of[srq] = request_id
+
+    def _hear_approval_event(self, params: dict[str, Any]) -> None:
+        kind, payload = params.get("type"), params.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if kind == "approval.request":
+            self._hear_approval({**payload, "session_id": params.get("session_id")})
+        elif kind == "request.cancel":
+            self._answered(payload.get("id"))
+        elif isinstance(payload.get("request_id"), str):
+            self._settled(payload["request_id"])
+
+    def _answered(self, srq: Any) -> None:
+        """The box's request `srq` is settled, an approval's included."""
+        request_id = self._approval_of.pop(srq, None) if isinstance(srq, str) else None
+        if request_id is not None:
+            self._settled(request_id)
+
+    def _settled(self, request_id: str) -> None:
+        self._approvals.pop(request_id, None)
+        for srq in [s for s, r in self._approval_of.items() if r == request_id]:
+            del self._approval_of[srq]
 
     def _note(self, what: str) -> None:
         _log.warning("refused %s from %s on %s", what, self._subject, self._box_id)
