@@ -209,7 +209,7 @@ def test_starting_over_stays_the_clients(fleet):
         assert "first" in _said(ana.rpc("session.resume", session_id=first))
 
 
-def test_a_client_can_attach_a_file_and_answer_an_approval_in_its_own_conversation(fleet):
+def test_a_client_can_attach_a_file_in_its_own_conversation(fleet):
     """A conversation still works through the gate, not only the plain sentences."""
     with Talk(fleet, "ana") as ana:
         live = ana.rpc("session.create")["result"]["session_id"]
@@ -220,25 +220,32 @@ def test_a_client_can_attach_a_file_and_answer_an_approval_in_its_own_conversati
             name="note.txt",
         )
         assert attached["result"]["attached"] is True
-        ana.socket.send_text(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 90,
-                    "method": "prompt.submit",
-                    "params": {"session_id": live, "text": "!approve go"},
-                }
-            )
-        )
+
+
+def test_a_client_neither_sees_nor_answers_an_approval_and_the_agency_does(fleet):
+    """FLOTTA-124, through the door against the stand-in's real `approval` request."""
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        ana.socket.send_text(_frame("prompt.submit", 90, session_id=live, text="!approve go"))
+        # The box answers in order, so what it said about the turn is ahead of this.
+        ana.socket.send_text(_frame("image.detach", 91, session_id=live, path="x"))
+        seen = []
+        while not seen or seen[-1].get("id") != 91:
+            seen.append(json.loads(ana.socket.receive_text()))
+        assert [f for f in seen if (f.get("params") or {}).get("type") == "message.delta"]
+        assert not [f for f in seen if f.get("method") == "approval"]
+    with Talk(fleet, "owner") as owner:
+        live = owner.rpc("session.create")["result"]["session_id"]
+        owner.socket.send_text(_frame("prompt.submit", 90, session_id=live, text="!approve go"))
         while True:
-            frame = json.loads(ana.socket.receive_text())
+            frame = json.loads(owner.socket.receive_text())
             if frame.get("method") == "approval":
                 break
-        ana.socket.send_text(
+        owner.socket.send_text(
             json.dumps({"jsonrpc": "2.0", "id": frame["id"], "result": {"choice": "once"}})
         )
         while True:
-            frame = json.loads(ana.socket.receive_text())
+            frame = json.loads(owner.socket.receive_text())
             params = frame.get("params") or {}
             if params.get("type") == "message.complete":
                 break
@@ -252,7 +259,6 @@ def test_a_client_cannot_act_on_a_session_it_was_not_given(fleet):
         with Talk(fleet, "ana") as ana:
             for method, params in (
                 ("prompt.submit", {"text": "hi"}),
-                ("approval.respond", {"choice": "once"}),
                 ("image.detach", {"path": "x"}),
             ):
                 frame = ana.rpc(method, session_id=live, **params)
@@ -272,6 +278,7 @@ def test_a_client_cannot_act_on_a_session_it_was_not_given(fleet):
         "session.active_list",
         "session.branch_stored",
         "approval.pending",
+        "approval.respond",
         "vault.list",
     ],
 )
@@ -389,10 +396,95 @@ def test_parameters_a_conversation_does_not_send_do_not_reach_the_box():
     assert json.loads(step.to_box)["params"] == {}
 
 
+def _asked(gate, method, rid="srq-1"):
+    return _run(gate.from_box(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method})))
+
+
 def test_an_answer_to_the_box_cannot_be_read_as_a_request():
-    frame = '{"id":"srq-1","method":null,"result":{"choice":"once"},"params":{"a":1}}'
-    forwarded = json.loads(_run(_gate().from_client(frame)).to_box)
-    assert forwarded == {"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}}
+    gate = _gate()
+    _asked(gate, "clarify")
+    frame = '{"id":"srq-1","method":null,"result":{"answers":{}},"params":{"a":1}}'
+    forwarded = json.loads(_run(gate.from_client(frame)).to_box)
+    assert forwarded == {"jsonrpc": "2.0", "id": "srq-1", "result": {"answers": {}}}
+
+
+APPROVAL_ANSWER = {"choice": "always"}
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        {"id": "srq-1", "method": "approval", "params": {"command": "rm -rf /x"}},
+        {"method": "event", "params": {"type": "approval.request", "payload": {"command": "x"}}},
+        {"method": "event", "params": {"type": "approval.cancelled", "payload": {}}},
+        {
+            "method": "event",
+            "params": {"type": "request.cancel", "payload": {"id": "srq-1", "method": "approval"}},
+        },
+    ],
+    ids=["request", "event", "cancelled", "withdrawn"],
+)
+def test_an_approval_never_reaches_a_client(ask):
+    assert _run(_gate().from_box(json.dumps({"jsonrpc": "2.0", **ask}))) is None
+
+
+def test_the_agency_still_hears_it():
+    frame = json.dumps({"jsonrpc": "2.0", "id": "srq-1", "method": "approval"})
+    assert _run(_gate(conversation_only=False).from_box(frame)) == frame
+
+
+def test_a_resume_doesnt_put_an_approval_back():
+    snapshot = {
+        "session_id": "live",
+        "pending_approval": {"command": "rm -rf /x"},
+        "open_requests": [
+            {"id": "srq-1", "method": "approval", "params": {"command": "rm -rf /x"}},
+            {"id": "srq-2", "method": "clarify", "params": {}},
+        ],
+    }
+    gate = _gate()
+    said = json.loads(
+        _run(gate.from_box(json.dumps({"jsonrpc": "2.0", "id": 1, "result": snapshot})))
+    )
+    assert "pending_approval" not in said["result"]
+    assert [r["id"] for r in said["result"]["open_requests"]] == ["srq-2"]
+    # What it does hand back can be answered, as this socket never saw it asked.
+    step = _run(gate.from_client(_frame("request.answer", id="srq-2", result={"answers": {}})))
+    assert json.loads(step.to_box)["params"]["id"] == "srq-2"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": APPROVAL_ANSWER}),
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "error": {"code": -32601}}),
+        _frame("request.answer", id="srq-1", result=APPROVAL_ANSWER),
+        _frame("approval.respond", session_id="live", choice="always"),
+    ],
+    ids=["response", "decline", "request.answer", "approval.respond"],
+)
+def test_no_way_of_answering_an_approval_reaches_the_box(answer):
+    gate = _gate()
+    gate._live.add("live")
+    _asked(gate, "approval")
+    assert _run(gate.from_client(answer)).to_box is None
+
+
+def test_an_answer_to_something_this_socket_wasnt_asked_goes_nowhere():
+    frame = json.dumps({"jsonrpc": "2.0", "id": "srq-guessed", "result": {"answers": {}}})
+    step = _run(_gate().from_client(frame))
+    assert step.to_box is None and step.to_client is None
+    step = _run(_gate().from_client(_frame("request.answer", id="srq-guessed", result={})))
+    assert json.loads(step.to_client)["error"]["code"] == METHOD_REFUSED
+
+
+def test_a_client_may_decline_what_it_cant_answer_but_not_answer_it():
+    gate = _gate()
+    _asked(gate, "sudo")
+    told = json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"value": "hunter2"}})
+    assert _run(gate.from_client(told)).to_box is None
+    declined = json.dumps({"jsonrpc": "2.0", "id": "srq-1", "error": {"code": -32601}})
+    assert json.loads(_run(gate.from_client(declined)).to_box)["error"]["code"] == -32601
 
 
 def test_with_no_control_plane_a_client_gets_nothing_of_the_agents():
