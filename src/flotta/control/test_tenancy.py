@@ -149,6 +149,7 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/repos", SCOPE_FLEET_WRITE, {"repo": "acme/secrets"}),
     ("DELETE", "/api/boxes/{b}/repos/acme/secrets", SCOPE_FLEET_WRITE, None),
     ("PUT", "/api/boxes/{b}/model", SCOPE_FLEET_WRITE, {"model": None}),
+    ("PUT", "/api/boxes/{b}/client-approvals", SCOPE_FLEET_WRITE, {"allowed": True}),
     ("POST", "/api/boxes/{b}/identity", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/connection", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/author", SCOPE_FLEET_WRITE, None),

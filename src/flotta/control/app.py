@@ -368,6 +368,7 @@ def _box_dict(
     fleet_model: str | None = None,
     given: str | None = None,
     model_change: dict[str, Any] | None = None,
+    clients_answer_approvals: bool = False,
 ) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
@@ -401,6 +402,7 @@ def _box_dict(
     # A change under way, or the last one failing (FLOTTA-99): what lets the
     # window say "restarting" and an open conversation expect the drop.
     out["model_change"] = model_change
+    out["clients_answer_approvals"] = clients_answer_approvals
     return out
 
 
@@ -414,6 +416,7 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         fleet_model=fleet_model(store),
         given=store.models_given([box.id]).get(box.id) or model_given_by_default(),
         model_change=model_changes(store, [box.id]).get(box.id),
+        clients_answer_approvals=store.clients_answer_approvals(box.id),
     )
 
 
@@ -2573,6 +2576,7 @@ def create_app(
         changes = model_changes(store, ids)
         default = fleet_model(store)
         default_given = model_given_by_default()
+        approvers = store.client_approvers(ids)
         return {
             "boxes": [
                 _for_reader(
@@ -2583,6 +2587,7 @@ def create_app(
                             model=models.get(b.id),
                             fleet_model=default,
                             given=given.get(b.id) or default_given,
+                            clients_answer_approvals=b.id in approvers,
                             model_change=changes.get(b.id),
                         ),
                         **summaries[b.id],
@@ -3379,6 +3384,33 @@ def create_app(
         store = store_factory()
         try:
             return {"models": allowed_models(store), "default": fleet_model(store)}
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/client-approvals")
+    def set_client_approvals(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Whether this agent's client's people may answer its approvals (FLOTTA-124).
+
+        Off unless the agency turns it on. It is signed into the next ticket, so a
+        socket already open keeps what it was given until it reconnects, and "always"
+        stays refused either way: `flotta.door.conversation`.
+        """
+        allowed = body.get("allowed")
+        if not isinstance(allowed, bool):
+            raise HTTPException(status_code=422, detail='send {"allowed": true} or false')
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            store.set_clients_answer_approvals(box.id, allowed)
+            store.add_event(
+                "box",
+                box.id,
+                "client_approvals_set",
+                {"allowed": allowed, "by": token.subject if token is not None else "operator"},
+            )
+            return {"box": _with_meta(store, box)}
         finally:
             store.close()
 
@@ -4392,6 +4424,7 @@ def create_app(
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}")
             if is_terminal("box", box.status):
                 raise HTTPException(status_code=409, detail=f"box {box.name!r} is {box.status}")
+            answers_approvals = store.clients_answer_approvals(box.id)
         finally:
             store.close()
         ticket = mint_ticket(
@@ -4403,6 +4436,7 @@ def create_app(
             # Someone who can change the agent anyway. Anyone else gets a
             # conversation and no more, which is what a ticket says by default.
             full_access=token is None or token.allows(SCOPE_FLEET_WRITE),
+            answers_approvals=answers_approvals,
         )
         from flotta.client import ticket_url
 

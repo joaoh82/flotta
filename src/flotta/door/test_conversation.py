@@ -252,6 +252,46 @@ def test_a_client_neither_sees_nor_answers_an_approval_and_the_agency_does(fleet
         assert "Approved" in json.dumps(frame)
 
 
+def _until(talk, wanted):
+    while True:
+        frame = json.loads(talk.socket.receive_text())
+        if wanted(frame):
+            return frame
+
+
+def _is_approval(frame):
+    return frame.get("method") == "approval"
+
+
+def test_the_agency_can_let_a_clients_people_answer_and_can_stop_them(fleet):
+    """FLOTTA-124's setting, from the route to the agent's answer."""
+    url = f"/api/boxes/{fleet['box']}/client-approvals"
+    owner = _bearer(fleet["tokens"]["owner"])
+    assert fleet["api"].put(url, json={"allowed": True}, headers=owner).is_success
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        ana.socket.send_text(_frame("prompt.submit", 90, session_id=live, text="!approve go"))
+        asked = _until(ana, _is_approval)
+        for choice in ("always", "nonsense"):
+            refused = ana.rpc("request.answer", id=asked["id"], result={"choice": choice})
+            assert refused["error"]["code"] == METHOD_REFUSED, choice
+        ana.socket.send_text(
+            json.dumps({"jsonrpc": "2.0", "id": asked["id"], "result": {"choice": "once"}})
+        )
+        done = _until(ana, lambda f: (f.get("params") or {}).get("type") == "message.complete")
+        assert "Approved" in json.dumps(done)
+
+    assert fleet["api"].put(url, json={"allowed": False}, headers=owner).is_success
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        ana.socket.send_text(_frame("prompt.submit", 90, session_id=live, text="!approve go"))
+        ana.socket.send_text(_frame("image.detach", 91, session_id=live, path="x"))
+        seen = []
+        while not seen or seen[-1].get("id") != 91:
+            seen.append(json.loads(ana.socket.receive_text()))
+        assert not [f for f in seen if _is_approval(f)]
+
+
 def test_a_client_cannot_act_on_a_session_it_was_not_given(fleet):
     """A live id it learned some other way, an approval included."""
     with Talk(fleet, "owner") as owner:
@@ -476,6 +516,156 @@ def test_an_answer_to_something_this_socket_wasnt_asked_goes_nowhere():
     assert step.to_box is None and step.to_client is None
     step = _run(_gate().from_client(_frame("request.answer", id="srq-guessed", result={})))
     assert json.loads(step.to_client)["error"]["code"] == METHOD_REFUSED
+
+
+def _approver():
+    gate = ConversationGate(
+        box_id="b-1",
+        subject="user:ana",
+        plane=Plane(),
+        conversation_only=True,
+        answers_approvals=True,
+    )
+    gate._live.add("live")
+    return gate
+
+
+def test_a_client_allowed_to_answer_hears_it_every_way():
+    asked = {"jsonrpc": "2.0", "id": "srq-1", "method": "approval", "params": {}}
+    event = {"jsonrpc": "2.0", "method": "event", "params": {"type": "approval.request"}}
+    snapshot = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "pending_approval": {"command": "x"},
+            "open_requests": [{"id": "srq-2", "method": "approval", "params": {}}],
+        },
+    }
+    gate = _approver()
+    for frame in (asked, event, snapshot):
+        assert json.loads(_run(gate.from_box(json.dumps(frame)))) == frame
+    answer = _frame("request.answer", id="srq-2", result={"choice": "deny"})
+    assert json.loads(_run(gate.from_client(answer)).to_box)["params"]["id"] == "srq-2"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "always"}}),
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {}}),
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": "once"}),
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "error": {"code": -32601}}),
+        _frame("request.answer", id="srq-1", result={"choice": "always"}),
+        _frame("approval.respond", session_id="live", choice="always"),
+        _frame("approval.respond", session_id="other", choice="once"),
+    ],
+    ids=["always", "no-choice", "not-an-object", "decline", "answer-always", "rpc-always", "other"],
+)
+def test_a_client_allowed_to_answer_still_cant_say_always(answer):
+    gate = _approver()
+    _asked(gate, "approval")
+    assert _run(gate.from_client(answer)).to_box is None
+
+
+def test_only_the_choice_of_an_answer_reaches_the_box():
+    """`all` in the answer would settle every approval waiting."""
+    gate = _approver()
+    _asked(gate, "approval")
+    frame = json.dumps({"id": "srq-1", "result": {"choice": "once", "all": True}})
+    sent = json.loads(_run(gate.from_client(frame)).to_box)
+    assert sent == {"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}}
+    # And approval.respond's `all` is not among its parameters.
+    _ask_approval(gate, "req-1")
+    frame = _frame(
+        "approval.respond", session_id="live", request_id="req-1", choice="once", all=True
+    )
+    assert "all" not in json.loads(_run(gate.from_client(frame)).to_box)["params"]
+
+
+def _ask_approval(gate, request_id, *, live="live", srq="srq-9"):
+    params = {"session_id": live, "request_id": request_id, "command": "x"}
+    frame = {"jsonrpc": "2.0", "id": srq, "method": "approval", "params": params}
+    return _run(gate.from_box(json.dumps(frame)))
+
+
+def _respond(request_id=None, live="live", choice="once"):
+    params = {"session_id": live, "choice": choice}
+    if request_id is not None:
+        params["request_id"] = request_id
+    return _frame("approval.respond", **params)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [_respond("req-agency"), _respond(), _respond("req-1", live="older")],
+    ids=["unseen", "omitted", "other-session"],
+)
+def test_approval_respond_only_settles_an_approval_this_socket_was_asked(frame):
+    """A stale live id makes Hermes look for the request id in every session."""
+    gate = _approver()
+    gate._live.add("older")
+    _ask_approval(gate, "req-1")
+    step = _run(gate.from_client(frame))
+    assert step.to_box is None
+    assert json.loads(step.to_client)["error"]["code"] == METHOD_REFUSED
+
+
+def test_approval_respond_settles_one_asked_every_way():
+    gate = _approver()
+    event = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "approval.request",
+            "session_id": "live",
+            "payload": {"request_id": "e"},
+        },
+    }
+    snapshot = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "session_id": "live",
+            "pending_approval": {"request_id": "p"},
+            "open_requests": [
+                {
+                    "id": "srq-2",
+                    "method": "approval",
+                    "params": {"session_id": "live", "request_id": "o"},
+                },
+            ],
+        },
+    }
+    _ask_approval(gate, "r")
+    for frame in (event, snapshot):
+        _run(gate.from_box(json.dumps(frame)))
+    for request_id in ("r", "e", "p", "o"):
+        sent = json.loads(_run(gate.from_client(_respond(request_id))).to_box)
+        assert sent["params"] == {"session_id": "live", "choice": "once", "request_id": request_id}
+
+
+@pytest.mark.parametrize(
+    "settle",
+    [
+        _respond("req-1"),
+        json.dumps({"jsonrpc": "2.0", "id": "srq-9", "result": {"choice": "deny"}}),
+        _frame("request.answer", id="srq-9", result={"choice": "deny"}),
+    ],
+    ids=["approval.respond", "response", "request.answer"],
+)
+def test_an_approval_answered_once_cant_be_answered_again(settle):
+    gate = _approver()
+    _ask_approval(gate, "req-1")
+    assert _run(gate.from_client(settle)).to_box is not None
+    assert _run(gate.from_client(_respond("req-1"))).to_box is None
+
+
+def test_an_approval_withdrawn_cant_be_answered():
+    gate = _approver()
+    _ask_approval(gate, "req-1")
+    cancel = {"type": "request.cancel", "payload": {"id": "srq-9", "method": "approval"}}
+    _run(gate.from_box(json.dumps({"jsonrpc": "2.0", "method": "event", "params": cancel})))
+    assert _run(gate.from_client(_respond("req-1"))).to_box is None
 
 
 def test_a_client_may_decline_what_it_cant_answer_but_not_answer_it():

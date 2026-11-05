@@ -2290,6 +2290,38 @@ class FleetStore:
             (box_id, session_id, _utcnow()),
         )
 
+    def set_clients_answer_approvals(self, box_id: str, allowed: bool) -> None:
+        """Whether this agent's client's people may answer its approvals (FLOTTA-124).
+
+        A row means yes, so an agent nobody has decided about is a no.
+        """
+        self._get_box_or_raise(box_id)
+        if not allowed:
+            self._conn.execute("DELETE FROM client_approvers WHERE box_id = ?", (box_id,))
+            return
+        self._conn.execute(
+            "INSERT INTO client_approvers (box_id, updated_at) VALUES (?, ?) "
+            "ON CONFLICT (box_id) DO NOTHING",
+            (box_id, _utcnow()),
+        )
+
+    def clients_answer_approvals(self, box_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT box_id FROM client_approvers WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        return row is not None
+
+    def client_approvers(self, box_ids: list[str]) -> set[str]:
+        """Which of these do. One query for the fleet list, not one per row."""
+        if not box_ids:
+            return set()
+        marks = ", ".join("?" for _ in box_ids)
+        rows = self._conn.execute(
+            f"SELECT box_id FROM client_approvers WHERE box_id IN ({marks})",
+            tuple(box_ids),
+        ).fetchall()
+        return {str(r["box_id"]) for r in rows}
+
     def client_conversations(self, box_id: str) -> list[tuple[str, str]]:
         """This box's client conversations as (session id, when), newest first."""
         rows = self._conn.execute(

@@ -574,6 +574,18 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        16,
+        "client approvers: agents whose client's people may answer an approval",
+        (
+            """
+            CREATE TABLE client_approvers (
+                box_id      TEXT PRIMARY KEY REFERENCES boxes(id),
+                updated_at  TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 

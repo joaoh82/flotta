@@ -996,6 +996,7 @@ def create_door(
             plane=plane,
             # Tokens that reach this far aren't a client's: see `authorize`.
             conversation_only=ticketed and not token.full_access,
+            answers_approvals=token.answers_approvals,
         )
 
         async def keep_awake() -> None:
