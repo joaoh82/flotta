@@ -19,6 +19,7 @@ dependencies = [
     # box. This used to be borrowed from Hermes's venv; Hermes v0.22 moved to
     # ruamel.yaml only, and every box boot-looped on `No module named 'yaml'`.
     "pyyaml>=6",
+    "tzdata>=2025.1",
 ]
 
 [project.optional-dependencies]

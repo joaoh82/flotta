@@ -659,6 +659,45 @@ def _run_approvals() -> tuple[str, ...]:
     )
 
 
+def _triggers() -> tuple[str, ...]:
+    """What starts a run on its own (FLOTTA-148): schedules now, webhooks next.
+
+    `trigger_fires` holds each time a trigger fired, keyed by the trigger and
+    the time, so a time fires once however many sweeps see it due: a retry,
+    or a second control plane. `run_id` is NULL for a time that was skipped.
+    `secret_nonce` is a webhook's (M14.4), and unused by a schedule.
+    """
+    return (
+        """
+        CREATE TABLE triggers (
+            id            TEXT PRIMARY KEY,
+            org_id        TEXT NOT NULL,
+            client_id     TEXT NOT NULL,
+            box_id        TEXT NOT NULL REFERENCES boxes(id),
+            kind          TEXT NOT NULL,
+            cron          TEXT,
+            tz            TEXT,
+            prompt        TEXT NOT NULL,
+            secret_nonce  TEXT,
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            created_by    TEXT,
+            created_at    TEXT NOT NULL,
+            last_fired_at TEXT
+        )
+        """,
+        "CREATE INDEX idx_triggers_box ON triggers(box_id)",
+        """
+        CREATE TABLE trigger_fires (
+            trigger_id TEXT NOT NULL REFERENCES triggers(id) ON DELETE CASCADE,
+            fire_at    TEXT NOT NULL,
+            run_id     TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (trigger_id, fire_at)
+        )
+        """,
+    )
+
+
 #: Every migration, in order. Append only.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
@@ -788,6 +827,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         21, "mcp clients: a client's own connection, and which one served a call", _mcp_clients()
     ),
     Migration(22, "run approvals: what a run's agent asked a person", _run_approvals()),
+    Migration(23, "triggers: schedules, and each time one fired", _triggers()),
 )
 
 

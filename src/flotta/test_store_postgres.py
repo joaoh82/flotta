@@ -111,6 +111,27 @@ def test_one_box_starts_one_run_in_a_real_race(pg_store):
     )
 
 
+def test_one_fire_time_makes_one_run_in_a_real_race(pg_store):
+    """Two sweeps see the same schedule due at once, a retry or a second
+    control plane (M14.3): one makes the run, the other finds it fired."""
+    from datetime import UTC, datetime
+
+    box = pg_store.create_box("eng-a")
+    trigger = pg_store.create_trigger(
+        box.id, cron="0 8 * * *", tz="UTC", prompt="Morning.", created_by="test"
+    )
+    eight = datetime(2026, 11, 6, 8, tzinfo=UTC)
+
+    def fire(fleet, i):
+        if fleet.fire_trigger(trigger.id, eight) is None:
+            raise LookupError("already fired")
+
+    outcomes = _race(pg_store, fire)
+
+    assert sorted(outcomes) == ["LookupError", "created"], f"expected one run, got {outcomes}"
+    assert len(pg_store.list_runs(org="default", box=box.id)) == 1
+
+
 def test_the_workspace_cap_survives_a_real_race(pg_store):
     """Same guard, the other table — wired ahead of the tier that uses it."""
     box = pg_store.create_box("eng-a")

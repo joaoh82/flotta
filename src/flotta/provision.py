@@ -3505,6 +3505,9 @@ def teardown_box(
             store.finish_run(task.id, ending, error_class="torn_down")
         failed_tasks.append(task.id)
 
+    # Its schedules stop with it (FLOTTA-148): a run for it could never start.
+    store.disable_triggers(box_id)
+
     for workspace in store.list_workspaces(box_id=box_id):
         if workspace.status == "torn_down":
             continue

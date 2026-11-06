@@ -407,6 +407,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "pyyaml" },
     { name = "typer" },
+    { name = "tzdata" },
 ]
 
 [package.optional-dependencies]
@@ -457,6 +458,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "tzdata", specifier = ">=2025.1" },
     { name = "uvicorn", marker = "extra == 'control'", specifier = ">=0.34" },
     { name = "uvicorn", marker = "extra == 'door'", specifier = ">=0.34" },
     { name = "websockets", marker = "extra == 'door'", specifier = ">=13" },
