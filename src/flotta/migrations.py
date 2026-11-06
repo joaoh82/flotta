@@ -556,6 +556,42 @@ def _mcp() -> tuple[str, ...]:
     )
 
 
+def _mcp_clients() -> tuple[str, ...]:
+    """A client's own MCP connection, ahead of its agency's (FLOTTA-125, slice 3).
+
+    `mcp_connections` gains `client_id` in its key, with `''` for the agency's
+    own: a key column can't be NULL in Postgres, and one table keeps one set of
+    queries for both. Neither engine changes a primary key in place, so the
+    table is made again and its rows copied, every one the org's. A flow says
+    which client it is for (NULL for the org), and a call which connection
+    served it (`org` or `client`; NULL for a call refused before one was read).
+    """
+    return (
+        """
+        CREATE TABLE mcp_connections_v2 (
+            org_id        TEXT NOT NULL REFERENCES orgs(id),
+            client_id     TEXT NOT NULL DEFAULT '',
+            server        TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            credential    TEXT NOT NULL,
+            status        TEXT NOT NULL,
+            detail        TEXT,
+            connected_by  TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (org_id, client_id, server)
+        )
+        """,
+        "INSERT INTO mcp_connections_v2 (org_id, client_id, server, kind, credential, status, "
+        "detail, connected_by, created_at, updated_at) SELECT org_id, '', server, kind, "
+        "credential, status, detail, connected_by, created_at, updated_at FROM mcp_connections",
+        "DROP TABLE mcp_connections",
+        "ALTER TABLE mcp_connections_v2 RENAME TO mcp_connections",
+        "ALTER TABLE mcp_oauth_flows ADD COLUMN client_id TEXT",
+        "ALTER TABLE mcp_calls ADD COLUMN account TEXT",
+    )
+
+
 def _runs() -> tuple[str, ...]:
     """A task becomes a run (FLOTTA-146, M14.1; D23, `flotta.runs`).
 
@@ -710,6 +746,9 @@ MIGRATIONS: tuple[Migration, ...] = (
         20,
         "mcp: an org's connections, an agent's grants, and every tool call",
         _mcp(),
+    ),
+    Migration(
+        21, "mcp clients: a client's own connection, and which one served a call", _mcp_clients()
     ),
 )
 

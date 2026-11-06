@@ -976,6 +976,11 @@ granted, puts the agency's credential on, and writes a row per tool call.
    with the `mcp_state` and `mcp_code` the browser comes back with: the code is traded
    only then), and the agency grants it to an agent
    (`PUT /api/boxes/<agent>/mcp`). The agent sees it in its next conversation.
+5. Optionally, an owner connects a client's own account for a server, the same way under
+   `/api/orgs/<org>/clients/<client>/mcp/<server>` (`PUT` a key, `POST …/connect` to sign
+   in, `DELETE` to disconnect). That client's agents then use it instead of the agency's;
+   no other agent can. `GET /api/boxes/<agent>/mcp` says, per granted server, whose
+   account its calls use.
 
 A grant is in force at the gateway the moment it is saved. If the agent's machine can't
 be written, the answer says `written: false`: the agent then can't find a new server, and

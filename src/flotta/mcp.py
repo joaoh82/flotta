@@ -366,8 +366,15 @@ def config_changes(
 # -- credentials ---------------------------------------------------------------
 
 
-def connection_context(org: str, server: str) -> str:
-    """What a connection's sealed credential is bound to (`flotta.sealed`)."""
+def connection_context(org: str, server: str, client: str | None = None) -> str:
+    """What a connection's sealed credential is bound to (`flotta.sealed`).
+
+    A client's is bound to that client as well, so a sealed value copied onto
+    another client's row, or onto the org's, doesn't open there. The org's
+    context is the one slice 1 sealed with, so its rows still open.
+    """
+    if client:
+        return f"mcp-client-connection:{org}:{client}:{server}"
     return f"mcp-connection:{org}:{server}"
 
 
