@@ -26,6 +26,8 @@ _log = logging.getLogger(__name__)
 
 RESEND_API_KEY_ENV = "FLOTTA_RESEND_API_KEY"
 MAIL_FROM_ENV = "FLOTTA_MAIL_FROM"
+#: Where a reply to an approval or decline goes; unset, the email asks for none.
+MAIL_REPLY_TO_ENV = "FLOTTA_MAIL_REPLY_TO"
 APP_URL_ENV = "FLOTTA_APP_URL"
 PRINT_LINKS_ENV = "FLOTTA_PRINT_SIGN_IN_LINKS"
 
@@ -48,6 +50,8 @@ class Message:
     link: str
     #: What a mailer that prints calls it.
     kind: str = "sign-in link"
+    #: Where a reply goes, when not to the sender (a sign-in address nobody reads).
+    reply_to: str | None = None
 
 
 #: Delivers one message, or raises. Injected into the control plane so the
@@ -141,7 +145,9 @@ def invite_message(to: str, url: str, org_name: str, role: str) -> Message:
 DECLINE_REASON_MAX = 500
 
 
-def approved_message(to: str, app_url: str, org_name: str) -> Message:
+def approved_message(
+    to: str, app_url: str, org_name: str, *, reply_to: str | None = None
+) -> Message:
     """Telling an owner their agency was approved (FLOTTA-143).
 
     Until now an approved agency found out only by its banner changing, on a
@@ -166,33 +172,42 @@ def approved_message(to: str, app_url: str, org_name: str) -> Message:
         ),
         link=home,
         kind="approval email",
+        reply_to=reply_to,
     )
 
 
-def declined_message(to: str, app_url: str, org_name: str, reason: str | None) -> Message:
+def declined_message(
+    to: str, app_url: str, org_name: str, reason: str | None, *, reply_to: str | None = None
+) -> Message:
     """Telling an owner their agency was declined, and why if the operator said.
 
     The reason is the operator's own words, escaped in the HTML like the org's
-    name, and cut to `DECLINE_REASON_MAX` by the route before it gets here.
+    name, and cut to `DECLINE_REASON_MAX` by the route before it gets here. It
+    invites a reply only when `reply_to` says where one goes: the sender is a
+    sign-in address, and an appeal sent there would be lost.
     """
     home = app_url.rstrip("/") + "/"
     why_text = f"\n\nWhy: {reason}" if reason else ""
     why_html = f"<p>Why: {html.escape(reason)}</p>" if reason else ""
+    after = (
+        "You can still sign in, and reply to this email if you think we got it wrong."
+        if reply_to
+        else "You can still sign in."
+    )
     return Message(
         to=to,
         subject=f"About {org_name} on Flotta",
         text=(
             f"We can't take {org_name} on Flotta at the moment, so it won't be able "
-            f"to create agents.{why_text}\n\n"
-            "You can still sign in, and reply to this email if you think we got it wrong."
+            f"to create agents.{why_text}\n\n{after}"
         ),
         html=(
             f"<p>We can't take <strong>{html.escape(org_name)}</strong> on Flotta at the "
-            f"moment, so it won't be able to create agents.</p>{why_html}"
-            "<p>You can still sign in, and reply to this email if you think we got it wrong.</p>"
+            f"moment, so it won't be able to create agents.</p>{why_html}<p>{after}</p>"
         ),
         link=home,
         kind="decline email",
+        reply_to=reply_to,
     )
 
 
@@ -218,16 +233,19 @@ def resend_mailer(
     caller = post or _httpx_post
 
     def send(message: Message) -> None:
+        payload: dict[str, Any] = {
+            "from": sender,
+            "to": [message.to],
+            "subject": message.subject,
+            "text": message.text,
+            "html": message.html,
+        }
+        if message.reply_to:
+            payload["reply_to"] = message.reply_to
         status = caller(
             RESEND_URL,
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "from": sender,
-                "to": [message.to],
-                "subject": message.subject,
-                "text": message.text,
-                "html": message.html,
-            },
+            json=payload,
             timeout_s=timeout_s,
         )
         if not 200 <= status < 300:
@@ -250,6 +268,12 @@ def resolve_mailer(*, keyless: bool, env: dict[str, str] | None = None) -> Maile
     if keyless or (env.get(PRINT_LINKS_ENV) or "").strip() == "1":
         return print_mailer
     return None
+
+
+def resolve_reply_to(env: dict[str, str] | None = None) -> str | None:
+    """`$FLOTTA_MAIL_REPLY_TO`, or `None`: replies then have nowhere to go."""
+    env = os.environ if env is None else env
+    return (env.get(MAIL_REPLY_TO_ENV) or "").strip() or None
 
 
 def resolve_app_url(env: dict[str, str] | None = None) -> str:

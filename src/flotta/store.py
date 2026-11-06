@@ -504,6 +504,8 @@ class Org:
     name: str
     created_at: str
     status: str = "active"
+    #: What the operator said when declining it, if anything (FLOTTA-143).
+    decline_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1245,8 +1247,10 @@ class FleetStore:
             )
         return org
 
-    def decide_org(self, org_id: str, *, approve: bool) -> Org:
+    def decide_org(self, org_id: str, *, approve: bool, reason: str | None = None) -> Org:
         """Approve or decline a pending org. Once: both answers are final.
+
+        A decline keeps `reason`, the operator's words, on the org.
 
         Under the org table's guard, so an approve and a decline arriving
         together cannot both succeed and leave the answer to whichever wrote
@@ -1261,8 +1265,8 @@ class FleetStore:
                     f"org {org_id!r} is {org.status}, not pending; there is nothing to decide"
                 )
             self._conn.execute(
-                "UPDATE orgs SET status = ? WHERE id = ?",
-                ("active" if approve else "declined", org_id),
+                "UPDATE orgs SET status = ?, decline_reason = ? WHERE id = ?",
+                ("active" if approve else "declined", None if approve else reason, org_id),
             )
         decided = self.get_org(org_id)
         assert decided is not None
@@ -3634,7 +3638,13 @@ def _box_from_row(row: db.Row) -> Box:
 
 
 def _org_from_row(row: db.Row) -> Org:
-    return Org(id=row["id"], name=row["name"], created_at=row["created_at"], status=row["status"])
+    return Org(
+        id=row["id"],
+        name=row["name"],
+        created_at=row["created_at"],
+        status=row["status"],
+        decline_reason=row["decline_reason"],
+    )
 
 
 def _client_from_row(row: db.Row) -> Client:

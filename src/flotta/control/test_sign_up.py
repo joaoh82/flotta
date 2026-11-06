@@ -557,6 +557,8 @@ def test_a_reason_too_long_is_refused_before_anything_is_decided(api, fleet, out
 
 
 def test_an_answer_that_cannot_be_sent_still_stands(fleet, outbox):
+    """The send is after the response: a failed one is logged, and the answer stands."""
+
     def mailer(message):
         if message.kind in ("approval email", "decline email"):
             raise RuntimeError("Resend answered 500")
@@ -566,5 +568,62 @@ def test_an_answer_that_cannot_be_sent_still_stands(fleet, outbox):
         _sign_up(api, outbox)
         approved = api.post("/api/orgs/studio-pat/approve", headers=_operator())
     assert approved.status_code == 200, approved.text
-    assert approved.json() == {"org": approved.json()["org"], "told": 0}
+    assert approved.json()["told"] == 1
     assert approved.json()["org"]["status"] == "active"
+    assert all(m.kind != "approval email" for m in outbox)
+
+
+def _another_owner(fleet, email, *, disabled=False):
+    with FleetStore(fleet) as store:
+        user = store.create_user(email)
+        store.add_membership(user.id, "studio-pat", "owner")
+        if disabled:
+            store.disable_user(user.id)
+
+
+def test_every_owner_is_told_and_a_disabled_one_is_not(api, fleet, outbox):
+    _sign_up(api, outbox)
+    _another_owner(fleet, "quinn@example.com")
+    _another_owner(fleet, "gone@example.com", disabled=True)
+    declined = api.post(
+        "/api/orgs/studio-pat/decline", json={"reason": "EU only"}, headers=_operator()
+    )
+    assert declined.status_code == 200, declined.text
+    assert declined.json()["told"] == 2
+    told = sorted(m.to for m in outbox if m.kind == "decline email")
+    assert told == ["pat@example.com", "quinn@example.com"]
+
+
+def test_the_reason_is_kept_on_the_org(api, fleet, outbox):
+    """A message that never arrived is not the only copy of the operator's words."""
+    _sign_up(api, outbox)
+    api.post("/api/orgs/studio-pat/decline", json={"reason": "EU only"}, headers=_operator())
+    with FleetStore(fleet) as store:
+        assert store.get_org("studio-pat").decline_reason == "EU only"
+    listed = api.get("/api/orgs?status=declined", headers=_operator(SCOPE_FLEET_READ)).json()
+    assert [o["decline_reason"] for o in listed["orgs"]] == ["EU only"]
+
+
+def test_printed_messages_are_not_counted_as_told(fleet, outbox):
+    """`print_mailer` logs a message; nobody was emailed, so `told` is null."""
+    from flotta.mail import print_mailer
+
+    with TestClient(_app(fleet, mailer=outbox)) as api:
+        _sign_up(api, outbox)
+    with TestClient(_app(fleet, mailer=print_mailer)) as api:
+        approved = api.post("/api/orgs/studio-pat/approve", headers=_operator())
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["told"] is None
+
+
+def test_a_reply_is_invited_only_when_it_has_somewhere_to_go(api, fleet, outbox, monkeypatch):
+    _sign_up(api, outbox)
+    api.post("/api/orgs/studio-pat/decline", headers=_operator())
+    assert "reply" not in outbox[-1].text and outbox[-1].reply_to is None
+
+    _sign_up(api, outbox, email="lee@example.com", org="studio-lee", org_name="Studio Lee")
+    monkeypatch.setenv("FLOTTA_MAIL_REPLY_TO", "hello@flotta.dev")
+    with TestClient(_app(fleet, mailer=outbox)) as again:
+        again.post("/api/orgs/studio-lee/decline", headers=_operator())
+    assert outbox[-1].reply_to == "hello@flotta.dev"
+    assert "reply to this email" in outbox[-1].text

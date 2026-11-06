@@ -553,11 +553,14 @@ def create_app(
 
     from flotta.mail import (
         DECLINE_REASON_MAX,
+        Message,
         approved_message,
         declined_message,
         invite_message,
+        print_mailer,
         resolve_app_url,
         resolve_mailer,
+        resolve_reply_to,
         sign_in_message,
         sign_in_url,
         sign_up_message,
@@ -594,6 +597,7 @@ def create_app(
             "to this log on a machine whose log only you can read."
         )
     link_base = app_url if app_url is not None else resolve_app_url()
+    reply_to = resolve_reply_to()
     local_webhooks = allow_local_webhooks(keyless=not key)
     # Where tickets send a browser: refused now, not in a ticket nobody can use.
     from flotta.client import browser_door
@@ -1014,14 +1018,17 @@ def create_app(
         return {"org": asdict(org)}
 
     @app.post("/api/orgs/{org_id}/approve")
-    def approve_org(org_id: str, token: Token | None = needs_admin) -> Any:
+    def approve_org(org_id: str, tasks: BackgroundTasks, token: Token | None = needs_admin) -> Any:
         """Let a signed-up org create agents. The operator's alone, and final."""
         _require_operator(token, "approve an org")
-        return _decide(org_id, approve=True)
+        return _decide(org_id, tasks, approve=True)
 
     @app.post("/api/orgs/{org_id}/decline")
     def decline_org(
-        org_id: str, body: dict[str, Any] | None = None, token: Token | None = needs_admin
+        org_id: str,
+        tasks: BackgroundTasks,
+        body: dict[str, Any] | None = None,
+        token: Token | None = needs_admin,
     ) -> Any:
         """Refuse a signed-up org. It keeps its sign-in and creates nothing, ever.
 
@@ -1034,20 +1041,25 @@ def create_app(
                 status_code=422,
                 detail=f"a reason has at most {DECLINE_REASON_MAX} characters",
             )
-        return _decide(org_id, approve=False, reason=reason or None)
+        return _decide(org_id, tasks, approve=False, reason=reason or None)
 
-    def _decide(org_id: str, *, approve: bool, reason: str | None = None) -> Any:
+    def _decide(
+        org_id: str, tasks: BackgroundTasks, *, approve: bool, reason: str | None = None
+    ) -> Any:
         """Decide, then tell the org's owners (FLOTTA-143).
 
-        The decision is final once written, so a message that cannot be sent is
-        logged rather than refused: the operator's answer stands either way,
-        and `told` says how many owners were told.
+        The decision is final once written, and the messages go after the
+        response, like a sign-in link's: a slow mail provider must not make an
+        answer that was saved look like one that failed, whose retry is a 409.
+        `told` is how many owners a message was queued for, and `null` when
+        messages are printed to the log rather than emailed. The reason is kept
+        on the org, so a message that never arrives is not its only copy.
         """
         from dataclasses import asdict
 
         store = store_factory()
         try:
-            org = store.decide_org(org_id, approve=approve)
+            org = store.decide_org(org_id, approve=approve, reason=reason)
             owners = [
                 user.email
                 for m in store.members_of(org_id)
@@ -1061,20 +1073,25 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
-        told = 0
+        told: int | None = 0
         if deliver_link is not None:
             for email in owners:
                 message = (
-                    approved_message(email, link_base, org.name)
+                    approved_message(email, link_base, org.name, reply_to=reply_to)
                     if approve
-                    else declined_message(email, link_base, org.name, reason)
+                    else declined_message(email, link_base, org.name, reason, reply_to=reply_to)
                 )
-                try:
-                    deliver_link(message)
-                    told += 1
-                except Exception:  # noqa: BLE001 - the decision stands; the log says who was not told
-                    _log.exception("could not tell %s that %s was decided", email, org_id)
+                tasks.add_task(_tell_decided, message, org_id)
+            told = None if deliver_link is print_mailer else len(owners)
         return {"org": asdict(org), "told": told}
+
+    def _tell_decided(message: Message, org_id: str) -> None:
+        """One owner's message, after the response. A failure is logged, never raised."""
+        assert deliver_link is not None
+        try:
+            deliver_link(message)
+        except Exception:  # noqa: BLE001 - the decision stands; the log says who was not told
+            _log.exception("could not tell %s that %s was decided", message.to, org_id)
 
     # -- the operator's view (M12.9) ------------------------------------------
     #
