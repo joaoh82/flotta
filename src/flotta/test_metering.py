@@ -334,6 +334,45 @@ def test_each_published_size_has_its_price(fleet, machine, memory, monthly):
     assert _machine_rows(fleet)[0]["upstream_cost_nano"] == expected
 
 
+@pytest.mark.parametrize(
+    ("cpus", "memory", "monthly"), [(1, 2048, "12.72"), (2, 2048, "13.39"), (2, 4096, "25.44")]
+)
+def test_every_size_an_agent_may_be_given_has_a_price(fleet, machine, cpus, memory, monthly):
+    """FLOTTA-157: a size with no price stops any budget covering it, and the
+    default is now 2 GB."""
+    from flotta.backend import MEMORY_SIZES_MB
+    from flotta.backends.fly_backend import cpus_for
+    from flotta.pricing import machine_usd_per_month
+
+    for size in MEMORY_SIZES_MB:
+        label = f"machine:shared-{cpus_for(size)}x-{size}"
+        assert machine_usd_per_month(label, "iad", {}) is not None, label
+    machine.size = {"cpu_kind": "shared", "cpus": cpus, "memory_mb": memory}
+    _started(fleet, machine)
+    _sweep(fleet, T0 + HOUR)
+    expected = round(Decimal(monthly) * NANO * 3600 / 2_592_000)
+    assert _machine_rows(fleet)[0]["upstream_cost_nano"] == expected
+
+
+def test_a_resized_machine_is_billed_at_its_new_size_from_the_next_sweep(fleet, machine):
+    """The sweep prices an hour at the size it read at the hour before, then
+    reads again, so a resize is priced from the first whole hour after it.
+    The part of the hour it happened in is at the old size: at most an hour."""
+    _started(fleet, machine)
+    _sweep(fleet, T0 + HOUR)
+    machine.size = {"cpu_kind": "shared", "cpus": 2, "memory_mb": 4096}  # resized at 1h30
+    _sweep(fleet, T0 + 2 * HOUR)
+    _sweep(fleet, T0 + 3 * HOUR)
+    assert [r["model"] for r in _machine_rows(fleet)] == [
+        "machine:shared-1x-1024",
+        "machine:shared-1x-1024",
+        "machine:shared-2x-4096",
+    ]
+    assert _machine_rows(fleet)[-1]["upstream_cost_nano"] == round(
+        Decimal("25.44") * NANO * 3600 / 2_592_000
+    )
+
+
 def test_a_machine_costs_what_its_region_costs(fleet, machine):
     machine.region = "ams"
     _started(fleet, machine)

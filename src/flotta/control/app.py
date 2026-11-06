@@ -141,6 +141,11 @@ _provisioning: set[threading.Thread] = set()
 _model_changes_running: set[str] = set()
 _model_changes_lock = threading.Lock()
 
+#: Agents being resized by a thread of this process (FLOTTA-157), for the
+#: reason `_model_changes_running` exists.
+_resizes_running: set[str] = set()
+_resizes_lock = threading.Lock()
+
 
 def _record_unfinished_change(
     store_factory: Any, box_id: str, model: str, error: Exception
@@ -162,6 +167,27 @@ def _record_unfinished_change(
             store.close()
     except Exception as exc:  # noqa: BLE001
         _log.warning("could not record %s's unfinished model change: %s", box_id, exc)
+
+
+def _record_unfinished_resize(
+    store_factory: Any, box_id: str, memory_mb: int, error: Exception
+) -> None:
+    """`_record_unfinished_change`, for a resize: on its own connection, best effort."""
+    from flotta.provision import SIZE_CHANGE_FAILED
+
+    try:
+        store = store_factory()
+        try:
+            store.add_event(
+                "box",
+                box_id,
+                SIZE_CHANGE_FAILED,
+                {"memory_mb": memory_mb, "error": str(error)[:400]},
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("could not record %s's unfinished resize: %s", box_id, exc)
 
 
 def _build() -> str:
@@ -369,6 +395,8 @@ def _box_dict(
     given: str | None = None,
     model_change: dict[str, Any] | None = None,
     clients_answer_approvals: bool = False,
+    memory_mb: int | None = None,
+    size_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
@@ -403,11 +431,22 @@ def _box_dict(
     # window say "restarting" and an open conversation expect the drop.
     out["model_change"] = model_change
     out["clients_answer_approvals"] = clients_answer_approvals
+    # The machine's memory in MB (FLOTTA-157), from the store rather than the
+    # substrate (`provision.box_sizes`); None when nothing has said. And a
+    # resize under way, which restarts the agent the way a model change does.
+    out["memory_mb"] = memory_mb
+    out["size_change"] = size_change
     return out
 
 
 def _with_meta(store: Any, box: Any) -> dict[str, Any]:
-    from flotta.provision import fleet_model, model_changes, model_given_by_default
+    from flotta.provision import (
+        box_sizes,
+        fleet_model,
+        model_changes,
+        model_given_by_default,
+        size_changes,
+    )
 
     return _box_dict(
         box,
@@ -417,6 +456,8 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         given=store.models_given([box.id]).get(box.id) or model_given_by_default(),
         model_change=model_changes(store, [box.id]).get(box.id),
         clients_answer_approvals=store.clients_answer_approvals(box.id),
+        memory_mb=box_sizes(store, [box.id]).get(box.id),
+        size_change=size_changes(store, [box.id]).get(box.id),
     )
 
 
@@ -811,6 +852,29 @@ def create_app(
             raise HTTPException(
                 status_code=403, detail=f"only the fleet's operator (the default org) may {action}"
             )
+
+    def _require_owner(token: Token | None, action: str) -> None:
+        """403 unless an org's owner (`org:admin`) or the operator.
+
+        For what changes what an agency pays rather than what its agents do — a
+        machine's size (FLOTTA-157). A member may restart, rename and re-model
+        an agent, and the bill is still the owner's to choose. The route's own
+        dependency asks for `fleet:write` as well, so the operator viewing an
+        agency as its owner, which holds `org:admin` and no write, is refused
+        there before this.
+        """
+        if token is None or _is_operator(token) or token.allows(SCOPE_ORG_ADMIN):
+            return
+        raise HTTPException(status_code=403, detail=f"only the org's owner may {action}")
+
+    def _checked_memory(raw: Any) -> int:
+        """A body's `memory_mb`, on the fleet's allowlist, or 422 saying which are."""
+        from flotta.backend import check_memory_mb
+
+        try:
+            return check_memory_mb(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     def _scoped_box(store: Any, token: Token | None, ref: str) -> Any:
         """A box by id or name that `token` may act on, or 404.
@@ -2751,13 +2815,21 @@ def create_app(
                 # "no rate configured", a zero claims the box ran for free.
                 "cost_estimate": sum(costs) if costs else None,
             }
-        from flotta.provision import fleet_model, model_changes, model_given_by_default
+        from flotta.provision import (
+            box_sizes,
+            fleet_model,
+            model_changes,
+            model_given_by_default,
+            size_changes,
+        )
 
         ids = [b.id for b in boxes]
         metas = store.meta_for_boxes(ids)
         models = store.models_for_boxes(ids)
         given = store.models_given(ids)
         changes = model_changes(store, ids)
+        sizes = box_sizes(store, ids)
+        resizes = size_changes(store, ids)
         default = fleet_model(store)
         default_given = model_given_by_default()
         approvers = store.client_approvers(ids)
@@ -2773,6 +2845,8 @@ def create_app(
                             given=given.get(b.id) or default_given,
                             clients_answer_approvals=b.id in approvers,
                             model_change=changes.get(b.id),
+                            memory_mb=sizes.get(b.id),
+                            size_change=resizes.get(b.id),
                         ),
                         **summaries[b.id],
                     },
@@ -2872,6 +2946,12 @@ def create_app(
                     status_code=422, detail=f"volume_gb must be at least 1, got {volume_gb}"
                 )
         region = (str(body.get("region") or "")).strip() or None
+        # Its size, which only an owner chooses (FLOTTA-157): absent is the
+        # fleet's default, which anyone who may create may have.
+        memory_mb: int | None = None
+        if body.get("memory_mb") is not None:
+            memory_mb = _checked_memory(body.get("memory_mb"))
+            _require_owner(token, "choose an agent's size")
 
         # Who the agent is. Validated here for the early exit and again in the
         # store for the guarantee; a description that cannot be stored must
@@ -2898,6 +2978,7 @@ def create_app(
                 label=label,
                 volume_gb=volume_gb,
                 region=region,
+                memory_mb=memory_mb,
                 display_name=display_name,
                 description=description,
                 instructions=instructions,
@@ -2914,6 +2995,7 @@ def create_app(
                     client=client,
                     volume_gb=volume_gb,
                     region=region,
+                    memory_mb=memory_mb,
                     display_name=display_name,
                     description=description,
                     instructions=instructions,
@@ -2967,6 +3049,7 @@ def create_app(
         label: str,
         volume_gb: int | None = None,
         region: str | None = None,
+        memory_mb: int | None = None,
         display_name: str | None = None,
         description: str | None = None,
         instructions: str | None = None,
@@ -3037,7 +3120,14 @@ def create_app(
         def provision() -> None:
             inner = store_factory()
             try:
-                create_box(name, store=inner, box=box, volume_gb=volume_gb, region=region)
+                create_box(
+                    name,
+                    store=inner,
+                    box=box,
+                    volume_gb=volume_gb,
+                    region=region,
+                    memory_mb=memory_mb,
+                )
             except Exception as exc:  # noqa: BLE001
                 # `create_box` already records the failure against the row;
                 # this only stops a stray exception ending the thread in
@@ -3737,6 +3827,112 @@ def create_app(
             finally:
                 if not handed_over:
                     _model_changes_running.discard(box.id)
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/size")
+    def set_size_endpoint(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Give an agent's machine more or less memory (FLOTTA-157), keeping its disk.
+
+        `{"memory_mb": 2048}`, one of `flotta.backend.MEMORY_SIZES_MB`; the CPUs
+        follow from it on the substrate. **An owner's, or the operator's**, not
+        a member's: the size is what the agency pays for the machine
+        (`_require_owner`), so `fleet:write` alone is a 403.
+
+        The model route's shape, for its reason (FLOTTA-99): a running agent
+        restarts, which outlasts the web app's ten seconds, so the refusals
+        come first, then `202` and a thread. The box's `size_change` says it is
+        under way — the cue for an open conversation to expect the drop and
+        reconnect — and the timeline's `size_set` or `size_change_failed` how
+        it ended. An agent already that size is a `200` with `already_current`
+        and no restart.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import ProvisionError, UpgradeFailed, begin_resize, resize_box
+
+        if "memory_mb" not in body:
+            raise HTTPException(
+                status_code=422, detail='how much memory? Send {"memory_mb": 2048}.'
+            )
+        memory_mb = _checked_memory(body.get("memory_mb"))
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            _require_owner(token, "resize an agent")
+            with _resizes_lock:
+                if box.id in _resizes_running:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{box.name} is already being resized; wait for that to finish.",
+                    )
+                try:
+                    started = begin_resize(box.id, memory_mb, store=store)
+                except ProvisionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if started.get("already_current"):
+                    return {
+                        "box_id": box.id,
+                        "memory_mb": memory_mb,
+                        "already_current": True,
+                        "box": _with_meta(store, box),
+                    }
+                _resizes_running.add(box.id)
+
+            def resize() -> None:
+                # Released whatever happens, opening the store included: only
+                # this thread releases it now (see `set_model_endpoint`).
+                try:
+                    inner = store_factory()
+                    try:
+                        resize_box(box.id, memory_mb, store=inner)
+                    except UpgradeFailed as exc:
+                        # `resize_box` recorded it.
+                        _log.warning("resizing %s failed: %s", box.name, exc)
+                    finally:
+                        inner.close()
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("resizing %s failed: %s", box.name, exc)
+                    _record_unfinished_resize(store_factory, box.id, memory_mb, exc)
+                finally:
+                    _resizes_running.discard(box.id)
+
+            handed_over = False
+            try:
+                if not background:
+                    try:
+                        resize_box(box.id, memory_mb, store=store)
+                    except UpgradeFailed as exc:
+                        raise HTTPException(status_code=502, detail=str(exc)) from exc
+                    except ProvisionError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    return {
+                        "box_id": box.id,
+                        "memory_mb": memory_mb,
+                        "box": _with_meta(store, _scoped_box(store, token, box.id)),
+                    }
+                answer = {
+                    "box_id": box.id,
+                    "memory_mb": memory_mb,
+                    "started": True,
+                    "box": _with_meta(store, box),
+                }
+                worker = threading.Thread(target=resize, name=f"resize-{box.name}", daemon=True)
+                _provisioning.add(worker)
+                worker.start()
+                handed_over = True
+                return JSONResponse(answer, status_code=202)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                # It will never run: say so, rather than leave "resizing" showing.
+                _record_unfinished_resize(store_factory, box.id, memory_mb, exc)
+                raise
+            finally:
+                if not handed_over:
+                    _resizes_running.discard(box.id)
         finally:
             store.close()
 

@@ -2882,6 +2882,21 @@ class FleetStore:
             volume_gb=row["volume_gb"],
         )
 
+    def machine_labels(self, box_ids: list[str]) -> dict[str, str]:
+        """Each box's metered machine label (`machine:shared-1x-2048`), one query.
+
+        What the hourly sweep last read off the substrate, so it is the size an
+        agent had before anything here recorded one (FLOTTA-157).
+        """
+        if not box_ids:
+            return {}
+        marks = ", ".join("?" for _ in box_ids)
+        rows = self._conn.execute(
+            f"SELECT box_id, machine_label FROM machine_meter_marks WHERE box_id IN ({marks})",
+            tuple(box_ids),
+        ).fetchall()
+        return {str(r["box_id"]): str(r["machine_label"]) for r in rows}
+
     def set_machine_mark(self, mark: MachineMark) -> None:
         self._conn.execute(
             "INSERT INTO machine_meter_marks (box_id, metered_to, machine_label, region, "

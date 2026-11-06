@@ -1817,3 +1817,46 @@ def test_moving_an_agent_needs_a_control_plane(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli.app, ["model", "gateway", "eng-a"])
     assert result.exit_code == 2
     assert "FLOTTA_CONTROL_URL" in result.output
+
+
+# -- `flotta resize` (FLOTTA-157) ---------------------------------------------
+
+
+def test_a_resize_goes_through_the_control_plane_and_is_not_reported_as_done(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    sent = []
+
+    def fake(method, path, *, scopes, body=None, **kw):
+        if path.endswith("/size"):
+            sent.append((method, path, body))
+            return {"box_id": "b-1", "memory_mb": 4096, "started": True, "box": {"name": "eng-a"}}
+        return {"id": "b-1", "name": "eng-a"}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    result = CliRunner().invoke(cli.app, ["resize", "eng-a", "--memory", "4096"])
+    assert result.exit_code == 0, result.output
+    assert sent == [("PUT", "/api/boxes/b-1/size", {"memory_mb": 4096})]
+    assert "is being resized to 4096 MB" in result.output
+
+
+def test_a_resize_off_the_list_is_refused_before_anything_is_asked(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+
+    def never(*args, **kwargs):
+        raise AssertionError("refused locally")
+
+    monkeypatch.setattr(cli, "control_request", never)
+    result = CliRunner().invoke(cli.app, ["resize", "eng-a", "--memory", "3000"])
+    assert result.exit_code == 2
+    assert "1024, 2048, 4096" in result.output

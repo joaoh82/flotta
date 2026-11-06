@@ -35,9 +35,11 @@ primary_region = ""
   source = "flotta_data"
   destination = "/data"
 
+# The fleet's default size (`DEFAULT_MEMORY_MB` in flotta/backend.py); an agent
+# created by `flotta create` is sized by FlyConfig, not by this file.
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "1gb"
+  memory = "2gb"
 
 # NO [http_service] / [[services]] block, deliberately.
 #

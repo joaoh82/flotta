@@ -79,6 +79,33 @@ class UnknownBackendError(BackendError):
     """An endpoint names a substrate nothing here implements."""
 
 
+#: The memory sizes an agent may be given, in MB (FLOTTA-157). Memory is the
+#: portable half of a machine's size: every substrate hands a VM some number of
+#: megabytes, while CPU presets are each provider's own vocabulary, so a
+#: backend derives its CPUs from this rather than being told them. An allowlist
+#: rather than a range because each step is a price somebody pays, and a size
+#: nobody has priced is one no budget can cover (`flotta.pricing`).
+MEMORY_SIZES_MB: tuple[int, ...] = (1024, 2048, 4096)
+
+#: What a new agent gets when nothing says otherwise. 1024 was the old figure,
+#: and an agent on it had `hermes` killed for memory mid-task: Hermes and its
+#: worker hold close to 500 MB between them, which left an `npm install` under
+#: 300.
+DEFAULT_MEMORY_MB = 2048
+
+
+def check_memory_mb(value: object) -> int:
+    """`value` as a size on `MEMORY_SIZES_MB`, or `ValueError` saying which are.
+
+    One check for every path that names a size — the API, the CLI, a spec — so
+    none of them can hand a backend a number it was never meant to price.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value not in MEMORY_SIZES_MB:
+        allowed = ", ".join(str(m) for m in MEMORY_SIZES_MB)
+        raise ValueError(f"memory_mb must be one of {allowed} (MB); got {value!r}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class BoxSpec:
     """What to create. Deliberately small — everything here is portable.
@@ -106,6 +133,11 @@ class BoxSpec:
     #: while `just fly-whoami` printed whatever the variable said. Config that
     #: reports itself as in effect and is not is worse than config nobody reads.
     volume_gb: int | None = None
+    #: How much memory the machine gets, in MB — one of `MEMORY_SIZES_MB`, or
+    #: None for the backend's own default, the same shape as `volume_gb`. Memory
+    #: and not a preset, because a preset (`shared-cpu-1x`) is one provider's
+    #: word; each backend works out what CPUs that much memory needs.
+    memory_mb: int | None = None
     #: Where the durable volume is mounted. `HERMES_HOME` lives inside it —
     #: that relocation is the whole of M2.
     mount_path: str = "/data"
@@ -142,6 +174,10 @@ class BoxHandle:
     #: machine to adopt. Discovered by comparing timestamps — the fleet's first
     #: box had a machine five days older than its row.
     adopted: bool = False
+    #: The memory the machine was given, in MB, when the backend knows it: what
+    #: it asked for, or what an adopted machine already had. None means "not
+    #: said", which a local stand-in, with no VM to size, always is.
+    memory_mb: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +340,22 @@ class Backend(Protocol):
         Costs a restart, like `apply_secrets` and for the same reason: a box
         reads its environment once, at boot. A failure must leave the box as it
         was — a half-upgraded agent is worse than an old one.
+        """
+        ...
+
+    def resize(self, box_id: str, memory_mb: int) -> None:
+        """Give the box's machine `memory_mb` of memory, **keeping its disk**.
+        `NotSupported` if it cannot.
+
+        Memory is the portable field (`MEMORY_SIZES_MB`); whatever CPUs that
+        much memory needs on this substrate is the backend's to work out, since
+        CPU presets are not portable and a caller naming one would be naming a
+        provider.
+
+        Costs a restart of a running box, like `reimage`: a VM's memory is set
+        when it boots. A box that is not running stays that way, for the reason
+        `reimage` gives — an asleep agent woken by a resize bills while its row
+        says `stopped`. A failure must leave the machine the size it was.
         """
         ...
 

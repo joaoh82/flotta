@@ -210,6 +210,7 @@ def test_the_backend_satisfies_the_protocol():
         "remove_secrets",
         "apply_env",
         "reimage",
+        "resize",
         "exec",
         "state",
         "endpoint",
@@ -1169,3 +1170,118 @@ def test_a_rotation_is_deployed_rather_than_merely_staged():
     )
     assert "--stage" not in issued[0]
     assert issued[0][:3] == ["flyctl", "secrets", "import"]
+
+
+# -- FLOTTA-157: an agent's size is memory, and the CPUs follow --------------
+
+
+def _sized(machines, memory_mb, cpu_kind=None):
+    for machine in machines:
+        guest = {"memory_mb": memory_mb, "cpus": 1}
+        if cpu_kind:
+            guest["cpu_kind"] = cpu_kind
+        machine["config"]["guest"] = guest
+    return machines
+
+
+def _flag(cmd, name):
+    return cmd[cmd.index(name) + 1]
+
+
+@pytest.mark.parametrize(("memory", "cpus"), [(1024, "1"), (2048, "1"), (4096, "2")])
+def test_a_resize_names_the_memory_and_the_cpus_it_needs(memory, cpus):
+    """A shared CPU holds at most 2 GB, so 4 GB is two of them — named every
+    time, so going back down gives the second one up."""
+    issued, backend = _recording_fly(_sized(_machines_list(state="started"), 1024, "shared"))
+    backend.resize("fly://joaoh82-flotta-eng-a/m-1", memory)
+
+    update = next(c for c in issued if "update" in c)
+    assert update[update.index("update") + 1] == "m-1"
+    assert (_flag(update, "--vm-memory"), _flag(update, "--vm-cpus")) == (str(memory), cpus)
+    assert "--yes" in update
+    assert "--skip-start" not in update, "a running agent restarts at its new size"
+    assert "--image" not in update and "--env" not in update
+    assert _flag(update, "--app") == "joaoh82-flotta-eng-a"
+
+
+@pytest.mark.parametrize("state", ["stopped", "suspended"])
+def test_resizing_an_asleep_agent_does_not_wake_it(state):
+    """`reimage`'s promise: an asleep agent woken by a resize bills while its row
+    says `stopped`."""
+    issued, backend = _recording_fly(_sized(_machines_list(state=state), 2048))
+    backend.resize("fly://joaoh82-flotta-eng-a/m-1", 4096)
+
+    update = next(c for c in issued if "update" in c)
+    assert "--skip-start" in update, update
+
+
+def test_a_performance_machine_keeps_one_cpu_for_four_gigabytes():
+    """The CPU kind is the machine's own, and a performance CPU holds 8 GB."""
+    issued, backend = _recording_fly(_sized(_machines_list(), 2048, "performance"))
+    backend.resize("fly://joaoh82-flotta-eng-a/m-1", 4096)
+
+    update = next(c for c in issued if "update" in c)
+    assert _flag(update, "--vm-cpus") == "1"
+
+
+def _created(spec, config=None):
+    import json as _json
+    import subprocess
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        if "machines" in cmd and "list" in cmd:
+            ran = any("run" in c for c in issued)
+            body = _json.dumps([{"id": "m9", "state": "started"}] if ran else [])
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+    backend = FlyBackend(config=config or _offline_config(), runner=runner)
+    handle = backend.create(spec)
+    return handle, next(c for c in issued if "run" in c)
+
+
+def test_a_new_agent_gets_two_gigabytes_by_default():
+    """1 GB had `hermes` killed for memory mid-task on a live agent."""
+    handle, run = _created(BoxSpec(name="eng-a", image="registry.fly.io/x:v1"))
+    assert _flag(run, "--vm-memory") == "2048"
+    assert _flag(run, "--vm-size") == "shared-cpu-1x"
+    assert "--vm-cpus" not in run
+    assert handle.memory_mb == 2048
+
+
+def test_a_spec_that_names_four_gigabytes_gets_the_second_cpu():
+    handle, run = _created(BoxSpec(name="eng-a", image="registry.fly.io/x:v1", memory_mb=4096))
+    assert (_flag(run, "--vm-memory"), _flag(run, "--vm-cpus")) == ("4096", "2")
+    assert handle.memory_mb == 4096
+
+
+def test_an_adopted_machine_reports_the_memory_it_already_has():
+    """Adopting changes nothing about the machine, so the spec's size is not its size."""
+    import json as _json
+    import subprocess
+
+    machines = _sized(_machines_list(), 1024)
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        if "apps" in cmd and "list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, '[{"Name": "flotta-box"}]', "")
+        if "machines" in cmd and "list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, _json.dumps(machines), "")
+        raise AssertionError(f"adopting must not change anything: {cmd}")
+
+    backend = FlyBackend(config=_offline_config(), runner=runner)
+    handle = backend.create(BoxSpec(name="eng-a", memory_mb=4096))
+    assert (handle.adopted, handle.memory_mb) == (True, 1024)
+
+
+def test_a_size_off_the_allowlist_is_refused_with_the_sizes_named():
+    from flotta.backend import MEMORY_SIZES_MB, check_memory_mb
+
+    assert MEMORY_SIZES_MB == (1024, 2048, 4096)
+    for bad in (512, 3000, "2048", True, None, 2048.0):
+        with pytest.raises(ValueError, match="1024, 2048, 4096"):
+            check_memory_mb(bad)
+    assert check_memory_mb(4096) == 4096
