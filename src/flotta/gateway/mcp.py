@@ -34,6 +34,22 @@ there. For an OAuth connection the token is refreshed and the call tried once
 more; otherwise the agent is told the agency's credential was refused. **A 403
 is passed back** (without `WWW-Authenticate`) as the upstream's refusal, and
 refreshes nothing: a token that works but may not do this is not a dead one.
+
+## Whose credential (slice 3)
+
+**The box's client's own connection, if it has one, else the agency's**: the
+D19 order `resolve_key` keeps for model keys. Read off the box's row, never the
+request, so no agent reaches another client's account, and there is no step
+from one client to another.
+
+**A client connection that has stopped working is not passed over for the
+agency's.** Connecting a client's own account says that client's work goes
+through it. Falling back would send it, unasked, through the agency's account,
+with the agency's access to everything else there, and nobody would notice the
+client's connection had broken. So the call fails and says to connect it
+again; disconnecting the client's is how the agency's comes back.
+
+Each call's row says which one served it (`account`: `org` or `client`).
 """
 
 from __future__ import annotations
@@ -108,11 +124,20 @@ _EVENT_END = b"\n\n"
 class McpRefused(Exception):
     """A request that stops here, with the status and what the agent is told."""
 
-    def __init__(self, status: int, message: str, *, code: int = UNAVAILABLE) -> None:
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        code: int = UNAVAILABLE,
+        account: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
         self.code = code
+        #: The connection it stopped at, if it got that far: for the call's row.
+        self.account = account
 
     def response(self, request_id: Any = None) -> JSONResponse:
         return rpc_error(request_id, self.code, self.message, status=self.status)
@@ -253,7 +278,7 @@ class Proxy:
             # rather than stopping the gateway that every agent's models go through.
             _log.exception("the MCP catalogue could not be read")
             self.servers = {}
-        self._locks: dict[tuple[str, str], threading.Lock] = {}
+        self._locks: dict[tuple[str, str, str], threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._audit = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-audit")
         self.upstream: httpx.AsyncClient | None = None
@@ -280,14 +305,18 @@ class Proxy:
             store.close()
         return grant_from_row(row.server, row.tools, row.ask_first) if row else None
 
-    def record(self, box: Box, server: Server, tool: str, status: str) -> None:
+    def record(
+        self, box: Box, server: Server, tool: str, status: str, account: str | None = None
+    ) -> None:
         """A row, on a thread nothing awaits: a hung-up client cancels its request's task."""
 
         def write() -> None:
             try:
                 store = self._store_factory()
                 try:
-                    store.record_mcp_call(box.id, server=server.name, tool=tool, status=status)
+                    store.record_mcp_call(
+                        box.id, server=server.name, tool=tool, status=status, account=account
+                    )
                 finally:
                     store.close()
             except Exception:
@@ -298,50 +327,82 @@ class Proxy:
         except RuntimeError:
             write()
 
-    def _lock(self, org: str, server: str) -> threading.Lock:
+    def _lock(self, org: str, client: str | None, server: str) -> threading.Lock:
         with self._locks_guard:
-            return self._locks.setdefault((org, server), threading.Lock())
+            return self._locks.setdefault((org, client or "", server), threading.Lock())
 
     def credential(self, box: Box, server: Server, *, stale: str | None = None) -> dict[str, Any]:
-        """The org's credential for `server`, refreshed if it has to be. Raises `McpRefused`.
+        """The credential a call from `box` goes out on. See `resolve`."""
+        return self.resolve(box, server, stale=stale)[0]
 
-        `stale` is an access token the upstream just refused: refresh unless
-        someone else already has.
+    def resolve(
+        self, box: Box, server: Server, *, stale: str | None = None
+    ) -> tuple[dict[str, Any], str]:
+        """`box`'s client's credential for `server`, else its org's, refreshed if need be.
+
+        Answers the credential and which one it is (`client` or `org`), or
+        raises `McpRefused`. `stale` is an access token the upstream just
+        refused: refresh unless someone else already has.
         """
-        context = connection_context(box.org, server.name)
         store = self._store_factory()
         try:
-            found = store.mcp_connection(box.org, server.name)
+            client: str | None = box.client
+            found = store.mcp_connection(box.org, server.name, client=client)
+            if found is None:
+                client = None
+                found = store.mcp_connection(box.org, server.name)
+            account = "client" if client else "org"
+            whose = "this client" if client else "this agency"
             if found is None or found.kind != server.auth:
-                raise McpRefused(503, f"{server.title} isn't connected for this agency yet")
-            if found.status != "ok":
                 raise McpRefused(
-                    503, f"{server.title}'s connection stopped working: connect it again"
+                    503, f"{server.title} isn't connected for {whose} yet", account=account
                 )
+            if found.status != "ok":
+                # Never the org's in its place: see the module docstring.
+                raise McpRefused(
+                    503,
+                    f"{server.title}'s connection for {whose} stopped working: connect it again",
+                    account=account,
+                )
+            context = connection_context(box.org, server.name, client)
             try:
                 credential = json.loads(unseal(found.credential, context=context, env=self._env))
             except SealError as exc:
-                _log.error("the %s credential for %s won't open: %s", server.name, box.org, exc)
-                raise McpRefused(503, "the gateway can't use this agency's credential") from exc
+                _log.error(
+                    "the %s credential for %s/%s won't open: %s",
+                    server.name,
+                    box.org,
+                    client or "-",
+                    exc,
+                )
+                raise McpRefused(
+                    503, f"the gateway can't use {whose}'s credential", account=account
+                ) from exc
             if server.auth != "oauth":
-                return credential
+                return credential, account
             if stale is None and not mcp_oauth.needs_refresh(credential):
-                return credential
-            with self._lock(box.org, server.name):
-                again = store.mcp_connection(box.org, server.name)
+                return credential, account
+            with self._lock(box.org, client, server.name):
+                again = store.mcp_connection(box.org, server.name, client=client)
                 if again is not None and again.updated_at != found.updated_at:
                     if again.status != "ok":
                         raise McpRefused(
-                            503, f"{server.title}'s connection stopped working: connect it again"
+                            503,
+                            f"{server.title}'s connection for {whose} stopped working: "
+                            "connect it again",
+                            account=account,
                         )
                     opened = unseal(again.credential, context=context, env=self._env)
                     credential = json.loads(opened)
                     if credential.get("access_token") != stale and not mcp_oauth.needs_refresh(
                         credential
                     ):
-                        return credential
+                        return credential, account
                     found = again
-                return self._refresh(store, box, server, found.updated_at, credential, context)
+                fresh = self._refresh(
+                    store, box, client, server, found.updated_at, credential, context
+                )
+                return fresh, account
         finally:
             store.close()
 
@@ -349,15 +410,21 @@ class Proxy:
         self,
         store: FleetStore,
         box: Box,
+        client: str | None,
         server: Server,
         was: str,
         credential: dict[str, Any],
         context: str,
     ) -> dict[str, Any]:
+        account = "client" if client else "org"
         token = credential.get("refresh_token")
         if not token:
-            store.break_mcp_connection(box.org, server.name, "expired, with no way to refresh")
-            raise McpRefused(503, f"{server.title}'s sign-in has expired: connect it again")
+            store.break_mcp_connection(
+                box.org, server.name, "expired, with no way to refresh", client=client
+            )
+            raise McpRefused(
+                503, f"{server.title}'s sign-in has expired: connect it again", account=account
+            )
         try:
             with httpx.Client(transport=self._oauth_transport, trust_env=False) as http:
                 tokens = mcp_oauth.refresh(
@@ -369,21 +436,28 @@ class Proxy:
                     env=self._env,
                 )
         except mcp_oauth.Refused as exc:
-            store.break_mcp_connection(box.org, server.name, str(exc))
+            store.break_mcp_connection(box.org, server.name, str(exc), client=client)
             store.add_event(
-                "box", box.id, "mcp_connection_broken", {"server": server.name, "detail": str(exc)}
+                "box",
+                box.id,
+                "mcp_connection_broken",
+                {"server": server.name, "account": account, "detail": str(exc)},
             )
             raise McpRefused(
-                503, f"{server.title} refused to renew the sign-in: connect it again"
+                503,
+                f"{server.title} refused to renew the sign-in: connect it again",
+                account=account,
             ) from exc
         except mcp_oauth.OAuthError as exc:
             _log.warning("%s could not be refreshed for %s: %s", server.name, box.org, exc)
             raise McpRefused(
-                503, f"{server.title} couldn't be reached to renew the sign-in"
+                503, f"{server.title} couldn't be reached to renew the sign-in", account=account
             ) from exc
         fresh = mcp_oauth.refreshed(credential, tokens)
         sealed = seal(json.dumps(fresh), context=context, env=self._env)
-        if not store.refresh_mcp_connection(box.org, server.name, credential=sealed, was=was):
+        if not store.refresh_mcp_connection(
+            box.org, server.name, credential=sealed, was=was, client=client
+        ):
             # Someone reconnected or refreshed meanwhile. Theirs stands; this one
             # still works for this call.
             _log.info("a newer %s credential for %s was kept", server.name, box.org)
@@ -421,6 +495,7 @@ class Proxy:
         tool: str | None = None
         box: Box | None = None
         server: Server | None = None
+        account: str | None = None
         try:
             box, server, grant = await self._prepare(request, name, caller)
             raw = b""
@@ -461,33 +536,35 @@ class Proxy:
                             NOT_GRANTED,
                             f"{tool} isn't one of the {server.title} tools granted to this agent",
                         )
-            credential = await asyncio.to_thread(self.credential, box, server)
+            credential, account = await asyncio.to_thread(self.resolve, box, server)
             response = await self._send(request, server, raw, credential)
             # A 401 is a token the upstream no longer takes; a 403 is a refusal of
             # this request, which a new token would not change. Only the first is
             # refreshed, so a forbidden tool can't break the agency's connection.
             if response.status_code == 401 and server.auth == "oauth":
                 await response.aclose()
-                credential = await asyncio.to_thread(
-                    self.credential, box, server, stale=credential.get("access_token")
+                credential, account = await asyncio.to_thread(
+                    self.resolve, box, server, stale=credential.get("access_token")
                 )
                 response = await self._send(request, server, raw, credential)
             if response.status_code == 401:
                 await response.aclose()
+                whose = "the client's" if account == "client" else "the agency's"
                 raise McpRefused(
                     502,
-                    f"{server.title} refused the agency's credential; it may need connecting again",
+                    f"{server.title} refused {whose} credential; it may need connecting again",
+                    account=account,
                 )
         except McpRefused as refused:
             if tool is not None and box is not None and server is not None:
-                self.record(box, server, tool, "unavailable")
+                self.record(box, server, tool, "unavailable", refused.account)
             return refused.response(request_id)
         except httpx.HTTPError as exc:
             _log.warning("%s could not be reached: %s", name, exc)
             if tool is not None and box is not None and server is not None:
-                self.record(box, server, tool, "unreachable")
+                self.record(box, server, tool, "unreachable", account)
             return rpc_error(request_id, UNAVAILABLE, f"{name} could not be reached", status=502)
-        return await self._answer(response, box, server, grant, request_id, tool)
+        return await self._answer(response, box, server, grant, request_id, tool, account)
 
     async def _send(
         self, request: Request, server: Server, raw: bytes, credential: Mapping[str, Any]
@@ -509,6 +586,7 @@ class Proxy:
         grant: Grant,
         request_id: Any,
         tool: str | None,
+        account: str | None,
     ) -> Response:
         headers = {k: v for k, v in response.headers.items() if k.lower() not in _DROPPED}
         kind = response.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -535,7 +613,7 @@ class Proxy:
                 nonlocal finished
                 if tool is not None and not finished:
                     finished = True
-                    self.record(box, server, tool, events.status or "no_answer")
+                    self.record(box, server, tool, events.status or "no_answer", account)
 
             return _FinishedStream(
                 relay(), finish, status_code=response.status_code, headers=headers
@@ -556,7 +634,7 @@ class Proxy:
                 if did:
                     body = json.dumps(changed).encode()
         if tool is not None:
-            self.record(box, server, tool, status or "no_answer")
+            self.record(box, server, tool, status or "no_answer", account)
         return Response(body, response.status_code, headers)
 
 

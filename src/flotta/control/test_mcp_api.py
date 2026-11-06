@@ -342,6 +342,144 @@ def test_a_key_server_has_no_sign_in(api, fleet):  # noqa: F811
     assert answer.status_code == 422
 
 
+# -- a client's own connection (slice 3) -------------------------------------------------
+
+
+def _client_connection(fleet, client="acme", server="notes", org="agency-x"):  # noqa: F811
+    with FleetStore(fleet) as store:
+        return store.mcp_connection(org, server, client=client)
+
+
+def test_an_owner_connects_a_clients_own_key_sealed_to_that_client(api, fleet):  # noqa: F811
+    ana = _as(fleet, "ana@example.com")
+    answer = api.put(
+        "/api/orgs/agency-x/clients/acme/mcp/notes", json={"key": "acme-secret"}, headers=ana
+    )
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["client"] == "acme" and "acme-secret" not in answer.text
+    stored = _client_connection(fleet)
+    assert _connection(fleet) is None  # the agency's is another thing
+    env = {"FLOTTA_SECRETS_KEY": SECRETS}
+    opened = unseal(
+        stored.credential, context=connection_context("agency-x", "notes", "acme"), env=env
+    )
+    assert json.loads(opened)["value"] == "acme-secret"
+
+    listed = api.get("/api/orgs/agency-x/mcp", headers=ana).json()["servers"]
+    notes = next(s for s in listed if s["name"] == "notes")
+    assert notes["connection"] is None
+    assert notes["clients"]["acme"]["status"] == "ok"
+    mine = api.get("/api/orgs/agency-x/clients/acme/mcp", headers=ana).json()["servers"]
+    notes = next(s for s in mine if s["name"] == "notes")
+    assert notes["connection"]["status"] == "ok" and notes["agency"] is None
+    assert "acme-secret" not in json.dumps([listed, mine])
+
+
+@pytest.mark.parametrize("email", ["mo@example.com", "cu@example.com", "vi@example.com"])
+def test_only_an_owner_connects_one_for_a_client(api, fleet, email):  # noqa: F811
+    """Not the agency's members, and never the client's own people."""
+    who = _as(fleet, email)
+    url = "/api/orgs/agency-x/clients/acme/mcp/notes"
+    assert api.put(url, json={"key": "k"}, headers=who).status_code == 403
+    assert api.delete(url, headers=who).status_code == 403
+    assert _client_connection(fleet) is None
+
+
+def test_a_client_of_another_org_or_none_at_all_is_a_404(api, fleet):  # noqa: F811
+    ana = _as(fleet, "ana@example.com")
+    for client in ("nobody", "../acme"):
+        url = f"/api/orgs/agency-x/clients/{client}/mcp/notes"
+        assert api.put(url, json={"key": "k"}, headers=ana).status_code == 404
+    with FleetStore(fleet) as store:
+        user = store.create_user("yo@example.com")
+        store.add_membership(user.id, "agency-y", "owner")
+    yo = _as(fleet, "yo@example.com", org="agency-y")
+    url = "/api/orgs/agency-x/clients/acme/mcp/notes"
+    assert api.put(url, json={"key": "k"}, headers=yo).status_code == 404
+    assert api.get("/api/orgs/agency-x/clients/acme/mcp", headers=yo).status_code == 404
+    assert api.delete(url, headers=yo).status_code == 404
+    assert _client_connection(fleet) is None
+
+
+def test_a_sign_in_for_a_client_ends_as_that_clients_connection(api, fleet, provider):  # noqa: F811
+    ana = _as(fleet, "ana@example.com")
+    started = api.post(
+        "/api/orgs/agency-x/clients/acme/mcp/tracker/connect",
+        json={"return_to": f"{APP_URL}/tools"},
+        headers=ana,
+    )
+    assert started.status_code == 200, started.text
+    back = _callback(api, provider, started.json()["url"])
+    assert "mcp_client=acme" in back.headers["location"]
+    assert provider.token_calls == []
+
+    claimed = api.post("/api/mcp/oauth/claim", json=_carried(back), headers=ana)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["client"] == "acme"
+    assert _connection(fleet, "tracker") is None
+    stored = _client_connection(fleet, server="tracker")
+    credential = json.loads(
+        unseal(
+            stored.credential,
+            context=connection_context("agency-x", "tracker", "acme"),
+            env={"FLOTTA_SECRETS_KEY": SECRETS},
+        )
+    )
+    assert credential["access_token"] == "at-1"
+
+    gone = api.delete("/api/orgs/agency-x/clients/acme/mcp/tracker", headers=ana)
+    assert gone.json() == {
+        "server": "tracker",
+        "disconnected": True,
+        "revoked": True,
+        "client": "acme",
+    }
+    assert _client_connection(fleet, server="tracker") is None
+
+
+def test_a_clients_sign_in_sent_to_a_stranger_gives_nobody_anything(api, fleet, provider):  # noqa: F811
+    """Slice 1's claim rule holds for a client's sign-in too."""
+    started = api.post(
+        "/api/orgs/agency-x/clients/acme/mcp/tracker/connect",
+        json={},
+        headers=_as(fleet, "ana@example.com"),
+    )
+    carried = _carried(_callback(api, provider, started.json()["url"]))
+    assert (
+        api.post("/api/mcp/oauth/claim", json=carried, headers=_stranger(fleet)).status_code == 403
+    )
+    assert provider.token_calls == []
+    assert _client_connection(fleet, server="tracker") is None
+
+
+def test_a_client_removed_mid_sign_in_gets_no_connection(api, fleet, provider):  # noqa: F811
+    ana = _as(fleet, "ana@example.com")
+    started = api.post("/api/orgs/agency-x/clients/acme/mcp/tracker/connect", json={}, headers=ana)
+    carried = _carried(_callback(api, provider, started.json()["url"]))
+    with FleetStore(fleet) as store:
+        store._conn.execute(
+            "UPDATE mcp_oauth_flows SET client_id = 'gone' WHERE client_id = 'acme'"
+        )
+    assert api.post("/api/mcp/oauth/claim", json=carried, headers=ana).status_code == 404
+    assert provider.token_calls == []
+
+
+def test_an_agents_grants_say_whose_account_its_calls_use(api, fleet, machine):  # noqa: F811
+    ana = _as(fleet, "ana@example.com")
+    body = {"servers": [{"server": "notes"}, {"server": "tracker"}]}
+    assert api.put("/api/boxes/b-support/mcp", json=body, headers=ana).status_code == 200
+    api.put("/api/orgs/agency-x/mcp/notes", json={"key": "agency"}, headers=ana)
+    read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
+    assert read["accounts"] == {"notes": {"account": "org", "status": "ok"}, "tracker": None}
+    api.put("/api/orgs/agency-x/clients/acme/mcp/notes", json={"key": "acme"}, headers=ana)
+    read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
+    assert read["accounts"]["notes"] == {"account": "client", "status": "ok"}
+    # Zeta's agent, same org: the agency's, never Acme's.
+    api.put("/api/boxes/b-sales/mcp", json={"servers": [{"server": "notes"}]}, headers=ana)
+    zeta = api.get("/api/boxes/b-sales/mcp", headers=ana).json()
+    assert zeta["accounts"] == {"notes": {"account": "org", "status": "ok"}}
+
+
 # -- granting ---------------------------------------------------------------------------
 
 

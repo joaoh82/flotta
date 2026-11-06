@@ -59,16 +59,21 @@ def path(tmp_path):
         fleet.create_client("studio-nord", "acme", "Acme Dental")
         fleet.create_box("one", box_id="b-one", org="studio-nord", client="acme")
         fleet.create_box("two", box_id="b-two", org="studio-nord", client="acme")
+        fleet.create_client("studio-nord", "zeta", "Zeta Labs")
+        fleet.create_box("zed", box_id="b-zeta", org="studio-nord", client="zeta")
         fleet.create_org("other", "Other")
         fleet.create_client("other", "acme", "Acme")
         fleet.create_box("theirs", box_id="b-theirs", org="other", client="acme")
     return db
 
 
-def _connect(path, credential, org="studio-nord", kind="bearer"):
-    sealed = seal(json.dumps(credential), context=connection_context(org, "tracker"), env=ENV)
+def _connect(path, credential, org="studio-nord", kind="bearer", client=None):
+    context = connection_context(org, "tracker", client)
+    sealed = seal(json.dumps(credential), context=context, env=ENV)
     with FleetStore(path) as fleet:
-        fleet.set_mcp_connection(org, "tracker", kind=kind, credential=sealed, by="test")
+        fleet.set_mcp_connection(
+            org, "tracker", kind=kind, credential=sealed, by="test", client=client
+        )
 
 
 def _grant(path, box="b-one", tools=("read_issue", "create_issue"), ask_first=True):
@@ -85,9 +90,9 @@ def server(path):
     return FakeMcp()
 
 
-def _token(box="b-one", scopes=(SCOPE_MCP_CALL,), org="studio-nord"):
+def _token(box="b-one", scopes=(SCOPE_MCP_CALL,), org="studio-nord", client="acme"):
     return mint(
-        subject=box_subject(box), scopes=set(scopes), key=SIGNING_KEY, org=org, client="acme"
+        subject=box_subject(box), scopes=set(scopes), key=SIGNING_KEY, org=org, client=client
     )
 
 
@@ -411,6 +416,119 @@ def test_two_calls_at_once_spend_one_refresh_token(path):
     assert errors == []
     assert server.refreshes == 1
     assert set(found) == {"at-2"}
+
+
+# -- whose credential: the client's, else the agency's (slice 3) -------------------
+
+
+def _accounts(path, box="b-one"):
+    with FleetStore(path) as fleet:
+        return [(c.tool, c.status, c.account) for c in reversed(fleet.mcp_calls(box))]
+
+
+def test_a_clients_own_connection_wins_over_the_agencys(path):
+    server = FakeMcp(keys={"Bearer agency-key", "Bearer acme-key"})
+    _connect(path, {"kind": "bearer", "value": "agency-key"})
+    _connect(path, {"kind": "bearer", "value": "acme-key"}, client="acme")
+    _grant(path)
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert "result" in answer.json(), answer.text
+    assert server.requests[-1].headers["authorization"] == "Bearer acme-key"
+    assert _accounts(path) == [("read_issue", "ok", "client")]
+
+
+def test_a_client_with_no_connection_of_its_own_uses_the_agencys(path, server):
+    with _client(path, server) as client:
+        client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert server.requests[-1].headers["authorization"] == "Bearer agency-key"
+    assert _accounts(path) == [("read_issue", "ok", "org")]
+
+
+def test_one_clients_connection_never_serves_another_clients_agent(path):
+    """Zeta's agent, in the same org, with only Acme's account connected: nothing."""
+    server = FakeMcp(keys={"Bearer acme-key"})
+    _connect(path, {"kind": "bearer", "value": "acme-key"}, client="acme")
+    _grant(path, box="b-zeta")
+    zeta = _auth(_token("b-zeta", client="zeta"))
+    with _client(path, server) as client:
+        alone = client.post("/mcp/tracker", json=_call("read_issue"), headers=zeta)
+        assert alone.status_code == 503
+        assert "isn't connected for this agency" in alone.json()["error"]["message"]
+        assert server.requests == []
+        _connect(path, {"kind": "bearer", "value": "agency-key"})
+        server.keys.add("Bearer agency-key")
+        client.post("/mcp/tracker", json=_call("read_issue"), headers=zeta)
+    assert [r.headers["authorization"] for r in server.requests] == ["Bearer agency-key"]
+    assert _accounts(path, "b-zeta") == [
+        ("read_issue", "unavailable", "org"),
+        ("read_issue", "ok", "org"),
+    ]
+
+
+def test_a_broken_client_connection_isnt_passed_over_for_the_agencys(path, server):
+    """The agency connected the client's own account; its work doesn't quietly
+    move to the agency's when that stops working."""
+    _connect(path, {"kind": "bearer", "value": "acme-key"}, client="acme")
+    with FleetStore(path) as fleet:
+        fleet.break_mcp_connection("studio-nord", "tracker", "refused", client="acme")
+        assert fleet.mcp_connection("studio-nord", "tracker").status == "ok"
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert answer.status_code == 503
+    message = answer.json()["error"]["message"]
+    assert "for this client stopped working" in message and "connect it again" in message
+    assert server.requests == []
+    assert _accounts(path) == [("read_issue", "unavailable", "client")]
+
+
+def test_a_clients_sealed_credential_only_opens_as_that_clients(path, server):
+    """Copied onto another client's row, or the org's, a sealed value doesn't open."""
+    _connect(path, {"kind": "bearer", "value": "acme-key"}, client="acme")
+    with FleetStore(path) as fleet:
+        acme = fleet.mcp_connection("studio-nord", "tracker", client="acme").credential
+        fleet.set_mcp_connection(
+            "studio-nord", "tracker", kind="bearer", credential=acme, by="x", client="zeta"
+        )
+        fleet.set_mcp_connection("studio-nord", "tracker", kind="bearer", credential=acme, by="x")
+    _grant(path, box="b-zeta")
+    with _client(path, server) as client:
+        zeta = client.post(
+            "/mcp/tracker",
+            json=_call("read_issue"),
+            headers=_auth(_token("b-zeta", client="zeta")),
+        )
+        with FleetStore(path) as fleet:
+            fleet.delete_mcp_connection("studio-nord", "tracker", client="acme")
+        org = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert zeta.status_code == 503 and "can't use" in zeta.json()["error"]["message"]
+    assert org.status_code == 503 and "can't use" in org.json()["error"]["message"]
+    assert server.requests == []
+
+
+def test_a_client_connection_refreshes_itself_and_leaves_the_agencys_alone(path):
+    server = FakeMcp(keys=set())
+    _connect(path, {"kind": "bearer", "value": "agency-key"})
+    tokens = server._issue()
+    credential = oauth_credential(
+        ENDPOINTS,
+        Client("dyn-1", "dyn-secret"),
+        Tokens(tokens["access_token"], tokens["refresh_token"], time.time() - 10),
+    )
+    _connect(path, credential, kind="oauth", client="acme")
+    _grant(path)
+    server.keys.discard(f"Bearer {tokens['access_token']}")
+    with FleetStore(path) as fleet:
+        agency_before = fleet.mcp_connection("studio-nord", "tracker")
+    with _client(path, server, env=OAUTH_ENV) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert "result" in answer.json(), answer.text
+    assert server.refreshes == 1
+    assert server.requests[-1].headers["authorization"] == "Bearer at-2"
+    with FleetStore(path) as fleet:
+        assert fleet.mcp_connection("studio-nord", "tracker") == agency_before
+        own = fleet.mcp_connection("studio-nord", "tracker", client="acme")
+        assert own.status == "ok" and own.updated_at != agency_before.updated_at
 
 
 # -- tools, and only tools ---------------------------------------------------------
