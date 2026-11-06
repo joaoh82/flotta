@@ -439,13 +439,36 @@ def test_a_provider_complaint_that_quotes_the_key_does_not_reach_the_box_from_th
     assert "bad key" in response.text
 
 
+def _queued_run(path, box="b-one"):
+    with FleetStore(path) as fleet:
+        return fleet.create_run(box, "Do the thing", trigger_kind="api").id
+
+
 def test_a_run_id_is_recorded_and_not_forwarded(path, upstream):
+    run = _queued_run(path)
     with _client(path, upstream) as client:
-        client.post(
-            "/v1/chat/completions", json=CALL, headers={**_auth(), "X-Flotta-Run": "run-42"}
-        )
-    assert _rows(path)[0]["run_id"] == "run-42"
+        client.post("/v1/chat/completions", json=CALL, headers={**_auth(), "X-Flotta-Run": run})
+    assert _rows(path)[0]["run_id"] == run
     assert "x-flotta-run" not in upstream.requests[0].headers
+
+
+def test_another_boxs_run_id_is_dropped(path, upstream):
+    """The header is the box's to set, so it can only name the box's own runs."""
+    theirs = _queued_run(path, "b-two")
+    with _client(path, upstream) as client:
+        client.post("/v1/chat/completions", json=CALL, headers={**_auth(), "X-Flotta-Run": theirs})
+    assert _rows(path)[0]["run_id"] is None
+
+
+def test_a_call_with_no_run_id_belongs_to_the_run_its_box_is_doing(path, upstream):
+    """Hermes can't send a header per run, so this is how a run gets its cost."""
+    with FleetStore(path) as fleet:
+        run = fleet.start_run(_queued_run(path)).id
+    with _client(path, upstream) as client:
+        client.post("/v1/chat/completions", json=CALL, headers=_auth())
+    assert _rows(path)[0]["run_id"] == run
+    with FleetStore(path) as fleet:
+        assert fleet.run_cost(run).calls == 1
 
 
 def test_a_run_id_that_cannot_be_one_is_dropped(path, upstream):

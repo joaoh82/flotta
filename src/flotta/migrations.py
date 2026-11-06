@@ -487,6 +487,36 @@ def _connected_person() -> tuple[str, ...]:
     )
 
 
+def _runs() -> tuple[str, ...]:
+    """A task becomes a run (FLOTTA-146, M14.1; D23, `flotta.runs`).
+
+    Columns on `tasks` rather than a `runs` table: a rename is not additive, and
+    the events CHECK names `'task'`. `org_id` and `client_id` are copied from the
+    box so a tenant's runs list without a join, and filled in here for rows from
+    before. A row with a `trigger_kind` is a run; one without is a task, from
+    before or from `create_task`. No cost or token columns: those are `usage`'s,
+    summed by `run_id`, which gets its index here. `(box_id, started_at)` is
+    for finding the run a model call was part of, which happens on every call.
+    """
+    return (
+        "ALTER TABLE tasks ADD COLUMN org_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN client_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN trigger_kind TEXT",
+        "ALTER TABLE tasks ADD COLUMN trigger_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN input_json TEXT",
+        "ALTER TABLE tasks ADD COLUMN output_json TEXT",
+        "ALTER TABLE tasks ADD COLUMN steps_json TEXT",
+        "ALTER TABLE tasks ADD COLUMN approval_count BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN error_class TEXT",
+        "UPDATE tasks SET "
+        "org_id = (SELECT org_id FROM boxes WHERE boxes.id = tasks.box_id), "
+        "client_id = (SELECT client_id FROM boxes WHERE boxes.id = tasks.box_id)",
+        "CREATE INDEX idx_tasks_tenant ON tasks(org_id, client_id, created_at)",
+        "CREATE INDEX idx_usage_run ON usage(run_id)",
+        "CREATE INDEX idx_tasks_box_started ON tasks(box_id, started_at)",
+    )
+
+
 #: Every migration, in order. Append only.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
@@ -606,6 +636,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         # the only copy of the operator's words.
         ("ALTER TABLE orgs ADD COLUMN decline_reason TEXT",),
     ),
+    Migration(19, "runs: a task's trigger, input, output and steps", _runs()),
 )
 
 

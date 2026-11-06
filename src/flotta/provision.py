@@ -81,10 +81,12 @@ from flotta.backend import backend_for as _backend_for
 from flotta.backend import pause as _pause
 from flotta.github import GITHUB_TOKEN_ENV
 from flotta.rules import Rules, config_changes, rules_from_json
+from flotta.runs import RUN_DEADLINE_S
 from flotta.store import (
     INSTRUCTIONS_CHANGED,
     Box,
     FleetStore,
+    InvalidTransitionError,
     Task,
     UnknownEntityError,
     box_label,
@@ -2940,6 +2942,9 @@ def overdue_tasks(
     "Past its deadline" is the task's own `timeout_s` plus a grace period —
     the container hard-exits at that timeout, so anything still `running` well
     beyond it has stopped without anyone recording the outcome.
+
+    Not runs, which share the table: a run's deadline is `RUN_DEADLINE_S`,
+    and `reap_runs` closes those.
     """
     now = now or datetime.now(UTC)
     overdue: list[tuple[Task, float]] = []
@@ -2951,7 +2956,7 @@ def overdue_tasks(
         # `failed` after `timeout_s + grace` purely for having waited, which is
         # the opposite of what a sleeping fleet is meant to allow.
         started = _parse_ts(task.started_at)
-        if started is None:
+        if started is None or store.get_run(task.id) is not None:
             continue
         age = (now - started).total_seconds()
         limit = task_deadline_s(store, task.id) + grace_s
@@ -3050,6 +3055,41 @@ def reconcile(
             }
         )
 
+    outcomes.extend(reap_runs(store, now=now, grace_s=grace_s))
+    return outcomes
+
+
+def reap_runs(
+    store: FleetStore, *, now: datetime | None = None, grace_s: int = DEFAULT_GRACE_S
+) -> list[dict[str, Any]]:
+    """Close runs still `running` past `RUN_DEADLINE_S` as `failed`, `stranded`.
+
+    Whoever delivers a run ends it, and gives up well inside the deadline. A
+    run still going after it lost its deliverer, most likely to a restart of
+    the control plane mid-delivery, and nothing else will ever end it (D10).
+    A queued run is not stranded: it is waiting for its box.
+    """
+    now = now or datetime.now(UTC)
+    outcomes: list[dict[str, Any]] = []
+    for task in store.list_tasks(status="running"):
+        run = store.get_run(task.id)
+        started = _parse_ts(run.started_at) if run else None
+        if run is None or started is None:
+            continue
+        over_by = (now - started).total_seconds() - (RUN_DEADLINE_S + grace_s)
+        if over_by <= 0:
+            continue
+        try:
+            store.finish_run(run.id, "failed", error_class="stranded", now=now)
+        except InvalidTransitionError:
+            continue  # its deliverer ended it between the read and the write
+        store.add_event(
+            "task",
+            run.id,
+            "failed",
+            {"error": "stranded past its deadline", "overdue_by_s": round(over_by, 1)},
+        )
+        outcomes.append({"task_id": run.id, "status": "failed", "recovered": False})
     return outcomes
 
 
@@ -3119,7 +3159,12 @@ def teardown_box(
         store.add_event(
             "task", task.id, "failed", {"error": f"box torn down ({reason})", "reconciled": False}
         )
-        store.update_task_status(task.id, "failed")
+        if store.get_run(task.id) is None:
+            store.update_task_status(task.id, "failed")
+        else:
+            # A queued run never started, so it was cancelled, not failed.
+            ending = "failed" if task.status == "running" else "cancelled"
+            store.finish_run(task.id, ending, error_class="torn_down")
         failed_tasks.append(task.id)
 
     for workspace in store.list_workspaces(box_id=box_id):
