@@ -1013,3 +1013,16 @@ def test_resolving_an_unknown_box_is_the_same_404_as_waking_one(stub_plane):
         asyncio.run(plane.resolve("nope"))
     assert exc.value.status == 404
     assert str(exc.value) == "no box named 'nope'"
+
+
+def test_the_door_waits_as_long_as_a_box_takes_to_boot():
+    """A shared-cpu-1x box took 162 s to answer after a wake (FLOTTA-156).
+
+    The door gave up at 90 s, so a box booting normally was reported as broken,
+    and reconnecting a minute later worked. The CLI waits the same time.
+    """
+    from flotta import client
+    from flotta.door import app as door
+
+    assert door.DEFAULT_READY_TIMEOUT_S >= 200
+    assert client.DEFAULT_READY_TIMEOUT_S == door.DEFAULT_READY_TIMEOUT_S

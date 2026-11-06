@@ -151,8 +151,11 @@ HERMES_TICKET_PATH = "/api/auth/ws-ticket"
 DEFAULT_DOMAIN = "flotta.dev"
 DEFAULT_BOX_PORT = 9119
 #: How long to wait for `hermes serve` after the machine reports started.
-#: Matches `flotta.client`, which learned the number the hard way.
-DEFAULT_READY_TIMEOUT_S = 90.0
+#: Matches `flotta.client`. Measured on a shared-cpu-1x box on 2026-11-06:
+#: 162 s from a wake and 152 s after a restart (FLOTTA-156), so the 90 s this
+#: once was refused agents that were booting normally. The web app's own wait
+#: (`READY_TIMEOUT_MS` in flotta-cloud) has to stay above this one.
+DEFAULT_READY_TIMEOUT_S = 240.0
 #: How often to tell the control plane a live conversation is still live.
 #: Comfortably under the default 30-minute idle threshold: this only has to
 #: beat the sweep, and a chattier heartbeat would write more events for no gain.
