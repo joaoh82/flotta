@@ -50,7 +50,8 @@ DEFAULT_REMOTE_PORT = 9119
 #: How long to wait for `hermes serve` to answer after the tunnel is up. A cold
 #: box has to import Hermes first, which is not fast — and is exactly the cost
 #: `suspend` avoids (M1: suspend keeps the VM's memory, cold stop does not).
-DEFAULT_READY_TIMEOUT_S = 90
+#: About two and a half minutes on a shared-cpu-1x box (FLOTTA-156).
+DEFAULT_READY_TIMEOUT_S = 240
 
 
 class ChatError(Exception):
