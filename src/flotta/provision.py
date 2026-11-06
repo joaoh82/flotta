@@ -1697,6 +1697,32 @@ def _rules_lock(box_id: str) -> threading.Lock:
         return _RULES_LOCKS.setdefault(box_id, threading.Lock())
 
 
+def _writable_box(box_id: str, store: FleetStore) -> Box:
+    """A box whose `config.yaml` can be written now, or `ProvisionError` saying why not."""
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is None:
+        raise ProvisionError(f"no box {box_id!r}")
+    _refuse_paused(box)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
+    if not box.endpoint:
+        raise ProvisionError(f"box {box.name} has no endpoint, so there is no machine to write to")
+    return box
+
+
+def _config_command(changes: list[list[Any]]) -> str:
+    """Run `flotta.box.rules` on the box with `changes`: the writer travels with them."""
+    import base64
+    import json
+    from pathlib import Path
+
+    from flotta.box import rules as box_rules
+
+    script = base64.b64encode(Path(box_rules.__file__).read_bytes()).decode("ascii")
+    payload = base64.b64encode(json.dumps(changes).encode("utf-8")).decode("ascii")
+    return f"printf %s {script} | base64 -d | {BOX_PYTHON} - {HERMES_HOME} {payload}"
+
+
 def set_rules(
     box_id: str,
     rules: Rules,
@@ -1716,28 +1742,13 @@ def set_rules(
     enforced, the next conversation for the rest. As with instructions, nothing
     restarts. Asleep is fine, since `exec` starts the machine; paused is not.
     """
-    import base64
     import json
-    from pathlib import Path
 
-    from flotta.box import rules as box_rules
-
-    box = store.get_box(box_id) or store.get_box_by_name(box_id)
-    if box is None:
-        raise ProvisionError(f"no box {box_id!r}")
-    _refuse_paused(box)
-    if is_terminal("box", box.status):
-        raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
-    if not box.endpoint:
-        raise ProvisionError(f"box {box.name} has no endpoint, so there is no machine to write to")
+    box = _writable_box(box_id, store)
     impl = _resolve_backend(box, backend)
 
-    script = base64.b64encode(Path(box_rules.__file__).read_bytes()).decode("ascii")
-    changes = json.dumps(config_changes(rules).to_json()).encode("utf-8")
-    payload = base64.b64encode(changes).decode("ascii")
-    command = f"printf %s {script} | base64 -d | {BOX_PYTHON} - {HERMES_HOME} {payload}"
     with _rules_lock(box.id):
-        result = impl.exec(box.endpoint, command)
+        result = impl.exec(box.endpoint, _config_command(config_changes(rules).to_json()))
         if result.exit_code != 0:
             detail = (result.stderr or result.stdout or "").strip() or "no output"
             store.add_event("box", box.id, "rules_write_failed", {"detail": detail[:500]})
@@ -1766,6 +1777,107 @@ def rules_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:
     stored = store.box_rules(box_id)
     rules = rules_from_json(stored[0] if stored else None)
     return {"box_id": box_id, "rules": rules.to_json(), "changed_at": stored[1] if stored else None}
+
+
+#: The event that says an agent's MCP grants were written to its `config.yaml`.
+MCP_GRANTS_CHANGED = "mcp_grants_changed"
+
+
+def set_mcp_grants(
+    box_id: str,
+    grants: tuple[Any, ...],
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    by: str | None = None,
+) -> dict[str, Any]:
+    """Write an agent's MCP grants into its `config.yaml`, then record them (FLOTTA-125).
+
+    Through the FLOTTA-124 writer, under the same lock as the rules, since it
+    is the same file. Each grant is a `flotta-<server>` entry pointing at the
+    gateway with a fresh `mcp:call` token for this box (`flotta.mcp` says why
+    it is written out rather than referred to).
+
+    **Recorded first, written second: the opposite of the rules.** The record
+    is what the gateway enforces, so it is the grant; the config is only how
+    the agent finds the server. Recorded first, a grant taken away stops on the
+    next call even if the machine can't be written, and the answer says the
+    config is behind (`written: false`) rather than pretending nothing changed.
+    A new server appears in the agent's next conversation; one taken away stays
+    in an open conversation's tool list until Hermes reloads (`reload.mcp`, or
+    a new conversation), and the gateway refuses it meanwhile.
+    """
+    import json
+
+    from flotta.auth import SCOPE_MCP_CALL, AuthError, box_subject, mint
+    from flotta.mcp import catalogue, config_changes, mcp_base
+    from flotta.settings import layered
+
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is None:
+        raise ProvisionError(f"no box {box_id!r}")
+    source = layered(store)
+    base = mcp_base(source)
+    if base is None:
+        raise ProvisionError(
+            f"there is no gateway for MCP servers to go through. Set ${GATEWAY_URL_ENV} "
+            "where the control plane runs."
+        )
+    try:
+        token = mint(
+            subject=box_subject(box.id),
+            scopes={SCOPE_MCP_CALL},
+            ttl_s=MODEL_TOKEN_TTL_S,
+            env=dict(source),
+            **_tenant_claims(box.org, box.client),
+        )
+    except AuthError as exc:
+        raise ProvisionError(
+            "no signing key is configured, so there is no token to give this agent. Set "
+            "$FLOTTA_SIGNING_KEY where the control plane runs."
+        ) from exc
+    previous = [g.server for g in store.box_mcp_grants(box.id)]
+    changes = config_changes(grants, catalogue(source), base=base, token=token, previous=previous)
+    detail = None
+    try:
+        _writable_box(box.id, store)
+    except ProvisionError as exc:
+        detail = str(exc)
+    with _rules_lock(box.id):
+        store.set_box_mcp_grants(
+            box.id,
+            [
+                (g.server, json.dumps(list(g.tools)) if g.tools is not None else None, g.ask_first)
+                for g in grants
+            ],
+        )
+        store.add_event(
+            "box", box.id, MCP_GRANTS_CHANGED, {"servers": [g.to_json() for g in grants], "by": by}
+        )
+        if detail is None:
+            assert box.endpoint is not None
+            try:
+                result = _resolve_backend(box, backend).exec(box.endpoint, _config_command(changes))
+            except Exception as exc:  # noqa: BLE001 - the grant stands; the config is behind
+                detail = str(exc) or type(exc).__name__
+            else:
+                if result.exit_code != 0:
+                    detail = (result.stderr or result.stdout or "").strip() or "no output"
+        if detail is not None:
+            store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
+    return {**mcp_grants_of(box.id, store=store), "written": detail is None, "detail": detail}
+
+
+def mcp_grants_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:
+    """An agent's grants as the API answers them."""
+    from flotta.mcp import grant_from_row
+
+    rows = store.box_mcp_grants(box_id)
+    return {
+        "box_id": box_id,
+        "servers": [grant_from_row(r.server, r.tools, r.ask_first).to_json() for r in rows],
+        "changed_at": max((r.updated_at for r in rows), default=None),
+    }
 
 
 def upgrade_box(

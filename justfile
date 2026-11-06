@@ -879,6 +879,11 @@ fly-auth: fly-whoami
     uv run python -m flotta.fleet_key generate
     echo "login set on $APP; the fleet's password is in .env and nowhere else (values not echoed)"
 
+# FLOTTA-125: a key for sealing credentials at rest, written into .env (not echoed).
+# Kept if one is there: a new one would lose every credential sealed under the old.
+secrets-key:
+    uv run python -m flotta.sealed generate
+
 # FLOTTA-96: replace the fleet's password in .env — every agent must then be rotated
 fleet-key:
     #!/usr/bin/env bash

@@ -6,9 +6,11 @@ it with the box's Python, so a rule reaches an agent on the image it already
 has. That is why it imports nothing of Flotta's, only `yaml`, which every box
 has because Hermes does.
 
-**What it touches.** The keys `flotta.rules.OWNED_KEYS` names, and nothing
-else: each is set to what it is given, or removed for `None`, so a rule taken
-out is gone rather than left behind. `command_allowlist`, which Hermes writes
+**What it touches.** The keys it is given, and nothing else: those
+`flotta.rules.OWNED_KEYS` names, and the `mcp_servers.flotta-<server>` entries
+of FLOTTA-125 (`flotta.mcp.config_changes`). Each is set to what it is given, or
+removed for `None`, so a rule or a grant taken out is gone rather than left
+behind. `command_allowlist`, which Hermes writes
 when someone answers "always", and everything else in the file stay as found.
 
 **Written whole, then moved.** Hermes reads this file on every command, so a
@@ -73,7 +75,7 @@ def apply(home: Path, changes: list[list[Any]]) -> str:
         except BaseException:
             Path(staged).unlink(missing_ok=True)
             raise
-    return f"rules written to {path}"
+    return f"config written to {path}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(f"[flotta-box] {apply(Path(args[0]), changes)}")
     except (OSError, ValueError) as exc:
-        print(f"[flotta-box] rules not written: {exc}", file=sys.stderr)
+        print(f"[flotta-box] config not written: {exc}", file=sys.stderr)
         return 1
     return 0
 

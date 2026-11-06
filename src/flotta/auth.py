@@ -151,6 +151,11 @@ SCOPE_FLEET_ROUTE = "fleet:route"
 SCOPE_ORG_ADMIN = "org:admin"
 SCOPE_AUTH_RELAY = "auth:relay"
 SCOPE_MODEL_CALL = "model:call"
+#: An agent calling an MCP server through the gateway (FLOTTA-125). Its own
+#: scope rather than `model:call`, because this token is written into the
+#: agent's `config.yaml`: one that leaks from there reaches the servers granted
+#: to that agent, and spends nothing on models.
+SCOPE_MCP_CALL = "mcp:call"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -163,12 +168,13 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_ORG_ADMIN,
         SCOPE_AUTH_RELAY,
         SCOPE_MODEL_CALL,
+        SCOPE_MCP_CALL,
     }
 )
 
 #: What a person may do, by role (M11.7). Mapped to scopes at mint time, so a
 #: token is still a flat list and nothing on the hot path knows roles exist.
-#: No box scopes (`git:credential`, `box:peer`, `model:call`), no `fleet:route`
+#: No box scopes (`git:credential`, `box:peer`, `model:call`, `mcp:call`), no `fleet:route`
 #: and no `auth:relay`: those are
 #: held by machines, never handed to a person.
 ROLES: dict[str, frozenset[str]] = {

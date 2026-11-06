@@ -9,8 +9,10 @@ adds that check here.
 Read from its source rather than assumed. On `provider: custom` it speaks
 `POST /chat/completions`, and it reads `GET /models` for a context length. It
 only uses `/messages` when the URL ends in `/anthropic`, and its embeddings live
-in a proxy of its own. So those two routes are all there is; anything else is a
-404, which reaches nothing and cannot be an unmetered way to spend.
+in a proxy of its own. So those two routes are all there is for models; anything
+else is a 404, which reaches nothing and cannot be an unmetered way to spend.
+`/mcp/<server>` is the other half of the gateway, MCP servers granted to an
+agent, with a token of its own scope (`flotta.gateway.mcp`, FLOTTA-125).
 
 ## Budgets come first
 
@@ -116,6 +118,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from flotta import budgets
 from flotta.auth import (
+    SCOPE_MCP_CALL,
     SCOPE_MODEL_CALL,
     AuthError,
     admits,
@@ -123,6 +126,7 @@ from flotta.auth import (
     subject_box,
     verify,
 )
+from flotta.gateway.mcp import add_mcp_routes
 from flotta.inference import InvalidModel, is_openrouter, validate_model
 from flotta.pricing import EurRate, Price, dollars_to_nano
 from flotta.pricing import rate_in_force as pricing_rate_in_force
@@ -534,8 +538,14 @@ def create_gateway(
     settle_s: float = _SETTLE_S,
     write_backoff_s: float = 0.5,
     write_retry_s: float = _WRITE_RETRY_S,
+    mcp_transport: httpx.AsyncBaseTransport | None = None,
+    oauth_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
-    """Build the gateway's ASGI app. The upstream and the store are injected."""
+    """Build the gateway's ASGI app. The upstream and the store are injected.
+
+    `mcp_transport` reaches MCP servers and `oauth_transport` their token
+    endpoints (`flotta.gateway.mcp`); both default to the network.
+    """
     environment: Mapping[str, str] = os.environ if env is None else env
     signing_key = resolve_signing_key(dict(environment))
     base_url = (environment.get(BASE_URL_ENV) or "").strip().rstrip("/")
@@ -600,6 +610,7 @@ def create_gateway(
         app.state.upstream = httpx.AsyncClient(
             transport=transport, timeout=_TIMEOUT, trust_env=False
         )
+        mcp_proxy.open()
         refresher = None
         if price_source is not None or rate_source is not None:
             await refresh_once()
@@ -610,6 +621,7 @@ def create_gateway(
             if refresher is not None:
                 refresher.cancel()
             await app.state.upstream.aclose()
+            await mcp_proxy.close()
             await ledger.drain()
             ledger.close()
 
@@ -622,7 +634,7 @@ def create_gateway(
         finally:
             store.close()
 
-    async def caller(request: Request) -> Box:
+    async def caller(request: Request, scope: str = SCOPE_MODEL_CALL) -> Box:
         """The box this request is from, or `_Refused`. Nothing is spent before it."""
         if not signing_key:
             raise _Refused(503, "the gateway has no signing key, so it cannot check a token")
@@ -633,11 +645,11 @@ def create_gateway(
             token = verify(presented.strip(), key=signing_key)
         except AuthError as exc:
             raise _Refused(401, str(exc)) from exc
-        if not token.allows(SCOPE_MODEL_CALL):
-            raise _Refused(403, f"this token does not carry {SCOPE_MODEL_CALL}")
+        if not token.allows(scope):
+            raise _Refused(403, f"this token does not carry {scope}")
         box_id = subject_box(token.subject)
         if box_id is None:
-            raise _Refused(403, "only an agent's own token may call a model through this gateway")
+            raise _Refused(403, "only an agent's own token may call through this gateway")
         try:
             box = await asyncio.to_thread(find_box, box_id)
         except Exception as exc:
@@ -651,6 +663,24 @@ def create_gateway(
         if reason is not None:
             raise _Refused(403, reason)
         return box
+
+    async def mcp_caller(request: Request) -> Box:
+        """An agent's own `mcp:call` token, checked as a model call's token is."""
+        from flotta.gateway.mcp import McpRefused
+
+        try:
+            return await caller(request, SCOPE_MCP_CALL)
+        except _Refused as refused:
+            raise McpRefused(refused.status, refused.message) from refused
+
+    mcp_proxy = add_mcp_routes(
+        app,
+        caller=mcp_caller,
+        store_factory=store_factory,
+        env=environment,
+        transport=mcp_transport,
+        oauth_transport=oauth_transport,
+    )
 
     def check_budgets(
         box: Box, model: str, unsettled: list[Box]

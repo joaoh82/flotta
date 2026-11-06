@@ -487,6 +487,75 @@ def _connected_person() -> tuple[str, ...]:
     )
 
 
+def _mcp() -> tuple[str, ...]:
+    """MCP servers through the gateway (FLOTTA-125): connections, grants, calls.
+
+    - `mcp_connections`: an org's credential for one catalogue server, sealed
+      (`flotta.sealed`), so a copy of the database is no copy of the key. `status`
+      is `broken` once a provider refuses a refresh.
+    - `mcp_oauth_flows`: a sign-in between its start and its claim, with the
+      PKCE verifier sealed. Never the code or the tokens: those are traded
+      inside the claim, by the person who started it (`flotta.mcp_oauth`).
+    - `box_mcp_grants`: which servers an agent may call, which tools (JSON, or
+      NULL for every tool the catalogue allows), and whether calls ask first.
+    - `mcp_calls`: one row per tool call, refused ones too. The tool's name and
+      what became of it, never its arguments or its result.
+
+    The catalogue is not here: it is the operator's, from the environment.
+    """
+    return (
+        """
+        CREATE TABLE mcp_connections (
+            org_id        TEXT NOT NULL REFERENCES orgs(id),
+            server        TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            credential    TEXT NOT NULL,
+            status        TEXT NOT NULL,
+            detail        TEXT,
+            connected_by  TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (org_id, server)
+        )
+        """,
+        """
+        CREATE TABLE mcp_oauth_flows (
+            id            TEXT PRIMARY KEY,
+            org_id        TEXT NOT NULL REFERENCES orgs(id),
+            server        TEXT NOT NULL,
+            subject       TEXT NOT NULL,
+            sealed        TEXT NOT NULL,
+            return_to     TEXT,
+            created_at    TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE box_mcp_grants (
+            box_id      TEXT NOT NULL REFERENCES boxes(id),
+            server      TEXT NOT NULL,
+            tools       TEXT,
+            ask_first   INTEGER NOT NULL,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (box_id, server)
+        )
+        """,
+        """
+        CREATE TABLE mcp_calls (
+            id          TEXT PRIMARY KEY,
+            box_id      TEXT NOT NULL REFERENCES boxes(id),
+            org_id      TEXT NOT NULL,
+            client_id   TEXT NOT NULL,
+            server      TEXT NOT NULL,
+            tool        TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            at          TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_mcp_calls_box ON mcp_calls(box_id, at)",
+        "CREATE INDEX idx_mcp_calls_org ON mcp_calls(org_id, at)",
+    )
+
+
 def _runs() -> tuple[str, ...]:
     """A task becomes a run (FLOTTA-146, M14.1; D23, `flotta.runs`).
 
@@ -637,6 +706,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         ("ALTER TABLE orgs ADD COLUMN decline_reason TEXT",),
     ),
     Migration(19, "runs: a task's trigger, input, output and steps", _runs()),
+    Migration(
+        20,
+        "mcp: an org's connections, an agent's grants, and every tool call",
+        _mcp(),
+    ),
 )
 
 

@@ -117,6 +117,7 @@ def no_substrate(monkeypatch):
         "refresh_author",
         "set_instructions",
         "set_rules",
+        "set_mcp_grants",
         "create_box",
     ):
         monkeypatch.setattr(provision, verb, reached)
@@ -153,6 +154,9 @@ BOX_ROUTES = [
     ("PUT", "/api/boxes/{b}/client-approvals", SCOPE_FLEET_WRITE, {"allowed": True}),
     ("GET", "/api/boxes/{b}/rules", SCOPE_FLEET_WRITE, None),
     ("PUT", "/api/boxes/{b}/rules", SCOPE_FLEET_WRITE, {"never": ["x"]}),
+    ("GET", "/api/boxes/{b}/mcp", SCOPE_FLEET_WRITE, None),
+    ("PUT", "/api/boxes/{b}/mcp", SCOPE_FLEET_WRITE, {"servers": []}),
+    ("GET", "/api/boxes/{b}/mcp/calls", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/identity", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/connection", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/author", SCOPE_FLEET_WRITE, None),

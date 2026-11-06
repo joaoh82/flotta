@@ -836,6 +836,25 @@ conventions, and the sharp edges below.
   Claude and Kimi, reasoning for Claude, both gated on OpenRouter's URL), so re-check it at
   a Hermes bump. Existing agents move one at a time: `join_gateway` writes before it
   removes, because the other order strands an agent with no key.
+- **MCP servers go through the gateway, and no upstream credential is on a box
+  (FLOTTA-125).** `flotta.mcp` (catalogue, grants, the `flotta-<server>` entries written
+  to `config.yaml` through the FLOTTA-124 writer), `flotta.gateway.mcp` (`/mcp/<server>`:
+  the grant every request, `tools/list` filtered, an ungranted `tools/call` refused before
+  it goes out, the credential swapped in, a row in `mcp_calls`), `flotta.mcp_oauth` (Flotta
+  as the OAuth client: discovery, registration, PKCE, refresh under a per-connection lock)
+  and `flotta.sealed` (AES-GCM under `$FLOTTA_SECRETS_KEY`, bound to its row, failing
+  closed; FLOTTA-102 is meant to reuse it). The box's token is its own `mcp:call`, written
+  literally into the entry: the agent reading it learns nothing it can't already use.
+  **A sign-in's code is traded only in the claim, by whoever started it**: the callback
+  keeps nothing and hands the code to the browser that signed in, so a starter who sends
+  the link to a stranger holds a state and no code. **Only tools pass the gateway**
+  (`gateway.mcp.PASSED`), refused before the credential is read. **OAuth URLs from a
+  server's metadata are held to the webhook rule** (public https, resolved address
+  pinned); only origins the operator wrote may be loopback. **Refresh on 401 only**: a
+  403 is the upstream's refusal and never breaks the connection. **Grants are recorded before the machine is
+  written**, the opposite of the rules, because the record is what the gateway enforces.
+  **An upstream 401 is never passed to the agent**: its `WWW-Authenticate` would start
+  Hermes's own OAuth on the box.
 
 ## Source of truth
 

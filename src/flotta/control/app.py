@@ -534,6 +534,9 @@ def create_app(
     #: Proxies in front of this process (`caller_address`). `None` reads
     #: `$FLOTTA_TRUSTED_PROXY_HOPS`.
     trusted_proxy_hops: int | None = None,
+    #: Reaches MCP servers' OAuth endpoints (FLOTTA-125), injected for the reason
+    #: `reachable` is. An `httpx.BaseTransport`; `None` is the network.
+    mcp_oauth_transport: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -3205,6 +3208,427 @@ def create_app(
             return {**written, "changed_at": _epoch(written["changed_at"])}
         finally:
             store.close()
+
+    # -- MCP servers (FLOTTA-125) -----------------------------------------------
+    #
+    # The catalogue is the operator's and the environment's (`flotta.mcp`), read
+    # once, as the signing key is. A connection is an org's, made by its owners;
+    # a grant is an agent's, made by the agency's people. A client's people do
+    # neither. The gateway enforces all of it on every call (`gateway.mcp`).
+
+    from flotta.mcp import McpError
+    from flotta.mcp import catalogue as _read_mcp_catalogue
+
+    try:
+        mcp_servers = _read_mcp_catalogue()
+        mcp_catalogue_error: str | None = None
+    except McpError as exc:
+        # Served empty, and the reason with it, rather than a control plane that
+        # won't start over a typo in one server.
+        _log.error("the MCP catalogue could not be read: %s", exc)
+        mcp_servers, mcp_catalogue_error = {}, str(exc)
+
+    def _mcp_server_or_404(name: str) -> Any:
+        server = mcp_servers.get(name)
+        if server is None:
+            raise HTTPException(status_code=404, detail=f"no MCP server {name!r} in this fleet")
+        return server
+
+    def _agency_of(token: Token | None, org_id: str) -> None:
+        """404 unless `token` is the operator's or one of the org's own people, org-wide."""
+        if _is_operator(token):
+            return
+        assert token is not None
+        if (
+            (token.org or DEFAULT_ORG) != org_id
+            or token.client is not None
+            or subject_box(token.subject) is not None
+        ):
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+
+    def _mcp_connection(found: Any) -> dict[str, Any] | None:
+        """A connection as the agency sees it: whether it works, never what it holds."""
+        if found is None:
+            return None
+        return {
+            "kind": found.kind,
+            "status": found.status,
+            "detail": found.detail,
+            "connected_by": found.connected_by,
+            "connected_at": _epoch(found.created_at),
+            "updated_at": _epoch(found.updated_at),
+        }
+
+    def _seal(value: str, context: str) -> str:
+        from flotta.sealed import SealError, seal
+
+        try:
+            return seal(value, context=context)
+        except SealError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def _unseal(value: str, context: str) -> str:
+        from flotta.sealed import SealError, unseal
+
+        try:
+            return unseal(value, context=context)
+        except SealError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def _oauth_http() -> Any:
+        import httpx
+
+        return httpx.Client(transport=mcp_oauth_transport, trust_env=False)
+
+    def _mcp_redirect_uri() -> str:
+        control = (os.environ.get("FLOTTA_CONTROL_URL") or "").strip().rstrip("/")
+        if not control:
+            raise HTTPException(
+                status_code=503,
+                detail="signing in to an MCP server needs $FLOTTA_CONTROL_URL, this control "
+                "plane's public address, for the provider to send the browser back to",
+            )
+        return f"{control}/api/mcp/oauth/callback"
+
+    def _return_to(raw: Any) -> str:
+        """Where the browser goes after the callback: the web app, and nowhere else."""
+        base = link_base.rstrip("/")
+        if raw is None or raw == "":
+            return base
+        if not isinstance(raw, str) or not (raw == base or raw.startswith(f"{base}/")):
+            raise HTTPException(status_code=422, detail=f"return_to must be under {base}")
+        return raw
+
+    @app.get("/api/mcp/servers")
+    def list_mcp_servers(token: Token | None = needs_read) -> Any:
+        """The operator's catalogue: what an agency can pick from."""
+        return {
+            "servers": [s.public() for s in mcp_servers.values()],
+            "error": mcp_catalogue_error,
+        }
+
+    @app.get("/api/orgs/{org_id}/mcp")
+    def org_mcp(org_id: str, token: Token | None = needs_write) -> Any:
+        """Every catalogue server, and whether this org has connected it."""
+        _agency_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            connected = {c.server: c for c in store.mcp_connections(org_id)}
+        finally:
+            store.close()
+        return {
+            "servers": [
+                {**s.public(), "connection": _mcp_connection(connected.get(s.name))}
+                for s in mcp_servers.values()
+            ]
+        }
+
+    @app.put("/api/orgs/{org_id}/mcp/{server}")
+    def connect_mcp_key(
+        org_id: str, server: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Connect a server with a key: `{"key": "..."}`. Sealed; never answered back."""
+        import json
+
+        from flotta.mcp import connection_context, parse_key
+
+        _admin_of(token, org_id)
+        found = _mcp_server_or_404(server)
+        try:
+            key_ = parse_key(body, found)
+        except McpError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sealed = _seal(
+            json.dumps({"kind": found.auth, "value": key_}), connection_context(org_id, server)
+        )
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            made = store.set_mcp_connection(
+                org_id,
+                server,
+                kind=found.auth,
+                credential=sealed,
+                by=token.subject if token is not None else "operator",
+            )
+        finally:
+            store.close()
+        return {"server": server, "connection": _mcp_connection(made)}
+
+    @app.post("/api/orgs/{org_id}/mcp/{server}/connect")
+    def connect_mcp_oauth(
+        org_id: str, server: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Where to send an owner to sign in to an OAuth server (`flotta.mcp_oauth`).
+
+        `{"return_to": "<web app URL>"}` is where the browser comes back to, with
+        `mcp_state` to claim. Nothing is connected until the claim.
+        """
+        import secrets as secrets_
+        from datetime import timedelta
+
+        from flotta import mcp_oauth
+
+        _admin_of(token, org_id)
+        found = _mcp_server_or_404(server)
+        if found.auth != "oauth":
+            raise HTTPException(status_code=422, detail=f"{server} is connected with a key")
+        if not key:
+            raise HTTPException(status_code=503, detail="signing in needs $FLOTTA_SIGNING_KEY set")
+        return_to = _return_to(body.get("return_to"))
+        redirect_uri = _mcp_redirect_uri()
+        try:
+            with _oauth_http() as http:
+                endpoints = mcp_oauth.discover(http, found)
+                client = mcp_oauth.client_for(http, found, endpoints, redirect_uri)
+        except mcp_oauth.OAuthError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        verifier, challenge = mcp_oauth.pkce()
+        flow_id = f"mf-{secrets_.token_urlsafe(24)}"
+        sealed = _seal(
+            mcp_oauth.flow_payload(endpoints, client, verifier, redirect_uri),
+            mcp_oauth.flow_context(flow_id),
+        )
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            store.delete_mcp_flows_before(
+                datetime.now(UTC) - timedelta(seconds=6 * mcp_oauth.STATE_TTL_S)
+            )
+            store.create_mcp_flow(
+                flow_id,
+                org_id=org_id,
+                server=server,
+                subject=token.subject if token is not None else "operator",
+                sealed=sealed,
+                return_to=return_to,
+            )
+        finally:
+            store.close()
+        state = mcp_oauth.sign_state(key, flow_id)
+        return {
+            "url": mcp_oauth.authorize_url(
+                found,
+                endpoints,
+                client,
+                redirect_uri=redirect_uri,
+                state=state,
+                challenge=challenge,
+            )
+        }
+
+    def _live_flow(store: Any, raw: Any) -> Any:
+        from flotta import mcp_oauth
+
+        if not key:
+            raise HTTPException(status_code=503, detail="signing in needs $FLOTTA_SIGNING_KEY set")
+        try:
+            flow_id = mcp_oauth.read_state(key, str(raw or ""))
+        except mcp_oauth.BadState as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        flow = store.mcp_flow(flow_id)
+        if flow is None:
+            raise HTTPException(status_code=422, detail="that sign-in is finished or unknown")
+        return flow
+
+    @app.get("/api/mcp/oauth/callback")
+    def mcp_oauth_callback(
+        state: str = "", code: str = "", error: str = "", error_description: str = ""
+    ) -> Any:
+        """Where a provider sends the browser back. It changes nothing.
+
+        **The code stays with the browser that signed in.** It is handed on to the
+        web app, whose server presents it in a claim with that person's session,
+        and only a claim by the person who started the sign-in trades it
+        (`flotta.mcp_oauth`). Trading it here would leave tokens anyone holding
+        the state could take, and the person who started it holds the state.
+
+        The state is checked so a forged one is refused here, and the flow is
+        left alone either way: this route has no caller to answer for.
+        """
+        from urllib.parse import urlencode
+
+        from fastapi.responses import RedirectResponse
+
+        store = store_factory()
+        try:
+            flow = _live_flow(store, state)
+        finally:
+            store.close()
+        server = _mcp_server_or_404(flow.server)
+        back = flow.return_to
+        if error or not code:
+            reason = error or "the provider sent no code"
+            if back:
+                query = urlencode({"mcp_server": server.name, "mcp_error": reason})
+                return RedirectResponse(f"{back}{'&' if '?' in back else '?'}{query}", 303)
+            raise HTTPException(status_code=400, detail=f"{server.title}: {reason}")
+        if back:
+            query = urlencode({"mcp_server": server.name, "mcp_state": state, "mcp_code": code})
+            return RedirectResponse(f"{back}{'&' if '?' in back else '?'}{query}", 303)
+        return {
+            "server": server.name,
+            "state": state,
+            "code": code,
+            "next": "POST /api/mcp/oauth/claim with this state and code, as whoever started it",
+        }
+
+    @app.post("/api/mcp/oauth/claim")
+    def claim_mcp_oauth(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Trade a sign-in's code and make it the org's connection: `{"state", "code"}`.
+
+        **Only the person who started it, and only then is the code spent**, as
+        `claim_github` asks GitHub who someone is only after the same check. The
+        flow is taken first, so one sign-in is claimed once.
+        """
+        import json
+
+        from flotta import mcp_oauth
+        from flotta.mcp import connection_context
+
+        code = body.get("code")
+        if not isinstance(code, str) or not code.strip():
+            raise HTTPException(
+                status_code=422, detail="a claim carries the code the provider sent"
+            )
+        store = store_factory()
+        try:
+            flow = _live_flow(store, body.get("state"))
+            subject = token.subject if token is not None else "operator"
+            if subject != flow.subject:
+                raise HTTPException(
+                    status_code=403,
+                    detail="this sign-in was started by someone else; start again yourself",
+                )
+            _admin_of(token, flow.org_id)
+            server = _mcp_server_or_404(flow.server)
+            payload = json.loads(_unseal(flow.sealed, mcp_oauth.flow_context(flow.id)))
+            if not store.delete_mcp_flow(flow.id):
+                raise HTTPException(status_code=422, detail="that sign-in is already claimed")
+            endpoints = mcp_oauth.Endpoints(**payload["endpoints"])
+            client = mcp_oauth.Client(**payload["client"])
+            try:
+                with _oauth_http() as http:
+                    tokens = mcp_oauth.exchange(
+                        http,
+                        server,
+                        endpoints,
+                        client,
+                        code=code.strip(),
+                        verifier=payload["verifier"],
+                        redirect_uri=payload["redirect_uri"],
+                    )
+            except mcp_oauth.OAuthError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            credential = mcp_oauth.oauth_credential(endpoints, client, tokens)
+            sealed = _seal(json.dumps(credential), connection_context(flow.org_id, server.name))
+            made = store.set_mcp_connection(
+                flow.org_id, server.name, kind="oauth", credential=sealed, by=subject
+            )
+        finally:
+            store.close()
+        return {"org": made.org_id, "server": server.name, "connection": _mcp_connection(made)}
+
+    @app.delete("/api/orgs/{org_id}/mcp/{server}")
+    def disconnect_mcp(org_id: str, server: str, token: Token | None = needs_admin) -> Any:
+        """Forget a connection, and ask the provider to revoke it where it can.
+
+        Grants stay: an agent granted a server nobody has connected is told so
+        by the gateway, and connecting it again needs no new grant.
+        """
+        import json
+
+        from flotta import mcp_oauth
+        from flotta.mcp import connection_context
+
+        _admin_of(token, org_id)
+        found = _mcp_server_or_404(server)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            gone = store.delete_mcp_connection(org_id, server)
+        finally:
+            store.close()
+        if gone is None:
+            raise HTTPException(status_code=404, detail=f"{server} isn't connected")
+        revoked = False
+        if gone.kind == "oauth":
+            try:
+                credential = json.loads(
+                    _unseal(gone.credential, connection_context(org_id, server))
+                )
+                with _oauth_http() as http:
+                    for value in (credential.get("refresh_token"), credential.get("access_token")):
+                        if value:
+                            revoked = (
+                                mcp_oauth.revoke(
+                                    http,
+                                    found,
+                                    mcp_oauth.endpoints_of(credential),
+                                    mcp_oauth.client_of(credential),
+                                    value,
+                                )
+                                or revoked
+                            )
+            except HTTPException:
+                # Forgotten here either way; the provider's copy expires on its own.
+                _log.warning("the %s connection of %s won't open to revoke", server, org_id)
+        return {"server": server, "disconnected": True, "revoked": revoked}
+
+    @app.get("/api/boxes/{box_id}/mcp")
+    def get_mcp_grants(box_id: str, token: Token | None = needs_write) -> Any:
+        """The MCP servers an agent may call, which tools, and whether calls ask first."""
+        from flotta.provision import mcp_grants_of
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            read = mcp_grants_of(box.id, store=store)
+        finally:
+            store.close()
+        return {**read, "changed_at": _epoch(read["changed_at"])}
+
+    @app.put("/api/boxes/{box_id}/mcp")
+    def put_mcp_grants(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """Replace an agent's grants: in force at the gateway at once, then written to it.
+
+        `written: false` says the agent's config is behind (`provision.set_mcp_grants`).
+        """
+        from flotta.mcp import parse_grants
+        from flotta.provision import ProvisionError, set_mcp_grants
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                grants = parse_grants(body, mcp_servers)
+            except McpError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            by = token.subject if token is not None else "operator"
+            try:
+                written = set_mcp_grants(box.id, grants, store=store, by=by)
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {**written, "changed_at": _epoch(written["changed_at"])}
+
+    @app.get("/api/boxes/{box_id}/mcp/calls")
+    def get_mcp_calls(box_id: str, limit: int = 100, token: Token | None = needs_write) -> Any:
+        """An agent's tool calls, newest first: which tool, and what became of it."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            calls = store.mcp_calls(box.id, limit=max(1, min(limit, 500)))
+        finally:
+            store.close()
+        return {
+            "calls": [
+                {"server": c.server, "tool": c.tool, "status": c.status, "at": _epoch(c.at)}
+                for c in calls
+            ]
+        }
 
     @app.get("/api/boxes/{box_id}/events")
     def get_events(box_id: str, token: Token | None = needs_read) -> Any:
