@@ -377,6 +377,9 @@ class LocalBackend:
         if command == f"rm -f {SOUL_PATH}":
             path.unlink(missing_ok=True)
             return ExecResult(exit_code=0, stdout="", stderr="")
+        rules = self._rules(box_id, command)
+        if rules is not None:
+            return rules
         written = re.fullmatch(
             rf"printf %s ([A-Za-z0-9+/=]+) \| base64 -d > {re.escape(SOUL_PATH)}", command
         )
@@ -389,6 +392,37 @@ class LocalBackend:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         return ExecResult(exit_code=0, stdout="", stderr="")
+
+    def _rules(self, box_id: str, command: str) -> ExecResult | None:
+        """`set_rules`'s command (FLOTTA-124), into this agent's own `config.yaml`.
+
+        Only when the script it carries is `flotta.box.rules` exactly, which then
+        runs here as itself rather than as whatever the command held.
+        """
+        import base64
+        import json
+        from pathlib import Path
+
+        from flotta.box import rules as box_rules
+        from flotta.provision import BOX_PYTHON, HERMES_HOME
+
+        shape = re.fullmatch(
+            rf"printf %s ([A-Za-z0-9+/=]+) \| base64 -d \| {re.escape(BOX_PYTHON)} - "
+            rf"{re.escape(HERMES_HOME)} ([A-Za-z0-9+/=]+)",
+            command,
+        )
+        if shape is None:
+            return None
+        if base64.b64decode(shape.group(1)) != Path(box_rules.__file__).read_bytes():
+            raise NotSupported("a local stand-in runs no script but Flotta's rules writer")
+        try:
+            changes = json.loads(base64.b64decode(shape.group(2)))
+            home = standin.soul_path(self._dir(box_id)).parent
+            home.mkdir(parents=True, exist_ok=True)
+            said = box_rules.apply(home, changes)
+        except (OSError, ValueError) as exc:
+            return ExecResult(exit_code=1, stdout="", stderr=f"rules not written: {exc}")
+        return ExecResult(exit_code=0, stdout=said, stderr="")
 
     def state(self, box_id: str) -> str:
         name = self._name(box_id)

@@ -2322,6 +2322,30 @@ class FleetStore:
         ).fetchall()
         return {str(r["box_id"]) for r in rows}
 
+    def set_box_rules(self, box_id: str, rules: str | None) -> None:
+        """An agent's rules as `flotta.rules` keeps them in JSON (FLOTTA-124); `None` clears.
+
+        A record of what was written to the agent's `config.yaml`, which is the
+        copy Hermes reads. `provision.set_rules` writes there first.
+        """
+        self._get_box_or_raise(box_id)
+        if rules is None:
+            self._conn.execute("DELETE FROM box_rules WHERE box_id = ?", (box_id,))
+            return
+        self._conn.execute(
+            "INSERT INTO box_rules (box_id, rules, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (box_id) DO UPDATE SET rules = EXCLUDED.rules, "
+            "updated_at = EXCLUDED.updated_at",
+            (box_id, rules, _utcnow()),
+        )
+
+    def box_rules(self, box_id: str) -> tuple[str, str] | None:
+        """The rules JSON and when it was written, or `None` for none."""
+        row = self._conn.execute(
+            "SELECT rules, updated_at FROM box_rules WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        return (str(row["rules"]), str(row["updated_at"])) if row else None
+
     def client_conversations(self, box_id: str) -> list[tuple[str, str]]:
         """This box's client conversations as (session id, when), newest first."""
         rows = self._conn.execute(

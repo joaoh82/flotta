@@ -116,6 +116,7 @@ def no_substrate(monkeypatch):
         "rotate_identity",
         "refresh_author",
         "set_instructions",
+        "set_rules",
         "create_box",
     ):
         monkeypatch.setattr(provision, verb, reached)
@@ -150,6 +151,8 @@ BOX_ROUTES = [
     ("DELETE", "/api/boxes/{b}/repos/acme/secrets", SCOPE_FLEET_WRITE, None),
     ("PUT", "/api/boxes/{b}/model", SCOPE_FLEET_WRITE, {"model": None}),
     ("PUT", "/api/boxes/{b}/client-approvals", SCOPE_FLEET_WRITE, {"allowed": True}),
+    ("GET", "/api/boxes/{b}/rules", SCOPE_FLEET_WRITE, None),
+    ("PUT", "/api/boxes/{b}/rules", SCOPE_FLEET_WRITE, {"never": ["x"]}),
     ("POST", "/api/boxes/{b}/identity", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/connection", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/author", SCOPE_FLEET_WRITE, None),

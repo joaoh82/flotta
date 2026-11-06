@@ -79,6 +79,7 @@ from flotta.backend import (
 from flotta.backend import backend_for as _backend_for
 from flotta.backend import pause as _pause
 from flotta.github import GITHUB_TOKEN_ENV
+from flotta.rules import Rules, config_changes, rules_from_json
 from flotta.store import (
     INSTRUCTIONS_CHANGED,
     Box,
@@ -1673,6 +1674,84 @@ def set_instructions(
         "instructions": meta.instructions,
         "changed_at": store.instructions_changed_at(box.id),
     }
+
+
+#: The box's Python: Hermes's, which has `yaml`, as `box_entrypoint.sh` uses.
+BOX_PYTHON = "/opt/hermes-venv/bin/python3"
+HERMES_HOME = "/data/hermes"
+#: The event that says an agent's rules were written to its `config.yaml`.
+RULES_CHANGED = "rules_changed"
+
+
+def set_rules(
+    box_id: str,
+    rules: Rules,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    by: str | None = None,
+) -> dict[str, Any]:
+    """Write an agent's rules into its `config.yaml`, then record them (FLOTTA-124).
+
+    **The writer travels with the rules.** `flotta.box.rules` is sent as source,
+    base64 like everything else on this path (`set_instructions` says why), and
+    run with the box's own Python. An agent made before this module existed
+    gets its rules without a new image.
+
+    **When they apply** is `flotta.rules`'s: the next command for what is
+    enforced, the next conversation for the rest. As with instructions, nothing
+    restarts. Asleep is fine, since `exec` starts the machine; paused is not.
+    """
+    import base64
+    import json
+    from pathlib import Path
+
+    from flotta.box import rules as box_rules
+
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is None:
+        raise ProvisionError(f"no box {box_id!r}")
+    _refuse_paused(box)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
+    if not box.endpoint:
+        raise ProvisionError(f"box {box.name} has no endpoint, so there is no machine to write to")
+    impl = _resolve_backend(box, backend)
+
+    script = base64.b64encode(Path(box_rules.__file__).read_bytes()).decode("ascii")
+    changes = json.dumps(config_changes(rules).to_json()).encode("utf-8")
+    payload = base64.b64encode(changes).decode("ascii")
+    command = f"printf %s {script} | base64 -d | {BOX_PYTHON} - {HERMES_HOME} {payload}"
+    result = impl.exec(box.endpoint, command)
+    if result.exit_code != 0:
+        detail = (result.stderr or result.stdout or "").strip() or "no output"
+        store.add_event("box", box.id, "rules_write_failed", {"detail": detail[:500]})
+        raise ProvisionError(f"could not write the rules on {box.name}: {detail}")
+
+    store.set_box_rules(box.id, None if rules.empty else json.dumps(rules.to_json()))
+    # After the write, as with instructions: the audit trail says what landed.
+    store.add_event(
+        "box",
+        box.id,
+        RULES_CHANGED,
+        {
+            "always": len(rules.always),
+            "never": len(rules.never),
+            "careful": len(rules.careful),
+            "denied_commands": len(rules.denied_commands),
+            "disabled_tools": list(rules.disabled_tools),
+            "private_conversations": rules.private_conversations,
+            "by": by,
+        },
+    )
+    return rules_of(box.id, store=store)
+
+
+def rules_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:
+    """An agent's rules as the API answers them, with when they were last written."""
+    stored = store.box_rules(box_id)
+    rules = rules_from_json(stored[0] if stored else None)
+    return {"box_id": box_id, "rules": rules.to_json(), "changed_at": stored[1] if stored else None}
 
 
 def upgrade_box(
