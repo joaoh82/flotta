@@ -31,6 +31,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from flotta.backend import DEFAULT_MEMORY_MB
+
 # --- defaults --------------------------------------------------------------
 
 DEFAULT_ORG = "personal"
@@ -63,9 +65,11 @@ DEFAULT_VOLUME_GB = 1
 DEFAULT_MOUNT_PATH = "/data"
 
 # Matches fly/fly.toml. `create` boots a machine directly rather than through a
-# deploy, so the size has to be named somewhere other than that file.
+# deploy, so the size has to be named somewhere other than that file. The
+# memory is the fleet's portable default (FLOTTA-157): 1024 had `hermes` killed
+# for memory mid-task on a live agent.
 DEFAULT_VM_SIZE = "shared-cpu-1x"
-DEFAULT_VM_MEMORY_MB = 1024
+DEFAULT_VM_MEMORY_MB = DEFAULT_MEMORY_MB
 
 # The whole point of the milestone. `HERMES_HOME` relocates Hermes's *entire*
 # store atomically — db, sessions, memories, skills (SEAM_NOTES Q3) — so

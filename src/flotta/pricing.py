@@ -218,10 +218,19 @@ VOLUME_PRICE_ENV = "FLOTTA_VOLUME_USD_GB_MONTH"
 _MONTH_S = 30 * 24 * 60 * 60
 _LOCAL = "machine:local"
 UNKNOWN_MACHINE = "machine:unknown"
+#
+# The sizes an agent may be given (`flotta.backend.MEMORY_SIZES_MB`, FLOTTA-157) all
+# need a price, or a budget covering one stops. Fly's table lists `shared-2x-2048`
+# and not `shared-1x-2048` or `shared-2x-4096`, so those two are its own rates worked
+# back from the rows it does list — about $0.68 a shared CPU and $6.02 a GB a month,
+# which reproduces every listed row within a cent. An operator's figure still wins.
 _FLY_MACHINE_USD_MONTH = {
     "shared-1x-256": Decimal("2.19"),
     "shared-1x-512": Decimal("3.69"),
     "shared-1x-1024": Decimal("6.70"),
+    "shared-1x-2048": Decimal("12.72"),
+    "shared-2x-2048": Decimal("13.39"),
+    "shared-2x-4096": Decimal("25.44"),
 }
 _FLY_REGION_MARKUP = {
     "ams": Decimal("1.038461538"),

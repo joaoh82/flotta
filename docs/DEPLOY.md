@@ -386,6 +386,18 @@ Main child exited normally with code: 1
 The box's own timeline says so — `flotta logs <box>` shows a
 `fleet_secrets_missing` event naming what was absent.
 
+**A new agent gets 2 GB of memory, and an owner can change one's size**
+(FLOTTA-157). 1 GB had `hermes` killed for memory mid-task: Hermes and its
+worker hold close to 500 MB between them. `$FLOTTA_FLY_VM_MEMORY_MB` changes the
+default for agents created afterwards. One agent is resized with `flotta resize
+<agent> --memory 4096` (`just agent-resize`), `PUT /api/boxes/{id}/size` with
+`{"memory_mb": 4096}`, or `memory_mb` on `POST /api/boxes`; the sizes are 1024,
+2048 and 4096, and only an org's owner or the operator may choose one, since it
+is what the agency pays. A running agent restarts at its new size and keeps its
+disk; a sleeping one stays asleep. On Fly a shared CPU holds at most 2 GB, so
+4096 is `shared-cpu-2x`. Metering prices the new size from the first whole hour
+after the resize.
+
 ---
 
 ## Step 6b — More than one agent

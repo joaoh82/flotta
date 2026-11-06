@@ -213,6 +213,11 @@ agent-gateway BOX:
 agent-direct BOX:
     uv run flotta model direct {{BOX}}
 
+# FLOTTA-157 — give an agent 1024, 2048 or 4096 MB, keeping its disk. Restarts it
+# if it is running. Goes through $FLOTTA_CONTROL_URL when set (an org owner's act).
+agent-resize BOX MEMORY:
+    uv run flotta resize {{BOX}} --memory {{MEMORY}}
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key

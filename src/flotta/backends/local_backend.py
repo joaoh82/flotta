@@ -360,6 +360,18 @@ class LocalBackend:
     def reimage(self, box_id: str, image: str) -> None:
         raise NotSupported("a local stand-in has no image to replace")
 
+    def check_resize(self, box_id: str, memory_mb: int) -> None:
+        raise NotSupported(
+            "a local stand-in is a process on this machine; it has no size to change"
+        )
+
+    def resize(self, box_id: str, memory_mb: int) -> None:
+        # Refused rather than recorded: a process has no VM to size, and saying
+        # it now has 4 GB would be a number the window shows and nothing holds.
+        raise NotSupported(
+            "a local stand-in is a process on this machine; it has no size to change"
+        )
+
     def exec(self, box_id: str, command: str, *, timeout_s: int = 300) -> ExecResult:
         """No shell, but the two commands `set_instructions` sends, and nothing else.
 

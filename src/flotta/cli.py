@@ -1175,6 +1175,69 @@ def start(
 
 
 @app.command()
+def resize(
+    box_id: str = typer.Argument(..., help="Box id or name"),
+    memory: int = typer.Option(..., "--memory", help="Memory in MB: 1024, 2048 or 4096"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Give an agent more or less memory, keeping its disk (FLOTTA-157).
+
+    A running agent restarts at its new size; a sleeping one stays asleep and
+    wakes at it. The CPUs follow from the memory (4096 on Fly is two shared
+    CPUs). Through the control plane when `$FLOTTA_CONTROL_URL` is set, where
+    only an org's owner may do it; otherwise against this machine's store.
+    """
+    from flotta.backend import check_memory_mb
+
+    try:
+        memory = check_memory_mb(memory)
+    except ValueError as exc:
+        raise _fail(exc, code=2) from exc
+
+    if control_url():
+        from flotta.auth import SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN
+
+        try:
+            box = _remote_box(box_id)
+            body = control_request(
+                "PUT",
+                f"/api/boxes/{box['id']}/size",
+                scopes=(SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN),
+                body={"memory_mb": memory},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        name = (body.get("box") or {}).get("name") or box_id
+        if body.get("already_current"):
+            text = f"{name} already has {memory} MB"
+        else:
+            # Accepted, not done: the restart is the control plane's thread's.
+            text = (
+                f"{name} is being resized to {memory} MB. A running agent restarts; "
+                "its timeline says how it went."
+            )
+        emit(body, text, as_json=as_json)
+        return
+
+    provision = _provision()
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        try:
+            result = provision.begin_resize(box.id, memory, store=fleet)
+            if not result.get("already_current"):
+                result = provision.resize_box(box.id, memory, store=fleet)
+        except provision.UpgradeFailed as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        except provision.ProvisionError as exc:
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=2) from exc
+        note = "already has" if result.get("already_current") else "now has"
+        emit(result, f"{box.name}  {note} {memory} MB", as_json=as_json)
+
+
+@app.command()
 def upgrade(
     box_id: str = typer.Argument(..., help="Box id or name"),
     image: str | None = typer.Option(
