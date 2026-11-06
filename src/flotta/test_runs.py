@@ -320,9 +320,9 @@ def test_a_wide_step_is_capped_too(agency):
     assert kept["…"] == MAX_ITEMS * 2, "says how many keys it left out"
 
 
-def test_migration_18_gives_an_old_task_its_boxs_tenant(target, monkeypatch):  # noqa: F811
-    """The one step of migration 18 that rewrites rows, on every engine."""
-    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(m for m in ALL if m.version < 18))
+def test_migration_19_gives_an_old_task_its_boxs_tenant(target, monkeypatch):  # noqa: F811
+    """The one step of migration 19 that rewrites rows, on every engine."""
+    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(m for m in ALL if m.version < 19))
     with FleetStore(target) as store:
         store.create_org("studio-nord", "Studio Nord")
         store.create_client("studio-nord", "acme", "Acme Dental")

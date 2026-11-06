@@ -532,8 +532,8 @@ def test_removing_a_member_withdraws_their_invites_to_that_org(agency):
     opened = agency.create_login_link("lee@example.com", **invite)
     agency.create_org("other", "Other")
     other = agency.create_login_link("lee@example.com", **{**invite, "org_id": "other"})
-    lee, _ = agency.accept_invite(agency.redeem_login_link(joined))
     read = agency.redeem_login_link(opened)
+    lee, _ = agency.accept_invite(agency.redeem_login_link(joined))
 
     agency.remove_membership(lee.id, "studio-nord")
 
