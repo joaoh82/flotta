@@ -110,3 +110,25 @@ def test_without_a_control_plane_run_says_so(monkeypatch):
 
     assert result.exit_code != 0
     assert "FLOTTA_CONTROL_URL" in result.output
+
+
+def test_without_a_control_plane_runs_says_so(monkeypatch):
+    monkeypatch.setattr(cli, "control_url", lambda env=None: None)
+
+    result = CliRunner().invoke(app, ["runs", "eng-a"])
+
+    assert result.exit_code != 0
+    assert "FLOTTA_CONTROL_URL" in result.output
+
+
+def test_names_are_quoted_into_the_path(remote):
+    calls, answers = remote
+    answers += [QUEUED, {"runs": []}]
+
+    CliRunner().invoke(app, ["run", "eng/../a", "hello"])
+    CliRunner().invoke(app, ["runs", "--client", "a b"])
+
+    assert [c[1] for c in calls] == [
+        "/api/boxes/eng%2F..%2Fa/runs",
+        "/api/clients/a%20b/runs?limit=20",
+    ]

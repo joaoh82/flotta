@@ -592,7 +592,9 @@ def _run_approvals() -> tuple[str, ...]:
     A run is work nobody is watching, so its approval waits here for someone
     to answer it from outside the conversation. `request_id` is the box's own
     id for the question, which the control plane answers on the run's socket.
-    `status` is `waiting`, `answered` or `expired`.
+    `status` is `waiting`, `answered` or `expired`. `held_at` is the delivery
+    saying it still holds the socket, so an answer has somewhere to go, and
+    `delivered_at` is when the answer reached the box.
     """
     return (
         """
@@ -612,6 +614,8 @@ def _run_approvals() -> tuple[str, ...]:
             choice      TEXT,
             answered_by TEXT,
             answered_at TEXT,
+            held_at     TEXT NOT NULL,
+            delivered_at TEXT,
             UNIQUE (run_id, request_id)
         )
         """,

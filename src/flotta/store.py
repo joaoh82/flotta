@@ -468,6 +468,12 @@ class InvalidBoxNameError(StoreError):
     """
 
 
+#: How long a run's approval stays answerable after its delivery last said it
+#: was listening (`hold_approvals`). Past it, nobody holds the run's socket,
+#: so an answer would reach no one: after a restart, say.
+APPROVAL_HELD_S = 30
+
+
 class ApprovalClosedError(StoreError):
     """An approval that was already answered, or that expired, takes no answer."""
 
@@ -4112,12 +4118,30 @@ class FleetStore:
         ).fetchone()
         return _run_from_row(row) if row else None
 
-    def queued_runs(self, *, limit: int = 200) -> list[Run]:
-        """Every org's runs waiting in `pending`, oldest first: the delivery queue."""
+    def queued_runs(
+        self, *, limit: int = 200, skip_boxes: list[str] | tuple[str, ...] = ()
+    ) -> list[Run]:
+        """The delivery queue: each agent's oldest waiting run, oldest first.
+
+        One per agent, because an agent does its runs in turn: a flat window
+        over every pending run would be filled by one agent with a long queue,
+        and no other agent would ever be offered work. `skip_boxes` are the
+        agents already busy.
+        """
+        skip = ""
+        params: list[Any] = []
+        if skip_boxes:
+            skip = f"AND t.box_id NOT IN ({','.join('?' * len(skip_boxes))}) "
+            params.extend(skip_boxes)
+        params.append(max(0, limit))
         rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE status = 'pending' AND trigger_kind IS NOT NULL "
-            "ORDER BY created_at, id LIMIT ?",
-            (max(0, limit),),
+            "SELECT * FROM tasks t WHERE t.status = 'pending' AND t.trigger_kind IS NOT NULL "
+            + skip
+            + "AND t.id = (SELECT h.id FROM tasks h WHERE h.box_id = t.box_id "
+            "AND h.status = 'pending' AND h.trigger_kind IS NOT NULL "
+            "ORDER BY h.created_at, h.id LIMIT 1) "
+            "ORDER BY t.created_at, t.id LIMIT ?",
+            params,
         ).fetchall()
         return [_run_from_row(r) for r in rows]
 
@@ -4234,7 +4258,7 @@ class FleetStore:
                 self._conn.execute(
                     "INSERT INTO run_approvals (id, run_id, box_id, org_id, client_id, "
                     "request_id, command, description, choices_json, asked_at, expires_at, "
-                    "status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting')",
+                    "held_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting')",
                     (
                         approval_id,
                         run.id,
@@ -4247,6 +4271,7 @@ class FleetStore:
                         json.dumps(list(choices)),
                         _instant(now) if now else _utcnow(),
                         _instant(expires_at),
+                        _instant(now) if now else _utcnow(),
                     ),
                 )
         return self._get_approval_or_raise(approval_id)
@@ -4254,13 +4279,22 @@ class FleetStore:
     def answer_approval(
         self, approval_id: str, choice: str, *, by: str, now: datetime | None = None
     ) -> RunApproval:
-        """A person's answer. Once only, and only while it waits and has time left."""
+        """A person's answer. Once only, while it waits, has time left, and its
+        delivery is still listening for the answer."""
         moment = now or datetime.now(UTC)
         with self._conn.transaction(guard="run_approvals"):
             current = self._get_approval_or_raise(approval_id)
             # Instants are stored in one format (`_instant`), so they compare as text.
             if current.status != "waiting" or current.expires_at <= _instant(moment):
                 raise ApprovalClosedError(f"approval {approval_id!r} is {current.status}")
+            held = self._conn.execute(
+                "SELECT held_at FROM run_approvals WHERE id = ?", (approval_id,)
+            ).fetchone()["held_at"]
+            if held < _instant(moment - timedelta(seconds=APPROVAL_HELD_S)):
+                raise ApprovalClosedError(
+                    f"nothing is listening for approval {approval_id!r}'s answer: "
+                    "the run that asked has lost its conversation"
+                )
             self._conn.execute(
                 "UPDATE run_approvals SET status = 'answered', choice = ?, answered_by = ?, "
                 "answered_at = ? WHERE id = ?",
@@ -4268,20 +4302,42 @@ class FleetStore:
             )
         return self._get_approval_or_raise(approval_id)
 
+    def hold_approvals(self, run_id: str, *, now: datetime | None = None) -> None:
+        """`run_id`'s delivery still holds its socket: its approvals can be answered."""
+        with self._conn.transaction(guard="run_approvals"):
+            self._conn.execute(
+                "UPDATE run_approvals SET held_at = ? WHERE run_id = ? AND status = 'waiting'",
+                (_instant(now) if now else _utcnow(), run_id),
+            )
+
+    def mark_delivered(self, approval_id: str, *, now: datetime | None = None) -> None:
+        """The answer reached the box."""
+        with self._conn.transaction(guard="run_approvals"):
+            self._conn.execute(
+                "UPDATE run_approvals SET delivered_at = ? WHERE id = ?",
+                (_instant(now) if now else _utcnow(), approval_id),
+            )
+
     def expire_approvals(self, run_id: str, *, now: datetime | None = None) -> list[RunApproval]:
-        """Close `run_id`'s waiting approvals as expired: its conversation has ended."""
+        """Close `run_id`'s approvals the box never heard an answer to: its
+        conversation has ended, and the box was told no on the way out.
+
+        That includes one answered too late to be carried, so the row says
+        what the box was actually told.
+        """
+        unheard = (
+            "run_id = ? AND (status = 'waiting' OR (status = 'answered' AND delivered_at IS NULL))"
+        )
         with self._conn.transaction(guard="run_approvals"):
             ids = [
                 r["id"]
                 for r in self._conn.execute(
-                    "SELECT id FROM run_approvals WHERE run_id = ? AND status = 'waiting'",
-                    (run_id,),
+                    f"SELECT id FROM run_approvals WHERE {unheard}", (run_id,)
                 ).fetchall()
             ]
             if ids:
                 self._conn.execute(
-                    "UPDATE run_approvals SET status = 'expired', answered_at = ? "
-                    "WHERE run_id = ? AND status = 'waiting'",
+                    f"UPDATE run_approvals SET status = 'expired', answered_at = ? WHERE {unheard}",
                     (_instant(now) if now else _utcnow(), run_id),
                 )
         return [self._get_approval_or_raise(i) for i in ids]
@@ -4307,13 +4363,19 @@ class FleetStore:
         boxes: list[str] | None = None,
         now: datetime | None = None,
     ) -> list[RunApproval]:
-        """`org`'s approvals still waiting for an answer, oldest first.
+        """`org`'s approvals still waiting for an answer, oldest first: only
+        those a delivery is listening for, since nothing else can be answered.
 
         `org` is always required, as in `list_runs`. `boxes`, when given, keeps
         only those agents' approvals.
         """
-        where = ["org_id = ?", "status = 'waiting'", "expires_at > ?"]
-        params: list[Any] = [org, _instant(now) if now else _utcnow()]
+        moment = now or datetime.now(UTC)
+        where = ["org_id = ?", "status = 'waiting'", "expires_at > ?", "held_at >= ?"]
+        params: list[Any] = [
+            org,
+            _instant(moment),
+            _instant(moment - timedelta(seconds=APPROVAL_HELD_S)),
+        ]
         if client is not None:
             where.append("client_id = ?")
             params.append(client)

@@ -279,9 +279,9 @@ def test_nothing_waiting_is_said(api, fleet):
 
 def test_waiting_approvals_are_listed_for_whoever_may_answer_them(api, fleet):
     run, approval = _waiting(fleet)
-    agency = _bearer(SCOPE_FLEET_READ, **AGENCY)
+    agency = _bearer(SCOPE_FLEET_WRITE, **AGENCY)
     person = _bearer(*CLIENT_USER, org="agency-x", client="acme")
-    stranger = _bearer(SCOPE_FLEET_READ, org="agency-y")
+    stranger = _bearer(SCOPE_FLEET_WRITE, org="agency-y")
 
     def listed(headers):
         return [a["id"] for a in api.get("/api/approvals", headers=headers).json()["approvals"]]
@@ -293,3 +293,21 @@ def test_waiting_approvals_are_listed_for_whoever_may_answer_them(api, fleet):
     assert listed(person) == [approval.id]
     _answer(api, run, "once")
     assert listed(agency) == []
+
+
+def test_only_those_who_may_answer_list_what_waits(api, fleet):
+    """The list is of what the caller can answer: a reader who can't, sees none."""
+    _waiting(fleet)
+
+    answer = api.get("/api/approvals", headers=_bearer(SCOPE_FLEET_READ, **AGENCY))
+
+    assert answer.status_code == 403
+
+
+def test_a_run_that_has_ended_takes_no_answer(api, fleet):
+    """Its delivery is gone, so an answer would reach nobody."""
+    run, _ = _waiting(fleet)
+    with FleetStore(fleet) as store:
+        store.finish_run(run.id, "failed", error_class="interrupted")
+
+    assert _answer(api, run, "once").status_code == 409

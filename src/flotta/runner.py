@@ -34,11 +34,15 @@ still open when the run ends is denied and marked `expired`: silence is not
 consent. The agent's own timeout is longer than a run (`flotta.box.approvals`),
 so it is this loop, not Hermes, that ends the wait.
 
-## When the control plane restarts mid-run
+## When the control plane stops mid-run
 
-Its delivery dies with it and the run stays `running`. Nothing here delivers it
-again, which would do the work twice: `provision.reap_runs` closes it as
-`stranded` at `RUN_DEADLINE_S`, and the agent's next run waits until then.
+Stopped on purpose, as on every deploy, it knows its own deliveries: each run
+ends `failed`, `interrupted`, and the agent's next run goes to whichever control
+plane comes up. Killed outright, its delivery dies with it and the run stays
+`running`. Nothing delivers it again, which would do the work twice:
+`provision.reap_runs` closes it as `stranded` at `RUN_DEADLINE_S`. Its
+approvals stop being answerable within `APPROVAL_HELD_S`, because nothing is
+saying it is listening for the answer any more.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -74,6 +79,13 @@ SWEEP_S = 2.0
 
 #: How often a run waiting on an approval looks for a person's answer.
 ANSWER_POLL_S = 1.0
+
+#: How often a delivery says it still holds its run's socket. Well inside
+#: `APPROVAL_HELD_S`, past which an approval takes no answer.
+HOLD_EVERY_S = 5.0
+
+#: How long a stopping control plane gives its deliveries to write `interrupted`.
+STOP_GRACE_S = 10.0
 
 #: What a box offers when its question names no choices.
 DEFAULT_CHOICES = ("once", "session", "always", "deny")
@@ -228,6 +240,9 @@ class Talk:
         self._heard: list[dict[str, Any]] = []
         #: Recorded and not yet answered: approval id -> the box's own request id.
         self._open: dict[str, Any] = {}
+        #: Answers sent to the box.
+        self._sent: set[str] = set()
+        self._held_at = 0.0
 
     def hear(self, frame: dict[str, Any]) -> None:
         """One frame of the turn, as `client.send_turn` streams it."""
@@ -238,10 +253,14 @@ class Talk:
     async def relay(self, send: Send) -> None:
         """Until cancelled: record each question, and send each answer back."""
         while True:
-            for rpc_id, choice, by in await asyncio.to_thread(self._sync):
+            for approval_id, rpc_id, choice, by in await asyncio.to_thread(self._sync):
                 answer = {"jsonrpc": "2.0", "id": rpc_id, "result": {"choice": choice}}
                 await send(json.dumps(answer))
+                # Noted before anything that can be cancelled: the box may finish
+                # its turn on this answer at once, and `close` must know it went.
+                self._sent.add(approval_id)
                 self.steps.answered(str(rpc_id), choice, by)
+                await asyncio.to_thread(self._delivered, approval_id)
             await asyncio.sleep(self._poll_s)
 
     async def withdraw(self, send: Send) -> None:
@@ -253,17 +272,31 @@ class Talk:
                 )
 
     def close(self) -> None:
-        """The run is over: its open questions expire, and its steps say so."""
+        """The run is over: its open questions expire, and its steps say so.
+
+        An answer that arrived after the last look was never carried to the box,
+        which `withdraw` told no; `expire_approvals` makes its row say the same.
+        """
         self._sync()
         store = self._store_factory()
         try:
+            for approval_id in self._sent:
+                store.mark_delivered(approval_id)
             store.expire_approvals(self.run.id)
         finally:
             store.close()
         self.steps.unanswered()
 
-    def _sync(self) -> list[tuple[Any, str, str | None]]:
-        """Record what was asked; return what has been answered since."""
+    def _delivered(self, approval_id: str) -> None:
+        store = self._store_factory()
+        try:
+            store.mark_delivered(approval_id)
+        finally:
+            store.close()
+
+    def _sync(self) -> list[tuple[str, Any, str, str | None]]:
+        """Record what was asked, say it is still listening, and return what
+        has been answered since."""
         store = self._store_factory()
         try:
             while self._heard:
@@ -282,11 +315,15 @@ class Talk:
                     expires_at=self._expires_at,
                 )
                 self._open.setdefault(approval.id, frame["id"])
+            if self._open and time.monotonic() - self._held_at >= HOLD_EVERY_S:
+                store.hold_approvals(self.run.id)
+                self._held_at = time.monotonic()
             answered = []
             for approval in store.run_approvals(self.run.id):
                 if approval.id in self._open and approval.status == "answered":
                     rpc_id = self._open.pop(approval.id)
-                    answered.append((rpc_id, approval.choice or "deny", approval.answered_by))
+                    choice = approval.choice or "deny"
+                    answered.append((approval.id, rpc_id, choice, approval.answered_by))
             return answered
         finally:
             store.close()
@@ -363,10 +400,12 @@ class RunLoop:
         *,
         max_concurrent: int = MAX_CONCURRENT,
         timeout_s: float = RUN_TIMEOUT_S,
+        queue_limit: int = 200,
     ) -> None:
         self._store_factory = store_factory
         self._deliver = deliver
         self._max = max_concurrent
+        self._queue_limit = queue_limit
         self._timeout_s = timeout_s
         #: The run each agent is doing now, by box id.
         self.in_flight: dict[str, asyncio.Task] = {}
@@ -393,7 +432,7 @@ class RunLoop:
         busy = set(self.in_flight)
         store = self._store_factory()
         try:
-            for run in store.queued_runs():
+            for run in store.queued_runs(limit=self._queue_limit, skip_boxes=sorted(busy)):
                 if len(self.in_flight) + len(claimed) >= self._max:
                     break
                 if run.box_id in busy:
@@ -439,12 +478,17 @@ class RunLoop:
         talk = Talk(
             self._store_factory, run, expires_at=started + timedelta(seconds=self._timeout_s)
         )
-        status, error_class = "done", None
+        status, error_class, stopped = "done", None, False
         try:
             output = await asyncio.wait_for(self._deliver(run, box, talk), timeout=self._timeout_s)
         except TimeoutError:
             status, error_class = "failed", "timeout"
             output = f"the agent did not finish within {self._timeout_s:.0f}s"
+        except asyncio.CancelledError:
+            # The control plane is stopping. It knows this delivery is its own,
+            # so it ends the run rather than leave the agent's queue to the reaper.
+            status, error_class, stopped = "failed", "interrupted", True
+            output = "the control plane stopped during the run"
         except ChatError as exc:
             paused = exc.status == 402
             status, error_class = ("budget_blocked", "paused") if paused else ("failed", "agent")
@@ -454,6 +498,8 @@ class RunLoop:
             status, error_class = "failed", "error"
             output = f"{type(exc).__name__}: {exc}"
         await asyncio.to_thread(self._finish, run, status, output, talk, error_class)
+        if stopped:
+            raise asyncio.CancelledError
 
     def _finish(
         self, run: Run, status: str, output: str, talk: Talk, error_class: str | None
@@ -509,5 +555,10 @@ async def run_run_loop(
                 _log.warning("run sweep failed: %s: %s", type(exc).__name__, exc)
             await sleep(interval_s)
     finally:
-        for task in list(loop.in_flight.values()):
+        flying = list(loop.in_flight.values())
+        for task in flying:
             task.cancel()
+        if flying:
+            # Each writes `interrupted` (`RunLoop._carry`). A delivery that
+            # cannot in time is left to `reap_runs`, as after a crash.
+            await asyncio.wait(flying, timeout=STOP_GRACE_S)

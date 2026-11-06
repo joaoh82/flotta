@@ -1073,6 +1073,13 @@ def create(
 RUN_POLL_S = 2.0
 
 
+def _quoted(part: str | None) -> str:
+    """One path segment: a name with a `/` in it must not become two."""
+    from urllib.parse import quote
+
+    return quote(part or "", safe="")
+
+
 def _run_line(run: dict[str, Any]) -> str:
     return f"{run.get('id')}  {run.get('status')}  {truncate(run.get('prompt'), 60)}"
 
@@ -1102,7 +1109,7 @@ def run(
         raise _fail(ControlPlaneError(f"runs go through the control plane: set ${CONTROL_URL_ENV}"))
     try:
         found = control_request(
-            "POST", f"/api/boxes/{box}/runs", scopes=(SCOPE_FLEET_WRITE,), body=body
+            "POST", f"/api/boxes/{_quoted(box)}/runs", scopes=(SCOPE_FLEET_WRITE,), body=body
         )
         deadline = time.monotonic() + timeout_s
         while wait and found.get("status") not in TASK_TERMINAL:
@@ -1132,7 +1139,9 @@ def runs(
 
     if (box is None) == (client is None):
         raise _fail(Exception("name an agent, or a client with --client"))
-    path = f"/api/boxes/{box}/runs" if box else f"/api/clients/{client}/runs"
+    if not control_url():
+        raise _fail(ControlPlaneError(f"runs go through the control plane: set ${CONTROL_URL_ENV}"))
+    path = f"/api/boxes/{_quoted(box)}/runs" if box else f"/api/clients/{_quoted(client)}/runs"
     try:
         found = control_request("GET", f"{path}?limit={limit}", scopes=(SCOPE_FLEET_READ,))
     except ControlPlaneError as exc:

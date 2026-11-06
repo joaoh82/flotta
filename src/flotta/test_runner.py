@@ -13,6 +13,7 @@ budget that stops an agent must not be undone by a schedule.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -423,3 +424,65 @@ def test_a_waiting_approval_expires_with_its_run(path, monkeypatch):
 
     started = datetime.fromisoformat(_run(path, run.id).started_at)
     assert datetime.fromisoformat(seen["expires"]) == started + timedelta(seconds=600)
+
+
+def test_one_agents_long_queue_does_not_starve_the_rest(path):
+    flood = [_queue(path, "b-one", prompt=f"flood {n}") for n in range(3)]
+    other = _queue(path, "b-two")
+    door = Door()
+
+    _sweep_and_finish(_loop(path, door, queue_limit=2))
+
+    assert {r for r, _ in door.sent} == {flood[0].id, other.id}
+
+
+def test_an_answer_that_came_too_late_is_not_left_saying_it_was_given(path):
+    """Answered after the delivery's last look: the box is told no on the way
+    out, and the row and the step both say so."""
+    run = _queue(path)
+    with FleetStore(path) as store:
+        run = store.start_run(run.id)
+    talk = runner.Talk(
+        lambda: FleetStore(path), run, expires_at=datetime.now(UTC) + timedelta(minutes=5)
+    )
+    talk.hear(ASK)
+    talk._sync()
+    with FleetStore(path) as store:
+        (waiting,) = store.waiting_approvals(org="studio-nord")
+        store.answer_approval(waiting.id, "once", by="user:ada")
+    to_box = []
+
+    async def send(frame):
+        to_box.append(json.loads(frame)["result"]["choice"])
+
+    asyncio.run(talk.withdraw(send))
+    talk.close()
+
+    assert to_box == ["deny"]
+    with FleetStore(path) as store:
+        assert store.get_approval(waiting.id).status == "expired"
+    assert (talk.steps.steps[0]["answer"], talk.steps.steps[0]["expired"]) == ("deny", True)
+
+
+def test_stopping_the_control_plane_ends_its_runs_as_interrupted(path):
+    """A deploy knows its own deliveries. Left `running`, each agent's queue
+    would wait an hour for `reap_runs`."""
+    first = _queue(path, prompt="first")
+    second = _queue(path, prompt="second")
+    door = Door(wait=asyncio.Event())
+
+    async def go():
+        loop = asyncio.create_task(
+            runner.run_run_loop(lambda: FleetStore(path), door, interval_s=0.01)
+        )
+        while not door.sent:
+            await asyncio.sleep(0.01)
+        loop.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop
+
+    asyncio.run(go())
+
+    stopped = _run(path, first.id)
+    assert (stopped.status, stopped.error_class) == ("failed", "interrupted")
+    assert _run(path, second.id).status == "pending", "free for the next control plane"

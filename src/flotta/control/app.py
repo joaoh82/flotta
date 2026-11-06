@@ -4928,6 +4928,10 @@ def create_app(
         try:
             run = _scoped_run(store, token, run_id)
             box = _scoped_box(store, token, run.box_id)
+            if run.status != "running":
+                raise HTTPException(
+                    status_code=409, detail=f"run {run_id!r} is {run.status}: nobody would hear it"
+                )
             allowed: frozenset[str] | None = None
             if token is not None:
                 if token.box is not None or subject_box(token.subject) is not None:
@@ -4974,7 +4978,7 @@ def create_app(
             store.close()
 
     @app.get("/api/approvals")
-    def list_waiting_approvals(token: Token | None = needs_read) -> Any:
+    def list_waiting_approvals(token: Token | None = needs_answer) -> Any:
         """The approvals waiting for a person that the caller may answer, oldest first.
 
         The agency's: every one in its org. A client's people: their client's,
