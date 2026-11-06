@@ -97,6 +97,20 @@ def test_the_task_cap_survives_a_real_race(pg_store):
     assert pg_store.count_live_tasks() == 1
 
 
+def test_one_box_starts_one_run_in_a_real_race(pg_store):
+    """`start_run` reads "nothing running" and then moves its run (M14.1). Two
+    deliverers doing that at once without the lock both start, and a model
+    call that names no run would then have two it could belong to."""
+    box = pg_store.create_box("eng-a")
+    runs = [pg_store.create_run(box.id, f"r{i}", trigger_kind="api").id for i in range(2)]
+
+    outcomes = _race(pg_store, lambda fleet, i: fleet.start_run(runs[i]))
+
+    assert sorted(outcomes) == ["BoxBusyError", "created"], (
+        f"expected exactly one run to start, got {outcomes}"
+    )
+
+
 def test_the_workspace_cap_survives_a_real_race(pg_store):
     """Same guard, the other table — wired ahead of the tier that uses it."""
     box = pg_store.create_box("eng-a")

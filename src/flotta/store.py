@@ -68,6 +68,7 @@ from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
 from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
+from flotta.runs import MAX_OUTPUT, cap_steps, check_trigger_kind, clip_text
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -126,13 +127,21 @@ WORKSPACE_TRANSITIONS: dict[str, frozenset[str]] = {
 # No `torn_down`. Killing a box mid-task resolves its task as `failed` — the
 # work did not happen, and saying so is the whole point of the watcher design.
 # `pending` is real: a task handed to a stopped box waits for it to wake.
-TASK_STATUSES: frozenset[str] = frozenset({"pending", "running", "done", "failed"})
-TASK_TERMINAL: frozenset[str] = frozenset({"done", "failed"})
+#
+# A task is a run (M14, D23). `budget_blocked` is a run that was never
+# delivered because its box was paused or a budget held it, so it never left
+# `pending`; `cancelled` is one somebody stopped, before or during.
+TASK_STATUSES: frozenset[str] = frozenset(
+    {"pending", "running", "done", "failed", "cancelled", "budget_blocked"}
+)
+TASK_TERMINAL: frozenset[str] = frozenset({"done", "failed", "cancelled", "budget_blocked"})
 TASK_TRANSITIONS: dict[str, frozenset[str]] = {
-    "pending": frozenset({"running", "failed"}),
-    "running": frozenset({"done", "failed"}),
+    "pending": frozenset({"running", "failed", "cancelled", "budget_blocked"}),
+    "running": frozenset({"done", "failed", "cancelled"}),
     "done": frozenset(),
     "failed": frozenset(),
+    "cancelled": frozenset(),
+    "budget_blocked": frozenset(),
 }
 
 _STATUSES: dict[str, frozenset[str]] = {
@@ -457,6 +466,16 @@ class InvalidBoxNameError(StoreError):
     """
 
 
+class BoxBusyError(StoreError):
+    """A box already has a run going. Runs on one box go one at a time, so a
+    model call that names no run has exactly one it can belong to."""
+
+    def __init__(self, box_id: str, running: str) -> None:
+        super().__init__(f"box {box_id!r} is already doing run {running!r}")
+        self.box_id = box_id
+        self.running = running
+
+
 class ConcurrencyLimitError(StoreError):
     """Raised when a create would exceed the live cap for that entity.
 
@@ -690,6 +709,42 @@ class Task:
     finished_at: str | None
     result: dict[str, Any] | None
     cost_estimate: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class Run:
+    """A task seen as a run (M14, `flotta.runs`): what started it, what it was
+    given, what it did. Its cost is `FleetStore.run_cost`, read from `usage`."""
+
+    id: str
+    box_id: str
+    org: str
+    client: str
+    #: NULL only on a task from before migration 18.
+    trigger_kind: str | None
+    trigger_id: str | None
+    prompt: str
+    input: Any
+    status: str
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    output: str | None
+    #: `{"steps": [...], "omitted": n}`, as `flotta.runs.cap_steps` keeps them.
+    steps: dict[str, Any] | None
+    approval_count: int
+    error_class: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunCost:
+    """What a run's model calls cost: `Spend`'s two numbers, plus its tokens."""
+
+    eur_nano: int
+    unpriced: int
+    calls: int
+    tokens_in: int
+    tokens_out: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -2500,11 +2555,12 @@ class FleetStore:
 
         The cost comes from the price in force at this moment and is never
         worked out again. Whose call it was comes from the box's row, so no
-        caller can say it wrongly. A call with no price or no rate is still
-        written, because the money is spent: its costs are NULL and `spend`
-        counts it. A call that used no tokens cost nothing whatever its model, so
-        a refused call is never unpriced. A retry with the same key returns the
-        row already there.
+        caller can say it wrongly, and which run it was part of from
+        `_run_for_call`, so `run_id` is only ever one of the box's own. A call
+        with no price or no rate is still written, because the money is spent:
+        its costs are NULL and `spend` counts it. A call that used no tokens
+        cost nothing whatever its model, so a refused call is never unpriced. A
+        retry with the same key returns the row already there.
 
         No transaction, on purpose: a guard is a table lock on Postgres, this
         runs after every model call, and one `INSERT … ON CONFLICT` is atomic.
@@ -2522,6 +2578,9 @@ class FleetStore:
             raise ValueError(f"key_scope must be one of {sorted(KEY_SCOPES)}, got {key_scope!r}")
         box = self._get_box_or_raise(box_id)
         moment = now or datetime.now(UTC)
+        run_id = self._run_for_call(
+            box.id, run_id, moment - timedelta(milliseconds=max(0, latency_ms or 0))
+        )
         price = self.price_of(model, at=moment)
         currency = None if price is None else price.currency
         upstream_cost: int | None
@@ -3401,19 +3460,20 @@ class FleetStore:
         """
         tid = task_id or f"t-{uuid.uuid4().hex[:12]}"
         with self._conn.transaction(guard="tasks"):
-            self._get_box_or_raise(box_id)
             if workspace_id is not None:
                 self._require_workspace_of(box_id, workspace_id)
             if max_live is not None:
                 live = self._live_task_ids()
                 if len(live) >= max_live:
                     raise ConcurrencyLimitError(max_live, live, noun="task")
+            box = self._get_box_or_raise(box_id)
             self._conn.execute(
                 """
-                INSERT INTO tasks (id, box_id, workspace_id, prompt, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks
+                    (id, box_id, workspace_id, prompt, status, created_at, org_id, client_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (tid, box_id, workspace_id, prompt, "pending", _utcnow()),
+                (tid, box_id, workspace_id, prompt, "pending", _utcnow(), box.org, box.client),
             )
         return self._get_task_or_raise(tid)
 
@@ -3507,6 +3567,206 @@ class FleetStore:
                 tuple(sorted(live)),
             ).fetchall()
         ]
+
+    # -- runs (M14, D23: a run is a row of `tasks`) ---------------------------
+
+    def create_run(
+        self,
+        box_id: str,
+        prompt: str,
+        *,
+        trigger_kind: str,
+        trigger_id: str | None = None,
+        input: Any = None,
+        run_id: str | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """Ask `box_id` for a piece of work. It waits in `pending` until
+        `start_run`: the box may be asleep, or doing another run.
+
+        `prompt` is what the agent is told and `input` what it was told about,
+        such as a webhook's body. Whose run it is comes from the box's row.
+        """
+        check_trigger_kind(trigger_kind)
+        rid = run_id or f"t-{uuid.uuid4().hex[:12]}"
+        with self._conn.transaction(guard="tasks"):
+            box = self._get_box_or_raise(box_id)
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            self._conn.execute(
+                "INSERT INTO tasks (id, box_id, prompt, status, created_at, org_id, client_id, "
+                "trigger_kind, trigger_id, input_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rid,
+                    box.id,
+                    prompt,
+                    "pending",
+                    _instant(now) if now else _utcnow(),
+                    box.org,
+                    box.client,
+                    trigger_kind,
+                    trigger_id,
+                    None if input is None else json.dumps(input),
+                ),
+            )
+        return self._get_run_or_raise(rid)
+
+    def start_run(self, run_id: str, *, now: datetime | None = None) -> Run:
+        """`pending` → `running`, unless its box is already doing another run.
+
+        The check and the move share one guarded transaction, because two
+        deliverers reading "nothing running" and both starting is the race the
+        guard exists for (`test_store_postgres.py`).
+        """
+        with self._conn.transaction(guard="tasks"):
+            current = self._get_run_or_raise(run_id)
+            _check_transition("task", run_id, current.status, "running")
+            busy = self._conn.execute(
+                "SELECT id FROM tasks WHERE box_id = ? AND status = 'running' AND id <> ?",
+                (current.box_id, run_id),
+            ).fetchone()
+            if busy is not None:
+                raise BoxBusyError(current.box_id, busy["id"])
+            self._conn.execute(
+                "UPDATE tasks SET status = 'running', started_at = ? WHERE id = ?",
+                (_instant(now) if now else _utcnow(), run_id),
+            )
+        return self._get_run_or_raise(run_id)
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        output: str | None = None,
+        steps: list[dict[str, Any]] | None = None,
+        approval_count: int | None = None,
+        error_class: str | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """End a run with `status`, one of the terminal ones, and what it did.
+
+        Steps are capped (`flotta.runs.cap_steps`) and the output clipped, so a
+        loop that runs a thousand tools makes a row someone can still read.
+        """
+        if status not in TASK_TERMINAL:
+            raise ValueError(f"a run's ending is one of {sorted(TASK_TERMINAL)}, got {status!r}")
+        with self._conn.transaction(guard="tasks"):
+            current = self._get_run_or_raise(run_id)
+            _check_transition("task", run_id, current.status, status)
+            self._conn.execute(
+                "UPDATE tasks SET status = ?, finished_at = ?, "
+                "output_json = COALESCE(?, output_json), steps_json = COALESCE(?, steps_json), "
+                "approval_count = COALESCE(?, approval_count), "
+                "error_class = COALESCE(?, error_class) WHERE id = ?",
+                (
+                    status,
+                    _instant(now) if now else _utcnow(),
+                    None if output is None else json.dumps(clip_text(output, MAX_OUTPUT)),
+                    None if steps is None else json.dumps(cap_steps(steps)),
+                    approval_count,
+                    error_class,
+                    run_id,
+                ),
+            )
+        return self._get_run_or_raise(run_id)
+
+    def get_run(self, run_id: str) -> Run | None:
+        row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (run_id,)).fetchone()
+        return _run_from_row(row) if row else None
+
+    def live_run(self, box_id: str) -> Run | None:
+        """The run `box_id` is doing now, if any. There is at most one."""
+        row = self._conn.execute(
+            "SELECT * FROM tasks WHERE box_id = ? AND status = 'running'", (box_id,)
+        ).fetchone()
+        return _run_from_row(row) if row else None
+
+    def list_runs(
+        self,
+        *,
+        org: str,
+        client: str | None = None,
+        box: str | None = None,
+        since: datetime | None = None,
+        limit: int = 50,
+    ) -> list[Run]:
+        """`org`'s runs, newest first. `org` is always required, as in `spend`:
+        a client's id is only unique within its org, and a box filter must not
+        reach past it."""
+        where = ["org_id = ?"]
+        params: list[Any] = [org]
+        if client is not None:
+            where.append("client_id = ?")
+            params.append(client)
+        if box is not None:
+            where.append("box_id = ?")
+            params.append(box)
+        if since is not None:
+            where.append("created_at >= ?")
+            params.append(_instant(since))
+        params.append(max(0, limit))
+        rows = self._conn.execute(
+            f"SELECT * FROM tasks WHERE {' AND '.join(where)} "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [_run_from_row(r) for r in rows]
+
+    def run_cost(self, run_id: str) -> RunCost:
+        """What `run_id`'s model calls cost, summed from `usage`.
+
+        Only the run's own box's rows: `record_usage` already refuses a run id
+        from another box, and this holds even for a row written before it did.
+        """
+        run = self._get_run_or_raise(run_id)
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls, "
+            "COALESCE(SUM(tokens_in), 0) AS tokens_in, "
+            "COALESCE(SUM(tokens_out), 0) AS tokens_out "
+            "FROM usage WHERE run_id = ? AND box_id = ? AND kind = 'model'",
+            (run.id, run.box_id),
+        ).fetchone()
+        return RunCost(
+            eur_nano=int(row["eur_nano"]),
+            unpriced=int(row["unpriced"]),
+            calls=int(row["calls"]),
+            tokens_in=int(row["tokens_in"]),
+            tokens_out=int(row["tokens_out"]),
+        )
+
+    def _run_for_call(self, box_id: str, named: str | None, started: datetime) -> str | None:
+        """Which run a model call from `box_id` that began at `started` was part of.
+
+        A run the box named (`X-Flotta-Run`) counts only if it is the box's own:
+        the box's agent has root and can send any header. Otherwise it is the
+        run the box was doing when the call began, which may have finished by
+        the time the call's row is written. A conversation's call while a run
+        is going counts against the run: one live run per box keeps this to one
+        answer, and a box that talks and runs at once is rare enough to say so
+        here rather than to split.
+        """
+        if named is not None:
+            own = self._conn.execute(
+                "SELECT id FROM tasks WHERE id = ? AND box_id = ?", (named, box_id)
+            ).fetchone()
+            if own is not None:
+                return named
+        moment = _instant(started)
+        row = self._conn.execute(
+            "SELECT id FROM tasks WHERE box_id = ? AND started_at IS NOT NULL "
+            "AND started_at <= ? AND (finished_at IS NULL OR finished_at >= ?) "
+            "ORDER BY started_at DESC LIMIT 1",
+            (box_id, moment, moment),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def _get_run_or_raise(self, run_id: str) -> Run:
+        run = self.get_run(run_id)
+        if run is None:
+            raise UnknownEntityError(f"no run with id {run_id!r}")
+        return run
 
     # -- events ------------------------------------------------------------
 
@@ -3980,6 +4240,27 @@ def _task_from_row(row: db.Row) -> Task:
         finished_at=row["finished_at"],
         result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
         cost_estimate=row["cost_estimate"],
+    )
+
+
+def _run_from_row(row: db.Row) -> Run:
+    return Run(
+        id=row["id"],
+        box_id=row["box_id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        trigger_kind=row["trigger_kind"],
+        trigger_id=row["trigger_id"],
+        prompt=row["prompt"],
+        input=json.loads(row["input_json"]) if row["input_json"] is not None else None,
+        status=row["status"],
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        output=json.loads(row["output_json"]) if row["output_json"] is not None else None,
+        steps=json.loads(row["steps_json"]) if row["steps_json"] is not None else None,
+        approval_count=int(row["approval_count"]),
+        error_class=row["error_class"],
     )
 
 
