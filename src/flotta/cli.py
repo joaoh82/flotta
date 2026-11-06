@@ -1321,6 +1321,7 @@ def serve(
     import uvicorn
 
     from flotta.control import create_app
+    from flotta.server_logs import log_config
 
     target = store_target(None)
     typer.secho(
@@ -1337,6 +1338,7 @@ def serve(
         port=port,
         log_level="info",
         proxy_headers=False,
+        log_config=log_config(),
     )
 
 
@@ -1443,9 +1445,10 @@ def door(
     import uvicorn
 
     from flotta.door import create_door
+    from flotta.server_logs import log_config
 
     typer.secho(f"front door on {host}:{port}", fg=typer.colors.BRIGHT_BLACK, err=True)
-    uvicorn.run(create_door(), host=host, port=port)
+    uvicorn.run(create_door(), host=host, port=port, log_config=log_config())
 
 
 @app.command()
@@ -1515,9 +1518,10 @@ def gateway(
         import uvicorn
     except ImportError as exc:
         raise refuse("the gateway needs its extra: `uv sync --extra control`") from exc
+    from flotta.server_logs import log_config
 
     typer.secho(f"model gateway on {host}:{port}", fg=typer.colors.BRIGHT_BLACK, err=True)
-    uvicorn.run(app_, host=host, port=port)
+    uvicorn.run(app_, host=host, port=port, log_config=log_config())
 
 
 # -- repository grants ------------------------------------------------------

@@ -45,13 +45,14 @@ deliberate:
   to route around it with a socat forwarder, and the workaround was the wrong
   answer — it would have removed a layer rather than passed one.
 
-## WebSocket auth goes in the query string, and only there
+## WebSocket auth: a header, or the query string for the desktop app
 
-A browser cannot set headers on a WebSocket handshake. So the door accepts
-`?access_token=` for WS upgrades — the standard workaround, and one with a real
-cost: query strings land in logs and proxy access records in a way headers do
-not. It is accepted **only** for the WS path, never for plain HTTP, where an
-`Authorization` header is always available and there is no excuse.
+A WS upgrade takes `Authorization` like any request, which is what `flotta chat`
+and a colleague's question send. The desktop app couldn't set headers, so the
+door also accepts `?access_token=` for WS upgrades, never for plain HTTP. That
+has a real cost: query strings land in logs and proxy access records in a way
+headers do not, so the door's own log hides every query value
+(`flotta.server_logs`, FLOTTA-118). The path can go with the app (FLOTTA-80).
 
 ## A browser comes with a ticket (M12.5)
 
