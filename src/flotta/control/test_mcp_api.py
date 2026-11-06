@@ -480,6 +480,26 @@ def test_an_agents_grants_say_whose_account_its_calls_use(api, fleet, machine): 
     assert zeta["accounts"] == {"notes": {"account": "org", "status": "ok"}}
 
 
+def test_an_account_the_gateway_wont_use_is_reported_as_broken_never_swapped(api, fleet, machine):  # noqa: F811
+    """A connection of another kind than the catalogue's auth is refused by the
+    gateway; the report says so, and a client's stays the client's."""
+    ana = _as(fleet, "ana@example.com")
+    api.put("/api/boxes/b-support/mcp", json={"servers": [{"server": "notes"}]}, headers=ana)
+    api.put("/api/orgs/agency-x/mcp/notes", json={"key": "agency"}, headers=ana)
+    with FleetStore(fleet) as store:
+        # As if the catalogue had moved Notes to signing in since Acme's key was given.
+        store.set_mcp_connection(
+            "agency-x", "notes", kind="oauth", credential="x", by="u", client="acme"
+        )
+    read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
+    assert read["accounts"] == {"notes": {"account": "client", "status": "broken"}}
+    with FleetStore(fleet) as store:
+        store.delete_mcp_connection("agency-x", "notes", client="acme")
+        store.set_mcp_connection("agency-x", "notes", kind="oauth", credential="x", by="u")
+    read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
+    assert read["accounts"] == {"notes": {"account": "org", "status": "broken"}}
+
+
 # -- granting ---------------------------------------------------------------------------
 
 

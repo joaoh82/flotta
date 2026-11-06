@@ -3647,7 +3647,11 @@ def create_app(
 
     @app.post("/api/mcp/oauth/claim")
     def claim_mcp_oauth(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
-        """Trade a sign-in's code and make it the org's connection: `{"state", "code"}`.
+        """Trade a sign-in's code and keep it as the connection it was started for.
+
+        `{"state", "code"}`. The flow says whose: the org's own, or one client's
+        (`client` in the answer), as `connect_mcp_oauth` or
+        `connect_client_mcp_oauth` started it.
 
         **Only the person who started it, and only then is the code spent**, as
         `claim_github` asks GitHub who someone is only after the same check. The
@@ -3779,8 +3783,12 @@ def create_app(
         """The MCP servers an agent may call, which tools, and whether calls ask first.
 
         `accounts` says, per granted server, whose connection its calls go out
-        on: its client's own, else the agency's (`gateway.mcp`), with that
-        connection's status, or `null` when neither is connected.
+        on: its client's own, else the agency's, chosen as the gateway chooses
+        (`gateway.mcp.Proxy.resolve`), with `status` `ok` only when the gateway
+        would use it. A connection of another kind than the catalogue now says
+        (or for a server no longer offered) is `broken`, and a client's that
+        can't be used is still the client's: the gateway doesn't fall back.
+        `null` when neither is connected.
         """
         from flotta.provision import mcp_grants_of
 
@@ -3793,11 +3801,15 @@ def create_app(
                 name = granted["server"]
                 own = store.mcp_connection(box.org, name, client=box.client)
                 found = own or store.mcp_connection(box.org, name)
-                accounts[name] = (
-                    {"account": "client" if own else "org", "status": found.status}
-                    if found is not None
-                    else None
-                )
+                if found is None:
+                    accounts[name] = None
+                    continue
+                offered = mcp_servers.get(name)
+                usable = offered is not None and found.kind == offered.auth
+                accounts[name] = {
+                    "account": "client" if own else "org",
+                    "status": found.status if usable else "broken",
+                }
         finally:
             store.close()
         return {**read, "accounts": accounts, "changed_at": _epoch(read["changed_at"])}
