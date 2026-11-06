@@ -380,6 +380,38 @@ def test_a_local_agents_instructions_are_written_where_it_reads_them(backend, tm
         assert not soul.exists()
 
 
+def test_a_local_agents_rules_are_written_to_its_config(backend, tmp_path):
+    """FLOTTA-124: `set_rules` reaches a stand-in through the real verb, so the
+    agent page's rules can be tried for $0. It runs Flotta's writer and no
+    other script."""
+    import base64
+
+    import yaml
+
+    from flotta.backends.standin import soul_path
+    from flotta.provision import BOX_PYTHON, HERMES_HOME, set_rules
+    from flotta.rules import parse_rules
+    from flotta.store import FleetStore
+
+    handle = backend.create(BoxSpec(name="eng-a"))
+    with FleetStore(tmp_path / "fleet.db") as store:
+        box = store.create_box("eng-a")
+        store.update_box_status(box.id, "stopped", endpoint=handle.endpoint)
+        rules = parse_rules({"never": ["Push to main"], "denied_commands": ["rm -rf *"]})
+        set_rules(box.id, rules, store=store, backend=backend)
+    config = yaml.safe_load((soul_path(backend.home / "eng-a").parent / "config.yaml").read_text())
+    assert config["approvals"]["deny"] == ["rm -rf *"]
+    assert "Push to main" in config["agent"]["system_prompt"]
+
+    other = base64.b64encode(b"import os; os.system('id')").decode()
+    payload = base64.b64encode(b"[]").decode()
+    with pytest.raises(NotSupported):
+        backend.exec(
+            handle.endpoint,
+            f"printf %s {other} | base64 -d | {BOX_PYTHON} - {HERMES_HOME} {payload}",
+        )
+
+
 def test_a_change_of_model_reaches_a_local_agent(backend):
     """The model's name is kept for a stand-in, and the provider key is not."""
     handle = backend.create(

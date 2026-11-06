@@ -586,6 +586,19 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        17,
+        "box rules: what an agent must always do, never do, and be careful with",
+        (
+            """
+            CREATE TABLE box_rules (
+                box_id      TEXT PRIMARY KEY REFERENCES boxes(id),
+                rules       TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 

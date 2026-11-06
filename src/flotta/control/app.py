@@ -2977,6 +2977,52 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/boxes/{box_id}/rules")
+    def get_rules(box_id: str, token: Token | None = needs_write) -> Any:
+        """What an agent must always do, never do, and be careful with (FLOTTA-124).
+
+        The agency's own people only, like the instructions they sit beside. A
+        client's people are bound by them and are not shown them here, though
+        asking the agent may well read the guidance back: it is in its prompt.
+        """
+        from flotta.provision import rules_of
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            read = rules_of(box.id, store=store)
+            return {**read, "changed_at": _epoch(read["changed_at"])}
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/rules")
+    def put_rules(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """Replace an agent's rules, on the machine first (`provision.set_rules`).
+
+        A full replace: a list left out is emptied. The enforced half reaches the
+        agent's next command, the guidance its next conversation.
+        """
+        from flotta.provision import ProvisionError, set_rules
+        from flotta.rules import RulesError, parse_rules, rules_from_json
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                stored = store.box_rules(box.id)
+                current = rules_from_json(stored[0] if stored else None)
+                rules = parse_rules(body, kept_tools=current.disabled_tools)
+            except RulesError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            by = token.subject if token is not None else "operator"
+            try:
+                written = set_rules(box.id, rules, store=store, by=by)
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {**written, "changed_at": _epoch(written["changed_at"])}
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}/events")
     def get_events(box_id: str, token: Token | None = needs_read) -> Any:
         store = store_factory()
