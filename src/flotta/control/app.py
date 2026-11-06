@@ -4488,6 +4488,8 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> None:  # pragma: no cove
     """Run the control plane. Refuses an unauthenticated public bind."""
     import uvicorn
 
+    from flotta.server_logs import log_config
+
     check_bind(host)
     described = (
         db.describe_url(os.environ.get(db.DATABASE_URL_ENV, ""))
@@ -4496,4 +4498,4 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> None:  # pragma: no cove
     )
     _log.info("control plane on %s:%s, fleet state in %s", host, port, described)
     # proxy_headers off: `caller_address` is the one reader of X-Forwarded-For.
-    uvicorn.run(create_app(), host=host, port=port, proxy_headers=False)
+    uvicorn.run(create_app(), host=host, port=port, proxy_headers=False, log_config=log_config())

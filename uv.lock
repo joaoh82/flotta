@@ -441,6 +441,7 @@ dev = [
     { name = "psycopg", extra = ["binary"] },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "uvicorn" },
     { name = "websockets" },
 ]
 
@@ -470,6 +471,7 @@ dev = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.8" },
+    { name = "uvicorn", specifier = ">=0.34" },
     { name = "websockets", specifier = ">=13" },
 ]
 
