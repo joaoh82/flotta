@@ -282,3 +282,22 @@ def test_a_client_secret_is_never_in_the_setting():
     )
     with pytest.raises(McpError, match="unknown oauth fields: client_secret"):
         normalized(raw)
+
+
+def test_a_substrate_with_no_shell_has_nothing_to_reload(granted):
+    """`just local`'s stand-in: not a failed reload, since there is no Hermes to ask."""
+    from flotta.backend import ExecResult, NotSupported
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    class _NoShell:
+        def exec(self, endpoint, command):
+            if MCP_RELOAD_MARK in command:
+                raise NotSupported("a local stand-in has no shell")
+            return ExecResult(0, "config written", "")
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    answer = set_mcp_grants(
+        "b-one", (Grant("notes", None, True),), store=granted, backend=_NoShell()
+    )
+    assert answer["written"] is True and answer["reloaded"] is None
+    assert not _events(granted, "mcp_reload_failed")

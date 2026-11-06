@@ -1841,13 +1841,18 @@ def _reload_mcp(box: Box, store: FleetStore, backend: Backend | None) -> bool | 
     """Ask a running agent's Hermes to drop and rediscover its MCP servers. Best effort.
 
     `None` when nothing was asked: an agent that isn't running reads its config
-    when it boots, so it isn't woken for this. The outcome is an event either
+    when it boots, so it isn't woken for this, and a substrate with no shell has
+    no Hermes to ask. The outcome is an event either
     way, and never fails the grant, which is already in force at the gateway.
     """
     if box.status != "running" or not box.endpoint:
         return None
     try:
         result = _resolve_backend(box, backend).exec(box.endpoint, _mcp_reload_command())
+    except NotSupported:
+        # A substrate with no shell, like `just local`'s stand-in: it has no Hermes
+        # to reload, so nothing was asked, rather than a reload that failed.
+        return None
     except Exception as exc:  # noqa: BLE001 - best effort, recorded
         detail: str | None = str(exc) or type(exc).__name__
     else:
