@@ -81,11 +81,12 @@ dev = [
     # rather than to add the extra to one CI job. A contributor running
     # `uv sync && just check` gets the same coverage CI does.
     #
-    # `uvicorn` stays extra-only: only `serve()` needs it, and that is an
-    # entrypoint with no test.
+    # `uvicorn` too, since FLOTTA-118: `test_server_logs.py` runs a real server
+    # to prove what its log holds, and an extra-only dependency would skip it.
     "cryptography>=42",
     "fastapi>=0.115",
     "httpx>=0.28.1",
+    "uvicorn>=0.34",
     # The door's WS client, in `dev` for the same reason as the two above:
     # extra-only test dependencies are how a test file goes quiet without
     # anyone noticing (see the M4.5 importorskip incident).

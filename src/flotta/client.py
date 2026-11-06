@@ -426,16 +426,14 @@ async def ws_ticket(session, base_url: str, *, token: str | None = None) -> str:
 async def open_agent_socket(session, base_url: str, ticket: str, *, token: str | None = None):
     """Connect to the box's agent socket. Caller owns the returned WS.
 
-    Through the door the Flotta token travels as `?access_token=`, not a
-    header — a browser cannot set headers on a WebSocket handshake, so the door
-    accepts it there and strips it before proxying. This client *could* use a
-    header, but sending it the same way the app must keeps one path tested
-    rather than two.
+    Through the door the Flotta token goes in `Authorization`, as on every
+    other request. It used to travel as `?access_token=`, the way the desktop
+    app had to send it, and the door's log kept every one (FLOTTA-118). A
+    browser doesn't need that path either: it comes with a ticket in
+    `Sec-WebSocket-Protocol`.
     """
-    url = f"{base_url}/api/ws?ticket={ticket}"
-    if token:
-        url += f"&access_token={token}"
-    return await session.ws_connect(url)
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    return await session.ws_connect(f"{base_url}/api/ws?ticket={ticket}", headers=headers)
 
 
 # --- talking to the agent --------------------------------------------------
