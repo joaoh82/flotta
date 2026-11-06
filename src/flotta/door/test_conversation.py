@@ -357,11 +357,21 @@ def test_a_relays_token_still_does(fleet):
 
 
 @pytest.mark.parametrize("person", ["owner", "ana"])
-def test_only_the_door_reads_the_list(fleet, person):
+def test_only_the_door_adds_to_the_list(fleet, person):
     headers = _bearer(fleet["tokens"][person])
     path = f"/api/boxes/{fleet['box']}/client-conversations"
-    assert fleet["api"].get(path, headers=headers).status_code == 403
     assert fleet["api"].post(path, json={"session_id": "x"}, headers=headers).status_code == 403
+
+
+def test_the_agency_reads_the_list_and_a_client_doesnt(fleet):
+    """FLOTTA-129: the agency opens a client's conversation from it."""
+    with FleetStore(fleet["path"]) as store:
+        store.add_client_conversation(fleet["box"], "theirs")
+    path = f"/api/boxes/{fleet['box']}/client-conversations"
+    owner = fleet["api"].get(path, headers=_bearer(fleet["tokens"]["owner"]))
+    assert owner.status_code == 200
+    assert [c["id"] for c in owner.json()["conversations"]] == ["theirs"]
+    assert fleet["api"].get(path, headers=_bearer(fleet["tokens"]["ana"])).status_code == 403
 
 
 def test_the_list_keeps_one_row_per_session_newest_first(fleet):

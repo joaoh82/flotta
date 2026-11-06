@@ -767,6 +767,7 @@ def create_app(
     # The door's `fleet:route`, or a person's `box:chat` — see `_routable_box`.
     needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
     needs_fleet_route = Depends(require(SCOPE_FLEET_ROUTE))
+    needs_route_or_write = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_FLEET_WRITE, any_of=True))
     # Called, not a dependency: only a request naming its caller needs it.
     check_relay = require(SCOPE_AUTH_RELAY)
 
@@ -4257,12 +4258,13 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/client-conversations")
-    def client_conversations(box_id: str, token: Token | None = needs_fleet_route) -> Any:
+    def client_conversations(box_id: str, token: Token | None = needs_route_or_write) -> Any:
         """Which of this agent's sessions are its client's (FLOTTA-126).
 
-        For the front door alone, which decides with this what a ticket may open.
-        A person who could read it would learn the ids of sessions they may not
-        open, and has no need to: the door answers them.
+        The front door decides with this what a ticket may open. The agency's own
+        people read it too, to open a client's conversation (FLOTTA-129): they
+        hold the whole agent already. A client's people don't: they would learn
+        the ids of sessions they may not open, and the door answers them.
         """
         store = store_factory()
         try:
