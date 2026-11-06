@@ -1,6 +1,7 @@
-"""Sending a sign-in link (M12.3).
+"""Sending a sign-in link (M12.3), and telling an agency its sign-up was decided.
 
-The control plane emails one thing: a link that signs a person in. It goes
+The control plane emails a link that signs a person in, and, since
+FLOTTA-143, the answer to an agency's sign-up, which carries no secret. It goes
 through Resend when `$FLOTTA_RESEND_API_KEY` is set. Without one, the link can
 be printed to the control plane's log instead, which is how sign-in works on a
 laptop for $0, and **only** there: a deployed control plane that printed links
@@ -25,6 +26,8 @@ _log = logging.getLogger(__name__)
 
 RESEND_API_KEY_ENV = "FLOTTA_RESEND_API_KEY"
 MAIL_FROM_ENV = "FLOTTA_MAIL_FROM"
+#: Where a reply to an approval or decline goes; unset, the email asks for none.
+MAIL_REPLY_TO_ENV = "FLOTTA_MAIL_REPLY_TO"
 APP_URL_ENV = "FLOTTA_APP_URL"
 PRINT_LINKS_ENV = "FLOTTA_PRINT_SIGN_IN_LINKS"
 
@@ -47,6 +50,8 @@ class Message:
     link: str
     #: What a mailer that prints calls it.
     kind: str = "sign-in link"
+    #: Where a reply goes, when not to the sender (a sign-in address nobody reads).
+    reply_to: str | None = None
 
 
 #: Delivers one message, or raises. Injected into the control plane so the
@@ -136,6 +141,76 @@ def invite_message(to: str, url: str, org_name: str, role: str) -> Message:
     )
 
 
+#: The longest reason the operator may give when declining an agency.
+DECLINE_REASON_MAX = 500
+
+
+def approved_message(
+    to: str, app_url: str, org_name: str, *, reply_to: str | None = None
+) -> Message:
+    """Telling an owner their agency was approved (FLOTTA-143).
+
+    Until now an approved agency found out only by its banner changing, on a
+    page it might not open for days. The link is the web app's home, which
+    carries no secret: the owner signs in as they always do.
+    """
+    home = app_url.rstrip("/") + "/"
+    return Message(
+        to=to,
+        subject=f"{org_name} is approved on Flotta",
+        text=(
+            f"You're in: {org_name} can now create agents for its clients.\n\n{home}\n\n"
+            "Creating one takes about a minute: pick a client, give it a name, "
+            "and start talking to it."
+        ),
+        html=(
+            f"<p>You're in: <strong>{html.escape(org_name)}</strong> can now create agents "
+            "for its clients.</p>"
+            f'<p><a href="{home}">Create your first agent</a></p>'
+            "<p>It takes about a minute: pick a client, give it a name, and start "
+            "talking to it.</p>"
+        ),
+        link=home,
+        kind="approval email",
+        reply_to=reply_to,
+    )
+
+
+def declined_message(
+    to: str, app_url: str, org_name: str, reason: str | None, *, reply_to: str | None = None
+) -> Message:
+    """Telling an owner their agency was declined, and why if the operator said.
+
+    The reason is the operator's own words, escaped in the HTML like the org's
+    name, and cut to `DECLINE_REASON_MAX` by the route before it gets here. It
+    invites a reply only when `reply_to` says where one goes: the sender is a
+    sign-in address, and an appeal sent there would be lost.
+    """
+    home = app_url.rstrip("/") + "/"
+    why_text = f"\n\nWhy: {reason}" if reason else ""
+    why_html = f"<p>Why: {html.escape(reason)}</p>" if reason else ""
+    after = (
+        "You can still sign in, and reply to this email if you think we got it wrong."
+        if reply_to
+        else "You can still sign in."
+    )
+    return Message(
+        to=to,
+        subject=f"About {org_name} on Flotta",
+        text=(
+            f"We can't take {org_name} on Flotta at the moment, so it won't be able "
+            f"to create agents.{why_text}\n\n{after}"
+        ),
+        html=(
+            f"<p>We can't take <strong>{html.escape(org_name)}</strong> on Flotta at the "
+            f"moment, so it won't be able to create agents.</p>{why_html}<p>{after}</p>"
+        ),
+        link=home,
+        kind="decline email",
+        reply_to=reply_to,
+    )
+
+
 def print_mailer(message: Message) -> None:
     """Local development: the message goes to the log, link and all."""
     _log.warning(
@@ -158,16 +233,19 @@ def resend_mailer(
     caller = post or _httpx_post
 
     def send(message: Message) -> None:
+        payload: dict[str, Any] = {
+            "from": sender,
+            "to": [message.to],
+            "subject": message.subject,
+            "text": message.text,
+            "html": message.html,
+        }
+        if message.reply_to:
+            payload["reply_to"] = message.reply_to
         status = caller(
             RESEND_URL,
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "from": sender,
-                "to": [message.to],
-                "subject": message.subject,
-                "text": message.text,
-                "html": message.html,
-            },
+            json=payload,
             timeout_s=timeout_s,
         )
         if not 200 <= status < 300:
@@ -190,6 +268,12 @@ def resolve_mailer(*, keyless: bool, env: dict[str, str] | None = None) -> Maile
     if keyless or (env.get(PRINT_LINKS_ENV) or "").strip() == "1":
         return print_mailer
     return None
+
+
+def resolve_reply_to(env: dict[str, str] | None = None) -> str | None:
+    """`$FLOTTA_MAIL_REPLY_TO`, or `None`: replies then have nowhere to go."""
+    env = os.environ if env is None else env
+    return (env.get(MAIL_REPLY_TO_ENV) or "").strip() or None
 
 
 def resolve_app_url(env: dict[str, str] | None = None) -> str:

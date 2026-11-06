@@ -599,6 +599,13 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        18,
+        "decline reason: what the operator told a declined org",
+        # FLOTTA-143. Kept on the org, so a message that never arrived is not
+        # the only copy of the operator's words.
+        ("ALTER TABLE orgs ADD COLUMN decline_reason TEXT",),
+    ),
 )
 
 
