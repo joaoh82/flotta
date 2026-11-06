@@ -204,7 +204,9 @@ def test_the_known_scopes_are_exactly_these():
     people without the operator holding its hand — and for M12.3's
     `auth:relay`, because the web app is one caller for every browser — and for
     M13.2's `model:call`, so a box's token can spend on models only if it was
-    given that, and a token that leaks from anywhere else cannot.
+    given that, and a token that leaks from anywhere else cannot — and for
+    FLOTTA-125's `mcp:call`, because that token is written into the agent's
+    `config.yaml`, and one that leaks from there should spend nothing on models.
     """
     assert {
         "fleet:read",
@@ -217,6 +219,7 @@ def test_the_known_scopes_are_exactly_these():
         "org:admin",
         "auth:relay",
         "model:call",
+        "mcp:call",
     } == SCOPES
 
 

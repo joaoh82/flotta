@@ -915,6 +915,60 @@ class Build:
     finished_at: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class McpConnection:
+    """An org's credential for one MCP server, still sealed (FLOTTA-125)."""
+
+    org_id: str
+    server: str
+    #: `bearer`, `api_key` or `oauth`: the catalogue's auth when it was connected.
+    kind: str
+    credential: str
+    #: `ok`, or `broken` once the provider refused a refresh.
+    status: str
+    detail: str | None
+    connected_by: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class McpFlow:
+    """An OAuth sign-in between its start and its claim (`flotta.mcp_oauth`)."""
+
+    id: str
+    org_id: str
+    server: str
+    subject: str
+    sealed: str
+    return_to: str | None
+    tokens: str | None
+    created_at: str
+    called_back_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class McpGrant:
+    box_id: str
+    server: str
+    #: JSON list of tool names, or `None` for every tool the catalogue allows.
+    tools: str | None
+    ask_first: bool
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class McpCall:
+    id: str
+    box_id: str
+    org_id: str
+    client_id: str
+    server: str
+    tool: str
+    status: str
+    at: str
+
+
 def _utcnow() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -2345,6 +2399,176 @@ class FleetStore:
             "SELECT rules, updated_at FROM box_rules WHERE box_id = ?", (box_id,)
         ).fetchone()
         return (str(row["rules"]), str(row["updated_at"])) if row else None
+
+    # -- MCP servers (FLOTTA-125) ------------------------------------------------
+
+    def set_mcp_connection(
+        self, org_id: str, server: str, *, kind: str, credential: str, by: str | None
+    ) -> McpConnection:
+        """Connect, or connect again: a new credential, and `ok` whatever it was before."""
+        now = _utcnow()
+        self._conn.execute(
+            "INSERT INTO mcp_connections (org_id, server, kind, credential, status, detail, "
+            "connected_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'ok', NULL, ?, ?, ?) "
+            "ON CONFLICT (org_id, server) DO UPDATE SET kind = EXCLUDED.kind, "
+            "credential = EXCLUDED.credential, status = 'ok', detail = NULL, "
+            "connected_by = EXCLUDED.connected_by, updated_at = EXCLUDED.updated_at",
+            (org_id, server, kind, credential, by, now, now),
+        )
+        found = self.mcp_connection(org_id, server)
+        assert found is not None
+        return found
+
+    def mcp_connection(self, org_id: str, server: str) -> McpConnection | None:
+        row = self._conn.execute(
+            "SELECT * FROM mcp_connections WHERE org_id = ? AND server = ?", (org_id, server)
+        ).fetchone()
+        return McpConnection(**dict(row)) if row else None
+
+    def mcp_connections(self, org_id: str) -> list[McpConnection]:
+        rows = self._conn.execute(
+            "SELECT * FROM mcp_connections WHERE org_id = ? ORDER BY server", (org_id,)
+        )
+        return [McpConnection(**dict(r)) for r in rows]
+
+    def refresh_mcp_connection(
+        self, org_id: str, server: str, *, credential: str, was: str
+    ) -> bool:
+        """Swap in a refreshed credential, if nobody else changed it since `was`.
+
+        A compare-and-set on `updated_at`, so a refresh racing a reconnect (or
+        another gateway's refresh) doesn't put an older token back.
+        """
+        cursor = self._conn.execute(
+            "UPDATE mcp_connections SET credential = ?, updated_at = ? "
+            "WHERE org_id = ? AND server = ? AND updated_at = ? AND status = 'ok' "
+            "RETURNING server",
+            (credential, _utcnow(), org_id, server, was),
+        )
+        return cursor.fetchone() is not None
+
+    def break_mcp_connection(self, org_id: str, server: str, detail: str) -> None:
+        self._conn.execute(
+            "UPDATE mcp_connections SET status = 'broken', detail = ?, updated_at = ? "
+            "WHERE org_id = ? AND server = ?",
+            (detail[:500], _utcnow(), org_id, server),
+        )
+
+    def delete_mcp_connection(self, org_id: str, server: str) -> McpConnection | None:
+        """Forget a connection, and say what it was, for revoking it."""
+        found = self.mcp_connection(org_id, server)
+        if found is not None:
+            self._conn.execute(
+                "DELETE FROM mcp_connections WHERE org_id = ? AND server = ?", (org_id, server)
+            )
+        return found
+
+    def create_mcp_flow(
+        self,
+        flow_id: str,
+        *,
+        org_id: str,
+        server: str,
+        subject: str,
+        sealed: str,
+        return_to: str | None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO mcp_oauth_flows (id, org_id, server, subject, sealed, return_to, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (flow_id, org_id, server, subject, sealed, return_to, _utcnow()),
+        )
+
+    def mcp_flow(self, flow_id: str) -> McpFlow | None:
+        row = self._conn.execute(
+            "SELECT * FROM mcp_oauth_flows WHERE id = ?", (flow_id,)
+        ).fetchone()
+        return McpFlow(**dict(row)) if row else None
+
+    def called_back_mcp_flow(self, flow_id: str, tokens: str) -> bool:
+        """Keep a flow's tokens, once: a code is good for one exchange, and so is this."""
+        cursor = self._conn.execute(
+            "UPDATE mcp_oauth_flows SET tokens = ?, called_back_at = ? "
+            "WHERE id = ? AND called_back_at IS NULL RETURNING id",
+            (tokens, _utcnow(), flow_id),
+        )
+        return cursor.fetchone() is not None
+
+    def delete_mcp_flow(self, flow_id: str) -> bool:
+        cursor = self._conn.execute(
+            "DELETE FROM mcp_oauth_flows WHERE id = ? RETURNING id", (flow_id,)
+        )
+        return cursor.fetchone() is not None
+
+    def delete_mcp_flows_before(self, moment: datetime) -> int:
+        cursor = self._conn.execute(
+            "DELETE FROM mcp_oauth_flows WHERE created_at < ? RETURNING id", (_instant(moment),)
+        )
+        return len(cursor.fetchall())
+
+    def set_box_mcp_grants(
+        self, box_id: str, grants: Sequence[tuple[str, str | None, bool]]
+    ) -> None:
+        """Replace an agent's grants with `(server, tools JSON or None, ask_first)`."""
+        self._get_box_or_raise(box_id)
+        now = _utcnow()
+        with self._conn.transaction(guard="box_mcp_grants"):
+            self._conn.execute("DELETE FROM box_mcp_grants WHERE box_id = ?", (box_id,))
+            for server, tools, ask_first in grants:
+                self._conn.execute(
+                    "INSERT INTO box_mcp_grants (box_id, server, tools, ask_first, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (box_id, server, tools, 1 if ask_first else 0, now),
+                )
+
+    def box_mcp_grants(self, box_id: str) -> list[McpGrant]:
+        rows = self._conn.execute(
+            "SELECT * FROM box_mcp_grants WHERE box_id = ? ORDER BY server", (box_id,)
+        )
+        return [McpGrant(**{**dict(r), "ask_first": bool(r["ask_first"])}) for r in rows]
+
+    def box_mcp_grant(self, box_id: str, server: str) -> McpGrant | None:
+        """The question the gateway asks on every request."""
+        row = self._conn.execute(
+            "SELECT * FROM box_mcp_grants WHERE box_id = ? AND server = ?", (box_id, server)
+        ).fetchone()
+        return McpGrant(**{**dict(row), "ask_first": bool(row["ask_first"])}) if row else None
+
+    def record_mcp_call(self, box_id: str, *, server: str, tool: str, status: str) -> McpCall:
+        """One tool call, by name. Tenancy read off the box's row, as `record_usage` does."""
+        box = self._get_box_or_raise(box_id)
+        call = McpCall(
+            id=f"mc-{uuid.uuid4().hex[:16]}",
+            box_id=box.id,
+            org_id=box.org,
+            client_id=box.client,
+            server=server,
+            tool=tool[:200],
+            status=status,
+            at=_utcnow(),
+        )
+        self._conn.execute(
+            "INSERT INTO mcp_calls (id, box_id, org_id, client_id, server, tool, status, at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                call.id,
+                call.box_id,
+                call.org_id,
+                call.client_id,
+                call.server,
+                call.tool,
+                call.status,
+                call.at,
+            ),
+        )
+        return call
+
+    def mcp_calls(self, box_id: str, *, limit: int = 100) -> list[McpCall]:
+        rows = self._conn.execute(
+            "SELECT * FROM mcp_calls WHERE box_id = ? ORDER BY at DESC, id LIMIT ?",
+            (box_id, limit),
+        )
+        return [McpCall(**dict(r)) for r in rows]
 
     def client_conversations(self, box_id: str) -> list[tuple[str, str]]:
         """This box's client conversations as (session id, when), newest first."""

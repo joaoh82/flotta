@@ -84,11 +84,13 @@ OPERATOR_ROUTES = frozenset(
 #: read the fleet: their answer is the same whoever asks, so they need not read
 #: their token. They still take one, so an unauthenticated caller is refused,
 #: and they may not reach a box any more than any other route.
-CONFIG_READS = frozenset({"list_models"})
+CONFIG_READS = frozenset({"list_models", "list_mcp_servers"})
 
 #: Routes with no principal at all, on purpose. They may not reach a box.
 #: The sign-in and sign-up routes are how a person without a credential gets one.
-OPEN_ROUTES = frozenset({"health", "request_link", "redeem_link", "sign_up"})
+#: An MCP server's OAuth callback is a provider's redirect: its signed state is
+#: the proof, and what it leaves is claimed by its starter (`mcp_oauth`).
+OPEN_ROUTES = frozenset({"health", "request_link", "redeem_link", "sign_up", "mcp_oauth_callback"})
 
 #: The routes not yet scoped. May only shrink — and is empty since M11.6b.
 UNSCOPED_ROUTES: frozenset[str] = frozenset()
