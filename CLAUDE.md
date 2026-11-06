@@ -845,8 +845,13 @@ conventions, and the sharp edges below.
   and `flotta.sealed` (AES-GCM under `$FLOTTA_SECRETS_KEY`, bound to its row, failing
   closed; FLOTTA-102 is meant to reuse it). The box's token is its own `mcp:call`, written
   literally into the entry: the agent reading it learns nothing it can't already use.
-  **A sign-in is claimed by whoever started it**, as GitHub's is, or a stranger's link
-  connects someone's account to another org. **Grants are recorded before the machine is
+  **A sign-in's code is traded only in the claim, by whoever started it**: the callback
+  keeps nothing and hands the code to the browser that signed in, so a starter who sends
+  the link to a stranger holds a state and no code. **Only tools pass the gateway**
+  (`gateway.mcp.PASSED`), refused before the credential is read. **OAuth URLs from a
+  server's metadata are held to the webhook rule** (public https, resolved address
+  pinned); only origins the operator wrote may be loopback. **Refresh on 401 only**: a
+  403 is the upstream's refusal and never breaks the connection. **Grants are recorded before the machine is
   written**, the opposite of the rules, because the record is what the gateway enforces.
   **An upstream 401 is never passed to the agent**: its `WWW-Authenticate` would start
   Hermes's own OAuth on the box.

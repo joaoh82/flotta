@@ -41,9 +41,13 @@ class FakeMcp:
         self.codes: dict[str, str] = {}
         self.refresh_tokens: set[str] = set()
         self.revoked: list[str] = []
+        #: Every grant type the token endpoint was asked for, in order.
+        self.token_calls: list[str] = []
         self.refreshes = 0
         self.registered = 0
         self.expires_in = 3600
+        #: Tools this server answers 403 for: not a dead token, a refusal.
+        self.forbidden: set[str] = set()
         #: Seconds a refresh takes, so concurrent ones overlap.
         self.refresh_delay = 0.0
         self._issued = 0
@@ -76,6 +80,7 @@ class FakeMcp:
 
     def _token(self, request: httpx.Request) -> httpx.Response:
         form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+        self.token_calls.append(form["grant_type"])
         if form.get("resource") != MCP_URL:
             return httpx.Response(400, json={"error": "invalid_target"})
         if form["grant_type"] == "authorization_code":
@@ -156,6 +161,9 @@ class FakeMcp:
         if request.method == "DELETE":
             return httpx.Response(200)
         message = json.loads(request.content)
+        params = message.get("params") or {}
+        if message.get("method") == "tools/call" and params.get("name") in self.forbidden:
+            return httpx.Response(403, json={"error": "insufficient_scope"})
         if "id" not in message:
             return httpx.Response(202)
         answer = self._answer(message)
@@ -172,7 +180,9 @@ class FakeMcp:
         return httpx.Response(200, headers=headers, json=answer)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        if request.url.host == urlsplit(AUTH_URL).hostname:
+        # By name, not by the URL: a pinned request dials an address (`mcp_oauth._send`).
+        host = request.headers.get("host", request.url.host).split(":")[0]
+        if host == urlsplit(AUTH_URL).hostname:
             return self._provider(request)
         return self._server(request)
 

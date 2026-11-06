@@ -45,6 +45,12 @@ def test_pkce_is_s256():
     assert challenge == base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
+@pytest.fixture(autouse=True)
+def public_names(monkeypatch):
+    """`.test` names resolve to a public address, as a real provider's would."""
+    monkeypatch.setattr(mcp_oauth, "resolve_host", lambda host, port: ["93.184.216.34"])
+
+
 @pytest.fixture
 def provider():
     return FakeMcp()
@@ -144,3 +150,112 @@ def test_a_token_about_to_expire_needs_refreshing():
     assert mcp_oauth.needs_refresh({"expires_at": now + 30}, now=now)
     assert not mcp_oauth.needs_refresh({"expires_at": now + 3600}, now=now)
     assert not mcp_oauth.needs_refresh({"expires_at": None}, now=now)
+
+
+def _metadata(issuer=None, **endpoints):
+    """A catalogue server whose metadata names `issuer`, and an issuer naming `endpoints`."""
+
+    def answer(request):
+        path = request.url.path
+        if path.startswith("/.well-known/oauth-protected-resource"):
+            return httpx.Response(200, json={"authorization_servers": [issuer]})
+        if path.endswith("oauth-authorization-server"):
+            return httpx.Response(200, json=endpoints)
+        return httpx.Response(404)
+
+    return httpx.MockTransport(answer)
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    ["http://127.0.0.1:4318", "https://127.0.0.1", "https://169.254.169.254", "https://x.local"],
+)
+def test_an_authorization_server_the_metadata_names_must_be_public(issuer):
+    with (
+        httpx.Client(transport=_metadata(issuer)) as http,
+        pytest.raises(mcp_oauth.OAuthError, match="public|https"),
+    ):
+        mcp_oauth.discover(http, SERVER)
+
+
+@pytest.mark.parametrize("address", ["169.254.169.254", "10.0.0.5", "127.0.0.1", "::1"])
+def test_a_name_that_resolves_somewhere_private_is_never_sent_a_code(monkeypatch, address):
+    monkeypatch.setattr(mcp_oauth, "resolve_host", lambda host, port: [address])
+    sent = []
+
+    def answer(request):
+        sent.append(request)
+        return httpx.Response(200, json={"access_token": "a"})
+
+    endpoints = mcp_oauth.Endpoints(
+        authorization="https://auth.example.test/authorize",
+        token="https://auth.example.test/token",
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(answer)) as http,
+        pytest.raises(mcp_oauth.OAuthError, match="isn't public"),
+    ):
+        mcp_oauth.exchange(
+            http,
+            SERVER,
+            endpoints,
+            mcp_oauth.Client("c", "secret"),
+            code="code",
+            verifier="v",
+            redirect_uri=REDIRECT,
+        )
+    assert sent == []
+
+
+def test_one_private_address_among_public_ones_is_enough_to_refuse(monkeypatch):
+    monkeypatch.setattr(mcp_oauth, "resolve_host", lambda h, p: ["93.184.216.34", "10.0.0.5"])
+    with pytest.raises(mcp_oauth.OAuthError, match="isn't public"):
+        mcp_oauth._send(
+            httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+            SERVER,
+            "GET",
+            "https://auth.example.test/x",
+            "metadata",
+        )
+
+
+def test_the_connection_goes_to_the_address_that_was_checked():
+    seen = []
+
+    def answer(request):
+        seen.append(request)
+        return httpx.Response(200)
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        mcp_oauth._send(http, SERVER, "GET", "https://auth.example.test/x", "metadata")
+    assert seen[0].url.host == "93.184.216.34"
+    assert seen[0].headers["host"] == "auth.example.test"
+    assert seen[0].extensions["sni_hostname"] == "auth.example.test"
+
+
+def test_a_local_server_the_operator_wrote_may_be_loopback():
+    """The catalogue's own origin keeps the catalogue's rule, for a laptop."""
+    local = parse_catalogue(
+        '[{"name": "dev", "url": "http://127.0.0.1:9000/mcp", "auth": "oauth"}]'
+    )["dev"]
+    transport = _metadata(
+        "http://127.0.0.1:9000",
+        authorization_endpoint="http://127.0.0.1:9000/authorize",
+        token_endpoint="http://127.0.0.1:9000/token",
+    )
+    with httpx.Client(transport=transport) as http:
+        endpoints = mcp_oauth.discover(http, local)
+    assert endpoints.token == "http://127.0.0.1:9000/token"
+
+
+def test_an_endpoint_the_metadata_names_elsewhere_is_held_to_the_rule():
+    transport = _metadata(
+        AUTH_URL,
+        authorization_endpoint="https://auth.example.test/authorize",
+        token_endpoint="http://127.0.0.1:4318/token",
+    )
+    with (
+        httpx.Client(transport=transport) as http,
+        pytest.raises(mcp_oauth.OAuthError, match="https"),
+    ):
+        mcp_oauth.discover(http, SERVER)

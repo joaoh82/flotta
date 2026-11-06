@@ -19,6 +19,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import flotta.provision as provision
+from flotta import mcp_oauth
 from flotta.auth import verify
 from flotta.backend import ExecResult
 from flotta.box import rules as box_rules
@@ -42,6 +43,12 @@ CATALOGUE = [
         "tools": ["read_note", "write_note"],
     },
 ]
+
+
+@pytest.fixture(autouse=True)
+def public_names(monkeypatch):
+    """`.test` names resolve to a public address, as a real provider's would."""
+    monkeypatch.setattr(mcp_oauth, "resolve_host", lambda host, port: ["93.184.216.34"])
 
 
 @pytest.fixture
@@ -188,6 +195,12 @@ def _callback(api, provider, url):
     )
 
 
+def _carried(back):
+    """What the browser brings back to the web app: the state, and the code."""
+    query = parse_qs(urlsplit(back.headers["location"]).query)
+    return {"state": query["mcp_state"][0], "code": query["mcp_code"][0]}
+
+
 def test_a_whole_sign_in_ends_as_the_orgs_connection(api, fleet, provider):  # noqa: F811
     url = _start(api, fleet, return_to=f"{APP_URL}/agency/mcp")
     query = parse_qs(urlsplit(url).query)
@@ -196,16 +209,16 @@ def test_a_whole_sign_in_ends_as_the_orgs_connection(api, fleet, provider):  # n
 
     back = _callback(api, provider, url)
     assert back.status_code == 303
-    location = back.headers["location"]
-    assert location.startswith(f"{APP_URL}/agency/mcp?")
-    assert "at-1" not in location
-    assert _connection(fleet, "tracker") is None  # nobody's until it is claimed
+    assert back.headers["location"].startswith(f"{APP_URL}/agency/mcp?")
+    # The callback traded nothing: the code is still the browser's.
+    assert provider.token_calls == []
+    assert _connection(fleet, "tracker") is None
 
-    state = parse_qs(urlsplit(location).query)["mcp_state"][0]
     claimed = api.post(
-        "/api/mcp/oauth/claim", json={"state": state}, headers=_as(fleet, "ana@example.com")
+        "/api/mcp/oauth/claim", json=_carried(back), headers=_as(fleet, "ana@example.com")
     )
     assert claimed.status_code == 200, claimed.text
+    assert provider.token_calls == ["authorization_code"]
     assert "at-1" not in claimed.text and "rt-1" not in claimed.text
     stored = _connection(fleet, "tracker")
     assert stored.kind == "oauth"
@@ -220,36 +233,74 @@ def test_a_whole_sign_in_ends_as_the_orgs_connection(api, fleet, provider):  # n
     assert credential["client"]["client_id"] == "dyn-1"
 
 
-def test_a_sign_in_finished_by_someone_else_is_refused(api, fleet, provider):  # noqa: F811
-    """The stranger's-link attack: one owner starts, another person claims."""
+def _stranger(fleet):  # noqa: F811
     with FleetStore(fleet) as store:
         user = store.create_user("bo@example.com")
-        store.add_membership(user.id, "agency-x", "owner")
+        store.add_membership(user.id, "agency-y", "owner")
+    return _as(fleet, "bo@example.com", org="agency-y")
+
+
+def test_a_sign_in_link_sent_to_a_stranger_gives_the_starter_nothing(api, fleet, provider):  # noqa: F811
+    """The attack the claim exists for, in the reviewer's direction.
+
+    Ana starts a sign-in for her org and sends the provider's link to Bo, who
+    signs in with his own account. Ana holds the state; the code went to Bo's
+    browser. She can't claim without it, Bo's claim is refused because he didn't
+    start it, and nothing was traded or kept at any point.
+    """
     url = _start(api, fleet)
-    back = _callback(api, provider, url)
-    state = parse_qs(urlsplit(back.headers["location"]).query)["mcp_state"][0]
-    answer = api.post(
-        "/api/mcp/oauth/claim", json={"state": state}, headers=_as(fleet, "bo@example.com")
+    back = _callback(api, provider, url)  # Bo's browser
+    carried = _carried(back)
+    assert provider.token_calls == []
+    with FleetStore(fleet) as store:
+        assert store.mcp_connection("agency-x", "tracker") is None
+
+    bo = api.post("/api/mcp/oauth/claim", json=carried, headers=_stranger(fleet))
+    assert bo.status_code == 403
+    assert provider.token_calls == []
+
+    ana = _as(fleet, "ana@example.com")
+    without = api.post("/api/mcp/oauth/claim", json={"state": carried["state"]}, headers=ana)
+    assert without.status_code == 422
+    guessed = api.post(
+        "/api/mcp/oauth/claim", json={"state": carried["state"], "code": "code-9"}, headers=ana
     )
-    assert answer.status_code == 403
+    assert guessed.status_code == 502  # a code the provider never issued: refused there
     assert _connection(fleet, "tracker") is None
 
 
-def test_a_callback_comes_back_once(api, fleet, provider):  # noqa: F811
-    url = _start(api, fleet)
-    code, state = provider.sign_in(url)
-    first = api.get(
-        "/api/mcp/oauth/callback", params={"code": code, "state": state}, follow_redirects=False
+def test_a_sign_in_claimed_by_another_owner_of_the_same_org_is_refused(api, fleet, provider):  # noqa: F811
+    with FleetStore(fleet) as store:
+        user = store.create_user("cy@example.com")
+        store.add_membership(user.id, "agency-x", "owner")
+    back = _callback(api, provider, _start(api, fleet))
+    answer = api.post(
+        "/api/mcp/oauth/claim", json=_carried(back), headers=_as(fleet, "cy@example.com")
     )
-    assert first.status_code == 303
-    again = api.get("/api/mcp/oauth/callback", params={"code": code, "state": state})
+    assert answer.status_code == 403
+    assert provider.token_calls == []
+    assert _connection(fleet, "tracker") is None
+
+
+def test_a_sign_in_is_claimed_once(api, fleet, provider):  # noqa: F811
+    carried = _carried(_callback(api, provider, _start(api, fleet)))
+    ana = _as(fleet, "ana@example.com")
+    assert api.post("/api/mcp/oauth/claim", json=carried, headers=ana).status_code == 200
+    again = api.post("/api/mcp/oauth/claim", json=carried, headers=ana)
     assert again.status_code == 422
+    assert provider.token_calls == ["authorization_code"]
 
 
 def test_a_forged_state_reaches_no_provider(api, fleet, provider):  # noqa: F811
     answer = api.get("/api/mcp/oauth/callback", params={"code": "c", "state": "mcp1.mf-x.9.sig"})
     assert answer.status_code == 422
-    assert all(r.url.path != "/token" for r in provider.requests)
+    claim = api.post(
+        "/api/mcp/oauth/claim",
+        json={"state": "mcp1.mf-x.9.sig", "code": "c"},
+        headers=_as(fleet, "ana@example.com"),
+    )
+    assert claim.status_code == 422
+    assert provider.token_calls == []
 
 
 def test_the_browser_goes_back_to_the_web_app_and_nowhere_else(api, fleet):  # noqa: F811
@@ -270,18 +321,14 @@ def test_a_refused_sign_in_goes_back_and_connects_nothing(api, fleet, provider):
         follow_redirects=False,
     )
     assert back.status_code == 303 and "mcp_error=access_denied" in back.headers["location"]
-    claim = api.post(
-        "/api/mcp/oauth/claim", json={"state": state}, headers=_as(fleet, "ana@example.com")
-    )
-    assert claim.status_code == 422
+    assert provider.token_calls == []
+    assert _connection(fleet, "tracker") is None
 
 
 def test_disconnecting_forgets_it_and_asks_the_provider_to_revoke(api, fleet, provider):  # noqa: F811
-    url = _start(api, fleet)
-    back = _callback(api, provider, url)
-    state = parse_qs(urlsplit(back.headers["location"]).query)["mcp_state"][0]
+    carried = _carried(_callback(api, provider, _start(api, fleet)))
     ana = _as(fleet, "ana@example.com")
-    api.post("/api/mcp/oauth/claim", json={"state": state}, headers=ana)
+    api.post("/api/mcp/oauth/claim", json=carried, headers=ana)
     answer = api.delete("/api/orgs/agency-x/mcp/tracker", headers=ana)
     assert answer.json() == {"server": "tracker", "disconnected": True, "revoked": True}
     assert set(provider.revoked) == {"rt-1", "at-1"}

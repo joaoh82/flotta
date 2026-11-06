@@ -494,7 +494,8 @@ def _mcp() -> tuple[str, ...]:
       (`flotta.sealed`), so a copy of the database is no copy of the key. `status`
       is `broken` once a provider refuses a refresh.
     - `mcp_oauth_flows`: a sign-in between its start and its claim, with the
-      PKCE verifier and, after the callback, the tokens, both sealed.
+      PKCE verifier sealed. Never the code or the tokens: those are traded
+      inside the claim, by the person who started it (`flotta.mcp_oauth`).
     - `box_mcp_grants`: which servers an agent may call, which tools (JSON, or
       NULL for every tool the catalogue allows), and whether calls ask first.
     - `mcp_calls`: one row per tool call, refused ones too. The tool's name and
@@ -525,9 +526,7 @@ def _mcp() -> tuple[str, ...]:
             subject       TEXT NOT NULL,
             sealed        TEXT NOT NULL,
             return_to     TEXT,
-            tokens        TEXT,
-            created_at    TEXT NOT NULL,
-            called_back_at TEXT
+            created_at    TEXT NOT NULL
         )
         """,
         """
@@ -554,6 +553,36 @@ def _mcp() -> tuple[str, ...]:
         """,
         "CREATE INDEX idx_mcp_calls_box ON mcp_calls(box_id, at)",
         "CREATE INDEX idx_mcp_calls_org ON mcp_calls(org_id, at)",
+    )
+
+
+def _runs() -> tuple[str, ...]:
+    """A task becomes a run (FLOTTA-146, M14.1; D23, `flotta.runs`).
+
+    Columns on `tasks` rather than a `runs` table: a rename is not additive, and
+    the events CHECK names `'task'`. `org_id` and `client_id` are copied from the
+    box so a tenant's runs list without a join, and filled in here for rows from
+    before. A row with a `trigger_kind` is a run; one without is a task, from
+    before or from `create_task`. No cost or token columns: those are `usage`'s,
+    summed by `run_id`, which gets its index here. `(box_id, started_at)` is
+    for finding the run a model call was part of, which happens on every call.
+    """
+    return (
+        "ALTER TABLE tasks ADD COLUMN org_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN client_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN trigger_kind TEXT",
+        "ALTER TABLE tasks ADD COLUMN trigger_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN input_json TEXT",
+        "ALTER TABLE tasks ADD COLUMN output_json TEXT",
+        "ALTER TABLE tasks ADD COLUMN steps_json TEXT",
+        "ALTER TABLE tasks ADD COLUMN approval_count BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN error_class TEXT",
+        "UPDATE tasks SET "
+        "org_id = (SELECT org_id FROM boxes WHERE boxes.id = tasks.box_id), "
+        "client_id = (SELECT client_id FROM boxes WHERE boxes.id = tasks.box_id)",
+        "CREATE INDEX idx_tasks_tenant ON tasks(org_id, client_id, created_at)",
+        "CREATE INDEX idx_usage_run ON usage(run_id)",
+        "CREATE INDEX idx_tasks_box_started ON tasks(box_id, started_at)",
     )
 
 
@@ -671,6 +700,14 @@ MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(
         18,
+        "decline reason: what the operator told a declined org",
+        # FLOTTA-143. Kept on the org, so a message that never arrived is not
+        # the only copy of the operator's words.
+        ("ALTER TABLE orgs ADD COLUMN decline_reason TEXT",),
+    ),
+    Migration(19, "runs: a task's trigger, input, output and steps", _runs()),
+    Migration(
+        20,
         "mcp: an org's connections, an agent's grants, and every tool call",
         _mcp(),
     ),

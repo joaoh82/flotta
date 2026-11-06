@@ -43,6 +43,14 @@ def _call(tool, request_id=2):
     }
 
 
+@pytest.fixture(autouse=True)
+def public_names(monkeypatch):
+    """`.test` names resolve to a public address, as a real provider's would."""
+    import flotta.mcp_oauth as mcp_oauth
+
+    monkeypatch.setattr(mcp_oauth, "resolve_host", lambda host, port: ["93.184.216.34"])
+
+
 @pytest.fixture
 def path(tmp_path):
     db = str(tmp_path / "fleet.db")
@@ -226,9 +234,10 @@ def test_nothing_the_box_sends_reaches_the_server_as_a_credential(path, server):
     "body",
     [
         json.dumps([_call("read_issue"), _call("delete_everything", 3)]),
+        json.dumps([_call("read_issue"), {"jsonrpc": "2.0", "id": 3, "method": "resources/read"}]),
         '{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "method": "tools/call"}',
     ],
-    ids=["batch", "repeated-key"],
+    ids=["batch", "batch-with-a-resource-read", "repeated-key"],
 )
 def test_a_message_that_could_hide_a_call_is_refused(path, server, body):
     with _client(path, server) as client:
@@ -402,3 +411,63 @@ def test_two_calls_at_once_spend_one_refresh_token(path):
     assert errors == []
     assert server.refreshes == 1
     assert set(found) == {"at-2"}
+
+
+# -- tools, and only tools ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["resources/read", "resources/subscribe", "prompts/get", "completion/complete", "sampling/x"],
+)
+def test_a_method_that_isnt_tools_is_refused_before_the_credential_is_read(
+    path, server, monkeypatch, method
+):
+    """The agent holds the token, so it can send anything; only tools go out."""
+    from flotta.gateway.mcp import Proxy
+
+    read = []
+    monkeypatch.setattr(Proxy, "credential", lambda self, *a, **k: read.append(a) or {})
+    message = {"jsonrpc": "2.0", "id": 5, "method": method, "params": {"uri": "file:///etc"}}
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=message, headers=_auth())
+    assert answer.status_code == 200
+    assert answer.json()["id"] == 5 and answer.json()["error"]["code"] == -32601
+    assert read == [] and server.requests == []
+
+
+def test_a_notification_that_isnt_the_handshake_is_refused(path, server):
+    note = {"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=note, headers=_auth())
+    assert answer.status_code == 400
+    assert server.requests == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+        {"jsonrpc": "2.0", "id": 4, "result": {"action": "accept"}},
+    ],
+    ids=["initialize", "initialized", "ping", "an-answer-to-the-server"],
+)
+def test_the_handshake_and_answers_to_the_server_go_through(path, server, message):
+    with _client(path, server) as client:
+        client.post("/mcp/tracker", json=message, headers=_auth())
+    assert len(server.requests) == 1
+
+
+def test_a_403_is_the_upstreams_refusal_and_never_breaks_the_connection(path):
+    server = FakeMcp(keys=set())
+    _oauth(path, server, expires_at=time.time() + 3600)
+    server.forbidden = {"create_issue"}
+    with _client(path, server, env=OAUTH_ENV) as client:
+        answer = client.post("/mcp/tracker", json=_call("create_issue"), headers=_auth())
+    assert answer.status_code == 403
+    assert "www-authenticate" not in answer.headers
+    assert server.refreshes == 0 and len(server.requests) == 1
+    with FleetStore(path) as fleet:
+        assert fleet.mcp_connection("studio-nord", "tracker").status == "ok"

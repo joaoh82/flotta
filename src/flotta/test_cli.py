@@ -1390,6 +1390,35 @@ def test_deciding_a_sign_up_against_a_local_store(tmp_path, monkeypatch):
     assert approved.exit_code == 0 and "studio-pat is active" in approved.output
     assert declined.exit_code == 0 and "studio-lee is declined" in declined.output
     assert again.exit_code == 1
+    # Only the control plane sends mail, and the store path says so.
+    assert "nobody was emailed" in declined.output
+
+
+def test_declining_with_a_reason_sends_it_and_says_who_was_told(tmp_path, monkeypatch):
+    org = {"id": "studio-pat", "name": "Studio Pat", "created_at": "now", "status": "declined"}
+    calls, result = _invoke(
+        tmp_path,
+        monkeypatch,
+        ["org", "decline", "studio-pat", "--reason", "EU only for now"],
+        remote={"org": org, "told": 2},
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        ("POST", "/api/orgs/studio-pat/decline", ["org:admin"], {"reason": "EU only for now"})
+    ]
+    assert "2 owners told" in result.output
+
+
+def test_a_reason_given_to_a_local_store_is_kept(tmp_path, monkeypatch):
+    db = str(tmp_path / "fleet.db")
+    with FleetStore(db) as store:
+        store.create_org("studio-lee", "Studio Lee", status="pending")
+    _, result = _invoke(
+        tmp_path, monkeypatch, ["org", "decline", "studio-lee", "--reason", "No", "--store", db]
+    )
+    assert result.exit_code == 0, result.output
+    with FleetStore(db) as store:
+        assert store.get_org("studio-lee").decline_reason == "No"
 
 
 def test_org_and_client_against_a_local_store(tmp_path, monkeypatch):

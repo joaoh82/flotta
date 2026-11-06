@@ -41,6 +41,17 @@ def test_resend_is_sent_the_message_and_the_key():
     assert kwargs["json"]["to"] == ["ana@example.com"]
     assert kwargs["json"]["from"] == "Flotta <a@b.c>"
     assert "https://app/sign-in#s" in kwargs["json"]["text"]
+    # A sign-in link has nothing to reply about: no reply_to unless a message asks.
+    assert "reply_to" not in kwargs["json"]
+
+
+def test_a_reply_to_is_sent_when_the_message_has_one():
+    from flotta.mail import approved_message
+
+    calls = []
+    message = approved_message("ana@example.com", "https://app", "Agency X", reply_to="h@f.dev")
+    resend_mailer("re_test", post=lambda url, **kw: calls.append(kw) or 200)(message)
+    assert calls[0]["json"]["reply_to"] == "h@f.dev"
 
 
 def test_resend_refusing_is_an_error_not_a_silent_success():

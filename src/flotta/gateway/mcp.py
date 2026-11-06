@@ -19,6 +19,11 @@ that has read its own config:
   and what became of it. Never the arguments or the result, which are the
   client's data.
 
+**Tools, and only tools.** Methods are an allowlist (`PASSED`): the session's
+handshake, `tools/list` and a granted `tools/call`. Anything else is refused
+before the credential is read, since the agent holds the token and needn't go
+through Hermes to send `resources/read`.
+
 **One JSON-RPC message per request.** MCP's Streamable HTTP dropped batches in
 2025-06-18, and a batch is a second place a `tools/call` could hide, so one is
 refused rather than inspected.
@@ -26,7 +31,9 @@ refused rather than inspected.
 **An upstream 401 is never passed on.** Its `WWW-Authenticate` would start
 Hermes's own OAuth sign-in, on the box, for a server whose tokens must never be
 there. For an OAuth connection the token is refreshed and the call tried once
-more; otherwise the agent is told the agency's credential was refused.
+more; otherwise the agent is told the agency's credential was refused. **A 403
+is passed back** (without `WWW-Authenticate`) as the upstream's refusal, and
+refreshes nothing: a token that works but may not do this is not a dead one.
 """
 
 from __future__ import annotations
@@ -86,6 +93,14 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
 #: JSON-RPC's range for a server's own errors.
 NOT_GRANTED = -32001
 UNAVAILABLE = -32002
+METHOD_REFUSED = -32601
+
+#: The methods that reach an MCP server: the session's handshake, and tools.
+#: An allowlist, because the token is in the agent's own config and the agent can
+#: send anything with it; `resources/*`, `prompts/*` and whatever comes next stop
+#: here. Answers to the server's own requests (an elicitation, say) carry no
+#: method and pass.
+PASSED = frozenset({"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"})
 
 _EVENT_END = b"\n\n"
 
@@ -420,7 +435,20 @@ class Proxy:
                         None, -32600, "one message per request; no batches", status=400
                     )
                 request_id = message.get("id")
-                if message.get("method") == "tools/call":
+                method = message.get("method")
+                if method is None and not ("result" in message or "error" in message):
+                    return rpc_error(
+                        request_id, -32600, "not a request, a notification or an answer"
+                    )
+                if method is not None and method not in PASSED:
+                    # Before the credential is read: nothing about the upstream is touched.
+                    return rpc_error(
+                        request_id,
+                        METHOD_REFUSED,
+                        f"{method} isn't passed to {server.title} through Flotta: only tools are",
+                        status=200 if "id" in message else 400,
+                    )
+                if method == "tools/call":
                     params = message.get("params")
                     called = params.get("name") if isinstance(params, dict) else None
                     if not isinstance(called, str):
@@ -435,13 +463,16 @@ class Proxy:
                         )
             credential = await asyncio.to_thread(self.credential, box, server)
             response = await self._send(request, server, raw, credential)
-            if response.status_code in (401, 403) and server.auth == "oauth":
+            # A 401 is a token the upstream no longer takes; a 403 is a refusal of
+            # this request, which a new token would not change. Only the first is
+            # refreshed, so a forbidden tool can't break the agency's connection.
+            if response.status_code == 401 and server.auth == "oauth":
                 await response.aclose()
                 credential = await asyncio.to_thread(
                     self.credential, box, server, stale=credential.get("access_token")
                 )
                 response = await self._send(request, server, raw, credential)
-            if response.status_code in (401, 403):
+            if response.status_code == 401:
                 await response.aclose()
                 raise McpRefused(
                     502,

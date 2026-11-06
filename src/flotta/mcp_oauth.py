@@ -15,14 +15,17 @@ so a token is issued for that server and no other.
    verifier, sealed, in the store. The browser is sent to the provider with a
    signed `state` naming the flow.
 2. **Callback** (`GET /api/mcp/oauth/callback`, the provider's redirect, on the
-   control plane so a self-hoster has it too): the code is traded for tokens,
-   which are kept on the flow, still sealed, and not yet anyone's.
-3. **Claim** (`POST /api/mcp/oauth/claim`, the same owner): the tokens become
-   the org's connection. **The person who finishes must be the one who
-   started.** Otherwise anyone could start a flow for their own org and send
+   control plane so a self-hoster has it too): it checks the state and hands
+   the code on to the web app, in the browser that signed in. Nothing is
+   traded and nothing is kept.
+3. **Claim** (`POST /api/mcp/oauth/claim`, with the state and the code): only
+   now is the code traded, and **only for the person who started the
+   sign-in.** Otherwise anyone could start a flow for their own org and send
    someone else the sign-in link, and that person's Notion would land in the
-   stranger's agents' reach: the attack `control.app._started_by_caller` stops
-   for GitHub.
+   starter's agents' reach. The starter holds the state, so a callback that
+   traded the code would have left them the tokens; the code is with whoever
+   signed in, and that person's claim is refused unless they started it. The
+   rule `control.app.claim_github` keeps for GitHub.
 4. **Refresh** (the gateway, before a call): an access token that has expired,
    or is about to, is refreshed under a per-connection lock, so two calls don't
    spend one refresh token twice. A provider that refuses the refresh marks the
@@ -31,6 +34,16 @@ so a token is issued for that server and no other.
 **Why the verifier is in the store and not in `state`:** `state` travels in the
 browser's address bar beside the code, and a verifier anyone with the code can
 read protects nothing.
+
+## Where a code and a secret may be sent
+
+A catalogue server's metadata names the authorization server and its
+endpoints, and the next request sends them a code and a client secret. So a URL
+the operator didn't write is held to the webhook rule (`alerts.check_webhook_url`):
+public https, every address its name resolves to public, and the connection made
+to the address that was checked, with the name kept for TLS. An origin the
+operator did write (the server's own, or an endpoint in its `oauth`) keeps the
+catalogue's rule, which lets a laptop use `http://127.0.0.1`.
 """
 
 from __future__ import annotations
@@ -41,14 +54,17 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from flotta.alerts import WebhookRefused, check_webhook_url
+from flotta.alerts import _is_public as is_public
 from flotta.mcp import McpError, Server, check_url
 
 STATE_TTL_S = 10 * 60
@@ -142,27 +158,89 @@ def _json(response: httpx.Response, what: str) -> dict[str, Any]:
     return body
 
 
-def _get_metadata(http: httpx.Client, url: str) -> dict[str, Any] | None:
-    try:
-        response = http.get(url, headers={"Accept": "application/json"}, timeout=_TIMEOUT)
-    except httpx.HTTPError as exc:
-        raise OAuthError(f"{url} could not be reached: {exc}") from exc
-    if response.status_code != 200:
-        return None
-    return _json(response, url)
+def _resolve(host: str, port: int) -> list[str]:
+    return [str(info[4][0]) for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+
+
+#: How a name becomes addresses. Replaced in tests, whose hosts are `.test` names.
+resolve_host: Callable[[str, int], list[str]] = _resolve
 
 
 def _origin(url: str) -> str:
     parts = urlsplit(url)
-    return f"{parts.scheme}://{parts.netloc}"
+    return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+def _operators(server: Server) -> set[str]:
+    """The origins the operator wrote into the catalogue for this server."""
+    settings = server.oauth
+    written = [server.url]
+    if settings is not None:
+        written += [
+            settings.authorization_endpoint,
+            settings.token_endpoint,
+            settings.registration_endpoint,
+            settings.revocation_endpoint,
+        ]
+    return {_origin(url) for url in written if url}
+
+
+def checked(server: Server, url: str, what: str) -> str:
+    """`url`, if a code may go there as far as can be told without resolving it."""
+    try:
+        if _origin(url) in _operators(server):
+            return check_url(url, what)
+        return check_webhook_url(url)
+    except (McpError, WebhookRefused) as exc:
+        raise OAuthError(f"{server.name}: {what}: {exc}") from exc
+
+
+def _send(
+    http: httpx.Client, server: Server, method: str, url: str, what: str, **kwargs: Any
+) -> httpx.Response:
+    """One request, to an address checked just now if the operator didn't write the URL."""
+    url = checked(server, url, what)
+    headers = dict(kwargs.pop("headers", None) or {})
+    extensions: dict[str, Any] = {}
+    if _origin(url) not in _operators(server):
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        try:
+            addresses = resolve_host(host, parts.port or 443)
+        except OSError as exc:
+            raise OAuthError(f"{server.name}: {what}: can't resolve {host}") from exc
+        if not addresses or not all(is_public(a) for a in addresses):
+            raise OAuthError(
+                f"{server.name}: {what}: {host} resolves to an address that isn't public"
+            )
+        address = addresses[0].split("%", 1)[0]
+        bracketed = f"[{address}]" if ":" in address else address
+        netloc = f"{bracketed}:{parts.port}" if parts.port else bracketed
+        url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+        headers["Host"] = parts.netloc
+        # The certificate is still checked against the name, whatever address was dialled.
+        extensions["sni_hostname"] = host
+    try:
+        return http.request(
+            method, url, headers=headers, extensions=extensions, timeout=_TIMEOUT, **kwargs
+        )
+    except httpx.HTTPError as exc:
+        raise OAuthError(f"{server.name}: {what} could not be reached: {exc}") from exc
+
+
+def _get_metadata(http: httpx.Client, server: Server, url: str) -> dict[str, Any] | None:
+    response = _send(http, server, "GET", url, "metadata", headers={"Accept": "application/json"})
+    if response.status_code != 200:
+        return None
+    return _json(response, url)
 
 
 def discover(http: httpx.Client, server: Server) -> Endpoints:
     """The server's OAuth endpoints: the operator's, else what the server publishes.
 
     Protected-resource metadata names the authorization server (RFC 9728), and
-    its metadata names the endpoints (RFC 8414). Every URL found is checked as
-    a catalogue URL is, since it is where a code and a secret will be sent.
+    its metadata names the endpoints (RFC 8414). Every URL found is `checked`,
+    and checked again with its addresses each time something is sent to it.
     """
     settings = server.oauth
     assert settings is not None
@@ -175,17 +253,17 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
             f"{origin}/.well-known/oauth-protected-resource{path}",
             f"{origin}/.well-known/oauth-protected-resource",
         ):
-            resource = _get_metadata(http, candidate)
+            resource = _get_metadata(http, server, candidate)
             if resource is not None:
                 break
         issuers = (resource or {}).get("authorization_servers") or [origin]
         issuer = str(issuers[0]).rstrip("/")
-        check_url(issuer, f"{server.name}: authorization server")
+        checked(server, issuer, "authorization server")
         for candidate in (
             f"{issuer}/.well-known/oauth-authorization-server",
             f"{issuer}/.well-known/openid-configuration",
         ):
-            metadata = _get_metadata(http, candidate)
+            metadata = _get_metadata(http, server, candidate)
             if metadata is not None:
                 found = metadata
                 break
@@ -197,17 +275,14 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         raise OAuthError(f"{server.name}'s OAuth metadata names no authorization or token endpoint")
     registration = settings.registration_endpoint or found.get("registration_endpoint")
     revocation = settings.revocation_endpoint or found.get("revocation_endpoint")
-    try:
-        return Endpoints(
-            authorization=check_url(str(authorization), "authorization endpoint"),
-            token=check_url(str(token), "token endpoint"),
-            registration=check_url(str(registration), "registration endpoint")
-            if registration
-            else None,
-            revocation=check_url(str(revocation), "revocation endpoint") if revocation else None,
-        )
-    except McpError as exc:
-        raise OAuthError(str(exc)) from exc
+    return Endpoints(
+        authorization=checked(server, str(authorization), "authorization endpoint"),
+        token=checked(server, str(token), "token endpoint"),
+        registration=checked(server, str(registration), "registration endpoint")
+        if registration
+        else None,
+        revocation=checked(server, str(revocation), "revocation endpoint") if revocation else None,
+    )
 
 
 def client_for(
@@ -227,20 +302,20 @@ def client_for(
             f"{server.name} offers no client registration, so the operator must register "
             "Flotta with it and set client_id"
         )
-    try:
-        response = http.post(
-            endpoints.registration,
-            json={
-                "client_name": "Flotta",
-                "redirect_uris": [redirect_uri],
-                "grant_types": ["authorization_code", "refresh_token"],
-                "response_types": ["code"],
-                "token_endpoint_auth_method": "client_secret_post",
-            },
-            timeout=_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        raise OAuthError(f"{server.name}'s registration could not be reached: {exc}") from exc
+    response = _send(
+        http,
+        server,
+        "POST",
+        endpoints.registration,
+        "registration endpoint",
+        json={
+            "client_name": "Flotta",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "client_secret_post",
+        },
+    )
     if response.status_code not in (200, 201):
         raise OAuthError(f"{server.name} refused to register Flotta ({response.status_code})")
     body = _json(response, "registration")
@@ -283,8 +358,9 @@ def authorize_url(
     }
     if server.oauth.scopes:
         query["scope"] = " ".join(server.oauth.scopes)
-    separator = "&" if urlsplit(endpoints.authorization).query else "?"
-    return f"{endpoints.authorization}{separator}{urlencode(query)}"
+    authorization = checked(server, endpoints.authorization, "authorization endpoint")
+    separator = "&" if urlsplit(authorization).query else "?"
+    return f"{authorization}{separator}{urlencode(query)}"
 
 
 def _tokens(response: httpx.Response, server: Server, *, now: float) -> Tokens:
@@ -323,15 +399,15 @@ def _post_token(
     secret = _secret(server, client, env)
     if secret:
         form["client_secret"] = secret
-    try:
-        return http.post(
-            endpoints.token,
-            data=form,
-            headers={"Accept": "application/json"},
-            timeout=_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        raise OAuthError(f"{server.name}'s token endpoint could not be reached: {exc}") from exc
+    return _send(
+        http,
+        server,
+        "POST",
+        endpoints.token,
+        "token endpoint",
+        data=form,
+        headers={"Accept": "application/json"},
+    )
 
 
 def exchange(
@@ -407,8 +483,10 @@ def revoke(
     if secret:
         form["client_secret"] = secret
     try:
-        response = http.post(endpoints.revocation, data=form, timeout=_TIMEOUT)
-    except httpx.HTTPError:
+        response = _send(
+            http, server, "POST", endpoints.revocation, "revocation endpoint", data=form
+        )
+    except OAuthError:
         return False
     return response.status_code == 200
 

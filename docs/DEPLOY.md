@@ -960,13 +960,16 @@ granted, puts the agency's credential on, and writes a row per tool call.
    with the provider, with that callback, and put `client_id` and `client_secret_env`
    (a `FLOTTA_MCP_*` variable holding the secret, on both processes) in its `oauth`.
 4. An owner connects a server (`PUT /api/orgs/<org>/mcp/<server>` with a key, or
-   `POST …/connect` to sign in, then `POST /api/mcp/oauth/claim` with the `mcp_state`
-   the browser comes back with), and the agency grants it to an agent
+   `POST …/connect` to sign in, then `POST /api/mcp/oauth/claim`, as the same person,
+   with the `mcp_state` and `mcp_code` the browser comes back with: the code is traded
+   only then), and the agency grants it to an agent
    (`PUT /api/boxes/<agent>/mcp`). The agent sees it in its next conversation.
 
 A grant is in force at the gateway the moment it is saved. If the agent's machine can't
 be written, the answer says `written: false`: the agent then can't find a new server, and
-a removed one is refused anyway. `GET /api/boxes/<agent>/mcp/calls` is the audit trail.
+a removed one is refused anyway. Only tools pass (`initialize`, `ping`, `tools/list`, a
+granted `tools/call`); `resources/*` and `prompts/*` are refused. OAuth endpoints a
+server's metadata names must be public https, checked again on every request. `GET /api/boxes/<agent>/mcp/calls` is the audit trail.
 
 ---
 

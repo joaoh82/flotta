@@ -48,6 +48,10 @@ def fleet(target):  # noqa: F811
 
 @pytest.fixture
 def agency(fleet):
+    return seed_agency(fleet)
+
+
+def seed_agency(fleet: FleetStore) -> FleetStore:
     """Two clients of one org and a client of another, each with an agent."""
     fleet.create_org("studio-nord", "Studio Nord")
     fleet.create_client("studio-nord", "acme", "Acme Dental")
