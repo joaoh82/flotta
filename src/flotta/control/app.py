@@ -1546,14 +1546,140 @@ def create_app(
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
         finally:
             store.close()
+        _deliver_invite(
+            org_id,
+            email,
+            secret,
+            invite_message(email, sign_in_url(link_base, secret), org.name, role),
+        )
+        return {"invited": email, "org": org_id, "role": role, "client": client}
+
+    def _deliver_invite(org_id: str, email: str, secret: str, message: Message) -> None:
+        """Send a new invite link, then withdraw the address's older ones (FLOTTA-144).
+
+        In that order: until the new link has gone, an older one may be the
+        person's only way in. One that cannot be sent is dropped and the older
+        ones stay, so a failed send changes nothing. Withdrawing the older ones
+        is what makes the newest the one grant: correcting a too-broad invite
+        by sending another must not leave the broad link live.
+        """
+        assert deliver_link is not None
         try:
-            deliver_link(invite_message(email, sign_in_url(link_base, secret), org.name, role))
+            deliver_link(message)
         except Exception as exc:  # noqa: BLE001 - said to the inviter, not swallowed
             _log.exception("could not deliver an invite to %s", email)
+            store = store_factory()
+            try:
+                store.drop_login_link(secret)
+            finally:
+                store.close()
             raise HTTPException(
                 status_code=502, detail=f"the invite to {email} could not be sent; try again"
             ) from exc
-        return {"invited": email, "org": org_id, "role": role, "client": client}
+        store = store_factory()
+        try:
+            store.drop_other_invites(org_id, email, keep=secret)
+        finally:
+            store.close()
+
+    # -- invites not yet opened (FLOTTA-144) -----------------------------------
+    #
+    # Once sent, an invite was invisible: nobody could see who had been asked
+    # and not joined, send a lost link again, or take back one sent to the
+    # wrong address. Owners only, like sending one; nothing secret-derived
+    # ever leaves (`Invite` has no hash).
+
+    @app.get("/api/orgs/{org_id}/invites")
+    def list_invites(org_id: str, token: Token | None = needs_admin) -> Any:
+        """The invites to `org_id` nobody has opened yet, newest first, one per address.
+
+        Expired ones too, with `expired: true`: those are what resending is for.
+        """
+        from dataclasses import asdict
+
+        _admin_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            invites = [asdict(i) for i in store.open_invites(org_id)]
+        finally:
+            store.close()
+        return {"org": org_id, "invites": invites}
+
+    @app.post("/api/orgs/{org_id}/invites/resend", status_code=202)
+    def resend_invite(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """A fresh link for an invite never opened: `{"email"}`. The old link stops working.
+
+        Counted as a new invite against the same limits, so resending cannot be
+        used to send more than inviting could; but only once there is something
+        to resend, so a mistyped address spends nothing. Someone already in the
+        org is refused as inviting them would be. The old link stops working
+        only once the new one is delivered.
+        """
+        _admin_of(token, org_id)
+        if deliver_link is None:
+            raise HTTPException(
+                status_code=503,
+                detail="this control plane cannot send email; set $FLOTTA_RESEND_API_KEY",
+            )
+        try:
+            email = normalize_email(str(body.get("email") or ""))
+        except InvalidAccountError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            org = _org_or_404(store, org_id)
+            invitee = store.get_user_by_email(email)
+            if invitee is not None and store.membership(invitee.id, org_id) is not None:
+                raise HTTPException(status_code=409, detail=f"{email} is already in {org_id!r}")
+            if store.open_invite(org_id, email) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"no open invite to {org_id!r} for {email}"
+                )
+            org_limit = invites_per_pending_org if org.status == "pending" else invites_per_org
+            if not hit_all((per_address, email), (org_limit, org_id)):
+                raise HTTPException(
+                    status_code=429,
+                    detail="too many invites sent; wait, then send again",
+                    headers={"Retry-After": str(int(LINK_LIMIT_WINDOW_S))},
+                )
+            try:
+                secret, invite = store.reissue_invite(org_id, email)
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except OrgNotActiveError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+        finally:
+            store.close()
+        _deliver_invite(
+            org_id,
+            email,
+            secret,
+            invite_message(email, sign_in_url(link_base, secret), org.name, invite.role),
+        )
+        return {"invited": email, "org": org_id, "role": invite.role, "client": invite.client}
+
+    @app.post("/api/orgs/{org_id}/invites/revoke")
+    def revoke_invite(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Take back the invites to `org_id` for `{"email"}`: their links stop working now.
+
+        One opened a moment ago whose person has not joined yet is taken back
+        too (`withdraw_invites`); 404 when nothing is left to take back.
+        """
+        _admin_of(token, org_id)
+        try:
+            email = normalize_email(str(body.get("email") or ""))
+        except InvalidAccountError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            gone = store.withdraw_invites(org_id, email)
+        finally:
+            store.close()
+        if gone == 0:
+            raise HTTPException(status_code=404, detail=f"no open invite to {org_id!r} for {email}")
+        return {"revoked": email, "org": org_id}
 
     @app.get("/api/orgs/{org_id}/clients")
     def list_org_clients(org_id: str, token: Token | None = needs_read) -> Any:
