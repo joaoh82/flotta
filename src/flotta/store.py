@@ -129,15 +129,17 @@ WORKSPACE_TRANSITIONS: dict[str, frozenset[str]] = {
 # `pending` is real: a task handed to a stopped box waits for it to wake.
 #
 # A task is a run (M14, D23). `budget_blocked` is a run that was never
-# delivered because its box was paused or a budget held it, so it never left
-# `pending`; `cancelled` is one somebody stopped, before or during.
+# delivered because its box was paused or a budget held it: usually seen while
+# it was `pending`, and sometimes only from the door's 402 once its delivery
+# had begun (`flotta.runner`). `cancelled` is one somebody stopped, before or
+# during.
 TASK_STATUSES: frozenset[str] = frozenset(
     {"pending", "running", "done", "failed", "cancelled", "budget_blocked"}
 )
 TASK_TERMINAL: frozenset[str] = frozenset({"done", "failed", "cancelled", "budget_blocked"})
 TASK_TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"running", "failed", "cancelled", "budget_blocked"}),
-    "running": frozenset({"done", "failed", "cancelled"}),
+    "running": frozenset({"done", "failed", "cancelled", "budget_blocked"}),
     "done": frozenset(),
     "failed": frozenset(),
     "cancelled": frozenset(),
@@ -4081,6 +4083,15 @@ class FleetStore:
             (box_id,),
         ).fetchone()
         return _run_from_row(row) if row else None
+
+    def queued_runs(self, *, limit: int = 200) -> list[Run]:
+        """Every org's runs waiting in `pending`, oldest first: the delivery queue."""
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE status = 'pending' AND trigger_kind IS NOT NULL "
+            "ORDER BY created_at, id LIMIT ?",
+            (max(0, limit),),
+        ).fetchall()
+        return [_run_from_row(r) for r in rows]
 
     def list_runs(
         self,

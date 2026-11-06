@@ -497,6 +497,16 @@ local control="8080" door="8081":
     echo "local fleet: control plane http://127.0.0.1:{{control}}, agents at http://<agent>.localhost:{{door}}, state in $DIR"
     wait
 
+# Through the control plane at $FLOTTA_CONTROL_URL, which delivers it: under
+# `just local` that is the local fleet, with stand-in agents and no model.
+# M14.2: give an agent a piece of work and print its reply when it is done
+run box prompt:
+    uv run flotta run {{box}} {{quote(prompt)}} --wait
+
+# M14.2: an agent's runs, newest first
+runs box:
+    uv run flotta runs {{box}}
+
 # Prints each alert it gets and whether its signature checks. `secret` is what
 # setting the webhook answered with: see docs/ALERTS.md.
 # M13.7: receive budget alerts locally, on http://127.0.0.1:8184

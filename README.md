@@ -230,7 +230,7 @@ flotta chat <box>              # talk to it, through the front door
 flotta chat <box> --tunnel     # ...or straight at the machine, if the door is broken
 flotta ps [--all] [--tasks]    # boxes in the fleet; --tasks lists the work
 flotta logs <box>              # that box's timeline, across both tiers
-flotta watch <id>              # re-attach to a task  (dormant until M6)
+flotta run <box> "<prompt>" --wait   # give an agent work and print its reply
 flotta stop <box>              # mark it idle (refused while work is in flight)
 flotta start <box>             # wake it again
 flotta kill <box>              # destroy it (idempotent)
@@ -263,9 +263,8 @@ an existing box, never creating one).
 
 **Pass `--wait`, or run the control plane.** The verdict is recorded by whatever local process
 outlives the container — never the container itself — so a task nobody is watching finishes in the
-cloud while its row sits at `running`. `flotta watch <id>` collects it afterwards and
-`flotta reconcile` sweeps up any you forgot, but both are things you have to remember. `flotta serve`
-runs that sweep on a timer so you do not have to.
+cloud while its row sits at `running`. `flotta reconcile` sweeps up any you forgot, but that is
+something you have to remember. `flotta serve` runs that sweep on a timer so you do not have to.
 
 ## The control plane
 
@@ -442,8 +441,8 @@ Stated plainly, because finding these yourself is worse.
 - **A box only knows the string you send it.** It cannot see your files, your repo, or your
   conversation, and it cannot ask a question. Under-specified tasks come back as confident
   nonsense. (This is the failure durable box memory is meant to remove rather than mitigate.)
-- **`--wait`, or the row strands** until something sweeps for it — `flotta watch`,
-  `flotta reconcile`, or a running `flotta serve`.
+- **`--wait`, or the row strands** until something sweeps for it — `flotta reconcile`, or a
+  running `flotta serve`.
 - **A token has scopes and a tenant, not a person.** There are no users and no sign-in, so the
   fleet cannot answer "who destroyed that box", and an agency's owner is onboarded by being
   handed a token. A signing key is an admin credential for every org.

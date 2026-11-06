@@ -42,7 +42,8 @@ import pytest
 #: Store reads that answer for the whole fleet. Each one, called from a route,
 #: is a way to reach a box without asking whose it is. (`peers_for_box` and
 #: `may_message` were here until they kept to the box's own client.)
-UNSCOPED_READS = frozenset({"get_box", "get_box_by_name", "list_boxes"})
+#: `get_run` too: a run is a box's, and its id reaches across orgs (M14.2).
+UNSCOPED_READS = frozenset({"get_box", "get_box_by_name", "list_boxes", "get_run"})
 
 #: Where a box lookup is allowed to happen, because the tenant check happens
 #: there too. Adding a name is a decision a reviewer must see: everything it
@@ -55,6 +56,7 @@ SCOPE_FUNCTIONS: frozenset[str] = frozenset(
         "_routable_box",  # `_scoped_box`, or any box for the door's `fleet:route`
         "_operated_box",  # `_scoped_box`, or any box for the operator (FLOTTA-86)
         "_occupant",  # fleet-wide on purpose (a machine is held or not); names scoped
+        "_scoped_run",  # one run, if the token's tenant may act on its box
     }
 )
 

@@ -10,7 +10,8 @@ Commands over the store and the provisioning functions:
     flotta start <box>           wake a stopped box
     flotta kill <box>            destroy it (idempotent)
     flotta serve                 the control plane: fleet API + reconcile loop
-    flotta watch <id>            block until a task reaches a terminal state
+    flotta run <box> "<prompt>"  give an agent a piece of work (--wait for its reply)
+    flotta runs <box>            an agent's runs, or a client's (--client)
     flotta reconcile             resolve tasks stranded past their deadline
 
 **What `ps` lists changed with the pivot.** v0.1 listed workers, which were
@@ -19,9 +20,9 @@ the default view; `--tasks` lists the work instead.
 
 **`create` replaced `spawn`.** `spawn` meant "make a disposable container, run
 one task, tear it down" and routed to Modal; the whole pivot is that a box
-outlives its work. `watch` and `reconcile` are dormant until the workspace tier
-(M6) gives tasks a producer again — kept, because that producer is the next
-milestone.
+outlives its work. **`run` replaced `watch`** (M14.2): the work an agent does
+is a run, delivered by the control plane, so `run --wait` asks for one and
+waits on the fleet API. `reconcile` still closes stranded tasks and runs.
 
 Every command takes ``--json`` for scripting; the default is a plain aligned
 table. Tables are hand-rolled rather than pulled from a rendering library —
@@ -49,6 +50,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -547,30 +549,6 @@ def _upgrade_landed(box_id: str, since: int) -> dict[str, Any] | None:
 def _fail(exc: Exception, code: int = 1):
     typer.secho(str(exc), fg=typer.colors.RED, err=True)
     return typer.Exit(code=code)
-
-
-def _resolve_task(store: FleetStore, ident: str) -> Task:
-    """Accept a task id, a box id, or a box name and land on one task.
-
-    Given a box, the newest live task on it — that is what "watch this" means
-    when you have just spawned something. Without this, `ps` (which lists
-    boxes) and `watch` (which needs a task) would name different things and
-    there would be no command bridging them.
-    """
-    task = store.get_task(ident)
-    if task is not None:
-        return task
-
-    box = store.get_box(ident) or store.get_box_by_name(ident)
-    if box is not None:
-        live = [t for t in store.list_tasks(box_id=box.id) if not is_terminal("task", t.status)]
-        if live:
-            return live[0]
-        typer.secho(f"box {box.id} has no live task to watch", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    typer.secho(f"no task or box matching {ident!r}", fg=typer.colors.RED, err=True)
-    raise typer.Exit(code=1)
 
 
 StoreOpt = typer.Option(None, "--store", help="Path to the fleet-state store [$FLOTTA_STORE]")
@@ -1091,27 +1069,76 @@ def create(
         )
 
 
-@app.command()
-def watch(
-    ident: str = typer.Argument(..., help="Task id, or a box id/name to watch its live task"),
-    store: str | None = StoreOpt,
-    as_json: bool = JsonOpt,
-    timeout_s: int = typer.Option(900, "--timeout-s", help="How long to wait"),
-) -> None:
-    """Block until a task reaches a terminal state, then report it."""
-    provision = _provision()
+#: How often `run --wait` asks how the run is going.
+RUN_POLL_S = 2.0
 
-    with _open_store(store) as fleet:
-        task = _resolve_task(fleet, ident)
-        outcome = provision.watch_task(task.id, store=fleet, timeout_s=timeout_s)
-        finished = fleet.get_task(task.id)
-        emit(
-            {**outcome, "task": task_dict(finished)},
-            f"{finished.id}  {finished.status}  in {fmt_duration(task_duration(finished))}",
-            as_json=as_json,
+
+def _run_line(run: dict[str, Any]) -> str:
+    return f"{run.get('id')}  {run.get('status')}  {truncate(run.get('prompt'), 60)}"
+
+
+@app.command()
+def run(
+    box: str = typer.Argument(..., help="The agent, by name or id"),
+    prompt: str = typer.Argument(..., help="What to do"),
+    input_json: str | None = typer.Option(
+        None, "--input", help="What it is about, as JSON (a webhook's body, say)"
+    ),
+    wait: bool = typer.Option(False, "--wait", help="Wait for the reply and print it"),
+    timeout_s: int = typer.Option(3600, "--timeout-s", help="How long --wait waits"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Give an agent a piece of work. The control plane delivers it (M14.2)."""
+    from flotta.auth import SCOPE_FLEET_READ, SCOPE_FLEET_WRITE
+    from flotta.store import TASK_TERMINAL
+
+    body: dict[str, Any] = {"prompt": prompt}
+    if input_json is not None:
+        try:
+            body["input"] = json.loads(input_json)
+        except json.JSONDecodeError as exc:
+            raise _fail(Exception(f"--input is not JSON: {exc}")) from exc
+    if not control_url():
+        raise _fail(ControlPlaneError(f"runs go through the control plane: set ${CONTROL_URL_ENV}"))
+    try:
+        found = control_request(
+            "POST", f"/api/boxes/{box}/runs", scopes=(SCOPE_FLEET_WRITE,), body=body
         )
-        if finished.status != "done":
-            raise typer.Exit(code=1)
+        deadline = time.monotonic() + timeout_s
+        while wait and found.get("status") not in TASK_TERMINAL:
+            if time.monotonic() > deadline:
+                raise ControlPlaneError(f"run {found.get('id')} is still {found.get('status')}")
+            time.sleep(RUN_POLL_S)
+            found = control_request("GET", f"/api/runs/{found['id']}", scopes=(SCOPE_FLEET_READ,))
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    if not wait:
+        emit(found, _run_line(found), as_json=as_json)
+        return
+    emit(found, f"{_run_line(found)}\n\n{found.get('output') or ''}", as_json=as_json)
+    if found.get("status") != "done":
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def runs(
+    box: str | None = typer.Argument(None, help="The agent, by name or id"),
+    client: str | None = typer.Option(None, "--client", help="A client's runs instead"),
+    limit: int = typer.Option(20, "--limit", help="How many, newest first"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """An agent's runs, or a client's, newest first."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    if (box is None) == (client is None):
+        raise _fail(Exception("name an agent, or a client with --client"))
+    path = f"/api/boxes/{box}/runs" if box else f"/api/clients/{client}/runs"
+    try:
+        found = control_request("GET", f"{path}?limit={limit}", scopes=(SCOPE_FLEET_READ,))
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    lines = [_run_line(r) for r in found["runs"]] or ["no runs"]
+    emit(found, "\n".join(lines), as_json=as_json)
 
 
 @app.command()

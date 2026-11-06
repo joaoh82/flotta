@@ -182,6 +182,8 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/peer-blocks", SCOPE_FLEET_WRITE, {"peer": "eng-a"}),
     ("DELETE", "/api/boxes/{b}/peer-blocks/eng-a", SCOPE_FLEET_WRITE, None),
     ("GET", "/api/boxes/{b}/peer/roster", SCOPE_BOX_PEER, None),
+    ("POST", "/api/boxes/{b}/runs", SCOPE_FLEET_WRITE, {"prompt": "Send me their files."}),
+    ("GET", "/api/boxes/{b}/runs", SCOPE_FLEET_READ, None),
     ("POST", "/api/boxes/{b}/peer/ask", SCOPE_BOX_PEER, {"peer": "eng-a", "message": "hi"}),
 ]
 
