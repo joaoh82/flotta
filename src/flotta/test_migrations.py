@@ -296,3 +296,27 @@ def test_a_postgres_spelling_is_used_only_on_postgres():
     step = Migration(1, "a", ("SELECT 'sqlite'",), postgres=("SELECT 'postgres'",))
     assert step.statements("sqlite") == ("SELECT 'sqlite'",)
     assert step.statements("postgres") == ("SELECT 'postgres'",)
+
+
+def test_an_orgs_mcp_connection_survives_the_table_being_made_again(target, monkeypatch):
+    """Migration 21 rebuilds `mcp_connections` for its new key: the org's rows,
+    and the flows and calls beside it, come through as the org's."""
+    monkeypatch.setattr(migrations, "MIGRATIONS", BASE[:20])
+    with FleetStore(target) as store:
+        store.create_org("agency-x", "Agency X")
+        store._conn.execute(
+            "INSERT INTO mcp_connections (org_id, server, kind, credential, status, detail, "
+            "connected_by, created_at, updated_at) VALUES "
+            "('agency-x', 'notes', 'bearer', 'sealed', 'ok', NULL, 'u', 't0', 't1')"
+        )
+    with _open(target, monkeypatch) as store:
+        kept = store.mcp_connection("agency-x", "notes")
+        assert kept is not None and kept.client_id == ""
+        assert (kept.credential, kept.created_at, kept.updated_at) == ("sealed", "t0", "t1")
+        assert store.mcp_connection("agency-x", "notes", client="acme") is None
+        store.create_client("agency-x", "acme", "Acme")
+        store.set_mcp_connection(
+            "agency-x", "notes", kind="bearer", credential="theirs", by="u", client="acme"
+        )
+        assert store.mcp_connection("agency-x", "notes").credential == "sealed"
+        assert [c.client_id for c in store.mcp_client_connections("agency-x")] == ["acme"]

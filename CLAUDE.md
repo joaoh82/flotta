@@ -855,6 +855,12 @@ conventions, and the sharp edges below.
   written**, the opposite of the rules, because the record is what the gateway enforces.
   **An upstream 401 is never passed to the agent**: its `WWW-Authenticate` would start
   Hermes's own OAuth on the box.
+  **A client's own connection wins over the agency's** (slice 3, migration 21: the
+  connection's key is `(org, client, server)`, `''` for the agency's), read off the box's
+  row, so no agent reaches another client's account. **A broken client connection is
+  not passed over for the agency's**: the client's work would quietly move to an account
+  nobody chose for it. A client's credential is sealed to that client as well
+  (`mcp.connection_context`), and each call's row says which served it (`account`).
 
 ## Source of truth
 

@@ -3328,6 +3328,10 @@ def create_app(
     # once, as the signing key is. A connection is an org's, made by its owners;
     # a grant is an agent's, made by the agency's people. A client's people do
     # neither. The gateway enforces all of it on every call (`gateway.mcp`).
+    #
+    # A connection may also be one client's own (slice 3), made by the same
+    # owners, at `/api/orgs/{org}/clients/{client}/mcp/...`. That client's agents
+    # use it ahead of the org's; no other agent can.
 
     from flotta.mcp import McpError
     from flotta.mcp import catalogue as _read_mcp_catalogue
@@ -3358,6 +3362,10 @@ def create_app(
             or subject_box(token.subject) is not None
         ):
             raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+
+    def _client_or_404(store: Any, org_id: str, client_id: str | None) -> None:
+        if client_id is not None and store.get_client(org_id, client_id) is None:
+            raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
 
     def _mcp_connection(found: Any) -> dict[str, Any] | None:
         """A connection as the agency sees it: whether it works, never what it holds."""
@@ -3428,20 +3436,49 @@ def create_app(
         try:
             _org_or_404(store, org_id)
             connected = {c.server: c for c in store.mcp_connections(org_id)}
+            by_client: dict[str, dict[str, Any]] = {}
+            for c in store.mcp_client_connections(org_id):
+                by_client.setdefault(c.server, {})[c.client_id] = _mcp_connection(c)
         finally:
             store.close()
         return {
             "servers": [
-                {**s.public(), "connection": _mcp_connection(connected.get(s.name))}
+                {
+                    **s.public(),
+                    "connection": _mcp_connection(connected.get(s.name)),
+                    "clients": by_client.get(s.name, {}),
+                }
                 for s in mcp_servers.values()
             ]
         }
 
-    @app.put("/api/orgs/{org_id}/mcp/{server}")
-    def connect_mcp_key(
-        org_id: str, server: str, body: dict[str, Any], token: Token | None = needs_admin
+    @app.get("/api/orgs/{org_id}/clients/{client_id}/mcp")
+    def client_mcp(org_id: str, client_id: str, token: Token | None = needs_write) -> Any:
+        """Every catalogue server, this client's own connection, and the agency's under it."""
+        _agency_of(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            _client_or_404(store, org_id, client_id)
+            own = {c.server: c for c in store.mcp_connections(org_id, client=client_id)}
+            agency = {c.server: c for c in store.mcp_connections(org_id)}
+        finally:
+            store.close()
+        return {
+            "client": client_id,
+            "servers": [
+                {
+                    **s.public(),
+                    "connection": _mcp_connection(own.get(s.name)),
+                    "agency": _mcp_connection(agency.get(s.name)),
+                }
+                for s in mcp_servers.values()
+            ],
+        }
+
+    def _connect_key(
+        org_id: str, client_id: str | None, server: str, body: Any, token: Token | None
     ) -> Any:
-        """Connect a server with a key: `{"key": "..."}`. Sealed; never answered back."""
         import json
 
         from flotta.mcp import connection_context, parse_key
@@ -3452,22 +3489,44 @@ def create_app(
             key_ = parse_key(body, found)
         except McpError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        sealed = _seal(
-            json.dumps({"kind": found.auth, "value": key_}), connection_context(org_id, server)
-        )
         store = store_factory()
         try:
             _org_or_404(store, org_id)
+            _client_or_404(store, org_id, client_id)
+            sealed = _seal(
+                json.dumps({"kind": found.auth, "value": key_}),
+                connection_context(org_id, server, client_id),
+            )
             made = store.set_mcp_connection(
                 org_id,
                 server,
                 kind=found.auth,
                 credential=sealed,
                 by=token.subject if token is not None else "operator",
+                client=client_id,
             )
         finally:
             store.close()
-        return {"server": server, "connection": _mcp_connection(made)}
+        answer = {"server": server, "connection": _mcp_connection(made)}
+        return {**answer, "client": client_id} if client_id else answer
+
+    @app.put("/api/orgs/{org_id}/mcp/{server}")
+    def connect_mcp_key(
+        org_id: str, server: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Connect a server with a key: `{"key": "..."}`. Sealed; never answered back."""
+        return _connect_key(org_id, None, server, body, token)
+
+    @app.put("/api/orgs/{org_id}/clients/{client_id}/mcp/{server}")
+    def connect_client_mcp_key(
+        org_id: str,
+        client_id: str,
+        server: str,
+        body: dict[str, Any],
+        token: Token | None = needs_admin,
+    ) -> Any:
+        """Connect a server with a client's own key, for that client's agents only."""
+        return _connect_key(org_id, client_id, server, body, token)
 
     @app.post("/api/orgs/{org_id}/mcp/{server}/connect")
     def connect_mcp_oauth(
@@ -3478,6 +3537,22 @@ def create_app(
         `{"return_to": "<web app URL>"}` is where the browser comes back to, with
         `mcp_state` to claim. Nothing is connected until the claim.
         """
+        return _start_sign_in(org_id, None, server, body, token)
+
+    @app.post("/api/orgs/{org_id}/clients/{client_id}/mcp/{server}/connect")
+    def connect_client_mcp_oauth(
+        org_id: str,
+        client_id: str,
+        server: str,
+        body: dict[str, Any],
+        token: Token | None = needs_admin,
+    ) -> Any:
+        """The same sign-in, ending as one client's own connection."""
+        return _start_sign_in(org_id, client_id, server, body, token)
+
+    def _start_sign_in(
+        org_id: str, client_id: str | None, server: str, body: Any, token: Token | None
+    ) -> Any:
         import secrets as secrets_
         from datetime import timedelta
 
@@ -3506,6 +3581,7 @@ def create_app(
         store = store_factory()
         try:
             _org_or_404(store, org_id)
+            _client_or_404(store, org_id, client_id)
             store.delete_mcp_flows_before(
                 datetime.now(UTC) - timedelta(seconds=6 * mcp_oauth.STATE_TTL_S)
             )
@@ -3516,6 +3592,7 @@ def create_app(
                 subject=token.subject if token is not None else "operator",
                 sealed=sealed,
                 return_to=return_to,
+                client=client_id,
             )
         finally:
             store.close()
@@ -3571,14 +3648,18 @@ def create_app(
             store.close()
         server = _mcp_server_or_404(flow.server)
         back = flow.return_to
+        # Which client it was for, so the page can say so; not a secret.
+        whose = {"mcp_client": flow.client_id} if flow.client_id else {}
         if error or not code:
             reason = error or "the provider sent no code"
             if back:
-                query = urlencode({"mcp_server": server.name, "mcp_error": reason})
+                query = urlencode({"mcp_server": server.name, **whose, "mcp_error": reason})
                 return RedirectResponse(f"{back}{'&' if '?' in back else '?'}{query}", 303)
             raise HTTPException(status_code=400, detail=f"{server.title}: {reason}")
         if back:
-            query = urlencode({"mcp_server": server.name, "mcp_state": state, "mcp_code": code})
+            query = urlencode(
+                {"mcp_server": server.name, **whose, "mcp_state": state, "mcp_code": code}
+            )
             return RedirectResponse(f"{back}{'&' if '?' in back else '?'}{query}", 303)
         return {
             "server": server.name,
@@ -3589,7 +3670,11 @@ def create_app(
 
     @app.post("/api/mcp/oauth/claim")
     def claim_mcp_oauth(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
-        """Trade a sign-in's code and make it the org's connection: `{"state", "code"}`.
+        """Trade a sign-in's code and keep it as the connection it was started for.
+
+        `{"state", "code"}`. The flow says whose: the org's own, or one client's
+        (`client` in the answer), as `connect_mcp_oauth` or
+        `connect_client_mcp_oauth` started it.
 
         **Only the person who started it, and only then is the code spent**, as
         `claim_github` asks GitHub who someone is only after the same check. The
@@ -3616,6 +3701,8 @@ def create_app(
                 )
             _admin_of(token, flow.org_id)
             server = _mcp_server_or_404(flow.server)
+            # A client removed since the start has nowhere to keep a connection.
+            _client_or_404(store, flow.org_id, flow.client_id)
             payload = json.loads(_unseal(flow.sealed, mcp_oauth.flow_context(flow.id)))
             if not store.delete_mcp_flow(flow.id):
                 raise HTTPException(status_code=422, detail="that sign-in is already claimed")
@@ -3635,13 +3722,26 @@ def create_app(
             except mcp_oauth.OAuthError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             credential = mcp_oauth.oauth_credential(endpoints, client, tokens)
-            sealed = _seal(json.dumps(credential), connection_context(flow.org_id, server.name))
+            sealed = _seal(
+                json.dumps(credential),
+                connection_context(flow.org_id, server.name, flow.client_id),
+            )
             made = store.set_mcp_connection(
-                flow.org_id, server.name, kind="oauth", credential=sealed, by=subject
+                flow.org_id,
+                server.name,
+                kind="oauth",
+                credential=sealed,
+                by=subject,
+                client=flow.client_id,
             )
         finally:
             store.close()
-        return {"org": made.org_id, "server": server.name, "connection": _mcp_connection(made)}
+        return {
+            "org": made.org_id,
+            "client": flow.client_id,
+            "server": server.name,
+            "connection": _mcp_connection(made),
+        }
 
     @app.delete("/api/orgs/{org_id}/mcp/{server}")
     def disconnect_mcp(org_id: str, server: str, token: Token | None = needs_admin) -> Any:
@@ -3650,6 +3750,16 @@ def create_app(
         Grants stay: an agent granted a server nobody has connected is told so
         by the gateway, and connecting it again needs no new grant.
         """
+        return _disconnect(org_id, None, server, token)
+
+    @app.delete("/api/orgs/{org_id}/clients/{client_id}/mcp/{server}")
+    def disconnect_client_mcp(
+        org_id: str, client_id: str, server: str, token: Token | None = needs_admin
+    ) -> Any:
+        """Forget a client's own connection: its agents go back to the agency's."""
+        return _disconnect(org_id, client_id, server, token)
+
+    def _disconnect(org_id: str, client_id: str | None, server: str, token: Token | None) -> Any:
         import json
 
         from flotta import mcp_oauth
@@ -3660,7 +3770,8 @@ def create_app(
         store = store_factory()
         try:
             _org_or_404(store, org_id)
-            gone = store.delete_mcp_connection(org_id, server)
+            _client_or_404(store, org_id, client_id)
+            gone = store.delete_mcp_connection(org_id, server, client=client_id)
         finally:
             store.close()
         if gone is None:
@@ -3669,7 +3780,7 @@ def create_app(
         if gone.kind == "oauth":
             try:
                 credential = json.loads(
-                    _unseal(gone.credential, connection_context(org_id, server))
+                    _unseal(gone.credential, connection_context(org_id, server, client_id))
                 )
                 with _oauth_http() as http:
                     for value in (credential.get("refresh_token"), credential.get("access_token")):
@@ -3687,20 +3798,44 @@ def create_app(
             except HTTPException:
                 # Forgotten here either way; the provider's copy expires on its own.
                 _log.warning("the %s connection of %s won't open to revoke", server, org_id)
-        return {"server": server, "disconnected": True, "revoked": revoked}
+        answer = {"server": server, "disconnected": True, "revoked": revoked}
+        return {**answer, "client": client_id} if client_id else answer
 
     @app.get("/api/boxes/{box_id}/mcp")
     def get_mcp_grants(box_id: str, token: Token | None = needs_write) -> Any:
-        """The MCP servers an agent may call, which tools, and whether calls ask first."""
+        """The MCP servers an agent may call, which tools, and whether calls ask first.
+
+        `accounts` says, per granted server, whose connection its calls go out
+        on: its client's own, else the agency's, chosen as the gateway chooses
+        (`gateway.mcp.Proxy.resolve`), with `status` `ok` only when the gateway
+        would use it. A connection of another kind than the catalogue now says
+        (or for a server no longer offered) is `broken`, and a client's that
+        can't be used is still the client's: the gateway doesn't fall back.
+        `null` when neither is connected.
+        """
         from flotta.provision import mcp_grants_of
 
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
             read = mcp_grants_of(box.id, store=store)
+            accounts: dict[str, Any] = {}
+            for granted in read["servers"]:
+                name = granted["server"]
+                own = store.mcp_connection(box.org, name, client=box.client)
+                found = own or store.mcp_connection(box.org, name)
+                if found is None:
+                    accounts[name] = None
+                    continue
+                offered = mcp_servers.get(name)
+                usable = offered is not None and found.kind == offered.auth
+                accounts[name] = {
+                    "account": "client" if own else "org",
+                    "status": found.status if usable else "broken",
+                }
         finally:
             store.close()
-        return {**read, "changed_at": _epoch(read["changed_at"])}
+        return {**read, "accounts": accounts, "changed_at": _epoch(read["changed_at"])}
 
     @app.put("/api/boxes/{box_id}/mcp")
     def put_mcp_grants(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
@@ -3738,7 +3873,13 @@ def create_app(
             store.close()
         return {
             "calls": [
-                {"server": c.server, "tool": c.tool, "status": c.status, "at": _epoch(c.at)}
+                {
+                    "server": c.server,
+                    "tool": c.tool,
+                    "status": c.status,
+                    "account": c.account,
+                    "at": _epoch(c.at),
+                }
                 for c in calls
             ]
         }
