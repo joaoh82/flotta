@@ -1766,25 +1766,49 @@ def org_list(
     emit({"orgs": orgs}, _org_lines(orgs), as_json=as_json)
 
 
-def _decide_org(org_id: str, *, approve: bool, store: str | None, as_json: bool) -> None:
+def _decide_org(
+    org_id: str,
+    *,
+    approve: bool,
+    store: str | None,
+    as_json: bool,
+    reason: str | None = None,
+) -> None:
+    """Decide through the control plane, which tells the org's owners (FLOTTA-143).
+
+    Straight on a store, nobody is told: only the control plane sends mail.
+    That path says so rather than leaving the operator to assume otherwise.
+    """
     from flotta.auth import SCOPE_ORG_ADMIN
     from flotta.store import InvalidTransitionError
 
     verb = "approve" if approve else "decline"
+    told: int | None
     if control_url():
         try:
-            org = control_request("POST", f"/api/orgs/{org_id}/{verb}", scopes=(SCOPE_ORG_ADMIN,))[
-                "org"
-            ]
+            answer = control_request(
+                "POST",
+                f"/api/orgs/{org_id}/{verb}",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"reason": reason} if reason else None,
+            )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
+        org, told = answer["org"], answer.get("told")
+        if told is None:
+            note = "its owners' messages went to the control plane's log, not by email"
+        else:
+            note = f"{told} owner{'' if told == 1 else 's'} told"
     else:
         with _open_store(store) as fleet:
             try:
-                org = _org_view(fleet.decide_org(org_id, approve=approve))
+                org = _org_view(fleet.decide_org(org_id, approve=approve, reason=reason))
             except (UnknownEntityError, InvalidTransitionError) as exc:
                 raise _fail(exc) from exc
-    emit({"org": org}, f"{org['id']} is {org['status']}", as_json=as_json)
+        told = 0
+        note = "decided on the store directly, so nobody was emailed; tell its owners yourself"
+        typer.echo(f"warning: {note}", err=True)
+    emit({"org": org, "told": told}, f"{org['id']} is {org['status']} ({note})", as_json=as_json)
 
 
 @org_app.command("approve")
@@ -1800,11 +1824,14 @@ def org_approve(
 @org_app.command("decline")
 def org_decline(
     org_id: str = typer.Argument(..., help="A pending org: `flotta org list --pending`"),
+    reason: str | None = typer.Option(
+        None, "--reason", help="Why, in your words: sent to its owners and kept on the org"
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
     """Refuse a signed-up org: it keeps its sign-in and never creates an agent."""
-    _decide_org(org_id, approve=False, store=store, as_json=as_json)
+    _decide_org(org_id, approve=False, store=store, as_json=as_json, reason=reason)
 
 
 @client_app.command("create")
