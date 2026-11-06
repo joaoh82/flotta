@@ -607,7 +607,8 @@ class Invite:
     """An invite nobody has opened yet, as an owner sees it (FLOTTA-144).
 
     Nothing derived from its secret, not even the hash: the list goes to a
-    browser, and a hash is how a link is found.
+    browser, and a hash is how a link is found. `expired` is listed rather
+    than hidden, since resending is how an owner revives one.
     """
 
     email: str
@@ -615,6 +616,7 @@ class Invite:
     client: str | None
     created_at: str
     expires_at: str
+    expired: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1560,19 +1562,30 @@ class FleetStore:
                 membership = self.add_membership(
                     user.id, link.org, link.role, client_id=link.client
                 )
+            # They are in now: any other invite to this org is not still open.
+            self._conn.execute(
+                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
+                "AND used_at IS NULL",
+                (link.org, link.email),
+            )
         return user, membership
 
     def open_invites(self, org_id: str, *, now: datetime | None = None) -> list[Invite]:
-        """The invites to `org_id` not yet opened and not expired, newest first.
+        """The invites to `org_id` never opened, newest first, expired ones flagged.
 
-        One per address: an owner may send two before either is opened, and
-        the newest says what joining would grant now.
+        One per address. Sending a new invite or resending withdraws the older
+        ones once the new link is delivered, so the newest is what joining
+        grants. Someone already in the org has nothing open, whatever rows from
+        before this rule are left.
         """
+        moment = now or datetime.now(UTC)
         rows = self._conn.execute(
             "SELECT email, role, client_id, created_at, expires_at FROM login_links "
-            "WHERE purpose = 'invite' AND org_id = ? AND used_at IS NULL AND expires_at > ? "
+            "WHERE purpose = 'invite' AND org_id = ? AND used_at IS NULL "
+            "AND email NOT IN (SELECT u.email FROM users u JOIN memberships m "
+            "ON m.user_id = u.id WHERE m.org_id = ?) "
             "ORDER BY created_at DESC, email",
-            (org_id, _stamp(now or datetime.now(UTC))),
+            (org_id, org_id),
         ).fetchall()
         seen: set[str] = set()
         found: list[Invite] = []
@@ -1587,30 +1600,62 @@ class FleetStore:
                     client=row["client_id"],
                     created_at=row["created_at"],
                     expires_at=row["expires_at"],
+                    expired=datetime.fromisoformat(row["expires_at"]) <= moment,
                 )
             )
         return found
 
-    def withdraw_invites(self, org_id: str, email: str) -> int:
-        """Take back every invite to `org_id` for `email`; how many there were.
+    def open_invite(self, org_id: str, email: str, *, now: datetime | None = None) -> Invite | None:
+        """`open_invites`' entry for `email`, or `None`: what resend would send again."""
+        email = normalize_email(email)
+        return next((i for i in self.open_invites(org_id, now=now) if i.email == email), None)
 
-        Deleting the row is what makes its link stop working, at once:
-        `redeem_login_link` finds nothing, and `accept_invite` re-checks the
-        row under its guard, so one opened a moment before is refused too.
+    def withdraw_invites(self, org_id: str, email: str) -> int:
+        """Take back every invite to `org_id` for `email`; how many were still open.
+
+        Opened or not, as `remove_membership` does, and under the same guard:
+        `_join` redeems a link and accepts it in two steps, and `accept_invite`
+        re-checks the row under `users`' guard. Deleting the opened row too is
+        what makes a revoke landing between those steps refuse the accept.
+        Counted as open: links never opened, and opened ones whose person has
+        not joined yet. Someone already in the org has nothing to take back.
         """
         email = normalize_email(email)
-        with self._conn.transaction(guard="login_links"):
-            gone = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM login_links "
-                "WHERE purpose = 'invite' AND org_id = ? AND email = ? AND used_at IS NULL",
+        with self._conn.transaction(guard="users"):
+            user = self.get_user_by_email(email)
+            joined = user is not None and self.membership(user.id, org_id) is not None
+            rows = self._conn.execute(
+                "SELECT used_at FROM login_links WHERE purpose = 'invite' AND org_id = ? "
+                "AND email = ?",
                 (org_id, email),
-            ).fetchone()["n"]
+            ).fetchall()
+            gone = sum(1 for r in rows if r["used_at"] is None or not joined)
             self._conn.execute(
-                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
-                "AND used_at IS NULL",
+                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ?",
                 (org_id, email),
             )
+        return gone
+
+    def drop_other_invites(self, org_id: str, email: str, *, keep: str) -> int:
+        """Withdraw the unopened invites to `org_id` for `email` but the one `keep` opens.
+
+        Called once a new link has been delivered: until then the old one is
+        the person's only way in, so it stays. Returns how many went.
+        """
+        email = normalize_email(email)
+        where = (
+            "FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
+            "AND used_at IS NULL AND token_hash <> ?"
+        )
+        params = (org_id, email, secret_hash(keep))
+        with self._conn.transaction(guard="login_links"):
+            gone = self._conn.execute(f"SELECT COUNT(*) AS n {where}", params).fetchone()["n"]
+            self._conn.execute(f"DELETE {where}", params)
         return int(gone)
+
+    def drop_login_link(self, secret: str) -> None:
+        """Delete the link `secret` opens: one that was made but never delivered."""
+        self._conn.execute("DELETE FROM login_links WHERE token_hash = ?", (secret_hash(secret),))
 
     def reissue_invite(
         self,
@@ -1620,42 +1665,35 @@ class FleetStore:
         ttl_s: int = INVITE_TTL_S,
         now: datetime | None = None,
     ) -> tuple[str, Invite]:
-        """A fresh link for the open invite to `org_id` for `email`; the old ones stop working.
+        """A fresh link for the open invite to `org_id` for `email`.
 
         For an invite that expired unopened, went to spam, or was lost: the
-        same role and client as the newest one, a new secret and a new expiry.
-        `UnknownEntityError` if there is no invite to that address that was
-        never opened (one that expired counts; one that was used does not).
+        same role and client as `open_invite`'s, a new secret and a new
+        expiry. The old links are left working: the caller withdraws them with
+        `drop_other_invites` once the new one is delivered, and drops the new
+        one with `drop_login_link` if it is not. `UnknownEntityError` if
+        `open_invite` has nothing for that address; a role or client that is
+        no longer valid is refused as a new invite would be.
         """
         email = normalize_email(email)
         moment = now or datetime.now(UTC)
         with self._conn.transaction(guard="login_links"):
-            row = self._conn.execute(
-                "SELECT role, client_id FROM login_links "
-                "WHERE purpose = 'invite' AND org_id = ? AND email = ? AND used_at IS NULL "
-                "ORDER BY created_at DESC LIMIT 1",
-                (org_id, email),
-            ).fetchone()
-            if row is None:
+            found = self.open_invite(org_id, email, now=moment)
+            if found is None:
                 raise UnknownEntityError(f"no open invite to {org_id!r} for {email}")
-            self._conn.execute(
-                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
-                "AND used_at IS NULL",
-                (org_id, email),
-            )
             secret = self.create_login_link(
                 email,
                 purpose="invite",
                 org_id=org_id,
-                client_id=row["client_id"],
-                role=row["role"],
+                client_id=found.client,
+                role=found.role,
                 ttl_s=ttl_s,
                 now=moment,
             )
         return secret, Invite(
             email=email,
-            role=row["role"],
-            client=row["client_id"],
+            role=found.role,
+            client=found.client,
             created_at=_stamp(moment),
             expires_at=_stamp(moment + timedelta(seconds=ttl_s)),
         )

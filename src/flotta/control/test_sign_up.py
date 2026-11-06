@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from flotta.auth import SCOPE_FLEET_READ, SCOPE_ORG_ADMIN, mint
 from flotta.control.app import INVITE_LIMIT_PER_PENDING_ORG
 from flotta.control.test_sign_in import KEY, Outbox, _app
-from flotta.store import INVITE_TTL_S, FleetStore, secret_hash
+from flotta.store import INVITE_TTL_S, FleetStore, InvalidAccountError, secret_hash
 
 
 @pytest.fixture
@@ -604,7 +604,8 @@ def test_lists_open_invites_once_per_address_newest_first(api, outbox):
         ("di@example.com", "member", None),
         ("cy@example.com", "client_user", "acme"),
     ]
-    assert set(invites[0]) == {"email", "role", "client", "created_at", "expires_at"}
+    assert set(invites[0]) == {"email", "role", "client", "created_at", "expires_at", "expired"}
+    assert invites[0]["expired"] is False
 
 
 def test_an_opened_invite_leaves_the_list(api, outbox):
@@ -614,7 +615,8 @@ def test_an_opened_invite_leaves_the_list(api, outbox):
     assert _list(api, ana).json()["invites"] == []
 
 
-def test_an_expired_invite_leaves_the_list_and_can_be_resent(fleet):
+def test_an_expired_invite_is_listed_as_expired_and_can_be_resent(fleet):
+    """The list and resend agree on what is open: an expired invite is both."""
     with FleetStore(fleet) as store:
         long_ago = datetime.now(UTC) - timedelta(days=30)
         store.create_login_link(
@@ -625,10 +627,12 @@ def test_an_expired_invite_leaves_the_list_and_can_be_resent(fleet):
             role="client_user",
             now=long_ago,
         )
-        assert store.open_invites("agency-x") == []
+        [listed] = store.open_invites("agency-x")
+        assert (listed.email, listed.expired) == ("cy@example.com", True)
         secret, invite = store.reissue_invite("agency-x", "cy@example.com")
         assert (invite.role, invite.client) == ("client_user", "acme")
-        assert [i.email for i in store.open_invites("agency-x")] == ["cy@example.com"]
+        [listed] = store.open_invites("agency-x")
+        assert (listed.email, listed.expired) == ("cy@example.com", False)
         assert store.redeem_login_link(secret) is not None
 
 
@@ -646,14 +650,108 @@ def test_nothing_to_resend_or_revoke_is_a_404(api, outbox):
         assert missing.status_code == 404, action
 
 
-def test_an_opened_invite_cannot_be_resent(api, outbox):
+def test_someone_who_joined_cannot_be_sent_an_invite_again(api, outbox):
+    """Refused as inviting a member is: 409, not a fresh link to an existing member."""
     ana = _signed_in(api, outbox, "ana@example.com")
     secret = _invited(api, outbox, ana)
     assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 200
     again = api.post(
         "/api/orgs/agency-x/invites/resend", json={"email": "cy@example.com"}, headers=ana
     )
-    assert again.status_code == 404
+    assert again.status_code == 409
+
+
+def test_joining_through_one_invite_closes_the_others(api, fleet, outbox):
+    """Two links to one address (the store allows it): one joins, nothing stays open."""
+    ana = _signed_in(api, outbox, "ana@example.com")
+    with FleetStore(fleet) as store:
+        invite = {"purpose": "invite", "org_id": "agency-x", "client_id": "acme"}
+        spare = store.create_login_link("cy@example.com", role="client_viewer", **invite)
+        used = store.create_login_link("cy@example.com", role="client_user", **invite)
+    assert api.post("/api/auth/redeem", json={"secret": used}).status_code == 200
+
+    assert _list(api, ana).json()["invites"] == []
+    resent = api.post(
+        "/api/orgs/agency-x/invites/resend", json={"email": "cy@example.com"}, headers=ana
+    )
+    assert resent.status_code == 409
+    assert api.post("/api/auth/redeem", json={"secret": spare}).status_code == 401
+
+
+def test_a_second_invite_withdraws_the_first(api, outbox):
+    """Correcting a too-broad invite by sending another must not leave the broad one live."""
+    ana = _signed_in(api, outbox, "ana@example.com")
+    broad = _invited(api, outbox, ana, role="owner", client=None)
+    narrow = _invited(api, outbox, ana, role="client_viewer")
+
+    assert [i["role"] for i in _list(api, ana).json()["invites"]] == ["client_viewer"]
+    assert api.post("/api/auth/redeem", json={"secret": broad}).status_code == 401
+    assert api.post("/api/auth/redeem", json={"secret": narrow}).status_code == 200
+
+
+def test_a_revoke_between_opening_and_joining_stops_the_join(api, fleet, outbox):
+    """`_join` redeems, then accepts: a revoke in between must win, and say it did."""
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    with FleetStore(fleet) as store:
+        opened = store.redeem_login_link(secret)
+    revoked = api.post(
+        "/api/orgs/agency-x/invites/revoke", json={"email": "cy@example.com"}, headers=ana
+    )
+    assert revoked.status_code == 200, revoked.text
+    with FleetStore(fleet) as store:
+        with pytest.raises(InvalidAccountError):
+            store.accept_invite(opened)
+        assert store.get_user_by_email("cy@example.com") is None
+
+
+def test_nothing_to_take_back_from_someone_who_joined(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 200
+    revoked = api.post(
+        "/api/orgs/agency-x/invites/revoke", json={"email": "cy@example.com"}, headers=ana
+    )
+    assert revoked.status_code == 404
+
+
+def test_a_resend_that_could_not_be_sent_leaves_the_old_link_working(fleet, outbox):
+    """The old link goes only once the new one has: a 502 changes nothing."""
+    failing = {"on": False}
+
+    def mailer(message):
+        if failing["on"]:
+            raise RuntimeError("Resend answered 500")
+        outbox(message)
+
+    with TestClient(_app(fleet, mailer=mailer)) as api:
+        ana = _signed_in(api, outbox, "ana@example.com")
+        old = _invited(api, outbox, ana)
+        failing["on"] = True
+        resent = api.post(
+            "/api/orgs/agency-x/invites/resend", json={"email": "cy@example.com"}, headers=ana
+        )
+        assert resent.status_code == 502
+        with FleetStore(fleet) as store:
+            unused = store._conn.execute(
+                "SELECT COUNT(*) AS n FROM login_links WHERE email = 'cy@example.com' "
+                "AND used_at IS NULL"
+            ).fetchone()["n"]
+        assert unused == 1, "the undelivered link is dropped"
+        assert api.post("/api/auth/redeem", json={"secret": old}).status_code == 200
+
+
+def test_a_resend_with_nothing_to_resend_spends_nothing(api, outbox):
+    """A mistyped address is a 404, and the pending org's three invites are all still there."""
+    pat = _session(_sign_up(api, outbox))
+    for _ in range(INVITE_LIMIT_PER_PENDING_ORG):
+        missing = api.post(
+            "/api/orgs/studio-pat/invites/resend", json={"email": "typo@example.com"}, headers=pat
+        )
+        assert missing.status_code == 404
+    for n in range(INVITE_LIMIT_PER_PENDING_ORG):
+        sent = _invite(api, pat, org="studio-pat", email=f"p{n}@example.com", role="member")
+        assert sent.status_code == 202, sent.text
 
 
 def test_resending_counts_against_the_same_limits_as_inviting(api, fleet, outbox):
