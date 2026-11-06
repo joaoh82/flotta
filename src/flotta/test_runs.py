@@ -16,7 +16,8 @@ from datetime import timedelta
 
 import pytest
 
-from flotta.runs import MAX_STEPS, MAX_TEXT, TRIGGER_KINDS
+from flotta import migrations, provision
+from flotta.runs import MAX_INPUT, MAX_ITEMS, MAX_STEPS, MAX_TEXT, RUN_DEADLINE_S, TRIGGER_KINDS
 from flotta.store import (
     BoxBusyError,
     FleetStore,
@@ -25,6 +26,9 @@ from flotta.store import (
 )
 from flotta.test_migrations import target  # noqa: F401
 from flotta.test_usage import T0, _call, seed_agency
+
+#: This build's migrations, before any test swaps the module's list.
+ALL = migrations.MIGRATIONS
 
 #: One `_call` at `test_usage.RATE`: 18 dollars, 9 euros, in nanos.
 ONE_CALL = 9_000_000_000
@@ -231,3 +235,109 @@ def test_the_live_run_is_the_running_one(agency):
 
     assert agency.live_run("b-one") == running
     assert agency.live_run("b-two") is None
+
+
+def test_the_sweep_leaves_a_run_inside_its_deadline_alone(agency):
+    """The guard for the control loop. Its reconcile sweep fails a *task* about
+    16 minutes in, and a run is a row of `tasks`. A run may last
+    `RUN_DEADLINE_S`: ending it early refuses its real result, and stops its
+    later model calls being charged to it."""
+    run = _started(agency, at=T0)
+    task_deadline = provision.DEFAULT_TIMEOUT_S + provision.DEFAULT_GRACE_S
+    later = T0 + timedelta(seconds=task_deadline + 60)
+
+    assert provision.reconcile(agency, now=later) == []
+    assert agency.get_run(run.id).status == "running"
+    assert agency.finish_run(run.id, "done", output="Done.", now=later).status == "done"
+
+
+def test_a_run_past_its_deadline_is_closed_as_stranded(agency):
+    """Whoever delivers a run gives up inside its deadline. A run still going
+    after it has lost its deliverer, and nothing else will ever end it."""
+    run = _started(agency, "b-one", at=T0)
+    queued = _run(agency, "b-two")
+    past = T0 + timedelta(seconds=RUN_DEADLINE_S + provision.DEFAULT_GRACE_S + 1)
+
+    outcomes = provision.reconcile(agency, now=past)
+
+    closed = agency.get_run(run.id)
+    assert [o["task_id"] for o in outcomes] == [run.id]
+    assert (closed.status, closed.error_class) == ("failed", "stranded")
+    assert agency.get_run(queued.id).status == "pending", "a queued run is not stranded"
+    with pytest.raises(InvalidTransitionError):
+        agency.finish_run(run.id, "done", now=past)
+
+
+def test_destroying_an_agent_ends_its_runs(agency):
+    running = _started(agency, "b-one")
+    queued = _run(agency, "b-one")
+
+    provision.teardown_box("b-one", store=agency)
+
+    assert agency.get_run(running.id).status == "failed"
+    assert agency.get_run(queued.id).status == "cancelled"
+    assert {agency.get_run(r.id).error_class for r in (running, queued)} == {"torn_down"}
+
+
+def test_the_task_status_path_cannot_move_a_run(agency):
+    """Only `start_run` checks the box is free, so only it may start a run."""
+    run = _run(agency)
+
+    with pytest.raises(ValueError, match="run"):
+        agency.update_task_status(run.id, "running")
+    assert agency.get_run(run.id).status == "pending"
+
+
+def test_a_task_is_not_a_run(agency):
+    """A row with no trigger is a task from the Modal era. It is not listed,
+    not live, and not something a call can be charged to."""
+    task = agency.create_task("b-one", "an old-style task")
+    agency.update_task_status(task.id, "running")
+    usage = _call(agency, "b-one", "names-a-task", run_id=task.id, now=T0)
+
+    assert agency.get_run(task.id) is None
+    assert agency.live_run("b-one") is None
+    assert agency.list_runs(org="studio-nord") == []
+    assert usage.run_id is None
+
+
+def test_a_runs_input_has_a_size_limit(agency):
+    """Output is clipped and steps are capped; a webhook's body is refused
+    whole rather than cut, since half a JSON document means something else."""
+    with pytest.raises(ValueError, match="input"):
+        _run(agency, input={"body": "x" * MAX_INPUT})
+
+    assert agency.list_runs(org="studio-nord") == []
+
+
+def test_a_wide_step_is_capped_too(agency):
+    wide = {f"key-{n}": n for n in range(MAX_ITEMS * 3)}
+    run = _started(agency)
+
+    kept = agency.finish_run(run.id, "done", steps=[wide], now=T0).steps["steps"][0]
+
+    assert len(kept) == MAX_ITEMS + 1
+    assert kept["…"] == MAX_ITEMS * 2, "says how many keys it left out"
+
+
+def test_migration_18_gives_an_old_task_its_boxs_tenant(target, monkeypatch):  # noqa: F811
+    """The one step of migration 18 that rewrites rows, on every engine."""
+    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(m for m in ALL if m.version < 18))
+    with FleetStore(target) as store:
+        store.create_org("studio-nord", "Studio Nord")
+        store.create_client("studio-nord", "acme", "Acme Dental")
+        store.create_box("one", box_id="b-one", org="studio-nord", client="acme")
+        store._conn.execute(
+            "INSERT INTO tasks (id, box_id, prompt, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("t-old", "b-one", "from before", "done", "2026-10-01T00:00:00+00:00"),
+        )
+
+    monkeypatch.setattr(migrations, "MIGRATIONS", ALL)
+    with FleetStore(target) as store:
+        row = store._conn.execute(
+            "SELECT org_id, client_id, trigger_kind, approval_count FROM tasks WHERE id = ?",
+            ("t-old",),
+        ).fetchone()
+
+    assert (row["org_id"], row["client_id"]) == ("studio-nord", "acme")
+    assert (row["trigger_kind"], row["approval_count"]) == (None, 0)

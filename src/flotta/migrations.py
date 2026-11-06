@@ -493,8 +493,10 @@ def _runs() -> tuple[str, ...]:
     Columns on `tasks` rather than a `runs` table: a rename is not additive, and
     the events CHECK names `'task'`. `org_id` and `client_id` are copied from the
     box so a tenant's runs list without a join, and filled in here for rows from
-    before. `trigger_kind` is NULL only on those. No cost or token columns: those
-    are `usage`'s, summed by `run_id`, which gets its index here.
+    before. A row with a `trigger_kind` is a run; one without is a task, from
+    before or from `create_task`. No cost or token columns: those are `usage`'s,
+    summed by `run_id`, which gets its index here. `(box_id, started_at)` is
+    for finding the run a model call was part of, which happens on every call.
     """
     return (
         "ALTER TABLE tasks ADD COLUMN org_id TEXT",
@@ -511,6 +513,7 @@ def _runs() -> tuple[str, ...]:
         "client_id = (SELECT client_id FROM boxes WHERE boxes.id = tasks.box_id)",
         "CREATE INDEX idx_tasks_tenant ON tasks(org_id, client_id, created_at)",
         "CREATE INDEX idx_usage_run ON usage(run_id)",
+        "CREATE INDEX idx_tasks_box_started ON tasks(box_id, started_at)",
     )
 
 

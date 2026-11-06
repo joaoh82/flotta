@@ -32,9 +32,20 @@ MAX_TEXT = 500
 #: Characters kept of a run's output, the agent's final reply.
 MAX_OUTPUT = 64_000
 
-#: Items kept of a list inside a step, and how deep a step's values may nest.
-_MAX_ITEMS = 50
+#: Characters of JSON a run's input may be. Refused whole above this rather
+#: than cut, because half a document means something else.
+MAX_INPUT = 64_000
+
+#: Items kept of a list or keys of a dict inside a step, and how deep a step's
+#: values may nest.
+MAX_ITEMS = 50
 _MAX_DEPTH = 6
+
+#: How long a run may stay `running` before the control loop closes it as
+#: `stranded`. Whoever delivers a run gives up well inside this, so a run still
+#: going after it has lost its deliverer (a restart mid-delivery) and nothing
+#: else will end it. A task's 15 minutes is too short for an agent's work.
+RUN_DEADLINE_S = 3600
 
 _CUT = "…"
 
@@ -42,6 +53,13 @@ _CUT = "…"
 def check_trigger_kind(kind: str) -> None:
     if kind not in TRIGGER_KINDS:
         raise ValueError(f"trigger kind must be one of {sorted(TRIGGER_KINDS)}, got {kind!r}")
+
+
+def check_input_size(encoded: str) -> None:
+    if len(encoded) > MAX_INPUT:
+        raise ValueError(
+            f"a run's input is {len(encoded)} characters of JSON; the limit is {MAX_INPUT}"
+        )
 
 
 def clip_text(text: str, limit: int) -> str:
@@ -66,8 +84,16 @@ def _clip(value: Any, depth: int) -> Any:
     if depth >= _MAX_DEPTH:
         return _CUT
     if isinstance(value, dict):
-        return {clip_text(str(k), MAX_TEXT): _clip(v, depth + 1) for k, v in value.items()}
+        # Two keys that clip to the same text keep the first, and count as left out.
+        kept_keys: dict[str, Any] = {}
+        for k, v in value.items():
+            key = clip_text(str(k), MAX_TEXT)
+            if len(kept_keys) < MAX_ITEMS and key not in kept_keys:
+                kept_keys[key] = _clip(v, depth + 1)
+        if len(kept_keys) < len(value):
+            kept_keys[_CUT] = len(value) - len(kept_keys)
+        return kept_keys
     if isinstance(value, list | tuple):
-        kept = [_clip(v, depth + 1) for v in value[:_MAX_ITEMS]]
-        return kept + [_CUT] if len(value) > _MAX_ITEMS else kept
+        kept = [_clip(v, depth + 1) for v in value[:MAX_ITEMS]]
+        return kept + [_CUT] if len(value) > MAX_ITEMS else kept
     return clip_text(str(value), MAX_TEXT)

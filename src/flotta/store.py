@@ -68,7 +68,7 @@ from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
 from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
-from flotta.runs import MAX_OUTPUT, cap_steps, check_trigger_kind, clip_text
+from flotta.runs import MAX_OUTPUT, cap_steps, check_input_size, check_trigger_kind, clip_text
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -713,15 +713,16 @@ class Task:
 
 @dataclass(frozen=True, slots=True)
 class Run:
-    """A task seen as a run (M14, `flotta.runs`): what started it, what it was
-    given, what it did. Its cost is `FleetStore.run_cost`, read from `usage`."""
+    """A row of `tasks` with a trigger (M14, `flotta.runs`): what started it,
+    what it was given, what it did. Its cost is `FleetStore.run_cost`, read
+    from `usage`. A row with no trigger is a task, from `create_task`, and is
+    not a run."""
 
     id: str
     box_id: str
     org: str
     client: str
-    #: NULL only on a task from before migration 18.
-    trigger_kind: str | None
+    trigger_kind: str
     trigger_id: str | None
     prompt: str
     input: Any
@@ -3492,10 +3493,15 @@ class FleetStore:
         with a status change in practice). ``finished_at`` is stamped on
         entering a terminal result. ``result`` carries the shard aggregate
         when there was fan-out — the reason shards need no table of their own.
+
+        Not a run's: those move by `start_run`, which checks the box is free,
+        and `finish_run`, which records what the run did.
         """
         _check_status("task", status)
         with self._conn.transaction(guard="tasks"):
             current = self._get_task_or_raise(task_id)
+            if self.get_run(task_id) is not None:
+                raise ValueError(f"{task_id!r} is a run; it moves by start_run and finish_run")
             _check_transition("task", task_id, current.status, status)
             if workspace_id is not None:
                 self._require_workspace_of(current.box_id, workspace_id)
@@ -3585,9 +3591,13 @@ class FleetStore:
         `start_run`: the box may be asleep, or doing another run.
 
         `prompt` is what the agent is told and `input` what it was told about,
-        such as a webhook's body. Whose run it is comes from the box's row.
+        such as a webhook's body, at most `flotta.runs.MAX_INPUT` characters of
+        JSON. Whose run it is comes from the box's row.
         """
         check_trigger_kind(trigger_kind)
+        encoded = None if input is None else json.dumps(input)
+        if encoded is not None:
+            check_input_size(encoded)
         rid = run_id or f"t-{uuid.uuid4().hex[:12]}"
         with self._conn.transaction(guard="tasks"):
             box = self._get_box_or_raise(box_id)
@@ -3606,7 +3616,7 @@ class FleetStore:
                     box.client,
                     trigger_kind,
                     trigger_id,
-                    None if input is None else json.dumps(input),
+                    encoded,
                 ),
             )
         return self._get_run_or_raise(rid)
@@ -3672,13 +3682,17 @@ class FleetStore:
         return self._get_run_or_raise(run_id)
 
     def get_run(self, run_id: str) -> Run | None:
-        row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (run_id,)).fetchone()
+        row = self._conn.execute(
+            "SELECT * FROM tasks WHERE id = ? AND trigger_kind IS NOT NULL", (run_id,)
+        ).fetchone()
         return _run_from_row(row) if row else None
 
     def live_run(self, box_id: str) -> Run | None:
         """The run `box_id` is doing now, if any. There is at most one."""
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE box_id = ? AND status = 'running'", (box_id,)
+            "SELECT * FROM tasks WHERE box_id = ? AND status = 'running' "
+            "AND trigger_kind IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1",
+            (box_id,),
         ).fetchone()
         return _run_from_row(row) if row else None
 
@@ -3694,7 +3708,7 @@ class FleetStore:
         """`org`'s runs, newest first. `org` is always required, as in `spend`:
         a client's id is only unique within its org, and a box filter must not
         reach past it."""
-        where = ["org_id = ?"]
+        where = ["org_id = ?", "trigger_kind IS NOT NULL"]
         params: list[Any] = [org]
         if client is not None:
             where.append("client_id = ?")
@@ -3749,14 +3763,16 @@ class FleetStore:
         """
         if named is not None:
             own = self._conn.execute(
-                "SELECT id FROM tasks WHERE id = ? AND box_id = ?", (named, box_id)
+                "SELECT id FROM tasks WHERE id = ? AND box_id = ? AND trigger_kind IS NOT NULL",
+                (named, box_id),
             ).fetchone()
             if own is not None:
                 return named
         moment = _instant(started)
         row = self._conn.execute(
-            "SELECT id FROM tasks WHERE box_id = ? AND started_at IS NOT NULL "
-            "AND started_at <= ? AND (finished_at IS NULL OR finished_at >= ?) "
+            "SELECT id FROM tasks WHERE box_id = ? AND trigger_kind IS NOT NULL "
+            "AND started_at IS NOT NULL AND started_at <= ? "
+            "AND (finished_at IS NULL OR finished_at >= ?) "
             "ORDER BY started_at DESC LIMIT 1",
             (box_id, moment, moment),
         ).fetchone()
