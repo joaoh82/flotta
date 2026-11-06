@@ -39,7 +39,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -55,7 +55,15 @@ DEFAULT_READY_TIMEOUT_S = 240
 
 
 class ChatError(Exception):
-    """Could not reach or drive the agent on a box."""
+    """Could not reach or drive the agent on a box.
+
+    `status` is the door's HTTP answer when it refused: 402 means the agent is
+    paused by budget and was not woken.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +395,10 @@ async def login(
     )
     if response.status != 200:
         body = (await response.text())[:200]
+        if token and response.status in (402, 403, 404):
+            # The door's own refusal, before any credential was tried: paused,
+            # or not this token's to reach.
+            raise ChatError(f"the door refused ({response.status}): {body}", status=response.status)
         if token:
             # Through the door the caller has no credentials to get wrong, so
             # a 401 is never about them. It is the door's copy — or a door
@@ -534,7 +546,12 @@ async def create_session(ws, *, title: str = "", timeout_s: float = 60.0) -> dic
 
 
 async def send_turn(
-    ws, session_id: str, text: str, *, timeout_s: float = DEFAULT_TURN_TIMEOUT_S
+    ws,
+    session_id: str,
+    text: str,
+    *,
+    timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
+    hear: Callable[[dict], None] | None = None,
 ) -> Turn:
     """Send one message and wait for the agent's reply.
 
@@ -567,6 +584,9 @@ async def send_turn(
         # answer that was refused in milliseconds.
         if frame.get("id") == rid and "error" in frame:
             raise ChatError(f"prompt.submit was rejected: {frame['error']}")
+        if hear is not None:
+            # Everything the turn streams, for a caller keeping its steps (M14.2).
+            hear(frame)
 
         params = frame.get("params") or {}
         if params.get("type") != COMPLETE_EVENT:

@@ -542,8 +542,12 @@ def mint(
     now: int | None = None,
     org: str | None = None,
     client: str | None = None,
+    box: str | None = None,
 ) -> str:
     """Issue a token. Refuses an unknown scope rather than carrying it.
+
+    `box` confines it to one box, as a chat ticket is (`admits`): a run's
+    delivery (`flotta.runner`) is good for its own agent and no other.
 
     An unknown scope is almost always a typo, and a typo'd scope is worse than
     a missing one: `fleet:reed` grants nothing while *looking* like it grants
@@ -563,7 +567,7 @@ def mint(
         )
     if ttl_s <= 0:
         raise AuthError("ttl must be positive; a token that is already expired is not useful")
-    for claim, value in (("org", org), ("client", client)):
+    for claim, value in (("org", org), ("client", client), ("box", box)):
         if value is not None and not value.strip():
             raise AuthError(f"an empty {claim} names nothing; omit it for the default")
     if SCOPE_ORG_ADMIN in wanted and client is not None:
@@ -585,6 +589,8 @@ def mint(
         claims["org"] = org.strip()
     if client is not None:
         claims["client"] = client.strip()
+    if box is not None:
+        claims["box"] = box.strip()
     payload = _encode(claims)
     return f"{TOKEN_PREFIX}{payload}.{_sign(payload, signing_key)}"
 
@@ -738,7 +744,7 @@ def _token_from(claims: dict[str, Any]) -> Token:
     # key, not the value: an explicit `"org": null` is a claim that is not a
     # name, and reading it as absent would hand out exactly that default.
     tenancy: dict[str, str | None] = {}
-    for claim in ("org", "client"):
+    for claim in ("org", "client", "box"):
         if claim not in claims:
             tenancy[claim] = None
             continue
@@ -757,4 +763,5 @@ def _token_from(claims: dict[str, Any]) -> Token:
         expires_at=claims["exp"],
         org=tenancy["org"],
         client=tenancy["client"],
+        box=tenancy["box"],
     )

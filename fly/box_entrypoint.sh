@@ -89,10 +89,9 @@ fi
 # How long a risky command waits for a person before it is denied (FLOTTA-60).
 #
 # Hermes asks the connected client and waits `approvals.timeout` seconds —
-# 300 by default — then denies. The app shows that question in the
-# conversation now, so a person watching answers in seconds; this shortens the
-# wait for an agent nobody is watching, from five minutes to one. Unanswered
-# is still deny.
+# 300 by default — then denies. A run's approval waits for a person to answer
+# it from the web app, and the control plane ends that wait (FLOTTA-147), so
+# this sets the agent's to outlast a run: an hour. Unanswered is still deny.
 #
 # In Python rather than here because it merges into a YAML file the agent may
 # have written, and leaves any timeout somebody chose alone — neither of which

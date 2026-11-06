@@ -3,6 +3,7 @@
 import yaml
 
 from flotta.box.approvals import (
+    EARLIER_FLOTTA_APPROVAL_TIMEOUTS_S,
     FLOTTA_APPROVAL_TIMEOUT_S,
     HERMES_DEFAULT_APPROVAL_TIMEOUT_S,
     apply,
@@ -11,19 +12,29 @@ from flotta.box.approvals import (
 )
 
 
-def test_a_box_with_no_config_gets_the_shorter_wait():
-    """The live fleet's case: no config.yaml on any volume, so Hermes ran on
-    its 300-second default and an unwatched approval stalled an agent for five
-    minutes."""
+def test_a_box_with_no_config_gets_flottas_wait():
+    """No config.yaml on the volume, so Hermes would run on its 300 s default."""
     config, changed = settle_timeout(None)
     assert changed
     assert config == {"approvals": {"timeout": FLOTTA_APPROVAL_TIMEOUT_S}}
 
 
-def test_the_shorter_wait_is_actually_shorter_than_hermes():
-    # A constant that drifted up to meet the default would make this whole
-    # change a no-op while every test above still passed.
-    assert FLOTTA_APPROVAL_TIMEOUT_S < HERMES_DEFAULT_APPROVAL_TIMEOUT_S
+def test_the_agent_waits_as_long_as_a_run_can():
+    """A run's approval waits for a person (FLOTTA-147), and the control plane
+    ends that wait. If the agent's own timeout ran out first, it would deny
+    the approval while someone was still being asked."""
+    from flotta.runs import RUN_DEADLINE_S, RUN_TIMEOUT_S
+
+    assert FLOTTA_APPROVAL_TIMEOUT_S >= RUN_DEADLINE_S > RUN_TIMEOUT_S
+
+
+def test_the_minute_this_used_to_write_is_replaced():
+    """Every box on the fleet booted with 60. Nobody chose it, and a box left
+    on it would deny a run's approval a minute after asking."""
+    for earlier in EARLIER_FLOTTA_APPROVAL_TIMEOUTS_S:
+        config, changed = settle_timeout({"approvals": {"timeout": earlier}})
+        assert changed
+        assert config["approvals"]["timeout"] == FLOTTA_APPROVAL_TIMEOUT_S
 
 
 def test_the_rest_of_the_approvals_block_is_kept():
@@ -97,7 +108,7 @@ def test_apply_merges_into_an_existing_file(tmp_path):
 
 def test_apply_is_idempotent_across_boots(tmp_path):
     """It runs on every boot. The second run must find its own value and
-    leave it — which also proves 60 is not mistaken for an unset default."""
+    leave it, so Flotta's own value is not mistaken for an unset default."""
     apply(tmp_path)
     first = (tmp_path / "config.yaml").read_text()
     line = apply(tmp_path)

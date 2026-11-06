@@ -47,6 +47,13 @@ _MAX_DEPTH = 6
 #: else will end it. A task's 15 minutes is too short for an agent's work.
 RUN_DEADLINE_S = 3600
 
+#: How long the control plane holds a run's conversation open before it gives
+#: up and fails the run (`flotta.runner`). Inside `RUN_DEADLINE_S`, so the
+#: deadline only ever closes a run that lost its deliverer. Not the relay's
+#: 240 s: that sits under the asking agent's own tool deadline, and a run has
+#: no asking agent.
+RUN_TIMEOUT_S = 50 * 60
+
 _CUT = "…"
 
 

@@ -578,6 +578,10 @@ def create_app(
     #: Reaches MCP servers' OAuth endpoints (FLOTTA-125), injected for the reason
     #: `reachable` is. An `httpx.BaseTransport`; `None` is the network.
     mcp_oauth_transport: Any = None,
+    #: Holds one run's conversation with its agent (`flotta.runner.Deliver`).
+    #: Injected for the reason `deliver` is. `None` goes through the front
+    #: door, and needs a signing key to mint the run's token.
+    deliver_run: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -812,6 +816,9 @@ def create_app(
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
     needs_peer = Depends(require(SCOPE_BOX_PEER))
     needs_admin = Depends(require(SCOPE_ORG_ADMIN))
+    #: The agency's people, or a client's person who talks to agents: who may
+    #: answer a run's approval, before the rules of `answer_run_approval`.
+    needs_answer = Depends(require(SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, any_of=True))
     needs_chat = Depends(require(SCOPE_BOX_CHAT))
     # Any valid credential at all: for the routes about the caller themselves.
     needs_anyone = Depends(require())
@@ -887,7 +894,12 @@ def create_app(
         """
         box = store.get_box(ref) or store.get_box_by_name(ref)
         if box is None or (
-            token is not None and admits_tenant(token, org=box.org, client=box.client) is not None
+            token is not None
+            and (
+                admits_tenant(token, org=box.org, client=box.client) is not None
+                # A run's token names its own box (`runner.run_token`).
+                or (token.box is not None and token.box != box.id)
+            )
         ):
             raise HTTPException(status_code=404, detail=f"no box {ref!r}")
         return box
@@ -956,6 +968,7 @@ def create_app(
     async def lifespan(app: Any):
         task: asyncio.Task | None = None
         alerts: asyncio.Task | None = None
+        runs: asyncio.Task | None = None
         if run_loop:
             # `loop_runner` makes the *interesting* failure testable: a loop
             # that is configured and supposed to be running, but is not
@@ -974,9 +987,19 @@ def create_app(
                     allow_local=local_webhooks,
                 )
             )
+            if carry_run is not None:
+                from flotta.runner import run_run_loop
+
+                runs = asyncio.create_task(run_run_loop(store_factory, carry_run))
+            else:
+                _log.warning("no signing key: runs wait in pending, since none can be delivered")
         try:
             yield
         finally:
+            if runs is not None:
+                runs.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await runs
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -4922,6 +4945,224 @@ def create_app(
         )
 
     carry = deliver if deliver is not None else _deliver
+
+    # -- runs (M14.2) ----------------------------------------------------------
+    #
+    # Work an agent does on its own: asked for here, delivered by the run loop
+    # (`flotta.runner`), read back with its steps and what it cost. The
+    # agency's, and a client's own systems' (a token for that client with
+    # `fleet:write`). A client's people see none of it (D21).
+
+    def _run_reader(token: Token | None) -> None:
+        """Not a client's people: a token confined to a client that can't change it."""
+        if token is not None and token.client is not None and not token.allows(SCOPE_FLEET_WRITE):
+            raise HTTPException(status_code=403, detail="runs are the agency's to see")
+
+    def _scoped_run(store: Any, token: Token | None, run_id: str) -> Any:
+        """A run `token` may read, or 404, as `_scoped_box` is for a box."""
+        run = store.get_run(run_id)
+        if run is None or (
+            token is not None
+            and (
+                admits_tenant(token, org=run.org, client=run.client) is not None
+                or (token.box is not None and token.box != run.box_id)
+            )
+        ):
+            raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+        return run
+
+    def _run_view(run: Any, cost: Any = None, approvals: Any = None) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        view = asdict(run)
+        if cost is not None:
+            view["cost"] = asdict(cost)
+        if approvals is not None:
+            view["approvals"] = [asdict(a) for a in approvals]
+            view["waiting_approval"] = any(a.status == "waiting" for a in approvals)
+        return view
+
+    @app.post("/api/boxes/{box_id}/runs", status_code=202)
+    def create_run(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """Ask an agent for a piece of work: `{prompt, input?}`. It waits in
+        `pending` until its agent is free; read it at `/api/runs/{id}`."""
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise HTTPException(status_code=422, detail="a run needs a prompt: what to do")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                run = store.create_run(box.id, prompt, trigger_kind="api", input=body.get("input"))
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            store.add_event(
+                "task",
+                run.id,
+                "created",
+                {"trigger": "api", "by": token.subject if token else None},
+            )
+            return _run_view(run)
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/runs")
+    def list_box_runs(box_id: str, limit: int = 50, token: Token | None = needs_read) -> Any:
+        """An agent's runs, newest first."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            _run_reader(token)
+            runs = store.list_runs(org=box.org, box=box.id, limit=min(limit, 200))
+            return {"runs": [_run_view(r) for r in runs]}
+        finally:
+            store.close()
+
+    @app.get("/api/clients/{client_id}/runs")
+    def list_client_runs(client_id: str, limit: int = 50, token: Token | None = needs_read) -> Any:
+        """A client's runs in the caller's org, newest first."""
+        org = (token.org if token else None) or DEFAULT_ORG
+        if token is not None and token.client is not None and token.client != client_id:
+            raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
+        _run_reader(token)
+        store = store_factory()
+        try:
+            runs = store.list_runs(org=org, client=client_id, limit=min(limit, 200))
+            return {"runs": [_run_view(r) for r in runs]}
+        finally:
+            store.close()
+
+    @app.get("/api/runs/{run_id}")
+    def get_run(run_id: str, token: Token | None = needs_read) -> Any:
+        """One run: what started it, what it was given, its steps, its reply and its cost."""
+        store = store_factory()
+        try:
+            run = _scoped_run(store, token, run_id)
+            _run_reader(token)
+            return _run_view(run, store.run_cost(run.id), store.run_approvals(run.id))
+        finally:
+            store.close()
+
+    # A run's agent asked permission and waits for a person (`flotta.runner`).
+    # FLOTTA-124's rules, as the door keeps them for a conversation: the
+    # agency answers with any choice the box offered; a client's people only
+    # where the agency allowed it for that agent, and never "always".
+
+    @app.post("/api/runs/{run_id}/approval")
+    def answer_run_approval(
+        run_id: str, body: dict[str, Any], token: Token | None = needs_answer
+    ) -> Any:
+        """`{choice, approval?}`: answer what the run's agent is waiting on.
+
+        `approval` names one when the agent asked more than one; without it, the
+        one waiting. The run's delivery sends the choice to the box.
+        """
+        from dataclasses import asdict
+
+        from flotta.door.conversation import CLIENT_APPROVAL_CHOICES
+        from flotta.store import ApprovalClosedError
+
+        choice = body.get("choice")
+        store = store_factory()
+        try:
+            run = _scoped_run(store, token, run_id)
+            box = _scoped_box(store, token, run.box_id)
+            if run.status != "running":
+                raise HTTPException(
+                    status_code=409, detail=f"run {run_id!r} is {run.status}: nobody would hear it"
+                )
+            allowed: frozenset[str] | None = None
+            if token is not None:
+                if token.box is not None or subject_box(token.subject) is not None:
+                    raise HTTPException(status_code=403, detail="an agent answers no approval")
+                if token.client is not None:
+                    if not store.clients_answer_approvals(box.id):
+                        raise HTTPException(
+                            status_code=403,
+                            detail="the agency answers this agent's approvals",
+                        )
+                    allowed = CLIENT_APPROVAL_CHOICES
+                elif not token.allows(SCOPE_FLEET_WRITE):
+                    raise HTTPException(
+                        status_code=403, detail=f"answering needs {SCOPE_FLEET_WRITE}"
+                    )
+            waiting = [a for a in store.run_approvals(run.id) if a.status == "waiting"]
+            named = body.get("approval")
+            if named is not None:
+                waiting = [a for a in waiting if a.id == named]
+            if len(waiting) != 1:
+                detail = (
+                    "nothing is waiting for an answer"
+                    if not waiting
+                    else "more than one approval is waiting: name one with `approval`"
+                )
+                raise HTTPException(status_code=409, detail=detail)
+            approval = waiting[0]
+            if choice not in approval.choices or (allowed is not None and choice not in allowed):
+                offered = [c for c in approval.choices if allowed is None or c in allowed]
+                raise HTTPException(
+                    status_code=422, detail=f"choose one of {offered}, got {choice!r}"
+                )
+            try:
+                answered = store.answer_approval(
+                    approval.id, choice, by=token.subject if token else "local"
+                )
+            except ApprovalClosedError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event(
+                "task", run.id, "approval_answered", {"choice": choice, "by": answered.answered_by}
+            )
+            return asdict(answered)
+        finally:
+            store.close()
+
+    @app.get("/api/approvals")
+    def list_waiting_approvals(token: Token | None = needs_answer) -> Any:
+        """The approvals waiting for a person that the caller may answer, oldest first.
+
+        The agency's: every one in its org. A client's people: their client's,
+        on the agents the agency lets them answer for.
+        """
+        from dataclasses import asdict
+
+        if token is not None and (token.box is not None or subject_box(token.subject)):
+            raise HTTPException(status_code=403, detail="an agent answers no approval")
+        org = (token.org if token else None) or DEFAULT_ORG
+        store = store_factory()
+        try:
+            if token is None or token.client is None:
+                found = store.waiting_approvals(org=org)
+            else:
+                boxes = [
+                    b.id
+                    for b in _scoped_boxes(store, token)
+                    if store.clients_answer_approvals(b.id)
+                ]
+                found = store.waiting_approvals(org=org, client=token.client, boxes=boxes)
+            return {"approvals": [asdict(a) for a in found]}
+        finally:
+            store.close()
+
+    async def _deliver_run(run: Any, box: Any, talk: Any) -> str:
+        """The default delivery: through the front door, with a token for this
+        run's agent alone (`runner.run_token`), alive for the conversation."""
+        from flotta import runner
+        from flotta.runs import RUN_TIMEOUT_S
+
+        assert key is not None
+        token = runner.run_token(run, box, key=key, ttl_s=int(RUN_TIMEOUT_S) + 60)
+        return await runner.through_door(
+            box,
+            runner.message(run),
+            token=token,
+            talk=talk,
+            timeout_s=RUN_TIMEOUT_S,
+            title=f"Run {run.id}",
+        )
+
+    carry_run = deliver_run if deliver_run is not None else (_deliver_run if key else None)
 
     @app.get("/api/boxes/{box_id}/peer/roster")
     def peer_roster(box_id: str, token: Token | None = needs_peer) -> Any:

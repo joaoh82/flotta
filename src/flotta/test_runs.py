@@ -19,6 +19,8 @@ import pytest
 from flotta import migrations, provision
 from flotta.runs import MAX_INPUT, MAX_ITEMS, MAX_STEPS, MAX_TEXT, RUN_DEADLINE_S, TRIGGER_KINDS
 from flotta.store import (
+    APPROVAL_HELD_S,
+    ApprovalClosedError,
     BoxBusyError,
     FleetStore,
     InvalidTransitionError,
@@ -341,3 +343,120 @@ def test_migration_19_gives_an_old_task_its_boxs_tenant(target, monkeypatch):  #
 
     assert (row["org_id"], row["client_id"]) == ("studio-nord", "acme")
     assert (row["trigger_kind"], row["approval_count"]) == (None, 0)
+
+
+# -- a run's approvals (FLOTTA-147) --------------------------------------------
+
+
+def _asked(store, box="b-one", request_id="srq-1", expires_in=timedelta(minutes=30)):
+    run = _started(store, box, at=T0)
+    return store.ask_approval(
+        run.id,
+        request_id=request_id,
+        command="rm -rf /tmp/x",
+        description="delete",
+        choices=["once", "deny"],
+        expires_at=T0 + expires_in,
+        now=T0,
+    )
+
+
+def test_an_approval_takes_one_answer(agency):
+    approval = _asked(agency)
+
+    answered = agency.answer_approval(approval.id, "once", by="user:ada", now=T0)
+
+    assert (answered.status, answered.choice, answered.answered_by) == (
+        "answered",
+        "once",
+        "user:ada",
+    )
+    with pytest.raises(ApprovalClosedError):
+        agency.answer_approval(approval.id, "deny", by="user:bob", now=T0)
+    assert agency.get_approval(approval.id).choice == "once"
+
+
+def test_an_approval_past_its_time_takes_no_answer(agency):
+    approval = _asked(agency, expires_in=timedelta(minutes=1))
+
+    with pytest.raises(ApprovalClosedError):
+        agency.answer_approval(approval.id, "once", by="user:ada", now=T0 + timedelta(minutes=2))
+    assert agency.waiting_approvals(org="studio-nord", now=T0 + timedelta(minutes=2)) == []
+
+
+def test_a_question_asked_twice_is_one_approval(agency):
+    first = _asked(agency)
+    again = agency.ask_approval(
+        first.run_id,
+        request_id="srq-1",
+        command="rm -rf /tmp/x",
+        description="delete",
+        choices=["once", "deny"],
+        expires_at=T0 + timedelta(minutes=30),
+    )
+
+    assert again.id == first.id
+    assert len(agency.run_approvals(first.run_id)) == 1
+
+
+def test_waiting_approvals_keep_to_their_tenant(agency):
+    mine = _asked(agency, "b-one")
+    bravo = _asked(agency, "b-three")
+    _asked(agency, "b-four")
+    expired = agency.expire_approvals(bravo.run_id, now=T0)
+
+    assert [a.id for a in expired] == [bravo.id]
+    assert [a.id for a in agency.waiting_approvals(org="studio-nord", now=T0)] == [mine.id]
+    assert agency.waiting_approvals(org="studio-nord", client="bravo", now=T0) == []
+    assert agency.waiting_approvals(org="studio-nord", boxes=["b-two"], now=T0) == []
+    assert agency.waiting_approvals(org="studio-nord", boxes=[], now=T0) == []
+
+
+def test_the_queue_offers_each_agent_its_oldest_run(agency):
+    """Not a flat window over every pending run: one agent with a long queue
+    would fill it, and no other agent would ever be offered work."""
+    flood = [_run(agency, "b-one") for _ in range(3)]
+    other = _run(agency, "b-two")
+
+    offered = agency.queued_runs(limit=2)
+    elsewhere = agency.queued_runs(limit=2, skip_boxes=["b-one"])
+
+    assert [r.id for r in offered] == [flood[0].id, other.id]
+    assert [r.id for r in elsewhere] == [other.id]
+
+
+def test_an_answer_needs_a_delivery_holding_the_run(agency):
+    """After a restart nobody holds the run's socket, so an answer would go
+    nowhere. Its delivery says it is listening (`hold_approvals`); an
+    approval nobody has held for `APPROVAL_HELD_S` takes no answer."""
+    approval = _asked(agency)
+    later = T0 + timedelta(seconds=APPROVAL_HELD_S + 1)
+
+    with pytest.raises(ApprovalClosedError, match="listening"):
+        agency.answer_approval(approval.id, "once", by="user:ada", now=later)
+    assert agency.waiting_approvals(org="studio-nord", now=later) == []
+
+    agency.hold_approvals(approval.run_id, now=later)
+
+    assert agency.answer_approval(approval.id, "once", by="user:ada", now=later).choice == "once"
+
+
+def test_an_answer_never_carried_to_the_box_expires_with_its_run(agency):
+    """Answered between the delivery's last look and its end: the box was told
+    no, so the row must not say yes."""
+    approval = _asked(agency)
+    agency.answer_approval(approval.id, "once", by="user:ada", now=T0)
+
+    agency.expire_approvals(approval.run_id, now=T0)
+
+    assert agency.get_approval(approval.id).status == "expired"
+
+
+def test_an_answer_carried_to_the_box_stands(agency):
+    approval = _asked(agency)
+    agency.answer_approval(approval.id, "once", by="user:ada", now=T0)
+    agency.mark_delivered(approval.id, now=T0)
+
+    agency.expire_approvals(approval.run_id, now=T0)
+
+    assert agency.get_approval(approval.id).status == "answered"
