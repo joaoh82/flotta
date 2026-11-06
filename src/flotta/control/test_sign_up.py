@@ -8,7 +8,7 @@ call and a sign-up should cost nothing at all.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -505,3 +505,178 @@ def test_only_an_orgs_admins_change_its_team(api, fleet, outbox):
     pat = _session(_sign_up(api, outbox))
     assert api.get("/api/orgs/agency-x/members", headers=pat).status_code == 404
     assert api.delete(f"/api/orgs/agency-x/members/{ana_id}", headers=pat).status_code == 404
+
+
+# -- invites not yet opened: listing, resending, taking back (FLOTTA-144) -------
+#
+# The guards come first: a resent or revoked link stops working, another org's
+# owner meets a 404, and the list never carries anything a link could be found by.
+
+
+def _invited(api, outbox, owner, email="cy@example.com", role="client_user", client="acme"):
+    sent = _invite(api, owner, email=email, role=role, client=client)
+    assert sent.status_code == 202, sent.text
+    return outbox.secret()
+
+
+def _list(api, headers, org="agency-x"):
+    return api.get(f"/api/orgs/{org}/invites", headers=headers)
+
+
+# -- the guards ------------------------------------------------------------------
+
+
+def test_a_resent_invite_replaces_the_old_link(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    first = _invited(api, outbox, ana)
+    resent = api.post(
+        "/api/orgs/agency-x/invites/resend", json={"email": "cy@example.com"}, headers=ana
+    )
+    assert resent.status_code == 202, resent.text
+    assert resent.json() == {
+        "invited": "cy@example.com",
+        "org": "agency-x",
+        "role": "client_user",
+        "client": "acme",
+    }
+    second = outbox.secret()
+    assert second != first
+
+    assert api.post("/api/auth/redeem", json={"secret": first}).status_code == 401
+    joined = api.post("/api/auth/redeem", json={"secret": second})
+    assert joined.status_code == 200, joined.text
+    me = api.get("/api/me", headers=_session(joined.json())).json()
+    assert me["memberships"] == [{"org": "agency-x", "client": "acme", "role": "client_user"}]
+
+
+def test_a_revoked_invite_stops_working(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    revoked = api.post(
+        "/api/orgs/agency-x/invites/revoke", json={"email": "cy@example.com"}, headers=ana
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 401
+    assert _list(api, ana).json()["invites"] == []
+
+
+def test_another_orgs_owner_cannot_see_or_touch_them(api, fleet, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    pat = _session(_sign_up(api, outbox))
+    assert _list(api, pat).status_code == 404
+    for action in ("resend", "revoke"):
+        refused = api.post(
+            f"/api/orgs/agency-x/invites/{action}", json={"email": "cy@example.com"}, headers=pat
+        )
+        assert refused.status_code == 404, action
+    assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 200
+
+
+def test_only_an_owner_lists_them(api, outbox):
+    bo = _signed_in(api, outbox, "bo@example.com")
+    assert _list(api, bo).status_code == 403
+
+
+def test_the_list_carries_nothing_a_link_could_be_found_by(api, fleet, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    with FleetStore(fleet) as store:
+        hashes = [
+            r["token_hash"]
+            for r in store._conn.execute("SELECT token_hash FROM login_links").fetchall()
+        ]
+    text = _list(api, ana).text
+    assert secret not in text
+    assert not any(h in text for h in hashes)
+
+
+# -- the list ----------------------------------------------------------------------
+
+
+def test_lists_open_invites_once_per_address_newest_first(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    _invited(api, outbox, ana, email="cy@example.com", role="client_viewer")
+    _invited(api, outbox, ana, email="cy@example.com", role="client_user")
+    _invited(api, outbox, ana, email="di@example.com", role="member", client=None)
+    invites = _list(api, ana).json()["invites"]
+    assert [(i["email"], i["role"], i["client"]) for i in invites] == [
+        ("di@example.com", "member", None),
+        ("cy@example.com", "client_user", "acme"),
+    ]
+    assert set(invites[0]) == {"email", "role", "client", "created_at", "expires_at"}
+
+
+def test_an_opened_invite_leaves_the_list(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 200
+    assert _list(api, ana).json()["invites"] == []
+
+
+def test_an_expired_invite_leaves_the_list_and_can_be_resent(fleet):
+    with FleetStore(fleet) as store:
+        long_ago = datetime.now(UTC) - timedelta(days=30)
+        store.create_login_link(
+            "cy@example.com",
+            purpose="invite",
+            org_id="agency-x",
+            client_id="acme",
+            role="client_user",
+            now=long_ago,
+        )
+        assert store.open_invites("agency-x") == []
+        secret, invite = store.reissue_invite("agency-x", "cy@example.com")
+        assert (invite.role, invite.client) == ("client_user", "acme")
+        assert [i.email for i in store.open_invites("agency-x")] == ["cy@example.com"]
+        assert store.redeem_login_link(secret) is not None
+
+
+# -- what is refused ----------------------------------------------------------------
+
+
+def test_nothing_to_resend_or_revoke_is_a_404(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    for action in ("resend", "revoke"):
+        missing = api.post(
+            f"/api/orgs/agency-x/invites/{action}",
+            json={"email": "nobody@example.com"},
+            headers=ana,
+        )
+        assert missing.status_code == 404, action
+
+
+def test_an_opened_invite_cannot_be_resent(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    secret = _invited(api, outbox, ana)
+    assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 200
+    again = api.post(
+        "/api/orgs/agency-x/invites/resend", json={"email": "cy@example.com"}, headers=ana
+    )
+    assert again.status_code == 404
+
+
+def test_resending_counts_against_the_same_limits_as_inviting(api, fleet, outbox):
+    """A pending org may send three: resending cannot be a way round that."""
+    pat = _session(_sign_up(api, outbox))
+    api.post("/api/orgs/studio-pat/clients", json={"id": "acme", "name": "Acme"}, headers=pat)
+    assert (
+        _invite(api, pat, org="studio-pat", email="a@example.com", role="member").status_code == 202
+    )
+    for _ in range(2):
+        assert (
+            api.post(
+                "/api/orgs/studio-pat/invites/resend", json={"email": "a@example.com"}, headers=pat
+            ).status_code
+            == 202
+        )
+    over = api.post(
+        "/api/orgs/studio-pat/invites/resend", json={"email": "a@example.com"}, headers=pat
+    )
+    assert over.status_code == 429
+
+
+def test_the_operator_may_list_any_orgs(api, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    _invited(api, outbox, ana)
+    assert [i["email"] for i in _list(api, _operator()).json()["invites"]] == ["cy@example.com"]

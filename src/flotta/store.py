@@ -603,6 +603,21 @@ class LoginLink:
 
 
 @dataclass(frozen=True, slots=True)
+class Invite:
+    """An invite nobody has opened yet, as an owner sees it (FLOTTA-144).
+
+    Nothing derived from its secret, not even the hash: the list goes to a
+    browser, and a hash is how a link is found.
+    """
+
+    email: str
+    role: str
+    client: str | None
+    created_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class Session:
     """A signed-in user, acting as their membership of one org.
 
@@ -1546,6 +1561,104 @@ class FleetStore:
                     user.id, link.org, link.role, client_id=link.client
                 )
         return user, membership
+
+    def open_invites(self, org_id: str, *, now: datetime | None = None) -> list[Invite]:
+        """The invites to `org_id` not yet opened and not expired, newest first.
+
+        One per address: an owner may send two before either is opened, and
+        the newest says what joining would grant now.
+        """
+        rows = self._conn.execute(
+            "SELECT email, role, client_id, created_at, expires_at FROM login_links "
+            "WHERE purpose = 'invite' AND org_id = ? AND used_at IS NULL AND expires_at > ? "
+            "ORDER BY created_at DESC, email",
+            (org_id, _stamp(now or datetime.now(UTC))),
+        ).fetchall()
+        seen: set[str] = set()
+        found: list[Invite] = []
+        for row in rows:
+            if row["email"] in seen:
+                continue
+            seen.add(row["email"])
+            found.append(
+                Invite(
+                    email=row["email"],
+                    role=row["role"],
+                    client=row["client_id"],
+                    created_at=row["created_at"],
+                    expires_at=row["expires_at"],
+                )
+            )
+        return found
+
+    def withdraw_invites(self, org_id: str, email: str) -> int:
+        """Take back every invite to `org_id` for `email`; how many there were.
+
+        Deleting the row is what makes its link stop working, at once:
+        `redeem_login_link` finds nothing, and `accept_invite` re-checks the
+        row under its guard, so one opened a moment before is refused too.
+        """
+        email = normalize_email(email)
+        with self._conn.transaction(guard="login_links"):
+            gone = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM login_links "
+                "WHERE purpose = 'invite' AND org_id = ? AND email = ? AND used_at IS NULL",
+                (org_id, email),
+            ).fetchone()["n"]
+            self._conn.execute(
+                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
+                "AND used_at IS NULL",
+                (org_id, email),
+            )
+        return int(gone)
+
+    def reissue_invite(
+        self,
+        org_id: str,
+        email: str,
+        *,
+        ttl_s: int = INVITE_TTL_S,
+        now: datetime | None = None,
+    ) -> tuple[str, Invite]:
+        """A fresh link for the open invite to `org_id` for `email`; the old ones stop working.
+
+        For an invite that expired unopened, went to spam, or was lost: the
+        same role and client as the newest one, a new secret and a new expiry.
+        `UnknownEntityError` if there is no invite to that address that was
+        never opened (one that expired counts; one that was used does not).
+        """
+        email = normalize_email(email)
+        moment = now or datetime.now(UTC)
+        with self._conn.transaction(guard="login_links"):
+            row = self._conn.execute(
+                "SELECT role, client_id FROM login_links "
+                "WHERE purpose = 'invite' AND org_id = ? AND email = ? AND used_at IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (org_id, email),
+            ).fetchone()
+            if row is None:
+                raise UnknownEntityError(f"no open invite to {org_id!r} for {email}")
+            self._conn.execute(
+                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
+                "AND used_at IS NULL",
+                (org_id, email),
+            )
+            secret = self.create_login_link(
+                email,
+                purpose="invite",
+                org_id=org_id,
+                client_id=row["client_id"],
+                role=row["role"],
+                ttl_s=ttl_s,
+                now=moment,
+            )
+        return secret, Invite(
+            email=email,
+            role=row["role"],
+            client=row["client_id"],
+            created_at=_stamp(moment),
+            expires_at=_stamp(moment + timedelta(seconds=ttl_s)),
+        )
 
     def create_login_link(
         self,
