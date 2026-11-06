@@ -43,6 +43,8 @@ class FakeMcp:
         self.revoked: list[str] = []
         #: Every grant type the token endpoint was asked for, in order.
         self.token_calls: list[str] = []
+        #: Every form the token endpoint was sent, to read the client it named.
+        self.token_forms: list[dict[str, str]] = []
         self.refreshes = 0
         self.registered = 0
         self.expires_in = 3600
@@ -81,6 +83,7 @@ class FakeMcp:
     def _token(self, request: httpx.Request) -> httpx.Response:
         form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
         self.token_calls.append(form["grant_type"])
+        self.token_forms.append(form)
         if form.get("resource") != MCP_URL:
             return httpx.Response(400, json={"error": "invalid_target"})
         if form["grant_type"] == "authorization_code":

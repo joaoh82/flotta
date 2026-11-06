@@ -501,7 +501,7 @@ def _mcp() -> tuple[str, ...]:
     - `mcp_calls`: one row per tool call, refused ones too. The tool's name and
       what became of it, never its arguments or its result.
 
-    The catalogue is not here: it is the operator's, from the environment.
+    The catalogue is not here: it is the operator's, a fleet setting (migration 23).
     """
     return (
         """
@@ -589,6 +589,31 @@ def _mcp_clients() -> tuple[str, ...]:
         "ALTER TABLE mcp_connections_v2 RENAME TO mcp_connections",
         "ALTER TABLE mcp_oauth_flows ADD COLUMN client_id TEXT",
         "ALTER TABLE mcp_calls ADD COLUMN account TEXT",
+    )
+
+
+def _mcp_catalogue() -> tuple[str, ...]:
+    """The MCP catalogue edited in the console (FLOTTA-125).
+
+    The list itself is a fleet setting, `FLOTTA_MCP_SERVERS`, beside the model
+    list (`flotta.settings`). What a setting can't hold is here:
+
+    - `mcp_server_secrets`: an operator's OAuth client secret per server, sealed
+      (`flotta.sealed`). Set and removed over the API, never read back.
+    - `mcp_connections.server_url`: the address a connection was made for, so an
+      agency's credential is never sent to another one after the entry changes
+      (`flotta.mcp.connection_usable`). NULL for a connection made before, kept.
+    """
+    return (
+        """
+        CREATE TABLE mcp_server_secrets (
+            server        TEXT PRIMARY KEY,
+            client_secret TEXT NOT NULL,
+            updated_by    TEXT,
+            updated_at    TEXT NOT NULL
+        )
+        """,
+        "ALTER TABLE mcp_connections ADD COLUMN server_url TEXT",
     )
 
 
@@ -788,6 +813,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         21, "mcp clients: a client's own connection, and which one served a call", _mcp_clients()
     ),
     Migration(22, "run approvals: what a run's agent asked a person", _run_approvals()),
+    Migration(
+        23,
+        "mcp catalogue: operators' client secrets, and the address a connection was made for",
+        _mcp_catalogue(),
+    ),
 )
 
 

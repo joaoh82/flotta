@@ -1043,6 +1043,8 @@ class McpConnection:
     connected_by: str | None
     created_at: str
     updated_at: str
+    #: The server's URL when it was connected; `None` for one made before that was kept.
+    server_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2662,20 +2664,23 @@ class FleetStore:
         credential: str,
         by: str | None,
         client: str | None = None,
+        server_url: str | None = None,
     ) -> McpConnection:
         """Connect, or connect again: a new credential, and `ok` whatever it was before.
 
         `client` makes it that client's own, ahead of the org's for its agents.
+        `server_url` is the address it is for; it is never used for another.
         """
         now = _utcnow()
         self._conn.execute(
             "INSERT INTO mcp_connections (org_id, client_id, server, kind, credential, status, "
-            "detail, connected_by, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 'ok', NULL, ?, ?, ?) "
+            "detail, connected_by, created_at, updated_at, server_url) "
+            "VALUES (?, ?, ?, ?, ?, 'ok', NULL, ?, ?, ?, ?) "
             "ON CONFLICT (org_id, client_id, server) DO UPDATE SET kind = EXCLUDED.kind, "
             "credential = EXCLUDED.credential, status = 'ok', detail = NULL, "
-            "connected_by = EXCLUDED.connected_by, updated_at = EXCLUDED.updated_at",
-            (org_id, client or "", server, kind, credential, by, now, now),
+            "connected_by = EXCLUDED.connected_by, updated_at = EXCLUDED.updated_at, "
+            "server_url = EXCLUDED.server_url",
+            (org_id, client or "", server, kind, credential, by, now, now, server_url),
         )
         found = self.mcp_connection(org_id, server, client=client)
         assert found is not None
@@ -2800,6 +2805,38 @@ class FleetStore:
                     "VALUES (?, ?, ?, ?, ?)",
                     (box_id, server, tools, 1 if ask_first else 0, now),
                 )
+
+    def boxes_granted_mcp(self, servers: Sequence[str]) -> list[str]:
+        """Every box granted any of `servers`: whose config a catalogue change rewrites."""
+        if not servers:
+            return []
+        marks = ", ".join("?" for _ in servers)
+        rows = self._conn.execute(
+            f"SELECT DISTINCT box_id FROM box_mcp_grants WHERE server IN ({marks}) ORDER BY box_id",
+            tuple(servers),
+        ).fetchall()
+        return [str(r["box_id"]) for r in rows]
+
+    def set_mcp_server_secret(self, server: str, sealed: str, *, by: str | None) -> None:
+        """An operator's OAuth client secret for `server`, already sealed."""
+        self._conn.execute(
+            "INSERT INTO mcp_server_secrets (server, client_secret, updated_by, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (server) DO UPDATE SET "
+            "client_secret = EXCLUDED.client_secret, updated_by = EXCLUDED.updated_by, "
+            "updated_at = EXCLUDED.updated_at",
+            (server, sealed, by, _utcnow()),
+        )
+
+    def delete_mcp_server_secret(self, server: str) -> bool:
+        row = self._conn.execute(
+            "DELETE FROM mcp_server_secrets WHERE server = ? RETURNING server", (server,)
+        ).fetchone()
+        return row is not None
+
+    def mcp_server_secrets(self) -> dict[str, str]:
+        """Every server's sealed client secret, by server: read with the catalogue."""
+        rows = self._conn.execute("SELECT server, client_secret FROM mcp_server_secrets")
+        return {str(r["server"]): str(r["client_secret"]) for r in rows}
 
     def box_mcp_grants(self, box_id: str) -> list[McpGrant]:
         rows = self._conn.execute(

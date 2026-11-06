@@ -50,6 +50,16 @@ client's connection had broken. So the call fails and says to connect it
 again; disconnecting the client's is how the agency's comes back.
 
 Each call's row says which one served it (`account`: `org` or `client`).
+
+## The catalogue, on every request
+
+Read from the store with each request (`flotta.mcp.catalogue_of`: the stored
+setting, or this process's environment), with no cache, so a server the
+operator removes or changes in the console is refused on its very next call.
+It is one small read beside the grant's, on a path that already reads the
+store. A connection made for another address than the entry now has, of
+another kind, or sealed under a key this process doesn't hold, is never used
+(`flotta.mcp.connection_usable`); the agent is told to have it connected again.
 """
 
 from __future__ import annotations
@@ -69,11 +79,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from flotta import mcp_oauth
 from flotta.mcp import (
     Grant,
-    McpError,
     Server,
     auth_headers,
-    catalogue,
+    catalogue_of,
     connection_context,
+    connection_usable,
     grant_from_row,
 )
 from flotta.sealed import SealError, seal, unseal
@@ -119,6 +129,14 @@ METHOD_REFUSED = -32601
 PASSED = frozenset({"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"})
 
 _EVENT_END = b"\n\n"
+
+
+def _as_clause(why: str, server: Server) -> str:
+    """`connection_usable`'s reason, after "<title>'s connection for <whose>"."""
+    prefix = f"{server.title} "
+    if why.startswith(prefix):
+        why = why[len(prefix) :]
+    return why if why.startswith("stopped") else f"can't be used: {why}"
 
 
 class McpRefused(Exception):
@@ -271,13 +289,6 @@ class Proxy:
         self._env = env
         self._transport = transport
         self._oauth_transport = oauth_transport
-        try:
-            self.servers = catalogue(env)
-        except McpError:
-            # A catalogue that can't be read serves nothing, and says why on every call,
-            # rather than stopping the gateway that every agent's models go through.
-            _log.exception("the MCP catalogue could not be read")
-            self.servers = {}
         self._locks: dict[tuple[str, str, str], threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._audit = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-audit")
@@ -297,13 +308,31 @@ class Proxy:
 
     # -- the store, on a thread ------------------------------------------------
 
-    def _grant(self, box: Box, server: Server) -> Grant | None:
+    def servers(self) -> dict[str, Server]:
+        """The catalogue now. One that can't be read serves nothing, and says why."""
         store = self._store_factory()
         try:
-            row = store.box_mcp_grant(box.id, server.name)
+            servers, error = catalogue_of(store, self._env)
         finally:
             store.close()
-        return grant_from_row(row.server, row.tools, row.ask_first) if row else None
+        if error:
+            # Not raised: the gateway every agent's models go through keeps going.
+            _log.error("the MCP catalogue could not be read: %s", error)
+        return servers
+
+    def _lookup(self, box: Box, name: str) -> tuple[Server | None, Grant | None]:
+        """The server as the catalogue has it now, and this box's grant of it."""
+        store = self._store_factory()
+        try:
+            servers, error = catalogue_of(store, self._env)
+            if error:
+                _log.error("the MCP catalogue could not be read: %s", error)
+            server = servers.get(name)
+            row = store.box_mcp_grant(box.id, name) if server is not None else None
+        finally:
+            store.close()
+        grant = grant_from_row(row.server, row.tools, row.ask_first) if row else None
+        return server, grant
 
     def record(
         self, box: Box, server: Server, tool: str, status: str, account: str | None = None
@@ -353,15 +382,18 @@ class Proxy:
                 found = store.mcp_connection(box.org, server.name)
             account = "client" if client else "org"
             whose = "this client" if client else "this agency"
-            if found is None or found.kind != server.auth:
+            if found is None:
                 raise McpRefused(
                     503, f"{server.title} isn't connected for {whose} yet", account=account
                 )
-            if found.status != "ok":
+            why = connection_usable(found, server, self._env)
+            if why is not None:
                 # Never the org's in its place: see the module docstring.
+                if found.status != "ok":
+                    why = "stopped working: connect it again"
                 raise McpRefused(
                     503,
-                    f"{server.title}'s connection for {whose} stopped working: connect it again",
+                    f"{server.title}'s connection for {whose} {_as_clause(why, server)}",
                     account=account,
                 )
             context = connection_context(box.org, server.name, client)
@@ -392,7 +424,12 @@ class Proxy:
                             "connect it again",
                             account=account,
                         )
-                    opened = unseal(again.credential, context=context, env=self._env)
+                    try:
+                        opened = unseal(again.credential, context=context, env=self._env)
+                    except SealError as exc:
+                        raise McpRefused(
+                            503, f"the gateway can't use {whose}'s credential", account=account
+                        ) from exc
                     credential = json.loads(opened)
                     if credential.get("access_token") != stale and not mcp_oauth.needs_refresh(
                         credential
@@ -469,10 +506,9 @@ class Proxy:
         self, request: Request, name: str, caller: Callable[[Request], Awaitable[Box]]
     ) -> tuple[Box, Server, Grant]:
         box = await caller(request)
-        server = self.servers.get(name)
+        server, grant = await asyncio.to_thread(self._lookup, box, name)
         if server is None:
             raise McpRefused(404, f"no MCP server {name!r} in this fleet", code=NOT_GRANTED)
-        grant = await asyncio.to_thread(self._grant, box, server)
         if grant is None:
             raise McpRefused(403, f"{server.title} isn't granted to this agent", code=NOT_GRANTED)
         return box, server, grant

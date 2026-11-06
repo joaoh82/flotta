@@ -842,8 +842,16 @@ conventions, and the sharp edges below.
   the grant every request, `tools/list` filtered, an ungranted `tools/call` refused before
   it goes out, the credential swapped in, a row in `mcp_calls`), `flotta.mcp_oauth` (Flotta
   as the OAuth client: discovery, registration, PKCE, refresh under a per-connection lock)
-  and `flotta.sealed` (AES-GCM under `$FLOTTA_SECRETS_KEY`, bound to its row, failing
-  closed; FLOTTA-102 is meant to reuse it). The box's token is its own `mcp:call`, written
+  and `flotta.sealed` (AES-GCM under `$FLOTTA_SECRETS_KEY`, else a key HKDF-derived from
+  the signing key, bound to its row, failing closed; FLOTTA-102 is meant to reuse it).
+  **The catalogue is the fleet setting `FLOTTA_MCP_SERVERS`**, edited in the console like
+  `FLOTTA_MODELS` (stored wins, environment the fallback) and read on every request by the
+  control plane and the gateway (`mcp.catalogue_of`); an operator's OAuth client secret
+  is not in it but sealed in `mcp_server_secrets` (migration 23). **A connection is
+  used only for the URL it was made for, and only if it opens under this key**
+  (`mcp.connection_usable`, the gateway's rule and every read's). A grant write, or a
+  catalogue change, asks a running agent's Hermes to `reload.mcp` over exec
+  (`box/mcp_reload.py`), best effort. The box's token is its own `mcp:call`, written
   literally into the entry: the agent reading it learns nothing it can't already use.
   **A sign-in's code is traded only in the claim, by whoever started it**: the callback
   keeps nothing and hands the code to the browser that signed in, so a starter who sends

@@ -62,7 +62,7 @@ import os
 import secrets as secrets_module
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -1822,6 +1822,46 @@ def rules_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:
 #: The event that says an agent's MCP grants were written to its `config.yaml`.
 MCP_GRANTS_CHANGED = "mcp_grants_changed"
 
+#: In the command that asks a box's Hermes to reload its MCP servers, and nowhere else.
+MCP_RELOAD_MARK = "--flotta-mcp-reload"
+
+
+def _mcp_reload_command() -> str:
+    """Run `flotta.box.mcp_reload` on the box: the script travels with the command."""
+    import base64
+    from pathlib import Path
+
+    from flotta.box import mcp_reload
+
+    script = base64.b64encode(Path(mcp_reload.__file__).read_bytes()).decode("ascii")
+    return f"printf %s {script} | base64 -d | {BOX_PYTHON} - {MCP_RELOAD_MARK}"
+
+
+def _reload_mcp(box: Box, store: FleetStore, backend: Backend | None) -> bool | None:
+    """Ask a running agent's Hermes to drop and rediscover its MCP servers. Best effort.
+
+    `None` when nothing was asked: an agent that isn't running reads its config
+    when it boots, so it isn't woken for this. The outcome is an event either
+    way, and never fails the grant, which is already in force at the gateway.
+    """
+    if box.status != "running" or not box.endpoint:
+        return None
+    try:
+        result = _resolve_backend(box, backend).exec(box.endpoint, _mcp_reload_command())
+    except Exception as exc:  # noqa: BLE001 - best effort, recorded
+        detail: str | None = str(exc) or type(exc).__name__
+    else:
+        detail = (
+            None
+            if result.exit_code == 0
+            else ((result.stderr or result.stdout or "").strip() or "no output")
+        )
+    if detail is None:
+        store.add_event("box", box.id, "mcp_reloaded", {})
+        return True
+    store.add_event("box", box.id, "mcp_reload_failed", {"detail": detail[:500]})
+    return False
+
 
 def set_mcp_grants(
     box_id: str,
@@ -1850,7 +1890,7 @@ def set_mcp_grants(
     import json
 
     from flotta.auth import SCOPE_MCP_CALL, AuthError, box_subject, mint
-    from flotta.mcp import catalogue, config_changes, mcp_base
+    from flotta.mcp import catalogue_of, config_changes, mcp_base
     from flotta.settings import layered
 
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
@@ -1877,7 +1917,8 @@ def set_mcp_grants(
             "$FLOTTA_SIGNING_KEY where the control plane runs."
         ) from exc
     previous = [g.server for g in store.box_mcp_grants(box.id)]
-    changes = config_changes(grants, catalogue(source), base=base, token=token, previous=previous)
+    servers, _ = catalogue_of(store)
+    changes = config_changes(grants, servers, base=base, token=token, previous=previous)
     detail = None
     try:
         _writable_box(box.id, store)
@@ -1905,7 +1946,48 @@ def set_mcp_grants(
                     detail = (result.stderr or result.stdout or "").strip() or "no output"
         if detail is not None:
             store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
-    return {**mcp_grants_of(box.id, store=store), "written": detail is None, "detail": detail}
+    reloaded = _reload_mcp(box, store, backend) if detail is None else None
+    return {
+        **mcp_grants_of(box.id, store=store),
+        "written": detail is None,
+        "detail": detail,
+        "reloaded": reloaded,
+    }
+
+
+def rewrite_mcp_configs(
+    servers: Iterable[str],
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    by: str | None = None,
+) -> dict[str, bool]:
+    """Write again the config of every agent granted any of `servers`, after the
+    catalogue changed (FLOTTA-125). Each `{box: written}`.
+
+    The grants stay as they are: a server taken off the catalogue is refused at
+    the gateway at once, its grant shows as going away, and writing the config
+    again takes its entry out and reloads the agent, the same as removing the
+    grant. A server whose tools changed gets its new `tools.include`.
+    """
+    from flotta.mcp import grant_from_row
+
+    out: dict[str, bool] = {}
+    for box_id in store.boxes_granted_mcp(list(servers)):
+        box = store.get_box(box_id)
+        if box is None or is_terminal("box", box.status):
+            continue
+        grants = tuple(
+            grant_from_row(r.server, r.tools, r.ask_first) for r in store.box_mcp_grants(box_id)
+        )
+        try:
+            written = set_mcp_grants(box_id, grants, store=store, backend=backend, by=by)
+        except ProvisionError as exc:
+            _log.warning("the MCP config of %s was not rewritten: %s", box_id, exc)
+            out[box_id] = False
+            continue
+        out[box_id] = bool(written["written"])
+    return out
 
 
 def mcp_grants_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:

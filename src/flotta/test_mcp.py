@@ -13,6 +13,7 @@ from flotta.mcp import (
     McpError,
     config_changes,
     mcp_base,
+    normalized,
     parse_catalogue,
     parse_grants,
     parse_key,
@@ -181,3 +182,103 @@ def test_a_key_that_cant_go_in_a_header_is_refused(key):
 def test_an_oauth_server_takes_no_key():
     with pytest.raises(McpError, match="signing in"):
         parse_key({"key": "k"}, SERVERS["linear"])
+
+
+# -- the console's catalogue, and asking a running agent to reload ---------------------
+
+
+class _Machine:
+    def __init__(self, reload_code=0, fail_reload=False):
+        self.commands: list[str] = []
+        self.reload_code, self.fail_reload = reload_code, fail_reload
+
+    def exec(self, endpoint, command):
+        from flotta.backend import ExecResult
+        from flotta.provision import MCP_RELOAD_MARK
+
+        self.commands.append(command)
+        if MCP_RELOAD_MARK in command:
+            if self.fail_reload:
+                raise RuntimeError("machine went away")
+            return ExecResult(self.reload_code, "", "refused" if self.reload_code else "")
+        return ExecResult(0, "config written", "")
+
+
+@pytest.fixture
+def granted(tmp_path, monkeypatch):
+    from flotta.store import FleetStore
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k")
+    monkeypatch.setenv("FLOTTA_GATEWAY_URL", "https://gw.example.test/v1")
+    store = FleetStore(tmp_path / "fleet.db")
+    store.set_setting(
+        "FLOTTA_MCP_SERVERS",
+        normalized(
+            json.dumps([{"name": "notes", "url": "https://n.example.test", "auth": "bearer"}])
+        ),
+    )
+    store.create_box("one", box_id="b-one")
+    yield store
+    store.close()
+
+
+def _events(store, kind):
+    return [e for e in store.get_box_timeline("b-one") if e.type == kind]
+
+
+def test_a_running_agent_is_asked_to_reload_after_its_grants_are_written(granted):
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    machine = _Machine()
+    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    assert answer["written"] is True and answer["reloaded"] is True
+    assert MCP_RELOAD_MARK in machine.commands[-1]
+    assert MCP_RELOAD_MARK not in machine.commands[0]
+    assert _events(granted, "mcp_reloaded")
+
+
+def test_an_agent_that_isnt_running_isnt_woken_to_reload(granted):
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    answer = set_mcp_grants("b-one", (), store=granted, backend=machine)
+    assert answer["reloaded"] is None
+    assert not any(MCP_RELOAD_MARK in c for c in machine.commands)
+
+
+@pytest.mark.parametrize("machine", [_Machine(reload_code=1), _Machine(fail_reload=True)])
+def test_a_reload_that_fails_is_recorded_and_the_grant_stands(granted, machine):
+    from flotta.provision import set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    assert answer["written"] is True and answer["reloaded"] is False
+    assert [g["server"] for g in answer["servers"]] == ["notes"]
+    assert _events(granted, "mcp_reload_failed")
+
+
+def test_the_reload_script_carries_no_credential():
+    """It reads the box's own dashboard login where it runs; nothing is sent in."""
+    from flotta.provision import _mcp_reload_command
+
+    command = _mcp_reload_command()
+    assert "PASSWORD=" not in command and "Bearer" not in command
+
+
+def test_a_client_secret_is_never_in_the_setting():
+    """The setting is shown to the operator and copied about; a secret has its own table."""
+    raw = json.dumps(
+        [
+            {
+                "name": "t",
+                "url": "https://t.example.test",
+                "auth": "oauth",
+                "oauth": {"client_id": "c", "client_secret": "s"},
+            }
+        ]
+    )
+    with pytest.raises(McpError, match="unknown oauth fields: client_secret"):
+        normalized(raw)

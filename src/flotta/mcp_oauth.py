@@ -98,9 +98,11 @@ class Endpoints:
 class Client:
     client_id: str
     #: A secret the provider issued at registration. One the operator registered
-    #: is read from the environment instead, and never stored.
+    #: is read where the operator keeps it instead, and never copied here.
     client_secret: str | None = None
-    #: Whether the secret comes from `client_secret_env`.
+    #: Whether the secret is the operator's: set in the console (sealed with the
+    #: catalogue) or named by `client_secret_env`. Read when it is needed, so a
+    #: secret changed since a connection was made is the one used.
     from_env: bool = False
 
 
@@ -296,7 +298,8 @@ def client_for(
     settings = server.oauth
     assert settings is not None
     if settings.client_id:
-        return Client(settings.client_id, from_env=bool(settings.client_secret_env))
+        held = bool(settings.client_secret_env or settings.client_secret_sealed)
+        return Client(settings.client_id, from_env=held)
     if not endpoints.registration:
         raise OAuthError(
             f"{server.name} offers no client registration, so the operator must register "
@@ -329,7 +332,23 @@ def client_for(
 def _secret(server: Server, client: Client, env: Mapping[str, str] | None) -> str | None:
     if not client.from_env:
         return client.client_secret
-    assert server.oauth is not None and server.oauth.client_secret_env
+    assert server.oauth is not None
+    if server.oauth.client_secret_sealed:
+        from flotta.mcp import server_secret_context
+        from flotta.sealed import SealError, unseal
+
+        try:
+            return unseal(
+                server.oauth.client_secret_sealed,
+                context=server_secret_context(server.name),
+                env=env,
+            )
+        except SealError as exc:
+            raise OAuthError(
+                f"{server.name}'s client secret won't open here: set it again in the console"
+            ) from exc
+    if not server.oauth.client_secret_env:
+        raise OAuthError(f"{server.name} has no client secret set: set one in the console")
     source = os.environ if env is None else env
     value = (source.get(server.oauth.client_secret_env) or "").strip()
     if not value:
