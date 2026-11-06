@@ -142,3 +142,154 @@ def test_a_run_token_reaches_no_other_agent_through_the_fleet_api(api, fleet):
 
 def test_an_agent_in_another_org_is_not_asked(api):
     assert _ask(api, box=Y).status_code == 404
+
+
+# -- answering a run's approval (FLOTTA-124's rules) ---------------------------
+
+
+def _waiting(fleet, choices=("once", "session", "always", "deny")):
+    """A run of agency-x's `support` agent, waiting on one approval."""
+    from datetime import UTC, datetime, timedelta
+
+    with FleetStore(fleet) as store:
+        run = store.create_run(_ids(fleet)[X], "Tidy up", trigger_kind="api")
+        store.start_run(run.id)
+        approval = store.ask_approval(
+            run.id,
+            request_id="srq-1",
+            command="rm -rf /tmp/flotta-standin-probe",
+            description="delete in root path",
+            choices=list(choices),
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+    return run, approval
+
+
+def _allow_clients(fleet):
+    with FleetStore(fleet) as store:
+        store.set_clients_answer_approvals(_ids(fleet)[X], True)
+
+
+CLIENT_USER = (SCOPE_FLEET_READ, SCOPE_BOX_CHAT)
+
+
+def _answer(api, run, choice, headers=None, **extra):
+    return api.post(
+        f"/api/runs/{run.id}/approval",
+        json={"choice": choice, **extra},
+        headers=headers or _bearer(SCOPE_FLEET_WRITE, **AGENCY),
+    )
+
+
+def test_the_agency_answers_with_any_choice_the_agent_offered(api, fleet):
+    run, approval = _waiting(fleet)
+
+    answer = _answer(api, run, "always")
+
+    assert answer.status_code == 200, answer.text
+    assert (answer.json()["status"], answer.json()["choice"]) == ("answered", "always")
+
+
+def test_a_run_is_read_as_waiting_until_it_is_answered(api, fleet):
+    run, approval = _waiting(fleet)
+    reader = _bearer(SCOPE_FLEET_READ, **AGENCY)
+
+    before = api.get(f"/api/runs/{run.id}", headers=reader).json()
+    _answer(api, run, "once")
+    after = api.get(f"/api/runs/{run.id}", headers=reader).json()
+
+    assert before["waiting_approval"] is True
+    assert before["approvals"][0]["command"] == "rm -rf /tmp/flotta-standin-probe"
+    assert after["waiting_approval"] is False
+
+
+def test_an_approval_is_answered_once(api, fleet):
+    run, _ = _waiting(fleet)
+
+    assert _answer(api, run, "once").status_code == 200
+    assert _answer(api, run, "deny").status_code == 409
+
+
+def test_a_choice_the_agent_did_not_offer_is_refused(api, fleet):
+    run, _ = _waiting(fleet, choices=("once", "deny"))
+
+    answer = _answer(api, run, "always")
+
+    assert answer.status_code == 422
+    assert "once" in answer.json()["detail"]
+
+
+def test_a_clients_person_answers_only_where_the_agency_allows_it(api, fleet):
+    run, _ = _waiting(fleet)
+    person = _bearer(*CLIENT_USER, org="agency-x", client="acme")
+
+    refused = _answer(api, run, "once", headers=person)
+    _allow_clients(fleet)
+    always = _answer(api, run, "always", headers=person)
+    once = _answer(api, run, "once", headers=person)
+
+    assert refused.status_code == 403
+    assert always.status_code == 422, "never 'always' from a client's people"
+    assert once.status_code == 200
+
+
+def test_a_client_viewer_answers_nothing(api, fleet):
+    run, _ = _waiting(fleet)
+    _allow_clients(fleet)
+
+    answer = _answer(api, run, "once", headers=_bearer(SCOPE_FLEET_READ, **AGENCY, client="acme"))
+
+    assert answer.status_code == 403
+
+
+def test_another_orgs_approval_is_not_there(api, fleet):
+    run, _ = _waiting(fleet)
+
+    answer = _answer(api, run, "once", headers=_bearer(SCOPE_FLEET_WRITE, org="agency-y"))
+
+    assert answer.status_code == 404
+
+
+def test_an_agents_own_run_token_answers_nothing(api, fleet):
+    """The run's token holds `box:chat` on that agent: still not a person."""
+    from flotta import runner
+
+    run, _ = _waiting(fleet)
+    with FleetStore(fleet) as store:
+        box = store.get_box(run.box_id)
+    token = runner.run_token(run, box, key=KEY, ttl_s=300)
+    _allow_clients(fleet)
+
+    answer = _answer(api, run, "once", headers={"Authorization": f"Bearer {token}"})
+
+    assert answer.status_code == 403
+
+
+def test_nothing_waiting_is_said(api, fleet):
+    run = _ask(api).json()
+
+    answer = api.post(
+        f"/api/runs/{run['id']}/approval",
+        json={"choice": "once"},
+        headers=_bearer(SCOPE_FLEET_WRITE, **AGENCY),
+    )
+
+    assert answer.status_code == 409
+
+
+def test_waiting_approvals_are_listed_for_whoever_may_answer_them(api, fleet):
+    run, approval = _waiting(fleet)
+    agency = _bearer(SCOPE_FLEET_READ, **AGENCY)
+    person = _bearer(*CLIENT_USER, org="agency-x", client="acme")
+    stranger = _bearer(SCOPE_FLEET_READ, org="agency-y")
+
+    def listed(headers):
+        return [a["id"] for a in api.get("/api/approvals", headers=headers).json()["approvals"]]
+
+    assert listed(agency) == [approval.id]
+    assert listed(person) == [], "not until the agency lets the client answer"
+    assert listed(stranger) == []
+    _allow_clients(fleet)
+    assert listed(person) == [approval.id]
+    _answer(api, run, "once")
+    assert listed(agency) == []

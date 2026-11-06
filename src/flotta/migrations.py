@@ -586,6 +586,39 @@ def _runs() -> tuple[str, ...]:
     )
 
 
+def _run_approvals() -> tuple[str, ...]:
+    """What a run's agent asked a person, and the answer (FLOTTA-147).
+
+    A run is work nobody is watching, so its approval waits here for someone
+    to answer it from outside the conversation. `request_id` is the box's own
+    id for the question, which the control plane answers on the run's socket.
+    `status` is `waiting`, `answered` or `expired`.
+    """
+    return (
+        """
+        CREATE TABLE run_approvals (
+            id          TEXT PRIMARY KEY,
+            run_id      TEXT NOT NULL REFERENCES tasks(id),
+            box_id      TEXT NOT NULL,
+            org_id      TEXT NOT NULL,
+            client_id   TEXT NOT NULL,
+            request_id  TEXT NOT NULL,
+            command     TEXT,
+            description TEXT,
+            choices_json TEXT NOT NULL,
+            asked_at    TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            choice      TEXT,
+            answered_by TEXT,
+            answered_at TEXT,
+            UNIQUE (run_id, request_id)
+        )
+        """,
+        "CREATE INDEX idx_run_approvals_waiting ON run_approvals(org_id, status, asked_at)",
+    )
+
+
 #: Every migration, in order. Append only.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
@@ -711,6 +744,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         "mcp: an org's connections, an agent's grants, and every tool call",
         _mcp(),
     ),
+    Migration(21, "run approvals: what a run's agent asked a person", _run_approvals()),
 )
 
 

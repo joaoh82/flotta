@@ -42,7 +42,6 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 #: How deep a chain of delegations may go. A asks B, B asks C, C asks D is
 #: three hops and already further than anything we can explain the bill for.
@@ -226,12 +225,8 @@ async def deliver_through_door(
     domain: str | None = None,
     title: str = "",
     timeout_s: float = DEFAULT_TIMEOUT_S,
-    hear: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Hold one turn with an agent through the front door, and return its reply.
-
-    `hear` gets every frame of the turn as it streams; a run keeps its steps
-    from them (`flotta.runner`).
 
     The same path the app takes, from the other side of it: resolve, wake,
     wait for ready, one `prompt.submit`, one `message.complete`. Waking is the
@@ -250,7 +245,7 @@ async def deliver_through_door(
             await client.await_ready(socket, timeout_s=timeout_s)
             created = await client.create_session(socket, title=title, timeout_s=timeout_s)
             turn = await client.send_turn(
-                socket, str(created.get("session_id") or ""), text, timeout_s=timeout_s, hear=hear
+                socket, str(created.get("session_id") or ""), text, timeout_s=timeout_s
             )
             return turn.response
         finally:

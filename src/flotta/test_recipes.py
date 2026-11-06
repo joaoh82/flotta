@@ -22,6 +22,8 @@ import re
 
 import pytest
 
+from flotta.box.approvals import FLOTTA_APPROVAL_TIMEOUT_S
+
 _JUSTFILE = pathlib.Path(__file__).resolve().parents[2] / "justfile"
 
 #: `from flotta.a.b import C, D` inside an inline `python -c` in a recipe.
@@ -261,7 +263,7 @@ def test_the_entrypoint_sets_the_approval_timeout_for_real(tmp_path):
 
     assert "approvals.timeout set to" in result.stdout, result.stdout + result.stderr
     written = yaml.safe_load((home / "config.yaml").read_text())
-    assert written["approvals"]["timeout"] < 300
+    assert written["approvals"]["timeout"] == FLOTTA_APPROVAL_TIMEOUT_S
 
 
 def test_a_box_without_the_venv_still_boots_past_the_approvals_line(tmp_path):
@@ -314,7 +316,7 @@ def test_the_entrypoint_registers_flottas_skills_for_real(tmp_path):
     )
     assert "still-booting" in result.stdout
     written = yaml.safe_load((home / "config.yaml").read_text())
-    assert written["approvals"]["timeout"] < 300
+    assert written["approvals"]["timeout"] == FLOTTA_APPROVAL_TIMEOUT_S
     (registered,) = written["skills"]["external_dirs"]
     assert pathlib.Path(registered, "flotta", "flotta-github-access", "SKILL.md").is_file()
 
@@ -370,7 +372,7 @@ def test_the_entrypoint_tells_hermes_its_model_for_real(tmp_path):
     written = yaml.safe_load((home / "config.yaml").read_text())
     assert written["model"]["default"] == "anthropic/claude-sonnet-4.5"
     assert written["model"]["provider"] == "openrouter"
-    assert written["approvals"]["timeout"] < 300
+    assert written["approvals"]["timeout"] == FLOTTA_APPROVAL_TIMEOUT_S
     assert written["skills"]["external_dirs"]
 
     # With no venv at all, the box still boots past all three.

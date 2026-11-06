@@ -468,6 +468,10 @@ class InvalidBoxNameError(StoreError):
     """
 
 
+class ApprovalClosedError(StoreError):
+    """An approval that was already answered, or that expired, takes no answer."""
+
+
 class BoxBusyError(StoreError):
     """A box already has a run going. Runs on one box go one at a time, so a
     model call that names no run has exactly one it can belong to."""
@@ -756,6 +760,30 @@ class Run:
     steps: dict[str, Any] | None
     approval_count: int
     error_class: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunApproval:
+    """Permission a run's agent asked for, waiting for a person (FLOTTA-147)."""
+
+    id: str
+    run_id: str
+    box_id: str
+    org: str
+    client: str
+    #: The box's JSON-RPC id for the question, which the answer goes back to.
+    request_id: str
+    command: str | None
+    description: str | None
+    #: What the box offered, such as `["once", "session", "always", "deny"]`.
+    choices: list[str]
+    asked_at: str
+    expires_at: str
+    #: `waiting`, `answered` or `expired`.
+    status: str
+    choice: str | None
+    answered_by: str | None
+    answered_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -4175,6 +4203,137 @@ class FleetStore:
         ).fetchone()
         return row["id"] if row else None
 
+    # -- a run's approvals (FLOTTA-147) ------------------------------------
+
+    def ask_approval(
+        self,
+        run_id: str,
+        *,
+        request_id: str,
+        command: str | None,
+        description: str | None,
+        choices: list[str],
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> RunApproval:
+        """Record that `run_id`'s agent is waiting for a person's answer.
+
+        Asked twice, by the same request, the first stands: Hermes can repeat
+        an open question, and it is still one question.
+        """
+        with self._conn.transaction(guard="run_approvals"):
+            run = self._get_run_or_raise(run_id)
+            row = self._conn.execute(
+                "SELECT id FROM run_approvals WHERE run_id = ? AND request_id = ?",
+                (run_id, request_id),
+            ).fetchone()
+            if row is not None:
+                approval_id = row["id"]
+            else:
+                approval_id = f"a-{uuid.uuid4().hex[:12]}"
+                self._conn.execute(
+                    "INSERT INTO run_approvals (id, run_id, box_id, org_id, client_id, "
+                    "request_id, command, description, choices_json, asked_at, expires_at, "
+                    "status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting')",
+                    (
+                        approval_id,
+                        run.id,
+                        run.box_id,
+                        run.org,
+                        run.client,
+                        request_id,
+                        command,
+                        description,
+                        json.dumps(list(choices)),
+                        _instant(now) if now else _utcnow(),
+                        _instant(expires_at),
+                    ),
+                )
+        return self._get_approval_or_raise(approval_id)
+
+    def answer_approval(
+        self, approval_id: str, choice: str, *, by: str, now: datetime | None = None
+    ) -> RunApproval:
+        """A person's answer. Once only, and only while it waits and has time left."""
+        moment = now or datetime.now(UTC)
+        with self._conn.transaction(guard="run_approvals"):
+            current = self._get_approval_or_raise(approval_id)
+            # Instants are stored in one format (`_instant`), so they compare as text.
+            if current.status != "waiting" or current.expires_at <= _instant(moment):
+                raise ApprovalClosedError(f"approval {approval_id!r} is {current.status}")
+            self._conn.execute(
+                "UPDATE run_approvals SET status = 'answered', choice = ?, answered_by = ?, "
+                "answered_at = ? WHERE id = ?",
+                (choice, by, _instant(moment), approval_id),
+            )
+        return self._get_approval_or_raise(approval_id)
+
+    def expire_approvals(self, run_id: str, *, now: datetime | None = None) -> list[RunApproval]:
+        """Close `run_id`'s waiting approvals as expired: its conversation has ended."""
+        with self._conn.transaction(guard="run_approvals"):
+            ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM run_approvals WHERE run_id = ? AND status = 'waiting'",
+                    (run_id,),
+                ).fetchall()
+            ]
+            if ids:
+                self._conn.execute(
+                    "UPDATE run_approvals SET status = 'expired', answered_at = ? "
+                    "WHERE run_id = ? AND status = 'waiting'",
+                    (_instant(now) if now else _utcnow(), run_id),
+                )
+        return [self._get_approval_or_raise(i) for i in ids]
+
+    def get_approval(self, approval_id: str) -> RunApproval | None:
+        row = self._conn.execute(
+            "SELECT * FROM run_approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        return _approval_from_row(row) if row else None
+
+    def run_approvals(self, run_id: str) -> list[RunApproval]:
+        """`run_id`'s approvals, in the order they were asked."""
+        rows = self._conn.execute(
+            "SELECT * FROM run_approvals WHERE run_id = ? ORDER BY asked_at, id", (run_id,)
+        ).fetchall()
+        return [_approval_from_row(r) for r in rows]
+
+    def waiting_approvals(
+        self,
+        *,
+        org: str,
+        client: str | None = None,
+        boxes: list[str] | None = None,
+        now: datetime | None = None,
+    ) -> list[RunApproval]:
+        """`org`'s approvals still waiting for an answer, oldest first.
+
+        `org` is always required, as in `list_runs`. `boxes`, when given, keeps
+        only those agents' approvals.
+        """
+        where = ["org_id = ?", "status = 'waiting'", "expires_at > ?"]
+        params: list[Any] = [org, _instant(now) if now else _utcnow()]
+        if client is not None:
+            where.append("client_id = ?")
+            params.append(client)
+        if boxes is not None:
+            if not boxes:
+                return []
+            where.append(f"box_id IN ({','.join('?' * len(boxes))})")
+            params.extend(boxes)
+        rows = self._conn.execute(
+            f"SELECT * FROM run_approvals WHERE {' AND '.join(where)} ORDER BY asked_at, id",
+            params,
+        ).fetchall()
+        return [_approval_from_row(r) for r in rows]
+
+    def _get_approval_or_raise(self, approval_id: str) -> RunApproval:
+        approval = self.get_approval(approval_id)
+        if approval is None:
+            raise UnknownEntityError(f"no approval with id {approval_id!r}")
+        return approval
+
     def _get_run_or_raise(self, run_id: str) -> Run:
         run = self.get_run(run_id)
         if run is None:
@@ -4680,6 +4839,26 @@ def _run_from_row(row: db.Row) -> Run:
         steps=json.loads(row["steps_json"]) if row["steps_json"] is not None else None,
         approval_count=int(row["approval_count"]),
         error_class=row["error_class"],
+    )
+
+
+def _approval_from_row(row: db.Row) -> RunApproval:
+    return RunApproval(
+        id=row["id"],
+        run_id=row["run_id"],
+        box_id=row["box_id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        request_id=row["request_id"],
+        command=row["command"],
+        description=row["description"],
+        choices=json.loads(row["choices_json"]),
+        asked_at=row["asked_at"],
+        expires_at=row["expires_at"],
+        status=row["status"],
+        choice=row["choice"],
+        answered_by=row["answered_by"],
+        answered_at=row["answered_at"],
     )
 
 

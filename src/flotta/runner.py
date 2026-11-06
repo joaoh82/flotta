@@ -22,11 +22,17 @@ A run for a paused agent, or for one a stopping budget holds, ends
 so a schedule must not undo what the budget did. A 402 from the door, a pause
 that landed between the check and the wake, ends the same way.
 
-## Approvals, for now
+## An approval waits for a person
 
-An approval the agent asks during a run is recorded as a step and counted, and
-left unanswered: the agent's own timeout denies it (`flotta.box.approvals`).
-Waiting for a person to answer it is FLOTTA-158.
+A run is work nobody is watching. When its agent asks permission for a risky
+command, the question is recorded (`FleetStore.ask_approval`) and the run
+waits, with its socket open, until someone answers it from outside the
+conversation (`POST /api/runs/{id}/approval`) or the run's time is up. The
+answer goes back to the box on this socket, as the reply to the box's own
+request, so the box hears exactly one answer and only its choice. A question
+still open when the run ends is denied and marked `expired`: silence is not
+consent. The agent's own timeout is longer than a run (`flotta.box.approvals`),
+so it is this loop, not Hermes, that ends the wait.
 
 ## When the control plane restarts mid-run
 
@@ -38,10 +44,11 @@ again, which would do the work twice: `provision.reap_runs` closes it as
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from flotta import budgets
@@ -65,11 +72,14 @@ MAX_CONCURRENT = 4
 #: How often the loop looks for runs waiting.
 SWEEP_S = 2.0
 
-#: Hears one frame of the turn as it streams.
-Hear = Callable[[dict[str, Any]], None]
+#: How often a run waiting on an approval looks for a person's answer.
+ANSWER_POLL_S = 1.0
 
-#: Holds one run's conversation with its agent and returns the agent's reply.
-Deliver = Callable[[Run, Box, Hear], Awaitable[str]]
+#: What a box offers when its question names no choices.
+DEFAULT_CHOICES = ("once", "session", "always", "deny")
+
+#: Sends one frame to the box on the run's socket.
+Send = Callable[[str], Awaitable[Any]]
 
 
 def message(run: Run) -> str:
@@ -111,10 +121,12 @@ class Steps:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._tools: dict[str, dict[str, Any]] = {}
         self._asked: set[str] = set()
+        self._by_request: dict[str, dict[str, Any]] = {}
+        self._by_rpc: dict[str, dict[str, Any]] = {}
 
     def hear(self, frame: dict[str, Any]) -> None:
         if frame.get("method") == "approval" and "id" in frame:
-            self._approval(frame.get("params"))
+            self._approval(frame.get("params"), str(frame["id"]))
             return
         params = frame.get("params")
         if not isinstance(params, dict):
@@ -130,22 +142,41 @@ class Steps:
         elif kind == "tool.complete":
             self._tool_completed(payload)
 
-    def _approval(self, params: Any) -> None:
+    def answered(self, rpc_id: str, choice: str | None, by: str | None) -> None:
+        """A person answered the question the box asked as request `rpc_id`."""
+        step = self._by_rpc.get(rpc_id)
+        if step is not None:
+            step.update(answer=choice, answered_by=by)
+
+    def unanswered(self) -> None:
+        """The run ended with questions open: each was denied, by nobody."""
+        for step in self.steps:
+            if step["kind"] == "approval" and step.get("answer") is None:
+                step.update(answer="deny", answered_by=None, expired=True)
+
+    def _approval(self, params: Any, rpc_id: str | None = None) -> None:
         params = params if isinstance(params, dict) else {}
         request_id = str(params.get("request_id") or "")
         if request_id and request_id in self._asked:
+            step = self._by_request.get(request_id)
+            if rpc_id is not None and step is not None:
+                self._by_rpc.setdefault(rpc_id, step)
             return
         self._asked.add(request_id)
         self.approvals += 1
-        self.steps.append(
-            {
-                "kind": "approval",
-                "command": params.get("command"),
-                "description": params.get("description"),
-                "answer": "nobody answered; the agent's own timeout denied it",
-                "at": self._now(),
-            }
-        )
+        step = {
+            "kind": "approval",
+            "command": params.get("command"),
+            "description": params.get("description"),
+            "choices": params.get("choices"),
+            "answer": None,
+            "at": self._now(),
+        }
+        self.steps.append(step)
+        if request_id:
+            self._by_request[request_id] = step
+        if rpc_id is not None:
+            self._by_rpc[rpc_id] = step
 
     def _tool_started(self, payload: dict[str, Any]) -> None:
         step: dict[str, Any] = {"kind": "tool", "name": payload.get("name")}
@@ -174,6 +205,152 @@ class Steps:
 
     def _now(self) -> str:
         return self._clock().isoformat()
+
+
+class Talk:
+    """One run's conversation as the control plane holds it: the steps it
+    hears, and the approvals it carries between the agent and a person."""
+
+    def __init__(
+        self,
+        store_factory: Callable[[], FleetStore],
+        run: Run,
+        *,
+        expires_at: datetime,
+        poll_s: float = ANSWER_POLL_S,
+    ) -> None:
+        self.steps = Steps()
+        self.run = run
+        self._store_factory = store_factory
+        self._expires_at = expires_at
+        self._poll_s = poll_s
+        #: Questions heard and not yet recorded.
+        self._heard: list[dict[str, Any]] = []
+        #: Recorded and not yet answered: approval id -> the box's own request id.
+        self._open: dict[str, Any] = {}
+
+    def hear(self, frame: dict[str, Any]) -> None:
+        """One frame of the turn, as `client.send_turn` streams it."""
+        self.steps.hear(frame)
+        if frame.get("method") == "approval" and isinstance(frame.get("id"), str | int):
+            self._heard.append(frame)
+
+    async def relay(self, send: Send) -> None:
+        """Until cancelled: record each question, and send each answer back."""
+        while True:
+            for rpc_id, choice, by in await asyncio.to_thread(self._sync):
+                answer = {"jsonrpc": "2.0", "id": rpc_id, "result": {"choice": choice}}
+                await send(json.dumps(answer))
+                self.steps.answered(str(rpc_id), choice, by)
+            await asyncio.sleep(self._poll_s)
+
+    async def withdraw(self, send: Send) -> None:
+        """Deny what is still open, before the socket closes on it."""
+        for rpc_id in list(self._open.values()):
+            with contextlib.suppress(Exception):
+                await send(
+                    json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": {"choice": "deny"}})
+                )
+
+    def close(self) -> None:
+        """The run is over: its open questions expire, and its steps say so."""
+        self._sync()
+        store = self._store_factory()
+        try:
+            store.expire_approvals(self.run.id)
+        finally:
+            store.close()
+        self.steps.unanswered()
+
+    def _sync(self) -> list[tuple[Any, str, str | None]]:
+        """Record what was asked; return what has been answered since."""
+        store = self._store_factory()
+        try:
+            while self._heard:
+                frame = self._heard.pop(0)
+                params = frame.get("params")
+                params = params if isinstance(params, dict) else {}
+                choices = params.get("choices")
+                approval = store.ask_approval(
+                    self.run.id,
+                    request_id=str(frame["id"]),
+                    command=_text(params.get("command")),
+                    description=_text(params.get("description")),
+                    choices=[str(c) for c in choices]
+                    if isinstance(choices, list) and choices
+                    else list(DEFAULT_CHOICES),
+                    expires_at=self._expires_at,
+                )
+                self._open.setdefault(approval.id, frame["id"])
+            answered = []
+            for approval in store.run_approvals(self.run.id):
+                if approval.id in self._open and approval.status == "answered":
+                    rpc_id = self._open.pop(approval.id)
+                    answered.append((rpc_id, approval.choice or "deny", approval.answered_by))
+            return answered
+        finally:
+            store.close()
+
+
+def _text(value: Any) -> str | None:
+    return None if value is None else str(value)[:2000]
+
+
+#: Holds one run's conversation with its agent and returns the agent's reply.
+Deliver = Callable[[Run, Box, Talk], Awaitable[str]]
+
+
+def door_base(box_name: str, env: dict[str, str] | None = None) -> str:
+    """Where the control plane reaches `box_name` through the front door.
+
+    The address a browser would use (`client.browser_door`), as HTTP: TLS on
+    the deployed domain, and `http://<agent>.localhost:<port>` under `just local`.
+    """
+    from flotta.client import browser_door
+
+    scheme, where = browser_door(env)
+    return f"{'https' if scheme == 'wss' else 'http'}://{box_name}.{where}"
+
+
+async def through_door(
+    box: Box, text: str, *, token: str, talk: Talk, timeout_s: float, title: str = ""
+) -> str:
+    """Hold one run's turn with its agent through the front door.
+
+    The relay's path (`relay.deliver_through_door`), with two differences: it
+    hears every frame for the run's steps, and it answers the approvals a
+    person gave while the turn waits on them.
+    """
+    from flotta import client
+
+    base_url = door_base(box.name)
+    session = client.new_session()
+    try:
+        await client.login(session, base_url, token=token)
+        ticket = await client.ws_ticket(session, base_url, token=token)
+        socket = await client.open_agent_socket(session, base_url, ticket, token=token)
+        relaying: asyncio.Task | None = None
+        try:
+            await client.await_ready(socket, timeout_s=120)
+            created = await client.create_session(socket, title=title, timeout_s=120)
+            relaying = asyncio.create_task(talk.relay(socket.send_str))
+            turn = await client.send_turn(
+                socket,
+                str(created.get("session_id") or ""),
+                text,
+                timeout_s=timeout_s,
+                hear=talk.hear,
+            )
+            return turn.response
+        finally:
+            if relaying is not None:
+                relaying.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await relaying
+            await talk.withdraw(socket.send_str)
+            await socket.close()
+    finally:
+        await session.close()
 
 
 class RunLoop:
@@ -258,12 +435,13 @@ class RunLoop:
         return True
 
     async def _carry(self, run: Run, box: Box) -> None:
-        heard = Steps()
+        started = datetime.fromisoformat(run.started_at or datetime.now(UTC).isoformat())
+        talk = Talk(
+            self._store_factory, run, expires_at=started + timedelta(seconds=self._timeout_s)
+        )
         status, error_class = "done", None
         try:
-            output = await asyncio.wait_for(
-                self._deliver(run, box, heard.hear), timeout=self._timeout_s
-            )
+            output = await asyncio.wait_for(self._deliver(run, box, talk), timeout=self._timeout_s)
         except TimeoutError:
             status, error_class = "failed", "timeout"
             output = f"the agent did not finish within {self._timeout_s:.0f}s"
@@ -275,11 +453,16 @@ class RunLoop:
             _log.exception("delivering run %s failed", run.id)
             status, error_class = "failed", "error"
             output = f"{type(exc).__name__}: {exc}"
-        await asyncio.to_thread(self._finish, run, status, output, heard, error_class)
+        await asyncio.to_thread(self._finish, run, status, output, talk, error_class)
 
     def _finish(
-        self, run: Run, status: str, output: str, heard: Steps, error_class: str | None
+        self, run: Run, status: str, output: str, talk: Talk, error_class: str | None
     ) -> None:
+        try:
+            talk.close()
+        except Exception:  # noqa: BLE001 - the verdict is written whatever the approvals did
+            _log.exception("closing run %s's approvals failed", run.id)
+        heard = talk.steps
         store = self._store_factory()
         try:
             self._end(

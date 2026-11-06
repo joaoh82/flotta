@@ -12,9 +12,19 @@ is *not* watching — the app closed, or looking at another agent — used to co
 the agent five minutes of doing nothing, and the product cannot feel smooth
 with a five-minute stall hiding in it.
 
-So this shortens the wait and keeps the answer: unanswered is still **deny**.
+So this shortened the wait and kept the answer: unanswered is still **deny**.
 Hermes's own words for it are that silence is not consent, and nothing here
 changes that. It changes only how long silence takes.
+
+## And then runs made the wait long (FLOTTA-147)
+
+A run is work nobody is watching, so its approval has to wait for a person to
+answer it from the web app (`POST /api/runs/{id}/approval`), and the control
+plane, which holds the run's conversation, decides when that wait is over.
+Hermes has one `approvals.timeout` for the whole agent, with no per-session
+value and no way to extend a wait, so the agent's must outlast any run:
+`RUN_DEADLINE_S`. The cost falls on chats: an approval nobody answers in a
+conversation now waits up to an hour, not a minute, before it is denied.
 
 ## What it will not overwrite
 
@@ -39,17 +49,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
-#: How long an unanswered approval waits before it is denied.
-#:
-#: Sixty seconds, against Hermes's 300. Hermes chose 300 because its prompts
-#: often arrive as phone notifications, and 60 once expired before a tap landed.
-#: Flotta's prompt is a card in the conversation the person is already reading,
-#: so a minute is ample to decide — and an agent nobody is watching gets its
-#: answer in a minute instead of five.
-FLOTTA_APPROVAL_TIMEOUT_S = 60
+from flotta.runs import RUN_DEADLINE_S
+
+#: How long an unanswered approval waits before the agent denies it: as long as
+#: a run may last, so a run's wait is ended by the control plane and not here.
+FLOTTA_APPROVAL_TIMEOUT_S = RUN_DEADLINE_S
 
 #: Hermes's shipped default. A value still equal to it was not chosen by anyone.
 HERMES_DEFAULT_APPROVAL_TIMEOUT_S = 300
+
+#: What this module wrote before runs (FLOTTA-60's minute). Every box on the
+#: fleet has it, and nobody chose it, so it is replaced like Hermes's default.
+EARLIER_FLOTTA_APPROVAL_TIMEOUTS_S = frozenset({60})
 
 
 def settle_timeout(config: dict[str, Any] | None) -> tuple[dict[str, Any], bool]:
@@ -71,7 +82,8 @@ def settle_timeout(config: dict[str, Any] | None) -> tuple[dict[str, Any], bool]
         return config, False
 
     current = approvals.get("timeout")
-    if current is not None and current != HERMES_DEFAULT_APPROVAL_TIMEOUT_S:
+    unchosen = {HERMES_DEFAULT_APPROVAL_TIMEOUT_S, *EARLIER_FLOTTA_APPROVAL_TIMEOUTS_S}
+    if current is not None and current not in unchosen:
         return config, False
 
     config["approvals"] = {**approvals, "timeout": FLOTTA_APPROVAL_TIMEOUT_S}

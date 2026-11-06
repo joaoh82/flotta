@@ -147,7 +147,7 @@ WORKDIR /workspace
 COPY pyproject.toml README.md /app/
 COPY src/ /app/src/
 RUN uv pip install --no-cache --python "$HERMES_VENV" -e /app \
-    && "$HERMES_VENV/bin/python" -c "import yaml, flotta.box.inference"
+    && "$HERMES_VENV/bin/python" -c "import yaml, flotta.box.inference, flotta.box.approvals"
 
 COPY fly/box_entrypoint.sh /usr/local/bin/box_entrypoint.sh
 RUN chmod +x /usr/local/bin/box_entrypoint.sh

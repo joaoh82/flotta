@@ -1,8 +1,9 @@
 """Delivering runs (FLOTTA-147, M14.2): the loop, the steps it hears, its token.
 
 The delivery itself is injected, so nothing here reaches a door, a box or a
-model: `deliver(run, box, hear)` stands in for the conversation, calls `hear`
-with the frames a real turn would stream, and returns the reply or raises.
+model: `deliver(run, box, talk)` stands in for the conversation, calls
+`talk.hear` with the frames a real turn would stream, and returns the reply or
+raises. One that waits on an approval runs `talk.relay` as `through_door` does.
 
 The first three tests are the guards. A paused agent, or one a budget holds,
 is never delivered to, because delivering is what wakes a machine, and a
@@ -12,7 +13,8 @@ budget that stops an agent must not be undone by a schedule.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -42,10 +44,10 @@ class Door:
         self.sent: list[tuple[str, str]] = []
         self.reply, self.frames, self.error, self.wait = reply, frames, error, wait
 
-    async def __call__(self, run, box, hear):
+    async def __call__(self, run, box, talk):
         self.sent.append((run.id, runner.message(run)))
         for frame in self.frames:
-            hear(frame)
+            talk.hear(frame)
         if self.wait is not None:
             await self.wait.wait()
         if self.error is not None:
@@ -165,8 +167,10 @@ def test_a_run_records_its_reply_steps_and_approvals(path):
         "at": None,
     }
     assert steps[1]["command"] == "rm -rf /tmp/x"
-    assert "denied" in steps[1]["answer"]
+    assert (steps[1]["answer"], steps[1]["expired"]) == ("deny", True)
     assert done.approval_count == 1
+    with FleetStore(path) as store:
+        assert [a.status for a in store.run_approvals(run.id)] == ["expired"]
 
 
 def test_a_delivery_that_fails_fails_the_run(path):
@@ -243,7 +247,7 @@ def test_a_run_a_restart_left_running_is_not_delivered_again(path):
 def test_a_run_the_reaper_closed_first_stays_closed(path):
     run = _queue(path)
 
-    async def reaped(run, box, hear):
+    async def reaped(run, box, talk):
         with FleetStore(path) as store:
             store.finish_run(run.id, "failed", error_class="stranded")
         return "Too late."
@@ -298,3 +302,124 @@ def test_the_steps_keep_the_time_each_began():
     heard.hear(_event("tool.start", {"tool_id": "c1", "name": "read_file"}))
 
     assert heard.steps[0]["at"] == "2026-11-06T12:00:00+00:00"
+
+
+# -- an approval waits for a person -------------------------------------------
+
+ASK = {
+    "jsonrpc": "2.0",
+    "id": "srq-1",
+    "method": "approval",
+    "params": {
+        "command": "rm -rf /tmp/flotta-standin-probe",
+        "description": "delete in root path",
+        "choices": ["once", "session", "always", "deny"],
+        "request_id": "r1",
+    },
+}
+
+
+class AskingDoor:
+    """A turn whose agent asks for approval and waits, as the stand-in's does,
+    until it hears an answer on the socket."""
+
+    def __init__(self):
+        self.to_box: list[dict] = []
+
+    async def __call__(self, run, box, talk):
+        answered = asyncio.Event()
+
+        async def send(frame):
+            self.to_box.append(json.loads(frame))
+            answered.set()
+
+        talk.hear(ASK)
+        relaying = asyncio.create_task(talk.relay(send))
+        try:
+            await answered.wait()
+            return f"Answered {self.to_box[0]['result']['choice']}."
+        finally:
+            relaying.cancel()
+            await talk.withdraw(send)
+
+
+def _answer_when_asked(path, choice):
+    """A person, answering the run's approval once it is waiting."""
+
+    async def go():
+        while True:
+            with FleetStore(path) as store:
+                waiting = store.waiting_approvals(org="studio-nord")
+                if waiting:
+                    return store.answer_approval(waiting[0].id, choice, by="user:ada")
+            await asyncio.sleep(0.01)
+
+    return go()
+
+
+def test_an_approval_waits_for_a_person_and_their_answer_reaches_the_box(path, monkeypatch):
+    monkeypatch.setattr(runner, "ANSWER_POLL_S", 0.01)
+    run = _queue(path)
+    door = AskingDoor()
+
+    async def go():
+        loop = _loop(path, door)
+        await loop.sweep()
+        await _answer_when_asked(path, "once")
+        await loop.drain()
+
+    asyncio.run(go())
+
+    done = _run(path, run.id)
+    assert door.to_box == [{"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}}]
+    assert (done.status, done.output) == ("done", "Answered once.")
+    step = done.steps["steps"][0]
+    assert (step["kind"], step["answer"], step["answered_by"]) == ("approval", "once", "user:ada")
+    with FleetStore(path) as store:
+        (approval,) = store.run_approvals(run.id)
+    assert (approval.status, approval.choice, approval.request_id) == ("answered", "once", "srq-1")
+
+
+def test_an_approval_nobody_answers_is_denied_when_the_run_runs_out(path, monkeypatch):
+    """Silence is not consent: the box is told no, and the question expires."""
+    monkeypatch.setattr(runner, "ANSWER_POLL_S", 0.01)
+    run = _queue(path)
+    door = AskingDoor()
+
+    async def go():
+        loop = _loop(path, door, timeout_s=0.2)
+        await loop.sweep()
+        await loop.drain()
+
+    asyncio.run(go())
+
+    ended = _run(path, run.id)
+    assert (ended.status, ended.error_class) == ("failed", "timeout")
+    assert door.to_box == [{"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "deny"}}]
+    with FleetStore(path) as store:
+        assert [a.status for a in store.run_approvals(run.id)] == ["expired"]
+        assert store.waiting_approvals(org="studio-nord") == []
+    assert ended.steps["steps"][0]["expired"] is True
+
+
+def test_a_waiting_approval_expires_with_its_run(path, monkeypatch):
+    """It can be answered until the run's delivery gives up, and not after."""
+    monkeypatch.setattr(runner, "ANSWER_POLL_S", 0.01)
+    run = _queue(path)
+    seen = {}
+
+    async def go():
+        loop = _loop(path, AskingDoor(), timeout_s=600)
+        await loop.sweep()
+        while not seen:
+            with FleetStore(path) as store:
+                for a in store.waiting_approvals(org="studio-nord"):
+                    seen["expires"] = a.expires_at
+            await asyncio.sleep(0.01)
+        await _answer_when_asked(path, "deny")
+        await loop.drain()
+
+    asyncio.run(go())
+
+    started = datetime.fromisoformat(_run(path, run.id).started_at)
+    assert datetime.fromisoformat(seen["expires"]) == started + timedelta(seconds=600)
