@@ -3847,11 +3847,18 @@ def create_app(
         under way — the cue for an open conversation to expect the drop and
         reconnect — and the timeline's `size_set` or `size_change_failed` how
         it ended. An agent already that size is a `200` with `already_current`
-        and no restart.
+        and no restart. A substrate that cannot resize (a local stand-in) is a
+        `409`, and a size this machine cannot have a `422`, both before the 202.
         """
         from fastapi.responses import JSONResponse
 
-        from flotta.provision import ProvisionError, UpgradeFailed, begin_resize, resize_box
+        from flotta.provision import (
+            InvalidSize,
+            ProvisionError,
+            UpgradeFailed,
+            begin_resize,
+            resize_box,
+        )
 
         if "memory_mb" not in body:
             raise HTTPException(
@@ -3870,6 +3877,10 @@ def create_app(
                     )
                 try:
                     started = begin_resize(box.id, memory_mb, store=store)
+                except InvalidSize as exc:
+                    # On the list, and still not a size this machine can have
+                    # (a performance CPU needs 2 GB of its own).
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
                 except ProvisionError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 if started.get("already_current"):

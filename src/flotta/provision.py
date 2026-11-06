@@ -74,6 +74,7 @@ from flotta.backend import (
     BackendError,
     BoxSpec,
     NotSupported,
+    SizeRefused,
     UnknownBackendError,
     check_memory_mb,
     default_scheme,
@@ -1357,6 +1358,20 @@ def create_box(
         given_memory = spec.memory_mb
     if given_memory is not None:
         store.add_event("box", box.id, SIZE_SET, {"memory_mb": given_memory, "reason": "created"})
+    if handle.adopted and spec.memory_mb is not None and given_memory != spec.memory_mb:
+        # `resources` above said what was asked, before the machine existed.
+        # Adopting changes nothing about a machine, so say plainly that the
+        # size asked for is not the size it has; a resize applies it.
+        store.add_event(
+            "box",
+            box.id,
+            "size_not_applied",
+            {
+                "requested_memory_mb": spec.memory_mb,
+                "memory_mb": given_memory,
+                "reason": "adopted a machine that already existed; resize it to apply",
+            },
+        )
 
     # An adopted machine did not exist when its secrets were written, because
     # it existed before `create` ran at all. On Fly that is the *normal* path,
@@ -2596,27 +2611,43 @@ def _memory_of_label(label: str | None) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+def _instant_of(text: str | None) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(text or "")
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
 def box_sizes(store: FleetStore, box_ids: list[str]) -> dict[str, int]:
     """Each agent's memory in MB, as far as the store knows, without asking Fly.
 
-    The latest `size_set` — recorded at creation and by every resize that
-    landed — and for an agent older than that event, what the hourly metering
-    sweep last read off its machine. Not `inspect` per request: it is a
-    `flyctl` subprocess, and the fleet list would be one per agent. Absent
-    when neither says, which the window shows as unknown rather than guessed.
+    The newer of two records. The latest `size_set`, written at creation and
+    by every resize that landed; and what the hourly metering sweep last read
+    off the machine, stamped with the hour it closed. The sweep is up to an
+    hour behind a resize made here, and the only one to see a resize made
+    anywhere else (`fly machine update`) — so trusting the event for ever left
+    such an agent showing a size it no longer had, and answering
+    `already_current` to the resize that would have put it back.
+
+    Not `inspect` per request: it is a `flyctl` subprocess, and the fleet list
+    would be one per agent. Absent when neither says, which the window shows
+    as unknown rather than guessed.
     """
-    latest = store.latest_box_events(box_ids, (SIZE_SET,))
-    sizes: dict[str, int] = {}
-    for box_id, event in latest.items():
+    found: dict[str, tuple[datetime | None, int]] = {}
+    for box_id, event in store.latest_box_events(box_ids, (SIZE_SET,)).items():
         value = (event.payload or {}).get("memory_mb")
         if isinstance(value, int) and not isinstance(value, bool):
-            sizes[box_id] = value
-    missing = [b for b in box_ids if b not in sizes]
-    for box_id, label in store.machine_labels(missing).items():
+            found[box_id] = (_instant_of(event.ts), value)
+    for box_id, (label, read_at) in store.machine_labels(box_ids).items():
         memory = _memory_of_label(label)
-        if memory is not None:
-            sizes[box_id] = memory
-    return sizes
+        if memory is None:
+            continue
+        when = _instant_of(read_at)
+        recorded = found.get(box_id)
+        if recorded is None or (when is not None and (recorded[0] is None or when > recorded[0])):
+            found[box_id] = (when, memory)
+    return {box_id: memory for box_id, (_, memory) in found.items()}
 
 
 def size_change_of(event: Any, *, now: datetime | None = None) -> dict[str, Any] | None:
@@ -2660,7 +2691,17 @@ def _size_plan(box_id: str, memory_mb: object, store: FleetStore) -> tuple[Box, 
     return box, wanted, box_sizes(store, [box.id]).get(box.id)
 
 
-def begin_resize(box_id: str, memory_mb: object, *, store: FleetStore) -> dict[str, Any]:
+class ResizeNotSupported(ProvisionError):
+    """This agent's substrate cannot change a machine's size (a local stand-in)."""
+
+
+def begin_resize(
+    box_id: str,
+    memory_mb: object,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
     """Accept a resize that `resize_box` will then make on a thread, or refuse
     it now (FLOTTA-157).
 
@@ -2672,6 +2713,18 @@ def begin_resize(box_id: str, memory_mb: object, *, store: FleetStore) -> dict[s
     """
     box, wanted, current = _size_plan(box_id, memory_mb, store)
     out = {"box_id": box.id, "name": box.name, "memory_mb": wanted}
+    # The substrate's own refusals, asked before anything is recorded: one that
+    # cannot resize at all, or a machine that cannot have this size (a Fly
+    # performance CPU needs 2 GB). Either answered on the thread would show
+    # "resizing" for something that was never going to happen.
+    try:
+        _resolve_backend(box, backend).check_resize(box.endpoint, wanted)
+    except NotSupported as exc:
+        raise ResizeNotSupported(f"{box.name} cannot be resized: {exc}") from exc
+    except SizeRefused as exc:
+        raise InvalidSize(f"{box.name} cannot have {wanted} MB: {exc}") from exc
+    except BackendError as exc:
+        raise ProvisionError(f"could not check whether {box.name} can be resized: {exc}") from exc
     if size_changes(store, [box.id]).get(box.id):
         raise ProvisionError(f"{box.name} is already being resized; wait for that to finish.")
     if current == wanted:

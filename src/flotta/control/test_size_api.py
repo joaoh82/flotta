@@ -44,6 +44,28 @@ def fleet(tmp_path):
     return path
 
 
+class Checker:
+    """What `begin_resize` asks the substrate before answering, with no `flyctl`."""
+
+    scheme = "fly"
+
+    def __init__(self):
+        self.refuses: BaseException | None = None
+
+    def check_resize(self, endpoint, memory_mb):
+        if self.refuses:
+            raise self.refuses
+
+
+@pytest.fixture(autouse=True)
+def checker(monkeypatch):
+    import flotta.provision as provision
+
+    fake = Checker()
+    monkeypatch.setattr(provision, "_resolve_backend", lambda box, backend=None: backend or fake)
+    return fake
+
+
 @pytest.fixture
 def held(monkeypatch):
     """`resize_box` held until the test lets it go: the restart, in slow motion."""
@@ -291,3 +313,27 @@ def test_an_owner_may_create_a_bigger_agent(fleet, monkeypatch):
     assert response.status_code in (200, 201), response.text
     assert seen == {"memory_mb": 4096}
     assert response.json()["box"]["memory_mb"] == 4096
+
+
+def test_a_substrate_that_cannot_resize_is_a_409_and_never_says_resizing(fleet, checker):
+    from flotta.backend import NotSupported
+
+    checker.refuses = NotSupported("a local stand-in is a process on this machine")
+    with _api(fleet) as api:
+        response = api.put(f"/api/boxes/{X}/size", json={"memory_mb": 4096}, headers=OWNER)
+        box = api.get(f"/api/boxes/{X}", headers=OWNER).json()["box"]
+    assert response.status_code == 409
+    assert "cannot be resized" in response.json()["detail"]
+    assert box["size_change"] is None
+
+
+def test_a_size_this_machine_cannot_have_is_a_422_before_the_202(fleet, checker):
+    from flotta.backend import SizeRefused
+
+    checker.refuses = SizeRefused("a Fly performance machine with 1 CPU(s) needs at least 2048 MB")
+    with _api(fleet) as api:
+        response = api.put(f"/api/boxes/{X}/size", json={"memory_mb": 1024}, headers=OWNER)
+        box = api.get(f"/api/boxes/{X}", headers=OWNER).json()["box"]
+    assert response.status_code == 422
+    assert "needs at least 2048 MB" in response.json()["detail"]
+    assert box["size_change"] is None

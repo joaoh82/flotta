@@ -79,6 +79,16 @@ class UnknownBackendError(BackendError):
     """An endpoint names a substrate nothing here implements."""
 
 
+class SizeRefused(BackendError):
+    """This machine cannot have that size, and the substrate has said why.
+
+    Not `NotSupported`: the substrate can resize, just not to this. A Fly
+    performance CPU needs 2 GB of its own, so one cannot go down to 1 GB.
+    Raised before anything is changed, which is what lets a caller refuse the
+    request instead of reporting a resize that was never going to happen.
+    """
+
+
 #: The memory sizes an agent may be given, in MB (FLOTTA-157). Memory is the
 #: portable half of a machine's size: every substrate hands a VM some number of
 #: megabytes, while CPU presets are each provider's own vocabulary, so a
@@ -356,6 +366,16 @@ class Backend(Protocol):
         when it boots. A box that is not running stays that way, for the reason
         `reimage` gives — an asleep agent woken by a resize bills while its row
         says `stopped`. A failure must leave the machine the size it was.
+        """
+        ...
+
+    def check_resize(self, box_id: str, memory_mb: int) -> None:
+        """Refuse a resize `resize` could not make, **before** anything changes.
+
+        `NotSupported` when this substrate cannot resize at all, `SizeRefused`
+        when this machine cannot have that size. Read-only, so a caller can ask
+        it before answering "resizing" — a window showing a restart for an
+        agent that cannot have one is the lie this exists to prevent.
         """
         ...
 

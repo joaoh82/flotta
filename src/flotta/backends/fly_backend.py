@@ -33,6 +33,7 @@ from flotta.backend import (
     ExecResult,
     MachineInfo,
     NotSupported,
+    SizeRefused,
 )
 from flotta.fly import IMAGE_ENV, FlyConfig
 
@@ -47,6 +48,9 @@ STABLE_STATES = frozenset({"started", "stopped", "suspended"})
 #: takes at most 2 GB, so 4 GB needs two of them (`shared-cpu-2x`); asking a
 #: `shared-cpu-1x` for more is refused by Fly with the machine unchanged.
 _MAX_MB_PER_CPU = {"shared": 2048, "performance": 8192}
+#: And the least: a performance CPU comes with 2 GB of its own, so a
+#: `performance-1x` cannot go down to 1 GB. Fly refuses it, so this does first.
+_MIN_MB_PER_CPU = {"shared": 256, "performance": 2048}
 
 DEFAULT_SETTLE_TIMEOUT_S = 90
 DEFAULT_WAIT_TIMEOUT_S = 120
@@ -88,6 +92,34 @@ def cpus_for(memory_mb: int, cpu_kind: str | None = "shared") -> int:
 def _kind_of(vm_size: str) -> str:
     """The CPU kind a Fly preset names: `performance-2x` is performance."""
     return "performance" if vm_size.startswith("performance") else "shared"
+
+
+def _preset_cpus(vm_size: str) -> int:
+    """The CPUs a Fly preset names: `shared-cpu-2x` is 2, anything unreadable 1."""
+    count = vm_size.rpartition("-")[2].removesuffix("x")
+    return int(count) if count.isdigit() and int(count) > 0 else 1
+
+
+def guest_cpus(memory_mb: int, cpu_kind: str | None, vm_size: str) -> int:
+    """The CPUs a machine of `cpu_kind` on preset `vm_size` gets for `memory_mb`.
+
+    The more of what the fleet's preset gives and what the memory needs: a
+    `shared-cpu-2x` fleet keeps the two CPUs its operator chose at 1 or 2 GB,
+    and a `shared-cpu-1x` one gains a second only for 4 GB — and gives it back
+    on the way down. The same rule for `create` and `resize`, so an agent's
+    CPUs never depend on which of them sized it last.
+
+    `SizeRefused` when that many CPUs cannot hold so little memory.
+    """
+    kind = cpu_kind or _kind_of(vm_size)
+    cpus = max(_preset_cpus(vm_size), cpus_for(memory_mb, kind))
+    least = _MIN_MB_PER_CPU.get(kind, _MIN_MB_PER_CPU["shared"]) * cpus
+    if memory_mb < least:
+        raise SizeRefused(
+            f"a Fly {kind} machine with {cpus} CPU(s) needs at least {least} MB; "
+            f"{memory_mb} MB is too little"
+        )
+    return cpus
 
 
 def _last_event_at(machine: dict, statuses: frozenset[str]) -> str | None:
@@ -252,11 +284,10 @@ class FlyBackend:
             "--vm-memory",
             str(memory),
         ]
-        # Only when the preset cannot hold it: `--vm-cpus` overrides the
-        # preset's count, and a `shared-cpu-2x` fleet asked for 1 GB should
-        # keep the two CPUs its operator chose.
-        cpus = cpus_for(memory, _kind_of(self.config.vm_size))
-        if cpus > 1:
+        # Only when it differs from the preset's: `guest_cpus` is never fewer,
+        # so a `shared-cpu-2x` fleet keeps the two CPUs its operator chose.
+        cpus = guest_cpus(memory, None, self.config.vm_size)
+        if cpus != _preset_cpus(self.config.vm_size):
             args += ["--vm-cpus", str(cpus)]
         for key, value in {"HERMES_HOME": self.config.hermes_home, **spec.env}.items():
             args += ["--env", f"{key}={value}"]
@@ -354,26 +385,28 @@ class FlyBackend:
             args.append("--skip-start")
         self._flyctl(*args, app=app)
 
+    def check_resize(self, box_id: str, memory_mb: int) -> None:
+        """`SizeRefused` if this machine cannot have `memory_mb`; one listing."""
+        app, machine_id = self._addr(box_id)
+        guest_cpus(memory_mb, self._guest(app, machine_id)[1], self.config.vm_size)
+
     def resize(self, box_id: str, memory_mb: int) -> None:
         """`flyctl machine update --vm-memory --vm-cpus`, which keeps the volume.
 
-        The CPUs are derived (`cpus_for`), of the kind the machine already has:
-        memory is the size an agent is given, and a shared machine asked for
-        4 GB needs a second CPU or Fly refuses it. Both flags every time, so a
-        machine going back down from 4 GB gives up the CPU it no longer needs.
+        The CPUs are `guest_cpus`, of the kind the machine already has: memory
+        is the size an agent is given, and a shared machine asked for 4 GB
+        needs a second CPU or Fly refuses it. Both flags every time, so a
+        machine going back down from 4 GB gives up the CPU it no longer needs
+        — and never below what the fleet's preset gives, which `create` keeps
+        too. A size the machine cannot have is refused before `flyctl` runs.
 
         `--skip-start` when the machine is not `started`, for `reimage`'s
         reason: an asleep agent stays asleep and unbilled. `--yes` because
         nobody is there to confirm.
         """
         app, machine_id = self._addr(box_id)
-        machine = next(
-            (m for m in self._machines(app) if m.get("id") == machine_id),
-            None,
-        )
-        state = (machine or {}).get("state") or "gone"
-        guest = ((machine or {}).get("config") or {}).get("guest") or {}
-        cpus = cpus_for(memory_mb, guest.get("cpu_kind") or _kind_of(self.config.vm_size))
+        state, kind = self._guest(app, machine_id)
+        cpus = guest_cpus(memory_mb, kind, self.config.vm_size)
         args = [
             "machine",
             "update",
@@ -387,6 +420,13 @@ class FlyBackend:
         if state != "started":
             args.append("--skip-start")
         self._flyctl(*args, app=app)
+
+    def _guest(self, app: str, machine_id: str) -> tuple[str, str | None]:
+        """The machine's state and CPU kind, from one lenient listing."""
+        machine = next((m for m in self._machines(app) if m.get("id") == machine_id), None)
+        guest = ((machine or {}).get("config") or {}).get("guest") or {}
+        kind = guest.get("cpu_kind")
+        return (machine or {}).get("state") or "gone", kind if isinstance(kind, str) else None
 
     def image_of(self, box_id: str) -> str | None:
         """What image this machine is actually running, or None.

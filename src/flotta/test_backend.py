@@ -1285,3 +1285,64 @@ def test_a_size_off_the_allowlist_is_refused_with_the_sizes_named():
         with pytest.raises(ValueError, match="1024, 2048, 4096"):
             check_memory_mb(bad)
     assert check_memory_mb(4096) == 4096
+
+
+def _fly_with(machines, vm_size):
+    import json as _json
+    import subprocess
+
+    from flotta.fly import FlyConfig
+
+    issued: list[list[str]] = []
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        if "list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, _json.dumps(machines), "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    config = FlyConfig.from_env({"FLOTTA_FLY_VM_SIZE": vm_size}, dotenv="/nonexistent/.env")
+    return issued, FlyBackend(config=config, runner=runner)
+
+
+@pytest.mark.parametrize(("vm_size", "cpus"), [("shared-cpu-2x", "2"), ("shared-cpu-1x", "1")])
+def test_going_back_down_keeps_the_preset_cpus_and_gives_up_the_rest(vm_size, cpus):
+    """The rule `create` keeps: a `shared-cpu-2x` fleet keeps its two CPUs at 2 GB,
+    and a `shared-cpu-1x` one gives back the second it gained for 4 GB."""
+    issued, backend = _fly_with(_sized(_machines_list(), 4096, "shared"), vm_size)
+    backend.resize("fly://joaoh82-flotta-eng-a/m-1", 2048)
+    update = next(c for c in issued if "update" in c)
+    assert _flag(update, "--vm-cpus") == cpus
+
+
+def test_a_two_cpu_fleet_creates_without_overriding_its_preset():
+    from flotta.fly import FlyConfig
+
+    config = FlyConfig.from_env({"FLOTTA_FLY_VM_SIZE": "shared-cpu-2x"}, dotenv="/nonexistent/.env")
+    _, run = _created(BoxSpec(name="eng-a", image="registry.fly.io/x:v1"), config)
+    assert "--vm-cpus" not in run
+    _, run = _created(BoxSpec(name="eng-a", image="registry.fly.io/x:v1", memory_mb=4096), config)
+    assert "--vm-cpus" not in run, "two shared CPUs already hold 4 GB"
+
+
+def test_a_performance_machine_cannot_go_down_to_one_gigabyte():
+    """A performance CPU comes with 2 GB of its own. Refused by `check_resize`
+    and by `resize` itself, before `flyctl` is asked to change anything."""
+    from flotta.backend import SizeRefused
+
+    issued, backend = _fly_with(_sized(_machines_list(), 2048, "performance"), "performance-1x")
+    with pytest.raises(SizeRefused, match="at least 2048 MB"):
+        backend.check_resize("fly://joaoh82-flotta-eng-a/m-1", 1024)
+    with pytest.raises(SizeRefused):
+        backend.resize("fly://joaoh82-flotta-eng-a/m-1", 1024)
+    assert not any("update" in c for c in issued)
+    backend.check_resize("fly://joaoh82-flotta-eng-a/m-1", 2048)
+
+
+def test_a_shared_machine_may_be_checked_for_every_size_on_the_list():
+    from flotta.backend import MEMORY_SIZES_MB
+
+    issued, backend = _recording_fly(_sized(_machines_list(), 2048, "shared"))
+    for size in MEMORY_SIZES_MB:
+        backend.check_resize("fly://joaoh82-flotta-eng-a/m-1", size)
+    assert not any("update" in c for c in issued), "checking is read-only"
