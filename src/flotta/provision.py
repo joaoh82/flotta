@@ -60,6 +60,7 @@ import logging
 import math
 import os
 import secrets as secrets_module
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -1681,6 +1682,17 @@ BOX_PYTHON = "/opt/hermes-venv/bin/python3"
 HERMES_HOME = "/data/hermes"
 #: The event that says an agent's rules were written to its `config.yaml`.
 RULES_CHANGED = "rules_changed"
+#: One save at a time per box, from the write on the machine to the record of
+#: it, so the store can't say one save while the machine holds another. Per
+#: process: the control plane is one. The box's own lock keeps the file whole
+#: whatever happens here.
+_RULES_LOCKS: dict[str, threading.Lock] = {}
+_RULES_LOCKS_GUARD = threading.Lock()
+
+
+def _rules_lock(box_id: str) -> threading.Lock:
+    with _RULES_LOCKS_GUARD:
+        return _RULES_LOCKS.setdefault(box_id, threading.Lock())
 
 
 def set_rules(
@@ -1722,13 +1734,13 @@ def set_rules(
     changes = json.dumps(config_changes(rules).to_json()).encode("utf-8")
     payload = base64.b64encode(changes).decode("ascii")
     command = f"printf %s {script} | base64 -d | {BOX_PYTHON} - {HERMES_HOME} {payload}"
-    result = impl.exec(box.endpoint, command)
-    if result.exit_code != 0:
-        detail = (result.stderr or result.stdout or "").strip() or "no output"
-        store.add_event("box", box.id, "rules_write_failed", {"detail": detail[:500]})
-        raise ProvisionError(f"could not write the rules on {box.name}: {detail}")
-
-    store.set_box_rules(box.id, None if rules.empty else json.dumps(rules.to_json()))
+    with _rules_lock(box.id):
+        result = impl.exec(box.endpoint, command)
+        if result.exit_code != 0:
+            detail = (result.stderr or result.stdout or "").strip() or "no output"
+            store.add_event("box", box.id, "rules_write_failed", {"detail": detail[:500]})
+            raise ProvisionError(f"could not write the rules on {box.name}: {detail}")
+        store.set_box_rules(box.id, None if rules.empty else json.dumps(rules.to_json()))
     # After the write, as with instructions: the audit trail says what landed.
     store.add_event(
         "box",

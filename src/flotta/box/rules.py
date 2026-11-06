@@ -13,15 +13,19 @@ when someone answers "always", and everything else in the file stay as found.
 
 **Written whole, then moved.** Hermes reads this file on every command, so a
 half-written one would be a broken agent for as long as it took. A rename
-replaces it in one step.
+replaces it in one step. The staged file is this run's own, and runs on one
+box take a lock on the file next to it, so two saves at once land one after
+the other rather than one renaming the other's half-written file.
 """
 
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -55,13 +59,20 @@ def apply(home: Path, changes: list[list[Any]]) -> str:
     import yaml
 
     path = home / "config.yaml"
-    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-    if loaded is not None and not isinstance(loaded, dict):
-        raise ValueError(f"{path} is not a mapping")
-    merged = merge(loaded, changes)
-    staged = path.with_name(".config.yaml.flotta")
-    staged.write_text(yaml.safe_dump(merged, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    os.replace(staged, path)
+    with open(home / ".config.yaml.flotta-lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if loaded is not None and not isinstance(loaded, dict):
+            raise ValueError(f"{path} is not a mapping")
+        merged = merge(loaded, changes)
+        fd, staged = tempfile.mkstemp(dir=home, prefix=".config.yaml.", suffix=".flotta")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(yaml.safe_dump(merged, sort_keys=False, allow_unicode=True))
+            os.replace(staged, path)
+        except BaseException:
+            Path(staged).unlink(missing_ok=True)
+            raise
     return f"rules written to {path}"
 
 

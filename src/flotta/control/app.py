@@ -3002,13 +3002,15 @@ def create_app(
         agent's next command, the guidance its next conversation.
         """
         from flotta.provision import ProvisionError, set_rules
-        from flotta.rules import RulesError, parse_rules
+        from flotta.rules import RulesError, parse_rules, rules_from_json
 
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
             try:
-                rules = parse_rules(body)
+                stored = store.box_rules(box.id)
+                current = rules_from_json(stored[0] if stored else None)
+                rules = parse_rules(body, kept_tools=current.disabled_tools)
             except RulesError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             by = token.subject if token is not None else "operator"

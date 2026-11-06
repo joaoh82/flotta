@@ -186,3 +186,110 @@ def test_a_failed_write_records_nothing_as_changed(tmp_path):
     kinds = [e.type for e in store.get_box_timeline(box.id)]
     assert "rules_write_failed" in kinds and "rules_changed" not in kinds
     store.close()
+
+
+def test_a_command_pattern_keeps_its_spacing():
+    """`a  b` and `a b` match different commands, so a pattern is only trimmed."""
+    from fnmatch import fnmatch
+
+    rules = parse_rules({"denied_commands": ["  *customer  exports*  "], "never": ["a   b"]})
+    assert rules.denied_commands == ("*customer  exports*",)
+    assert rules.never == ("a b",)
+    command = "cat '/data/customer  exports/secret.txt'"
+    assert fnmatch(command.lower(), rules.denied_commands[0])
+    with pytest.raises(RulesError, match="one line"):
+        parse_rules({"denied_commands": ["rm *\nls"]})
+
+
+def test_a_tool_the_catalogue_lost_stays_off_and_readable():
+    """Switched off when it was in the list, and still off on the machine."""
+    import json
+
+    stored = json.dumps({"disabled_tools": ["terminal", "retired_tool"]})
+    rules = rules_from_json(stored)
+    assert rules.disabled_tools == ("terminal", "retired_tool")
+    kept = parse_rules({"disabled_tools": ["retired_tool"]}, kept_tools=rules.disabled_tools)
+    assert kept.disabled_tools == ("retired_tool",)
+    with pytest.raises(RulesError):
+        parse_rules({"disabled_tools": ["another_tool"]}, kept_tools=rules.disabled_tools)
+
+
+def test_writers_on_one_box_land_one_after_the_other(tmp_path):
+    """Two at once used to share a staged file: one renamed the other's bytes."""
+    import base64
+    import json
+    from pathlib import Path
+
+    from flotta.box import rules as box_rules
+
+    script = Path(box_rules.__file__)
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"command_allowlist": ["x"]}))
+    payloads = []
+    for i in range(12):
+        changes = config_changes(parse_rules({"denied_commands": [f"cmd{i} *"]})).to_json()
+        payloads.append(base64.b64encode(json.dumps(changes).encode()).decode())
+    runs = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(tmp_path), p],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for p in payloads
+    ]
+    codes = [run.wait() for run in runs]
+    assert codes == [0] * len(runs), [r.stderr.read() for r in runs]
+    final = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    assert final["command_allowlist"] == ["x"]
+    assert final["approvals"]["deny"][0] in {f"cmd{i} *" for i in range(12)}
+    assert not list(tmp_path.glob(".config.yaml.*.flotta")), "a staged file was left behind"
+
+
+def test_the_store_records_the_save_the_machine_holds(tmp_path):
+    """Saves to one box don't overlap, from the write to its record."""
+    import threading
+    import time
+
+    from flotta.backend import ExecResult
+    from flotta.provision import set_rules
+    from flotta.store import FleetStore
+
+    path = tmp_path / "fleet.db"
+    with FleetStore(path) as store:
+        box = store.create_box("eng-r")
+        store.update_box_status(box.id, "running", endpoint="fake://m-1")
+    on_machine: list[str] = []
+    busy = threading.Lock()
+
+    class Slow:
+        def exec(self, endpoint, command):
+            assert busy.acquire(blocking=False), "two writes overlapped"
+            try:
+                time.sleep(0.05)
+                on_machine.append(command)
+            finally:
+                busy.release()
+            return ExecResult(0, "", "")
+
+    errors: list[BaseException] = []
+
+    def save(pattern):
+        try:
+            with FleetStore(path) as store:
+                rules = parse_rules({"denied_commands": [pattern]})
+                set_rules(box.id, rules, store=store, backend=Slow())
+        except BaseException as exc:  # a thread's failure is otherwise silent
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(f"p{i}*",)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    with FleetStore(path) as store:
+        recorded = __import__("json").loads(store.box_rules(box.id)[0])["denied_commands"][0]
+    import base64
+    import json
+
+    last = json.loads(base64.b64decode(on_machine[-1].rsplit(" ", 1)[1]))
+    assert [v for s, k, v in last if k == "deny"] == [[recorded]]

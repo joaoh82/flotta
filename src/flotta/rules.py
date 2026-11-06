@@ -100,7 +100,10 @@ class ConfigChanges:
         return [[section, key, value] for (section, key), value in self.values.items()]
 
 
-def _lines(raw: Any, name: str, limit: int) -> tuple[str, ...]:
+def _lines(raw: Any, name: str, limit: int, *, exact: bool = False) -> tuple[str, ...]:
+    """A list of strings, tidied. Prose has its spacing collapsed; an `exact` one,
+    a command pattern, is only trimmed, since `a  b` and `a b` match different
+    commands."""
     if raw is None:
         return ()
     if not isinstance(raw, list):
@@ -109,7 +112,9 @@ def _lines(raw: Any, name: str, limit: int) -> tuple[str, ...]:
     for item in raw:
         if not isinstance(item, str):
             raise RulesError(f"{name} is a list of strings")
-        text = " ".join(item.split())
+        text = item.strip() if exact else " ".join(item.split())
+        if exact and ("\n" in text or "\r" in text):
+            raise RulesError(f"each of {name} is one line")
         if not text:
             continue
         if len(text) > limit:
@@ -121,15 +126,20 @@ def _lines(raw: Any, name: str, limit: int) -> tuple[str, ...]:
     return tuple(kept)
 
 
-def parse_rules(body: Any) -> Rules:
-    """Rules from an API body, or `RulesError` saying what is wrong."""
+def parse_rules(body: Any, *, kept_tools: tuple[str, ...] = ()) -> Rules:
+    """Rules from an API body, or `RulesError` saying what is wrong.
+
+    A tool group not in `TOOLSETS` is refused unless it is in `kept_tools`: one
+    already switched off on this agent, from before the catalogue lost it,
+    stays off rather than refusing every save until someone finds it.
+    """
     if not isinstance(body, dict):
         raise RulesError("rules are an object")
     unknown = set(body) - set(Rules.__slots__)
     if unknown:
         raise RulesError(f"unknown fields: {', '.join(sorted(unknown))}")
     tools = _lines(body.get("disabled_tools"), "disabled_tools", MAX_PATTERN)
-    strange = [t for t in tools if t not in TOOLSETS]
+    strange = [t for t in tools if t not in TOOLSETS and t not in kept_tools]
     if strange:
         raise RulesError(f"not a tool group that can be switched off: {', '.join(strange)}")
     private = body.get("private_conversations", False)
@@ -139,15 +149,29 @@ def parse_rules(body: Any) -> Rules:
         always=_lines(body.get("always"), "always", MAX_TEXT),
         never=_lines(body.get("never"), "never", MAX_TEXT),
         careful=_lines(body.get("careful"), "careful", MAX_TEXT),
-        denied_commands=_lines(body.get("denied_commands"), "denied_commands", MAX_PATTERN),
-        disabled_tools=tuple(t for t in TOOLSETS if t in tools),
+        denied_commands=_lines(
+            body.get("denied_commands"), "denied_commands", MAX_PATTERN, exact=True
+        ),
+        disabled_tools=(
+            *(t for t in TOOLSETS if t in tools),
+            *(t for t in tools if t not in TOOLSETS),
+        ),
         private_conversations=private,
     )
 
 
 def rules_from_json(raw: str | None) -> Rules:
-    """What the store holds, read back. Nothing stored is no rules."""
-    return Rules() if not raw else parse_rules(json.loads(raw))
+    """What the store holds, read back. Nothing stored is no rules.
+
+    Every tool group it names is kept, in the catalogue or not: it was valid
+    when written, and it is still switched off on the machine.
+    """
+    if not raw:
+        return Rules()
+    body = json.loads(raw)
+    stored = body.get("disabled_tools") if isinstance(body, dict) else None
+    kept = tuple(t for t in stored if isinstance(t, str)) if isinstance(stored, list) else ()
+    return parse_rules(body, kept_tools=kept)
 
 
 def prompt_block(rules: Rules) -> str | None:
