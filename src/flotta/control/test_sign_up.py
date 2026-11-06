@@ -505,3 +505,66 @@ def test_only_an_orgs_admins_change_its_team(api, fleet, outbox):
     pat = _session(_sign_up(api, outbox))
     assert api.get("/api/orgs/agency-x/members", headers=pat).status_code == 404
     assert api.delete(f"/api/orgs/agency-x/members/{ana_id}", headers=pat).status_code == 404
+
+
+# -- telling the agency (FLOTTA-143) ------------------------------------------
+#
+# Until FLOTTA-143 an approved agency found out only by its banner changing, on
+# a page it might not open for days, and a declined one never did.
+
+
+def test_approving_tells_the_owners(api, outbox):
+    _sign_up(api, outbox)
+    approved = api.post("/api/orgs/studio-pat/approve", headers=_operator())
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["told"] == 1
+    told = outbox[-1]
+    assert (told.to, told.kind) == ("pat@example.com", "approval email")
+    assert "Studio Pat" in told.subject
+    # The web app's home: no secret rides in it.
+    assert "#" not in told.link
+
+
+def test_declining_tells_the_owners_why_when_the_operator_says(api, outbox):
+    _sign_up(api, outbox)
+    declined = api.post(
+        "/api/orgs/studio-pat/decline",
+        json={"reason": "We take <agencies> in the EU only for now."},
+        headers=_operator(),
+    )
+    assert declined.status_code == 200, declined.text
+    told = outbox[-1]
+    assert (told.to, told.kind) == ("pat@example.com", "decline email")
+    assert "We take <agencies> in the EU only for now." in told.text
+    assert "&lt;agencies&gt;" in told.html
+
+
+def test_declining_without_a_reason_still_tells_them(api, outbox):
+    _sign_up(api, outbox)
+    assert api.post("/api/orgs/studio-pat/decline", headers=_operator()).status_code == 200
+    assert outbox[-1].kind == "decline email"
+    assert "Why:" not in outbox[-1].text
+
+
+def test_a_reason_too_long_is_refused_before_anything_is_decided(api, fleet, outbox):
+    _sign_up(api, outbox)
+    refused = api.post(
+        "/api/orgs/studio-pat/decline", json={"reason": "x" * 501}, headers=_operator()
+    )
+    assert refused.status_code == 422
+    with FleetStore(fleet) as store:
+        assert store.get_org("studio-pat").status == "pending"
+
+
+def test_an_answer_that_cannot_be_sent_still_stands(fleet, outbox):
+    def mailer(message):
+        if message.kind in ("approval email", "decline email"):
+            raise RuntimeError("Resend answered 500")
+        outbox(message)
+
+    with TestClient(_app(fleet, mailer=mailer)) as api:
+        _sign_up(api, outbox)
+        approved = api.post("/api/orgs/studio-pat/approve", headers=_operator())
+    assert approved.status_code == 200, approved.text
+    assert approved.json() == {"org": approved.json()["org"], "told": 0}
+    assert approved.json()["org"]["status"] == "active"

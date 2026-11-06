@@ -1,6 +1,7 @@
-"""Sending a sign-in link (M12.3).
+"""Sending a sign-in link (M12.3), and telling an agency its sign-up was decided.
 
-The control plane emails one thing: a link that signs a person in. It goes
+The control plane emails a link that signs a person in, and, since
+FLOTTA-143, the answer to an agency's sign-up, which carries no secret. It goes
 through Resend when `$FLOTTA_RESEND_API_KEY` is set. Without one, the link can
 be printed to the control plane's log instead, which is how sign-in works on a
 laptop for $0, and **only** there: a deployed control plane that printed links
@@ -133,6 +134,65 @@ def invite_message(to: str, url: str, org_name: str, role: str) -> Message:
             "this email.</p>"
         ),
         link=url,
+    )
+
+
+#: The longest reason the operator may give when declining an agency.
+DECLINE_REASON_MAX = 500
+
+
+def approved_message(to: str, app_url: str, org_name: str) -> Message:
+    """Telling an owner their agency was approved (FLOTTA-143).
+
+    Until now an approved agency found out only by its banner changing, on a
+    page it might not open for days. The link is the web app's home, which
+    carries no secret: the owner signs in as they always do.
+    """
+    home = app_url.rstrip("/") + "/"
+    return Message(
+        to=to,
+        subject=f"{org_name} is approved on Flotta",
+        text=(
+            f"You're in: {org_name} can now create agents for its clients.\n\n{home}\n\n"
+            "Creating one takes about a minute: pick a client, give it a name, "
+            "and start talking to it."
+        ),
+        html=(
+            f"<p>You're in: <strong>{html.escape(org_name)}</strong> can now create agents "
+            "for its clients.</p>"
+            f'<p><a href="{home}">Create your first agent</a></p>'
+            "<p>It takes about a minute: pick a client, give it a name, and start "
+            "talking to it.</p>"
+        ),
+        link=home,
+        kind="approval email",
+    )
+
+
+def declined_message(to: str, app_url: str, org_name: str, reason: str | None) -> Message:
+    """Telling an owner their agency was declined, and why if the operator said.
+
+    The reason is the operator's own words, escaped in the HTML like the org's
+    name, and cut to `DECLINE_REASON_MAX` by the route before it gets here.
+    """
+    home = app_url.rstrip("/") + "/"
+    why_text = f"\n\nWhy: {reason}" if reason else ""
+    why_html = f"<p>Why: {html.escape(reason)}</p>" if reason else ""
+    return Message(
+        to=to,
+        subject=f"About {org_name} on Flotta",
+        text=(
+            f"We can't take {org_name} on Flotta at the moment, so it won't be able "
+            f"to create agents.{why_text}\n\n"
+            "You can still sign in, and reply to this email if you think we got it wrong."
+        ),
+        html=(
+            f"<p>We can't take <strong>{html.escape(org_name)}</strong> on Flotta at the "
+            f"moment, so it won't be able to create agents.</p>{why_html}"
+            "<p>You can still sign in, and reply to this email if you think we got it wrong.</p>"
+        ),
+        link=home,
+        kind="decline email",
     )
 
 

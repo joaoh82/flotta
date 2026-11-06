@@ -552,6 +552,9 @@ def create_app(
     from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
     from flotta.mail import (
+        DECLINE_REASON_MAX,
+        approved_message,
+        declined_message,
         invite_message,
         resolve_app_url,
         resolve_mailer,
@@ -1017,24 +1020,61 @@ def create_app(
         return _decide(org_id, approve=True)
 
     @app.post("/api/orgs/{org_id}/decline")
-    def decline_org(org_id: str, token: Token | None = needs_admin) -> Any:
-        """Refuse a signed-up org. It keeps its sign-in and creates nothing, ever."""
-        _require_operator(token, "decline an org")
-        return _decide(org_id, approve=False)
+    def decline_org(
+        org_id: str, body: dict[str, Any] | None = None, token: Token | None = needs_admin
+    ) -> Any:
+        """Refuse a signed-up org. It keeps its sign-in and creates nothing, ever.
 
-    def _decide(org_id: str, *, approve: bool) -> Any:
+        `{"reason": "..."}` is optional: the operator's words, sent to its owners.
+        """
+        _require_operator(token, "decline an org")
+        reason = str((body or {}).get("reason") or "").strip()
+        if len(reason) > DECLINE_REASON_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=f"a reason has at most {DECLINE_REASON_MAX} characters",
+            )
+        return _decide(org_id, approve=False, reason=reason or None)
+
+    def _decide(org_id: str, *, approve: bool, reason: str | None = None) -> Any:
+        """Decide, then tell the org's owners (FLOTTA-143).
+
+        The decision is final once written, so a message that cannot be sent is
+        logged rather than refused: the operator's answer stands either way,
+        and `told` says how many owners were told.
+        """
         from dataclasses import asdict
 
         store = store_factory()
         try:
             org = store.decide_org(org_id, approve=approve)
+            owners = [
+                user.email
+                for m in store.members_of(org_id)
+                if m.role == "owner"
+                and (user := store.get_user(m.user_id)) is not None
+                and user.disabled_at is None
+            ]
         except UnknownEntityError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except InvalidTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
-        return {"org": asdict(org)}
+        told = 0
+        if deliver_link is not None:
+            for email in owners:
+                message = (
+                    approved_message(email, link_base, org.name)
+                    if approve
+                    else declined_message(email, link_base, org.name, reason)
+                )
+                try:
+                    deliver_link(message)
+                    told += 1
+                except Exception:  # noqa: BLE001 - the decision stands; the log says who was not told
+                    _log.exception("could not tell %s that %s was decided", email, org_id)
+        return {"org": asdict(org), "told": told}
 
     # -- the operator's view (M12.9) ------------------------------------------
     #
