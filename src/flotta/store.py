@@ -69,7 +69,14 @@ from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
 from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
-from flotta.runs import MAX_OUTPUT, cap_steps, check_input_size, check_trigger_kind, clip_text
+from flotta.runs import (
+    MAX_CHAT_PROMPT,
+    MAX_OUTPUT,
+    cap_steps,
+    check_input_size,
+    check_trigger_kind,
+    clip_text,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -4289,6 +4296,93 @@ class FleetStore:
             )
         return self._get_run_or_raise(run_id)
 
+    def open_chat_run(
+        self,
+        box_id: str,
+        prompt: str,
+        *,
+        input: Any = None,
+        started_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """A person's turn in a conversation, as a run already `running` (M14.6).
+
+        Made and started in one guarded transaction: a `chat` run is never
+        `pending`, so the run loop never sees one to deliver, and a box doing
+        another run refuses it with `BoxBusyError`, as `start_run` would. That
+        keeps a model call to one run (`_run_for_call`), and is why the door
+        records a turn only when nothing else is going on that agent.
+
+        **It starts when the door heard it start** (`started_at`), not when
+        this is called: the door sends it off the conversation, so it lands
+        after the agent's first model call may have. What a turn cost is read
+        from its times, not from the run a call was given when it was written
+        (`run_cost`), so that call still counts.
+        """
+        encoded = None if input is None else json.dumps(input)
+        if encoded is not None:
+            check_input_size(encoded)
+        rid = f"t-{uuid.uuid4().hex[:12]}"
+        began = started_at or now or datetime.now(UTC)
+        moment = _instant(began)
+        with self._conn.transaction(guard="tasks"):
+            box = self._get_box_or_raise(box_id)
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            busy = self._conn.execute(
+                "SELECT id FROM tasks WHERE box_id = ? AND status = 'running'", (box.id,)
+            ).fetchone()
+            if busy is not None:
+                raise BoxBusyError(box.id, busy["id"])
+            self._conn.execute(
+                "INSERT INTO tasks (id, box_id, prompt, status, created_at, started_at, org_id, "
+                "client_id, trigger_kind, input_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rid,
+                    box.id,
+                    clip_text(prompt, MAX_CHAT_PROMPT),
+                    "running",
+                    moment,
+                    moment,
+                    box.org,
+                    box.client,
+                    "chat",
+                    encoded,
+                ),
+            )
+        return self._get_run_or_raise(rid)
+
+    def finish_chat_run(
+        self,
+        run_id: str,
+        box_id: str,
+        status: str,
+        *,
+        output: str | None = None,
+        steps: list[dict[str, Any]] | None = None,
+        approval_count: int | None = None,
+        error_class: str | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """End `box_id`'s chat run `run_id` with its steps (M14.6).
+
+        Only a `chat` run of that box, still `running`: the door names the box
+        whose socket it heard, and a run of any other box, or one the control
+        plane delivers, is `UnknownEntityError` to it.
+        """
+        run = self.get_run(run_id)
+        if run is None or run.box_id != box_id or run.trigger_kind != "chat":
+            raise UnknownEntityError(f"no chat run {run_id!r} on box {box_id!r}")
+        return self.finish_run(
+            run_id,
+            status,
+            output=output,
+            steps=steps,
+            approval_count=approval_count,
+            error_class=error_class,
+            now=now,
+        )
+
     def get_run(self, run_id: str) -> Run | None:
         row = self._conn.execute(
             "SELECT * FROM tasks WHERE id = ? AND trigger_kind IS NOT NULL", (run_id,)
@@ -4367,8 +4461,17 @@ class FleetStore:
 
         Only the run's own box's rows: `record_usage` already refuses a run id
         from another box, and this holds even for a row written before it did.
+
+        **A conversation's turn is read by its times** (M14.6): the calls of its
+        box that began while the turn went on, as the door heard it, and that
+        no delivered run was given. The door records a turn off the
+        conversation, so a call can be written before the turn's run exists, or
+        given the turn before while that one's end was still on its way. The
+        ledger is never rewritten for it (`test_usage.py`); this reads it.
         """
         run = self._get_run_or_raise(run_id)
+        if run.trigger_kind == "chat":
+            return self._turn_cost(run)
         row = self._conn.execute(
             "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
             "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls, "
@@ -4383,6 +4486,34 @@ class FleetStore:
             calls=int(row["calls"]),
             tokens_in=int(row["tokens_in"]),
             tokens_out=int(row["tokens_out"]),
+        )
+
+    def _turn_cost(self, run: Run) -> RunCost:
+        if run.started_at is None:
+            return RunCost(eur_nano=0, unpriced=0, calls=0, tokens_in=0, tokens_out=0)
+        began = datetime.fromisoformat(run.started_at)
+        ended = datetime.fromisoformat(run.finished_at) if run.finished_at else None
+        rows = self._conn.execute(
+            "SELECT u.at, u.latency_ms, u.cost_eur_nano, u.tokens_in, u.tokens_out, "
+            "t.trigger_kind AS given_to FROM usage u LEFT JOIN tasks t ON t.id = u.run_id "
+            "WHERE u.box_id = ? AND u.kind = 'model' AND u.at >= ?",
+            (run.box_id, _instant(began)),
+        ).fetchall()
+        kept = []
+        for r in rows:
+            if r["given_to"] not in (None, "chat"):
+                continue  # a delivered run's, which a turn never overlaps
+            start = datetime.fromisoformat(r["at"]) - timedelta(
+                milliseconds=max(0, r["latency_ms"] or 0)
+            )
+            if start >= began and (ended is None or start <= ended):
+                kept.append(r)
+        return RunCost(
+            eur_nano=sum(int(r["cost_eur_nano"] or 0) for r in kept),
+            unpriced=sum(1 for r in kept if r["cost_eur_nano"] is None),
+            calls=len(kept),
+            tokens_in=sum(int(r["tokens_in"] or 0) for r in kept),
+            tokens_out=sum(int(r["tokens_out"] or 0) for r in kept),
         )
 
     def _run_for_call(self, box_id: str, named: str | None, started: datetime) -> str | None:

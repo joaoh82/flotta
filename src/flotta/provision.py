@@ -1583,6 +1583,10 @@ def stop_box(
     # strand that watcher. M6's workspace tier is where mid-task suspend
     # becomes meaningful.
     live = [t.id for t in store.list_tasks(box_id=box_id) if not is_terminal("task", t.status)]
+    # A conversation's turn is not work this would strand: it is the door's
+    # record of one (M14.6), and a stopped agent ends the conversation anyway.
+    turns = [t for t in live if _a_turn(store, t)]
+    live = [t for t in live if t not in turns]
     if live:
         raise ProvisionError(
             f"box {box_id} has {len(live)} task(s) still running ({', '.join(live)}); "
@@ -1603,6 +1607,10 @@ def stop_box(
         {"reason": reason, "previous_status": box.status, "method": method},
     )
     store.update_box_status(box_id, "stopped")
+    for turn in turns:
+        with contextlib.suppress(InvalidTransitionError):  # its door ended it meanwhile
+            store.finish_run(turn, "failed", error_class="stopped")
+            store.add_event("task", turn, "failed", {"error": "its agent was stopped"})
     return {
         "box_id": box_id,
         "status": "stopped",
@@ -3809,7 +3817,16 @@ def idle_boxes(
 
     # One query, not one per box: a live task means occupied, whatever the
     # event log says, and a box mid-task must never be suspended.
-    occupied = {t.box_id for t in store.list_tasks() if not is_terminal("task", t.status)}
+    #
+    # Not a conversation's turn (M14.6). The door holds a box awake while
+    # anyone is talking to it (`door.app.Liveness`), and the turn's run is only
+    # its record: one whose end was lost, to a door that died mid-turn, must
+    # not keep an agent awake and billing until `reap_runs` closes it.
+    occupied = {
+        t.box_id
+        for t in store.list_tasks()
+        if not is_terminal("task", t.status) and not _a_turn(store, t.id)
+    }
 
     idle: list[tuple[Box, float]] = []
     for box in store.list_boxes():
@@ -3962,6 +3979,12 @@ def enforce_budgets(
             _log.warning("budget action on %s failed: %s", box.name, exc)
             outcomes.append({"box_id": box.id, "error": str(exc)})
     return outcomes
+
+
+def _a_turn(store: FleetStore, task_id: str) -> bool:
+    """Whether a task is a conversation's turn, recorded by the door (M14.6)."""
+    run = store.get_run(task_id)
+    return run is not None and run.trigger_kind == "chat"
 
 
 def sleep_idle_boxes(

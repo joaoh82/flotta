@@ -32,6 +32,10 @@ MAX_TEXT = 500
 #: Characters kept of a run's output, the agent's final reply.
 MAX_OUTPUT = 64_000
 
+#: Characters kept of what a person said to open a chat run (M14.6). A run's
+#: prompt is a sentence; a pasted document is what the conversation holds.
+MAX_CHAT_PROMPT = 8_000
+
 #: Characters of JSON a run's input may be. Refused whole above this rather
 #: than cut, because half a document means something else.
 MAX_INPUT = 64_000
