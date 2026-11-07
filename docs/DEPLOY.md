@@ -991,7 +991,7 @@ Once agents use the gateway, its outage or the database's stops their model call
 Agencies give agents tools from outside (Linear, Notion, anything remote that speaks
 MCP) through `/mcp/<server>` on the gateway. No upstream credential is ever on a box:
 the gateway checks the grant on every request, hides and refuses tools that weren't
-granted, puts the agency's credential on, and writes a row per tool call.
+granted, puts the agency's credential on, and writes a row per tool call, refused ones included (a call to a server the agent lost is one).
 
 **Nothing to set to turn it on.** The gateway and `FLOTTA_GATEWAY_URL` are the only
 requirements, and an OAuth sign-in needs `FLOTTA_CONTROL_URL`, which a control plane
@@ -1037,7 +1037,8 @@ a removed one is refused anyway. A running agent is then asked to reload its MCP
 `mcp_reload_failed` event), so a removed tool leaves its open conversations too. **A
 sleeping agent isn't woken for a grant or a catalogue change**: the grant is in force at
 the gateway at once (`pending: true` in the answer), and its config is written by
-`wake_box` when something next addresses it, before it is reached. **A catalogue change
+`wake_box` when something next addresses it, before it is reached. That wake's reload
+waits for Hermes to finish booting (up to 120 s), so it isn't recorded as a failure. **A catalogue change
 reaches every agent granted the server:** its config is written again (the entry gone, or
 new tools) and it is reloaded, its grant kept and shown as going away. **A connection is
 only ever used for the address it was made for**: an entry whose URL changes leaves its
