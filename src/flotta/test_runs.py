@@ -523,3 +523,69 @@ def test_a_turn_is_ended_only_on_its_own_agent(agency):
     steps = [{"kind": "tool", "name": "terminal"}]
     ended = agency.finish_chat_run(turn.id, "b-one", "done", output="Nothing.", steps=steps)
     assert ended.status == "done" and ended.steps["steps"][0]["name"] == "terminal"
+
+
+def test_a_call_recorded_before_its_turns_run_still_counts(agency):
+    """Found in review: the door's call to open a turn lands after the turn
+    began, and the agent's first model call can be written before it. The run
+    starts when the door heard the turn start, and takes that call."""
+    early = _call(agency, "b-one", "first", now=T0 + timedelta(seconds=2), latency_ms=1_500)
+    assert early.run_id is None
+
+    turn = agency.open_chat_run(
+        "b-one", "What changed?", started_at=T0, now=T0 + timedelta(seconds=3)
+    )
+
+    assert turn.started_at == T0.isoformat()
+    assert agency.run_cost(turn.id).calls == 1
+
+
+def test_a_call_from_before_the_turn_is_not_taken(agency):
+    _call(agency, "b-one", "earlier", now=T0 - timedelta(seconds=1))
+    _call(agency, "b-one", "straddles", now=T0 + timedelta(seconds=1), latency_ms=5_000)
+    _call(agency, "b-two", "other-box", now=T0 + timedelta(seconds=1))
+
+    turn = agency.open_chat_run("b-one", "What changed?", started_at=T0)
+
+    assert agency.run_cost(turn.id).calls == 0
+
+
+def test_a_late_end_hands_the_next_turns_calls_back(agency):
+    """Found in review: a turn ended late is still running while the next
+    turn's first call is written, so that call was counted to it. Ending it at
+    the time the door heard gives such calls back, for the next turn."""
+    first = agency.open_chat_run("b-one", "One.", started_at=T0)
+    _call(agency, "b-one", "first-turn", now=T0 + timedelta(seconds=5))
+    _call(agency, "b-one", "second-turn", now=T0 + timedelta(seconds=20), latency_ms=1_000)
+    agency.finish_chat_run(first.id, "b-one", "done", output="1.", now=T0 + timedelta(seconds=10))
+
+    second = agency.open_chat_run("b-one", "Two.", started_at=T0 + timedelta(seconds=15))
+
+    assert agency.run_cost(first.id).calls == 1
+    assert agency.run_cost(second.id).calls == 1
+    assert agency.get_run(first.id).finished_at == (T0 + timedelta(seconds=10)).isoformat()
+
+
+def test_a_delivered_runs_call_is_never_a_turns(agency):
+    """A turn's cost is read by its times, which are the door's and so a
+    little earlier than the control plane's. A call given to a delivered run
+    that was still ending then stays that run's."""
+    delivered = _started(agency, at=T0 - timedelta(minutes=1))
+    _call(agency, "b-one", "delivered", now=T0 + timedelta(seconds=2))
+    agency.finish_run(delivered.id, "done", output="Done.", now=T0 + timedelta(seconds=5))
+
+    turn = agency.open_chat_run("b-one", "Hello.", started_at=T0)
+
+    assert agency.run_cost(delivered.id).calls == 1
+    assert agency.run_cost(turn.id).calls == 0
+
+
+def test_the_ledger_is_not_rewritten_for_a_turn(agency):
+    """`test_usage.py` reads the store for it; this is what it means here."""
+    early = _call(agency, "b-one", "first", now=T0 + timedelta(seconds=2), latency_ms=1_500)
+    turn = agency.open_chat_run("b-one", "What changed?", started_at=T0)
+    agency.finish_chat_run(turn.id, "b-one", "done", output="1.", now=T0 + timedelta(seconds=10))
+
+    (row,) = agency._conn.execute("SELECT run_id FROM usage WHERE id = ?", (early.id,)).fetchall()
+    assert row["run_id"] is None
+    assert agency.run_cost(turn.id).calls == 1

@@ -208,8 +208,14 @@ class ConversationGate:
     # -- from the client ---------------------------------------------------------
 
     async def from_client(self, frame: str | bytes) -> Step:
-        if self._turns is not None:
-            self._turns.heard_client(frame)
+        step = await self._from_client(frame)
+        if self._turns is not None and step.to_box is not None:
+            # What reaches the agent, after the gate: a refused answer to an
+            # approval answered nothing, and is not recorded as answering it.
+            self._turns.heard_client(step.to_box)
+        return step
+
+    async def _from_client(self, frame: str | bytes) -> Step:
         if self.conversation_only:
             return await self._confined(frame)
         if isinstance(frame, bytes) or "session.most_recent" not in frame:

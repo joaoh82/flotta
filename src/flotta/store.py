@@ -4302,6 +4302,7 @@ class FleetStore:
         prompt: str,
         *,
         input: Any = None,
+        started_at: datetime | None = None,
         now: datetime | None = None,
     ) -> Run:
         """A person's turn in a conversation, as a run already `running` (M14.6).
@@ -4311,12 +4312,19 @@ class FleetStore:
         another run refuses it with `BoxBusyError`, as `start_run` would. That
         keeps a model call to one run (`_run_for_call`), and is why the door
         records a turn only when nothing else is going on that agent.
+
+        **It starts when the door heard it start** (`started_at`), not when
+        this is called: the door sends it off the conversation, so it lands
+        after the agent's first model call may have. What a turn cost is read
+        from its times, not from the run a call was given when it was written
+        (`run_cost`), so that call still counts.
         """
         encoded = None if input is None else json.dumps(input)
         if encoded is not None:
             check_input_size(encoded)
         rid = f"t-{uuid.uuid4().hex[:12]}"
-        moment = _instant(now) if now else _utcnow()
+        began = started_at or now or datetime.now(UTC)
+        moment = _instant(began)
         with self._conn.transaction(guard="tasks"):
             box = self._get_box_or_raise(box_id)
             if box.status in BOX_TERMINAL:
@@ -4453,8 +4461,17 @@ class FleetStore:
 
         Only the run's own box's rows: `record_usage` already refuses a run id
         from another box, and this holds even for a row written before it did.
+
+        **A conversation's turn is read by its times** (M14.6): the calls of its
+        box that began while the turn went on, as the door heard it, and that
+        no delivered run was given. The door records a turn off the
+        conversation, so a call can be written before the turn's run exists, or
+        given the turn before while that one's end was still on its way. The
+        ledger is never rewritten for it (`test_usage.py`); this reads it.
         """
         run = self._get_run_or_raise(run_id)
+        if run.trigger_kind == "chat":
+            return self._turn_cost(run)
         row = self._conn.execute(
             "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
             "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls, "
@@ -4469,6 +4486,34 @@ class FleetStore:
             calls=int(row["calls"]),
             tokens_in=int(row["tokens_in"]),
             tokens_out=int(row["tokens_out"]),
+        )
+
+    def _turn_cost(self, run: Run) -> RunCost:
+        if run.started_at is None:
+            return RunCost(eur_nano=0, unpriced=0, calls=0, tokens_in=0, tokens_out=0)
+        began = datetime.fromisoformat(run.started_at)
+        ended = datetime.fromisoformat(run.finished_at) if run.finished_at else None
+        rows = self._conn.execute(
+            "SELECT u.at, u.latency_ms, u.cost_eur_nano, u.tokens_in, u.tokens_out, "
+            "t.trigger_kind AS given_to FROM usage u LEFT JOIN tasks t ON t.id = u.run_id "
+            "WHERE u.box_id = ? AND u.kind = 'model' AND u.at >= ?",
+            (run.box_id, _instant(began)),
+        ).fetchall()
+        kept = []
+        for r in rows:
+            if r["given_to"] not in (None, "chat"):
+                continue  # a delivered run's, which a turn never overlaps
+            start = datetime.fromisoformat(r["at"]) - timedelta(
+                milliseconds=max(0, r["latency_ms"] or 0)
+            )
+            if start >= began and (ended is None or start <= ended):
+                kept.append(r)
+        return RunCost(
+            eur_nano=sum(int(r["cost_eur_nano"] or 0) for r in kept),
+            unpriced=sum(1 for r in kept if r["cost_eur_nano"] is None),
+            calls=len(kept),
+            tokens_in=sum(int(r["tokens_in"] or 0) for r in kept),
+            tokens_out=sum(int(r["tokens_out"] or 0) for r in kept),
         )
 
     def _run_for_call(self, box_id: str, named: str | None, started: datetime) -> str | None:

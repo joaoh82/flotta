@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime
 
 import pytest
 
@@ -65,12 +66,13 @@ class Plane:
         self.released = asyncio.Event()
         self._n = 0
 
-    async def open_chat_run(self, box_id, *, prompt, session_id, by, client):
+    async def open_chat_run(self, box_id, *, prompt, session_id, by, client, started_at):
         if self.hang:
             await self.released.wait()
         self.opened.append(
             {"box": box_id, "prompt": prompt, "session": session_id, "by": by, "client": client}
         )
+        self.started_at = started_at
         if self.busy:
             return None
         self._n += 1
@@ -89,12 +91,33 @@ class Plane:
         return None
 
 
-def _gate(plane, *, box="b-1", subject="user:u-1", client=False):
+def _gate(plane, *, box="b-1", subject="user:u-1", client=False, answers=False):
     recorder = TurnRecorder(box_id=box, subject=subject, client=client, plane=plane)
     gate = ConversationGate(
-        box_id=box, subject=subject, plane=plane, conversation_only=client, turns=recorder
+        box_id=box,
+        subject=subject,
+        plane=plane,
+        conversation_only=client,
+        answers_approvals=answers,
+        turns=recorder,
     )
     return gate, recorder
+
+
+def _ask(srq="srq-1", request_id="r-1", session="live-1"):
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": srq,
+            "method": "approval",
+            "params": {
+                "request_id": request_id,
+                "session_id": session,
+                "command": "rm -rf build/",
+                "choices": ["once", "session", "always", "deny"],
+            },
+        }
+    )
 
 
 async def _settle(recorder):
@@ -195,6 +218,10 @@ def test_a_turn_is_a_run_with_its_prompt_steps_and_reply():
     async def go():
         plane = Plane()
         gate, recorder = _gate(plane, subject="user:u-9", client=True)
+        # A client's socket may prompt only in a session it was given.
+        await gate.from_client(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create"}))
+        made = {"session_id": "live-1", "stored_session_id": "s-1"}
+        await gate.from_box(json.dumps({"jsonrpc": "2.0", "id": 1, "result": made}))
         await gate.from_client(_submit("What is in the workspace?"))
         for frame in _turn():
             await gate.from_box(frame)
@@ -203,6 +230,7 @@ def test_a_turn_is_a_run_with_its_prompt_steps_and_reply():
 
     plane = asyncio.run(go())
 
+    assert datetime.fromisoformat(plane.started_at).tzinfo is not None
     (opened,) = plane.opened
     assert opened == {
         "box": "b-1",
@@ -331,3 +359,127 @@ def test_an_approval_kept_from_a_client_is_still_a_step():
 def test_only_a_persons_conversation_is_recorded(subject, recorded):
     """A run's own delivery is a run already; a relay is the other agent's."""
     assert records(subject) is recorded
+
+
+# -- found in review -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}},
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "request.answer",
+            "params": {"id": "srq-1", "result": {"choice": "once"}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "approval.respond",
+            "params": {"session_id": "live-1", "choice": "once", "request_id": "r-1"},
+        },
+    ],
+    ids=["response", "request.answer", "approval.respond"],
+)
+def test_an_approval_granted_is_recorded_granted_by_whoever_granted_it(answer):
+    """Every answer was recorded as denied and expired: the door never heard
+    one. It hears what the gate forwards, so an answer that reached the agent
+    is the step's answer."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:ops")
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        forwarded = await gate.from_client(json.dumps(answer))
+        await gate.from_box(_event("message.complete", {"text": "Done.", "status": "complete"}))
+        await _settle(recorder)
+        return plane, forwarded
+
+    plane, forwarded = asyncio.run(go())
+
+    assert forwarded.to_box is not None
+    (step,) = plane.finished[0]["steps"]
+    assert (step["answer"], step["answered_by"]) == ("once", "user:ops")
+    assert not step.get("expired")
+
+
+def test_an_answer_the_gate_refused_answered_nothing():
+    """A client's ticket that may not answer approvals: its answer never
+    reaches the agent, so the step still ends denied, by nobody."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, client=True)
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        refused = await gate.from_client(
+            json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "always"}})
+        )
+        await gate.from_box(_event("message.complete", {"text": "No.", "status": "complete"}))
+        await _settle(recorder)
+        return plane, refused
+
+    plane, refused = asyncio.run(go())
+
+    assert refused.to_box is None
+    (step,) = plane.finished[0]["steps"]
+    assert (step["answer"], step["answered_by"], step["expired"]) == ("deny", None, True)
+
+
+def test_a_turn_skipped_when_behind_cannot_crowd_out_an_opened_turns_end():
+    """The reviewer's case: turn A opened, then a hundred turns of B while
+    the control plane is held. B's skipped turns queued their ends anyway,
+    filled the queue, and A's end was dropped, leaving its run running."""
+
+    async def go():
+        plane = Plane(hang=True)
+        gate, recorder = _gate(plane)
+        await gate.from_box(_event("message.start", session="live-a"))
+        for _ in range(100):
+            await gate.from_box(_event("message.start", session="live-b"))
+            done = {"text": "B.", "status": "complete"}
+            await gate.from_box(_event("message.complete", done, session="live-b"))
+        await gate.from_box(
+            _event("message.complete", {"text": "A.", "status": "complete"}, session="live-a")
+        )
+        plane.released.set()
+        await asyncio.wait_for(recorder.close(), 5)
+        return plane
+
+    plane = asyncio.run(go())
+
+    opened = {o["session"] for o in plane.opened}
+    assert "live-a" in opened
+    assert len(plane.finished) == len(plane.opened), "an opened turn was never ended"
+    assert plane.finished[0]["output"] == "A." or any(f["output"] == "A." for f in plane.finished)
+
+
+def test_every_turn_opened_keeps_room_for_its_end_however_many_are_open():
+    """Forty sessions mid-turn at once, then a burst on another, with the
+    control plane held: a turn is taken only with its end's place kept, so
+    each one opened is ended. Without the kept place, the burst fills the
+    queue and the forty ends are dropped."""
+
+    async def go():
+        plane = Plane(hang=True)
+        gate, recorder = _gate(plane)
+        for n in range(40):
+            await gate.from_box(_event("message.start", session=f"live-{n}"))
+        for _ in range(100):
+            await gate.from_box(_event("message.start", session="live-burst"))
+            done = {"text": "B.", "status": "complete"}
+            await gate.from_box(_event("message.complete", done, session="live-burst"))
+        for n in range(40):
+            done = {"text": f"{n}.", "status": "complete"}
+            await gate.from_box(_event("message.complete", done, session=f"live-{n}"))
+        plane.released.set()
+        await asyncio.wait_for(recorder.close(), 5)
+        return plane
+
+    plane = asyncio.run(go())
+
+    assert plane.opened
+    assert len(plane.finished) == len(plane.opened), "an opened turn was never ended"

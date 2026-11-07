@@ -571,14 +571,27 @@ class ControlPlane:
         )
 
     async def open_chat_run(
-        self, box_id: str, *, prompt: str, session_id: str, by: str, client: bool
+        self,
+        box_id: str,
+        *,
+        prompt: str,
+        session_id: str,
+        by: str,
+        client: bool,
+        started_at: str,
     ) -> str | None:
         """A turn began on `box_id`: its `chat` run's id, or None while the agent
         is doing another run (M14.6, `flotta.door.turns`)."""
         import httpx
 
         url = f"{self.base_url.rstrip('/')}/api/boxes/{box_id}/chat-runs"
-        body = {"prompt": prompt, "session_id": session_id, "by": by, "client": client}
+        body = {
+            "prompt": prompt,
+            "session_id": session_id,
+            "by": by,
+            "client": client,
+            "started_at": started_at,
+        }
         async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
             response = await http.post(url, headers=self._headers(), json=body)
         if response.status_code == 409:
@@ -596,6 +609,7 @@ class ControlPlane:
         output: str | None,
         error_class: str | None,
         approvals: int,
+        ended_at: str,
     ) -> None:
         """The turn ended: its steps and reply, in one batch."""
         import httpx
@@ -607,6 +621,7 @@ class ControlPlane:
             "output": output,
             "error_class": error_class,
             "approvals": approvals,
+            "ended_at": ended_at,
         }
         async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
             response = await http.post(url, headers=self._headers(), json=body)

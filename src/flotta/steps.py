@@ -54,6 +54,12 @@ class Steps:
         if step is not None:
             step.update(answer=choice, answered_by=by)
 
+    def answered_request(self, request_id: str, choice: str | None, by: str | None) -> None:
+        """A person answered the approval Hermes calls `request_id` (`approval.respond`)."""
+        step = self._by_request.get(request_id)
+        if step is not None:
+            step.update(answer=choice, answered_by=by)
+
     def unanswered(self) -> None:
         """The run ended with questions open: each was denied, by nobody."""
         for step in self.steps:

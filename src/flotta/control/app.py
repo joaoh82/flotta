@@ -38,7 +38,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from flotta import db
@@ -95,6 +95,7 @@ from flotta.relay import (
     deliver_through_door,
     envelope,
 )
+from flotta.runs import RUN_DEADLINE_S
 from flotta.store import (
     AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
@@ -6103,11 +6104,32 @@ def create_app(
     # side (`flotta.door.turns`), so a slow control plane costs a conversation
     # nothing. A run per turn, not per conversation: see `door/turns.py`.
 
+    def _door_time(value: Any, name: str) -> datetime | None:
+        """A time the door heard something at, or None if it sent none.
+
+        The door sends its calls off the conversation, so they land late, and
+        the run's times are when the turn happened (`open_chat_run`). Within a
+        run's deadline of now and not ahead of it: anything else is a clock or
+        a bug, and a 422 says so rather than a run that began last year.
+        """
+        if value is None:
+            return None
+        try:
+            moment = datetime.fromisoformat(str(value))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"{name} is an ISO time") from exc
+        now = datetime.now(UTC)
+        if moment.tzinfo is None or not (
+            now - timedelta(seconds=RUN_DEADLINE_S) <= moment <= now + timedelta(seconds=5)
+        ):
+            raise HTTPException(status_code=422, detail=f"{name} is not a time of this turn")
+        return moment
+
     @app.post("/api/boxes/{box_id}/chat-runs", status_code=201)
     def open_chat_run(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{prompt, session_id, by, client}`: a turn began. 409 while the agent
+        """`{prompt, session_id, by, client, started_at}`: a turn began. 409 while the agent
         is doing another run, and the turn is then not recorded: its model
         calls belong to that run (`FleetStore._run_for_call`)."""
         session_id, by = body.get("session_id"), body.get("by")
@@ -6118,6 +6140,7 @@ def create_app(
                 )
         prompt = body.get("prompt")
         prompt = prompt if isinstance(prompt, str) and prompt.strip() else CHAT_NO_PROMPT
+        started_at = _door_time(body.get("started_at"), "started_at")
         store = store_factory()
         try:
             box = _routable_box(store, token, box_id)
@@ -6126,6 +6149,7 @@ def create_app(
                     box.id,
                     prompt,
                     input={"session_id": session_id, "by": by, "client": bool(body.get("client"))},
+                    started_at=started_at,
                 )
             except BoxBusyError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -6140,7 +6164,7 @@ def create_app(
     def finish_chat_run(
         box_id: str, run_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{steps, status, output?, error_class?, approvals?}`: the turn ended,
+        """`{steps, status, output?, error_class?, approvals?, ended_at?}`: the turn ended,
         `done` or `failed`. Only a chat run of this box, still running."""
         steps = body.get("steps") or []
         status = body.get("status")
@@ -6150,6 +6174,7 @@ def create_app(
             raise HTTPException(status_code=422, detail="a turn ends done or failed")
         output, error_class = body.get("output"), body.get("error_class")
         approvals = body.get("approvals")
+        ended_at = _door_time(body.get("ended_at"), "ended_at")
         store = store_factory()
         try:
             box = _routable_box(store, token, box_id)
@@ -6162,6 +6187,7 @@ def create_app(
                     steps=steps[:CHAT_MAX_STEPS_SENT],
                     approval_count=approvals if isinstance(approvals, int) else None,
                     error_class=str(error_class)[:80] if error_class else None,
+                    now=ended_at,
                 )
             except UnknownEntityError as exc:
                 raise HTTPException(status_code=404, detail=f"no chat run {run_id!r}") from exc

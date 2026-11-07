@@ -35,6 +35,7 @@ would cost the person their conversation.
   agent's turn. Nor a box's own token.
 - A turn whose socket closes before `message.complete` is ended `failed`,
   `disconnected`, with the steps heard so far.
+- A new turn while the queue has no room for both its calls.
 - A turn going on when the door itself dies. Its run stays `running` until
   `provision.reap_runs` closes it as `stranded`, as a delivered run's does when
   the control plane dies, and the agent's schedules wait until then. It does
@@ -49,6 +50,7 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from flotta.steps import Steps
@@ -56,7 +58,9 @@ from flotta.steps import Steps
 _log = logging.getLogger("flotta.door")
 
 #: Calls waiting for the control plane, per socket. Two per turn, so this is a
-#: control plane that has been away for a while; past it, turns go unrecorded.
+#: control plane that has been away for a while; past it, new turns go
+#: unrecorded. A turn is taken only with room for both its calls, its end's
+#: kept for it (`_reserved`), so a turn that was opened always gets its end.
 QUEUE_LIMIT = 64
 
 #: The longest one call to the control plane may take before it is given up.
@@ -71,6 +75,8 @@ NOT_A_CONVERSATION = ("run:", "relay", "box:")
 #: The frames a turn's record reads. Anything else, `message.delta` above all,
 #: is passed without being parsed.
 _HEARD = ('"message.start"', '"message.complete"', '"tool.start"', '"tool.complete"', "approval")
+#: The person's frames it reads: a prompt, or an answer to an approval.
+_HEARD_FROM_CLIENT = ('"prompt.submit"', '"choice"')
 
 #: Characters of a reply kept on the run; the store clips again.
 MAX_REPLY = 64_000
@@ -83,7 +89,14 @@ class Recorder(Protocol):
     """What the door asks the control plane for a turn."""
 
     async def open_chat_run(
-        self, box_id: str, *, prompt: str, session_id: str, by: str, client: bool
+        self,
+        box_id: str,
+        *,
+        prompt: str,
+        session_id: str,
+        by: str,
+        client: bool,
+        started_at: str,
     ) -> str | None: ...
 
     async def finish_chat_run(
@@ -96,6 +109,7 @@ class Recorder(Protocol):
         output: str | None,
         error_class: str | None,
         approvals: int,
+        ended_at: str,
     ) -> None: ...
 
 
@@ -107,6 +121,12 @@ def records(subject: str) -> bool:
 @dataclass
 class _Turn:
     prompt: str
+    #: When the door heard it begin and end. Its calls land later, and the
+    #: run's times must be the turn's, or its cost misses the first model call.
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    ended_at: datetime | None = None
+    #: False for a turn the door had no room to record: it queues nothing.
+    admitted: bool = True
     steps: Steps = field(default_factory=Steps)
     #: Set by the worker once the control plane has made the run.
     run_id: asyncio.Future[str | None] = field(
@@ -132,22 +152,42 @@ class TurnRecorder:
         self._worker: asyncio.Task[None] | None = None
         self._dropped = False
         self._closed = False
+        #: Places kept on the queue for the ends of turns opened and not ended.
+        self._reserved = 0
 
     # -- what passes through ------------------------------------------------
 
     def heard_client(self, frame: str | bytes) -> None:
-        """A frame from the person: the prompt of the turn about to begin."""
-        if isinstance(frame, bytes) or '"prompt.submit"' not in frame:
+        """A frame from the person **as the gate forwards it to the agent**: the
+        prompt of the turn about to begin, or an answer to an approval. What the
+        gate refused never reached the agent, so it is not heard here either."""
+        if isinstance(frame, bytes) or not any(m in frame for m in _HEARD_FROM_CLIENT):
             return
         parsed = _parse(frame)
-        if parsed is None or parsed.get("method") != "prompt.submit":
+        if parsed is None:
             return
-        params = parsed.get("params")
-        if not isinstance(params, dict):
-            return
-        session, text = params.get("session_id"), params.get("text")
-        if isinstance(session, str) and session and isinstance(text, str):
-            self._prompts[session] = text
+        method, params = parsed.get("method"), parsed.get("params")
+        params = params if isinstance(params, dict) else {}
+        if method == "prompt.submit":
+            session, text = params.get("session_id"), params.get("text")
+            if isinstance(session, str) and session and isinstance(text, str):
+                self._prompts[session] = text
+        elif method == "approval.respond":
+            request_id = params.get("request_id")
+            if isinstance(request_id, str):
+                for turn in self._turns.values():
+                    turn.steps.answered_request(request_id, params.get("choice"), self._subject)
+        elif method == "request.answer":
+            self._answered(params.get("id"), params.get("result"))
+        elif method is None:
+            # A response frame: the agent's own request, answered by id.
+            self._answered(parsed.get("id"), parsed.get("result"))
+
+    def _answered(self, rpc_id: Any, result: Any) -> None:
+        choice = result.get("choice") if isinstance(result, dict) else None
+        if isinstance(rpc_id, str) and choice is not None:
+            for turn in self._turns.values():
+                turn.steps.answered(rpc_id, choice, self._subject)
 
     def heard_box(self, frame: str) -> None:
         """A frame from the agent, before the gate decides what the person sees."""
@@ -211,21 +251,25 @@ class TurnRecorder:
             self._end(session, None)
         turn = _Turn(prompt=self._prompts.pop(session, ""))
         self._turns[session] = turn
-        if self._queue.qsize() >= QUEUE_LIMIT // 2:
-            # Behind: this turn goes unrecorded, so that every turn that was
-            # opened has room left for its end. An end dropped would leave its
-            # run `running` (see `close`).
+        if self._queue.qsize() + self._reserved + 2 > QUEUE_LIMIT:
+            # Behind: this turn goes unrecorded, and queues nothing, not even
+            # its end. Every turn that was opened keeps room for its end, since
+            # an end dropped would leave its run `running` (see `close`).
+            turn.admitted = False
             turn.run_id.set_result(None)
             self._behind()
             return
+        self._reserved += 1
         self._send("open", session, turn)
 
     def _end(self, session: str, payload: dict[str, Any] | None) -> None:
         turn = self._turns.pop(session, None)
-        if turn is None:
+        if turn is None or not turn.admitted:
             return
         turn.steps.unanswered()
         turn.ending = payload
+        turn.ended_at = datetime.now(UTC)
+        self._reserved -= 1
         self._send("end", session, turn)
 
     def _send(self, what: str, session: str, turn: _Turn) -> None:
@@ -233,7 +277,7 @@ class TurnRecorder:
             self._worker = asyncio.get_running_loop().create_task(self._work())
         try:
             self._queue.put_nowait((what, session, turn))
-        except asyncio.QueueFull:  # not reached while `_begin` keeps half the room
+        except asyncio.QueueFull:  # not reached: `_begin` keeps room for every end
             if what == "open" and not turn.run_id.done():
                 turn.run_id.set_result(None)
             self._behind()
@@ -268,6 +312,7 @@ class TurnRecorder:
                 session_id=session,
                 by=self._subject,
                 client=self._client,
+                started_at=turn.started_at.isoformat(),
             )
         turn.run_id.set_result(run_id)
 
@@ -293,6 +338,7 @@ class TurnRecorder:
                 output=output,
                 error_class=error,
                 approvals=turn.steps.approvals,
+                ended_at=(turn.ended_at or datetime.now(UTC)).isoformat(),
             )
 
 

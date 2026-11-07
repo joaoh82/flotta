@@ -134,3 +134,29 @@ def test_a_turns_steps_are_kept_as_a_runs_are():
         )
 
     assert len(ended.steps["steps"]) == MAX_STEPS and ended.steps["omitted"] == 50
+
+
+def test_a_turn_keeps_the_times_the_door_heard(api, fleet):
+    """Found in review: the door's calls land after the turn, and the run's
+    times are the turn's, or its first model call falls outside it."""
+    began = datetime.now(UTC) - timedelta(seconds=30)
+    ended = began + timedelta(seconds=12)
+
+    opened = _open(api, started_at=began.isoformat()).json()
+    _end(api, opened["id"], ended_at=ended.isoformat())
+
+    with FleetStore(fleet) as store:
+        run = store.get_run(opened["id"])
+    assert datetime.fromisoformat(run.started_at) == began
+    assert datetime.fromisoformat(run.finished_at) == ended
+
+
+def test_a_time_that_is_not_this_turns_is_refused(api):
+    now = datetime.now(UTC)
+    for bad in (
+        "yesterday",
+        now.replace(tzinfo=None).isoformat(),
+        (now - timedelta(days=1)).isoformat(),
+        (now + timedelta(minutes=5)).isoformat(),
+    ):
+        assert _open(api, started_at=bad).status_code == 422, bad
