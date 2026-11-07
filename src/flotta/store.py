@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -69,6 +70,11 @@ from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
 from flotta.runs import MAX_OUTPUT, cap_steps, check_input_size, check_trigger_kind, clip_text
+
+_log = logging.getLogger(__name__)
+
+#: The migration that gave connections an address; applying it binds the ones already there.
+MCP_BIND_MIGRATION = 24
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -1064,6 +1070,8 @@ class McpConnection:
     connected_by: str | None
     created_at: str
     updated_at: str
+    #: The server's URL when it was connected; `None` for one made before that was kept.
+    server_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1173,9 +1181,36 @@ class FleetStore:
         try:
             #: What opening this store applied — `flotta db migrate` reports it.
             self.migrations_applied: list[int] = migrations.apply(self._conn, dialect=dialect)
+            if MCP_BIND_MIGRATION in self.migrations_applied:
+                self._bind_mcp_connections()
         except BaseException:
             self._conn.close()
             raise
+
+    def _bind_mcp_connections(self) -> int:
+        """Give every connection made before migration 24 the address it was made for.
+
+        Run once, by whichever process applies that migration, from the catalogue
+        in force then: the environment's, since nothing could store one before.
+        A connection for a server not offered then stays unbound, and an unbound
+        connection is never used (`flotta.mcp.connection_usable`), so a server
+        removed and added back later with another address can't inherit it.
+        """
+        from flotta.mcp import catalogue_of
+
+        servers, error = catalogue_of(self)
+        if error:
+            _log.error("MCP connections left unbound: the catalogue could not be read: %s", error)
+            return 0
+        bound = 0
+        for server in servers.values():
+            cursor = self._conn.execute(
+                "UPDATE mcp_connections SET server_url = ? WHERE server = ? AND server_url IS NULL "
+                "RETURNING server",
+                (server.url, server.name),
+            )
+            bound += len(cursor.fetchall())
+        return bound
 
     def _check_not_legacy(self, db_path: str | Path) -> None:
         """Refuse a pre-M0 store instead of rendering it as an empty fleet.
@@ -2683,20 +2718,23 @@ class FleetStore:
         credential: str,
         by: str | None,
         client: str | None = None,
+        server_url: str | None = None,
     ) -> McpConnection:
         """Connect, or connect again: a new credential, and `ok` whatever it was before.
 
         `client` makes it that client's own, ahead of the org's for its agents.
+        `server_url` is the address it is for; it is never used for another.
         """
         now = _utcnow()
         self._conn.execute(
             "INSERT INTO mcp_connections (org_id, client_id, server, kind, credential, status, "
-            "detail, connected_by, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 'ok', NULL, ?, ?, ?) "
+            "detail, connected_by, created_at, updated_at, server_url) "
+            "VALUES (?, ?, ?, ?, ?, 'ok', NULL, ?, ?, ?, ?) "
             "ON CONFLICT (org_id, client_id, server) DO UPDATE SET kind = EXCLUDED.kind, "
             "credential = EXCLUDED.credential, status = 'ok', detail = NULL, "
-            "connected_by = EXCLUDED.connected_by, updated_at = EXCLUDED.updated_at",
-            (org_id, client or "", server, kind, credential, by, now, now),
+            "connected_by = EXCLUDED.connected_by, updated_at = EXCLUDED.updated_at, "
+            "server_url = EXCLUDED.server_url",
+            (org_id, client or "", server, kind, credential, by, now, now, server_url),
         )
         found = self.mcp_connection(org_id, server, client=client)
         assert found is not None
@@ -2821,6 +2859,55 @@ class FleetStore:
                     "VALUES (?, ?, ?, ?, ?)",
                     (box_id, server, tools, 1 if ask_first else 0, now),
                 )
+
+    def boxes_granted_mcp(self, servers: Sequence[str]) -> list[str]:
+        """Every box granted any of `servers`: whose config a catalogue change rewrites."""
+        if not servers:
+            return []
+        marks = ", ".join("?" for _ in servers)
+        rows = self._conn.execute(
+            f"SELECT DISTINCT box_id FROM box_mcp_grants WHERE server IN ({marks}) ORDER BY box_id",
+            tuple(servers),
+        ).fetchall()
+        return [str(r["box_id"]) for r in rows]
+
+    def mark_mcp_config_pending(self, box_id: str) -> None:
+        """`box_id`'s MCP config is behind its grants: write it when it next wakes."""
+        self._conn.execute(
+            "INSERT INTO box_mcp_config_pending (box_id, since) VALUES (?, ?) "
+            "ON CONFLICT (box_id) DO NOTHING",
+            (box_id, _utcnow()),
+        )
+
+    def clear_mcp_config_pending(self, box_id: str) -> None:
+        self._conn.execute("DELETE FROM box_mcp_config_pending WHERE box_id = ?", (box_id,))
+
+    def mcp_config_pending(self, box_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT box_id FROM box_mcp_config_pending WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        return row is not None
+
+    def set_mcp_server_secret(self, server: str, sealed: str, *, by: str | None) -> None:
+        """An operator's OAuth client secret for `server`, already sealed."""
+        self._conn.execute(
+            "INSERT INTO mcp_server_secrets (server, client_secret, updated_by, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (server) DO UPDATE SET "
+            "client_secret = EXCLUDED.client_secret, updated_by = EXCLUDED.updated_by, "
+            "updated_at = EXCLUDED.updated_at",
+            (server, sealed, by, _utcnow()),
+        )
+
+    def delete_mcp_server_secret(self, server: str) -> bool:
+        row = self._conn.execute(
+            "DELETE FROM mcp_server_secrets WHERE server = ? RETURNING server", (server,)
+        ).fetchone()
+        return row is not None
+
+    def mcp_server_secrets(self) -> dict[str, str]:
+        """Every server's sealed client secret, by server: read with the catalogue."""
+        rows = self._conn.execute("SELECT server, client_secret FROM mcp_server_secrets")
+        return {str(r["server"]): str(r["client_secret"]) for r in rows}
 
     def box_mcp_grants(self, box_id: str) -> list[McpGrant]:
         rows = self._conn.execute(

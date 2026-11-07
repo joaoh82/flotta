@@ -88,6 +88,8 @@ class Machine:
         self.commands.append(command)
         if self.code:
             return ExecResult(self.code, "", "disk full")
+        if provision.MCP_RELOAD_MARK in command:
+            return ExecResult(0, "reloaded", "")
         payload = command.rsplit(" ", 1)[1]
         said = box_rules.apply(self.home, json.loads(base64.b64decode(payload)))
         return ExecResult(0, said, "")
@@ -168,13 +170,42 @@ def test_a_client_member_doesnt_see_the_agencys_connections(api, fleet):  # noqa
     )
 
 
-def test_without_the_secrets_key_nothing_is_stored(api, fleet, monkeypatch):  # noqa: F811
+def test_without_the_secrets_key_the_signing_key_seals_it(api, fleet, monkeypatch):  # noqa: F811
+    """Nothing to configure: the sealing key is derived from the signing key."""
     monkeypatch.delenv("FLOTTA_SECRETS_KEY")
     answer = api.put(
         "/api/orgs/agency-x/mcp/notes", json={"key": "k"}, headers=_as(fleet, "ana@example.com")
     )
-    assert answer.status_code == 503 and "FLOTTA_SECRETS_KEY" in answer.text
+    assert answer.status_code == 200, answer.text
+    found = _connection(fleet)
+    opened = unseal(
+        found.credential,
+        context=connection_context("agency-x", "notes"),
+        env={"FLOTTA_SIGNING_KEY": KEY},
+    )
+    assert json.loads(opened)["value"] == "k"
+
+
+def test_with_no_key_at_all_nothing_is_stored(api, fleet, monkeypatch):  # noqa: F811
+    monkeypatch.delenv("FLOTTA_SECRETS_KEY")
+    monkeypatch.delenv("FLOTTA_SIGNING_KEY")
+    answer = api.put(
+        "/api/orgs/agency-x/mcp/notes", json={"key": "k"}, headers=_as(fleet, "ana@example.com")
+    )
+    assert answer.status_code == 503 and "FLOTTA_SIGNING_KEY" in answer.text
     assert _connection(fleet) is None
+
+
+def test_a_connection_sealed_under_another_key_reads_as_broken(api, fleet, monkeypatch):  # noqa: F811
+    """A new signing key (or a secrets key set since) is detected, never used."""
+    api.put(
+        "/api/orgs/agency-x/mcp/notes", json={"key": "k"}, headers=_as(fleet, "ana@example.com")
+    )
+    monkeypatch.setenv("FLOTTA_SECRETS_KEY", fresh())
+    listed = api.get("/api/orgs/agency-x/mcp", headers=_as(fleet, "ana@example.com")).json()
+    notes = next(s for s in listed["servers"] if s["name"] == "notes")
+    assert notes["connection"]["status"] == "broken"
+    assert "connect it again" in notes["connection"]["detail"]
 
 
 # -- signing in ------------------------------------------------------------------------
@@ -470,14 +501,17 @@ def test_an_agents_grants_say_whose_account_its_calls_use(api, fleet, machine): 
     assert api.put("/api/boxes/b-support/mcp", json=body, headers=ana).status_code == 200
     api.put("/api/orgs/agency-x/mcp/notes", json={"key": "agency"}, headers=ana)
     read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
-    assert read["accounts"] == {"notes": {"account": "org", "status": "ok"}, "tracker": None}
+    assert read["accounts"] == {
+        "notes": {"account": "org", "status": "ok", "detail": None},
+        "tracker": None,
+    }
     api.put("/api/orgs/agency-x/clients/acme/mcp/notes", json={"key": "acme"}, headers=ana)
     read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
-    assert read["accounts"]["notes"] == {"account": "client", "status": "ok"}
+    assert read["accounts"]["notes"] == {"account": "client", "status": "ok", "detail": None}
     # Zeta's agent, same org: the agency's, never Acme's.
     api.put("/api/boxes/b-sales/mcp", json={"servers": [{"server": "notes"}]}, headers=ana)
     zeta = api.get("/api/boxes/b-sales/mcp", headers=ana).json()
-    assert zeta["accounts"] == {"notes": {"account": "org", "status": "ok"}}
+    assert zeta["accounts"] == {"notes": {"account": "org", "status": "ok", "detail": None}}
 
 
 def test_an_account_the_gateway_wont_use_is_reported_as_broken_never_swapped(api, fleet, machine):  # noqa: F811
@@ -492,12 +526,15 @@ def test_an_account_the_gateway_wont_use_is_reported_as_broken_never_swapped(api
             "agency-x", "notes", kind="oauth", credential="x", by="u", client="acme"
         )
     read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
-    assert read["accounts"] == {"notes": {"account": "client", "status": "broken"}}
+    assert read["accounts"]["notes"]["account"] == "client"
+    assert read["accounts"]["notes"]["status"] == "broken"
+    assert "connect it again" in read["accounts"]["notes"]["detail"]
     with FleetStore(fleet) as store:
         store.delete_mcp_connection("agency-x", "notes", client="acme")
         store.set_mcp_connection("agency-x", "notes", kind="oauth", credential="x", by="u")
     read = api.get("/api/boxes/b-support/mcp", headers=ana).json()
-    assert read["accounts"] == {"notes": {"account": "org", "status": "broken"}}
+    assert read["accounts"]["notes"]["account"] == "org"
+    assert read["accounts"]["notes"]["status"] == "broken"
 
 
 # -- granting ---------------------------------------------------------------------------
@@ -581,6 +618,7 @@ def test_the_box_command_carries_no_upstream_credential(api, fleet, machine):  #
     ana = _as(fleet, "ana@example.com")
     api.put("/api/orgs/agency-x/mcp/notes", json={"key": "notes-secret"}, headers=ana)
     api.put("/api/boxes/b-support/mcp", json=GRANTS, headers=ana)
-    sent = machine.commands[-1]
+    sent = next(c for c in machine.commands if provision.MCP_RELOAD_MARK not in c)
+    assert all("notes-secret" not in c for c in machine.commands)
     payload = base64.b64decode(re.split(r"\s+", sent)[-1]).decode()
     assert "notes-secret" not in payload and "notes-secret" not in sent

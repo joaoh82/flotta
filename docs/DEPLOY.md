@@ -960,17 +960,32 @@ MCP) through `/mcp/<server>` on the gateway. No upstream credential is ever on a
 the gateway checks the grant on every request, hides and refuses tools that weren't
 granted, puts the agency's credential on, and writes a row per tool call.
 
-1. `just secrets-key`, then set the same `FLOTTA_SECRETS_KEY` on the **control plane
-   and the gateway**. It seals credentials in the database. Lose it and every
-   connection has to be made again; leak it with a database copy and they are readable.
-2. Set `FLOTTA_MCP_SERVERS` (JSON, `flotta.mcp`) on **both**, the same value. It is the
-   catalogue agencies pick from: `name`, `url` (https), `auth` (`bearer`, `api_key` with
-   a `header`, or `oauth`), optional `tools` and `ask_first`.
-3. For an `oauth` server, set `FLOTTA_CONTROL_URL` on the control plane: the provider
-   sends the browser back to `$FLOTTA_CONTROL_URL/api/mcp/oauth/callback`. A server
-   offering dynamic client registration needs nothing else. Otherwise register Flotta
-   with the provider, with that callback, and put `client_id` and `client_secret_env`
-   (a `FLOTTA_MCP_*` variable holding the secret, on both processes) in its `oauth`.
+**Nothing to set to turn it on.** The gateway and `FLOTTA_GATEWAY_URL` are the only
+requirements, and an OAuth sign-in needs `FLOTTA_CONTROL_URL`, which a control plane
+already has.
+
+1. **The sealing key needs nothing.** Credentials are sealed in the database under a
+   key derived from `FLOTTA_SIGNING_KEY` (HKDF, its own label, never the signing key's
+   bytes), which the control plane and the gateway already share. **The trade-off:** a
+   new signing key is a new sealing key, so every connection has to be made again after
+   one (the console shows them as needing it, and nothing sealed under the old key is
+   ever tried). To keep the two apart, `just secrets-key` and set the same
+   `FLOTTA_SECRETS_KEY` on both; it wins, with the same consequence for values sealed
+   before it. Leak either key with a database copy and the credentials are readable.
+2. **The catalogue is edited in the operator's console** (Fleet, beside the model
+   list), as the fleet setting `FLOTTA_MCP_SERVERS`: a stored list wins, and the
+   environment's is the fallback, exactly as for `FLOTTA_MODELS`. Each entry: `name`,
+   `url` (https), `auth` (`bearer`, `api_key` with a `header`, or `oauth`), optional
+   `tools` and `ask_first`. A self-hoster may set the variable instead, on **both**
+   processes, the same value; the gateway reads the stored list from the database on
+   every request, so a list saved in the console needs nothing on the gateway.
+3. For an `oauth` server the provider sends the browser back to
+   `$FLOTTA_CONTROL_URL/api/mcp/oauth/callback`. A server offering dynamic client
+   registration needs nothing else. Otherwise register Flotta with the provider, with
+   that callback, put its `client_id` in the entry's `oauth`, and set its secret in the
+   console (`PUT /api/mcp/servers/<server>/client-secret`): sealed, never shown again,
+   and dropped if the server leaves the list or its `client_id` changes. A
+   `client_secret_env` naming a `FLOTTA_MCP_*` variable on both processes still works.
 4. An owner connects a server (`PUT /api/orgs/<org>/mcp/<server>` with a key, or
    `POST …/connect` to sign in, then `POST /api/mcp/oauth/claim`, as the same person,
    with the `mcp_state` and `mcp_code` the browser comes back with: the code is traded
@@ -984,7 +999,19 @@ granted, puts the agency's credential on, and writes a row per tool call.
 
 A grant is in force at the gateway the moment it is saved. If the agent's machine can't
 be written, the answer says `written: false`: the agent then can't find a new server, and
-a removed one is refused anyway. Only tools pass (`initialize`, `ping`, `tools/list`, a
+a removed one is refused anyway. A running agent is then asked to reload its MCP servers
+(Hermes's `reload.mcp`, `reloaded` in the answer, and an `mcp_reloaded` or
+`mcp_reload_failed` event), so a removed tool leaves its open conversations too. **A
+sleeping agent isn't woken for a grant or a catalogue change**: the grant is in force at
+the gateway at once (`pending: true` in the answer), and its config is written by
+`wake_box` when something next addresses it, before it is reached. **A catalogue change
+reaches every agent granted the server:** its config is written again (the entry gone, or
+new tools) and it is reloaded, its grant kept and shown as going away. **A connection is
+only ever used for the address it was made for**: an entry whose URL changes leaves its
+connections needing to be made again rather than sending a key to the new address.
+Connections made before this was recorded are bound, when the store is upgraded to
+migration 24, to the address the catalogue gave then; one for a server not offered then
+is never used, and has to be connected again. Only tools pass (`initialize`, `ping`, `tools/list`, a
 granted `tools/call`); `resources/*` and `prompts/*` are refused. OAuth endpoints a
 server's metadata names must be public https, checked again on every request. `GET /api/boxes/<agent>/mcp/calls` is the audit trail.
 

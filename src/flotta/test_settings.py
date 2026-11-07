@@ -92,6 +92,10 @@ def test_every_catalogued_setting_actually_changes_something():
         # every model against before an agent is created with it or moved to
         # it (FLOTTA-85), and which `GET /api/models` serves to the picker.
         "FLOTTA_MODELS",
+        # Read by `flotta.mcp.catalogue_of`, through `layered`, on every request
+        # of the control plane's MCP routes and of the gateway's `/mcp/<server>`
+        # (FLOTTA-125): what an agency may connect, and what an agent may call.
+        "FLOTTA_MCP_SERVERS",
         # Read by `provision.create_box` into `BoxSpec.env` as `FLOTTA_WORKDIR`,
         # which the entrypoint already mkdir's. The catalogue test exists to
         # make somebody check that wiring; a setting nobody reads is a field

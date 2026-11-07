@@ -13,6 +13,7 @@ from flotta.mcp import (
     McpError,
     config_changes,
     mcp_base,
+    normalized,
     parse_catalogue,
     parse_grants,
     parse_key,
@@ -181,3 +182,223 @@ def test_a_key_that_cant_go_in_a_header_is_refused(key):
 def test_an_oauth_server_takes_no_key():
     with pytest.raises(McpError, match="signing in"):
         parse_key({"key": "k"}, SERVERS["linear"])
+
+
+# -- the console's catalogue, and asking a running agent to reload ---------------------
+
+
+class _Machine:
+    def __init__(self, reload_code=0, fail_reload=False):
+        self.commands: list[str] = []
+        self.reload_code, self.fail_reload = reload_code, fail_reload
+
+    def exec(self, endpoint, command):
+        from flotta.backend import ExecResult
+        from flotta.provision import MCP_RELOAD_MARK
+
+        self.commands.append(command)
+        if MCP_RELOAD_MARK in command:
+            if self.fail_reload:
+                raise RuntimeError("machine went away")
+            return ExecResult(self.reload_code, "", "refused" if self.reload_code else "")
+        return ExecResult(0, "config written", "")
+
+    # Enough of a substrate for `wake_box`: asleep until started.
+    asleep = False
+
+    def state(self, endpoint):
+        return "stopped" if self.asleep else "started"
+
+    def start(self, endpoint):
+        self.commands.append("start")
+        self.asleep = False
+
+    def configs(self):
+        from flotta.provision import MCP_RELOAD_MARK
+
+        return [c for c in self.commands if c != "start" and MCP_RELOAD_MARK not in c]
+
+
+@pytest.fixture
+def granted(tmp_path, monkeypatch):
+    from flotta.store import FleetStore
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k")
+    monkeypatch.setenv("FLOTTA_GATEWAY_URL", "https://gw.example.test/v1")
+    store = FleetStore(tmp_path / "fleet.db")
+    store.set_setting(
+        "FLOTTA_MCP_SERVERS",
+        normalized(
+            json.dumps([{"name": "notes", "url": "https://n.example.test", "auth": "bearer"}])
+        ),
+    )
+    store.create_box("one", box_id="b-one")
+    yield store
+    store.close()
+
+
+def _events(store, kind):
+    return [e for e in store.get_box_timeline("b-one") if e.type == kind]
+
+
+def test_a_running_agent_is_asked_to_reload_after_its_grants_are_written(granted):
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    machine = _Machine()
+    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    assert answer["written"] is True and answer["reloaded"] is True
+    assert MCP_RELOAD_MARK in machine.commands[-1]
+    assert MCP_RELOAD_MARK not in machine.commands[0]
+    assert _events(granted, "mcp_reloaded")
+
+
+def test_an_agent_that_isnt_running_isnt_woken_to_reload(granted):
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    answer = set_mcp_grants("b-one", (), store=granted, backend=machine)
+    assert answer["reloaded"] is None
+    assert not any(MCP_RELOAD_MARK in c for c in machine.commands)
+
+
+@pytest.mark.parametrize("machine", [_Machine(reload_code=1), _Machine(fail_reload=True)])
+def test_a_reload_that_fails_is_recorded_and_the_grant_stands(granted, machine):
+    from flotta.provision import set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    assert answer["written"] is True and answer["reloaded"] is False
+    assert [g["server"] for g in answer["servers"]] == ["notes"]
+    assert _events(granted, "mcp_reload_failed")
+
+
+def test_the_reload_script_carries_no_credential():
+    """It reads the box's own dashboard login where it runs; nothing is sent in."""
+    from flotta.provision import _mcp_reload_command
+
+    command = _mcp_reload_command()
+    assert "PASSWORD=" not in command and "Bearer" not in command
+
+
+def test_a_client_secret_is_never_in_the_setting():
+    """The setting is shown to the operator and copied about; a secret has its own table."""
+    raw = json.dumps(
+        [
+            {
+                "name": "t",
+                "url": "https://t.example.test",
+                "auth": "oauth",
+                "oauth": {"client_id": "c", "client_secret": "s"},
+            }
+        ]
+    )
+    with pytest.raises(McpError, match="unknown oauth fields: client_secret"):
+        normalized(raw)
+
+
+def test_a_substrate_with_no_shell_has_nothing_to_reload(granted):
+    """`just local`'s stand-in: not a failed reload, since there is no Hermes to ask."""
+    from flotta.backend import ExecResult, NotSupported
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    class _NoShell:
+        def exec(self, endpoint, command):
+            if MCP_RELOAD_MARK in command:
+                raise NotSupported("a local stand-in has no shell")
+            return ExecResult(0, "config written", "")
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    answer = set_mcp_grants(
+        "b-one", (Grant("notes", None, True),), store=granted, backend=_NoShell()
+    )
+    assert answer["written"] is True and answer["reloaded"] is None
+    assert not _events(granted, "mcp_reload_failed")
+
+
+# -- a catalogue change rewrites configs, and never grants (review of #188) ------------
+
+
+def _grant_notes(store, machine):
+    from flotta.provision import set_mcp_grants
+
+    store.update_box_status("b-one", "running", endpoint="fake://m")
+    set_mcp_grants("b-one", (Grant("notes", None, True),), store=store, backend=machine)
+    machine.commands.clear()
+
+
+def test_a_catalogue_rewrite_writes_no_grant_and_a_revoke_meanwhile_stays(granted, monkeypatch):
+    """The agency revokes between the rewrite finding the box and taking its lock:
+    the rewrite reads the grants under the lock, so the revoke stands."""
+    import flotta.provision as provision
+    from flotta.provision import rewrite_mcp_configs
+
+    machine = _Machine()
+    _grant_notes(granted, machine)
+    real_lock = provision._rules_lock
+    revoke = granted.set_box_mcp_grants
+
+    def revoking_first(box_id):
+        revoke(box_id, [])  # the agency's save lands first
+        return real_lock(box_id)
+
+    writes = []
+    monkeypatch.setattr(provision, "_rules_lock", revoking_first)
+    monkeypatch.setattr(granted, "set_box_mcp_grants", lambda *a, **k: writes.append(a))
+    rewrite_mcp_configs(["notes"], store=granted, backend=machine)
+    assert writes == []
+    assert granted.box_mcp_grants("b-one") == []
+    payload = machine.configs()[-1].rsplit(" ", 1)[1]
+    import base64
+
+    changes = json.loads(base64.b64decode(payload))
+    assert ["mcp_servers", "flotta-notes", None] in changes
+
+
+def test_a_stopped_agent_isnt_woken_by_a_catalogue_change_and_gets_it_at_wake(granted):
+    from flotta.provision import rewrite_mcp_configs, wake_box
+
+    machine = _Machine()
+    _grant_notes(granted, machine)
+    granted.update_box_status("b-one", "stopped")
+    machine.asleep = True
+    assert rewrite_mcp_configs(["notes"], store=granted, backend=machine) == {"b-one": None}
+    assert machine.commands == []
+    assert granted.mcp_config_pending("b-one")
+
+    wake_box("b-one", store=granted, backend=machine)
+    assert machine.commands[0] == "start"
+    assert len(machine.configs()) == 1
+    assert not granted.mcp_config_pending("b-one")
+
+
+def test_a_grant_saved_for_a_stopped_agent_is_in_force_and_written_at_wake(granted):
+    """Saved now, enforced at the gateway now, written to the agent when it next wakes."""
+    from flotta.provision import set_mcp_grants, wake_box
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    machine.asleep = True
+    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    assert (answer["written"], answer["pending"]) == (False, True)
+    assert "asleep" in answer["detail"]
+    assert machine.commands == []
+    assert [g.server for g in granted.box_mcp_grants("b-one")] == ["notes"]
+
+    wake_box("b-one", store=granted, backend=machine)
+    assert len(machine.configs()) == 1
+    assert not granted.mcp_config_pending("b-one")
+
+
+def test_a_wake_with_nothing_pending_writes_nothing(granted):
+    from flotta.provision import wake_box
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    machine.asleep = True
+    wake_box("b-one", store=granted, backend=machine)
+    assert machine.commands == ["start"]

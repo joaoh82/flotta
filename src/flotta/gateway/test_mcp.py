@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from flotta.auth import SCOPE_MCP_CALL, SCOPE_MODEL_CALL, box_subject, mint
 from flotta.gateway.app import create_gateway
-from flotta.gateway.fake_mcp import FakeMcp, catalogue
+from flotta.gateway.fake_mcp import MCP_URL, FakeMcp, catalogue
 from flotta.mcp import connection_context
 from flotta.mcp_oauth import Client, Endpoints, Tokens, oauth_credential
 from flotta.sealed import fresh, seal
@@ -72,7 +72,13 @@ def _connect(path, credential, org="studio-nord", kind="bearer", client=None):
     sealed = seal(json.dumps(credential), context=context, env=ENV)
     with FleetStore(path) as fleet:
         fleet.set_mcp_connection(
-            org, "tracker", kind=kind, credential=sealed, by="test", client=client
+            org,
+            "tracker",
+            kind=kind,
+            credential=sealed,
+            by="test",
+            client=client,
+            server_url=MCP_URL,
         )
 
 
@@ -404,7 +410,7 @@ def test_two_calls_at_once_spend_one_refresh_token(path):
 
     def one():
         try:
-            found.append(proxy.credential(box, proxy.servers["tracker"])["access_token"])
+            found.append(proxy.credential(box, proxy.servers()["tracker"])["access_token"])
         except Exception as exc:  # noqa: BLE001 - collected, so a thread's failure is seen
             errors.append(exc)
 
@@ -488,9 +494,17 @@ def test_a_clients_sealed_credential_only_opens_as_that_clients(path, server):
     with FleetStore(path) as fleet:
         acme = fleet.mcp_connection("studio-nord", "tracker", client="acme").credential
         fleet.set_mcp_connection(
-            "studio-nord", "tracker", kind="bearer", credential=acme, by="x", client="zeta"
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=acme,
+            by="x",
+            client="zeta",
+            server_url=MCP_URL,
         )
-        fleet.set_mcp_connection("studio-nord", "tracker", kind="bearer", credential=acme, by="x")
+        fleet.set_mcp_connection(
+            "studio-nord", "tracker", kind="bearer", credential=acme, by="x", server_url=MCP_URL
+        )
     _grant(path, box="b-zeta")
     with _client(path, server) as client:
         zeta = client.post(
@@ -589,3 +603,118 @@ def test_a_403_is_the_upstreams_refusal_and_never_breaks_the_connection(path):
     assert server.refreshes == 0 and len(server.requests) == 1
     with FleetStore(path) as fleet:
         assert fleet.mcp_connection("studio-nord", "tracker").status == "ok"
+
+
+# -- the catalogue, read on every request -----------------------------------------------
+
+
+def _store_catalogue(path, raw):
+    with FleetStore(path) as fleet:
+        fleet.set_setting("FLOTTA_MCP_SERVERS", raw)
+
+
+def test_a_server_removed_in_the_console_is_refused_on_the_next_call(path, server):
+    """No cache: the stored setting wins over the gateway's environment at once."""
+    with _client(path, server) as client:
+        first = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+        _store_catalogue(path, json.dumps([{**json.loads(catalogue())[0], "name": "other"}]))
+        second = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert "result" in first.json()
+    assert second.status_code == 404
+    assert len(server.requests) == 1
+
+
+def test_a_server_added_in_the_console_is_offered_without_a_restart(path):
+    server = FakeMcp()
+    env = {k: v for k, v in ENV.items() if k != "FLOTTA_MCP_SERVERS"}
+    with _client(path, server, env=env) as client:
+        before = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+        _store_catalogue(path, catalogue())
+        _connect(path, {"kind": "bearer", "value": "agency-key"})
+        _grant(path)
+        after = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert before.status_code == 404
+    assert "result" in after.json(), after.text
+
+
+def test_a_connection_is_never_sent_to_an_address_it_wasnt_made_for(path):
+    """The operator moves the entry: the agency's key stays where it was given."""
+    context = connection_context("studio-nord", "tracker")
+    sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=ENV)
+    with FleetStore(path) as fleet:
+        fleet.set_mcp_connection(
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=sealed,
+            by="test",
+            server_url="https://the-old-address.example.test/mcp",
+        )
+    _grant(path)
+    server = FakeMcp()
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert server.requests == []
+    assert "moved" in answer.json()["error"]["message"]
+
+
+def test_a_credential_sealed_under_another_key_is_never_used(path):
+    """A new signing key, or a secrets key set since: refused, not tried."""
+    context = connection_context("studio-nord", "tracker")
+    other = {"FLOTTA_SECRETS_KEY": fresh()}
+    sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=other)
+    with FleetStore(path) as fleet:
+        fleet.set_mcp_connection(
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=sealed,
+            by="test",
+            server_url=MCP_URL,
+        )
+    _grant(path)
+    server = FakeMcp()
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert server.requests == []
+    assert "connect it again" in answer.json()["error"]["message"]
+
+
+def test_with_no_secrets_key_the_signing_keys_seals_and_opens(path):
+    """Nothing to configure on the gateway either: both derive the same key."""
+    env = {k: v for k, v in ENV.items() if k != "FLOTTA_SECRETS_KEY"}
+    context = connection_context("studio-nord", "tracker")
+    sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=env)
+    with FleetStore(path) as fleet:
+        fleet.set_mcp_connection(
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=sealed,
+            by="test",
+            server_url=MCP_URL,
+        )
+    _grant(path)
+    server = FakeMcp()
+    with _client(path, server, env=env) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert "result" in answer.json(), answer.text
+    assert server.requests[-1].headers["authorization"] == "Bearer agency-key"
+
+
+def test_a_connection_with_no_address_on_record_is_never_used(path):
+    """Shaped like one made before migration 24 and left unbound: refused, however
+    the catalogue reads now, so an entry moved since can't receive its key."""
+    context = connection_context("studio-nord", "tracker")
+    sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=ENV)
+    with FleetStore(path) as fleet:
+        fleet.set_mcp_connection(
+            "studio-nord", "tracker", kind="bearer", credential=sealed, by="test"
+        )
+        assert fleet.mcp_connection("studio-nord", "tracker").server_url is None
+    _grant(path)
+    server = FakeMcp()
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert server.requests == []
+    assert "no record of the address" in answer.json()["error"]["message"]

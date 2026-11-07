@@ -155,6 +155,18 @@ SETTINGS: tuple[Setting, ...] = (
         default="",
     ),
     Setting(
+        key="FLOTTA_MCP_SERVERS",
+        label="MCP servers agencies may use",
+        help=(
+            "The MCP servers an agency may connect and give its agents, as a JSON "
+            "list (`flotta.mcp`). An agency's credential is only ever sent to the "
+            "address it was connected for, and an OAuth client secret is set on its "
+            "own, never here. Empty means none."
+        ),
+        kind="text",
+        default="",
+    ),
+    Setting(
         key="FLOTTA_MODEL_BASE_URL",
         label="Provider endpoint",
         help=(
@@ -323,6 +335,13 @@ def validate(key: str, value: str) -> str:
             if model not in models:
                 models.append(model)
         return ", ".join(models)
+    elif key == "FLOTTA_MCP_SERVERS":
+        from flotta.mcp import McpError, normalized
+
+        try:
+            return normalized(text)
+        except McpError as exc:
+            raise ValueError(f"{setting.label}: {exc}") from exc
     elif key == "FLOTTA_WORKDIR":
         from flotta.workdir import validate_workdir
 

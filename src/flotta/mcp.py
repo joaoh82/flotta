@@ -9,10 +9,18 @@ so whatever is on its machine is its to read, and to keep after the grant goes.
 
 ## Who decides what
 
-- **The operator defines the catalogue,** `$FLOTTA_MCP_SERVERS`, a JSON list.
-  Environment only, never a setting changed over HTTP: an entry decides where an
-  agency's credential is sent, the reason `$FLOTTA_GATEWAY_URL` is environment
-  only too.
+- **The operator defines the catalogue,** the fleet setting
+  `FLOTTA_MCP_SERVERS`, a JSON list, edited in the operator's console beside the
+  model list and kept the way that list is (`flotta.settings`): **a stored value
+  wins, the environment is the fallback**, the whole list either way. Writing
+  it is the operator's alone (`PUT /api/settings`), because an entry decides
+  where an agency's credential is sent. Two guards make that safe to edit over
+  HTTP: a connection remembers the URL it was made for and is never sent to
+  another one (`connection_usable`), and an operator's OAuth client secret is
+  not in the setting at all but sealed in a table of its own
+  (`mcp_server_secrets`), set and never read back. Read on every request by the
+  control plane and the gateway (`catalogue_of`), so a change is in force on
+  the next call.
 - **An agency picks from it**: its owners connect a server (a key, or an OAuth
   sign-in), and its owners and members grant it to agents, choosing tools and
   whether calls ask first. Never a client's people.
@@ -28,7 +36,8 @@ so whatever is on its machine is its to read, and to keep after the grant goes.
 `auth` is `bearer` (sent as `Authorization: Bearer`), `api_key` (sent in the
 `header` the entry names) or `oauth` (see `flotta.mcp_oauth`; endpoints are
 discovered unless given, and a client registers itself unless `client_id` is
-given, with its secret read from the variable `client_secret_env` names).
+given, with its secret either set in the console, sealed and never returned, or
+read from the variable `client_secret_env` names).
 `tools`, if given, is every tool an agency may grant; without it, any tool the
 server lists. Remote servers only: a server that runs on the box would need its
 secret on the box.
@@ -51,7 +60,7 @@ import json
 import os
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -86,6 +95,27 @@ class OAuthSettings:
     registration_endpoint: str | None = None
     revocation_endpoint: str | None = None
     scopes: tuple[str, ...] = ()
+    #: The operator's client secret set in the console, still sealed
+    #: (`server_secret_context`). Never in an answer, never in the setting.
+    client_secret_sealed: str | None = None
+
+    def spec(self) -> dict[str, Any]:
+        """What the operator wrote, without the secret."""
+        out: dict[str, Any] = {}
+        for field in (
+            "client_id",
+            "client_secret_env",
+            "authorization_endpoint",
+            "token_endpoint",
+            "registration_endpoint",
+            "revocation_endpoint",
+        ):
+            value = getattr(self, field)
+            if value:
+                out[field] = value
+        if self.scopes:
+            out["scopes"] = list(self.scopes)
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +134,31 @@ class Server:
     @property
     def entry(self) -> str:
         return f"{ENTRY_PREFIX}{self.name}"
+
+    def spec(self) -> dict[str, Any]:
+        """The entry as `parse_server` reads it: what the setting holds."""
+        out: dict[str, Any] = {
+            "name": self.name,
+            "title": self.title,
+            "url": self.url,
+            "auth": self.auth,
+            "ask_first": self.ask_first,
+        }
+        if self.tools is not None:
+            out["tools"] = list(self.tools)
+        if self.header is not None:
+            out["header"] = self.header
+        if self.oauth is not None:
+            out["oauth"] = self.oauth.spec()
+        return out
+
+    def for_operator(self) -> dict[str, Any]:
+        """What the console edits: the whole entry, and whether a client secret is set."""
+        return {**self.spec(), "has_client_secret": self.has_client_secret}
+
+    @property
+    def has_client_secret(self) -> bool:
+        return bool(self.oauth and self.oauth.client_secret_sealed)
 
     def public(self) -> dict[str, Any]:
         """What anyone in the fleet may read: no client secret's name, no endpoints."""
@@ -275,9 +330,112 @@ def parse_catalogue(raw: str | None) -> dict[str, Server]:
 
 
 def catalogue(env: Mapping[str, str] | None = None) -> dict[str, Server]:
-    """The operator's servers, by name. Raises `McpError` for one that can't be used."""
+    """The servers `env` names, by name. Raises `McpError` for one that can't be used.
+
+    Pass `flotta.settings.layered(store)` for the fleet's: the stored list, or
+    the environment's. `catalogue_of` does, and adds the stored secrets.
+    """
     source = os.environ if env is None else env
     return parse_catalogue(source.get(CATALOGUE_ENV))
+
+
+def normalized(raw: str) -> str:
+    """The setting as it is stored: parsed, then written back, so a bad one is refused."""
+    servers = parse_catalogue(raw)
+    return json.dumps([s.spec() for s in servers.values()], separators=(",", ":"))
+
+
+def catalogue_of(
+    store: Any, env: Mapping[str, str] | None = None
+) -> tuple[dict[str, Server], str | None]:
+    """The fleet's servers, by name, with their client secrets, and an error if unreadable.
+
+    Served empty with the reason when the list can't be read, rather than raising:
+    a server that isn't offered is refused at the gateway, which is safe, and one
+    typo must not stop every agent's models going through the same process.
+    """
+    from flotta.settings import layered
+
+    try:
+        servers = catalogue(layered(store, env))
+    except McpError as exc:
+        return {}, str(exc)
+    secrets = store.mcp_server_secrets()
+    for name, server in list(servers.items()):
+        held = secrets.get(name)
+        oauth = server.oauth
+        if held and oauth is not None and oauth.client_id and not oauth.client_secret_env:
+            servers[name] = replace(server, oauth=replace(oauth, client_secret_sealed=held))
+    return servers, None
+
+
+def server_secret_context(name: str) -> str:
+    """What an operator's OAuth client secret is sealed to: its own server, nowhere else."""
+    return f"mcp-server-secret:{name}"
+
+
+def parse_client_secret(body: Any, server: Server) -> str:
+    """The client secret the operator sets for `server`, or `McpError`."""
+    if server.oauth is None:
+        raise McpError(f"{server.name} doesn't sign in with OAuth, so it has no client secret")
+    if not server.oauth.client_id:
+        raise McpError(
+            f"{server.name} registers itself with the provider; a client secret goes with "
+            "the client_id the operator registered"
+        )
+    if server.oauth.client_secret_env:
+        raise McpError(
+            f"{server.name}'s client secret is read from ${server.oauth.client_secret_env}"
+        )
+    if not isinstance(body, dict) or set(body) - {"client_secret"}:
+        raise McpError('a client secret is {"client_secret": "..."}')
+    value = body.get("client_secret")
+    if not isinstance(value, str) or not value.strip():
+        raise McpError("the client secret is empty")
+    value = value.strip()
+    if len(value) > 4096 or any(ch in value for ch in "\r\n\0"):
+        raise McpError("that isn't a client secret")
+    return value
+
+
+def connection_usable(
+    connection: Any, server: Server | None, env: Mapping[str, str] | None = None
+) -> str | None:
+    """Why a stored connection won't be used for `server` now, or `None` if it will.
+
+    The gateway's rule, and what every read of a connection reports, so a page
+    never shows a connection in use that the gateway refuses:
+
+    - **no longer offered,** or **of another kind** than the server now signs in
+      with;
+    - **made for another URL, or for none on record.** An entry's URL can change
+      in the console, and an agency's credential was given for the server it was
+      connected to, never for wherever the entry points next. Connections from
+      before the URL was recorded were bound when the store was upgraded
+      (`FleetStore._bind_mcp_connections`); one that couldn't be is never used,
+      so removing a server and adding it back elsewhere can't rebind it;
+    - **sealed under a key this process doesn't hold** (`flotta.sealed.opens_here`):
+      the signing key changed, or a secrets key was set since;
+    - **broken** already, once a provider refused a refresh.
+    """
+    from flotta.sealed import opens_here
+
+    if server is None:
+        return "no longer offered by this Flotta"
+    if connection.kind != server.auth:
+        return f"{server.title} now signs in another way: connect it again"
+    if not connection.server_url:
+        return (
+            f"Flotta has no record of the address {server.title} was connected for: "
+            "connect it again"
+        )
+    if connection.server_url != server.url:
+        return f"{server.title} has moved to another address since: connect it again"
+    if not opens_here(connection.credential, env=env):
+        return "sealed under a key this Flotta no longer holds: connect it again"
+    if connection.status != "ok":
+        return connection.detail or f"{server.title}'s connection stopped working: connect it again"
+    return None
 
 
 def parse_grants(body: Any, servers: Mapping[str, Server]) -> tuple[Grant, ...]:
