@@ -829,6 +829,8 @@ def create_app(
             client=box.client,
             box_id=box.id,
             issued_at=int(datetime.fromisoformat(found.created_at).timestamp()),
+            # The stand-in token's, for this one request: a key does not
+            # expire, and revoking it is what stops it (`docs/API_KEYS.md`).
             expires_at=now + 60,
         )
 

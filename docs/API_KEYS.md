@@ -32,6 +32,8 @@ Send it as a bearer token, `Authorization: Bearer flotta_key_…`, to these thre
 | `GET /api/runs/<run id>` | The run: its status, steps, output and cost. |
 | `GET /api/boxes/<agent>/runs` | The agent's runs, newest first. |
 
+`GET /api/me` answers a key too, as it answers any live credential: with the key's own claims, its subject (`key:<id>`), org, client and `run:create`. Its `expires_at` is about a minute away, because a key is turned into a token for each request. The key itself doesn't expire: revoking it is what stops it.
+
 ```sh
 curl -X POST "$FLOTTA_CONTROL_URL/api/boxes/eng-a/runs" \
   -H "Authorization: Bearer $FLOTTA_KEY" -H "Content-Type: application/json" \
@@ -40,7 +42,7 @@ curl -X POST "$FLOTTA_CONTROL_URL/api/boxes/eng-a/runs" \
 
 ## What a key can't do
 
-A key is for **one agent**. On another agent, even the same client's, the answer is the 404 of no agent at all. It holds one scope, `run:create`, that no role and no minted token carries, so every other route refuses it with a 403. That covers:
+A key is for **one agent**. On another agent, even the same client's, the answer is the 404 of no agent at all. It holds one scope, `run:create`, that no role and no minted token carries, so every other route refuses it with a 403, except `/api/me` above. That covers:
 
 - opening a conversation, here or at the front door (a key is not `box:chat`);
 - reading the agent, its timeline, its triggers or its keys;
