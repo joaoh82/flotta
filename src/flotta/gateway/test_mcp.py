@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from flotta.auth import SCOPE_MCP_CALL, SCOPE_MODEL_CALL, box_subject, mint
 from flotta.gateway.app import create_gateway
-from flotta.gateway.fake_mcp import FakeMcp, catalogue
+from flotta.gateway.fake_mcp import MCP_URL, FakeMcp, catalogue
 from flotta.mcp import connection_context
 from flotta.mcp_oauth import Client, Endpoints, Tokens, oauth_credential
 from flotta.sealed import fresh, seal
@@ -72,7 +72,13 @@ def _connect(path, credential, org="studio-nord", kind="bearer", client=None):
     sealed = seal(json.dumps(credential), context=context, env=ENV)
     with FleetStore(path) as fleet:
         fleet.set_mcp_connection(
-            org, "tracker", kind=kind, credential=sealed, by="test", client=client
+            org,
+            "tracker",
+            kind=kind,
+            credential=sealed,
+            by="test",
+            client=client,
+            server_url=MCP_URL,
         )
 
 
@@ -488,9 +494,17 @@ def test_a_clients_sealed_credential_only_opens_as_that_clients(path, server):
     with FleetStore(path) as fleet:
         acme = fleet.mcp_connection("studio-nord", "tracker", client="acme").credential
         fleet.set_mcp_connection(
-            "studio-nord", "tracker", kind="bearer", credential=acme, by="x", client="zeta"
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=acme,
+            by="x",
+            client="zeta",
+            server_url=MCP_URL,
         )
-        fleet.set_mcp_connection("studio-nord", "tracker", kind="bearer", credential=acme, by="x")
+        fleet.set_mcp_connection(
+            "studio-nord", "tracker", kind="bearer", credential=acme, by="x", server_url=MCP_URL
+        )
     _grant(path, box="b-zeta")
     with _client(path, server) as client:
         zeta = client.post(
@@ -651,7 +665,12 @@ def test_a_credential_sealed_under_another_key_is_never_used(path):
     sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=other)
     with FleetStore(path) as fleet:
         fleet.set_mcp_connection(
-            "studio-nord", "tracker", kind="bearer", credential=sealed, by="test"
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=sealed,
+            by="test",
+            server_url=MCP_URL,
         )
     _grant(path)
     server = FakeMcp()
@@ -668,7 +687,12 @@ def test_with_no_secrets_key_the_signing_keys_seals_and_opens(path):
     sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=env)
     with FleetStore(path) as fleet:
         fleet.set_mcp_connection(
-            "studio-nord", "tracker", kind="bearer", credential=sealed, by="test"
+            "studio-nord",
+            "tracker",
+            kind="bearer",
+            credential=sealed,
+            by="test",
+            server_url=MCP_URL,
         )
     _grant(path)
     server = FakeMcp()
@@ -676,3 +700,21 @@ def test_with_no_secrets_key_the_signing_keys_seals_and_opens(path):
         answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
     assert "result" in answer.json(), answer.text
     assert server.requests[-1].headers["authorization"] == "Bearer agency-key"
+
+
+def test_a_connection_with_no_address_on_record_is_never_used(path):
+    """Shaped like one made before migration 23 and left unbound: refused, however
+    the catalogue reads now, so an entry moved since can't receive its key."""
+    context = connection_context("studio-nord", "tracker")
+    sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=ENV)
+    with FleetStore(path) as fleet:
+        fleet.set_mcp_connection(
+            "studio-nord", "tracker", kind="bearer", credential=sealed, by="test"
+        )
+        assert fleet.mcp_connection("studio-nord", "tracker").server_url is None
+    _grant(path)
+    server = FakeMcp()
+    with _client(path, server) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert server.requests == []
+    assert "no record of the address" in answer.json()["error"]["message"]

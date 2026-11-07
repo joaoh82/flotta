@@ -2600,26 +2600,35 @@ def create_app(
             # and not only bad input.
             store.set_settings(cleaned)
             if before is not None:
-                _mcp_catalogue_changed(store, before, by=token.subject if token else "operator")
+                _mcp_catalogue_changed(store, before)
             return {"settings": describe(store)}
         finally:
             store.close()
 
-    def _mcp_catalogue_changed(store: Any, before: dict[str, Any], *, by: str) -> None:
+    def _mcp_catalogue_changed(store: Any, before: dict[str, Any]) -> None:
         """What changing the MCP catalogue sets going (FLOTTA-125).
 
         - **A client secret goes with its server:** one removed from the list, or
           whose `client_id` changed, loses the secret set for it, which belonged
           to that registration and no other.
-        - **Every agent granted a server that went or changed** has its config
-          written again, in the background: an entry taken out and the agent
-          reloaded, or new `tools.include`. Its grants stay as they are.
+        - **Every agent granted a server that went, came back or changed** has its
+          config written again, in the background: an entry taken out or put back
+          and the agent reloaded, or new `tools.include`. Its grants are never
+          written (`provision.rewrite_mcp_configs`), and a sleeping agent isn't
+          woken: it is written when it next wakes.
         """
         from flotta.mcp import catalogue_of as mcp_catalogue_of
         from flotta.provision import rewrite_mcp_configs
 
         after = mcp_catalogue_of(store)[0]
-        changed = [n for n, s in before.items() if n not in after or after[n].spec() != s.spec()]
+        # Gone or changed, and come back: a server removed and added again (or the
+        # override cleared back to the environment's) has grantees to write it to.
+        names = list(dict.fromkeys([*before, *after]))
+        changed = [
+            n
+            for n in names
+            if n not in before or n not in after or after[n].spec() != before[n].spec()
+        ]
         for name, server in before.items():
             moved = after.get(name)
             same_client = (
@@ -2636,7 +2645,7 @@ def create_app(
         def run() -> None:
             inner = store_factory()
             try:
-                rewrite_mcp_configs(changed, store=inner, by=by)
+                rewrite_mcp_configs(changed, store=inner)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("rewriting MCP configs failed: %s: %s", type(exc).__name__, exc)
             finally:

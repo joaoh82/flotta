@@ -203,6 +203,21 @@ class _Machine:
             return ExecResult(self.reload_code, "", "refused" if self.reload_code else "")
         return ExecResult(0, "config written", "")
 
+    # Enough of a substrate for `wake_box`: asleep until started.
+    asleep = False
+
+    def state(self, endpoint):
+        return "stopped" if self.asleep else "started"
+
+    def start(self, endpoint):
+        self.commands.append("start")
+        self.asleep = False
+
+    def configs(self):
+        from flotta.provision import MCP_RELOAD_MARK
+
+        return [c for c in self.commands if c != "start" and MCP_RELOAD_MARK not in c]
+
 
 @pytest.fixture
 def granted(tmp_path, monkeypatch):
@@ -301,3 +316,89 @@ def test_a_substrate_with_no_shell_has_nothing_to_reload(granted):
     )
     assert answer["written"] is True and answer["reloaded"] is None
     assert not _events(granted, "mcp_reload_failed")
+
+
+# -- a catalogue change rewrites configs, and never grants (review of #188) ------------
+
+
+def _grant_notes(store, machine):
+    from flotta.provision import set_mcp_grants
+
+    store.update_box_status("b-one", "running", endpoint="fake://m")
+    set_mcp_grants("b-one", (Grant("notes", None, True),), store=store, backend=machine)
+    machine.commands.clear()
+
+
+def test_a_catalogue_rewrite_writes_no_grant_and_a_revoke_meanwhile_stays(granted, monkeypatch):
+    """The agency revokes between the rewrite finding the box and taking its lock:
+    the rewrite reads the grants under the lock, so the revoke stands."""
+    import flotta.provision as provision
+    from flotta.provision import rewrite_mcp_configs
+
+    machine = _Machine()
+    _grant_notes(granted, machine)
+    real_lock = provision._rules_lock
+    revoke = granted.set_box_mcp_grants
+
+    def revoking_first(box_id):
+        revoke(box_id, [])  # the agency's save lands first
+        return real_lock(box_id)
+
+    writes = []
+    monkeypatch.setattr(provision, "_rules_lock", revoking_first)
+    monkeypatch.setattr(granted, "set_box_mcp_grants", lambda *a, **k: writes.append(a))
+    rewrite_mcp_configs(["notes"], store=granted, backend=machine)
+    assert writes == []
+    assert granted.box_mcp_grants("b-one") == []
+    payload = machine.configs()[-1].rsplit(" ", 1)[1]
+    import base64
+
+    changes = json.loads(base64.b64decode(payload))
+    assert ["mcp_servers", "flotta-notes", None] in changes
+
+
+def test_a_stopped_agent_isnt_woken_by_a_catalogue_change_and_gets_it_at_wake(granted):
+    from flotta.provision import rewrite_mcp_configs, wake_box
+
+    machine = _Machine()
+    _grant_notes(granted, machine)
+    granted.update_box_status("b-one", "stopped")
+    machine.asleep = True
+    assert rewrite_mcp_configs(["notes"], store=granted, backend=machine) == {"b-one": None}
+    assert machine.commands == []
+    assert granted.mcp_config_pending("b-one")
+
+    wake_box("b-one", store=granted, backend=machine)
+    assert machine.commands[0] == "start"
+    assert len(machine.configs()) == 1
+    assert not granted.mcp_config_pending("b-one")
+
+
+def test_a_grant_saved_for_a_stopped_agent_is_in_force_and_written_at_wake(granted):
+    """Saved now, enforced at the gateway now, written to the agent when it next wakes."""
+    from flotta.provision import set_mcp_grants, wake_box
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    machine.asleep = True
+    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    assert (answer["written"], answer["pending"]) == (False, True)
+    assert "asleep" in answer["detail"]
+    assert machine.commands == []
+    assert [g.server for g in granted.box_mcp_grants("b-one")] == ["notes"]
+
+    wake_box("b-one", store=granted, backend=machine)
+    assert len(machine.configs()) == 1
+    assert not granted.mcp_config_pending("b-one")
+
+
+def test_a_wake_with_nothing_pending_writes_nothing(granted):
+    from flotta.provision import wake_box
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    machine.asleep = True
+    wake_box("b-one", store=granted, backend=machine)
+    assert machine.commands == ["start"]

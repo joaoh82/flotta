@@ -10,6 +10,7 @@ disagree. What the real migrations *do* is `test_tenancy.py`'s business.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -320,3 +321,52 @@ def test_an_orgs_mcp_connection_survives_the_table_being_made_again(target, monk
         )
         assert store.mcp_connection("agency-x", "notes").credential == "sealed"
         assert [c.client_id for c in store.mcp_client_connections("agency-x")] == ["acme"]
+
+
+def _a_connection_from_before_23(target, monkeypatch, *servers):
+    """A store at migration 22 with an org connected to each of `servers`, with a
+    credential that opens here: only the address can stop it being used."""
+    from flotta.mcp import connection_context
+    from flotta.sealed import seal
+
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "a-signing-key")
+    monkeypatch.setattr(migrations, "MIGRATIONS", BASE[:22])
+    with FleetStore(target) as store:
+        store.create_org("agency-x", "Agency X")
+        for server in servers:
+            sealed = seal('{"value": "k"}', context=connection_context("agency-x", server))
+            store._conn.execute(
+                "INSERT INTO mcp_connections (org_id, client_id, server, kind, credential, "
+                "status, detail, connected_by, created_at, updated_at) VALUES "
+                "('agency-x', '', ?, 'bearer', ?, 'ok', NULL, 'u', 't0', 't1')",
+                (server, sealed),
+            )
+
+
+def test_upgrading_binds_a_connection_to_the_address_in_force_then(target, monkeypatch):
+    """Migration 23 records the address of each connection already there, from the
+    catalogue it was made under: the environment's, since none could be stored."""
+    _a_connection_from_before_23(target, monkeypatch, "notes", "gone")
+    catalogue = [{"name": "notes", "url": "https://notes.example.test/mcp", "auth": "bearer"}]
+    monkeypatch.setenv("FLOTTA_MCP_SERVERS", json.dumps(catalogue))
+    with _open(target, monkeypatch) as store:
+        assert store.mcp_connection("agency-x", "notes").server_url == catalogue[0]["url"]
+        # Not offered when the store was upgraded: never bound, so never used.
+        assert store.mcp_connection("agency-x", "gone").server_url is None
+
+
+def test_a_server_added_back_later_does_not_rebind_an_unbound_connection(target, monkeypatch):
+    _a_connection_from_before_23(target, monkeypatch, "notes")
+    monkeypatch.delenv("FLOTTA_MCP_SERVERS", raising=False)
+    with _open(target, monkeypatch) as store:
+        assert store.mcp_connection("agency-x", "notes").server_url is None
+    catalogue = [{"name": "notes", "url": "https://elsewhere.example.test/mcp", "auth": "bearer"}]
+    monkeypatch.setenv("FLOTTA_MCP_SERVERS", json.dumps(catalogue))
+    with _open(target, monkeypatch) as store:
+        found = store.mcp_connection("agency-x", "notes")
+        assert found.server_url is None
+        from flotta.mcp import catalogue_of, connection_usable
+
+        assert "no record of the address" in connection_usable(
+            found, catalogue_of(store)[0]["notes"]
+        )

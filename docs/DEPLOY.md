@@ -1001,12 +1001,17 @@ A grant is in force at the gateway the moment it is saved. If the agent's machin
 be written, the answer says `written: false`: the agent then can't find a new server, and
 a removed one is refused anyway. A running agent is then asked to reload its MCP servers
 (Hermes's `reload.mcp`, `reloaded` in the answer, and an `mcp_reloaded` or
-`mcp_reload_failed` event), so a removed tool leaves its open conversations too; a
-sleeping one isn't woken, since it reads its config when it boots. **A catalogue change
+`mcp_reload_failed` event), so a removed tool leaves its open conversations too. **A
+sleeping agent isn't woken for a grant or a catalogue change**: the grant is in force at
+the gateway at once (`pending: true` in the answer), and its config is written by
+`wake_box` when something next addresses it, before it is reached. **A catalogue change
 reaches every agent granted the server:** its config is written again (the entry gone, or
 new tools) and it is reloaded, its grant kept and shown as going away. **A connection is
 only ever used for the address it was made for**: an entry whose URL changes leaves its
-connections needing to be made again rather than sending a key to the new address. Only tools pass (`initialize`, `ping`, `tools/list`, a
+connections needing to be made again rather than sending a key to the new address.
+Connections made before this was recorded are bound, when the store is upgraded to
+migration 23, to the address the catalogue gave then; one for a server not offered then
+is never used, and has to be connected again. Only tools pass (`initialize`, `ping`, `tools/list`, a
 granted `tools/call`); `resources/*` and `prompts/*` are refused. OAuth endpoints a
 server's metadata names must be public https, checked again on every request. `GET /api/boxes/<agent>/mcp/calls` is the audit trail.
 

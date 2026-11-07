@@ -602,7 +602,13 @@ def _mcp_catalogue() -> tuple[str, ...]:
       (`flotta.sealed`). Set and removed over the API, never read back.
     - `mcp_connections.server_url`: the address a connection was made for, so an
       agency's credential is never sent to another one after the entry changes
-      (`flotta.mcp.connection_usable`). NULL for a connection made before, kept.
+      (`flotta.mcp.connection_usable`). The connections already there are bound
+      right after this step, from the catalogue in force then
+      (`FleetStore._bind_mcp_connections`): SQL can't read the environment it
+      was in. One still NULL after that was for a server not offered then, and
+      is never used: it has to be connected again.
+    - `box_mcp_config_pending`: agents whose MCP config is behind their grants
+      because they were asleep, written when they next wake (`provision.wake_box`).
     """
     return (
         """
@@ -614,6 +620,12 @@ def _mcp_catalogue() -> tuple[str, ...]:
         )
         """,
         "ALTER TABLE mcp_connections ADD COLUMN server_url TEXT",
+        """
+        CREATE TABLE box_mcp_config_pending (
+            box_id      TEXT PRIMARY KEY REFERENCES boxes(id),
+            since       TEXT NOT NULL
+        )
+        """,
     )
 
 
@@ -815,7 +827,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(22, "run approvals: what a run's agent asked a person", _run_approvals()),
     Migration(
         23,
-        "mcp catalogue: operators' client secrets, and the address a connection was made for",
+        "mcp catalogue: client secrets, a connection's address, and configs held back",
         _mcp_catalogue(),
     ),
 )

@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -69,6 +70,11 @@ from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
 from flotta.runs import MAX_OUTPUT, cap_steps, check_input_size, check_trigger_kind, clip_text
+
+_log = logging.getLogger(__name__)
+
+#: The migration that gave connections an address; applying it binds the ones already there.
+MCP_BIND_MIGRATION = 23
 
 EntityKind = Literal["box", "workspace", "task"]
 
@@ -1154,9 +1160,36 @@ class FleetStore:
         try:
             #: What opening this store applied — `flotta db migrate` reports it.
             self.migrations_applied: list[int] = migrations.apply(self._conn, dialect=dialect)
+            if MCP_BIND_MIGRATION in self.migrations_applied:
+                self._bind_mcp_connections()
         except BaseException:
             self._conn.close()
             raise
+
+    def _bind_mcp_connections(self) -> int:
+        """Give every connection made before migration 23 the address it was made for.
+
+        Run once, by whichever process applies that migration, from the catalogue
+        in force then: the environment's, since nothing could store one before.
+        A connection for a server not offered then stays unbound, and an unbound
+        connection is never used (`flotta.mcp.connection_usable`), so a server
+        removed and added back later with another address can't inherit it.
+        """
+        from flotta.mcp import catalogue_of
+
+        servers, error = catalogue_of(self)
+        if error:
+            _log.error("MCP connections left unbound: the catalogue could not be read: %s", error)
+            return 0
+        bound = 0
+        for server in servers.values():
+            cursor = self._conn.execute(
+                "UPDATE mcp_connections SET server_url = ? WHERE server = ? AND server_url IS NULL "
+                "RETURNING server",
+                (server.url, server.name),
+            )
+            bound += len(cursor.fetchall())
+        return bound
 
     def _check_not_legacy(self, db_path: str | Path) -> None:
         """Refuse a pre-M0 store instead of rendering it as an empty fleet.
@@ -2816,6 +2849,23 @@ class FleetStore:
             tuple(servers),
         ).fetchall()
         return [str(r["box_id"]) for r in rows]
+
+    def mark_mcp_config_pending(self, box_id: str) -> None:
+        """`box_id`'s MCP config is behind its grants: write it when it next wakes."""
+        self._conn.execute(
+            "INSERT INTO box_mcp_config_pending (box_id, since) VALUES (?, ?) "
+            "ON CONFLICT (box_id) DO NOTHING",
+            (box_id, _utcnow()),
+        )
+
+    def clear_mcp_config_pending(self, box_id: str) -> None:
+        self._conn.execute("DELETE FROM box_mcp_config_pending WHERE box_id = ?", (box_id,))
+
+    def mcp_config_pending(self, box_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT box_id FROM box_mcp_config_pending WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        return row is not None
 
     def set_mcp_server_secret(self, server: str, sealed: str, *, by: str | None) -> None:
         """An operator's OAuth client secret for `server`, already sealed."""

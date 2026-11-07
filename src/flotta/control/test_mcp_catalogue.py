@@ -236,3 +236,30 @@ def test_an_unchanged_server_rewrites_nothing(api, fleet, machine):  # noqa: F81
     machine.commands.clear()
     assert _save(api, CATALOGUE).status_code == 200
     assert machine.commands == []
+
+
+def test_a_server_removed_and_restored_is_put_back_in_its_agents_config(api, fleet, machine):  # noqa: F811
+    """Its grants were kept while it was gone, so coming back has agents to write it to,
+    whether it is saved again or the override is cleared back to the environment's."""
+    ana = _as(fleet, "ana@example.com")
+    api.put("/api/boxes/b-support/mcp", json={"servers": [{"server": "notes"}]}, headers=ana)
+    _save(api, [CATALOGUE[0]])
+    assert "flotta-notes" not in machine.config["mcp_servers"]
+    _save(api, CATALOGUE)
+    assert "flotta-notes" in machine.config["mcp_servers"]
+    _save(api, [CATALOGUE[0]])
+    assert "flotta-notes" not in machine.config["mcp_servers"]
+    _save(api, None)  # back to the environment's list, which has it
+    assert "flotta-notes" in machine.config["mcp_servers"]
+
+
+def test_a_catalogue_change_doesnt_wake_a_sleeping_agent(api, fleet, machine):  # noqa: F811
+    ana = _as(fleet, "ana@example.com")
+    api.put("/api/boxes/b-support/mcp", json={"servers": [{"server": "notes"}]}, headers=ana)
+    with FleetStore(fleet) as store:
+        store.update_box_status("b-support", "stopped")
+    machine.commands.clear()
+    _save(api, [CATALOGUE[0]])
+    assert machine.commands == []
+    with FleetStore(fleet) as store:
+        assert store.mcp_config_pending("b-support")

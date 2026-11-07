@@ -408,10 +408,12 @@ def connection_usable(
 
     - **no longer offered,** or **of another kind** than the server now signs in
       with;
-    - **made for another URL.** An entry's URL can change in the console, and an
-      agency's credential was given for the server it was connected to, never for
-      wherever the entry points next. Connections from before this was recorded
-      have no URL and are kept;
+    - **made for another URL, or for none on record.** An entry's URL can change
+      in the console, and an agency's credential was given for the server it was
+      connected to, never for wherever the entry points next. Connections from
+      before the URL was recorded were bound when the store was upgraded
+      (`FleetStore._bind_mcp_connections`); one that couldn't be is never used,
+      so removing a server and adding it back elsewhere can't rebind it;
     - **sealed under a key this process doesn't hold** (`flotta.sealed.opens_here`):
       the signing key changed, or a secrets key was set since;
     - **broken** already, once a provider refused a refresh.
@@ -422,7 +424,12 @@ def connection_usable(
         return "no longer offered by this Flotta"
     if connection.kind != server.auth:
         return f"{server.title} now signs in another way: connect it again"
-    if connection.server_url and connection.server_url != server.url:
+    if not connection.server_url:
+        return (
+            f"Flotta has no record of the address {server.title} was connected for: "
+            "connect it again"
+        )
+    if connection.server_url != server.url:
         return f"{server.title} has moved to another address since: connect it again"
     if not opens_here(connection.credential, env=env):
         return "sealed under a key this Flotta no longer holds: connect it again"

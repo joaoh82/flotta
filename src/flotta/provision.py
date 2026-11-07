@@ -1868,39 +1868,12 @@ def _reload_mcp(box: Box, store: FleetStore, backend: Backend | None) -> bool | 
     return False
 
 
-def set_mcp_grants(
-    box_id: str,
-    grants: tuple[Any, ...],
-    *,
-    store: FleetStore,
-    backend: Backend | None = None,
-    by: str | None = None,
-) -> dict[str, Any]:
-    """Write an agent's MCP grants into its `config.yaml`, then record them (FLOTTA-125).
-
-    Through the FLOTTA-124 writer, under the same lock as the rules, since it
-    is the same file. Each grant is a `flotta-<server>` entry pointing at the
-    gateway with a fresh `mcp:call` token for this box (`flotta.mcp` says why
-    it is written out rather than referred to).
-
-    **Recorded first, written second: the opposite of the rules.** The record
-    is what the gateway enforces, so it is the grant; the config is only how
-    the agent finds the server. Recorded first, a grant taken away stops on the
-    next call even if the machine can't be written, and the answer says the
-    config is behind (`written: false`) rather than pretending nothing changed.
-    A new server appears in the agent's next conversation; one taken away stays
-    in an open conversation's tool list until Hermes reloads (`reload.mcp`, or
-    a new conversation), and the gateway refuses it meanwhile.
-    """
-    import json
-
+def _mcp_token(box: Box, store: FleetStore) -> tuple[str, str]:
+    """The gateway's MCP base and a fresh `mcp:call` token for `box`, or `ProvisionError`."""
     from flotta.auth import SCOPE_MCP_CALL, AuthError, box_subject, mint
-    from flotta.mcp import catalogue_of, config_changes, mcp_base
+    from flotta.mcp import mcp_base
     from flotta.settings import layered
 
-    box = store.get_box(box_id) or store.get_box_by_name(box_id)
-    if box is None:
-        raise ProvisionError(f"no box {box_id!r}")
     source = layered(store)
     base = mcp_base(source)
     if base is None:
@@ -1921,15 +1894,87 @@ def set_mcp_grants(
             "no signing key is configured, so there is no token to give this agent. Set "
             "$FLOTTA_SIGNING_KEY where the control plane runs."
         ) from exc
-    previous = [g.server for g in store.box_mcp_grants(box.id)]
+    return base, token
+
+
+def _write_mcp_config(
+    box: Box,
+    store: FleetStore,
+    backend: Backend | None,
+    *,
+    base: str,
+    token: str,
+    previous: Iterable[str] = (),
+) -> str | None:
+    """Write `box`'s `flotta-<server>` entries from its grants as they are now.
+
+    Called with `_rules_lock(box.id)` held, so the grants read here are the ones
+    in force: a grant saved or revoked meanwhile is either before this read or
+    waits for the lock. Writes no grant. Answers why the config couldn't be
+    written, or `None`. Clears the box's pending mark when it is written.
+    """
+    from flotta.mcp import catalogue_of, config_changes, grant_from_row
+
+    grants = [grant_from_row(r.server, r.tools, r.ask_first) for r in store.box_mcp_grants(box.id)]
     servers, _ = catalogue_of(store)
     changes = config_changes(grants, servers, base=base, token=token, previous=previous)
+    assert box.endpoint is not None
+    try:
+        result = _resolve_backend(box, backend).exec(box.endpoint, _config_command(changes))
+    except Exception as exc:  # noqa: BLE001 - the grant stands; the config is behind
+        return str(exc) or type(exc).__name__
+    if result.exit_code != 0:
+        return (result.stderr or result.stdout or "").strip() or "no output"
+    store.clear_mcp_config_pending(box.id)
+    return None
+
+
+def set_mcp_grants(
+    box_id: str,
+    grants: tuple[Any, ...],
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    by: str | None = None,
+) -> dict[str, Any]:
+    """Record an agent's MCP grants, then write them into its `config.yaml` (FLOTTA-125).
+
+    Through the FLOTTA-124 writer, under the same lock as the rules, since it
+    is the same file. Each grant is a `flotta-<server>` entry pointing at the
+    gateway with a fresh `mcp:call` token for this box (`flotta.mcp` says why
+    it is written out rather than referred to).
+
+    **Recorded first, written second: the opposite of the rules.** The record
+    is what the gateway enforces, so it is the grant; the config is only how
+    the agent finds the server. Recorded first, a grant taken away stops on the
+    next call even if the machine can't be written, and the answer says the
+    config is behind (`written: false`) rather than pretending nothing changed.
+
+    **A sleeping agent isn't woken for it** (`pending: true`). Writing over
+    `exec` starts a stopped Fly machine, and the grant is in force at the
+    gateway already, so the config waits: `wake_box` writes it when something
+    next addresses the agent, before the agent is reached. Unlike the rules
+    (FLOTTA-124), which are the agent's own instructions and are written at
+    once, waking it if need be: a rule held back would be a rule not followed,
+    while a grant held back is still enforced.
+
+    A running agent is then asked to reload (`reload.mcp`), so a server taken
+    away leaves its open conversations too; see `_reload_mcp`.
+    """
+    import json
+
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is None:
+        raise ProvisionError(f"no box {box_id!r}")
+    base, token = _mcp_token(box, store)
     detail = None
     try:
         _writable_box(box.id, store)
     except ProvisionError as exc:
         detail = str(exc)
+    pending = False
     with _rules_lock(box.id):
+        previous = [g.server for g in store.box_mcp_grants(box.id)]
         store.set_box_mcp_grants(
             box.id,
             [
@@ -1940,24 +1985,60 @@ def set_mcp_grants(
         store.add_event(
             "box", box.id, MCP_GRANTS_CHANGED, {"servers": [g.to_json() for g in grants], "by": by}
         )
-        if detail is None:
-            assert box.endpoint is not None
-            try:
-                result = _resolve_backend(box, backend).exec(box.endpoint, _config_command(changes))
-            except Exception as exc:  # noqa: BLE001 - the grant stands; the config is behind
-                detail = str(exc) or type(exc).__name__
-            else:
-                if result.exit_code != 0:
-                    detail = (result.stderr or result.stdout or "").strip() or "no output"
-        if detail is not None:
+        now = store.get_box(box.id) or box
+        if detail is None and now.status != "running":
+            store.mark_mcp_config_pending(box.id)
+            pending = True
+            detail = f"{box.name} is asleep: its config is written when it next wakes"
+        elif detail is None:
+            detail = _write_mcp_config(
+                now, store, backend, base=base, token=token, previous=previous
+            )
+            if detail is not None:
+                store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
+        else:
             store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
     reloaded = _reload_mcp(box, store, backend) if detail is None else None
     return {
         **mcp_grants_of(box.id, store=store),
         "written": detail is None,
+        "pending": pending,
         "detail": detail,
         "reloaded": reloaded,
     }
+
+
+def rewrite_mcp_config(
+    box_id: str, *, store: FleetStore, backend: Backend | None = None, reason: str
+) -> bool | None:
+    """Write a running agent's MCP config again from its grants as they are. Writes no grant.
+
+    `None` when it wasn't written now: an agent that isn't running keeps its
+    pending mark and is written when it next wakes (`wake_box`). True when
+    written (and the agent asked to reload), False when the write failed, which
+    leaves it pending. For a catalogue change and for a wake.
+    """
+    box = store.get_box(box_id)
+    if box is None or is_terminal("box", box.status):
+        return None
+    try:
+        base, token = _mcp_token(box, store)
+    except ProvisionError as exc:
+        _log.warning("the MCP config of %s was not rewritten: %s", box_id, exc)
+        return False
+    with _rules_lock(box.id):
+        now = store.get_box(box.id)
+        if now is None or now.status != "running" or not now.endpoint:
+            store.mark_mcp_config_pending(box.id)
+            return None
+        detail = _write_mcp_config(now, store, backend, base=base, token=token)
+        if detail is not None:
+            store.mark_mcp_config_pending(box.id)
+            store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
+            return False
+        store.add_event("box", box.id, "mcp_config_rewritten", {"reason": reason})
+    _reload_mcp(now, store, backend)
+    return True
 
 
 def rewrite_mcp_configs(
@@ -1965,33 +2046,21 @@ def rewrite_mcp_configs(
     *,
     store: FleetStore,
     backend: Backend | None = None,
-    by: str | None = None,
-) -> dict[str, bool]:
+) -> dict[str, bool | None]:
     """Write again the config of every agent granted any of `servers`, after the
-    catalogue changed (FLOTTA-125). Each `{box: written}`.
+    catalogue changed (FLOTTA-125). Each `{box: written}`, `None` for deferred.
 
-    The grants stay as they are: a server taken off the catalogue is refused at
-    the gateway at once, its grant shows as going away, and writing the config
-    again takes its entry out and reloads the agent, the same as removing the
-    grant. A server whose tools changed gets its new `tools.include`.
+    **No grant is written**, here or below: each agent's config is made from its
+    grants read under the config lock (`rewrite_mcp_config`), so a grant saved
+    or revoked while this runs is never undone. A server taken off the catalogue
+    is refused at the gateway at once, its grant shows as going away, and the
+    entry leaves the config. **Only running agents are written now**; a stopped
+    one is marked pending and written by `wake_box` when it next wakes, since
+    writing over `exec` would start it.
     """
-    from flotta.mcp import grant_from_row
-
-    out: dict[str, bool] = {}
+    out: dict[str, bool | None] = {}
     for box_id in store.boxes_granted_mcp(list(servers)):
-        box = store.get_box(box_id)
-        if box is None or is_terminal("box", box.status):
-            continue
-        grants = tuple(
-            grant_from_row(r.server, r.tools, r.ask_first) for r in store.box_mcp_grants(box_id)
-        )
-        try:
-            written = set_mcp_grants(box_id, grants, store=store, backend=backend, by=by)
-        except ProvisionError as exc:
-            _log.warning("the MCP config of %s was not rewritten: %s", box_id, exc)
-            out[box_id] = False
-            continue
-        out[box_id] = bool(written["written"])
+        out[box_id] = rewrite_mcp_config(box_id, store=store, backend=backend, reason="catalogue")
     return out
 
 
@@ -3250,6 +3319,15 @@ def wake_box(
     if box.status == "stopped":
         store.add_event("box", box_id, "running", {"reason": reason, "previous_status": "stopped"})
         store.update_box_status(box_id, "running")
+
+    # MCP config held back while it slept (FLOTTA-125: `set_mcp_grants`), written
+    # now it is up, before whoever addressed it reaches it. Best effort: the
+    # grants are in force at the gateway either way, and a failure stays pending.
+    if store.mcp_config_pending(box_id):
+        try:
+            rewrite_mcp_config(box_id, store=store, backend=backend, reason="woken")
+        except Exception as exc:  # noqa: BLE001 - never fail a wake over discovery
+            _log.warning("the pending MCP config of %s was not written: %s", box_id, exc)
 
     return {
         "box_id": box_id,
