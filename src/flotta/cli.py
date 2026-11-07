@@ -1181,7 +1181,7 @@ def _trigger_line(trigger: dict[str, Any]) -> str:
 def _through_control(method: str, path: str, scope: str, body: dict | None = None) -> Any:
     if not control_url():
         raise _fail(
-            ControlPlaneError(f"triggers go through the control plane: set ${CONTROL_URL_ENV}")
+            ControlPlaneError(f"this goes through the control plane: set ${CONTROL_URL_ENV}")
         )
     try:
         return control_request(method, path, scopes=(scope,), body=body)
@@ -1258,6 +1258,69 @@ def trigger_rm(trigger_id: str = typer.Argument(..., help="The trigger's id")) -
 
     _through_control("DELETE", f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_WRITE)
     typer.echo(f"removed {trigger_id}")
+
+
+# -- API keys (M14.5) ------------------------------------------------------------
+#
+# What a client's own systems hold to start one agent's runs. Made, listed and
+# revoked through the control plane, which alone holds their hashes.
+
+key_app = typer.Typer(
+    name="key",
+    help="API keys: a client's own systems start one agent's runs.",
+    no_args_is_help=True,
+)
+app.add_typer(key_app)
+
+
+def _key_line(found: dict[str, Any]) -> str:
+    state = "revoked" if found.get("revoked_at") else "live"
+    used = found.get("last_used_at") or "never used"
+    return f"{found.get('id')}  {found.get('prefix')}…  {found.get('name')}  {state}  {used}"
+
+
+@key_app.command("add")
+def key_add(
+    box: str = typer.Argument(..., help="The agent, by name or id"),
+    name: str = typer.Option(..., "--name", help="What will hold it, e.g. crm"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """A key for one agent, printed this once. It starts that agent's runs and
+    reads them, and does nothing else."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    found = _through_control(
+        "POST", f"/api/boxes/{_quoted(box)}/keys", SCOPE_FLEET_WRITE, {"name": name}
+    )
+    text = (
+        f"{_key_line(found)}\n\nkey  {found.get('key')}\n\n"
+        "The key is shown this once: put it in the system that will call the agent, as\n"
+        "`Authorization: Bearer <key>` on POST /api/boxes/<agent>/runs. "
+        "`flotta key rm` revokes it."
+    )
+    emit(found, text, as_json=as_json)
+
+
+@key_app.command("ls")
+def key_ls(
+    box: str = typer.Argument(..., help="The agent, by name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """An agent's keys, newest first, revoked ones too. Never the keys themselves."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    found = _through_control("GET", f"/api/boxes/{_quoted(box)}/keys", SCOPE_FLEET_WRITE)
+    lines = [_key_line(k) for k in found["keys"]] or ["no keys"]
+    emit(found, "\n".join(lines), as_json=as_json)
+
+
+@key_app.command("rm")
+def key_rm(key_id: str = typer.Argument(..., help="The key's id, key-…")) -> None:
+    """Revoke a key. Its next request is refused; the runs it started stay."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    _through_control("DELETE", f"/api/keys/{_quoted(key_id)}", SCOPE_FLEET_WRITE)
+    typer.echo(f"revoked {key_id}")
 
 
 hook_app = typer.Typer(

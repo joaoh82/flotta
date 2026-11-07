@@ -156,6 +156,10 @@ SCOPE_MODEL_CALL = "model:call"
 #: agent's `config.yaml`: one that leaks from there reaches the servers granted
 #: to that agent, and spends nothing on models.
 SCOPE_MCP_CALL = "mcp:call"
+#: Starting a run on one agent and reading its runs, and nothing else: what an
+#: API key carries (M14.5). No role holds it and `mint` refuses it, so a request
+#: that has it was made with a key, confined to that key's one agent.
+SCOPE_RUN_CREATE = "run:create"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -169,13 +173,14 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_AUTH_RELAY,
         SCOPE_MODEL_CALL,
         SCOPE_MCP_CALL,
+        SCOPE_RUN_CREATE,
     }
 )
 
 #: What a person may do, by role (M11.7). Mapped to scopes at mint time, so a
 #: token is still a flat list and nothing on the hot path knows roles exist.
-#: No box scopes (`git:credential`, `box:peer`, `model:call`, `mcp:call`), no `fleet:route`
-#: and no `auth:relay`: those are
+#: No box scopes (`git:credential`, `box:peer`, `model:call`, `mcp:call`), no `fleet:route`,
+#: no `auth:relay` and no `run:create`: those are
 #: held by machines, never handed to a person.
 ROLES: dict[str, frozenset[str]] = {
     "owner": frozenset(
@@ -301,6 +306,27 @@ USER_SUBJECT_PREFIX = "user:"
 def user_subject(user_id: str) -> str:
     """The subject a signed-in person's requests carry."""
     return f"{USER_SUBJECT_PREFIX}{user_id}"
+
+
+#: An API key (M14.5): what a client's own systems hold to start an agent's
+#: runs. Greppable, and distinct from a token's `flotta_<payload>.<sig>` and a
+#: ticket's `flotta_ticket_`, so a leaked one says what it is and none is
+#: mistaken for another. Random, not signed: the store keeps its hash
+#: (`store.secret_hash`), so revoking it is deleting a row's use, at once.
+API_KEY_PREFIX = "flotta_key_"
+
+#: Subjects starting with this name an **API key** (M14.5). Only a key's lookup
+#: makes one (`key_token`); `mint` refuses the prefix, as it does `user:`.
+KEY_SUBJECT_PREFIX = "key:"
+
+
+def generate_api_key() -> str:
+    """A new API key. 256 random bits, like a session's secret."""
+    return API_KEY_PREFIX + secrets.token_urlsafe(32)
+
+
+def is_api_key(credential: str) -> bool:
+    return credential.startswith(API_KEY_PREFIX)
 
 
 class AuthError(Exception):
@@ -430,6 +456,34 @@ def person_token(
         expires_at=expires_at,
         org=None if org == DEFAULT_ORG else org,
         client=client,
+    )
+
+
+def key_token(
+    *,
+    key_id: str,
+    org: str,
+    client: str,
+    box_id: str,
+    issued_at: int,
+    expires_at: int,
+) -> Token:
+    """The token an API key is, for one request: one agent, `run:create` only.
+
+    Built, never minted, as `person_token` is for a session. The box claim
+    confines it the way a chat ticket is confined (`admits`), so every route
+    that finds a box through `_scoped_box` already refuses another; and it
+    holds no other scope, so no route that asks for one admits it at all. Not
+    `box:chat`: a key starts runs, and opens no conversation.
+    """
+    return Token(
+        subject=f"{KEY_SUBJECT_PREFIX}{key_id}",
+        scopes=frozenset({SCOPE_RUN_CREATE}),
+        issued_at=issued_at,
+        expires_at=expires_at,
+        org=None if org == DEFAULT_ORG else org,
+        client=client,
+        box=box_id,
     )
 
 
@@ -570,7 +624,14 @@ def mint(
     signing_key = _require_key(key, env)
     if subject.startswith(USER_SUBJECT_PREFIX):
         raise AuthError(f"{subject!r} names a person who signs in; they get a session, not a token")
+    if subject.startswith(KEY_SUBJECT_PREFIX):
+        raise AuthError(f"{subject!r} names an API key; make one with `flotta key add`")
     wanted = frozenset(scopes)
+    if SCOPE_RUN_CREATE in wanted:
+        raise AuthError(
+            f"{SCOPE_RUN_CREATE} is an API key's, confined to one agent; "
+            "make one with `flotta key add`"
+        )
     if not wanted:
         raise AuthError("a token with no scopes can do nothing; name at least one")
     unknown = sorted(wanted - SCOPES)
@@ -709,6 +770,10 @@ def verify(
         raise AuthError(
             "a chat ticket opens one conversation through the door, from a browser; "
             "it is not a token"
+        )
+    if token and is_api_key(token):
+        raise AuthError(
+            "an API key starts an agent's runs through the fleet API; it is not a token"
         )
     if not token or not token.startswith(TOKEN_PREFIX):
         raise AuthError("not a Flotta token")

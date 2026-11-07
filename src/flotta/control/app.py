@@ -57,6 +57,7 @@ from flotta.auth import (
     SCOPE_FLEET_WRITE,
     SCOPE_GIT_CREDENTIAL,
     SCOPE_ORG_ADMIN,
+    SCOPE_RUN_CREATE,
     SIGNING_KEY_ENV,
     TICKET_PROTOCOL_PREFIX,
     TICKET_TTL_S,
@@ -65,6 +66,8 @@ from flotta.auth import (
     Token,
     admits,
     admits_tenant,
+    is_api_key,
+    key_token,
     mint,
     mint_ticket,
     person_token,
@@ -685,6 +688,10 @@ def create_app(
         control plane must see one agency's view, not the operator's over
         everything. It becomes the token its membership would mint
         (`_session_token`), and from here on nothing can tell the two apart.
+
+        **So is an API key** (M14.5), for the same reason: a row, not a
+        signature. It becomes a token for its one agent holding `run:create`
+        alone (`_api_key_token`), which only the run routes accept.
         """
 
         def dependency(
@@ -693,6 +700,8 @@ def create_app(
             scheme, _, credential = (authorization or "").partition(" ")
             if scheme.lower() == "session":
                 token = _session_token(credential.strip(), request)
+            elif scheme.lower() == "bearer" and is_api_key(credential.strip()):
+                token = _api_key_token(credential.strip())
             elif key is None:
                 return None
             elif scheme.lower() != "bearer":
@@ -794,6 +803,35 @@ def create_app(
         except AuthError as exc:  # a role this build no longer knows
             raise refused from exc
 
+    def _api_key_token(secret: str) -> Token:
+        """The token a live API key is, or 401.
+
+        Looked up on every request, so a revoked key, or one whose agent was
+        destroyed, is refused on its next one. The tenancy is the box's, read
+        now, not what the key was made with.
+        """
+        store = store_factory()
+        try:
+            found = store.api_key(secret)
+            box = store.get_box(found.box_id) if found is not None else None
+        finally:
+            store.close()
+        if found is None or box is None:
+            raise HTTPException(
+                status_code=401,
+                detail="no such API key, or it has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        now = int(time.time())
+        return key_token(
+            key_id=found.id,
+            org=box.org,
+            client=box.client,
+            box_id=box.id,
+            issued_at=int(datetime.fromisoformat(found.created_at).timestamp()),
+            expires_at=now + 60,
+        )
+
     def _session_of(authorization: str | None) -> Any:
         """The session a request was made with, or 403 if it was not a session.
 
@@ -833,6 +871,10 @@ def create_app(
     needs_route = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_BOX_CHAT, any_of=True))
     needs_fleet_route = Depends(require(SCOPE_FLEET_ROUTE))
     needs_route_or_write = Depends(require(SCOPE_FLEET_ROUTE, SCOPE_FLEET_WRITE, any_of=True))
+    # The agency, or an API key (M14.5): the run routes a key may use, and
+    # only those. A key's token is confined to its box (`key_token`).
+    needs_run_write = Depends(require(SCOPE_FLEET_WRITE, SCOPE_RUN_CREATE, any_of=True))
+    needs_run_read = Depends(require(SCOPE_FLEET_READ, SCOPE_RUN_CREATE, any_of=True))
     # Called, not a dependency: only a request naming its caller needs it.
     check_relay = require(SCOPE_AUTH_RELAY)
 
@@ -5128,7 +5170,13 @@ def create_app(
     # `fleet:write`). A client's people see none of it (D21).
 
     def _run_reader(token: Token | None) -> None:
-        """Not a client's people: a token confined to a client that can't change it."""
+        """Not a client's people: a token confined to a client that can't change it.
+
+        An API key is a client's systems, not its people, and reads its own
+        agent's runs only (`_scoped_box`, `_scoped_run`).
+        """
+        if token is not None and token.allows(SCOPE_RUN_CREATE) and token.box is not None:
+            return
         if token is not None and token.client is not None and not token.allows(SCOPE_FLEET_WRITE):
             raise HTTPException(status_code=403, detail="runs are the agency's to see")
 
@@ -5157,7 +5205,7 @@ def create_app(
         return view
 
     @app.post("/api/boxes/{box_id}/runs", status_code=202)
-    def create_run(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+    def create_run(box_id: str, body: dict[str, Any], token: Token | None = needs_run_write) -> Any:
         """Ask an agent for a piece of work: `{prompt, input?}`. It waits in
         `pending` until its agent is free; read it at `/api/runs/{id}`."""
         prompt = body.get("prompt")
@@ -5183,7 +5231,7 @@ def create_app(
             store.close()
 
     @app.get("/api/boxes/{box_id}/runs")
-    def list_box_runs(box_id: str, limit: int = 50, token: Token | None = needs_read) -> Any:
+    def list_box_runs(box_id: str, limit: int = 50, token: Token | None = needs_run_read) -> Any:
         """An agent's runs, newest first."""
         store = store_factory()
         try:
@@ -5209,7 +5257,7 @@ def create_app(
             store.close()
 
     @app.get("/api/runs/{run_id}")
-    def get_run(run_id: str, token: Token | None = needs_read) -> Any:
+    def get_run(run_id: str, token: Token | None = needs_run_read) -> Any:
         """One run: what started it, what it was given, its steps, its reply and its cost."""
         store = store_factory()
         try:
@@ -5462,6 +5510,84 @@ def create_app(
         try:
             trigger = _scoped_trigger(store, token, trigger_id)
             store.delete_trigger(trigger.id)
+        finally:
+            store.close()
+
+    # -- API keys (M14.5) --------------------------------------------------
+    #
+    # What a client's own systems hold to start one agent's runs and read them
+    # back: `Authorization: Bearer flotta_key_…` on the three run routes, and
+    # nothing else (`require`, `key_token`). The agency's to make and revoke,
+    # with `fleet:write`; a key cannot make another.
+
+    def _scoped_key(store: Any, token: Token | None, key_id: str) -> Any:
+        """An API key `token` may act on, or 404, as `_scoped_box` is for a box."""
+        found = store.get_api_key(key_id)
+        if found is None or (
+            token is not None
+            and (
+                admits_tenant(token, org=found.org, client=found.client) is not None
+                or (token.box is not None and token.box != found.box_id)
+            )
+        ):
+            raise HTTPException(status_code=404, detail=f"no API key {key_id!r}")
+        return found
+
+    def _key_view(found: Any) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        return asdict(found)
+
+    @app.post("/api/boxes/{box_id}/keys", status_code=201)
+    def create_api_key(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """A key for this agent: `{name}`. **The answer's `key` is shown this
+        once**; the store keeps only its hash. `docs/API_KEYS.md` says how to use it."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                found, secret = store.create_api_key(
+                    box.id,
+                    name=str(body.get("name") or ""),
+                    created_by=token.subject if token else None,
+                )
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            store.add_event(
+                "box",
+                box.id,
+                "api_key_created",
+                {"key": found.id, "name": found.name, "by": token.subject if token else None},
+            )
+            return {**_key_view(found), "key": secret}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/keys")
+    def list_api_keys(box_id: str, token: Token | None = needs_write) -> Any:
+        """An agent's keys, newest first, revoked ones too. Never the keys themselves."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            return {"keys": [_key_view(k) for k in store.list_api_keys(box.id)]}
+        finally:
+            store.close()
+
+    @app.delete("/api/keys/{key_id}", status_code=204)
+    def revoke_api_key(key_id: str, token: Token | None = needs_write) -> None:
+        """Revoke a key: its next request is refused. The runs it started stay."""
+        store = store_factory()
+        try:
+            found = _scoped_key(store, token, key_id)
+            store.revoke_api_key(found.id)
+            store.add_event(
+                "box",
+                found.box_id,
+                "api_key_revoked",
+                {"key": found.id, "name": found.name, "by": token.subject if token else None},
+            )
         finally:
             store.close()
 

@@ -735,6 +735,35 @@ def _triggers() -> tuple[str, ...]:
     )
 
 
+def _api_keys() -> tuple[str, ...]:
+    """API keys (FLOTTA-150, M14.5): a client's own systems start one agent's runs.
+
+    `secret_hash` is the key's SHA-256 (`store.secret_hash`), as for sessions
+    and sign-in links: the key itself is shown once and kept nowhere. `prefix`
+    is its first few characters, for telling keys apart in a list. Revoking
+    sets `revoked_at`, and the row stays, so a run it started still says which
+    key that was.
+    """
+    return (
+        """
+        CREATE TABLE api_keys (
+            id           TEXT PRIMARY KEY,
+            org_id       TEXT NOT NULL,
+            client_id    TEXT NOT NULL,
+            box_id       TEXT NOT NULL REFERENCES boxes(id),
+            name         TEXT NOT NULL,
+            secret_hash  TEXT NOT NULL UNIQUE,
+            prefix       TEXT NOT NULL,
+            created_by   TEXT,
+            created_at   TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at   TEXT
+        )
+        """,
+        "CREATE INDEX idx_api_keys_box ON api_keys(box_id)",
+    )
+
+
 #: Every migration, in order. Append only.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
@@ -870,6 +899,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         "mcp catalogue: client secrets, a connection's address, and configs held back",
         _mcp_catalogue(),
     ),
+    Migration(25, "api keys: a client's own systems start one agent's runs", _api_keys()),
 )
 
 

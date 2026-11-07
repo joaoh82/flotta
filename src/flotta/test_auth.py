@@ -206,7 +206,10 @@ def test_the_known_scopes_are_exactly_these():
     M13.2's `model:call`, so a box's token can spend on models only if it was
     given that, and a token that leaks from anywhere else cannot — and for
     FLOTTA-125's `mcp:call`, because that token is written into the agent's
-    `config.yaml`, and one that leaks from there should spend nothing on models.
+    `config.yaml`, and one that leaks from there should spend nothing on models
+    — and for M14.5's `run:create`, because an API key sits in a client's own
+    systems and should start its one agent's runs and do nothing else, not even
+    open a conversation, which `box:chat` would.
     """
     assert {
         "fleet:read",
@@ -220,6 +223,7 @@ def test_the_known_scopes_are_exactly_these():
         "auth:relay",
         "model:call",
         "mcp:call",
+        "run:create",
     } == SCOPES
 
 
