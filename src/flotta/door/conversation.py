@@ -58,7 +58,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from flotta.door.turns import TurnRecorder
 
 _log = logging.getLogger("flotta.door")
 
@@ -176,8 +179,13 @@ class ConversationGate:
         plane: Conversations,
         conversation_only: bool,
         answers_approvals: bool = False,
+        turns: TurnRecorder | None = None,
     ) -> None:
         self._box_id = box_id
+        #: Records each turn as a run (M14.6). Told every frame first, before
+        #: anything here decides what passes: an approval kept from a client
+        #: was still asked.
+        self._turns = turns
         self._subject = subject
         self._plane = plane
         self.conversation_only = conversation_only
@@ -200,6 +208,8 @@ class ConversationGate:
     # -- from the client ---------------------------------------------------------
 
     async def from_client(self, frame: str | bytes) -> Step:
+        if self._turns is not None:
+            self._turns.heard_client(frame)
         if self.conversation_only:
             return await self._confined(frame)
         if isinstance(frame, bytes) or "session.most_recent" not in frame:
@@ -343,6 +353,8 @@ class ConversationGate:
 
     async def from_box(self, frame: str) -> str | None:
         """What to send the client for a frame from the box, if anything."""
+        if self._turns is not None:
+            self._turns.heard_box(frame)
         if self.conversation_only:
             kept = self._without_approvals(frame)
             if kept is None:

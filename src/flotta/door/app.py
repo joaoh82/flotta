@@ -112,6 +112,7 @@ from flotta.auth import (
     verify_ticket,
 )
 from flotta.door.conversation import ConversationGate
+from flotta.door.turns import TurnRecorder, records
 
 # Imported at module level, not lazily inside `create_door`, and the reason is
 # a bug rather than a preference: `from __future__ import annotations` turns
@@ -569,6 +570,48 @@ class ControlPlane:
             json={"session_id": session_id},
         )
 
+    async def open_chat_run(
+        self, box_id: str, *, prompt: str, session_id: str, by: str, client: bool
+    ) -> str | None:
+        """A turn began on `box_id`: its `chat` run's id, or None while the agent
+        is doing another run (M14.6, `flotta.door.turns`)."""
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}/api/boxes/{box_id}/chat-runs"
+        body = {"prompt": prompt, "session_id": session_id, "by": by, "client": client}
+        async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
+            response = await http.post(url, headers=self._headers(), json=body)
+        if response.status_code == 409:
+            return None
+        response.raise_for_status()
+        return str(response.json()["id"])
+
+    async def finish_chat_run(
+        self,
+        box_id: str,
+        run_id: str,
+        *,
+        steps: list[dict[str, Any]],
+        status: str,
+        output: str | None,
+        error_class: str | None,
+        approvals: int,
+    ) -> None:
+        """The turn ended: its steps and reply, in one batch."""
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}/api/boxes/{box_id}/runs/{run_id}/steps"
+        body = {
+            "steps": steps,
+            "status": status,
+            "output": output,
+            "error_class": error_class,
+            "approvals": approvals,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
+            response = await http.post(url, headers=self._headers(), json=body)
+        response.raise_for_status()
+
     async def _call(self, method: str, path: str, *, name: str, verb: str, json: Any = None) -> Any:
         """One request to the fleet API, with the door's errors mapped once."""
         import httpx
@@ -994,13 +1037,21 @@ def create_door(
         await websocket.accept(subprotocol=answer)
 
         liveness = Liveness(target.name)
+        # Tokens that reach this far aren't a client's: see `authorize`.
+        a_clients = ticketed and not token.full_access
+        # Each turn of a person's conversation becomes a `chat` run (M14.6).
+        turns = (
+            TurnRecorder(box_id=target.box_id, subject=token.subject, client=a_clients, plane=plane)
+            if records(token.subject)
+            else None
+        )
         gate = ConversationGate(
             box_id=target.box_id,
             subject=token.subject,
             plane=plane,
-            # Tokens that reach this far aren't a client's: see `authorize`.
-            conversation_only=ticketed and not token.full_access,
+            conversation_only=a_clients,
             answers_approvals=token.answers_approvals,
+            turns=turns,
         )
 
         async def keep_awake() -> None:
@@ -1111,6 +1162,9 @@ def create_door(
             heartbeat.cancel()
             with contextlib.suppress(Exception):
                 await websocket.close()
+            if turns is not None:
+                # After the person's socket is closed: it costs them nothing.
+                await turns.close()
 
     app.state.plane = plane
     app.state.signing_key = key

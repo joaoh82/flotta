@@ -1,0 +1,333 @@
+"""A conversation's turns as runs (FLOTTA-151, M14.6), as the door hears them.
+
+The guards first: a control plane that hangs costs the conversation nothing,
+and what one socket hears is recorded on its own agent only. The routes the
+door calls are in `control/test_chat_runs.py`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+
+import pytest
+
+from flotta.door.conversation import ConversationGate
+from flotta.door.turns import TurnRecorder, records
+
+
+def _event(kind, payload=None, session="live-1"):
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"type": kind, "payload": payload or {}, "session_id": session},
+        }
+    )
+
+
+def _submit(text, session="live-1", rid=7):
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "method": "prompt.submit",
+            "params": {"session_id": session, "text": text},
+        }
+    )
+
+
+def _turn(session="live-1", reply="It is empty.", tool=True):
+    frames = [_event("message.start", {}, session)]
+    if tool:
+        frames += [
+            _event("tool.start", {"tool_id": "t1", "name": "terminal"}, session),
+            _event("message.delta", {"text": "tool.start inside a delta, not a frame"}, session),
+            _event(
+                "tool.complete",
+                {"tool_id": "t1", "name": "terminal", "result": {"exit_code": 0}},
+                session,
+            ),
+        ]
+    frames.append(_event("message.complete", {"text": reply, "status": "complete"}, session))
+    return frames
+
+
+class Plane:
+    """The control plane the door talks to, recording what it was told."""
+
+    def __init__(self, *, busy=False, hang=False):
+        self.opened: list[dict] = []
+        self.finished: list[dict] = []
+        self.busy = busy
+        self.hang = hang
+        self.released = asyncio.Event()
+        self._n = 0
+
+    async def open_chat_run(self, box_id, *, prompt, session_id, by, client):
+        if self.hang:
+            await self.released.wait()
+        self.opened.append(
+            {"box": box_id, "prompt": prompt, "session": session_id, "by": by, "client": client}
+        )
+        if self.busy:
+            return None
+        self._n += 1
+        return f"t-{self._n}"
+
+    async def finish_chat_run(self, box_id, run_id, **ending):
+        if self.hang:
+            await self.released.wait()
+        self.finished.append({"box": box_id, "run": run_id, **ending})
+
+    # The gate's own questions, unused by these turns.
+    async def client_conversations(self, box_id):
+        return []
+
+    async def record_client_conversation(self, box_id, session_id):
+        return None
+
+
+def _gate(plane, *, box="b-1", subject="user:u-1", client=False):
+    recorder = TurnRecorder(box_id=box, subject=subject, client=client, plane=plane)
+    gate = ConversationGate(
+        box_id=box, subject=subject, plane=plane, conversation_only=client, turns=recorder
+    )
+    return gate, recorder
+
+
+async def _settle(recorder):
+    await recorder.close()
+
+
+# -- the guards ----------------------------------------------------------------
+
+
+def test_a_control_plane_that_hangs_costs_the_conversation_nothing():
+    """The guard: with every call to the control plane hanging, a hundred
+    turns' frames pass through at once, each forwarded. The calls wait until
+    the person's socket is closed (`TurnRecorder.close`)."""
+
+    async def go():
+        plane = Plane(hang=True)
+        gate, recorder = _gate(plane)
+        started = time.monotonic()
+        forwarded = 0
+        for n in range(100):
+            await gate.from_client(_submit(f"turn {n}"))
+            for frame in _turn():
+                if await gate.from_box(frame) == frame:
+                    forwarded += 1
+        elapsed = time.monotonic() - started
+        plane.released.set()
+        await asyncio.wait_for(recorder.close(), 5)
+        return forwarded, elapsed, recorder._worker.done(), plane
+
+    forwarded, elapsed, ended, plane = asyncio.run(go())
+
+    assert forwarded == 100 * len(_turn())
+    assert elapsed < 1.0
+    # Nothing is left behind: the socket's worker ends by itself.
+    assert ended
+    # Behind, it records fewer turns, and every one it opened it also ended:
+    # an end dropped would leave a run `running`, its agent busy.
+    assert 0 < len(plane.opened) < 100
+    assert len(plane.finished) == len(plane.opened)
+
+
+def test_a_control_plane_that_is_down_costs_the_conversation_nothing():
+    class Down(Plane):
+        async def open_chat_run(self, *args, **kwargs):
+            raise ConnectionError("the control plane is down")
+
+    async def go():
+        plane = Down()
+        gate, recorder = _gate(plane)
+        await gate.from_client(_submit("Hello"))
+        out = [await gate.from_box(f) for f in _turn()]
+        await _settle(recorder)
+        return plane, out
+
+    plane, out = asyncio.run(go())
+
+    assert out == _turn()
+    assert plane.finished == []
+
+
+def test_a_socket_records_on_its_own_agent_only():
+    """The guard: the box is the one the socket was opened against. Nothing a
+    frame says, a session id or a run id, names another."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, box="b-1")
+        await gate.from_client(_submit("Hello"))
+        for frame in _turn():
+            await gate.from_box(frame)
+        forged = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "message.start",
+                    "session_id": "live-2",
+                    "box_id": "b-2",
+                    "run_id": "t-theirs",
+                    "payload": {"box_id": "b-2"},
+                },
+            }
+        )
+        await gate.from_box(forged)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    assert {c["box"] for c in plane.opened + plane.finished} == {"b-1"}
+    assert {c["run"] for c in plane.finished} <= {"t-1", "t-2"}
+
+
+# -- what is recorded ----------------------------------------------------------
+
+
+def test_a_turn_is_a_run_with_its_prompt_steps_and_reply():
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:u-9", client=True)
+        await gate.from_client(_submit("What is in the workspace?"))
+        for frame in _turn():
+            await gate.from_box(frame)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    (opened,) = plane.opened
+    assert opened == {
+        "box": "b-1",
+        "prompt": "What is in the workspace?",
+        "session": "live-1",
+        "by": "user:u-9",
+        "client": True,
+    }
+    (finished,) = plane.finished
+    assert (finished["run"], finished["status"], finished["output"]) == (
+        "t-1",
+        "done",
+        "It is empty.",
+    )
+    (step,) = finished["steps"]
+    assert (step["kind"], step["name"], step["exit_code"]) == ("tool", "terminal", 0)
+
+
+def test_each_turn_is_its_own_run():
+    """A run per turn, not per conversation (`door/turns.py`)."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane)
+        for text in ("First.", "Second."):
+            await gate.from_client(_submit(text))
+            for frame in _turn(tool=False):
+                await gate.from_box(frame)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    assert [o["prompt"] for o in plane.opened] == ["First.", "Second."]
+    assert [f["run"] for f in plane.finished] == ["t-1", "t-2"]
+
+
+def test_a_turn_cut_off_by_the_socket_closing_ends_failed():
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane)
+        await gate.from_client(_submit("Run the tests."))
+        for frame in _turn()[:-1]:
+            await gate.from_box(frame)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    (finished,) = plane.finished
+    assert (finished["status"], finished["error_class"]) == ("failed", "disconnected")
+    assert len(finished["steps"]) == 1
+
+
+def test_a_turn_while_the_agent_does_another_run_goes_unrecorded():
+    async def go():
+        plane = Plane(busy=True)
+        gate, recorder = _gate(plane)
+        await gate.from_client(_submit("Hello"))
+        for frame in _turn():
+            await gate.from_box(frame)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    assert len(plane.opened) == 1
+    assert plane.finished == []
+
+
+def test_an_agents_failed_answer_ends_the_run_failed():
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane)
+        await gate.from_client(_submit("Hello"))
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_event("message.complete", {"text": "429", "status": "error"}))
+        await _settle(recorder)
+        return plane
+
+    (finished,) = asyncio.run(go()).finished
+
+    assert (finished["status"], finished["error_class"]) == ("failed", "error")
+
+
+def test_an_approval_kept_from_a_client_is_still_a_step():
+    """The gate takes the question out of what a client hears; the run still
+    says it was asked."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, client=True)
+        await gate.from_box(_event("message.start"))
+        ask = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "srq-1",
+                "method": "approval",
+                "params": {"request_id": "r-1", "session_id": "live-1", "command": "rm -rf /"},
+            }
+        )
+        heard = await gate.from_box(ask)
+        await gate.from_box(_event("message.complete", {"text": "Denied.", "status": "complete"}))
+        await _settle(recorder)
+        return plane, heard
+
+    plane, heard = asyncio.run(go())
+
+    assert heard is None
+    (finished,) = plane.finished
+    assert finished["approvals"] == 1
+    assert finished["steps"][0]["kind"] == "approval"
+    assert finished["steps"][0]["answer"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("subject", "recorded"),
+    [
+        ("user:u-1", True),
+        ("ops", True),
+        ("run:t-1", False),
+        ("relay", False),
+        ("box:b-1", False),
+    ],
+)
+def test_only_a_persons_conversation_is_recorded(subject, recorded):
+    """A run's own delivery is a run already; a relay is the other agent's."""
+    assert records(subject) is recorded

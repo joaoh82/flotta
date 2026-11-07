@@ -1785,6 +1785,37 @@ def test_a_box_with_a_live_task_is_never_suspended(store):
     assert store.get_box(box_of(store, task_id)).status == "running"
 
 
+def test_a_turn_left_running_does_not_keep_its_agent_awake(store):
+    """A conversation's turn is the door's record of it (M14.6), and the door
+    holds an agent awake while anyone talks. A turn whose end was lost, to a
+    door that died, must not keep a quiet agent billing: it sleeps, and the
+    turn is ended. Found by `test_local_offline.py`, whose door is cancelled
+    the moment its conversation closes."""
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    turn = store.open_chat_run(box.id, "Hello.", now=datetime.now(UTC) - timedelta(hours=1))
+
+    outcomes = sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60)
+
+    assert [(o["box_id"], o["slept"]) for o in outcomes] == [(box.id, True)]
+    ended = store.get_run(turn.id)
+    assert (ended.status, ended.error_class) == ("failed", "stopped")
+
+
+def test_a_delivered_run_still_keeps_its_agent_awake_beside_a_turn(store):
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    run = store.create_run(box.id, "Summarise.", trigger_kind="api")
+    store.start_run(run.id, now=datetime.now(UTC) - timedelta(hours=1))
+    old = (datetime.now(UTC) - timedelta(seconds=10_000)).isoformat()
+    store._conn.execute("UPDATE events SET ts = ?", (old,))
+
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60) == []
+    assert store.get_box(box.id).status == "running"
+
+
 def test_activity_is_recorded_as_an_event_and_defers_sleep(store):
     """The whole mechanism, end to end.
 

@@ -99,6 +99,7 @@ from flotta.store import (
     AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
     LINK_TTL_S,
+    BoxBusyError,
     DuplicateMembershipError,
     DuplicateTenantError,
     FleetStore,
@@ -249,6 +250,11 @@ INVITE_LIMIT_PER_PENDING_ORG = 3
 #: guard on a caller in a loop, the cap is the guard on cost.
 HOOK_LIMIT_PER_TRIGGER = 30
 HOOK_LIMIT_WINDOW_S = 60.0
+#: A chat run's prompt when the turn began without one the door heard: the
+#: agent carrying on by itself, or a prompt sent before the door was listening.
+CHAT_NO_PROMPT = "(a turn the door heard begin without a prompt)"
+#: The most steps the door may send for one turn; the store keeps `MAX_STEPS`.
+CHAT_MAX_STEPS_SENT = 2_000
 #: The browser behind a sign-in request, as the web app's server says. Only
 #: believed on the operator's token holding `auth:relay`: from anyone else it
 #: would be a way to pick a fresh bucket for every request.
@@ -6085,6 +6091,84 @@ def create_app(
             box = _routable_box(store, token, box_id)
             store.add_client_conversation(box.id, session_id)
             return {"id": session_id}
+        finally:
+            store.close()
+
+    # -- a conversation's turns, as runs (M14.6) ----------------------------
+    #
+    # The door is the one process that sees every frame of a person's
+    # conversation, so it records each turn as a `chat` run: opened when the
+    # agent starts answering, ended with its steps when it has answered. Both
+    # with the door's `fleet:route` token, and both best effort on the door's
+    # side (`flotta.door.turns`), so a slow control plane costs a conversation
+    # nothing. A run per turn, not per conversation: see `door/turns.py`.
+
+    @app.post("/api/boxes/{box_id}/chat-runs", status_code=201)
+    def open_chat_run(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
+    ) -> Any:
+        """`{prompt, session_id, by, client}`: a turn began. 409 while the agent
+        is doing another run, and the turn is then not recorded: its model
+        calls belong to that run (`FleetStore._run_for_call`)."""
+        session_id, by = body.get("session_id"), body.get("by")
+        for name, value in (("session_id", session_id), ("by", by)):
+            if not isinstance(value, str) or not 0 < len(value) <= 200:
+                raise HTTPException(
+                    status_code=422, detail=f"{name} is a name of 1 to 200 characters"
+                )
+        prompt = body.get("prompt")
+        prompt = prompt if isinstance(prompt, str) and prompt.strip() else CHAT_NO_PROMPT
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            try:
+                run = store.open_chat_run(
+                    box.id,
+                    prompt,
+                    input={"session_id": session_id, "by": by, "client": bool(body.get("client"))},
+                )
+            except BoxBusyError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}") from exc
+            store.add_event("task", run.id, "created", {"trigger": "chat", "by": by})
+            return {"id": run.id, "status": run.status}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/runs/{run_id}/steps")
+    def finish_chat_run(
+        box_id: str, run_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
+    ) -> Any:
+        """`{steps, status, output?, error_class?, approvals?}`: the turn ended,
+        `done` or `failed`. Only a chat run of this box, still running."""
+        steps = body.get("steps") or []
+        status = body.get("status")
+        if not isinstance(steps, list) or not all(isinstance(x, dict) for x in steps):
+            raise HTTPException(status_code=422, detail="steps is a list of objects")
+        if status not in ("done", "failed"):
+            raise HTTPException(status_code=422, detail="a turn ends done or failed")
+        output, error_class = body.get("output"), body.get("error_class")
+        approvals = body.get("approvals")
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            try:
+                run = store.finish_chat_run(
+                    run_id,
+                    box.id,
+                    status,
+                    output=output if isinstance(output, str) else None,
+                    steps=steps[:CHAT_MAX_STEPS_SENT],
+                    approval_count=approvals if isinstance(approvals, int) else None,
+                    error_class=str(error_class)[:80] if error_class else None,
+                )
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no chat run {run_id!r}") from exc
+            except InvalidTransitionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event("task", run.id, status, {"trigger": "chat"})
+            return {"id": run.id, "status": run.status}
         finally:
             store.close()
 

@@ -69,7 +69,14 @@ from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, AuthError, scopes_for_role
 from flotta.github import Person
 from flotta.inference import InvalidModel, validate_model
 from flotta.pricing import EurRate, Price, cost_nano, to_eur_nano
-from flotta.runs import MAX_OUTPUT, cap_steps, check_input_size, check_trigger_kind, clip_text
+from flotta.runs import (
+    MAX_CHAT_PROMPT,
+    MAX_OUTPUT,
+    cap_steps,
+    check_input_size,
+    check_trigger_kind,
+    clip_text,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -4288,6 +4295,85 @@ class FleetStore:
                 ),
             )
         return self._get_run_or_raise(run_id)
+
+    def open_chat_run(
+        self,
+        box_id: str,
+        prompt: str,
+        *,
+        input: Any = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """A person's turn in a conversation, as a run already `running` (M14.6).
+
+        Made and started in one guarded transaction: a `chat` run is never
+        `pending`, so the run loop never sees one to deliver, and a box doing
+        another run refuses it with `BoxBusyError`, as `start_run` would. That
+        keeps a model call to one run (`_run_for_call`), and is why the door
+        records a turn only when nothing else is going on that agent.
+        """
+        encoded = None if input is None else json.dumps(input)
+        if encoded is not None:
+            check_input_size(encoded)
+        rid = f"t-{uuid.uuid4().hex[:12]}"
+        moment = _instant(now) if now else _utcnow()
+        with self._conn.transaction(guard="tasks"):
+            box = self._get_box_or_raise(box_id)
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            busy = self._conn.execute(
+                "SELECT id FROM tasks WHERE box_id = ? AND status = 'running'", (box.id,)
+            ).fetchone()
+            if busy is not None:
+                raise BoxBusyError(box.id, busy["id"])
+            self._conn.execute(
+                "INSERT INTO tasks (id, box_id, prompt, status, created_at, started_at, org_id, "
+                "client_id, trigger_kind, input_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rid,
+                    box.id,
+                    clip_text(prompt, MAX_CHAT_PROMPT),
+                    "running",
+                    moment,
+                    moment,
+                    box.org,
+                    box.client,
+                    "chat",
+                    encoded,
+                ),
+            )
+        return self._get_run_or_raise(rid)
+
+    def finish_chat_run(
+        self,
+        run_id: str,
+        box_id: str,
+        status: str,
+        *,
+        output: str | None = None,
+        steps: list[dict[str, Any]] | None = None,
+        approval_count: int | None = None,
+        error_class: str | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """End `box_id`'s chat run `run_id` with its steps (M14.6).
+
+        Only a `chat` run of that box, still `running`: the door names the box
+        whose socket it heard, and a run of any other box, or one the control
+        plane delivers, is `UnknownEntityError` to it.
+        """
+        run = self.get_run(run_id)
+        if run is None or run.box_id != box_id or run.trigger_kind != "chat":
+            raise UnknownEntityError(f"no chat run {run_id!r} on box {box_id!r}")
+        return self.finish_run(
+            run_id,
+            status,
+            output=output,
+            steps=steps,
+            approval_count=approval_count,
+            error_class=error_class,
+            now=now,
+        )
 
     def get_run(self, run_id: str) -> Run | None:
         row = self._conn.execute(

@@ -171,6 +171,18 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/wake", SCOPE_BOX_CHAT, None),
     ("GET", "/api/boxes/{b}/client-conversations", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/client-conversations", SCOPE_FLEET_ROUTE, {"session_id": "s"}),
+    (
+        "POST",
+        "/api/boxes/{b}/chat-runs",
+        SCOPE_FLEET_ROUTE,
+        {"prompt": "Mine now.", "session_id": "s", "by": "user:u-1"},
+    ),
+    (
+        "POST",
+        "/api/boxes/{b}/runs/t-000000000000/steps",
+        SCOPE_FLEET_ROUTE,
+        {"steps": [], "status": "done"},
+    ),
     ("POST", "/api/boxes/{b}/sleep", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/unpause", SCOPE_ORG_ADMIN, None),
     ("POST", "/api/boxes/{b}/ticket", SCOPE_BOX_CHAT, None),
@@ -206,7 +218,12 @@ def test_every_box_route_is_here(api):
         for method in route.methods
     }
     listed = {
-        (method, path.replace("/acme/secrets", "/{owner}/{name}").replace("/eng-a", "/{peer}"))
+        (
+            method,
+            path.replace("/acme/secrets", "/{owner}/{name}")
+            .replace("/eng-a", "/{peer}")
+            .replace("/t-000000000000", "/{run_id}"),
+        )
         for method, path, _, _ in BOX_ROUTES
     }
     assert served == listed

@@ -460,3 +460,66 @@ def test_an_answer_carried_to_the_box_stands(agency):
     agency.expire_approvals(approval.run_id, now=T0)
 
     assert agency.get_approval(approval.id).status == "answered"
+
+
+# -- a conversation's turns (FLOTTA-151) ---------------------------------------
+
+
+def _chat(store, box="b-one", at=T0):
+    return store.open_chat_run(
+        box, "What changed?", input={"session_id": "s-1", "by": "user:u-1"}, now=at
+    )
+
+
+def test_a_turn_is_running_from_the_start_and_never_waits_to_be_delivered(agency):
+    """The guard for the run loop: a `chat` run is never `pending`, so nothing
+    delivers it a second time."""
+    run = _chat(agency)
+
+    assert (run.status, run.trigger_kind, run.started_at) == ("running", "chat", T0.isoformat())
+    assert [r.id for r in agency.list_runs(org="studio-nord") if r.status == "pending"] == []
+
+
+def test_a_turn_and_a_run_do_not_overlap_on_one_agent(agency):
+    """One run at a time, so a model call belongs to one: a turn is refused
+    while a run goes on, and a waiting run starts only once the turn is done."""
+    delivered = _started(agency, at=T0)
+    with pytest.raises(BoxBusyError):
+        _chat(agency, at=T0 + timedelta(seconds=1))
+    agency.finish_run(delivered.id, "done", output="Done.", now=T0 + timedelta(minutes=1))
+
+    turn = _chat(agency, at=T0 + timedelta(minutes=2))
+    waiting = _run(agency)
+    with pytest.raises(BoxBusyError):
+        agency.start_run(waiting.id)
+    agency.finish_chat_run(turn.id, "b-one", "done", output="Nothing.")
+    assert agency.start_run(waiting.id).status == "running"
+
+
+def test_a_turns_cost_is_the_calls_made_during_it(agency):
+    turn = _chat(agency, at=T0)
+    _call(agency, "b-one", "during", now=T0 + timedelta(seconds=20))
+    agency.finish_chat_run(
+        turn.id, "b-one", "done", output="Nothing.", now=T0 + timedelta(seconds=30)
+    )
+    _call(agency, "b-one", "next-turn-unrecorded", now=T0 + timedelta(minutes=5))
+
+    assert agency.run_cost(turn.id).calls == 1
+
+
+def test_a_turn_is_ended_only_on_its_own_agent(agency):
+    """The guard: the door names the box whose socket it heard, and a run of
+    another box, or one the control plane delivers, is not that box's turn."""
+    turn = _chat(agency, "b-one")
+    delivered = _started(agency, "b-two")
+
+    with pytest.raises(UnknownEntityError):
+        agency.finish_chat_run(turn.id, "b-two", "done", output="Mine now.")
+    with pytest.raises(UnknownEntityError):
+        agency.finish_chat_run(delivered.id, "b-two", "done", output="Mine now.")
+
+    assert agency.get_run(turn.id).status == "running"
+    assert agency.get_run(delivered.id).status == "running"
+    steps = [{"kind": "tool", "name": "terminal"}]
+    ended = agency.finish_chat_run(turn.id, "b-one", "done", output="Nothing.", steps=steps)
+    assert ended.status == "done" and ended.steps["steps"][0]["name"] == "terminal"
