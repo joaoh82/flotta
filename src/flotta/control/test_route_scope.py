@@ -59,8 +59,14 @@ SCOPE_FUNCTIONS: frozenset[str] = frozenset(
         "_occupant",  # fleet-wide on purpose (a machine is held or not); names scoped
         "_scoped_run",  # one run, if the token's tenant may act on its box
         "_scoped_trigger",  # one trigger, likewise
+        "_hooked_trigger",  # a webhook, if the caller proves its secret (below)
     }
 )
+
+#: Scope functions whose credential is a secret, not a token: a webhook's caller
+#: is a client's CRM, holding the trigger's secret (M14.4, `flotta.hooks`). Each
+#: must call `authenticated`, as the others must take a `Token`.
+SECRET_SCOPE_FUNCTIONS = frozenset({"_hooked_trigger"})
 
 #: Routes that act on the whole fleet and are the operator's alone. Each must
 #: open with `_require_operator(<principal>)`; after that it may read anything.
@@ -94,7 +100,11 @@ CONFIG_READS = frozenset({"list_models", "list_mcp_servers"})
 #: The sign-in and sign-up routes are how a person without a credential gets one.
 #: An MCP server's OAuth callback is a provider's redirect: its signed state is
 #: the proof, and what it leaves is claimed by its starter (`mcp_oauth`).
-OPEN_ROUTES = frozenset({"health", "request_link", "redeem_link", "sign_up", "mcp_oauth_callback"})
+#: A webhook (M14.4) is called by a client's system holding the trigger's
+#: secret, not a token; it reaches a trigger only through `_hooked_trigger`.
+OPEN_ROUTES = frozenset(
+    {"health", "request_link", "redeem_link", "sign_up", "mcp_oauth_callback", "receive_hook"}
+)
 
 #: The routes not yet scoped. May only shrink — and is empty since M11.6b.
 UNSCOPED_ROUTES: frozenset[str] = frozenset()
@@ -339,7 +349,15 @@ def test_the_unscoped_allowlist_names_real_routes():
     assert not SCOPE_FUNCTIONS - functions.keys(), (
         f"not functions: {sorted(SCOPE_FUNCTIONS - functions.keys())}"
     )
-    for name in SCOPE_FUNCTIONS:
+    assert SECRET_SCOPE_FUNCTIONS <= SCOPE_FUNCTIONS
+    for name in SECRET_SCOPE_FUNCTIONS:
+        called = {
+            n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+            for n in ast.walk(functions[name])
+            if isinstance(n, ast.Call)
+        }
+        assert "authenticated" in called, f"{name} checks no secret"
+    for name in SCOPE_FUNCTIONS - SECRET_SCOPE_FUNCTIONS:
         annotations = [ast.unparse(a.annotation) for a in functions[name].args.args if a.annotation]
         # Not proof the check is right — its own tests are — but a scope
         # function that is never handed a token cannot be making one.

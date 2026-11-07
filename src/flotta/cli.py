@@ -1158,13 +1158,19 @@ def runs(
 
 trigger_app = typer.Typer(
     name="trigger",
-    help="What starts an agent's runs on its own: schedules.",
+    help="What starts an agent's runs on its own: schedules and webhooks.",
     no_args_is_help=True,
 )
 app.add_typer(trigger_app)
 
 
 def _trigger_line(trigger: dict[str, Any]) -> str:
+    if trigger.get("kind") == "webhook":
+        state = "on" if trigger.get("enabled") else "off"
+        return (
+            f"{trigger.get('id')}  webhook  {state}  {trigger.get('url')}  "
+            f"{truncate(trigger.get('prompt'), 50)}"
+        )
     upcoming = (trigger.get("next") or ["off"])[0] if trigger.get("enabled") else "off"
     return (
         f"{trigger.get('id')}  {trigger.get('cron')}  {trigger.get('tz')}  next {upcoming}  "
@@ -1186,17 +1192,50 @@ def _through_control(method: str, path: str, scope: str, body: dict | None = Non
 @trigger_app.command("add")
 def trigger_add(
     box: str = typer.Argument(..., help="The agent, by name or id"),
-    cron: str = typer.Option(..., "--cron", help='Five cron fields, e.g. "0 8 * * 1-5"'),
+    cron: str | None = typer.Option(None, "--cron", help='Five cron fields, e.g. "0 8 * * 1-5"'),
     tz: str = typer.Option("UTC", "--tz", help="IANA time zone the times are in"),
-    prompt: str = typer.Option(..., "--prompt", help="What the agent is to do each time"),
+    webhook: bool = typer.Option(False, "--webhook", help="Run when a webhook is called instead"),
+    prompt: str = typer.Option(
+        ..., "--prompt", help="What the agent is to do; a webhook's may use {{body.path}}"
+    ),
     as_json: bool = JsonOpt,
 ) -> None:
-    """Run an agent on a schedule. At most every 5 minutes."""
+    """Run an agent on a schedule (at most every 5 minutes), or when its webhook
+    is called. A webhook's URL and secret are printed this once."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
-    body = {"cron": cron, "tz": tz, "prompt": prompt}
+    if webhook == bool(cron):
+        typer.secho("give --cron for a schedule, or --webhook", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    body: dict[str, Any] = (
+        {"kind": "webhook", "prompt": prompt}
+        if webhook
+        else {"cron": cron, "tz": tz, "prompt": prompt}
+    )
     found = _through_control("POST", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_WRITE, body)
-    emit(found, _trigger_line(found), as_json=as_json)
+    text = _trigger_line(found)
+    if webhook:
+        text += (
+            f"\n\nurl     {found.get('url')}\nsecret  {found.get('secret')}\n\n"
+            "The secret is shown this once: put it in the system that calls the webhook, as\n"
+            "`Authorization: Bearer <secret>`, Basic auth's password, or the key that signs\n"
+            "`Flotta-Signature`. `flotta trigger secret` makes a new one."
+        )
+    emit(found, text, as_json=as_json)
+
+
+@trigger_app.command("secret")
+def trigger_secret_cmd(
+    trigger_id: str = typer.Argument(..., help="The webhook's id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """A webhook's new secret, printed this once. The old one stops at once."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    found = _through_control(
+        "POST", f"/api/triggers/{_quoted(trigger_id)}/secret", SCOPE_FLEET_WRITE
+    )
+    emit(found, f"secret  {found.get('secret')}", as_json=as_json)
 
 
 @trigger_app.command("ls")
@@ -1204,21 +1243,94 @@ def trigger_ls(
     box: str = typer.Argument(..., help="The agent, by name or id"),
     as_json: bool = JsonOpt,
 ) -> None:
-    """An agent's schedules, with when each fires next."""
+    """An agent's triggers: schedules with when each fires next, and webhooks."""
     from flotta.auth import SCOPE_FLEET_READ
 
     found = _through_control("GET", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_READ)
-    lines = [_trigger_line(t) for t in found["triggers"]] or ["no schedules"]
+    lines = [_trigger_line(t) for t in found["triggers"]] or ["no triggers"]
     emit(found, "\n".join(lines), as_json=as_json)
 
 
 @trigger_app.command("rm")
 def trigger_rm(trigger_id: str = typer.Argument(..., help="The trigger's id")) -> None:
-    """Remove a schedule. The runs it made stay."""
+    """Remove a trigger. The runs it made stay."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
     _through_control("DELETE", f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_WRITE)
     typer.echo(f"removed {trigger_id}")
+
+
+hook_app = typer.Typer(
+    name="hook", help="Call a webhook trigger, to try one.", no_args_is_help=True
+)
+app.add_typer(hook_app)
+
+#: Where `flotta hook send` finds the webhook's secret when `--secret` is not given.
+HOOK_SECRET_ENV = "FLOTTA_HOOK_SECRET"
+
+
+@hook_app.command("send")
+def hook_send(
+    trigger_id: str = typer.Argument(..., help="The webhook's id"),
+    body: str = typer.Argument(..., help='The JSON to send, e.g. \'{"title": "New lead"}\''),
+    secret: str | None = typer.Option(
+        None, "--secret", help=f"The webhook's secret (default: ${HOOK_SECRET_ENV})"
+    ),
+    wait: int = typer.Option(0, "--wait", help="Seconds to hold for the run's output, at most 30"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Call a webhook as a client's system would, signed with `Flotta-Signature`.
+
+    Sent to `$FLOTTA_CONTROL_URL/hooks/<id>`. Prints the run it started.
+    """
+    import urllib.error
+    import urllib.request
+
+    from flotta.alerts import SIGNATURE_HEADER, sign
+
+    key = secret or os.environ.get(HOOK_SECRET_ENV)
+    if not key:
+        typer.secho(
+            f"no secret: pass --secret, or set ${HOOK_SECRET_ENV} to what "
+            "`flotta trigger add --webhook` printed",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        json.loads(body)
+    except ValueError as exc:
+        typer.secho(f"the body is not JSON: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    base = control_url()
+    if not base:
+        raise _fail(ControlPlaneError(f"webhooks are on the control plane: set ${CONTROL_URL_ENV}"))
+    raw = body.encode()
+    query = f"?wait={wait}" if wait else ""
+    request = urllib.request.Request(
+        f"{base.rstrip('/')}/hooks/{_quoted(trigger_id)}{query}",
+        data=raw,
+        headers={
+            "Content-Type": "application/json",
+            SIGNATURE_HEADER: sign(key, int(time.time()), raw),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=wait + 30) as response:
+            answer = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = json.loads(exc.read().decode()).get("detail", "")
+        typer.secho(f"{exc.code}: {detail or exc.reason}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    except urllib.error.URLError as exc:
+        raise _fail(ControlPlaneError(f"cannot reach {base}: {exc.reason}")) from exc
+    line = f"{answer.get('run_id')}  {answer.get('status')}"
+    if answer.get("output"):
+        line += f"\n{answer['output']}"
+    emit(answer, line, as_json=as_json)
 
 
 @app.command()

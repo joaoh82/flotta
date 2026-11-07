@@ -510,6 +510,19 @@ def webhook_secret(signing_key: str | None, org: str, nonce: str) -> str:
     return _sign(f"{WEBHOOK_SECRET_DOMAIN}{org}:{nonce}", signing_key or "")
 
 
+#: So a trigger's secret is never an org's webhook secret, or anything else.
+TRIGGER_SECRET_DOMAIN = "flotta-trigger-secret:"
+
+
+def trigger_secret(signing_key: str | None, trigger_id: str, nonce: str) -> str:
+    """The secret a webhook trigger is called with (M14.4, `flotta.hooks`).
+
+    Derived like `webhook_secret`, so the store holds the nonce and no secret.
+    A new nonce is a new secret, and the old one stops working at once.
+    """
+    return _sign(f"{TRIGGER_SECRET_DOMAIN}{trigger_id}:{nonce}", signing_key or "")
+
+
 #: Prefixed to a box id before it is signed, so a box's password is never the
 #: signature some other use of the fleet's password would produce.
 BOX_PASSWORD_DOMAIN = "flotta-box-password:"

@@ -517,9 +517,19 @@ trigger-add box cron tz prompt:
 trigger-ls box:
     uv run flotta trigger ls {{box}}
 
-# M14.3: remove a schedule (the runs it made stay)
+# M14.3: remove a trigger (the runs it made stay)
 trigger-rm id:
     uv run flotta trigger rm {{id}}
+
+# `just trigger-add-webhook eng-a "Qualify the lead {{body.title}}."`
+# M14.4: run an agent when its webhook is called; prints the URL and secret once
+trigger-add-webhook box prompt:
+    uv run flotta trigger add {{box}} --webhook --prompt {{quote(prompt)}}
+
+# `FLOTTA_HOOK_SECRET=… just hook-send tr-… '{"title":"New lead"}'`
+# M14.4: call a webhook as a client's system would, signed, and wait for the run
+hook-send trigger body:
+    uv run flotta hook send {{trigger}} {{quote(body)}} --wait 30
 
 # Prints each alert it gets and whether its signature checks. `secret` is what
 # setting the webhook answered with: see docs/ALERTS.md.

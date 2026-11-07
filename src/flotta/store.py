@@ -800,15 +800,17 @@ class RunApproval:
 
 @dataclass(frozen=True, slots=True)
 class Trigger:
-    """What starts an agent's run on its own (FLOTTA-148): for now, a schedule."""
+    """What starts an agent's run on its own: a schedule (FLOTTA-148) or a
+    webhook (FLOTTA-149). A webhook's secret is not here: it is derived from
+    a nonce the store keeps and never returns with the trigger."""
 
     id: str
     org: str
     client: str
     box_id: str
-    #: `schedule`; `webhook` comes with M14.4.
+    #: `schedule` or `webhook`.
     kind: str
-    #: Five cron fields, read in `tz` (`flotta.schedules`).
+    #: Five cron fields, read in `tz` (`flotta.schedules`). None on a webhook.
     cron: str | None
     tz: str | None
     prompt: str
@@ -4389,21 +4391,33 @@ class FleetStore:
         self,
         box_id: str,
         *,
-        cron: str,
-        tz: str,
         prompt: str,
         created_by: str | None,
+        kind: str = "schedule",
+        cron: str | None = None,
+        tz: str | None = None,
         enabled: bool = True,
         now: datetime | None = None,
     ) -> Trigger:
-        """A schedule on `box_id`: `cron` read in `tz`, delivering `prompt`.
+        """A trigger on `box_id` that delivers `prompt`: a schedule, `cron`
+        read in `tz`, or a webhook, which has neither.
 
-        Checked here, where every caller meets it (`flotta.schedules.check`):
-        five fields, a real zone, and not more often than every five minutes.
+        A schedule is checked here, where every caller meets it
+        (`flotta.schedules.check`): five fields, a real zone, and not more
+        often than every five minutes. A webhook gets the nonce its secret is
+        derived from (`auth.trigger_secret`, `trigger_nonce`).
         """
         from flotta.schedules import check
 
-        cron = check(cron, tz).expr
+        nonce = None
+        if kind == "schedule":
+            cron = check(cron or "", tz or "").expr
+        elif kind == "webhook":
+            if cron or tz:
+                raise ValueError("a webhook has no cron or time zone: it runs when it is called")
+            cron, tz, nonce = None, None, secrets.token_hex(16)
+        else:
+            raise ValueError(f"a trigger is a schedule or a webhook, not {kind!r}")
         prompt = _trigger_prompt(prompt)
         trigger_id = f"tr-{uuid.uuid4().hex[:12]}"
         with self._conn.transaction(guard="triggers"):
@@ -4412,16 +4426,18 @@ class FleetStore:
                 raise UnknownEntityError(f"box {box_id!r} has been destroyed")
             self._conn.execute(
                 "INSERT INTO triggers (id, org_id, client_id, box_id, kind, cron, tz, prompt, "
-                "enabled, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, 'schedule', ?, ?, ?, ?, ?, ?)",
+                "secret_nonce, enabled, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     trigger_id,
                     box.org,
                     box.client,
                     box.id,
+                    kind,
                     cron,
                     tz,
                     prompt,
+                    nonce,
                     1 if enabled else 0,
                     created_by,
                     _instant(now) if now else _utcnow(),
@@ -4439,14 +4455,20 @@ class FleetStore:
         enabled: bool | None = None,
         now: datetime | None = None,
     ) -> Trigger:
-        """Change a schedule. Turned back on, it fires from now: what it missed
-        while off is not owed."""
+        """Change a trigger. A schedule turned back on fires from now: what it
+        missed while off is not owed. A webhook has only its prompt and
+        whether it is on; its secret changes with `rotate_trigger_secret`."""
         from flotta.schedules import check
 
         with self._conn.transaction(guard="triggers"):
             current = self._get_trigger_or_raise(trigger_id)
-            new_cron = check(cron or current.cron or "", tz or current.tz or "").expr
-            new_tz = tz or current.tz
+            if current.kind == "webhook":
+                if cron or tz:
+                    raise ValueError("a webhook has no cron or time zone to change")
+                new_cron, new_tz = None, None
+            else:
+                new_cron = check(cron or current.cron or "", tz or current.tz or "").expr
+                new_tz = tz or current.tz
             new_prompt = _trigger_prompt(prompt) if prompt is not None else current.prompt
             new_enabled = current.enabled if enabled is None else enabled
             last = current.last_fired_at
@@ -4465,6 +4487,30 @@ class FleetStore:
             self._get_trigger_or_raise(trigger_id)
             self._conn.execute("DELETE FROM trigger_fires WHERE trigger_id = ?", (trigger_id,))
             self._conn.execute("DELETE FROM triggers WHERE id = ?", (trigger_id,))
+
+    def trigger_nonce(self, trigger_id: str) -> str | None:
+        """What a webhook's secret is derived from (`auth.trigger_secret`).
+
+        Not on `Trigger`, so no view of one can carry it by accident. Alone it
+        is not the secret: that also takes the signing key, which the store
+        does not hold.
+        """
+        row = self._conn.execute(
+            "SELECT secret_nonce FROM triggers WHERE id = ?", (trigger_id,)
+        ).fetchone()
+        return row["secret_nonce"] if row else None
+
+    def rotate_trigger_secret(self, trigger_id: str) -> str:
+        """A new nonce for a webhook, so a new secret. The old one stops at once."""
+        nonce = secrets.token_hex(16)
+        with self._conn.transaction(guard="triggers"):
+            trigger = self._get_trigger_or_raise(trigger_id)
+            if trigger.kind != "webhook":
+                raise ValueError("only a webhook has a secret")
+            self._conn.execute(
+                "UPDATE triggers SET secret_nonce = ? WHERE id = ?", (nonce, trigger_id)
+            )
+        return nonce
 
     def disable_triggers(self, box_id: str) -> None:
         """A destroyed agent's triggers stop.
@@ -4518,52 +4564,116 @@ class FleetStore:
         at = _instant(fire_at)
         with self._conn.transaction(guard="triggers"):
             trigger = self._get_trigger_or_raise(trigger_id)
-            if not trigger.enabled or self._fired(trigger_id, at):
+            if trigger.kind != "schedule" or not trigger.enabled or self._fired(trigger_id, at):
                 return None
-            box = self._get_box_or_raise(trigger.box_id)
-            if box.status in BOX_TERMINAL:
-                return None
-            waiting = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM tasks WHERE box_id = ? AND status = 'pending' "
-                "AND trigger_kind IS NOT NULL",
-                (box.id,),
-            ).fetchone()["n"]
-            run_id = f"t-{uuid.uuid4().hex[:12]}"
-            full = waiting >= TRIGGER_QUEUE_CAP
-            self._conn.execute(
-                "INSERT INTO tasks (id, box_id, prompt, status, created_at, finished_at, org_id, "
-                "client_id, trigger_kind, trigger_id, input_json, error_class) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'schedule', ?, ?, ?)",
-                (
-                    run_id,
-                    box.id,
-                    trigger.prompt,
-                    "cancelled" if full else "pending",
-                    moment,
-                    moment if full else None,
-                    box.org,
-                    box.client,
-                    trigger.id,
-                    json.dumps({"scheduled_for": at, "cron": trigger.cron, "tz": trigger.tz}),
-                    "queue_full" if full else None,
-                ),
+            made = self._queue_triggered_run(
+                trigger,
+                prompt=trigger.prompt,
+                input={"scheduled_for": at, "cron": trigger.cron, "tz": trigger.tz},
+                moment=moment,
             )
+            if made is None:
+                return None
             self._conn.execute(
                 "INSERT INTO trigger_fires (trigger_id, fire_at, run_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
-                (trigger_id, at, run_id, moment),
+                (trigger_id, at, made, moment),
             )
             self._conn.execute(
                 "UPDATE triggers SET last_fired_at = ? WHERE id = ?", (at, trigger_id)
             )
-        if full:
+        return self._dropped_or_run(made, trigger)
+
+    def fire_webhook(
+        self, trigger_id: str, *, prompt: str, input: Any, now: datetime | None = None
+    ) -> Run | None:
+        """A webhook was called: its run, or None if the trigger is off or its
+        agent destroyed (the caller answers that as an unknown trigger).
+
+        Under the lock every change to a trigger takes, like `fire_trigger`,
+        so a webhook called while its agent is torn down either makes a run
+        teardown then closes, or finds the trigger off. The same queue cap: an
+        agent with `TRIGGER_QUEUE_CAP` runs waiting gets this one `cancelled`
+        as `queue_full`, with an event. `prompt` is what `hooks.prompt_for`
+        made of the body, and `input` what `hooks.run_input` kept of it.
+        """
+        encoded = json.dumps(input)
+        check_input_size(encoded)
+        moment = _instant(now) if now else _utcnow()
+        with self._conn.transaction(guard="triggers"):
+            trigger = self._get_trigger_or_raise(trigger_id)
+            if trigger.kind != "webhook" or not trigger.enabled:
+                return None
+            made = self._queue_triggered_run(trigger, prompt=prompt, input=input, moment=moment)
+            if made is None:
+                return None
+            self._conn.execute(
+                "UPDATE triggers SET last_fired_at = ? WHERE id = ?", (moment, trigger_id)
+            )
+        return self._dropped_or_run(made, trigger)
+
+    def trigger_run(self, trigger_id: str, run_id: str) -> Run | None:
+        """`run_id`, if `trigger_id` made it: a webhook's caller reads back the
+        run its own call made (`?wait=`), and no other."""
+        run = self.get_run(run_id)
+        return run if run is not None and run.trigger_id == trigger_id else None
+
+    def _queue_triggered_run(
+        self, trigger: Trigger, *, prompt: str, input: Any, moment: str
+    ) -> str | None:
+        """Insert `trigger`'s run: `pending`, or `cancelled` as `queue_full`
+        when its agent has `TRIGGER_QUEUE_CAP` waiting. None if the agent is
+        destroyed. In the caller's transaction, under the `triggers` lock."""
+        box = self._get_box_or_raise(trigger.box_id)
+        if box.status in BOX_TERMINAL:
+            return None
+        waiting = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE box_id = ? AND status = 'pending' "
+            "AND trigger_kind IS NOT NULL",
+            (box.id,),
+        ).fetchone()["n"]
+        run_id = f"t-{uuid.uuid4().hex[:12]}"
+        full = waiting >= TRIGGER_QUEUE_CAP
+        self._conn.execute(
+            "INSERT INTO tasks (id, box_id, prompt, status, created_at, finished_at, org_id, "
+            "client_id, trigger_kind, trigger_id, input_json, error_class) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                box.id,
+                prompt,
+                "cancelled" if full else "pending",
+                moment,
+                moment if full else None,
+                box.org,
+                box.client,
+                trigger.kind,
+                trigger.id,
+                json.dumps(input),
+                "queue_full" if full else None,
+            ),
+        )
+        return run_id
+
+    def _dropped_or_run(self, run_id: str, trigger: Trigger) -> Run:
+        """The run `_queue_triggered_run` made, with an event if it was dropped."""
+        run = self._get_run_or_raise(run_id)
+        if run.error_class == "queue_full":
             self.add_event(
                 "box",
-                box.id,
-                "schedule_dropped",
-                {"trigger": trigger_id, "fire_at": at, "run": run_id, "waiting": waiting},
+                trigger.box_id,
+                "schedule_dropped" if trigger.kind == "schedule" else "webhook_dropped",
+                {
+                    "trigger": trigger.id,
+                    "run": run_id,
+                    **(
+                        {"fire_at": run.input.get("scheduled_for")}
+                        if trigger.kind == "schedule"
+                        else {}
+                    ),
+                },
             )
-        return self._get_run_or_raise(run_id)
+        return run
 
     def skip_fire(self, trigger_id: str, fire_at: datetime, *, now: datetime | None = None) -> None:
         """Record `fire_at` as missed, too late to run (`schedules.MISSED_WINDOW`)."""
