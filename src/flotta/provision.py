@@ -1855,9 +1855,7 @@ def _reload_mcp(
     if box.status != "running" or not box.endpoint:
         return None
     try:
-        result = _resolve_backend(box, backend).exec(
-            box.endpoint, _mcp_reload_command(wait=wait)
-        )
+        result = _resolve_backend(box, backend).exec(box.endpoint, _mcp_reload_command(wait=wait))
     except NotSupported:
         # A substrate with no shell, like `just local`'s stand-in: it has no Hermes
         # to reload, so nothing was asked, rather than a reload that failed.
