@@ -264,3 +264,102 @@ def test_a_paused_agents_schedule_never_wakes_it(target):  # noqa: F811
         "budget_blocked",
         "paused",
     )
+
+
+# -- webhooks (M14.4) ----------------------------------------------------------
+
+
+def _webhook(store, box="b-one"):
+    return store.create_trigger(
+        box, kind="webhook", prompt="Qualify {{body.title}}.", created_by="user:ada"
+    )
+
+
+def _call(store, trigger, body=None):
+    return store.fire_webhook(
+        trigger.id, prompt=f"Qualify {body!r}.", input={"body": body or {}}, now=FRI
+    )
+
+
+def test_a_webhook_call_makes_a_run_on_its_agent(agency):
+    trigger = _webhook(agency, box="b-three")
+
+    run = _call(agency, trigger, {"title": "New lead"})
+
+    assert (trigger.kind, trigger.cron, trigger.tz) == ("webhook", None, None)
+    assert (run.trigger_kind, run.trigger_id, run.status) == ("webhook", trigger.id, "pending")
+    assert (run.org, run.client, run.box_id) == ("studio-nord", "bravo", "b-three")
+    assert run.input == {"body": {"title": "New lead"}}
+    assert agency.trigger_run(trigger.id, run.id) == run
+
+
+def test_a_webhook_has_a_nonce_and_a_schedule_has_none(agency):
+    hook, schedule = _webhook(agency), _schedule(agency)
+
+    assert agency.trigger_nonce(hook.id)
+    assert agency.trigger_nonce(schedule.id) is None
+    assert "secret_nonce" not in hook.__dataclass_fields__
+
+
+def test_a_webhooks_secret_changes_and_a_schedule_has_none_to_change(agency):
+    hook, schedule = _webhook(agency), _schedule(agency)
+    before = agency.trigger_nonce(hook.id)
+
+    after = agency.rotate_trigger_secret(hook.id)
+
+    assert after != before and agency.trigger_nonce(hook.id) == after
+    with pytest.raises(ValueError, match="only a webhook"):
+        agency.rotate_trigger_secret(schedule.id)
+
+
+def test_a_webhook_that_is_off_makes_nothing(agency):
+    trigger = _webhook(agency)
+    agency.update_trigger(trigger.id, enabled=False)
+
+    assert _call(agency, trigger) is None
+    assert _runs(agency) == []
+
+
+def test_a_webhook_on_a_destroyed_agent_makes_nothing(agency):
+    trigger = _webhook(agency)
+
+    provision.teardown_box("b-one", store=agency)
+
+    assert _call(agency, trigger) is None
+
+
+def test_a_webhook_called_faster_than_its_agent_works_is_capped(agency):
+    trigger = _webhook(agency)
+
+    runs = [_call(agency, trigger, {"n": n}) for n in range(4)]
+
+    assert [r.status for r in runs] == ["pending", "pending", "pending", "cancelled"]
+    assert runs[-1].error_class == "queue_full"
+    assert any(e.type == "webhook_dropped" for e in agency.get_events("box", "b-one"))
+
+
+def test_a_webhook_and_a_schedule_are_not_each_other(agency):
+    hook, schedule = _webhook(agency), _schedule(agency)
+
+    assert agency.fire_trigger(hook.id, FRI - timedelta(hours=1), now=FRI) is None
+    assert _call(agency, schedule) is None
+    assert agency.enabled_schedules() == [agency.get_trigger(schedule.id)]
+
+
+def test_a_webhook_has_no_cron_to_set(agency):
+    with pytest.raises(ValueError, match="no cron"):
+        agency.create_trigger(
+            "b-one", kind="webhook", cron="0 8 * * *", prompt="x", created_by="user:ada"
+        )
+    trigger = _webhook(agency)
+    with pytest.raises(ValueError, match="no cron"):
+        agency.update_trigger(trigger.id, cron="0 8 * * *")
+    edited = agency.update_trigger(trigger.id, prompt="Now this.")
+    assert (edited.prompt, edited.cron) == ("Now this.", None)
+
+
+def test_another_runs_id_is_not_a_webhooks_to_read_back(agency):
+    trigger = _webhook(agency)
+    other = agency.create_run("b-one", "Something else.", trigger_kind="api")
+
+    assert agency.trigger_run(trigger.id, other.id) is None

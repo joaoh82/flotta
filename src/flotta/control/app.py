@@ -240,6 +240,12 @@ LINK_LIMIT_WINDOW_S = LINK_TTL_S
 #: a pending org sends enough to bring in a small team and no more.
 INVITE_LIMIT_PER_ORG = 20
 INVITE_LIMIT_PER_PENDING_ORG = 3
+#: Calls one webhook trigger may take per minute, counted once a call has
+#: proved it holds the secret: a stranger's calls cannot use up a client's
+#: allowance. Above the queue cap's three waiting runs on purpose; this is a
+#: guard on a caller in a loop, the cap is the guard on cost.
+HOOK_LIMIT_PER_TRIGGER = 30
+HOOK_LIMIT_WINDOW_S = 60.0
 #: The browser behind a sign-in request, as the web app's server says. Only
 #: believed on the operator's token holding `auth:relay`: from anyone else it
 #: would be a way to pick a fresh bucket for every request.
@@ -655,6 +661,7 @@ def create_app(
     per_ip = RateLimit(LINK_LIMIT_PER_IP, LINK_LIMIT_WINDOW_S)
     invites_per_org = RateLimit(INVITE_LIMIT_PER_ORG, LINK_LIMIT_WINDOW_S)
     invites_per_pending_org = RateLimit(INVITE_LIMIT_PER_PENDING_ORG, LINK_LIMIT_WINDOW_S)
+    hooks_per_trigger = RateLimit(HOOK_LIMIT_PER_TRIGGER, HOOK_LIMIT_WINDOW_S)
     proxy_hops = (
         trusted_proxy_hops if trusted_proxy_hops is not None else resolve_trusted_proxy_hops()
     )
@@ -5314,7 +5321,7 @@ def create_app(
 
     # -- triggers (M14.3) ------------------------------------------------------
     #
-    # What starts an agent's runs on its own: for now, schedules. The agency's,
+    # What starts an agent's runs on its own: schedules and webhooks. The agency's,
     # like runs, and a client's own systems' (a client's token with
     # `fleet:write`); a client's people see none. Checked in the store, where
     # every caller meets the same rules (`flotta.schedules.check`).
@@ -5345,21 +5352,45 @@ def create_app(
             now = datetime.now(UTC)
             upcoming = [t.isoformat() for t in schedules.next_fires(cron, trigger.tz, now, 3)]
         view["next"] = upcoming
+        if trigger.kind == "webhook":
+            view["url"] = _hook_url(trigger.id)
+        return view
+
+    def _hook_url(trigger_id: str) -> str:
+        """Where a webhook is called. `$FLOTTA_HOOKS_URL` once `hooks.flotta.dev`
+        points here; until then the control plane's own `$FLOTTA_CONTROL_URL`."""
+        base = (
+            os.environ.get("FLOTTA_HOOKS_URL") or os.environ.get("FLOTTA_CONTROL_URL") or ""
+        ).strip()
+        return f"{base.rstrip('/')}/hooks/{trigger_id}"
+
+    def _with_secret(store: Any, trigger: Any) -> dict[str, Any]:
+        """A webhook's view and its secret: answered once, when it is made or changed."""
+        from flotta.auth import trigger_secret
+
+        view = _trigger_view(trigger)
+        view["secret"] = trigger_secret(key, trigger.id, store.trigger_nonce(trigger.id) or "")
         return view
 
     @app.post("/api/boxes/{box_id}/triggers", status_code=201)
     def create_trigger(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
-        """A schedule on an agent: `{cron, tz, prompt, enabled?}`."""
-        if body.get("kind", "schedule") != "schedule":
-            raise HTTPException(status_code=422, detail="only a schedule can be added yet")
+        """A trigger on an agent: a schedule, `{cron, tz, prompt, enabled?}`, or
+        a webhook, `{kind: "webhook", prompt, enabled?}`.
+
+        **A webhook answers with its `url` and its `secret`, this once.** The
+        secret is not stored and cannot be read again; a new one is
+        `POST /api/triggers/{id}/secret`. `docs/WEBHOOKS.md` says how to call it.
+        """
+        kind = body.get("kind", "schedule")
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
             try:
                 trigger = store.create_trigger(
                     box.id,
-                    cron=str(body.get("cron") or ""),
-                    tz=str(body.get("tz") or "UTC"),
+                    kind=str(kind),
+                    cron=str(body.get("cron") or "") if kind == "schedule" else body.get("cron"),
+                    tz=str(body.get("tz") or "UTC") if kind == "schedule" else body.get("tz"),
                     prompt=body.get("prompt") or "",
                     enabled=bool(body.get("enabled", True)),
                     created_by=token.subject if token else None,
@@ -5368,7 +5399,23 @@ def create_app(
                 raise HTTPException(status_code=404, detail=f"no box {box_id!r}") from exc
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if trigger.kind == "webhook":
+                return _with_secret(store, trigger)
             return _trigger_view(trigger)
+        finally:
+            store.close()
+
+    @app.post("/api/triggers/{trigger_id}/secret")
+    def rotate_trigger_secret(trigger_id: str, token: Token | None = needs_write) -> Any:
+        """A webhook's new secret, answered this once. The old one stops at once."""
+        store = store_factory()
+        try:
+            trigger = _scoped_trigger(store, token, trigger_id)
+            try:
+                store.rotate_trigger_secret(trigger.id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _with_secret(store, trigger)
         finally:
             store.close()
 
@@ -5387,7 +5434,8 @@ def create_app(
     def update_trigger(
         trigger_id: str, body: dict[str, Any], token: Token | None = needs_write
     ) -> Any:
-        """Change a schedule: any of `{cron, tz, prompt, enabled}`."""
+        """Change a trigger: any of `{cron, tz, prompt, enabled}`; a webhook's
+        `{prompt, enabled}`."""
         store = store_factory()
         try:
             trigger = _scoped_trigger(store, token, trigger_id)
@@ -5408,13 +5456,118 @@ def create_app(
 
     @app.delete("/api/triggers/{trigger_id}", status_code=204)
     def delete_trigger(trigger_id: str, token: Token | None = needs_write) -> None:
-        """Remove a schedule. The runs it made stay."""
+        """Remove a trigger. The runs it made stay. A webhook's URL is then
+        unknown, like any other."""
         store = store_factory()
         try:
             trigger = _scoped_trigger(store, token, trigger_id)
             store.delete_trigger(trigger.id)
         finally:
             store.close()
+
+    # -- webhooks (M14.4) --------------------------------------------------
+    #
+    # `POST /hooks/{trigger_id}`, called by a client's CRM or form or Zap, which
+    # holds the trigger's secret and no token. The trigger id alone is the
+    # address, not `/<org>/<client>/<trigger>` as the spec first had it: the id
+    # names all three already, and a URL is stored in a client's CRM, pasted
+    # into tickets and printed in logs, so it should say nothing about whose
+    # agent is behind it. `flotta.hooks` has who may call it and how.
+
+    def _hooked_trigger(store: Any, trigger_id: str, headers: Any, raw: bytes) -> Any:
+        """The webhook `trigger_id`, if the request proves it holds its secret
+        and it is on; else None, whichever of those it was.
+
+        This is the webhook's tenant check: the secret is the credential, and
+        it was given only to whoever the trigger's agency gave it. One answer
+        for "no such trigger", "wrong secret" and "turned off", so a caller
+        without the secret learns nothing about which ids exist.
+        """
+        from flotta import hooks
+        from flotta.auth import trigger_secret
+
+        trigger = store.get_trigger(trigger_id)
+        nonce = store.trigger_nonce(trigger_id)
+        # The same reads, and a secret checked, even when there is no trigger,
+        # so the answer takes about the same time either way.
+        secret = trigger_secret(key, trigger_id, nonce or "no-such-trigger")
+        proved = hooks.authenticated(secret, headers, raw, now=time.time())
+        if trigger is None or nonce is None or not proved or not trigger.enabled:
+            return None
+        if trigger.kind != "webhook":
+            return None
+        return trigger
+
+    @app.post("/hooks/{trigger_id}")
+    async def receive_hook(trigger_id: str, request: Request, wait: int = 0) -> Any:
+        """A client's system calls an agent: a JSON body starts a run.
+
+        `202 {run_id, status}`, or with `?wait=N` (at most 30) the connection is
+        held until the run ends and the answer is `200` with its `output`, or
+        `202` if it has not ended by then. 413 for a body over 64 KB and 415
+        for one that is not JSON, both before anything about the trigger is
+        read. A missing, wrong or stale secret, an unknown trigger and one that
+        is off all answer the same 404. 429 past 30 calls a minute.
+        """
+        import json
+
+        from fastapi.responses import JSONResponse
+
+        from flotta import hooks
+        from flotta.store import TASK_TERMINAL
+
+        not_found = HTTPException(status_code=404, detail="no such webhook")
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > hooks.MAX_BODY:
+            raise HTTPException(status_code=413, detail="a webhook's body is at most 64 KB")
+        raw = b""
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > hooks.MAX_BODY:
+                raise HTTPException(status_code=413, detail="a webhook's body is at most 64 KB")
+        kind = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if kind != "application/json" and not kind.endswith("+json"):
+            raise HTTPException(status_code=415, detail="a webhook's body is JSON")
+        try:
+            body = json.loads(raw or b"null")
+        except ValueError as exc:
+            raise HTTPException(status_code=415, detail="a webhook's body is JSON") from exc
+
+        store = store_factory()
+        try:
+            trigger = _hooked_trigger(store, trigger_id, request.headers, raw)
+            if trigger is None:
+                raise not_found
+            if not hooks_per_trigger.hit(trigger.id):
+                raise HTTPException(
+                    status_code=429, detail="too many calls to this webhook; try in a minute"
+                )
+            try:
+                run = store.fire_webhook(
+                    trigger.id,
+                    prompt=hooks.render(trigger.prompt, body),
+                    input=hooks.run_input(raw, body),
+                )
+            except UnknownEntityError as exc:
+                raise not_found from exc
+            if run is None:
+                raise not_found
+            store.add_event("task", run.id, "created", {"trigger": "webhook", "by": trigger.id})
+        finally:
+            store.close()
+
+        deadline = time.monotonic() + max(0, min(wait, hooks.MAX_WAIT_S))
+        while run.status not in TASK_TERMINAL and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            store = store_factory()
+            try:
+                run = store.trigger_run(trigger.id, run.id) or run
+            finally:
+                store.close()
+        answer: dict[str, Any] = {"run_id": run.id, "status": run.status}
+        if wait > 0 and run.status in TASK_TERMINAL:
+            return JSONResponse({**answer, "output": run.output}, status_code=200)
+        return JSONResponse(answer, status_code=202)
 
     async def _deliver_run(run: Any, box: Any, talk: Any) -> str:
         """The default delivery: through the front door, with a token for this

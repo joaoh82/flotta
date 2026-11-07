@@ -59,7 +59,7 @@ def test_an_agents_schedules_are_listed(api):
         ({"cron": "0 8 * *"}, "five fields"),
         ({"tz": "Lisbon"}, "time zone"),
         ({"prompt": ""}, "prompt"),
-        ({"kind": "webhook"}, "schedule"),
+        ({"kind": "email"}, "schedule or a webhook"),
     ],
 )
 def test_a_schedule_that_cannot_be_kept_is_a_422(api, body, message):

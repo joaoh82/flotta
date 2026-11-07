@@ -171,6 +171,38 @@ def test_a_fire_waits_for_the_disable_and_then_fires_nothing(pg_store):
     assert pg_store.list_runs(org="default", box=box.id) == []
 
 
+def test_a_webhook_call_waits_for_the_disable_and_then_makes_nothing(pg_store):
+    """The same for a webhook (M14.4): called while its agent is torn down, it
+    takes the disable's lock, then finds the trigger off."""
+    from flotta.store import FleetStore
+
+    box = pg_store.create_box("eng-a")
+    trigger = pg_store.create_trigger(box.id, kind="webhook", prompt="New lead.", created_by="test")
+    result: list[object] = []
+
+    def call():
+        fleet = FleetStore(pg_store._url)
+        try:
+            result.append(fleet.fire_webhook(trigger.id, prompt="New lead.", input={"body": {}}))
+        finally:
+            fleet.close()
+
+    disabler = FleetStore(pg_store._url)
+    try:
+        with disabler._conn.transaction(guard="triggers"):
+            disabler._conn.execute("UPDATE triggers SET enabled = 0 WHERE box_id = ?", (box.id,))
+            caller = threading.Thread(target=call)
+            caller.start()
+            caller.join(timeout=2)
+            assert caller.is_alive(), "the webhook did not wait for the disable's lock"
+        caller.join(timeout=15)
+    finally:
+        disabler.close()
+
+    assert result == [None]
+    assert pg_store.list_runs(org="default", box=box.id) == []
+
+
 def test_the_workspace_cap_survives_a_real_race(pg_store):
     """Same guard, the other table — wired ahead of the tier that uses it."""
     box = pg_store.create_box("eng-a")
