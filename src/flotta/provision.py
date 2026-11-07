@@ -3633,6 +3633,12 @@ def teardown_box(
             "name_released": store.release_name(box_id),
         }
 
+    # Its schedules stop first (FLOTTA-148), before the task scan below and
+    # under the lock `fire_trigger` takes: a fire that won the lock has made
+    # its run, and the scan closes it; one that lost finds the schedule off.
+    # The other order let a run land after the scan and stay pending forever.
+    store.disable_triggers(box_id)
+
     # Destruction goes through the backend that owns the box: a Fly box loses
     # its machine *and* its volume. `canceller` survives as a pure injection
     # seam — it was the Modal cancel path, and keeping it lets a caller (and

@@ -111,6 +111,66 @@ def test_one_box_starts_one_run_in_a_real_race(pg_store):
     )
 
 
+def test_one_fire_time_makes_one_run_in_a_real_race(pg_store):
+    """Two sweeps see the same schedule due at once, a retry or a second
+    control plane (M14.3): one makes the run, the other finds it fired."""
+    from datetime import UTC, datetime
+
+    box = pg_store.create_box("eng-a")
+    trigger = pg_store.create_trigger(
+        box.id, cron="0 8 * * *", tz="UTC", prompt="Morning.", created_by="test"
+    )
+    eight = datetime(2026, 11, 6, 8, tzinfo=UTC)
+
+    def fire(fleet, i):
+        if fleet.fire_trigger(trigger.id, eight) is None:
+            raise LookupError("already fired")
+
+    outcomes = _race(pg_store, fire)
+
+    assert sorted(outcomes) == ["LookupError", "created"], f"expected one run, got {outcomes}"
+    assert len(pg_store.list_runs(org="default", box=box.id)) == 1
+
+
+def test_a_fire_waits_for_the_disable_and_then_fires_nothing(pg_store):
+    """Teardown disables a destroyed agent's schedules while a sweep is
+    firing one (M14.3). The fire must take the disable's lock, and read the
+    trigger once it has it: on separate locks it read `enabled = 1` and made
+    a pending run that teardown had already scanned past."""
+    from datetime import UTC, datetime
+
+    from flotta.store import FleetStore
+
+    box = pg_store.create_box("eng-a")
+    trigger = pg_store.create_trigger(
+        box.id, cron="0 8 * * *", tz="UTC", prompt="Morning.", created_by="test"
+    )
+    eight = datetime(2026, 11, 6, 8, tzinfo=UTC)
+    result: list[object] = []
+
+    def fire():
+        fleet = FleetStore(pg_store._url)
+        try:
+            result.append(fleet.fire_trigger(trigger.id, eight))
+        finally:
+            fleet.close()
+
+    disabler = FleetStore(pg_store._url)
+    try:
+        with disabler._conn.transaction(guard="triggers"):
+            disabler._conn.execute("UPDATE triggers SET enabled = 0 WHERE box_id = ?", (box.id,))
+            sweep = threading.Thread(target=fire)
+            sweep.start()
+            sweep.join(timeout=2)
+            assert sweep.is_alive(), "the fire did not wait for the disable's lock"
+        sweep.join(timeout=15)
+    finally:
+        disabler.close()
+
+    assert result == [None]
+    assert pg_store.list_runs(org="default", box=box.id) == []
+
+
 def test_the_workspace_cap_survives_a_real_race(pg_store):
     """Same guard, the other table — wired ahead of the tier that uses it."""
     box = pg_store.create_box("eng-a")

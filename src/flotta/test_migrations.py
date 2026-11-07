@@ -323,14 +323,14 @@ def test_an_orgs_mcp_connection_survives_the_table_being_made_again(target, monk
         assert [c.client_id for c in store.mcp_client_connections("agency-x")] == ["acme"]
 
 
-def _a_connection_from_before_23(target, monkeypatch, *servers):
-    """A store at migration 22 with an org connected to each of `servers`, with a
+def _a_connection_from_before_24(target, monkeypatch, *servers):
+    """A store at migration 23 with an org connected to each of `servers`, with a
     credential that opens here: only the address can stop it being used."""
     from flotta.mcp import connection_context
     from flotta.sealed import seal
 
     monkeypatch.setenv("FLOTTA_SIGNING_KEY", "a-signing-key")
-    monkeypatch.setattr(migrations, "MIGRATIONS", BASE[:22])
+    monkeypatch.setattr(migrations, "MIGRATIONS", BASE[:23])
     with FleetStore(target) as store:
         store.create_org("agency-x", "Agency X")
         for server in servers:
@@ -344,9 +344,9 @@ def _a_connection_from_before_23(target, monkeypatch, *servers):
 
 
 def test_upgrading_binds_a_connection_to_the_address_in_force_then(target, monkeypatch):
-    """Migration 23 records the address of each connection already there, from the
+    """Migration 24 records the address of each connection already there, from the
     catalogue it was made under: the environment's, since none could be stored."""
-    _a_connection_from_before_23(target, monkeypatch, "notes", "gone")
+    _a_connection_from_before_24(target, monkeypatch, "notes", "gone")
     catalogue = [{"name": "notes", "url": "https://notes.example.test/mcp", "auth": "bearer"}]
     monkeypatch.setenv("FLOTTA_MCP_SERVERS", json.dumps(catalogue))
     with _open(target, monkeypatch) as store:
@@ -356,7 +356,7 @@ def test_upgrading_binds_a_connection_to_the_address_in_force_then(target, monke
 
 
 def test_a_server_added_back_later_does_not_rebind_an_unbound_connection(target, monkeypatch):
-    _a_connection_from_before_23(target, monkeypatch, "notes")
+    _a_connection_from_before_24(target, monkeypatch, "notes")
     monkeypatch.delenv("FLOTTA_MCP_SERVERS", raising=False)
     with _open(target, monkeypatch) as store:
         assert store.mcp_connection("agency-x", "notes").server_url is None

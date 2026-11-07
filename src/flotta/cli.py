@@ -12,6 +12,7 @@ Commands over the store and the provisioning functions:
     flotta serve                 the control plane: fleet API + reconcile loop
     flotta run <box> "<prompt>"  give an agent a piece of work (--wait for its reply)
     flotta runs <box>            an agent's runs, or a client's (--client)
+    flotta trigger add <box>     run an agent on a schedule (--cron, --tz, --prompt)
     flotta reconcile             resolve tasks stranded past their deadline
 
 **What `ps` lists changed with the pivot.** v0.1 listed workers, which were
@@ -1148,6 +1149,76 @@ def runs(
         raise _fail(exc) from exc
     lines = [_run_line(r) for r in found["runs"]] or ["no runs"]
     emit(found, "\n".join(lines), as_json=as_json)
+
+
+# -- triggers (M14.3) -----------------------------------------------------------
+#
+# What starts an agent's runs on its own. Through the control plane, like
+# `run`: it is the control plane that fires a schedule.
+
+trigger_app = typer.Typer(
+    name="trigger",
+    help="What starts an agent's runs on its own: schedules.",
+    no_args_is_help=True,
+)
+app.add_typer(trigger_app)
+
+
+def _trigger_line(trigger: dict[str, Any]) -> str:
+    upcoming = (trigger.get("next") or ["off"])[0] if trigger.get("enabled") else "off"
+    return (
+        f"{trigger.get('id')}  {trigger.get('cron')}  {trigger.get('tz')}  next {upcoming}  "
+        f"{truncate(trigger.get('prompt'), 50)}"
+    )
+
+
+def _through_control(method: str, path: str, scope: str, body: dict | None = None) -> Any:
+    if not control_url():
+        raise _fail(
+            ControlPlaneError(f"triggers go through the control plane: set ${CONTROL_URL_ENV}")
+        )
+    try:
+        return control_request(method, path, scopes=(scope,), body=body)
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+
+
+@trigger_app.command("add")
+def trigger_add(
+    box: str = typer.Argument(..., help="The agent, by name or id"),
+    cron: str = typer.Option(..., "--cron", help='Five cron fields, e.g. "0 8 * * 1-5"'),
+    tz: str = typer.Option("UTC", "--tz", help="IANA time zone the times are in"),
+    prompt: str = typer.Option(..., "--prompt", help="What the agent is to do each time"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Run an agent on a schedule. At most every 5 minutes."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    body = {"cron": cron, "tz": tz, "prompt": prompt}
+    found = _through_control("POST", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_WRITE, body)
+    emit(found, _trigger_line(found), as_json=as_json)
+
+
+@trigger_app.command("ls")
+def trigger_ls(
+    box: str = typer.Argument(..., help="The agent, by name or id"),
+    as_json: bool = JsonOpt,
+) -> None:
+    """An agent's schedules, with when each fires next."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    found = _through_control("GET", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_READ)
+    lines = [_trigger_line(t) for t in found["triggers"]] or ["no schedules"]
+    emit(found, "\n".join(lines), as_json=as_json)
+
+
+@trigger_app.command("rm")
+def trigger_rm(trigger_id: str = typer.Argument(..., help="The trigger's id")) -> None:
+    """Remove a schedule. The runs it made stay."""
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    _through_control("DELETE", f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_WRITE)
+    typer.echo(f"removed {trigger_id}")
 
 
 @app.command()

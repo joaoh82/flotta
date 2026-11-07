@@ -703,7 +703,7 @@ def test_with_no_secrets_key_the_signing_keys_seals_and_opens(path):
 
 
 def test_a_connection_with_no_address_on_record_is_never_used(path):
-    """Shaped like one made before migration 23 and left unbound: refused, however
+    """Shaped like one made before migration 24 and left unbound: refused, however
     the catalogue reads now, so an entry moved since can't receive its key."""
     context = connection_context("studio-nord", "tracker")
     sealed = seal(json.dumps({"kind": "bearer", "value": "agency-key"}), context=context, env=ENV)

@@ -1010,7 +1010,7 @@ new tools) and it is reloaded, its grant kept and shown as going away. **A conne
 only ever used for the address it was made for**: an entry whose URL changes leaves its
 connections needing to be made again rather than sending a key to the new address.
 Connections made before this was recorded are bound, when the store is upgraded to
-migration 23, to the address the catalogue gave then; one for a server not offered then
+migration 24, to the address the catalogue gave then; one for a server not offered then
 is never used, and has to be connected again. Only tools pass (`initialize`, `ping`, `tools/list`, a
 granted `tools/call`); `resources/*` and `prompts/*` are refused. OAuth endpoints a
 server's metadata names must be public https, checked again on every request. `GET /api/boxes/<agent>/mcp/calls` is the audit trail.

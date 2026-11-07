@@ -593,7 +593,11 @@ def test_a_paused_machine_goes_to_sleep_once_quiet(fleet, machine):
     today = datetime.now(UTC)
     _sweep(fleet, now=today, idle_after_s=1800)
     assert machine.calls == []
-    _sweep(fleet, now=today + timedelta(seconds=1801), idle_after_s=1800)
+    quiet = today + timedelta(seconds=1801)
+    # The budget is a day's, and these two tests read the real clock: spent in
+    # the sweep's own day too, so a run just before midnight UTC still holds it.
+    _spend(fleet, now=quiet, key="k2")
+    _sweep(fleet, now=quiet, idle_after_s=1800)
     assert machine.calls == ["suspend"]
     assert _status(fleet) == "paused"
     assert "budget_machine_slept" in _types(fleet)
@@ -608,11 +612,15 @@ def test_a_paused_machine_with_a_live_task_is_not_put_to_sleep(fleet, machine):
     task = fleet.create_task("b-one", "a long one")
     fleet.update_task_status(task.id, "running")
     later = today + timedelta(seconds=1801)
+    # A day's budget and the real clock, as above: spent in each sweep's own day.
+    _spend(fleet, now=later, key="k2")
     _sweep(fleet, now=later, idle_after_s=1800)
     assert _status(fleet) == "paused"
     assert machine.calls == []
     fleet.update_task_status(task.id, "done")
-    _sweep(fleet, now=later + timedelta(seconds=1801), idle_after_s=1800)
+    quiet = later + timedelta(seconds=1801)
+    _spend(fleet, now=quiet, key="k3")
+    _sweep(fleet, now=quiet, idle_after_s=1800)
     assert machine.calls == ["suspend"]
 
 

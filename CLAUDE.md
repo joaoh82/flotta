@@ -847,7 +847,7 @@ conventions, and the sharp edges below.
   **The catalogue is the fleet setting `FLOTTA_MCP_SERVERS`**, edited in the console like
   `FLOTTA_MODELS` (stored wins, environment the fallback) and read on every request by the
   control plane and the gateway (`mcp.catalogue_of`); an operator's OAuth client secret
-  is not in it but sealed in `mcp_server_secrets` (migration 23). **A connection is
+  is not in it but sealed in `mcp_server_secrets` (migration 24). **A connection is
   used only for the URL it was made for, and only if it opens under this key**
   (`mcp.connection_usable`, the gateway's rule and every read's). A grant write, or a
   catalogue change, asks a running agent's Hermes to `reload.mcp` over exec
@@ -855,7 +855,7 @@ conventions, and the sharp edges below.
   agent's config is made from its grants read under `_rules_lock` (`rewrite_mcp_config`),
   so a revoke meanwhile stands. **Nothing MCP wakes a sleeping agent**: `exec` starts a
   stopped Fly machine, so its config is marked pending (`box_mcp_config_pending`) and
-  `wake_box` writes it. Connections from before migration 23 are bound to the
+  `wake_box` writes it. Connections from before migration 24 are bound to the
   catalogue's address when that migration is applied; an unbound one is refused.
   The box's token is its own `mcp:call`, written
   literally into the entry: the agent reading it learns nothing it can't already use.
