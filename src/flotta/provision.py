@@ -1826,18 +1826,25 @@ MCP_GRANTS_CHANGED = "mcp_grants_changed"
 MCP_RELOAD_MARK = "--flotta-mcp-reload"
 
 
-def _mcp_reload_command() -> str:
-    """Run `flotta.box.mcp_reload` on the box: the script travels with the command."""
+def _mcp_reload_command(*, wait: bool = False) -> str:
+    """Run `flotta.box.mcp_reload` on the box: the script travels with the command.
+
+    `wait` when the machine was just started: the script then waits for Hermes
+    to listen rather than failing because it is still booting.
+    """
     import base64
     from pathlib import Path
 
     from flotta.box import mcp_reload
 
     script = base64.b64encode(Path(mcp_reload.__file__).read_bytes()).decode("ascii")
-    return f"printf %s {script} | base64 -d | {BOX_PYTHON} - {MCP_RELOAD_MARK}"
+    flag = f" {mcp_reload.WAIT_FLAG}" if wait else ""
+    return f"printf %s {script} | base64 -d | {BOX_PYTHON} - {MCP_RELOAD_MARK}{flag}"
 
 
-def _reload_mcp(box: Box, store: FleetStore, backend: Backend | None) -> bool | None:
+def _reload_mcp(
+    box: Box, store: FleetStore, backend: Backend | None, *, wait: bool = False
+) -> bool | None:
     """Ask a running agent's Hermes to drop and rediscover its MCP servers. Best effort.
 
     `None` when nothing was asked: an agent that isn't running reads its config
@@ -1848,7 +1855,7 @@ def _reload_mcp(box: Box, store: FleetStore, backend: Backend | None) -> bool | 
     if box.status != "running" or not box.endpoint:
         return None
     try:
-        result = _resolve_backend(box, backend).exec(box.endpoint, _mcp_reload_command())
+        result = _resolve_backend(box, backend).exec(box.endpoint, _mcp_reload_command(wait=wait))
     except NotSupported:
         # A substrate with no shell, like `just local`'s stand-in: it has no Hermes
         # to reload, so nothing was asked, rather than a reload that failed.
@@ -2009,7 +2016,12 @@ def set_mcp_grants(
 
 
 def rewrite_mcp_config(
-    box_id: str, *, store: FleetStore, backend: Backend | None = None, reason: str
+    box_id: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+    reason: str,
+    just_started: bool = False,
 ) -> bool | None:
     """Write a running agent's MCP config again from its grants as they are. Writes no grant.
 
@@ -2017,6 +2029,9 @@ def rewrite_mcp_config(
     pending mark and is written when it next wakes (`wake_box`). True when
     written (and the agent asked to reload), False when the write failed, which
     leaves it pending. For a catalogue change and for a wake.
+
+    `just_started` when the wake started the machine: Hermes may still be booting,
+    so the reload waits for it to listen instead of recording a failure.
     """
     box = store.get_box(box_id)
     if box is None or is_terminal("box", box.status):
@@ -2037,7 +2052,7 @@ def rewrite_mcp_config(
             store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
             return False
         store.add_event("box", box.id, "mcp_config_rewritten", {"reason": reason})
-    _reload_mcp(now, store, backend)
+    _reload_mcp(now, store, backend, wait=just_started)
     return True
 
 
@@ -3325,7 +3340,13 @@ def wake_box(
     # grants are in force at the gateway either way, and a failure stays pending.
     if store.mcp_config_pending(box_id):
         try:
-            rewrite_mcp_config(box_id, store=store, backend=backend, reason="woken")
+            rewrite_mcp_config(
+                box_id,
+                store=store,
+                backend=backend,
+                reason="woken",
+                just_started=observed != "started",
+            )
         except Exception as exc:  # noqa: BLE001 - never fail a wake over discovery
             _log.warning("the pending MCP config of %s was not written: %s", box_id, exc)
 

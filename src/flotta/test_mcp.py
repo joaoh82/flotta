@@ -374,6 +374,39 @@ def test_a_stopped_agent_isnt_woken_by_a_catalogue_change_and_gets_it_at_wake(gr
     assert not granted.mcp_config_pending("b-one")
 
 
+def _reloads(machine):
+    from flotta.provision import MCP_RELOAD_MARK
+
+    return [c for c in machine.commands if MCP_RELOAD_MARK in c]
+
+
+def test_a_wake_that_starts_the_machine_waits_for_hermes_to_reload(granted):
+    """Seen live on eng-r: a reload sent while Hermes booted was a failure that wasn't."""
+    from flotta.box.mcp_reload import WAIT_FLAG
+    from flotta.provision import set_mcp_grants, wake_box
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    machine = _Machine()
+    machine.asleep = True
+    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    wake_box("b-one", store=granted, backend=machine)
+    (reload,) = _reloads(machine)
+    assert reload.endswith(WAIT_FLAG)
+    assert _events(granted, "mcp_reloaded") and not _events(granted, "mcp_reload_failed")
+
+
+def test_a_reload_on_a_machine_already_up_does_not_wait(granted):
+    from flotta.box.mcp_reload import WAIT_FLAG
+    from flotta.provision import set_mcp_grants
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    machine = _Machine()
+    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    (reload,) = _reloads(machine)
+    assert not reload.endswith(WAIT_FLAG)
+
+
 def test_a_grant_saved_for_a_stopped_agent_is_in_force_and_written_at_wake(granted):
     """Saved now, enforced at the gateway now, written to the agent when it next wakes."""
     from flotta.provision import set_mcp_grants, wake_box
