@@ -73,6 +73,25 @@ def test_the_fields_cron_has(expr, after, expected):
     assert next_fires(check(expr, "UTC"), "UTC", after, 1) == [expected]
 
 
+@pytest.mark.parametrize(
+    ("expr", "days"),
+    [
+        # Odd days of the month: the 8th and 10th are even.
+        ("0 8 */2 * *", [7, 9, 11, 13]),
+        # Sunday, Tuesday, Thursday, Saturday: not Monday the 9th.
+        ("0 8 * * */2", [7, 8, 10, 12]),
+        # Both restricted, so the union: odd days, and Monday the 16th.
+        ("0 8 */2 * 1", [7, 9, 11, 13, 15, 16]),
+    ],
+)
+def test_a_step_in_a_day_field_restricts_it(expr, days):
+    """The guard: only a bare `*` leaves a day field open. `*/2` once
+    counted as `*`, so both of these fired every day."""
+    fires = next_fires(check(expr, "UTC"), "UTC", utc(2026, 11, 6, 12), len(days))
+
+    assert fires == [utc(2026, 11, d, 8) for d in days]
+
+
 def test_a_date_that_never_comes_is_refused():
     with pytest.raises(ValueError, match="never"):
         check("0 9 31 2 *", "UTC")

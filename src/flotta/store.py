@@ -4380,7 +4380,12 @@ class FleetStore:
             self._conn.execute("DELETE FROM triggers WHERE id = ?", (trigger_id,))
 
     def disable_triggers(self, box_id: str) -> None:
-        """A destroyed agent's triggers stop."""
+        """A destroyed agent's triggers stop.
+
+        Under the lock `fire_trigger` takes, so a fire either commits first,
+        and its run is there for teardown to close, or waits and finds the
+        trigger off (`provision.teardown_box` disables before it scans tasks).
+        """
         with self._conn.transaction(guard="triggers"):
             self._conn.execute("UPDATE triggers SET enabled = 0 WHERE box_id = ?", (box_id,))
 
@@ -4414,12 +4419,19 @@ class FleetStore:
         them (`test_store_postgres.py`). An agent with `TRIGGER_QUEUE_CAP` runs
         already waiting gets this one `cancelled` as `queue_full`, with an
         event, rather than a pile it will never get through.
+
+        The lock is `triggers`, the one every change to a trigger takes, not
+        `trigger_fires`: a fire must not overlap the disable of a destroyed
+        agent's schedules. On Postgres a sweep that read the trigger as on
+        could otherwise insert a `pending` run after teardown closed the box's
+        tasks, and nothing would ever close it. So it reads the trigger under
+        that lock, and a trigger that is off fires nothing.
         """
         moment = _instant(now) if now else _utcnow()
         at = _instant(fire_at)
-        with self._conn.transaction(guard="trigger_fires"):
+        with self._conn.transaction(guard="triggers"):
             trigger = self._get_trigger_or_raise(trigger_id)
-            if self._fired(trigger_id, at):
+            if not trigger.enabled or self._fired(trigger_id, at):
                 return None
             box = self._get_box_or_raise(trigger.box_id)
             if box.status in BOX_TERMINAL:
@@ -4470,9 +4482,9 @@ class FleetStore:
         """Record `fire_at` as missed, too late to run (`schedules.MISSED_WINDOW`)."""
         moment = _instant(now) if now else _utcnow()
         at = _instant(fire_at)
-        with self._conn.transaction(guard="trigger_fires"):
+        with self._conn.transaction(guard="triggers"):
             trigger = self._get_trigger_or_raise(trigger_id)
-            if self._fired(trigger_id, at):
+            if not trigger.enabled or self._fired(trigger_id, at):
                 return
             self._conn.execute(
                 "INSERT INTO trigger_fires (trigger_id, fire_at, run_id, created_at) "

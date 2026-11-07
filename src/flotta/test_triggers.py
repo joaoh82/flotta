@@ -117,6 +117,41 @@ def test_a_destroyed_agent_takes_no_schedule_and_its_schedules_stop(agency):
         _schedule(agency)
 
 
+def test_a_schedule_that_is_off_fires_nothing_even_when_asked(agency):
+    """A sweep that read the schedule as on, then lost the lock to its disable:
+    the fire reads it again under the lock, and makes nothing."""
+    trigger = _schedule(agency)
+    agency.update_trigger(trigger.id, enabled=False, now=FRI)
+    eight = FRI - timedelta(hours=1)
+
+    assert agency.fire_trigger(trigger.id, eight, now=FRI) is None
+    agency.skip_fire(trigger.id, eight, now=FRI)
+    assert _runs(agency) == []
+    assert agency.get_trigger(trigger.id).last_fired_at is None
+
+
+def test_a_fire_just_before_teardown_disables_is_closed_by_it(agency):
+    """The guard for the order inside `teardown_box`: a fire that wins the
+    lock just before the disable has made a pending run, and teardown's task
+    scan has to come after, to close it. The other way round it stayed
+    pending on a destroyed agent, in the delivery queue for good."""
+    trigger = _schedule(agency)
+    disable = agency.disable_triggers
+    fired = []
+
+    def fire_then_disable(box_id):
+        fired.append(agency.fire_trigger(trigger.id, FRI - timedelta(hours=1), now=FRI))
+        disable(box_id)
+
+    agency.disable_triggers = fire_then_disable
+
+    provision.teardown_box("b-one", store=agency)
+
+    (run,) = _runs(agency)
+    assert fired[0] is not None and run.id == fired[0].id
+    assert (run.status, run.error_class) == ("cancelled", "torn_down")
+
+
 def test_a_schedule_turned_back_on_does_not_fire_what_it_missed(agency):
     """Off for a week and back on: it fires from now, not for the week."""
     trigger = _schedule(agency)

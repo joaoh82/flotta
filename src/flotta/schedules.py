@@ -93,8 +93,10 @@ def parse(expr: str) -> Cron:
         days=frozenset(sets[2]),
         months=frozenset(sets[3]),
         weekdays=weekdays,
-        any_day=parts[2].startswith("*"),
-        any_weekday=parts[4].startswith("*"),
+        # Unrestricted means exactly `*`, as cron has it: `*/2` is every other
+        # day, and `1-31` or `*/1` beside a restricted weekday is still the union.
+        any_day=parts[2] == "*",
+        any_weekday=parts[4] == "*",
     )
 
 
