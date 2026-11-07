@@ -435,3 +435,58 @@ def test_a_wake_with_nothing_pending_writes_nothing(granted):
     machine.asleep = True
     wake_box("b-one", store=granted, backend=machine)
     assert machine.commands == ["start"]
+
+
+class _MovingMachine(_Machine):
+    """`_Machine`, plus the secrets a gateway move writes and removes."""
+
+    def apply_secrets(self, endpoint, secrets):
+        self.commands.append("apply")
+
+    def remove_secrets(self, endpoint, names):
+        self.commands.append("remove")
+
+
+def test_joining_a_moved_gateway_points_the_agents_mcp_servers_at_it(granted, monkeypatch):
+    """The gateway left Render for Fly (7 Nov 2026). An agent joined again must not keep
+    calling its MCP servers at the old address, which its config names."""
+    from flotta.provision import join_gateway
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.set_box_model("b-one", "z-ai/glm-5.2")
+    granted.set_box_mcp_grants("b-one", [("notes", None, False)])
+    monkeypatch.setenv("FLOTTA_GATEWAY_URL", "http://flotta-gateway.internal:8080")
+    machine = _MovingMachine()
+    join_gateway("b-one", store=granted, backend=machine)
+
+    assert machine.commands[:2] == ["apply", "remove"]
+    (config,) = machine.configs()[2:]
+    import base64
+
+    changes = json.dumps(json.loads(base64.b64decode(config.rsplit(" ", 1)[1])))
+    assert "http://flotta-gateway.internal:8080/mcp/notes" in changes
+    assert "gw.example.test" not in changes
+    assert _events(granted, "mcp_config_rewritten")
+
+
+def test_joining_leaves_a_sleeping_agents_mcp_config_for_its_wake(granted):
+    from flotta.provision import join_gateway
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.update_box_status("b-one", "stopped")
+    granted.set_box_model("b-one", "z-ai/glm-5.2")
+    granted.set_box_mcp_grants("b-one", [("notes", None, False)])
+    machine = _MovingMachine()
+    join_gateway("b-one", store=granted, backend=machine)
+    assert machine.configs() == ["apply", "remove"]
+    assert granted.mcp_config_pending("b-one")
+
+
+def test_joining_an_agent_with_no_mcp_grants_writes_no_mcp_config(granted):
+    from flotta.provision import join_gateway
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    granted.set_box_model("b-one", "z-ai/glm-5.2")
+    machine = _MovingMachine()
+    join_gateway("b-one", store=granted, backend=machine)
+    assert machine.commands == ["apply", "remove"]

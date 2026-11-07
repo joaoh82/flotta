@@ -1,0 +1,40 @@
+# The model gateway — one always-on machine, reached by agents over 6PN at
+# http://<app>.internal:8080/v1. See fly/gateway/Dockerfile for why it left
+# Render, and docs/DEPLOY.md step 10.
+#
+# Overridden by `--app` in `just gateway-deploy`, which reads
+# $FLOTTA_GATEWAY_APP. Fly app names are globally unique.
+app = "flotta-gateway"
+
+# Beside the database (Render `virginia`), not beside the agents: a call reads
+# the store several times before it forwards anything, and an agent in `ams`
+# pays the Atlantic once either way.
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# **No `[http_service]`, on purpose.** Nothing public: an agent's model calls
+# are the only traffic, and they arrive over 6PN. Without a service there is no
+# Fly proxy, so nothing auto-stops it either — the gateway must not sleep while
+# any agent might think.
+#
+# **Exactly one machine.** Usage rows that could not be written wait in the
+# gateway's memory, and budgets are checked against them, so a second instance
+# would not see the first one's. `just gateway-deploy` passes `--ha=false`.
+
+[[restart]]
+  policy = "always"
+
+[checks]
+  [checks.health]
+    type = "http"
+    port = 8080
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
