@@ -180,6 +180,27 @@ def test_a_grant_taken_away_stops_the_next_call_on_the_same_gateway(path, server
     assert "result" in first.json()
     assert second.status_code == 403
     assert len(server.requests) == 1
+    # The refusal is in the audit: an agent still calling a server it lost.
+    assert _calls(path) == [("read_issue", "ok"), ("read_issue", "refused")]
+
+
+def test_an_ungranted_servers_handshake_and_list_leave_no_audit_row(path, server):
+    """Only a tool call is a call: the handshake and the list call nothing."""
+    with FleetStore(path) as fleet:
+        fleet.set_box_mcp_grants("b-one", [])
+    with _client(path, server) as client:
+        listed = client.post("/mcp/tracker", json=LIST, headers=_auth())
+        broken = client.post("/mcp/tracker", content=b"{not json", headers=_auth())
+    assert (listed.status_code, broken.status_code) == (403, 403)
+    assert server.requests == []
+    assert _calls(path) == []
+
+
+def test_a_server_outside_the_catalogue_leaves_no_audit_row(path, server):
+    with _client(path, server) as client:
+        answer = client.post("/mcp/nope", json=_call("read_issue"), headers=_auth())
+    assert answer.status_code == 404
+    assert _calls(path) == []
 
 
 def test_one_agents_grant_is_not_anothers(path, server):

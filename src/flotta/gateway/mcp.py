@@ -70,7 +70,7 @@ import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -508,10 +508,33 @@ class Proxy:
         box = await caller(request)
         server, grant = await asyncio.to_thread(self._lookup, box, name)
         if server is None:
+            # Not recorded: a name that isn't in the catalogue is anything at all,
+            # and the audit is of servers the fleet has.
             raise McpRefused(404, f"no MCP server {name!r} in this fleet", code=NOT_GRANTED)
         if grant is None:
-            raise McpRefused(403, f"{server.title} isn't granted to this agent", code=NOT_GRANTED)
+            await self._refuse_ungranted(request, box, server)
+        assert grant is not None
         return box, server, grant
+
+    async def _refuse_ungranted(self, request: Request, box: Box, server: Server) -> NoReturn:
+        """Refuse a server this agent isn't granted, recording a tool call it tried.
+
+        A grant taken away is enforced here on the next call, and an agent still
+        calling a server it lost is the refusal most worth seeing in the audit,
+        so a `tools/call` leaves a `refused` row like a tool outside the grant
+        does. The handshake and `tools/list` leave none: they call nothing.
+        """
+        if request.method == "POST":
+            try:
+                message = json.loads(await request.body())
+            except ValueError:
+                message = None
+            if isinstance(message, dict) and message.get("method") == "tools/call":
+                params = message.get("params")
+                called = params.get("name") if isinstance(params, dict) else None
+                if isinstance(called, str):
+                    self.record(box, server, called, "refused")
+        raise McpRefused(403, f"{server.title} isn't granted to this agent", code=NOT_GRANTED)
 
     def _headers(
         self, request: Request, server: Server, credential: Mapping[str, Any]
