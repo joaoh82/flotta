@@ -24,7 +24,7 @@ curl -X POST "$FLOTTA_CONTROL_URL/api/boxes/eng-a/keys" \
 
 ## Using one
 
-Send it as a bearer token, `Authorization: Bearer flotta_key_…`, to these three routes and no others:
+Send it as a bearer token, `Authorization: Bearer flotta_key_…`. It starts and reads runs on these three routes:
 
 | | |
 | --- | --- |
