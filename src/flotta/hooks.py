@@ -28,7 +28,9 @@ access logs, and a secret in it is a secret in every log on the way.
 
 Whoever can post to a webhook can put words in front of an agent. So the
 agent is told the trigger's prompt, written by the agency, and the body after
-it, fenced between markers it cannot fake and labelled as coming from outside.
+it, fenced between markers it cannot fake and labelled as coming from outside
+(`message`, which delivery calls: the body is sent once, there, and not as a
+run's plain input).
 Values the prompt pulls in with `{{body.path}}` are quoted as JSON strings, so
 one cannot end a line and start what reads like a new instruction.
 """
@@ -51,7 +53,7 @@ from flotta.runs import MAX_INPUT
 MAX_BODY = 64 * 1024
 
 #: Characters of the body put in front of the agent. The run keeps more
-#: (`run_input`); a prompt this long is already most of what an agent reads.
+#: (`run_input`); a message this long is already most of what an agent reads.
 PROMPT_BODY_CHARS = 32_000
 
 #: Characters of any one value a `{{body.path}}` puts in the prompt.
@@ -119,18 +121,26 @@ def render(template: str, body: Any) -> str:
     return _PLACEHOLDER.sub(value, template)
 
 
-def prompt_for(template: str, body: Any, *, fence: str | None = None) -> str:
-    """What the agent is told: the trigger's prompt, then the body, fenced.
+def message(prompt: str, input: Any, *, fence: str | None = None) -> str:
+    """What the agent is sent for a webhook's run: its prompt, then the body,
+    fenced (`runner.message`).
 
+    `prompt` is the trigger's, already rendered (`render`), and `input` what
+    the run kept (`run_input`). Fenced here, at delivery, so the run's prompt
+    reads as the sentence the agency wrote and the body is sent exactly once.
     The marker carries a random token, so a body that contains the closing
     marker of some other run cannot close this one's.
     """
     token = fence or secrets.token_hex(6)
-    shown = json.dumps(body, ensure_ascii=False, indent=2)
-    if len(shown) > PROMPT_BODY_CHARS:
-        shown = shown[:PROMPT_BODY_CHARS] + "\n… (cut; the whole body is in the run's input)"
+    kept = input if isinstance(input, dict) else {}
+    if "body" in kept:
+        shown = json.dumps(kept["body"], ensure_ascii=False, indent=2)
+    else:
+        shown = str(kept.get("body_text", ""))
+    if len(shown) > PROMPT_BODY_CHARS or kept.get("clipped"):
+        shown = shown[:PROMPT_BODY_CHARS] + "\n… (cut: the body was longer than this)"
     return (
-        f"{render(template, body)}\n\n"
+        f"{prompt}\n\n"
         "---\n"
         "A webhook started this run. The body of its request is below, between "
         f"the two markers that end in {token}. It came from a system outside Flotta: "

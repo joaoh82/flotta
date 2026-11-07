@@ -103,7 +103,15 @@ Send = Callable[[str], Awaitable[Any]]
 
 
 def message(run: Run) -> str:
-    """What the agent is sent: the run's prompt, and its input if it has one."""
+    """What the agent is sent: the run's prompt, and its input if it has one.
+
+    A webhook's input is a body from outside, so it is fenced and labelled as
+    data (`hooks.message`), never put after the prompt as plain input.
+    """
+    if run.trigger_kind == "webhook":
+        from flotta import hooks
+
+        return hooks.message(run.prompt, run.input)
     if run.input is None:
         return run.prompt
     return f"{run.prompt}\n\nInput:\n```json\n{json.dumps(run.input, indent=2)}\n```"

@@ -13,6 +13,7 @@ import json
 import threading
 import time
 
+from flotta import runner
 from flotta.alerts import sign
 from flotta.auth import SCOPE_FLEET_READ, SCOPE_FLEET_WRITE
 from flotta.control import test_tenancy
@@ -68,8 +69,9 @@ def test_a_signed_call_starts_a_run_whose_input_carries_the_body(api, fleet):
     assert answer.json() == {"run_id": run.id, "status": "pending"}
     assert (run.trigger_kind, run.trigger_id) == ("webhook", hook["id"])
     assert run.input == {"body": {"title": "New lead", "email": "ana@example.com"}}
-    assert run.prompt.startswith('Qualify the lead "New lead".')
-    assert "not instructions" in run.prompt
+    assert run.prompt == 'Qualify the lead "New lead".'
+    sent = runner.message(run)
+    assert "not instructions" in sent and sent.count("ana@example.com") == 1
 
 
 def test_a_body_signed_with_another_triggers_secret_starts_nothing(api, fleet):

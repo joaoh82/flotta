@@ -5545,7 +5545,7 @@ def create_app(
             try:
                 run = store.fire_webhook(
                     trigger.id,
-                    prompt=hooks.prompt_for(trigger.prompt, body),
+                    prompt=hooks.render(trigger.prompt, body),
                     input=hooks.run_input(raw, body),
                 )
             except UnknownEntityError as exc:

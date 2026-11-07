@@ -4594,8 +4594,9 @@ class FleetStore:
         so a webhook called while its agent is torn down either makes a run
         teardown then closes, or finds the trigger off. The same queue cap: an
         agent with `TRIGGER_QUEUE_CAP` runs waiting gets this one `cancelled`
-        as `queue_full`, with an event. `prompt` is what `hooks.prompt_for`
-        made of the body, and `input` what `hooks.run_input` kept of it.
+        as `queue_full`, with an event. `prompt` is the trigger's, rendered with
+        the body (`hooks.render`), and `input` what `hooks.run_input` kept of
+        it; delivery fences the body after the prompt (`hooks.message`).
         """
         encoded = json.dumps(input)
         check_input_size(encoded)
