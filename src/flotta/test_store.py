@@ -9,7 +9,7 @@ hand-wrote each tier would let one drift without anyone noticing.
 import itertools
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -1220,3 +1220,58 @@ def test_the_same_rate_on_a_new_day_is_recorded(store):
     assert store.record_eur_rate(_rate("0.89", "2026-11-02"), now=datetime(2026, 11, 2, tzinfo=UTC))
     assert store.record_eur_rate(_rate("0.89", "2026-11-03"), now=datetime(2026, 11, 3, tzinfo=UTC))
     assert store.fetched_eur_rate().as_of == "2026-11-03"
+
+
+# -- API keys (FLOTTA-150) ---------------------------------------------------
+
+
+def test_an_api_key_is_found_by_itself_and_kept_only_as_a_hash(store):
+    box = store.create_box("support")
+    made, secret = store.create_api_key(box.id, name="crm", created_by="user:u-1")
+
+    found = store.api_key(secret)
+
+    assert found is not None and found.id == made.id and found.box_id == box.id
+    assert (found.org, found.client, found.name) == ("default", "default", "crm")
+    assert secret.startswith(made.prefix) and len(made.prefix) < len(secret)
+    row = store._conn.execute("SELECT * FROM api_keys WHERE id = ?", (made.id,)).fetchone()
+    assert secret not in [str(row[k]) for k in row.keys()]  # noqa: SIM118
+    assert store.api_key(secret + "x") is None and store.api_key("") is None
+
+
+def test_a_revoked_api_key_is_found_no_more_and_stays_listed(store):
+    box = store.create_box("support")
+    made, secret = store.create_api_key(box.id, name="crm")
+
+    revoked = store.revoke_api_key(made.id)
+
+    assert revoked.revoked_at is not None
+    assert store.api_key(secret) is None
+    assert store.revoke_api_key(made.id).revoked_at == revoked.revoked_at
+    assert [k.id for k in store.list_api_keys(box.id)] == [made.id]
+    with pytest.raises(UnknownEntityError):
+        store.revoke_api_key("key-000000000000")
+
+
+def test_an_api_key_dies_with_its_agent(store):
+    box = store.create_box("support")
+    _, secret = store.create_api_key(box.id, name="crm")
+
+    store.update_box_status(box.id, "torn_down")
+
+    assert store.api_key(secret) is None
+    with pytest.raises(UnknownEntityError):
+        store.create_api_key(box.id, name="late")
+
+
+def test_an_api_key_notes_its_use_to_the_minute(store):
+    box = store.create_box("support")
+    made, secret = store.create_api_key(box.id, name="crm")
+    first = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
+
+    assert store.api_key(secret, now=first).last_used_at == first.isoformat()
+    assert store.api_key(secret, now=first + timedelta(seconds=30)).last_used_at == (
+        first.isoformat()
+    )
+    later = first + timedelta(minutes=2)
+    assert store.api_key(secret, now=later).last_used_at == later.isoformat()

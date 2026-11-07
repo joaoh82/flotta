@@ -191,6 +191,8 @@ BOX_ROUTES = [
         {"cron": "0 8 * * *", "tz": "UTC", "prompt": "Send me their files."},
     ),
     ("GET", "/api/boxes/{b}/triggers", SCOPE_FLEET_READ, None),
+    ("POST", "/api/boxes/{b}/keys", SCOPE_FLEET_WRITE, {"name": "theirs"}),
+    ("GET", "/api/boxes/{b}/keys", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/peer/ask", SCOPE_BOX_PEER, {"peer": "eng-a", "message": "hi"}),
 ]
 

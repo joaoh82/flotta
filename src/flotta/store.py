@@ -821,6 +821,34 @@ class Trigger:
     last_fired_at: str | None
 
 
+#: The longest an API key's name may be: a label in a list, like "crm".
+API_KEY_NAME_MAX = 64
+
+#: How often a key's `last_used_at` is written. Every request would be a write
+#: on every request; to the minute is enough to tell a key in use from a dead one.
+API_KEY_USE_RESOLUTION_S = 60
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKey:
+    """A key a client's own systems hold to start one agent's runs (M14.5).
+
+    The key itself is not here and not in the store: only its hash, and
+    `prefix`, enough of it to tell two keys apart in a list.
+    """
+
+    id: str
+    org: str
+    client: str
+    box_id: str
+    name: str
+    prefix: str
+    created_by: str | None
+    created_at: str
+    last_used_at: str | None
+    revoked_at: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class RunCost:
     """What a run's model calls cost: `Spend`'s two numbers, plus its tokens."""
@@ -4714,6 +4742,107 @@ class FleetStore:
             raise UnknownEntityError(f"no trigger with id {trigger_id!r}")
         return trigger
 
+    # -- API keys (FLOTTA-150) ---------------------------------------------
+
+    def create_api_key(
+        self,
+        box_id: str,
+        *,
+        name: str,
+        created_by: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[ApiKey, str]:
+        """A new key for `box_id`, and the key itself, which is returned this
+        once and kept nowhere: the store holds its hash (`secret_hash`).
+
+        The key is the box's org's and client's, read under the guard, so a
+        key cannot be made for an agent that is being destroyed.
+        """
+        from flotta.auth import API_KEY_PREFIX, generate_api_key
+
+        label = (name or "").strip()
+        if not label:
+            raise ValueError("name the key for what will hold it, e.g. crm")
+        if len(label) > API_KEY_NAME_MAX:
+            raise ValueError(f"a key's name is at most {API_KEY_NAME_MAX} characters")
+        secret = generate_api_key()
+        key_id = f"key-{uuid.uuid4().hex[:12]}"
+        with self._conn.transaction(guard="api_keys"):
+            box = self._get_box_or_raise(box_id)
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            self._conn.execute(
+                "INSERT INTO api_keys (id, org_id, client_id, box_id, name, secret_hash, prefix, "
+                "created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    key_id,
+                    box.org,
+                    box.client,
+                    box.id,
+                    label,
+                    secret_hash(secret),
+                    secret[: len(API_KEY_PREFIX) + 6],
+                    created_by,
+                    _instant(now) if now else _utcnow(),
+                ),
+            )
+        found = self.get_api_key(key_id)
+        assert found is not None
+        return found, secret
+
+    def api_key(self, secret: str, *, now: datetime | None = None) -> ApiKey | None:
+        """The live key `secret` is, or None: unknown, revoked, or its agent destroyed.
+
+        Asked on every request, so revoking a key or destroying its agent takes
+        effect on the next one. Notes when it was used, to the minute.
+        """
+        if not secret:
+            return None
+        row = self._conn.execute(
+            "SELECT k.*, b.status AS box_status FROM api_keys k JOIN boxes b ON b.id = k.box_id "
+            "WHERE k.secret_hash = ?",
+            (secret_hash(secret),),
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None or row["box_status"] in BOX_TERMINAL:
+            return None
+        moment = now or datetime.now(UTC)
+        last = row["last_used_at"]
+        if (
+            last is None
+            or (moment - datetime.fromisoformat(last)).total_seconds() >= API_KEY_USE_RESOLUTION_S
+        ):
+            self._conn.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE id = ?", (_instant(moment), row["id"])
+            )
+        return self.get_api_key(row["id"])
+
+    def get_api_key(self, key_id: str) -> ApiKey | None:
+        row = self._conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+        return _api_key_from_row(row) if row else None
+
+    def list_api_keys(self, box_id: str) -> list[ApiKey]:
+        """`box_id`'s keys, newest first, revoked ones too: a list that hides a
+        revoked key cannot answer "which key was that"."""
+        rows = self._conn.execute(
+            "SELECT * FROM api_keys WHERE box_id = ? ORDER BY created_at DESC, id", (box_id,)
+        ).fetchall()
+        return [_api_key_from_row(r) for r in rows]
+
+    def revoke_api_key(self, key_id: str, *, now: datetime | None = None) -> ApiKey:
+        """Stop a key. Its next request is refused. Revoking it again changes nothing."""
+        with self._conn.transaction(guard="api_keys"):
+            key = self.get_api_key(key_id)
+            if key is None:
+                raise UnknownEntityError(f"no API key with id {key_id!r}")
+            if key.revoked_at is None:
+                self._conn.execute(
+                    "UPDATE api_keys SET revoked_at = ? WHERE id = ?",
+                    (_instant(now) if now else _utcnow(), key_id),
+                )
+        found = self.get_api_key(key_id)
+        assert found is not None
+        return found
+
     # -- a run's approvals (FLOTTA-147) ------------------------------------
 
     def ask_approval(
@@ -5404,6 +5533,21 @@ def _trigger_prompt(prompt: str) -> str:
     if len(prompt) > MAX_TRIGGER_PROMPT:
         raise ValueError(f"a schedule's prompt is at most {MAX_TRIGGER_PROMPT} characters")
     return prompt.strip()
+
+
+def _api_key_from_row(row: db.Row) -> ApiKey:
+    return ApiKey(
+        id=row["id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        box_id=row["box_id"],
+        name=row["name"],
+        prefix=row["prefix"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        last_used_at=row["last_used_at"],
+        revoked_at=row["revoked_at"],
+    )
 
 
 def _trigger_from_row(row: db.Row) -> Trigger:

@@ -531,6 +531,19 @@ trigger-add-webhook box prompt:
 hook-send trigger body:
     uv run flotta hook send {{trigger}} {{quote(body)}} --wait 30
 
+# `just key-add eng-a crm`
+# M14.5: an API key for one agent, for a client's own systems; printed once
+key-add box name:
+    uv run flotta key add {{box}} --name {{quote(name)}}
+
+# M14.5: an agent's API keys, revoked ones too
+keys box:
+    uv run flotta key ls {{box}}
+
+# M14.5: revoke an API key; its next request is refused
+key-rm key:
+    uv run flotta key rm {{key}}
+
 # Prints each alert it gets and whether its signature checks. `secret` is what
 # setting the webhook answered with: see docs/ALERTS.md.
 # M13.7: receive budget alerts locally, on http://127.0.0.1:8184
