@@ -838,22 +838,56 @@ page's content security policy, so set it on both or neither.
 ## Step 10 — The model gateway (M13.2)
 
 Every model call a box makes goes through this once M13.4 points boxes at it. **Until
-then nothing calls it, and nothing needs it running.** It is deliberately not in
-`render.yaml`, because a Blueprint can create a billed service on its own.
+then nothing calls it, and nothing needs it running.**
 
-**A separate service from the same image,** not a route on the control plane. Streams
+**A separate service from the same package,** not a route on the control plane. Streams
 last minutes, and a model call must not queue behind the control plane's work, or the
 reverse. It also restarts on its own schedule, without taking the reconcile loop with it.
 
-On Render, in `virginia` beside the database:
+**On Fly, in `iad` beside the database, reached over 6PN.** It ran on Render until
+7 Nov 2026. Every Render service sits behind Render's Cloudflare edge, whose managed
+WAF reads request bodies, and a model call's body is the whole conversation. An agent
+ran `sleep 120; curl …` to wait for a deploy, the WAF took it for an injection, and every
+later turn of that conversation got Cloudflare's 403 "Blocked" page, because each turn
+resends the history. Hermes reports that as "a firewall/CDN in front of custom blocked
+the request". Nothing reached the gateway, so it logged nothing. Over 6PN there is no
+edge and no proxy hop.
+
+1. Put these in the main checkout's `.env`: `FLOTTA_SIGNING_KEY` (the **same** value as
+   the control plane, or no box token verifies), `FLOTTA_API_KEY` and
+   `FLOTTA_MODEL_BASE_URL` (the provider's key and endpoint), and
+   `FLOTTA_GATEWAY_DATABASE_URL`. That last one is the database's **external** URL from
+   Render with `?sslmode=require`, under its own name, so the local CLI keeps talking to
+   whatever it did before. Add `FLOTTA_SECRETS_KEY` too if the control plane has one.
+2. `just gateway-secrets`, then `just gateway-deploy`. The first deploy creates the app
+   (`$FLOTTA_GATEWAY_APP`, default `flotta-gateway`) and a **static egress IP**. The
+   database admits only that IP, and Fly's egress addresses otherwise change. It runs as
+   one always-on machine (`--ha=false`; see "Run one instance" below).
+3. Add the egress IPv4 it prints to `ipAllowList` on `flotta-db` in `render.yaml`. The
+   Blueprint owns that list, so an entry made by hand in the dashboard is undone at the
+   next sync. Until it's there the gateway can't read the store, and every call answers
+   402.
+4. Check it from any agent:
+   `flyctl ssh console -a <agent app> -C "curl -s http://flotta-gateway.internal:8080/health"`.
+5. Set `FLOTTA_GATEWAY_URL=http://flotta-gateway.internal:8080` on the control plane,
+   then run `just agent-gateway <agent>` for each agent, one at a time. Joining again
+   rewrites the agent's model provider **and** its MCP entries, which name the gateway
+   too. Each boot clears stored conversation routes to a gateway address Flotta no
+   longer gives, so open conversations follow the agent.
+6. Delete the Render service once no agent's timeline shows a call through it.
+
+Plain HTTP is enough here: 6PN is WireGuard between Fly machines, and the gateway has
+no public address. A self-hoster off Fly runs the same image anywhere their agents can
+reach. **Keep a WAF out of the path, whoever hosts it**: anything that inspects request
+bodies will sooner or later block a conversation for a command the agent ran.
 
 | Setting | Value |
 |---|---|
-| Runtime and image | Docker, this repo's `./Dockerfile` |
-| Docker command | `flotta gateway --host 0.0.0.0 --port $PORT` |
-| Health check path | `/health` |
-| `FLOTTA_DATABASE_URL` | The internal URL of the same database as the control plane |
-| `FLOTTA_SIGNING_KEY` | The **same** value as the control plane, or no box token verifies |
+| Image | `fly/gateway/Dockerfile` (no flyctl, no box build context) |
+| Command | `flotta gateway --host :: --port 8080` (6PN is IPv6-only) |
+| Health check | `/health` |
+| `FLOTTA_DATABASE_URL` | The database's external URL, `sslmode=require` |
+| `FLOTTA_SIGNING_KEY` | The **same** value as the control plane |
 | `FLOTTA_API_KEY`, `FLOTTA_MODEL_BASE_URL` | The provider's key and endpoint |
 
 **Which models a call may name** is the Fleet page's two model settings, and whatever
@@ -861,8 +895,7 @@ an agent already runs. The gateway reads them from the database, so set them the
 value kept only in the control plane's environment doesn't reach it, and its agents' calls
 are refused, each with a 404 that lists what it could read.
 
-It has to be reachable from Fly, so it takes a public address. Every route but
-`/health` needs a box's own token carrying `model:call`.
+Every route but `/health` needs a box's own token carrying `model:call`.
 
 **The euro rate looks after itself:** the gateway fetches the European Central Bank's
 daily rate when it starts and daily, free and with no key, and a failed fetch keeps the

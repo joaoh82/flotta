@@ -205,6 +205,63 @@ gateway-fake port="8083":
 gateway-smoke:
     uv run --extra control python scripts/gateway_smoke.py
 
+# The gateway on Fly (docs/DEPLOY.md step 10): one always-on machine in `iad`,
+# reached by agents over 6PN at http://$FLOTTA_GATEWAY_APP.internal:8080/v1.
+# Creates the app and its static egress IP (the database admits only that
+# address) the first time. Costs money: an always-on machine plus the IP.
+gateway-deploy: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
+    APP="${FLOTTA_GATEWAY_APP:-flotta-gateway}"
+    # Exact match on parsed JSON, for the reason door-deploy records.
+    if ! flyctl apps list --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any(a.get('Name')=='$APP' for a in json.load(sys.stdin)) else 1)"; then
+      echo "creating app $APP in org $ORG"
+      flyctl apps create "$APP" --org "$ORG"
+    fi
+    # Before the first deploy, so the first boot already has the address the
+    # database's allowlist names.
+    if ! flyctl ips list --app "$APP" --json \
+      | uv run python -c "import json,sys; sys.exit(0 if any('egress' in (i.get('Type') or '').lower() for i in json.load(sys.stdin)) else 1)"; then
+      echo "allocating a static egress IP for $APP in iad"
+      flyctl ips allocate-egress --app "$APP" --region iad --yes
+    fi
+    echo ""
+    echo "Deploying $APP — ONE always-on machine. Ctrl-C to stop."
+    sleep 3
+    # --ha=false: a second instance would not see the first one's unwritten usage.
+    flyctl deploy --config fly/gateway/fly.toml --dockerfile fly/gateway/Dockerfile \
+      --app "$APP" --ha=false .
+    echo ""
+    echo "Egress IPs (add the IPv4 to the database's ipAllowList in render.yaml):"
+    flyctl ips list --app "$APP"
+    echo "Agents reach it at: http://$APP.internal:8080"
+
+# Stages the gateway's secrets on Fly from .env, piped, never in argv. The
+# database URL is Render's EXTERNAL one, with sslmode=require, under its own
+# name so it never changes what the local CLI talks to.
+gateway-secrets: fly-whoami
+    #!/usr/bin/env bash
+    set -euo pipefail
+    APP="${FLOTTA_GATEWAY_APP:-flotta-gateway}"
+    : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
+    : "${FLOTTA_GATEWAY_DATABASE_URL:?set FLOTTA_GATEWAY_DATABASE_URL in .env — Render's external URL for flotta-db}"
+    : "${FLOTTA_API_KEY:?set FLOTTA_API_KEY in .env — the provider key the gateway calls with}"
+    : "${FLOTTA_MODEL_BASE_URL:?set FLOTTA_MODEL_BASE_URL in .env, e.g. https://openrouter.ai/api/v1}"
+    {
+      printf 'FLOTTA_SIGNING_KEY=%s\n' "$FLOTTA_SIGNING_KEY"
+      printf 'FLOTTA_DATABASE_URL=%s\n' "$FLOTTA_GATEWAY_DATABASE_URL"
+      printf 'FLOTTA_API_KEY=%s\n' "$FLOTTA_API_KEY"
+      printf 'FLOTTA_MODEL_BASE_URL=%s\n' "$FLOTTA_MODEL_BASE_URL"
+      # Only if set on the control plane too: it seals MCP credentials.
+      if [ -n "${FLOTTA_SECRETS_KEY:-}" ]; then
+        printf 'FLOTTA_SECRETS_KEY=%s\n' "$FLOTTA_SECRETS_KEY"
+      fi
+    } | flyctl secrets import --stage --app "$APP"
+    echo "staged secrets on $APP (values not echoed)"
+    echo "now run: just gateway-deploy  (or, for a running gateway: flyctl secrets deploy --app $APP)"
+
 # M13.4 — move one agent onto the gateway, or back. Restarts it twice if it is
 # running. Goes through $FLOTTA_CONTROL_URL. Measure one before moving the rest.
 agent-gateway BOX:

@@ -2590,6 +2590,12 @@ def join_gateway(
     )
     via = secrets["FLOTTA_MODEL_BASE_URL"]
     store.add_event("box", box.id, GATEWAY_JOINED, {"via": via, "model": model})
+    # An agent already on a gateway is joined again when the gateway moves (it left
+    # Render for Fly on 7 Nov 2026), and its MCP entries name the gateway too. Left
+    # alone they would keep calling the old address. A sleeping agent is marked
+    # pending and written when it wakes, as for a catalogue change.
+    if store.box_mcp_grants(box.id):
+        rewrite_mcp_config(box.id, store=store, backend=backend, reason="gateway")
     return {"box_id": box.id, "name": box.name, "model": model, "via": via}
 
 
