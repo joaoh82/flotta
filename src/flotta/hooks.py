@@ -64,6 +64,15 @@ MAX_WAIT_S = 30
 
 _PLACEHOLDER = re.compile(r"\{\{\s*body((?:\.[A-Za-z0-9_\-]+)*)\s*\}\}")
 
+#: The line breaks JSON leaves raw: it escapes everything below U+0020, and
+#: NEXT LINE, LINE SEPARATOR and PARAGRAPH SEPARATOR are above it. Any of them
+#: in a value would start a line of the prompt, ahead of the fence.
+_RAW_BREAK = re.compile("[\u0085  ]")
+
+
+def _escaped(match: re.Match[str]) -> str:
+    return f"\\u{ord(match.group()):04x}"
+
 
 def authenticated(secret: str, headers: Mapping[str, str], body: bytes, *, now: float) -> bool:
     """Whether the request proves it holds `secret`, in any of the three ways."""
@@ -101,7 +110,8 @@ def render(template: str, body: Any) -> str:
     A path that is not there is empty, never an error: a CRM that leaves a
     field out should not stop the run. A list is indexed by number
     (`{{body.items.0.name}}`). A value is put in as JSON, a string in quotes,
-    and clipped to `MAX_VALUE_CHARS`.
+    with every line break escaped, the Unicode ones JSON leaves raw too, and
+    then clipped to `MAX_VALUE_CHARS`.
     """
 
     def value(match: re.Match[str]) -> str:
@@ -115,7 +125,7 @@ def render(template: str, body: Any) -> str:
                 return ""
         if found is None:
             return ""
-        text = json.dumps(found, ensure_ascii=False)
+        text = _RAW_BREAK.sub(_escaped, json.dumps(found, ensure_ascii=False))
         return text if len(text) <= MAX_VALUE_CHARS else text[:MAX_VALUE_CHARS] + "…"
 
     return _PLACEHOLDER.sub(value, template)

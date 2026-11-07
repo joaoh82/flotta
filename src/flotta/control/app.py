@@ -5487,9 +5487,9 @@ def create_app(
         from flotta.auth import trigger_secret
 
         trigger = store.get_trigger(trigger_id)
-        nonce = store.trigger_nonce(trigger_id) if trigger is not None else None
-        # Checked against something even when there is no trigger, so the
-        # answer takes the same time either way.
+        nonce = store.trigger_nonce(trigger_id)
+        # The same reads, and a secret checked, even when there is no trigger,
+        # so the answer takes about the same time either way.
         secret = trigger_secret(key, trigger_id, nonce or "no-such-trigger")
         proved = hooks.authenticated(secret, headers, raw, now=time.time())
         if trigger is None or nonce is None or not proved or not trigger.enabled:
