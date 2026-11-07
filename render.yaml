@@ -94,5 +94,11 @@ projects:
             region: virginia
             plan: basic-256mb
             postgresMajorVersion: "17"
-            # Only the control plane connects, over Render's private network.
-            ipAllowList: []
+            # The control plane connects over Render's private network. The model
+            # gateway runs on Fly (FLOTTA-159, docs/DEPLOY.md step 10) and connects
+            # from its app's static egress IP, and from nowhere else. A new egress IP
+            # (`flyctl ips allocate-egress --app flotta-gateway`) has to be added here
+            # too, or every model call answers 402.
+            ipAllowList:
+              - source: 209.71.108.55/32
+                description: flotta-gateway on Fly (iad egress)
