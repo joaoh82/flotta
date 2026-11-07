@@ -507,6 +507,20 @@ run box prompt:
 runs box:
     uv run flotta runs {{box}}
 
+# `cron` is five fields in `tz`, at most every 5 minutes, e.g.
+# `just trigger-add eng-a "0 8 * * 1-5" Europe/Lisbon "Send the morning summary."`
+# M14.3: run an agent on a schedule
+trigger-add box cron tz prompt:
+    uv run flotta trigger add {{box}} --cron {{quote(cron)}} --tz {{tz}} --prompt {{quote(prompt)}}
+
+# M14.3: an agent's schedules, with when each fires next
+trigger-ls box:
+    uv run flotta trigger ls {{box}}
+
+# M14.3: remove a schedule (the runs it made stay)
+trigger-rm id:
+    uv run flotta trigger rm {{id}}
+
 # Prints each alert it gets and whether its signature checks. `secret` is what
 # setting the webhook answered with: see docs/ALERTS.md.
 # M13.7: receive budget alerts locally, on http://127.0.0.1:8184

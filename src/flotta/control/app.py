@@ -5145,6 +5145,110 @@ def create_app(
         finally:
             store.close()
 
+    # -- triggers (M14.3) ------------------------------------------------------
+    #
+    # What starts an agent's runs on its own: for now, schedules. The agency's,
+    # like runs, and a client's own systems' (a client's token with
+    # `fleet:write`); a client's people see none. Checked in the store, where
+    # every caller meets the same rules (`flotta.schedules.check`).
+
+    def _scoped_trigger(store: Any, token: Token | None, trigger_id: str) -> Any:
+        """A trigger `token` may act on, or 404, as `_scoped_box` is for a box."""
+        trigger = store.get_trigger(trigger_id)
+        if trigger is None or (
+            token is not None
+            and (
+                admits_tenant(token, org=trigger.org, client=trigger.client) is not None
+                or (token.box is not None and token.box != trigger.box_id)
+            )
+        ):
+            raise HTTPException(status_code=404, detail=f"no trigger {trigger_id!r}")
+        return trigger
+
+    def _trigger_view(trigger: Any) -> dict[str, Any]:
+        """A trigger, with its next three times so the web app can say "next: Mon 08:00"."""
+        from dataclasses import asdict
+
+        from flotta import schedules
+
+        view = asdict(trigger)
+        upcoming: list[str] = []
+        if trigger.enabled and trigger.kind == "schedule":
+            cron = schedules.parse(trigger.cron)
+            now = datetime.now(UTC)
+            upcoming = [t.isoformat() for t in schedules.next_fires(cron, trigger.tz, now, 3)]
+        view["next"] = upcoming
+        return view
+
+    @app.post("/api/boxes/{box_id}/triggers", status_code=201)
+    def create_trigger(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """A schedule on an agent: `{cron, tz, prompt, enabled?}`."""
+        if body.get("kind", "schedule") != "schedule":
+            raise HTTPException(status_code=422, detail="only a schedule can be added yet")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                trigger = store.create_trigger(
+                    box.id,
+                    cron=str(body.get("cron") or ""),
+                    tz=str(body.get("tz") or "UTC"),
+                    prompt=body.get("prompt") or "",
+                    enabled=bool(body.get("enabled", True)),
+                    created_by=token.subject if token else None,
+                )
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no box {box_id!r}") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _trigger_view(trigger)
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/triggers")
+    def list_box_triggers(box_id: str, token: Token | None = needs_read) -> Any:
+        """An agent's triggers, oldest first, each with when it fires next."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            _run_reader(token)
+            return {"triggers": [_trigger_view(t) for t in store.list_triggers(box.id)]}
+        finally:
+            store.close()
+
+    @app.patch("/api/triggers/{trigger_id}")
+    def update_trigger(
+        trigger_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Change a schedule: any of `{cron, tz, prompt, enabled}`."""
+        store = store_factory()
+        try:
+            trigger = _scoped_trigger(store, token, trigger_id)
+            enabled = body.get("enabled")
+            try:
+                changed = store.update_trigger(
+                    trigger.id,
+                    cron=body.get("cron"),
+                    tz=body.get("tz"),
+                    prompt=body.get("prompt"),
+                    enabled=None if enabled is None else bool(enabled),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _trigger_view(changed)
+        finally:
+            store.close()
+
+    @app.delete("/api/triggers/{trigger_id}", status_code=204)
+    def delete_trigger(trigger_id: str, token: Token | None = needs_write) -> None:
+        """Remove a schedule. The runs it made stay."""
+        store = store_factory()
+        try:
+            trigger = _scoped_trigger(store, token, trigger_id)
+            store.delete_trigger(trigger.id)
+        finally:
+            store.close()
+
     async def _deliver_run(run: Any, box: Any, talk: Any) -> str:
         """The default delivery: through the front door, with a token for this
         run's agent alone (`runner.run_token`), alive for the conversation."""

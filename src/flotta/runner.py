@@ -7,6 +7,14 @@ app would, and writes how it ended. The control plane is the client, so it
 hears every frame of the turn and keeps the steps itself; nothing on the door
 or the box changes for a run.
 
+## Schedules fire here too (M14.3)
+
+Each sweep first fires the schedules that are due (`fire_schedules`), then
+delivers. Here rather than in the reconcile loop because a fired schedule is
+a run waiting to be delivered, and in the same sweep it is delivered within
+seconds; the reconcile loop is about what the substrate says, on its own
+cadence. A time fires once however many sweeps see it (`fire_trigger`).
+
 ## One at a time per agent, several agents at once
 
 An agent does its runs in the order they were asked for, one after another:
@@ -390,6 +398,34 @@ async def through_door(
         await session.close()
 
 
+def fire_schedules(store: FleetStore, *, now: datetime) -> list[Run]:
+    """Fire every schedule that is due at `now`, once each: the runs it made.
+
+    Only the latest due time counts (`schedules.due`), so an outage across
+    several times fires once. One missed by more than `schedules.MISSED_WINDOW`
+    is skipped, with an event. A schedule whose cron no longer reads is left
+    alone and logged: it was checked when saved, so this is a bug, not input.
+    """
+    from flotta import schedules
+
+    fired: list[Run] = []
+    for trigger in store.enabled_schedules():
+        try:
+            cron = schedules.parse(trigger.cron or "")
+        except ValueError:
+            _log.exception("schedule %s no longer reads as cron", trigger.id)
+            continue
+        since = datetime.fromisoformat(trigger.last_fired_at or trigger.created_at)
+        fire, skipped = schedules.due(cron, trigger.tz or "UTC", since=since, now=now)
+        if fire is not None:
+            run = store.fire_trigger(trigger.id, fire, now=now)
+            if run is not None:
+                fired.append(run)
+        elif skipped is not None:
+            store.skip_fire(trigger.id, skipped, now=now)
+    return fired
+
+
 class RunLoop:
     """Picks up waiting runs, delivers each, and writes how it ended."""
 
@@ -401,7 +437,9 @@ class RunLoop:
         max_concurrent: int = MAX_CONCURRENT,
         timeout_s: float = RUN_TIMEOUT_S,
         queue_limit: int = 200,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._store_factory = store_factory
         self._deliver = deliver
         self._max = max_concurrent
@@ -411,7 +449,11 @@ class RunLoop:
         self.in_flight: dict[str, asyncio.Task] = {}
 
     async def sweep(self) -> None:
-        """Start every run that may start now."""
+        """Fire what is due, then start every run that may start now."""
+        try:
+            await asyncio.to_thread(self._fire)
+        except Exception:  # noqa: BLE001 - a schedule must not stop delivery
+            _log.exception("firing schedules failed")
         for run, box in await asyncio.to_thread(self._claim):
             task = asyncio.create_task(self._carry(run, box))
             self.in_flight[box.id] = task
@@ -421,6 +463,13 @@ class RunLoop:
         """Wait for every delivery in flight to end."""
         while self.in_flight:
             await asyncio.gather(*list(self.in_flight.values()), return_exceptions=True)
+
+    def _fire(self) -> None:
+        store = self._store_factory()
+        try:
+            fire_schedules(store, now=self._clock())
+        finally:
+            store.close()
 
     def _claim(self) -> list[tuple[Run, Box]]:
         """The runs to deliver now, already moved to `running`.

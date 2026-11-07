@@ -793,6 +793,27 @@ class RunApproval:
 
 
 @dataclass(frozen=True, slots=True)
+class Trigger:
+    """What starts an agent's run on its own (FLOTTA-148): for now, a schedule."""
+
+    id: str
+    org: str
+    client: str
+    box_id: str
+    #: `schedule`; `webhook` comes with M14.4.
+    kind: str
+    #: Five cron fields, read in `tz` (`flotta.schedules`).
+    cron: str | None
+    tz: str | None
+    prompt: str
+    enabled: bool
+    created_by: str | None
+    created_at: str
+    #: The last time it fired or was skipped; due times are after this.
+    last_fired_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RunCost:
     """What a run's model calls cost: `Spend`'s two numbers, plus its tokens."""
 
@@ -4275,6 +4296,226 @@ class FleetStore:
         ).fetchone()
         return row["id"] if row else None
 
+    # -- triggers (FLOTTA-148) ----------------------------------------------
+
+    def create_trigger(
+        self,
+        box_id: str,
+        *,
+        cron: str,
+        tz: str,
+        prompt: str,
+        created_by: str | None,
+        enabled: bool = True,
+        now: datetime | None = None,
+    ) -> Trigger:
+        """A schedule on `box_id`: `cron` read in `tz`, delivering `prompt`.
+
+        Checked here, where every caller meets it (`flotta.schedules.check`):
+        five fields, a real zone, and not more often than every five minutes.
+        """
+        from flotta.schedules import check
+
+        cron = check(cron, tz).expr
+        prompt = _trigger_prompt(prompt)
+        trigger_id = f"tr-{uuid.uuid4().hex[:12]}"
+        with self._conn.transaction(guard="triggers"):
+            box = self._get_box_or_raise(box_id)
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            self._conn.execute(
+                "INSERT INTO triggers (id, org_id, client_id, box_id, kind, cron, tz, prompt, "
+                "enabled, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, 'schedule', ?, ?, ?, ?, ?, ?)",
+                (
+                    trigger_id,
+                    box.org,
+                    box.client,
+                    box.id,
+                    cron,
+                    tz,
+                    prompt,
+                    1 if enabled else 0,
+                    created_by,
+                    _instant(now) if now else _utcnow(),
+                ),
+            )
+        return self._get_trigger_or_raise(trigger_id)
+
+    def update_trigger(
+        self,
+        trigger_id: str,
+        *,
+        cron: str | None = None,
+        tz: str | None = None,
+        prompt: str | None = None,
+        enabled: bool | None = None,
+        now: datetime | None = None,
+    ) -> Trigger:
+        """Change a schedule. Turned back on, it fires from now: what it missed
+        while off is not owed."""
+        from flotta.schedules import check
+
+        with self._conn.transaction(guard="triggers"):
+            current = self._get_trigger_or_raise(trigger_id)
+            new_cron = check(cron or current.cron or "", tz or current.tz or "").expr
+            new_tz = tz or current.tz
+            new_prompt = _trigger_prompt(prompt) if prompt is not None else current.prompt
+            new_enabled = current.enabled if enabled is None else enabled
+            last = current.last_fired_at
+            if new_enabled and not current.enabled:
+                last = _instant(now) if now else _utcnow()
+            self._conn.execute(
+                "UPDATE triggers SET cron = ?, tz = ?, prompt = ?, enabled = ?, last_fired_at = ? "
+                "WHERE id = ?",
+                (new_cron, new_tz, new_prompt, 1 if new_enabled else 0, last, trigger_id),
+            )
+        return self._get_trigger_or_raise(trigger_id)
+
+    def delete_trigger(self, trigger_id: str) -> None:
+        """Remove a trigger and its record of fires. Its runs stay, naming it."""
+        with self._conn.transaction(guard="triggers"):
+            self._get_trigger_or_raise(trigger_id)
+            self._conn.execute("DELETE FROM trigger_fires WHERE trigger_id = ?", (trigger_id,))
+            self._conn.execute("DELETE FROM triggers WHERE id = ?", (trigger_id,))
+
+    def disable_triggers(self, box_id: str) -> None:
+        """A destroyed agent's triggers stop.
+
+        Under the lock `fire_trigger` takes, so a fire either commits first,
+        and its run is there for teardown to close, or waits and finds the
+        trigger off (`provision.teardown_box` disables before it scans tasks).
+        """
+        with self._conn.transaction(guard="triggers"):
+            self._conn.execute("UPDATE triggers SET enabled = 0 WHERE box_id = ?", (box_id,))
+
+    def get_trigger(self, trigger_id: str) -> Trigger | None:
+        row = self._conn.execute("SELECT * FROM triggers WHERE id = ?", (trigger_id,)).fetchone()
+        return _trigger_from_row(row) if row else None
+
+    def list_triggers(self, box_id: str) -> list[Trigger]:
+        """`box_id`'s triggers, oldest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM triggers WHERE box_id = ? ORDER BY created_at, id", (box_id,)
+        ).fetchall()
+        return [_trigger_from_row(r) for r in rows]
+
+    def enabled_schedules(self) -> list[Trigger]:
+        """Every org's schedules that are on, for the sweep (`runner.fire_schedules`)."""
+        rows = self._conn.execute(
+            "SELECT t.* FROM triggers t JOIN boxes b ON b.id = t.box_id "
+            "WHERE t.kind = 'schedule' AND t.enabled = 1 AND b.status <> 'torn_down' "
+            "ORDER BY t.created_at, t.id"
+        ).fetchall()
+        return [_trigger_from_row(r) for r in rows]
+
+    def fire_trigger(
+        self, trigger_id: str, fire_at: datetime, *, now: datetime | None = None
+    ) -> Run | None:
+        """Fire `trigger_id` for `fire_at`: its run, or None if that time already fired.
+
+        The fire and the run are one transaction, keyed by the trigger and the
+        time, so two sweeps that both see the time due make one run between
+        them (`test_store_postgres.py`). An agent with `TRIGGER_QUEUE_CAP` runs
+        already waiting gets this one `cancelled` as `queue_full`, with an
+        event, rather than a pile it will never get through.
+
+        The lock is `triggers`, the one every change to a trigger takes, not
+        `trigger_fires`: a fire must not overlap the disable of a destroyed
+        agent's schedules. On Postgres a sweep that read the trigger as on
+        could otherwise insert a `pending` run after teardown closed the box's
+        tasks, and nothing would ever close it. So it reads the trigger under
+        that lock, and a trigger that is off fires nothing.
+        """
+        moment = _instant(now) if now else _utcnow()
+        at = _instant(fire_at)
+        with self._conn.transaction(guard="triggers"):
+            trigger = self._get_trigger_or_raise(trigger_id)
+            if not trigger.enabled or self._fired(trigger_id, at):
+                return None
+            box = self._get_box_or_raise(trigger.box_id)
+            if box.status in BOX_TERMINAL:
+                return None
+            waiting = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE box_id = ? AND status = 'pending' "
+                "AND trigger_kind IS NOT NULL",
+                (box.id,),
+            ).fetchone()["n"]
+            run_id = f"t-{uuid.uuid4().hex[:12]}"
+            full = waiting >= TRIGGER_QUEUE_CAP
+            self._conn.execute(
+                "INSERT INTO tasks (id, box_id, prompt, status, created_at, finished_at, org_id, "
+                "client_id, trigger_kind, trigger_id, input_json, error_class) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'schedule', ?, ?, ?)",
+                (
+                    run_id,
+                    box.id,
+                    trigger.prompt,
+                    "cancelled" if full else "pending",
+                    moment,
+                    moment if full else None,
+                    box.org,
+                    box.client,
+                    trigger.id,
+                    json.dumps({"scheduled_for": at, "cron": trigger.cron, "tz": trigger.tz}),
+                    "queue_full" if full else None,
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO trigger_fires (trigger_id, fire_at, run_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (trigger_id, at, run_id, moment),
+            )
+            self._conn.execute(
+                "UPDATE triggers SET last_fired_at = ? WHERE id = ?", (at, trigger_id)
+            )
+        if full:
+            self.add_event(
+                "box",
+                box.id,
+                "schedule_dropped",
+                {"trigger": trigger_id, "fire_at": at, "run": run_id, "waiting": waiting},
+            )
+        return self._get_run_or_raise(run_id)
+
+    def skip_fire(self, trigger_id: str, fire_at: datetime, *, now: datetime | None = None) -> None:
+        """Record `fire_at` as missed, too late to run (`schedules.MISSED_WINDOW`)."""
+        moment = _instant(now) if now else _utcnow()
+        at = _instant(fire_at)
+        with self._conn.transaction(guard="triggers"):
+            trigger = self._get_trigger_or_raise(trigger_id)
+            if not trigger.enabled or self._fired(trigger_id, at):
+                return
+            self._conn.execute(
+                "INSERT INTO trigger_fires (trigger_id, fire_at, run_id, created_at) "
+                "VALUES (?, ?, NULL, ?)",
+                (trigger_id, at, moment),
+            )
+            self._conn.execute(
+                "UPDATE triggers SET last_fired_at = ? WHERE id = ?", (at, trigger_id)
+            )
+        self.add_event(
+            "box",
+            trigger.box_id,
+            "schedule_skipped",
+            {"trigger": trigger_id, "fire_at": at, "reason": "missed by more than an hour"},
+        )
+
+    def _fired(self, trigger_id: str, at: str) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM trigger_fires WHERE trigger_id = ? AND fire_at = ?",
+                (trigger_id, at),
+            ).fetchone()
+            is not None
+        )
+
+    def _get_trigger_or_raise(self, trigger_id: str) -> Trigger:
+        trigger = self.get_trigger(trigger_id)
+        if trigger is None:
+            raise UnknownEntityError(f"no trigger with id {trigger_id!r}")
+        return trigger
+
     # -- a run's approvals (FLOTTA-147) ------------------------------------
 
     def ask_approval(
@@ -4949,6 +5190,38 @@ def _run_from_row(row: db.Row) -> Run:
         steps=json.loads(row["steps_json"]) if row["steps_json"] is not None else None,
         approval_count=int(row["approval_count"]),
         error_class=row["error_class"],
+    )
+
+
+#: Runs an agent may have waiting before its triggers' next ones are dropped.
+TRIGGER_QUEUE_CAP = 3
+
+#: Characters a trigger's prompt may be: what the agent is told, each time.
+MAX_TRIGGER_PROMPT = 8000
+
+
+def _trigger_prompt(prompt: str) -> str:
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("a schedule needs a prompt: what the agent is to do each time")
+    if len(prompt) > MAX_TRIGGER_PROMPT:
+        raise ValueError(f"a schedule's prompt is at most {MAX_TRIGGER_PROMPT} characters")
+    return prompt.strip()
+
+
+def _trigger_from_row(row: db.Row) -> Trigger:
+    return Trigger(
+        id=row["id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        box_id=row["box_id"],
+        kind=row["kind"],
+        cron=row["cron"],
+        tz=row["tz"],
+        prompt=row["prompt"],
+        enabled=bool(row["enabled"]),
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        last_fired_at=row["last_fired_at"],
     )
 
 
