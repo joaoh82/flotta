@@ -884,7 +884,7 @@ bodies will sooner or later block a conversation for a command the agent ran.
 | Setting | Value |
 |---|---|
 | Image | `fly/gateway/Dockerfile` (no flyctl, no box build context) |
-| Command | `flotta gateway --host :: --port 8080` (6PN is IPv6-only) |
+| Command | `flotta gateway --host "" --port 8080`: every address, since 6PN is IPv6 and Fly's check dials IPv4 |
 | Health check | `/health` |
 | `FLOTTA_DATABASE_URL` | The database's external URL, `sslmode=require` |
 | `FLOTTA_SIGNING_KEY` | The **same** value as the control plane |

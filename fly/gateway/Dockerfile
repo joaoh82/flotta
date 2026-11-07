@@ -24,10 +24,12 @@ COPY src/ ./src/
 # `[server]` = postgres + control, which is where the gateway's FastAPI lives.
 RUN pip install --no-cache-dir ".[server]"
 
-# `::`, like a box and unlike the door: the gateway is reached *from other
-# machines* over 6PN, which is IPv6-only, and never through Fly's proxy. A
-# single uvicorn process binds `::` v6-only, which is all 6PN needs.
-ENV FLOTTA_GATEWAY_HOST="::"
+# Empty, meaning every address: one socket on `::` and one on `0.0.0.0`.
+# Agents reach it *from other machines* over 6PN, which is IPv6-only, but Fly's
+# machine check dials IPv4. A single uvicorn process binds `::` v6-only (asyncio
+# sets IPV6_V6ONLY), so `::` alone failed every check with "connection refused"
+# while serving 6PN perfectly — the door's bind story, the other way round.
+ENV FLOTTA_GATEWAY_HOST=""
 ENV FLOTTA_GATEWAY_PORT="8080"
 EXPOSE 8080
 

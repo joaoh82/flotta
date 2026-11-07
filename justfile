@@ -246,7 +246,7 @@ gateway-secrets: fly-whoami
     set -euo pipefail
     APP="${FLOTTA_GATEWAY_APP:-flotta-gateway}"
     : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
-    : "${FLOTTA_GATEWAY_DATABASE_URL:?set FLOTTA_GATEWAY_DATABASE_URL in .env — Render's external URL for flotta-db}"
+    : "${FLOTTA_GATEWAY_DATABASE_URL:?set FLOTTA_GATEWAY_DATABASE_URL in .env — the external URL of flotta-db on Render}"
     : "${FLOTTA_API_KEY:?set FLOTTA_API_KEY in .env — the provider key the gateway calls with}"
     : "${FLOTTA_MODEL_BASE_URL:?set FLOTTA_MODEL_BASE_URL in .env, e.g. https://openrouter.ai/api/v1}"
     {
