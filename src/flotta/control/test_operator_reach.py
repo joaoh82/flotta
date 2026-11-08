@@ -174,3 +174,153 @@ def test_the_operator_repairs_an_agency_agents_connection(api, substrate, fleet)
     response = api.post(f"/api/boxes/{AGENCY_BOX}/connection", headers=OPERATOR)
     assert response.status_code == 200, response.text
     assert substrate == [("repair", box_id)]
+
+
+# -- the CLI, end to end (FLOTTA-162) ------------------------------------------
+
+
+@pytest.fixture
+def cli_on(api, monkeypatch):
+    """The CLI talking to this app, with the token it would mint for itself.
+
+    `control_request` is the CLI's one way to the fleet API, so standing in for
+    the wire there runs everything above it as it runs against Render: the name
+    lookup, the token minted from the signing key, and the act.
+    """
+    from flotta import cli
+
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
+    monkeypatch.delenv("FLOTTA_CONTROL_TOKEN", raising=False)
+
+    def wire(method, path, *, scopes, body=None, env=None, timeout_s=30.0):
+        token = cli.control_token(*scopes, env=env)
+        response = api.request(
+            method, path, json=body, headers={"Authorization": f"Bearer {token}"}
+        )
+        if response.status_code >= 400:
+            raise cli.ControlPlaneError(f"{response.status_code}: {response.json()['detail']}")
+        return response.json()
+
+    monkeypatch.setattr(cli, "control_request", wire)
+    return cli
+
+
+@pytest.fixture
+def moves(monkeypatch):
+    import flotta.provision as provision
+
+    moved: list[str] = []
+
+    def join_gateway(box_id, *, store):
+        moved.append(box_id)
+        return {"box_id": box_id, "name": store.get_box(box_id).name, "started": True}
+
+    monkeypatch.setattr(provision, "gateway_url", lambda env=None: "http://gw.internal:8080/v1")
+    monkeypatch.setattr(provision, "movable_box", lambda box_id, store: (None, "m"))
+    monkeypatch.setattr(provision, "join_gateway", join_gateway)
+    return moved
+
+
+def test_the_operators_cli_moves_an_agency_agent_onto_the_gateway(cli_on, moves, fleet):
+    """FLOTTA-162. `looper--acme--test-agency` answered 404 to the CLI, while the
+    move route itself let the operator act on it: the CLI's lookup came first."""
+    from typer.testing import CliRunner
+
+    with FleetStore(fleet) as store:
+        box_id = store.get_box_by_name(AGENCY_BOX).id
+    for ref in (AGENCY_BOX, box_id):
+        result = CliRunner().invoke(cli_on.app, ["model", "gateway", ref])
+        assert result.exit_code == 0, result.output
+        assert AGENCY_BOX in result.output
+    assert moves == [box_id, box_id]
+
+
+def test_the_operators_cli_upgrades_an_agency_agent(cli_on, substrate):
+    """`flotta upgrade` asked the same scoped lookup first (FLOTTA-162)."""
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(cli_on.app, ["upgrade", AGENCY_BOX])
+    assert result.exit_code == 0, result.output
+    assert substrate == [("upgrade", None)]
+
+
+def test_the_operators_cli_refreshes_an_agency_agents_author(cli_on, fleet, monkeypatch):
+    from typer.testing import CliRunner
+
+    import flotta.provision as provision
+
+    asked: list[str] = []
+
+    def refresh_author(box_id, *, store):
+        asked.append(box_id)
+        return {"box_id": box_id, "name": store.get_box(box_id).name, "changed": False}
+
+    monkeypatch.setattr(provision, "refresh_author", refresh_author)
+    with FleetStore(fleet) as store:
+        box_id = store.get_box_by_name(AGENCY_BOX).id
+    result = CliRunner().invoke(cli_on.app, ["author", "refresh", AGENCY_BOX])
+    assert result.exit_code == 0, result.output
+    assert f"{AGENCY_BOX}  already commits as itself" in result.output
+    assert asked == [box_id]
+
+
+def test_the_operators_cli_lists_and_revokes_an_agency_agents_repositories(cli_on):
+    """FLOTTA-162 review: `repo` asked the same scoped lookup first."""
+    from typer.testing import CliRunner
+
+    # Nothing granted: a grant on an agency's agent needs the agency's own GitHub,
+    # which this fleet has not got. What is asserted is that the routes answer.
+    listed = CliRunner().invoke(cli_on.app, ["repo", "list", AGENCY_BOX, "--json"])
+    assert listed.exit_code == 0, listed.output
+    assert '"repos": []' in listed.output
+
+    revoked = CliRunner().invoke(cli_on.app, ["repo", "revoke", AGENCY_BOX, "joaoh82/flotta"])
+    assert revoked.exit_code == 0, revoked.output
+    assert f"{AGENCY_BOX} was not using joaoh82/flotta" in revoked.output
+
+
+def test_the_operators_cli_gets_the_routes_reason_for_an_agency_grant(cli_on):
+    """The route refuses the operator a grant on an agency's agent (FLOTTA-83).
+    The CLI now shows that reason, not the 404 its lookup answered first."""
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(cli_on.app, ["repo", "grant", AGENCY_BOX, "joaoh82/flotta"])
+    assert result.exit_code != 0
+    assert "403" in result.output
+    assert "not available yet" in result.output
+
+
+def test_an_agencys_own_cli_still_cannot_move_its_agent(cli_on, moves, monkeypatch):
+    """Moving is the fleet's bill and key: the agency finds its agent, and is refused."""
+    from typer.testing import CliRunner
+
+    token = mint(
+        scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE},
+        key=KEY,
+        ttl_s=300,
+        subject="p",
+        org="agency-x",
+    )
+    monkeypatch.setenv("FLOTTA_CONTROL_TOKEN", token)
+    result = CliRunner().invoke(cli_on.app, ["model", "gateway", AGENCY_BOX])
+    assert result.exit_code != 0
+    assert "only the fleet's operator may move an agent" in result.output
+    assert moves == []
+
+
+def test_another_agencys_cli_still_finds_no_such_agent(cli_on, moves, monkeypatch):
+    from typer.testing import CliRunner
+
+    token = mint(
+        scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE},
+        key=KEY,
+        ttl_s=300,
+        subject="p",
+        org="agency-y",
+    )
+    monkeypatch.setenv("FLOTTA_CONTROL_TOKEN", token)
+    result = CliRunner().invoke(cli_on.app, ["model", "gateway", AGENCY_BOX])
+    assert result.exit_code != 0
+    assert "404" in result.output
+    assert moves == []

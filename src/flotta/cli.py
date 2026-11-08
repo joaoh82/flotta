@@ -511,6 +511,22 @@ def _remote_box(box_id: str) -> dict[str, Any]:
     return box
 
 
+def _operated_ref(box_id: str) -> str:
+    """A box name or id as a path segment, for a route that finds the box itself.
+
+    The routes the operator may use on any org's agent (`_operated_box` in the
+    control plane: moving it onto the gateway, upgrading it, its author, its
+    timeline, its repository grants) resolve a name or an id on their own.
+    Asking `_remote_box` first asks `GET /api/boxes/{ref}`, which keeps to the
+    token's org, so the operator met a 404 for every agency's agent before the
+    act was even sent (FLOTTA-162).
+    Anyone else meets the same 404 from the route itself.
+    """
+    from urllib.parse import quote
+
+    return quote(box_id, safe="")
+
+
 def _newest_event_id(box_id: str) -> int:
     """The id of the box's newest event, or 0. Best-effort by construction."""
     from flotta.auth import SCOPE_FLEET_READ
@@ -1547,18 +1563,16 @@ def upgrade(
     from flotta.auth import SCOPE_FLEET_WRITE
 
     if control_url():
-        try:
-            box = _remote_box(box_id)
-        except ControlPlaneError as exc:
-            raise _fail(exc) from exc
-
+        # Not `_remote_box`: see `_operated_ref`. The timeline's route finds the
+        # box by name or id too.
+        ref = _operated_ref(box_id)
         # What the timeline said before the attempt, so a request that dies in
         # transit can still be answered truthfully. See `_upgrade_landed`.
-        before_events = _newest_event_id(box["id"])
+        before_events = _newest_event_id(ref)
         try:
             body = control_request(
                 "POST",
-                f"/api/boxes/{box['id']}/upgrade",
+                f"/api/boxes/{ref}/upgrade",
                 scopes=(SCOPE_FLEET_WRITE,),
                 body={"image": image} if image else {},
                 # `flyctl machine update` waits up to 300s; 30 would report a
@@ -1571,23 +1585,23 @@ def upgrade(
             # repeat that lie, ask the box what happened: the `reimaged` event
             # is written on success, so the timeline is the ground truth and a
             # dropped connection does not have to mean a failed upgrade.
-            landed = _upgrade_landed(box["id"], before_events)
+            landed = _upgrade_landed(ref, before_events)
             if landed is None:
                 raise _fail(exc) from exc
             emit(
-                {"box_id": box["id"], "image": landed.get("to"), "recovered": True},
-                f"{box['name']}  the request did not come back ({exc}), but the "
+                {"box_id": box_id, "image": landed.get("to"), "recovered": True},
+                f"{box_id}  the request did not come back ({exc}), but the "
                 f"upgrade landed: now on {landed.get('to')}",
                 as_json=as_json,
             )
             return
 
         if body.get("already_current"):
-            emit(body, f"{box['name']}  already on {body['image']}", as_json=as_json)
+            emit(body, f"{box_id}  already on {body['image']}", as_json=as_json)
             return
         emit(
             body,
-            f"{box['name']}  {body.get('previous_image') or '(unknown)'} -> {body['image']}",
+            f"{box_id}  {body.get('previous_image') or '(unknown)'} -> {body['image']}",
             as_json=as_json,
         )
         return
@@ -1905,18 +1919,21 @@ def repo_grant(
 
     if control_url():
         try:
-            box = _remote_box(box_id)
+            # Not `_remote_box`: see `_operated_ref`. An agency's agent then meets
+            # the route's own 403 for the operator (FLOTTA-83), not a 404.
             body = control_request(
                 "POST",
-                f"/api/boxes/{box['id']}/repos",
+                f"/api/boxes/{_operated_ref(box_id)}/repos",
                 scopes=(SCOPE_FLEET_WRITE,),
                 body={"repo": repo},
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
+        # The route names no box, so the line says the one that was typed.
+        name = body.get("name") or box_id
         emit(
-            {"box_id": box["id"], "name": box["name"], "repos": body["repos"]},
-            f"{box['name']} may now use {normalise_repo(repo)}",
+            {"box_id": body["box_id"], "name": name, "repos": body["repos"]},
+            f"{name} may now use {normalise_repo(repo)}",
             as_json=as_json,
         )
         return
@@ -1958,17 +1975,19 @@ def repo_revoke(
     if control_url():
         try:
             slug = normalise_repo(repo)
-            box = _remote_box(box_id)
             body = control_request(
-                "DELETE", f"/api/boxes/{box['id']}/repos/{slug}", scopes=(SCOPE_FLEET_WRITE,)
+                "DELETE",
+                f"/api/boxes/{_operated_ref(box_id)}/repos/{slug}",
+                scopes=(SCOPE_FLEET_WRITE,),
             )
         except ValueError as exc:
             raise _fail(exc, code=2) from exc
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
+        name = body.get("name") or box_id
         emit(
-            {"box_id": box["id"], "revoked": body["revoked"], "repos": body["repos"]},
-            f"{box['name']} {'no longer uses' if body['revoked'] else 'was not using'} {slug}",
+            {"box_id": body["box_id"], "revoked": body["revoked"], "repos": body["repos"]},
+            f"{name} {'no longer uses' if body['revoked'] else 'was not using'} {slug}",
             as_json=as_json,
         )
         return
@@ -1996,15 +2015,14 @@ def repo_list(
 
     if control_url():
         try:
-            box = _remote_box(box_id)
             body = control_request(
-                "GET", f"/api/boxes/{box['id']}/repos", scopes=(SCOPE_FLEET_READ,)
+                "GET", f"/api/boxes/{_operated_ref(box_id)}/repos", scopes=(SCOPE_FLEET_READ,)
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
         repos = body["repos"]
         emit(
-            {"box_id": box["id"], "name": box["name"], "repos": repos},
+            {"box_id": body["box_id"], "name": body.get("name") or box_id, "repos": repos},
             "\n".join(f"  {r}" for r in repos) or "  (none — public repositories only)",
             as_json=as_json,
         )
@@ -2631,10 +2649,9 @@ def _move_provider(box_id: str, method: str, as_json: bool) -> None:
             code=2,
         )
     try:
-        box = _remote_box(box_id)
         body = control_request(
             method,
-            f"/api/boxes/{box['id']}/gateway",
+            f"/api/boxes/{_operated_ref(box_id)}/gateway",
             scopes=(SCOPE_FLEET_WRITE,),
             timeout_s=180.0,
         )
@@ -2772,17 +2789,16 @@ def author_refresh(
             code=2,
         )
     try:
-        box = _remote_box(box_id)
         body = control_request(
             "POST",
-            f"/api/boxes/{box['id']}/author",
+            f"/api/boxes/{_operated_ref(box_id)}/author",
             scopes=(SCOPE_FLEET_WRITE,),
             # A running agent restarts before this answers.
             timeout_s=300.0,
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
-    name = body.get("name") or box.get("name") or box_id
+    name = body.get("name") or box_id
     login = body.get("login")
     if not body.get("changed"):
         said = (

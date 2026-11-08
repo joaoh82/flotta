@@ -798,10 +798,10 @@ def test_repo_grant_goes_to_the_control_plane_and_needs_write(tmp_path, monkeypa
         tmp_path,
         monkeypatch,
         ["repo", "grant", "eng-a", "joaoh82/flotta"],
-        box={"id": "b-remote", "name": "eng-a", "repos": ["joaoh82/flotta"]},
+        box={"box_id": "b-remote", "name": "eng-a", "repos": ["joaoh82/flotta"]},
     )
     assert result.exit_code == 0
-    assert calls[-1][0:2] == ("POST", "/api/boxes/b-remote/repos")
+    assert [c[0:2] for c in calls] == [("POST", "/api/boxes/eng-a/repos")]
     assert calls[-1][2] == ["fleet:write"]
     assert calls[-1][3] == {"repo": "joaoh82/flotta"}
 
@@ -812,7 +812,7 @@ def test_repo_list_needs_only_read(tmp_path, monkeypatch):
         tmp_path,
         monkeypatch,
         ["repo", "list", "eng-a"],
-        box={"id": "b-remote", "name": "eng-a", "repos": ["joaoh82/flotta"]},
+        box={"box_id": "b-remote", "name": "eng-a", "repos": ["joaoh82/flotta"]},
     )
     assert result.exit_code == 0
     assert {s for c in calls for s in c[2]} == {"fleet:read"}
@@ -825,10 +825,11 @@ def test_repo_revoke_normalises_before_building_the_url(tmp_path, monkeypatch):
         tmp_path,
         monkeypatch,
         ["repo", "revoke", "eng-a", "https://github.com/joaoh82/Flotta.git"],
-        box={"id": "b-remote", "name": "eng-a", "revoked": True, "repos": []},
+        box={"box_id": "b-remote", "revoked": True, "repos": []},
     )
     assert result.exit_code == 0
-    assert calls[-1][0:2] == ("DELETE", "/api/boxes/b-remote/repos/joaoh82/flotta")
+    assert [c[0:2] for c in calls] == [("DELETE", "/api/boxes/eng-a/repos/joaoh82/flotta")]
+    assert "eng-a no longer uses joaoh82/flotta" in result.output
 
 
 def test_a_malformed_repository_never_reaches_the_control_plane(tmp_path, monkeypatch):
@@ -1053,7 +1054,7 @@ def test_upgrade_goes_to_the_control_plane_and_needs_write(tmp_path, monkeypatch
     )
     assert result.exit_code == 0
     post = next(c for c in calls if c[0] == "POST")
-    assert post[1] == "/api/boxes/b-remote/upgrade"
+    assert post[1] == "/api/boxes/eng-g/upgrade"
     assert post[2] == ["fleet:write"]
     assert post[3] == {"image": "registry/flotta:new"}
 
@@ -1804,7 +1805,7 @@ def test_moving_an_agent_goes_through_the_fleet_api(tmp_path, monkeypatch, comma
     monkeypatch.setattr(cli, "control_request", fake)
     result = CliRunner().invoke(cli.app, ["model", command, "eng-a"])
     assert result.exit_code == 0, result.output
-    assert calls[-1] == (method, "/api/boxes/b-1/gateway")
+    assert calls == [(method, "/api/boxes/eng-a/gateway")]
     assert "restarts twice" in result.output
 
 
