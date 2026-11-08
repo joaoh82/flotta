@@ -216,7 +216,8 @@ def test_the_email_says_who_wants_what_and_where_to_answer(agency):
     assert "12:30 UTC on 2026-11-02" in message.text
     assert "https://app.flotta.dev/" in message.text
     assert "every approval" in message.text
-    assert "<pre>rm -rf /tmp/old-exports</pre>" in message.html
+    assert ">rm -rf /tmp/old-exports</pre>" in message.html
+    assert 'href="https://app.flotta.dev/"' in message.html
 
 
 def test_a_clients_person_is_not_told_the_clients_name(agency):
@@ -231,6 +232,7 @@ def test_a_clients_person_is_not_told_the_clients_name(agency):
     )
 
     assert "Acme Dental" not in message.text
+    assert "Acme Dental" not in message.html
     assert "your assistants page" in message.text
 
 

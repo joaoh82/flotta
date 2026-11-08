@@ -133,6 +133,16 @@ def quote(inner: str) -> str:
     )
 
 
+def code(text: str) -> str:
+    """A command, verbatim and escaped, in the app's mono face where a client has it."""
+    return (
+        f'<pre style="margin:0 0 16px;padding:12px 14px;background:{SUNKEN};'
+        f"border:1px solid {LINE};border-radius:6px;white-space:pre-wrap;word-break:break-all;"
+        f"font-family:'Geist Mono',SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;"
+        f'line-height:20px;color:{INK};">{esc(text)}</pre>'
+    )
+
+
 def _button(label: str, url: str) -> str:
     href = esc(url)
     return (

@@ -110,7 +110,54 @@ _EVERY = {
     "invite": lambda: invite_message("a@b.co", "https://app/sign-in#s3cret", "Acme", "member"),
     "approved": lambda: approved_message("a@b.co", "https://app", "Acme"),
     "declined": lambda: declined_message("a@b.co", "https://app", "Acme", "EU only"),
+    "budget": lambda: _budget_alert(),
+    "approval": lambda: _approval(),
 }
+
+
+def _budget_alert():
+    from flotta.alerts import alert_message
+    from flotta.store import BudgetEvent
+
+    budget = {
+        "spent_eur": "20.01",
+        "limit_eur": "20",
+        "period": "day",
+        "action": "notify",
+        "soft_pct": 0.8,
+        "resets_at": "2026-11-09 00:00 UTC",
+    }
+    event = BudgetEvent(
+        id="e",
+        org="o",
+        client="c",
+        box=None,
+        budget="b",
+        type="budget_limit",
+        period_start="",
+        payload={"budget": budget},
+        ts="",
+    )
+    return alert_message("a@b.co", event, app_url="https://app")
+
+
+def _approval():
+    from types import SimpleNamespace
+
+    from flotta.approval_mail import Recipient, approval_message
+
+    approval = SimpleNamespace(
+        description="delete old exports",
+        command="rm -rf /tmp/<old>",
+        expires_at="2026-11-02T12:30:00+00:00",
+    )
+    return approval_message(
+        Recipient("a@b.co", client=False),
+        approval,  # type: ignore[arg-type]
+        agent="Front desk",
+        client_name="Acme",
+        app_url="https://app",
+    )
 
 
 @pytest.mark.parametrize("kind", list(_EVERY))
@@ -167,3 +214,9 @@ def test_a_name_someone_chose_is_inert_everywhere_it_appears():
         assert "<img src=x" not in message.html
         assert '<a href="x">' not in message.html
         assert "&lt;img src=x onerror=&quot;1&quot;&gt;" in message.html
+
+
+def test_a_command_an_agent_sent_is_shown_verbatim_and_inert():
+    page = _approval().html
+    assert ">rm -rf /tmp/&lt;old&gt;</pre>" in page
+    assert "<old>" not in page
