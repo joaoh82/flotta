@@ -497,14 +497,90 @@ def test_an_org_keeps_its_last_owner(api, fleet, outbox):
     assert api.delete(f"/api/orgs/agency-x/members/{ana_id}", headers=ana).status_code == 409
 
 
+def test_an_owner_changes_someones_role_and_it_holds_at_once(api, fleet, outbox):
+    """No sign-out: Bo's open session is the new role from its next request."""
+    bo = _signed_in(api, outbox, "bo@example.com")
+    with FleetStore(fleet) as store:
+        bo_id = store.get_user_by_email("bo@example.com").id
+    ana = _signed_in(api, outbox, "ana@example.com")
+
+    changed = api.patch(
+        f"/api/orgs/agency-x/members/{bo_id}",
+        json={"role": "client_viewer", "client": "acme"},
+        headers=ana,
+    )
+
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["changed"] == {
+        "user": bo_id,
+        "org": "agency-x",
+        "role": "client_viewer",
+        "client": "acme",
+    }
+    me = api.get("/api/me", headers=bo).json()
+    assert (me["client"], me["scopes"]) == ("acme", ["fleet:read"])
+    members = api.get("/api/orgs/agency-x/members", headers=ana).json()["members"]
+    assert [(m["role"], m["client"]) for m in members] == [
+        ("owner", None),
+        ("client_viewer", "acme"),
+    ]
+
+    promoted = api.patch(f"/api/orgs/agency-x/members/{bo_id}", json={"role": "owner"}, headers=ana)
+    assert promoted.json()["changed"]["client"] is None
+    assert "org:admin" in api.get("/api/me", headers=bo).json()["scopes"]
+
+
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        ({"role": "client_user"}, 422),
+        ({"role": "owner", "client": "acme"}, 422),
+        ({"role": "admin"}, 422),
+        ({}, 422),
+        ({"role": "client_user", "client": "nope"}, 404),
+    ],
+)
+def test_a_role_change_that_could_not_be_a_membership_is_refused(api, fleet, outbox, body, status):
+    with FleetStore(fleet) as store:
+        bo_id = store.get_user_by_email("bo@example.com").id
+    ana = _signed_in(api, outbox, "ana@example.com")
+    assert api.patch(f"/api/orgs/agency-x/members/{bo_id}", json=body, headers=ana).status_code == (
+        status
+    )
+    with FleetStore(fleet) as store:
+        assert store.membership(bo_id, "agency-x").role == "member"
+
+
+def test_the_last_owner_is_not_demoted(api, fleet, outbox):
+    ana = _signed_in(api, outbox, "ana@example.com")
+    ana_id = api.get("/api/me", headers=ana).json()["user"]["id"]
+    demoted = api.patch(
+        f"/api/orgs/agency-x/members/{ana_id}", json={"role": "member"}, headers=ana
+    )
+    assert demoted.status_code == 409
+    assert (
+        api.patch(
+            "/api/orgs/agency-x/members/u-nobody", json={"role": "member"}, headers=ana
+        ).status_code
+        == 404
+    )
+
+
 def test_only_an_orgs_admins_change_its_team(api, fleet, outbox):
     with FleetStore(fleet) as store:
         ana_id = store.get_user_by_email("ana@example.com").id
     bo = _signed_in(api, outbox, "bo@example.com")
     assert api.delete(f"/api/orgs/agency-x/members/{ana_id}", headers=bo).status_code == 403
+    member = {"role": "member"}
+    assert api.patch(
+        f"/api/orgs/agency-x/members/{ana_id}", json=member, headers=bo
+    ).status_code == (403)
     pat = _session(_sign_up(api, outbox))
     assert api.get("/api/orgs/agency-x/members", headers=pat).status_code == 404
     assert api.delete(f"/api/orgs/agency-x/members/{ana_id}", headers=pat).status_code == 404
+    assert api.patch(
+        f"/api/orgs/agency-x/members/{ana_id}", json=member, headers=pat
+    ).status_code == (404)
 
 
 # -- telling the agency (FLOTTA-143) ------------------------------------------

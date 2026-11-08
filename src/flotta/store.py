@@ -1721,6 +1721,45 @@ class FleetStore:
         ).fetchall()
         return [_membership_from_row(r) for r in rows]
 
+    def change_membership(
+        self, user_id: str, org_id: str, role: str, *, client_id: str | None = None
+    ) -> Membership:
+        """Make `user_id` a `role` in `org_id`, confined to `client_id` if named.
+
+        The membership is the whole grant, so this is the whole change: M12.2
+        re-reads it on every request, and a session already open acts as the
+        new role from its next request, with nobody signed out. That holds for
+        a demotion too, which is the case that has to.
+
+        The same rules as `add_membership`, and the same one as
+        `remove_membership`: an org's last owner stays an owner, under `users`'
+        guard so two owners demoting each other at once cannot both succeed.
+        """
+        try:
+            scopes_for_role(role, client=client_id)
+        except AuthError as exc:
+            raise InvalidAccountError(str(exc)) from exc
+        with self._conn.transaction(guard="users"):
+            membership = self.membership(user_id, org_id)
+            if membership is None:
+                raise UnknownEntityError(f"user {user_id!r} is not in org {org_id!r}")
+            if client_id is not None and self.get_client(org_id, client_id) is None:
+                raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+            if membership.role == "owner" and role != "owner":
+                owners = [m for m in self.members_of(org_id) if m.role == "owner"]
+                if len(owners) == 1:
+                    raise LastOwnerError(
+                        f"{user_id!r} is org {org_id!r}'s only owner; make someone else "
+                        "an owner first"
+                    )
+            self._conn.execute(
+                "UPDATE memberships SET role = ?, client_id = ? WHERE user_id = ? AND org_id = ?",
+                (role, client_id, user_id, org_id),
+            )
+            changed = self.membership(user_id, org_id)
+        assert changed is not None
+        return changed
+
     def remove_membership(self, user_id: str, org_id: str) -> Membership:
         """Take `user_id` out of `org_id`, and end their sessions there now.
 
