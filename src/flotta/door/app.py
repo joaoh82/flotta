@@ -627,6 +627,51 @@ class ControlPlane:
             response = await http.post(url, headers=self._headers(), json=body)
         response.raise_for_status()
 
+    async def ask_chat_approval(
+        self, box_id: str, run_id: str, *, request_id: str, params: dict[str, Any]
+    ) -> str:
+        """The agent asked a person in this turn: the approval's id (FLOTTA-166)."""
+        body = {
+            "request_id": request_id,
+            "command": params.get("command"),
+            "description": params.get("description"),
+            "choices": params.get("choices"),
+        }
+        response = await self._door_post(f"/api/boxes/{box_id}/runs/{run_id}/approvals", body)
+        return str(response.json()["id"])
+
+    async def held_chat_approvals(self, box_id: str, run_id: str) -> list[dict[str, Any]]:
+        """The turn's approvals, saying the door still holds its socket."""
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}/api/boxes/{box_id}/runs/{run_id}/approvals"
+        async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
+            response = await http.get(url, headers=self._headers())
+        response.raise_for_status()
+        return list(response.json().get("approvals") or [])
+
+    async def settle_chat_approval(
+        self, box_id: str, run_id: str, *, request_id: str, choice: str | None, by: str | None
+    ) -> None:
+        """Settled on the socket: answered there, or withdrawn by the box."""
+        body = {"request_id": request_id, "choice": choice, "by": by}
+        await self._door_post(f"/api/boxes/{box_id}/runs/{run_id}/approvals/settled", body)
+
+    async def chat_approval_delivered(self, box_id: str, run_id: str, approval_id: str) -> None:
+        """An answer from outside reached the box."""
+        await self._door_post(
+            f"/api/boxes/{box_id}/runs/{run_id}/approvals/{approval_id}/delivered", None
+        )
+
+    async def _door_post(self, path: str, body: Any) -> Any:
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}{path}"
+        async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
+            response = await http.post(url, headers=self._headers(), json=body)
+        response.raise_for_status()
+        return response
+
     async def _call(self, method: str, path: str, *, name: str, verb: str, json: Any = None) -> Any:
         """One request to the fleet API, with the door's errors mapped once."""
         import httpx
@@ -1119,6 +1164,19 @@ def create_door(
                 max_size=BOX_FRAME_LIMIT,
             ) as upstream:
                 liveness.connected(upstream.send)
+
+                async def deliver(srq: str, session: str, choice: str) -> None:
+                    """An answer given from outside the conversation (FLOTTA-166):
+                    to the box as the reply to its own request, then the card down."""
+                    reply = {"jsonrpc": "2.0", "id": srq, "result": {"choice": choice}}
+                    await upstream.send(json.dumps(reply))
+                    withdrawn = gate.answered_elsewhere(srq, session)
+                    if withdrawn is not None:
+                        with contextlib.suppress(Exception):
+                            await websocket.send_text(withdrawn)
+
+                if turns is not None:
+                    turns.attach(deliver)
 
                 async def downstream_to_box() -> None:
                     while True:

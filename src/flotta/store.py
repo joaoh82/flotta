@@ -4409,9 +4409,10 @@ class FleetStore:
         whose socket it heard, and a run of any other box, or one the control
         plane delivers, is `UnknownEntityError` to it.
         """
-        run = self.get_run(run_id)
-        if run is None or run.box_id != box_id or run.trigger_kind != "chat":
-            raise UnknownEntityError(f"no chat run {run_id!r} on box {box_id!r}")
+        self.chat_run_of(run_id, box_id)
+        # The turn is over, and the box denied on its way out whatever it was
+        # still asking: the rows say the same (FLOTTA-166).
+        self.expire_approvals(run_id, now=now)
         return self.finish_run(
             run_id,
             status,
@@ -5127,6 +5128,53 @@ class FleetStore:
                     (_instant(now) if now else _utcnow(), run_id),
                 )
         return [self._get_approval_or_raise(i) for i in ids]
+
+    def settle_approval(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        choice: str | None,
+        by: str | None,
+        now: datetime | None = None,
+    ) -> RunApproval | None:
+        """A conversation's approval settled on its own socket (FLOTTA-166).
+
+        `choice` is what the person there answered, which the box has already
+        heard, so it is answered and delivered at once. None is the box
+        withdrawing it (`request.cancel`), as it does when its own timeout
+        denies it. Only a waiting one changes: an answer from outside that got
+        there first stands. None when the run never recorded `request_id`.
+        """
+        moment = _instant(now) if now else _utcnow()
+        with self._conn.transaction(guard="run_approvals"):
+            row = self._conn.execute(
+                "SELECT id, status FROM run_approvals WHERE run_id = ? AND request_id = ?",
+                (run_id, request_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "waiting":
+                if choice is None:
+                    self._conn.execute(
+                        "UPDATE run_approvals SET status = 'expired', answered_at = ? WHERE id = ?",
+                        (moment, row["id"]),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE run_approvals SET status = 'answered', choice = ?, "
+                        "answered_by = ?, answered_at = ?, delivered_at = ? WHERE id = ?",
+                        (choice, by, moment, moment, row["id"]),
+                    )
+        return self._get_approval_or_raise(row["id"])
+
+    def chat_run_of(self, run_id: str, box_id: str) -> Run:
+        """`box_id`'s chat run `run_id`, or `UnknownEntityError`: the door names
+        the box whose socket it heard, and nothing else is its to touch."""
+        run = self.get_run(run_id)
+        if run is None or run.box_id != box_id or run.trigger_kind != "chat":
+            raise UnknownEntityError(f"no chat run {run_id!r} on box {box_id!r}")
+        return run
 
     def get_approval(self, approval_id: str) -> RunApproval | None:
         row = self._conn.execute(

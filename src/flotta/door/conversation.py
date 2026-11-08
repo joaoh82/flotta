@@ -31,6 +31,10 @@ snapshot. So the door keeps the question from this socket and accepts an answer
 only to something the box asked this socket. An approval nobody answers is denied
 when `approvals.timeout` runs out, which is `flotta.box.approvals`'s rule.
 
+Kept from the client, it is not lost: the door records it on the turn's run
+(`flotta.door.turns`, FLOTTA-166), so the agency answers it from its Home, and
+the answer comes back to the box through this socket.
+
 The agency can allow it per agent, which the ticket says. Such a socket hears the
 question and may answer it, but only with `CLIENT_APPROVAL_CHOICES`, and the
 answer is rebuilt so that only the choice reaches the box: "all" in it would settle
@@ -499,6 +503,26 @@ class ConversationGate:
         self._approvals.pop(request_id, None)
         for srq in [s for s, r in self._approval_of.items() if r == request_id]:
             del self._approval_of[srq]
+
+    def answered_elsewhere(self, srq: str, session: str) -> str | None:
+        """The box's approval `srq` was answered from outside this conversation
+        (FLOTTA-166), and the door has sent the box that answer. What the client
+        is sent to take its card down, or None for a socket never shown one."""
+        self._open.pop(srq, None)
+        self._answered(srq)
+        if self.conversation_only and not self.answers_approvals:
+            return None
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "request.cancel",
+                    "session_id": session,
+                    "payload": {"id": srq, "method": APPROVAL_METHOD, "reason": "answered"},
+                },
+            }
+        )
 
     def _note(self, what: str) -> None:
         _log.warning("refused %s from %s on %s", what, self._subject, self._box_id)
