@@ -20,6 +20,19 @@
 # success, changes no arguments, and in every case it cannot help it `exec`s
 # the real `gh` unchanged. `gh --version` is `gh --version`.
 #
+# ## Pull requests, the two exceptions (FLOTTA-171)
+#
+# `gh pr merge` asks the agency first (`flotta-pr may-merge`) and is refused
+# unless the agency lets this agent merge its own pull requests, or when it
+# cannot be asked. That is a guard against an agent merging by mistake, or
+# because someone in a conversation told it to, and not a wall: the agent has
+# root, `/usr/bin/gh` is right there, and so is the REST API.
+#
+# `gh pr create` that succeeds is followed by `flotta-pr report <url>`, so the
+# agency sees the pull request and its reviews come back to the agent. It
+# prints nothing when that works and one `flotta:` line when it does not; the
+# pull request is made either way, and `gh`'s exit status is the shim's.
+#
 # ## What it does not fix
 #
 # The token lands in the real `gh`'s environment, where the agent could read
@@ -33,6 +46,20 @@ REAL_GH=/usr/bin/gh
 if [ ! -x "$REAL_GH" ]; then
   echo "flotta: $REAL_GH is missing — the gh shim has nothing to wrap" >&2
   exit 127
+fi
+
+# `gh pr merge`, unless asking how to use it: the agency's to allow.
+if [ "${1:-}" = pr ] && [ "${2:-}" = merge ]; then
+  wants_help=0
+  for arg in "$@"; do
+    case "$arg" in -h | --help) wants_help=1 ;; esac
+  done
+  if [ "$wants_help" -eq 0 ]; then
+    if ! answer=$(flotta-pr may-merge 2>&1); then
+      echo "flotta: gh pr merge refused. ${answer:-The agency could not be asked whether this agent may merge.}" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Something already authenticated this shell. Its choice wins.
@@ -67,6 +94,34 @@ token=$(printf '%s\n' "$credential" | sed -n 's/^password=//p' | head -1)
 # this script could, and for a public repo some subcommands work regardless.
 if [ -z "$token" ]; then
   exec "$REAL_GH" "$@"
+fi
+
+# `gh pr create`: made as asked, then the agency is told which pull request.
+if [ "${1:-}" = pr ] && [ "${2:-}" = create ]; then
+  env GH_TOKEN="$token" "$REAL_GH" "$@"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    head="" repo="" dry=0 previous=""
+    for arg in "$@"; do
+      case "$previous" in -H | --head) head=$arg ;; -R | --repo) repo=$arg ;; esac
+      case "$arg" in
+        --head=*) head=${arg#--head=} ;;
+        --repo=*) repo=${arg#--repo=} ;;
+        --dry-run | --web | -w) dry=1 ;;
+      esac
+      previous=$arg
+    done
+    if [ "$dry" -eq 0 ]; then
+      view=(pr view)
+      [ -n "$head" ] && view+=("$head")
+      [ -n "$repo" ] && view+=(--repo "$repo")
+      url=$(env GH_TOKEN="$token" "$REAL_GH" "${view[@]}" --json url --jq .url 2>/dev/null || true)
+      if [ -z "$url" ] || ! flotta-pr report "$url" >/dev/null 2>&1; then
+        echo "flotta: the agency was not told about this pull request. Run: flotta-pr report <its url>" >&2
+      fi
+    fi
+  fi
+  exit "$status"
 fi
 
 exec env GH_TOKEN="$token" "$REAL_GH" "$@"

@@ -1,5 +1,7 @@
 """The skills Flotta ships in the box image (FLOTTA-61)."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -180,3 +182,17 @@ def test_the_projects_skill_says_the_folder_does_not_survive_an_update():
     assert "sync `main`" in body
     assert "re-clone" in body.lower() or "clone it" in body.lower()
     assert "update" in body.lower()
+
+
+def test_the_github_skill_tells_the_agent_about_its_pull_requests():
+    """FLOTTA-171/172: reviews come to the agent, and merging is the agency's.
+    A skill that names a command the image does not install fails quietly."""
+    import tomllib
+
+    pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts["flotta-pr"] == "flotta.box.pulls:main"
+    _, body = _skill("flotta-github-access")
+    assert "flotta-pr report" in body
+    assert "You do not need to check for reviews" in body
+    assert "gh pr merge" in body

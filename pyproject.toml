@@ -60,6 +60,9 @@ git-credential-flotta = "flotta.box.git_credential:main"
 flotta-repos = "flotta.box.repos:main"
 # What an agent runs to ask a colleague a question (M7, FLOTTA-54).
 flotta-ask = "flotta.box.ask:main"
+# This agent's pull requests: reported after `gh pr create`, asked before
+# `gh pr merge`, and listed (FLOTTA-171). The box's `gh` calls the first two.
+flotta-pr = "flotta.box.pulls:main"
 # Where this agent clones projects (FLOTTA-56). The path is in the
 # environment; the command exists so the agent does not have to guess it,
 # and so it is told the folder does not survive an image update.

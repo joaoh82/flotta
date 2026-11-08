@@ -80,6 +80,7 @@ from flotta.auth import (
 from flotta.control.loop import DEFAULT_INTERVAL_S, LoopState, run_reconcile_loop
 from flotta.control.ratelimit import RateLimit, hit_all
 from flotta.github import GITHUB_TOKEN_ENV
+from flotta.pulls import run_pull_request_loop
 from flotta.relay import (
     DEFAULT_TIMEOUT_S as RELAY_TIMEOUT_S,
 )
@@ -599,6 +600,9 @@ def create_app(
     #: Injected for the reason `deliver` is. `None` goes through the front
     #: door, and needs a signing key to mint the run's token.
     deliver_run: Any = None,
+    #: Reads and merges the pull requests agents open (FLOTTA-171), as
+    #: `pulls.Fetch`. Injected for the reason `reachable` is; `None` is GitHub.
+    github_fetch: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -1023,12 +1027,32 @@ def create_app(
     #: hop counter, and neither must two fleets in one process.
     chains = Chains()
 
+    def _github_fetch(method: str, url: str, **kwargs: Any) -> tuple[int, Any]:
+        if github_fetch is not None:
+            return github_fetch(method, url, **kwargs)
+        from flotta.github_app import _httpx_fetch
+
+        return _httpx_fetch(method, url, **kwargs)
+
+    def _sweep_token(store: Any, box: Any, repo: str) -> str:
+        """A repository token for the pull-request sweep, refused as the box would be."""
+        from flotta.repo_tokens import repo_token
+
+        return repo_token(
+            store,
+            box,
+            repo,
+            github_app=_github_app_or_none(),
+            fleet_token=(os.environ.get(GITHUB_TOKEN_ENV) or "").strip(),
+        )[0]
+
     @asynccontextmanager
     async def lifespan(app: Any):
         task: asyncio.Task | None = None
         alerts: asyncio.Task | None = None
         notices: asyncio.Task | None = None
         runs: asyncio.Task | None = None
+        pulls_task: asyncio.Task | None = None
         if run_loop:
             # `loop_runner` makes the *interesting* failure testable: a loop
             # that is configured and supposed to be running, but is not
@@ -1050,6 +1074,10 @@ def create_app(
             # Approvals waiting past a minute, emailed to whoever can answer (FLOTTA-167).
             notices = asyncio.create_task(
                 run_approval_mail_loop(store_factory, mailer=deliver_link, app_url=link_base)
+            )
+            # Pull requests agents opened, read again from GitHub (FLOTTA-171/172).
+            pulls_task = asyncio.create_task(
+                run_pull_request_loop(store_factory, token_for=_sweep_token, fetch=_github_fetch)
             )
             if carry_run is not None:
                 from flotta.runner import run_run_loop
@@ -1076,6 +1104,10 @@ def create_app(
                 notices.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await notices
+            if pulls_task is not None:
+                pulls_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pulls_task
 
     app = FastAPI(title="Flotta control plane", lifespan=lifespan)
     app.state.loop_state = state
@@ -1351,6 +1383,21 @@ def create_app(
                 + ", ".join(f"${name}" for name in missing_settings(os.environ)),
             )
         return app_
+
+    def _repo_token(store: Any, box: Any, repo: str) -> tuple[str, str, str]:
+        """`repo_tokens.repo_token` for a route: its refusal is the route's answer."""
+        from flotta.repo_tokens import RepoTokenError, repo_token
+
+        try:
+            return repo_token(
+                store,
+                box,
+                repo,
+                github_app=_github_app_or_none(),
+                fleet_token=(os.environ.get(GITHUB_TOKEN_ENV) or "").strip(),
+            )
+        except RepoTokenError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
 
     def _state_key() -> str:
         """Signing a state needs the fleet's key, and an open control plane has none."""
@@ -5988,11 +6035,6 @@ def create_app(
         root. Without this check one box's token would reach every other box's
         grants, which is precisely the containment the grants exist to provide.
         """
-        from flotta.github_app import GitHubAppError, InstallationGone, RepositoryNotSelected
-        from flotta.store import normalise_repo
-
-        fleet_token = (os.environ.get(GITHUB_TOKEN_ENV) or "").strip()
-
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
@@ -6004,56 +6046,206 @@ def create_app(
             repo = str(body.get("repo") or "").strip()
             if not repo:
                 raise HTTPException(status_code=422, detail="which repository?")
-            try:
-                if not store.may_use_repo(box.id, repo):
-                    raise HTTPException(
-                        status_code=403,
-                        detail=f"box {box.name!r} is not granted {repo!r}. Grant it on the "
-                        f"agent's page, or with `flotta repo grant {box.name} {repo}`.",
-                    )
-                repo = normalise_repo(repo)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-            installation = store.github_installation_for(box.org, box.client, repo)
-            if installation is None:
-                # Whatever the grants say: a grant from before FLOTTA-83 must
-                # not hand another org's agent the operator's token, and one made
-                # on an account since disconnected was never authorised to use it.
-                if not store.may_spend_fleet_token(box.id, repo):
-                    raise HTTPException(status_code=403, detail=AGENCY_GITHUB_UNAVAILABLE)
-                if not fleet_token:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"no ${GITHUB_TOKEN_ENV} configured on the control plane; "
-                        f"boxes can read public repositories and nothing else",
-                    )
-                password, source = fleet_token, "fleet_token"
-            else:
-                try:
-                    password = _configured_github_app().token_for(
-                        installation.installation_id, repo.split("/")[1]
-                    )
-                except InstallationGone as exc:
-                    raise HTTPException(
-                        status_code=403,
-                        detail=f"the GitHub connection to {installation.account} was removed "
-                        f"or suspended on GitHub. Connect it again to use {repo}.",
-                    ) from exc
-                except RepositoryNotSelected as exc:
-                    raise HTTPException(
-                        status_code=403,
-                        detail=f"{repo} is no longer among the repositories selected for "
-                        f"Flotta on {installation.account}. Add it there on GitHub.",
-                    ) from exc
-                except GitHubAppError as exc:
-                    raise HTTPException(status_code=502, detail=str(exc)) from exc
-                source = "github_app"
+            password, source, repo = _repo_token(store, box, repo)
 
             store.add_event("box", box.id, "git_credential", {"repo": repo, "source": source})
             # The username is ignored by GitHub when the password is a token;
             # `x-access-token` is the convention its own docs use.
             return {"username": "x-access-token", "password": password, "repo": repo}
+        finally:
+            store.close()
+
+    # -- pull requests (FLOTTA-171, FLOTTA-172) ---------------------------------
+
+    needs_box_or_read = Depends(require(SCOPE_FLEET_READ, SCOPE_GIT_CREDENTIAL, any_of=True))
+
+    def _scoped_pull(store: Any, token: Token | None, pull_id: str) -> Any:
+        """A pull request `token` may act on, or 404, as `_scoped_box` is for a box."""
+        pr = store.get_pull_request(pull_id)
+        if pr is None or (
+            token is not None
+            and (
+                admits_tenant(token, org=pr.org, client=pr.client) is not None
+                or (token.box is not None and token.box != pr.box_id)
+            )
+        ):
+            raise HTTPException(status_code=404, detail=f"no pull request {pull_id!r}")
+        return pr
+
+    def _policy_view(policy: Any) -> dict[str, Any]:
+        return {"may_merge": policy.may_merge, "follow_reviews": policy.follow_reviews}
+
+    @app.post("/api/boxes/{box_id}/pull-requests")
+    def report_pull_request(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_git
+    ) -> Any:
+        """A pull request this agent opened (`flotta-pr report`, which its `gh`
+        runs after `gh pr create`). `{"url": "https://github.com/o/r/pull/n"}`.
+
+        The box says which PR; GitHub says what it is. It is read with a token
+        for a repository this box is granted, so a box can report only a real
+        PR, in a repository it was given. Reporting the same PR again answers
+        it as it is (`created: false`).
+        """
+        from flotta import pulls
+
+        try:
+            repo, number = pulls.parse_url(str(body.get("url") or ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "report pull requests for")
+            github, _, repo = _repo_token(store, box, repo)
+            try:
+                fresh = pulls.read_pull(_github_fetch, github, repo, number)
+            except pulls.PullError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+            try:
+                pr, created = store.record_pull_request(box.id, repo=repo, number=number, **fresh)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if created:
+                store.add_event(
+                    "box",
+                    box.id,
+                    "pull_request_opened",
+                    {"repo": repo, "number": number, "title": pr.title},
+                )
+            return {"pull_request": pulls.view(store, pr), "created": created}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/pull-requests")
+    def box_pull_requests(box_id: str, token: Token | None = needs_box_or_read) -> Any:
+        """This agent's pull requests: every open one, then the latest others."""
+        from flotta import pulls
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "read the pull requests of")
+            found = store.pull_requests(org=box.org, box=box.id)
+            return {"pull_requests": [pulls.view(store, pr) for pr in found]}
+        finally:
+            store.close()
+
+    @app.get("/api/pull-requests")
+    def list_pull_requests(token: Token | None = needs_read) -> Any:
+        """Every pull request the caller's agents opened: the org's for the
+        agency, one client's for its people. Open first, newest first."""
+        from flotta import pulls
+
+        if token is not None and (token.box is not None or subject_box(token.subject)):
+            raise HTTPException(status_code=403, detail="an agent reads its own, on its own box")
+        org = (token.org if token else None) or DEFAULT_ORG
+        store = store_factory()
+        try:
+            found = store.pull_requests(org=org, client=token.client if token else None)
+            return {"pull_requests": [pulls.view(store, pr) for pr in found]}
+        finally:
+            store.close()
+
+    @app.post("/api/pull-requests/{pull_id}/merge")
+    def merge_pull_request(
+        pull_id: str, body: dict[str, Any] | None = None, token: Token | None = needs_write
+    ) -> Any:
+        """Merge an agent's pull request from Flotta, as the agency.
+
+        With the same token the agent would have had for the repository, so the
+        agency can merge only what its agent was granted. `{"method": "squash"}`
+        (the default), `"merge"` or `"rebase"`; GitHub's own refusal (a branch
+        rule, a conflict) is the 409's words.
+        """
+        from flotta import pulls
+
+        method = str((body or {}).get("method") or "squash")
+        store = store_factory()
+        try:
+            pr = _scoped_pull(store, token, pull_id)
+            if pr.state != "open":
+                raise HTTPException(status_code=409, detail=f"{pr.repo}#{pr.number} is {pr.state}")
+            box = _scoped_box(store, token, pr.box_id)
+            github, _, _ = _repo_token(store, box, pr.repo)
+            try:
+                pulls.merge(_github_fetch, github, pr.repo, pr.number, method)
+            except pulls.PullError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+            who = (_person(store, token.subject) if token is not None else None) or "the operator"
+            # GitHub said it merged. Who it says merged it, and when, is read
+            # back when it can be; if not, now is close enough until the sweep.
+            changes: dict[str, Any] = {
+                "merged_by_person": who,
+                "state": "merged",
+                "merged_at": datetime.now(UTC).isoformat(),
+            }
+            with contextlib.suppress(pulls.PullError):
+                fresh = pulls.read_pull(_github_fetch, github, pr.repo, pr.number)
+                if fresh["state"] == "merged":
+                    changes.update(merged_at=fresh["merged_at"], merged_by=fresh["merged_by"])
+            pr = store.update_pull_request(pr.id, **changes)
+            store.add_event(
+                "box",
+                pr.box_id,
+                "pull_request_merged",
+                {"repo": pr.repo, "number": pr.number, "by": who, "method": method, "in": "flotta"},
+            )
+            return {"pull_request": pulls.view(store, pr)}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/pr-policy")
+    def get_pr_policy(box_id: str, token: Token | None = needs_box_or_read) -> Any:
+        """Whether this agent may merge its own pull requests, and follows their
+        reviews. Its own box asks before `gh pr merge` (`flotta-pr may-merge`)."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "read the pull-request policy of")
+            return _policy_view(store.pr_policy(box.id))
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/pr-policy")
+    def put_pr_policy(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """Change either or both: `{"may_merge": bool, "follow_reviews": bool}`.
+
+        "May merge" is enforced by the box's `gh`, which asks before it merges:
+        a guard against an agent merging by mistake or because someone asked it
+        to, not a wall, since the agent has root and its token may merge.
+        """
+        from flotta.store import PrPolicy
+
+        unknown = set(body) - {"may_merge", "follow_reviews"}
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"no setting {sorted(unknown)[0]!r}")
+        for key, value in body.items():
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"{key} is true or false")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            current = store.pr_policy(box.id)
+            policy = store.set_pr_policy(
+                box.id,
+                PrPolicy(
+                    may_merge=body.get("may_merge", current.may_merge),
+                    follow_reviews=body.get("follow_reviews", current.follow_reviews),
+                ),
+            )
+            store.add_event(
+                "box",
+                box.id,
+                "pr_policy_set",
+                {
+                    **_policy_view(policy),
+                    "by": token.subject if token is not None else "operator",
+                },
+            )
+            return _policy_view(policy)
         finally:
             store.close()
 

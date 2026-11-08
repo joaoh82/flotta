@@ -225,6 +225,15 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/keys", SCOPE_FLEET_WRITE, {"name": "theirs"}),
     ("GET", "/api/boxes/{b}/keys", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/peer/ask", SCOPE_BOX_PEER, {"peer": "eng-a", "message": "hi"}),
+    (
+        "POST",
+        "/api/boxes/{b}/pull-requests",
+        SCOPE_GIT_CREDENTIAL,
+        {"url": "https://github.com/acme/secrets/pull/1"},
+    ),
+    ("GET", "/api/boxes/{b}/pull-requests", SCOPE_FLEET_READ, None),
+    ("GET", "/api/boxes/{b}/pr-policy", SCOPE_FLEET_READ, None),
+    ("PUT", "/api/boxes/{b}/pr-policy", SCOPE_FLEET_WRITE, {"may_merge": True}),
 ]
 
 

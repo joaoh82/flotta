@@ -828,6 +828,84 @@ class Trigger:
     last_fired_at: str | None
 
 
+#: What a pull request can be, as `pull_requests.state` keeps it (FLOTTA-171).
+PULL_STATES: frozenset[str] = frozenset({"open", "closed", "merged"})
+
+#: The reviewers' standing verdict on a pull request, when they have given one.
+REVIEW_STATES: frozenset[str] = frozenset({"approved", "changes_requested", "commented"})
+
+#: What `update_pull_request` may change. Who opened it, where, and when it was
+#: reported are fixed when the row is made.
+_PULL_FIELDS: frozenset[str] = frozenset(
+    {
+        "title",
+        "head_ref",
+        "base_ref",
+        "state",
+        "draft",
+        "review_state",
+        "merged_at",
+        "merged_by",
+        "merged_by_person",
+        "closed_at",
+        "checked_at",
+        "check_error",
+        "feedback_seen_at",
+        "followups",
+        "followup_run_id",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequest:
+    """A pull request an agent opened, as GitHub last said it was (FLOTTA-171)."""
+
+    id: str
+    box_id: str
+    org: str
+    client: str
+    #: `owner/name`, as `normalise_repo` writes it.
+    repo: str
+    number: int
+    url: str
+    title: str
+    #: Who GitHub says opened it: the App's bot, or the fleet token's owner.
+    author_login: str | None
+    head_ref: str | None
+    base_ref: str | None
+    #: `open`, `closed` or `merged`.
+    state: str
+    draft: bool
+    #: `approved`, `changes_requested`, `commented`, or None for no review yet.
+    review_state: str | None
+    opened_at: str
+    merged_at: str | None
+    #: The GitHub login that merged it.
+    merged_by: str | None
+    #: Who merged it from Flotta, by name or email; None when it was GitHub.
+    merged_by_person: str | None
+    closed_at: str | None
+    reported_at: str
+    checked_at: str | None
+    #: Why the last look at GitHub failed, in words; None when it worked.
+    check_error: str | None
+    #: The newest feedback already answered, or there when it was reported.
+    feedback_seen_at: str
+    followups: int
+    followup_run_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PrPolicy:
+    """What the agency lets one agent do with its own pull requests."""
+
+    #: Merge them itself. Off unless the agency turns it on.
+    may_merge: bool = False
+    #: Be sent their reviews to address, until they are merged or closed.
+    follow_reviews: bool = True
+
+
 #: The longest an API key's name may be: a label in a list, like "crm".
 API_KEY_NAME_MAX = 64
 
@@ -4584,6 +4662,183 @@ class FleetStore:
         ).fetchone()
         return row["id"] if row else None
 
+    def was_working(self, box_id: str, at: datetime) -> bool:
+        """Whether `box_id` was doing a run, a conversation's turn included, at `at`."""
+        return self._run_for_call(box_id, None, at) is not None
+
+    # -- pull requests (FLOTTA-171) -------------------------------------------
+
+    def record_pull_request(
+        self,
+        box_id: str,
+        *,
+        repo: str,
+        number: int,
+        url: str,
+        title: str,
+        author_login: str | None,
+        head_ref: str | None,
+        base_ref: str | None,
+        state: str,
+        draft: bool,
+        opened_at: str,
+        merged_at: str | None = None,
+        merged_by: str | None = None,
+        closed_at: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PullRequest, bool]:
+        """The pull request `box_id` opened, made if it is new; and whether it was.
+
+        Reported twice by its own agent is the same row, not an error: `gh` runs
+        the report after every `gh pr create`, and a retry is the same PR. One
+        reported by a *different* agent is refused, since a PR is one agent's.
+        Whose it is comes from the box's row. Feedback already on the PR when
+        it is reported counts as seen: the agent is answering a review, not
+        being sent the history of one.
+        """
+        if state not in PULL_STATES:
+            raise ValueError(f"a pull request is {sorted(PULL_STATES)}, not {state!r}")
+        repo = normalise_repo(repo)
+        reported = _instant(now) if now else _utcnow()
+        with self._conn.transaction(guard="pull_requests"):
+            box = self._get_box_or_raise(box_id)
+            row = self._conn.execute(
+                "SELECT * FROM pull_requests WHERE repo = ? AND number = ?", (repo, number)
+            ).fetchone()
+            if row is not None:
+                existing = _pull_from_row(row)
+                if existing.box_id != box.id:
+                    raise ValueError(
+                        f"{repo}#{number} was reported by another agent; a pull request is one "
+                        "agent's"
+                    )
+                return existing, False
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            pull_id = f"pr-{uuid.uuid4().hex[:12]}"
+            self._conn.execute(
+                "INSERT INTO pull_requests (id, box_id, org_id, client_id, repo, number, url, "
+                "title, author_login, head_ref, base_ref, state, draft, opened_at, merged_at, "
+                "merged_by, closed_at, reported_at, feedback_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pull_id,
+                    box.id,
+                    box.org,
+                    box.client,
+                    repo,
+                    number,
+                    url,
+                    title,
+                    author_login,
+                    head_ref,
+                    base_ref,
+                    state,
+                    1 if draft else 0,
+                    opened_at,
+                    merged_at,
+                    merged_by,
+                    closed_at,
+                    reported,
+                    reported,
+                ),
+            )
+        found = self.get_pull_request(pull_id)
+        assert found is not None
+        return found, True
+
+    def get_pull_request(self, pull_id: str) -> PullRequest | None:
+        row = self._conn.execute("SELECT * FROM pull_requests WHERE id = ?", (pull_id,)).fetchone()
+        return _pull_from_row(row) if row else None
+
+    def update_pull_request(self, pull_id: str, **fields: Any) -> PullRequest:
+        """Change what GitHub, or a follow-up, says has changed. Unknown fields refused."""
+        unknown = set(fields) - _PULL_FIELDS
+        if unknown:
+            raise ValueError(f"a pull request has no field {sorted(unknown)[0]!r} to change")
+        if "state" in fields and fields["state"] not in PULL_STATES:
+            raise ValueError(f"a pull request is {sorted(PULL_STATES)}, not {fields['state']!r}")
+        review = fields.get("review_state")
+        if review is not None and review not in REVIEW_STATES:
+            raise ValueError(f"a review is {sorted(REVIEW_STATES)} or none, not {review!r}")
+        if "draft" in fields:
+            fields["draft"] = 1 if fields["draft"] else 0
+        if fields:
+            names = sorted(fields)
+            assignments = ", ".join(f"{name} = ?" for name in names)
+            self._conn.execute(
+                f"UPDATE pull_requests SET {assignments} WHERE id = ?",
+                (*(fields[name] for name in names), pull_id),
+            )
+        found = self.get_pull_request(pull_id)
+        if found is None:
+            raise UnknownEntityError(f"no pull request {pull_id!r}")
+        return found
+
+    def pull_requests(
+        self,
+        *,
+        org: str,
+        client: str | None = None,
+        box: str | None = None,
+        limit: int = 200,
+    ) -> list[PullRequest]:
+        """An org's pull requests, or one client's or one agent's: every open one,
+        newest first, then the closed and merged ones up to `limit` in all."""
+        where, args = ["org_id = ?"], [org]
+        if client is not None:
+            where.append("client_id = ?")
+            args.append(client)
+        if box is not None:
+            where.append("box_id = ?")
+            args.append(box)
+        clause = " AND ".join(where)
+        rows = self._conn.execute(
+            f"SELECT * FROM pull_requests WHERE {clause} AND state = 'open' "
+            "ORDER BY opened_at DESC",
+            tuple(args),
+        ).fetchall()
+        room = max(0, limit - len(rows))
+        if room:
+            rows += self._conn.execute(
+                f"SELECT * FROM pull_requests WHERE {clause} AND state <> 'open' "
+                "ORDER BY COALESCE(merged_at, closed_at, opened_at) DESC LIMIT ?",
+                (*args, room),
+            ).fetchall()
+        return [_pull_from_row(r) for r in rows]
+
+    def pulls_to_check(self, *, before: datetime, limit: int = 50) -> list[PullRequest]:
+        """Open pull requests last looked at before `before`, or never, the
+        longest-unchecked first. A merged or closed one is never looked at again."""
+        rows = self._conn.execute(
+            "SELECT * FROM pull_requests WHERE state = 'open' "
+            "AND (checked_at IS NULL OR checked_at < ?) "
+            "ORDER BY COALESCE(checked_at, '') ASC LIMIT ?",
+            (_instant(before), limit),
+        ).fetchall()
+        return [_pull_from_row(r) for r in rows]
+
+    def pr_policy(self, box_id: str) -> PrPolicy:
+        row = self._conn.execute(
+            "SELECT may_merge, follow_reviews FROM box_pr_policy WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        if row is None:
+            return PrPolicy()
+        return PrPolicy(
+            may_merge=bool(row["may_merge"]), follow_reviews=bool(row["follow_reviews"])
+        )
+
+    def set_pr_policy(self, box_id: str, policy: PrPolicy) -> PrPolicy:
+        self._get_box_or_raise(box_id)
+        self._conn.execute(
+            "INSERT INTO box_pr_policy (box_id, may_merge, follow_reviews, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (box_id) DO UPDATE SET "
+            "may_merge = EXCLUDED.may_merge, follow_reviews = EXCLUDED.follow_reviews, "
+            "updated_at = EXCLUDED.updated_at",
+            (box_id, 1 if policy.may_merge else 0, 1 if policy.follow_reviews else 0, _utcnow()),
+        )
+        return self.pr_policy(box_id)
+
     # -- triggers (FLOTTA-148) ----------------------------------------------
 
     def create_trigger(
@@ -5814,6 +6069,36 @@ def _api_key_from_row(row: db.Row) -> ApiKey:
         created_at=row["created_at"],
         last_used_at=row["last_used_at"],
         revoked_at=row["revoked_at"],
+    )
+
+
+def _pull_from_row(row: db.Row) -> PullRequest:
+    return PullRequest(
+        id=row["id"],
+        box_id=row["box_id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        repo=row["repo"],
+        number=int(row["number"]),
+        url=row["url"],
+        title=row["title"],
+        author_login=row["author_login"],
+        head_ref=row["head_ref"],
+        base_ref=row["base_ref"],
+        state=row["state"],
+        draft=bool(row["draft"]),
+        review_state=row["review_state"],
+        opened_at=row["opened_at"],
+        merged_at=row["merged_at"],
+        merged_by=row["merged_by"],
+        merged_by_person=row["merged_by_person"],
+        closed_at=row["closed_at"],
+        reported_at=row["reported_at"],
+        checked_at=row["checked_at"],
+        check_error=row["check_error"],
+        feedback_seen_at=row["feedback_seen_at"],
+        followups=int(row["followups"] or 0),
+        followup_run_id=row["followup_run_id"],
     )
 
 
