@@ -857,10 +857,9 @@ def test_told_once_while_it_waits_however_often_it_is_asked():
     [
         _event("request.cancel", id="srq-1", method="approval"),
         _event("approval.resolved", request_id="r-1"),
-        _event("tool.complete", name="terminal"),
         _event("message.complete", text="done"),
     ],
-    ids=["withdrawn", "resolved", "went-on", "turn-ended"],
+    ids=["withdrawn", "resolved", "turn-ended"],
 )
 def test_told_when_it_no_longer_waits(settle):
     gate = _gate()
@@ -880,6 +879,19 @@ def test_answered_from_outside_the_chat_takes_the_waiting_line_down():
         "session_id": "live",
         "payload": {"waiting": False},
     }
+
+
+def test_another_tool_finishing_while_it_waits_leaves_it_waiting():
+    """Hermes can ask a command's approval while an earlier tool is still running."""
+    gate = _gate()
+    _box(gate, **_event("tool.start", tool_id="call_1", name="terminal"))
+    _box(gate, **_approval_request())
+    gate.notices()
+    _box(gate, **_event("tool.complete", tool_id="call_1", name="terminal"))
+    _box(gate, **_event("tool.complete", tool_id="call_2", name="terminal"))
+    assert _notices(gate) == []
+    _box(gate, **_event("request.cancel", id="srq-1", method="approval", reason="answered"))
+    assert _notices(gate) == [("live", {"waiting": False})]
 
 
 def test_another_sessions_turn_ending_doesnt_clear_it():

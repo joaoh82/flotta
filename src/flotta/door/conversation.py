@@ -51,10 +51,18 @@ conversation waits on the agency, and again when it no longer does:
 `true` once per session while anything there waits, however many times or ways
 the box asks; `false` when the last of it is settled: withdrawn
 (`request.cancel`), resolved by an `approval.*` event, answered from outside the
-conversation (FLOTTA-166's `answered_elsewhere`), or the agent going on in that
-session (`tool.complete`, `message.complete`), which is how an answer from the
-agency's own socket shows here. A resume of a session that still waits says
-`true` after the snapshot. It carries nothing of the question, no id and no
+conversation (FLOTTA-166's `answered_elsewhere`), or the turn ending
+(`message.complete`). A resume of a session that still waits says `true` after
+the snapshot.
+
+**Not on `tool.complete`.** Hermes's approval says nothing of the tool call that
+asked it, and its terminal batch asks a command's approval *before* that tool's
+`tool.start`, while an earlier tool may still be running (Hermes
+`agent/terminal_approval_batch.py`), so a tool finishing can't be tied to one.
+Nor is it needed: Hermes withdraws an approval request with `request.cancel`
+however it is settled, by any socket, its own timeout or an interrupt
+(`tui_gateway/server.py` `_emit_approval_request`), and that is how an answer
+from the agency's own socket shows here. It carries nothing of the question, no id and no
 command, so it is no way to answer: every answer this socket sends is refused
 exactly as before. A socket that may answer gets the card, and none of this.
 
@@ -393,8 +401,8 @@ class ConversationGate:
         """What to send the client for a frame from the box, if anything."""
         if self._turns is not None:
             self._turns.heard_box(frame)
-        if self._withheld and ('"message.complete"' in frame or '"tool.complete"' in frame):
-            self._agent_went_on(frame)
+        if self._withheld and '"message.complete"' in frame:
+            self._turn_ended(frame)
         if self.conversation_only:
             kept = self._without_approvals(frame)
             if kept is None:
@@ -607,14 +615,11 @@ class ConversationGate:
         elif isinstance(payload.get("request_id"), str):
             self._release(payload["request_id"])
 
-    def _agent_went_on(self, frame: str) -> None:
-        """A tool finished or the turn ended: what this session waited on is over."""
+    def _turn_ended(self, frame: str) -> None:
+        """The turn ended: nothing in this session waits any more."""
         parsed = _parse(frame)
         params = parsed.get("params") if parsed else None
-        if not isinstance(params, dict) or params.get("type") not in (
-            "message.complete",
-            "tool.complete",
-        ):
+        if not isinstance(params, dict) or params.get("type") != "message.complete":
             return
         session = params.get("session_id")
         for key in [k for k, s in self._withheld.items() if s == session]:
