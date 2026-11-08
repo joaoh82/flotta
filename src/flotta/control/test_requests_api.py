@@ -199,6 +199,19 @@ def test_filed_in_a_conversation_it_names_the_conversation_and_the_person(api, f
         )
     filed = _file(api, fleet).json()["request"]
     assert (filed["session_id"], filed["asked_by"]) == ("s-42", "user:u-7")
+    assert filed["whose"] is None, "u-7 is nobody this store knows"
+
+
+def test_who_asked_is_named_when_they_sign_in(api, fleet, jev):
+    with FleetStore(fleet) as store:
+        user = store.create_user("ana@acme.example", name="Ana")
+        store.open_chat_run(
+            _id(fleet),
+            "Can you add an export?",
+            input={"session_id": "s-1", "by": f"user:{user.id}", "client": True},
+            started_at=datetime.now(UTC),
+        )
+    assert _file(api, fleet).json()["request"]["whose"] == "Ana"
 
 
 def test_who_may_do_what(api, fleet, jev):

@@ -48,7 +48,18 @@ def view(store: Any, request: Any) -> dict[str, Any]:
     )
     work = store.get_run(request.work_run_id) if request.work_run_id else None
     out["work_status"] = work.status if work is not None else None
+    out["whose"] = whose(store, request.asked_by)
     return out
+
+
+def whose(store: Any, subject: str | None) -> str | None:
+    """Who asked, by name or email, when it was one of the people who sign in."""
+    from flotta.auth import USER_SUBJECT_PREFIX
+
+    if not subject or not subject.startswith(USER_SUBJECT_PREFIX):
+        return None
+    user = store.get_user(subject.removeprefix(USER_SUBJECT_PREFIX))
+    return (user.name or user.email) if user is not None else None
 
 
 def work_prompt(request: Any, *, note: str | None) -> str:
