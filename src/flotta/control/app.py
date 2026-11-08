@@ -101,6 +101,7 @@ from flotta.store import (
     AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
     LINK_TTL_S,
+    TASK_STATUSES,
     BoxBusyError,
     DuplicateMembershipError,
     DuplicateTenantError,
@@ -5285,29 +5286,77 @@ def create_app(
         finally:
             store.close()
 
+    def _runs_since(raw: str | None) -> datetime | None:
+        """`?since=`: a day (its midnight in UTC) or a moment that says its zone."""
+        if raw is None:
+            return None
+        from flotta.usage_report import BadReport, parse_instant
+
+        try:
+            return parse_instant(raw, "since")
+        except BadReport as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def _runs_status(raw: str | None) -> list[str] | None:
+        """`?status=`: the run statuses wanted, comma-separated."""
+        if raw is None:
+            return None
+        wanted = [part.strip() for part in raw.split(",") if part.strip()]
+        unknown = [s for s in wanted if s not in TASK_STATUSES]
+        if unknown or not wanted:
+            known = ", ".join(sorted(TASK_STATUSES))
+            raise HTTPException(status_code=422, detail=f"status must be some of: {known}")
+        return wanted
+
     @app.get("/api/boxes/{box_id}/runs")
-    def list_box_runs(box_id: str, limit: int = 50, token: Token | None = needs_run_read) -> Any:
-        """An agent's runs, newest first."""
+    def list_box_runs(
+        box_id: str,
+        limit: int = 50,
+        since: str | None = None,
+        status: str | None = None,
+        token: Token | None = needs_run_read,
+    ) -> Any:
+        """An agent's runs, newest first, each with what it cost; `?since=` the
+        ones made from then on, `?status=failed,budget_blocked` those that
+        ended so."""
+        after = _runs_since(since)
+        statuses = _runs_status(status)
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
             _run_reader(token)
-            runs = store.list_runs(org=box.org, box=box.id, limit=min(limit, 200))
-            return {"runs": [_run_view(r) for r in runs]}
+            runs = store.list_runs(
+                org=box.org, box=box.id, since=after, statuses=statuses, limit=min(limit, 200)
+            )
+            costs = store.run_costs(runs)
+            return {"runs": [_run_view(r, costs[r.id]) for r in runs]}
         finally:
             store.close()
 
     @app.get("/api/clients/{client_id}/runs")
-    def list_client_runs(client_id: str, limit: int = 50, token: Token | None = needs_read) -> Any:
-        """A client's runs in the caller's org, newest first."""
+    def list_client_runs(
+        client_id: str,
+        limit: int = 50,
+        since: str | None = None,
+        status: str | None = None,
+        token: Token | None = needs_read,
+    ) -> Any:
+        """A client's runs in the caller's org, newest first, each with what it
+        cost; `?since=` the ones made from then on, `?status=` those that ended
+        one of these ways."""
         org = (token.org if token else None) or DEFAULT_ORG
         if token is not None and token.client is not None and token.client != client_id:
             raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
         _run_reader(token)
+        after = _runs_since(since)
+        statuses = _runs_status(status)
         store = store_factory()
         try:
-            runs = store.list_runs(org=org, client=client_id, limit=min(limit, 200))
-            return {"runs": [_run_view(r) for r in runs]}
+            runs = store.list_runs(
+                org=org, client=client_id, since=after, statuses=statuses, limit=min(limit, 200)
+            )
+            costs = store.run_costs(runs)
+            return {"runs": [_run_view(r, costs[r.id]) for r in runs]}
         finally:
             store.close()
 

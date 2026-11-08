@@ -70,6 +70,95 @@ def test_runs_are_listed_by_agent_and_by_client(api):
     assert [r["id"] for r in by_client.json()["runs"]] == [run["id"]]
 
 
+def test_listed_runs_say_what_each_cost(api, fleet):
+    """The web app's runs list shows a cost per run, and asking each run for
+    it would be a request per row (M14.7)."""
+    from decimal import Decimal
+
+    run = _ask(api).json()
+    with FleetStore(fleet) as store:
+        store.record_usage(
+            _ids(fleet)[X],
+            model="some/model",
+            upstream="openrouter",
+            tokens_in=10,
+            tokens_out=5,
+            idempotency_key="call-1",
+            eur_per_usd=Decimal("1"),
+            reported_cost_nano=3_000_000,
+            run_id=run["id"],
+        )
+    reader = _bearer(SCOPE_FLEET_READ, **AGENCY)
+    one = api.get(f"/api/runs/{run['id']}", headers=reader).json()["cost"]
+
+    for path in (f"/api/boxes/{X}/runs", "/api/clients/acme/runs"):
+        listed = api.get(path, headers=reader).json()["runs"]
+        assert listed[0]["cost"] == one, path
+    assert one["eur_nano"] == 3_000_000 and one["calls"] == 1
+
+
+def test_runs_are_listed_from_a_moment_on(api, fleet):
+    from datetime import UTC, datetime
+
+    with FleetStore(fleet) as store:
+        old = store.create_run(
+            _ids(fleet)[X], "Last month's", trigger_kind="api", now=datetime(2026, 1, 5, tzinfo=UTC)
+        )
+    new = _ask(api).json()
+    reader = _bearer(SCOPE_FLEET_READ, **AGENCY)
+
+    for path in (f"/api/boxes/{X}/runs", "/api/clients/acme/runs"):
+        every = [r["id"] for r in api.get(path, headers=reader).json()["runs"]]
+        since_day = api.get(f"{path}?since=2026-02-01", headers=reader).json()["runs"]
+        since_moment = api.get(f"{path}?since=2026-01-05T00:00:01%2B00:00", headers=reader).json()[
+            "runs"
+        ]
+        assert every == [new["id"], old.id], path
+        assert [r["id"] for r in since_day] == [new["id"]], path
+        assert [r["id"] for r in since_moment] == [new["id"]], path
+
+
+def test_runs_are_listed_by_how_they_ended(api, fleet):
+    """Home counts a week's failures; with every run in the list, a busy
+    week's successes pushed the failures past the cap (flotta-cloud #45)."""
+    with FleetStore(fleet) as store:
+        failed = store.create_run(_ids(fleet)[X], "Broke", trigger_kind="api")
+        store.start_run(failed.id)
+        store.finish_run(failed.id, "failed", error_class="agent")
+        held = store.create_run(_ids(fleet)[X], "Held", trigger_kind="api")
+        store.finish_run(held.id, "budget_blocked", error_class="budget")
+    waiting = _ask(api).json()
+    reader = _bearer(SCOPE_FLEET_READ, **AGENCY)
+
+    for path in (f"/api/boxes/{X}/runs", "/api/clients/acme/runs"):
+        ended = api.get(path, params={"status": "failed,budget_blocked"}, headers=reader)
+        assert ended.status_code == 200, (path, ended.text)
+        assert sorted(r["id"] for r in ended.json()["runs"]) == sorted([failed.id, held.id]), path
+        pending = api.get(path, params={"status": "pending"}, headers=reader).json()["runs"]
+        assert [r["id"] for r in pending] == [waiting["id"]], path
+
+
+@pytest.mark.parametrize("status", ["broken", "failed,nope", ",", ""])
+def test_a_status_that_is_not_one_is_refused(api, status):
+    reader = _bearer(SCOPE_FLEET_READ, **AGENCY)
+
+    for path in (f"/api/boxes/{X}/runs", "/api/clients/acme/runs"):
+        answer = api.get(path, params={"status": status}, headers=reader)
+        assert answer.status_code == 422, (path, answer.text)
+        assert "status" in answer.json()["detail"]
+
+
+@pytest.mark.parametrize("since", ["last week", "2026-02-01T08:00"])
+def test_a_moment_that_is_not_one_is_refused(api, since):
+    """No zone is no particular moment, as in the usage report."""
+    reader = _bearer(SCOPE_FLEET_READ, **AGENCY)
+
+    for path in (f"/api/boxes/{X}/runs", "/api/clients/acme/runs"):
+        answer = api.get(path, params={"since": since}, headers=reader)
+        assert answer.status_code == 422, (path, answer.text)
+        assert "since" in answer.json()["detail"]
+
+
 def test_another_orgs_run_is_not_there(api):
     """Read by id or listed by a client with the same name in another org."""
     run = _ask(api).json()
