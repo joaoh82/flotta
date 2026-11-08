@@ -1053,7 +1053,7 @@ def test_upgrade_goes_to_the_control_plane_and_needs_write(tmp_path, monkeypatch
     )
     assert result.exit_code == 0
     post = next(c for c in calls if c[0] == "POST")
-    assert post[1] == "/api/boxes/b-remote/upgrade"
+    assert post[1] == "/api/boxes/eng-g/upgrade"
     assert post[2] == ["fleet:write"]
     assert post[3] == {"image": "registry/flotta:new"}
 
@@ -1804,7 +1804,7 @@ def test_moving_an_agent_goes_through_the_fleet_api(tmp_path, monkeypatch, comma
     monkeypatch.setattr(cli, "control_request", fake)
     result = CliRunner().invoke(cli.app, ["model", command, "eng-a"])
     assert result.exit_code == 0, result.output
-    assert calls[-1] == (method, "/api/boxes/b-1/gateway")
+    assert calls == [(method, "/api/boxes/eng-a/gateway")]
     assert "restarts twice" in result.output
 
 
