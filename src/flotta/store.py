@@ -5176,6 +5176,41 @@ class FleetStore:
         ).fetchall()
         return [_approval_from_row(r) for r in rows]
 
+    def approvals_to_notify(self, *, older_than: datetime, now: datetime) -> list[RunApproval]:
+        """Approvals still waiting and answerable, asked before `older_than`, whose
+        people have not been emailed yet (FLOTTA-167), oldest first, in every org.
+
+        Answerable as `waiting_approvals` means it: not past its time, and held,
+        so an email never points at something Home won't list.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM run_approvals WHERE status = 'waiting' AND notified_at IS NULL "
+            "AND asked_at <= ? AND expires_at > ? AND held_at >= ? ORDER BY asked_at, id",
+            (
+                _instant(older_than),
+                _instant(now),
+                _instant(now - timedelta(seconds=APPROVAL_HELD_S)),
+            ),
+        ).fetchall()
+        return [_approval_from_row(r) for r in rows]
+
+    def claim_approval_notice(self, approval_id: str, *, now: datetime) -> bool:
+        """Mark `approval_id` as emailed, if nobody has: True for the one caller
+        who gets to send it. Two control planes overlapping on a deploy can't
+        both send."""
+        taken = self._conn.execute(
+            "UPDATE run_approvals SET notified_at = ? WHERE id = ? AND notified_at IS NULL "
+            "RETURNING id",
+            (_instant(now), approval_id),
+        ).fetchone()
+        return taken is not None
+
+    def release_approval_notice(self, approval_id: str) -> None:
+        """The email could not be sent: the next sweep may try again."""
+        self._conn.execute(
+            "UPDATE run_approvals SET notified_at = NULL WHERE id = ?", (approval_id,)
+        )
+
     def _get_approval_or_raise(self, approval_id: str) -> RunApproval:
         approval = self.get_approval(approval_id)
         if approval is None:

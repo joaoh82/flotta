@@ -44,6 +44,7 @@ from typing import Any
 from flotta import db
 from flotta.address import parse as parse_address
 from flotta.alerts import WebhookRefused, allow_local_webhooks, check_webhook_url, run_alert_loop
+from flotta.approval_mail import run_approval_mail_loop
 from flotta.auth import (
     CHAT_PROTOCOL,
     DEFAULT_CLIENT,
@@ -1026,6 +1027,7 @@ def create_app(
     async def lifespan(app: Any):
         task: asyncio.Task | None = None
         alerts: asyncio.Task | None = None
+        notices: asyncio.Task | None = None
         runs: asyncio.Task | None = None
         if run_loop:
             # `loop_runner` makes the *interesting* failure testable: a loop
@@ -1044,6 +1046,10 @@ def create_app(
                     signing_key=key,
                     allow_local=local_webhooks,
                 )
+            )
+            # Approvals waiting past a minute, emailed to whoever can answer (FLOTTA-167).
+            notices = asyncio.create_task(
+                run_approval_mail_loop(store_factory, mailer=deliver_link, app_url=link_base)
             )
             if carry_run is not None:
                 from flotta.runner import run_run_loop
@@ -1066,6 +1072,10 @@ def create_app(
                 alerts.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await alerts
+            if notices is not None:
+                notices.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await notices
 
     app = FastAPI(title="Flotta control plane", lifespan=lifespan)
     app.state.loop_state = state
