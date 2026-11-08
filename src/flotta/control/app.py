@@ -5265,7 +5265,8 @@ def create_app(
             box = _scoped_box(store, token, box_id)
             _run_reader(token)
             runs = store.list_runs(org=box.org, box=box.id, since=after, limit=min(limit, 200))
-            return {"runs": [_run_view(r, store.run_cost(r.id)) for r in runs]}
+            costs = store.run_costs(runs)
+            return {"runs": [_run_view(r, costs[r.id]) for r in runs]}
         finally:
             store.close()
 
@@ -5286,7 +5287,8 @@ def create_app(
         store = store_factory()
         try:
             runs = store.list_runs(org=org, client=client_id, since=after, limit=min(limit, 200))
-            return {"runs": [_run_view(r, store.run_cost(r.id)) for r in runs]}
+            costs = store.run_costs(runs)
+            return {"runs": [_run_view(r, costs[r.id]) for r in runs]}
         finally:
             store.close()
 

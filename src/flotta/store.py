@@ -49,6 +49,7 @@ Readers: the CLI and the dashboard API routes.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import logging
@@ -865,6 +866,13 @@ class RunCost:
     calls: int
     tokens_in: int
     tokens_out: int
+
+
+_NO_COST = RunCost(eur_nano=0, unpriced=0, calls=0, tokens_in=0, tokens_out=0)
+
+#: How many ids one `IN (...)` lists. SQLite's limit on bound values is 32,766
+#: since 3.32 and 999 before it; a page of runs is far under either.
+_IN_CHUNK = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -4457,64 +4465,121 @@ class FleetStore:
         return [_run_from_row(r) for r in rows]
 
     def run_cost(self, run_id: str) -> RunCost:
-        """What `run_id`'s model calls cost, summed from `usage`.
+        """What `run_id`'s model calls cost, summed from `usage` (`run_costs`)."""
+        run = self._get_run_or_raise(run_id)
+        return self.run_costs([run])[run.id]
 
-        Only the run's own box's rows: `record_usage` already refuses a run id
+    def run_costs(self, runs: Sequence[Run]) -> dict[str, RunCost]:
+        """What each of `runs` cost, by run id, in a few reads however many.
+
+        Only each run's own box's rows: `record_usage` already refuses a run id
         from another box, and this holds even for a row written before it did.
 
-        **A conversation's turn is read by its times** (M14.6): the calls of its
-        box that began while the turn went on, as the door heard it, and that
-        no delivered run was given. The door records a turn off the
-        conversation, so a call can be written before the turn's run exists, or
-        given the turn before while that one's end was still on its way. The
-        ledger is never rewritten for it (`test_usage.py`); this reads it.
+        A delivered run's calls are the rows given its id, summed together for
+        every such run in one query. **A conversation's turn is read by its
+        times** (M14.6): the calls of its box that began while the turn went
+        on, as the door heard it, and that no delivered run was given. The door
+        records a turn off the conversation, so a call can be written before
+        the turn's run exists, or given the turn before while that one's end
+        was still on its way. The ledger is never rewritten for it
+        (`test_usage.py`); this reads it, once per box from its earliest turn
+        here, rather than once per turn (flotta #196's review: a page of turns
+        reread the same later history for each one).
         """
-        run = self._get_run_or_raise(run_id)
-        if run.trigger_kind == "chat":
-            return self._turn_cost(run)
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
-            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls, "
-            "COALESCE(SUM(tokens_in), 0) AS tokens_in, "
-            "COALESCE(SUM(tokens_out), 0) AS tokens_out "
-            "FROM usage WHERE run_id = ? AND box_id = ? AND kind = 'model'",
-            (run.id, run.box_id),
-        ).fetchone()
-        return RunCost(
-            eur_nano=int(row["eur_nano"]),
-            unpriced=int(row["unpriced"]),
-            calls=int(row["calls"]),
-            tokens_in=int(row["tokens_in"]),
-            tokens_out=int(row["tokens_out"]),
-        )
+        costs: dict[str, RunCost] = {}
+        delivered = [r for r in runs if r.trigger_kind != "chat"]
+        turns: dict[str, list[Run]] = {}
+        for r in runs:
+            if r.trigger_kind == "chat":
+                turns.setdefault(r.box_id, []).append(r)
+        for i in range(0, len(delivered), _IN_CHUNK):
+            chunk = delivered[i : i + _IN_CHUNK]
+            rows = self._conn.execute(
+                "SELECT run_id, box_id, COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+                "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls, "
+                "COALESCE(SUM(tokens_in), 0) AS tokens_in, "
+                "COALESCE(SUM(tokens_out), 0) AS tokens_out FROM usage "
+                f"WHERE kind = 'model' AND run_id IN ({','.join('?' * len(chunk))}) "
+                "GROUP BY run_id, box_id",
+                [r.id for r in chunk],
+            ).fetchall()
+            summed = {(row["run_id"], row["box_id"]): row for row in rows}
+            for r in chunk:
+                row = summed.get((r.id, r.box_id))
+                costs[r.id] = (
+                    RunCost(
+                        eur_nano=int(row["eur_nano"]),
+                        unpriced=int(row["unpriced"]),
+                        calls=int(row["calls"]),
+                        tokens_in=int(row["tokens_in"]),
+                        tokens_out=int(row["tokens_out"]),
+                    )
+                    if row
+                    else _NO_COST
+                )
+        for box_id, box_turns in turns.items():
+            costs.update(self._turn_costs(box_id, box_turns))
+        return costs
 
-    def _turn_cost(self, run: Run) -> RunCost:
-        if run.started_at is None:
-            return RunCost(eur_nano=0, unpriced=0, calls=0, tokens_in=0, tokens_out=0)
-        began = datetime.fromisoformat(run.started_at)
-        ended = datetime.fromisoformat(run.finished_at) if run.finished_at else None
+    def _turn_costs(self, box_id: str, turns: list[Run]) -> dict[str, RunCost]:
+        """`turns` of `box_id`, each with the calls that began inside it.
+
+        One read of the box's calls from its earliest turn's start. Each call
+        then finds its turns by bisecting the turns' starts and walking back
+        while some earlier turn could still have been going: `reach[j]` is the
+        latest end among the first j + 1 turns, so once it is before the call's
+        start, no earlier turn holds it. Turns of two conversations can
+        overlap, and a call inside both counts in both, as one turn read alone
+        would count it.
+        """
+        costs = {t.id: _NO_COST for t in turns}
+        timed = sorted(
+            (
+                (
+                    datetime.fromisoformat(t.started_at),
+                    datetime.fromisoformat(t.finished_at) if t.finished_at else None,
+                    t.id,
+                )
+                for t in turns
+                if t.started_at is not None
+            ),
+            key=lambda w: w[0],
+        )
+        if not timed:
+            return costs
+        starts = [w[0] for w in timed]
+        reach: list[datetime | None] = []
+        for _, end, _ in timed:
+            prev = reach[-1] if reach else end
+            reach.append(None if end is None or prev is None else max(prev, end))
         rows = self._conn.execute(
-            "SELECT u.at, u.latency_ms, u.cost_eur_nano, u.tokens_in, u.tokens_out, "
-            "t.trigger_kind AS given_to FROM usage u LEFT JOIN tasks t ON t.id = u.run_id "
-            "WHERE u.box_id = ? AND u.kind = 'model' AND u.at >= ?",
-            (run.box_id, _instant(began)),
+            "SELECT u.at, u.latency_ms, u.cost_eur_nano, u.tokens_in, u.tokens_out "
+            "FROM usage u LEFT JOIN tasks t ON t.id = u.run_id "
+            "WHERE u.box_id = ? AND u.kind = 'model' AND u.at >= ? "
+            "AND (t.id IS NULL OR t.trigger_kind IS NULL OR t.trigger_kind = 'chat')",
+            (box_id, _instant(starts[0])),
         ).fetchall()
-        kept = []
+        sums: dict[str, list[int]] = {}
         for r in rows:
-            if r["given_to"] not in (None, "chat"):
-                continue  # a delivered run's, which a turn never overlaps
             start = datetime.fromisoformat(r["at"]) - timedelta(
                 milliseconds=max(0, r["latency_ms"] or 0)
             )
-            if start >= began and (ended is None or start <= ended):
-                kept.append(r)
-        return RunCost(
-            eur_nano=sum(int(r["cost_eur_nano"] or 0) for r in kept),
-            unpriced=sum(1 for r in kept if r["cost_eur_nano"] is None),
-            calls=len(kept),
-            tokens_in=sum(int(r["tokens_in"] or 0) for r in kept),
-            tokens_out=sum(int(r["tokens_out"] or 0) for r in kept),
-        )
+            j = bisect.bisect_right(starts, start) - 1
+            while j >= 0 and (reach[j] is None or reach[j] >= start):
+                _, end, run_id = timed[j]
+                if end is None or start <= end:
+                    s = sums.setdefault(run_id, [0, 0, 0, 0, 0])
+                    s[0] += int(r["cost_eur_nano"] or 0)
+                    s[1] += 1 if r["cost_eur_nano"] is None else 0
+                    s[2] += 1
+                    s[3] += int(r["tokens_in"] or 0)
+                    s[4] += int(r["tokens_out"] or 0)
+                j -= 1
+        for run_id, (eur, unpriced, calls, t_in, t_out) in sums.items():
+            costs[run_id] = RunCost(
+                eur_nano=eur, unpriced=unpriced, calls=calls, tokens_in=t_in, tokens_out=t_out
+            )
+        return costs
 
     def _run_for_call(self, box_id: str, named: str | None, started: datetime) -> str | None:
         """Which run a model call from `box_id` that began at `started` was part of.

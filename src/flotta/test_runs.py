@@ -589,3 +589,128 @@ def test_the_ledger_is_not_rewritten_for_a_turn(agency):
     (row,) = agency._conn.execute("SELECT run_id FROM usage WHERE id = ?", (early.id,)).fetchall()
     assert row["run_id"] is None
     assert agency.run_cost(turn.id).calls == 1
+
+
+class _Counted:
+    """The store's connection, counting the queries sent and the rows read."""
+
+    def __init__(self, conn):
+        self._conn, self.queries, self.rows = conn, 0, 0
+
+    def execute(self, sql, params=()):
+        self.queries += 1
+        cursor = self._conn.execute(sql, params)
+        counted = self
+
+        class _Cursor:
+            def fetchall(self):
+                rows = cursor.fetchall()
+                counted.rows += len(rows)
+                return rows
+
+            def fetchone(self):
+                row = cursor.fetchone()
+                counted.rows += row is not None
+                return row
+
+        return _Cursor()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _turns(store, box, count, calls_each, start=T0):
+    """`count` finished turns a minute apart, each with `calls_each` calls."""
+    turns = []
+    for i in range(count):
+        began = start + timedelta(minutes=i)
+        turn = store.open_chat_run(box, "Next?", started_at=began, now=began)
+        for c in range(calls_each):
+            _call(store, box, f"{box}-{i}-{c}", now=began + timedelta(seconds=1 + c))
+        store.finish_chat_run(turn.id, box, "done", output="Ok.", now=began + timedelta(seconds=30))
+        turns.append(turn)
+    return turns
+
+
+def test_a_page_of_runs_is_costed_in_a_few_reads_however_long(agency):
+    """flotta #196's review: costing each listed run on its own read the run
+    again and, for a turn, every later call of its box, so a page of turns read
+    the same history once per turn (200 turns: 401 queries, 2 million rows for
+    20,000 calls). Now one query for the delivered runs and one per box with
+    turns, and each call is read once."""
+    _turns(agency, "b-one", 40, 3)
+    for i in range(10):
+        run = _started(agency, "b-two", at=T0 + timedelta(minutes=i))
+        _call(
+            agency, "b-two", f"run-{i}-a", run_id=run.id, now=T0 + timedelta(minutes=i, seconds=5)
+        )
+        _call(
+            agency, "b-two", f"run-{i}-b", run_id=run.id, now=T0 + timedelta(minutes=i, seconds=9)
+        )
+        agency.finish_run(run.id, "done", output="Done.", now=T0 + timedelta(minutes=i, seconds=30))
+    runs = agency.list_runs(org="studio-nord", limit=200)
+    assert len(runs) == 50
+
+    counted = _Counted(agency._conn)
+    agency._conn = counted
+    try:
+        costs = agency.run_costs(runs)
+    finally:
+        agency._conn = counted._conn
+
+    assert counted.queries == 2
+    assert counted.rows <= 40 * 3 + 10
+    assert {r.id: costs[r.id].calls for r in runs} == {
+        r.id: 3 if r.trigger_kind == "chat" else 2 for r in runs
+    }
+    assert all(c.eur_nano == c.calls * ONE_CALL for c in costs.values())
+
+
+def test_a_batch_costs_each_run_as_reading_it_alone_would(agency):
+    """Turns that overlap (two conversations, or ends recorded late), one still
+    going, a call written before its turn's run, a delivered run's call inside
+    a turn's times, and a run id forged by another box: each run costs the same
+    in the page as on its own."""
+    first, second = _turns(agency, "b-one", 2, 2)
+    # Stretch the first turn over the second's start, as a late end would.
+    agency._conn.execute(
+        "UPDATE tasks SET finished_at = ? WHERE id = ?",
+        ((T0 + timedelta(minutes=1, seconds=10)).isoformat(), first.id),
+    )
+    delivered = _started(agency, "b-one", at=T0 + timedelta(minutes=5))
+    _call(
+        agency, "b-one", "delivered", run_id=delivered.id, now=T0 + timedelta(minutes=5, seconds=3)
+    )
+    forged = _call(
+        agency, "b-four", "forged", run_id=delivered.id, now=T0 + timedelta(minutes=5, seconds=4)
+    )
+    # As a row written before `record_usage` refused another box's run id.
+    agency._conn.execute("UPDATE usage SET run_id = ? WHERE id = ?", (delivered.id, forged.id))
+    agency.finish_run(
+        delivered.id, "done", output="Done.", now=T0 + timedelta(minutes=5, seconds=6)
+    )
+    _call(agency, "b-one", "early", now=T0 + timedelta(minutes=6, seconds=2), latency_ms=1_500)
+    going = agency.open_chat_run(
+        "b-one",
+        "And now?",
+        started_at=T0 + timedelta(minutes=6),
+        now=T0 + timedelta(minutes=6, seconds=3),
+    )
+    _call(agency, "b-one", "going", now=T0 + timedelta(minutes=7))
+    other = _turns(agency, "b-three", 1, 1)[0]
+    runs = agency.list_runs(org="studio-nord", limit=200)
+
+    costs = agency.run_costs(runs)
+
+    assert costs == {r.id: agency.run_cost(r.id) for r in runs}
+    assert {
+        k: costs[run.id].calls
+        for k, run in {
+            "first": first,
+            "second": second,
+            "delivered": delivered,
+            "going": going,
+            "other": other,
+        }.items()
+    } == {"first": 4, "second": 2, "delivered": 1, "going": 2, "other": 1}
+    assert agency.run_costs([]) == {}
