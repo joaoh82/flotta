@@ -519,9 +519,9 @@ def _require_key(
     # a new key invalidates every token already deployed — so the advice could
     # break a working fleet while appearing to fix a missing one. Never suggest
     # minting a key over the top of one that exists.
-    from flotta.dotenv import DEFAULT_DOTENV, read_dotenv_value
+    from flotta.dotenv import read_dotenv_value
 
-    if read_dotenv_value(SIGNING_KEY_ENV, dotenv_path or DEFAULT_DOTENV):
+    if read_dotenv_value(SIGNING_KEY_ENV, dotenv_path):
         raise NoSigningKey(
             f"${SIGNING_KEY_ENV} is in .env but not in this process's "
             f"environment. Run the command through `just`, or export it with "

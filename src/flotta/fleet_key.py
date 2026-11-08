@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m flotta.fleet_key")
     sub = parser.add_subparsers(dest="command", required=True)
     gen = sub.add_parser("generate", help=f"write a fresh {ENV} into the dotenv")
-    gen.add_argument("--dotenv", default=".env")
+    gen.add_argument("--dotenv", default=None, help="default: $FLOTTA_DOTENV, else .env")
     gen.add_argument("--replace", action="store_true", help="replace one already there")
     sub.add_parser("bootstrap", help="the first machine's login, as KEY=VALUE lines on stdout")
     args = parser.parse_args(argv)
@@ -86,7 +86,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(f"{key}={value}\n")
         return 0
 
-    dotenv = Path(args.dotenv)
+    from flotta.dotenv import dotenv_path
+
+    dotenv = Path(args.dotenv or dotenv_path())
     if record(dotenv, replace=args.replace):
         print(f"wrote a fresh {ENV} into {dotenv} (value not echoed)")
     else:

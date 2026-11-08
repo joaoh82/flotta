@@ -215,14 +215,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m flotta.sealed")
     sub = parser.add_subparsers(dest="command", required=True)
     generate = sub.add_parser("generate", help=f"write a fresh ${KEY_ENV} into .env")
-    generate.add_argument("--env-file", default=".env")
+    generate.add_argument("--env-file", default=None, help="default: $FLOTTA_DOTENV, else .env")
     generate.add_argument(
         "--replace",
         action="store_true",
         help="replace a key that is there: every credential sealed under it is lost",
     )
     args = parser.parse_args(argv)
-    path = Path(args.env_file)
+    from flotta.dotenv import dotenv_path
+
+    path = Path(args.env_file or dotenv_path())
     if record(path, replace=args.replace):
         print(f"{KEY_ENV} written to {path}. Set the same value where the control plane and")
         print("the gateway run, and nowhere else. Optional: without it, the sealing key is")

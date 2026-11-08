@@ -21,6 +21,24 @@ needs a control-plane URL to ask "which machine is this box?".
 web service and Postgres (about $7 + $6/month on their smallest paid plans), plus whatever the boxes cost. A box suspends itself after 30 minutes
 idle and its volume keeps billing while it sleeps — cheap, not free.
 
+**Staging (M14.8)** is a second copy of all of this, in its own Fly org
+(`flotta-staging`) with its own database and secrets, and every step below
+applies to it unchanged. Its settings live in `.env.staging`, beside `.env` in
+the main checkout (gitignored; the vault keeps a copy), and every recipe runs
+against it through `just staging`:
+
+```bash
+just staging door-deploy        # the staging door, never production's
+just staging gateway-secrets    # staging's key, staging's database
+```
+
+`just staging` loads `.env.staging` **instead of** `.env`: it drops every
+`FLOTTA_` variable it inherited, loads no `.env` in any recipe it runs, and
+points the CLI at the same file with `$FLOTTA_DOTENV`. A value staging lacks is
+then missing, never borrowed from production. What staging is made of, and how
+a change moves from it to production, is in `docs/ENVIRONMENTS.md` in
+flotta_parent.
+
 ---
 
 ## Step 0 — Generate every secret at once

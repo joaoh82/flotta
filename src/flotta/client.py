@@ -325,7 +325,7 @@ def flotta_token(env: dict[str, str] | None = None) -> str:
     return token
 
 
-def credentials(dotenv: str = ".env", *, box_id: str) -> tuple[str, str]:
+def credentials(dotenv: str | None = None, *, box_id: str) -> tuple[str, str]:
     """(username, password) for one box, derived from the fleet's in the dotenv.
 
     The box's own, as the door sends it (FLOTTA-96): a box no longer accepts
@@ -337,6 +337,9 @@ def credentials(dotenv: str = ".env", *, box_id: str) -> tuple[str, str]:
     """
     from pathlib import Path
 
+    from flotta.dotenv import dotenv_path
+
+    dotenv = dotenv or dotenv_path()
     try:
         text = Path(dotenv).read_text(encoding="utf-8")
     except OSError as exc:

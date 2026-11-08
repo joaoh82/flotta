@@ -25,6 +25,17 @@ from pathlib import Path
 
 DEFAULT_DOTENV = ".env"
 
+#: Which file to read instead of `.env` (M14.8). `just staging <recipe>` sets it
+#: to `.env.staging`, and every reader here then sees that file and never
+#: `.env`, so no production value fills a gap in staging's settings: a
+#: staging command missing a value fails, rather than borrowing production's.
+DOTENV_ENV = "FLOTTA_DOTENV"
+
+
+def dotenv_path() -> str:
+    """The dotenv file this process reads: `$FLOTTA_DOTENV`, else `.env`."""
+    return os.environ.get(DOTENV_ENV, "").strip() or DEFAULT_DOTENV
+
 
 def parse_dotenv(text: str) -> dict[str, str]:
     """Parse dotenv text into a mapping. Ignores what it cannot understand.
@@ -50,20 +61,20 @@ def parse_dotenv(text: str) -> dict[str, str]:
     return values
 
 
-def read_dotenv(path: str | Path = DEFAULT_DOTENV) -> dict[str, str]:
+def read_dotenv(path: str | Path | None = None) -> dict[str, str]:
     """Everything in a dotenv file, or an empty mapping if it is unreadable."""
     try:
-        return parse_dotenv(Path(path).read_text(encoding="utf-8"))
+        return parse_dotenv(Path(path or dotenv_path()).read_text(encoding="utf-8"))
     except OSError:
         return {}
 
 
-def read_dotenv_value(key: str, path: str | Path = DEFAULT_DOTENV) -> str | None:
+def read_dotenv_value(key: str, path: str | Path | None = None) -> str | None:
     """One key from a dotenv file, or None if absent."""
     return read_dotenv(path).get(key)
 
 
-def load_dotenv(path: str | Path = DEFAULT_DOTENV, env: dict[str, str] | None = None) -> list[str]:
+def load_dotenv(path: str | Path | None = None, env: dict[str, str] | None = None) -> list[str]:
     """Load `.env` into the environment. Returns the names it set.
 
     **An already-set variable always wins.** `FLOTTA_STORE=x flotta ps` must

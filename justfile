@@ -5,6 +5,24 @@
 # That file is the single place to look for machine-local config.
 set dotenv-load := true
 
+# Reads .env.staging INSTEAD of .env (docs/ENVIRONMENTS.md in flotta_parent):
+# every FLOTTA_ variable this shell or .env set is dropped first, `just` is told
+# to load no .env (nested recipes included), and the CLI reads $FLOTTA_DOTENV.
+# So a value staging lacks is missing, never production's.
+# M14.8 — run any recipe against STAGING: `just staging door-deploy`
+staging +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f .env.staging ] || { echo "no .env.staging here: copy it from the vault (wiki/dot env staging.md)" >&2; exit 1; }
+    grep -qx 'FLOTTA_ENVIRONMENT=staging' .env.staging \
+      || { echo ".env.staging does not say FLOTTA_ENVIRONMENT=staging; refusing to run" >&2; exit 1; }
+    for v in $(compgen -e); do
+      case "$v" in FLOTTA_*|FLY_API_TOKEN|FLY_ACCESS_TOKEN) unset "$v" ;; esac
+    done
+    set -a; . ./.env.staging; set +a
+    export FLOTTA_DOTENV=.env.staging JUST_NO_DOTENV=true
+    exec just {{ARGS}}
+
 # Binds `::` and refuses to start without $FLOTTA_SIGNING_KEY — a front door has
 # no unauthenticated mode. Needs a running control plane ($FLOTTA_CONTROL_URL)
 # and its own token ($FLOTTA_CONTROL_TOKEN) with fleet:route (M11.6a).
@@ -142,17 +160,18 @@ door-dns:
 cli-setup:
     #!/usr/bin/env bash
     set -euo pipefail
-    [ -f .env ] || { echo "no .env here — copy the fleet's (vault: wiki/dot env.md) or .env.example"; exit 1; }
+    DOTENV="${FLOTTA_DOTENV:-.env}"
+    [ -f "$DOTENV" ] || { echo "no $DOTENV here — copy the fleet's (vault: wiki/dot env.md) or .env.example"; exit 1; }
     : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the deployed control plane}"
     : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
     uv sync --quiet
-    if ! grep -q '^FLOTTA_TOKEN=.' .env; then
+    if ! grep -q '^FLOTTA_TOKEN=.' "$DOTENV"; then
       # A year of box:chat only. Read and write through the fleet API mint
       # their own five-minute tokens from the signing key per command.
       TOKEN=$(uv run flotta token mint "$USER" --scope box:chat --days 365 --json \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-      printf 'FLOTTA_TOKEN=%s\n' "$TOKEN" >> .env
-      echo "added a 1-year chat token to .env (value not echoed)"
+      printf 'FLOTTA_TOKEN=%s\n' "$TOKEN" >> "$DOTENV"
+      echo "added a 1-year chat token to $DOTENV (value not echoed)"
     fi
     echo "fleet at $FLOTTA_CONTROL_URL:"
     uv run flotta ps
