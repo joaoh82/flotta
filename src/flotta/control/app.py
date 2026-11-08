@@ -5424,9 +5424,8 @@ def create_app(
         from dataclasses import asdict
 
         view: dict[str, Any] = {**asdict(approval), "kind": "run"}
-        run = store.get_run(approval.run_id)
-        if run is not None and run.trigger_kind == "chat":
-            given = run.input if isinstance(run.input, dict) else {}
+        trigger, given = store.asked_in(approval)
+        if trigger == "chat":
             session, by = given.get("session_id"), given.get("by")
             view["kind"] = "chat"
             view["session_id"] = session if isinstance(session, str) else None

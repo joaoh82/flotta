@@ -5168,6 +5168,20 @@ class FleetStore:
                     )
         return self._get_approval_or_raise(row["id"])
 
+    def asked_in(self, approval: RunApproval) -> tuple[str, dict[str, Any]]:
+        """Where `approval` was asked: its run's trigger and input (FLOTTA-166).
+
+        Read within the approval's own org, so it says nothing of anyone else's.
+        """
+        row = self._conn.execute(
+            "SELECT trigger_kind, input_json FROM tasks WHERE id = ? AND org_id = ?",
+            (approval.run_id, approval.org),
+        ).fetchone()
+        if row is None:
+            return "run", {}
+        given = json.loads(row["input_json"]) if row["input_json"] is not None else None
+        return row["trigger_kind"] or "run", given if isinstance(given, dict) else {}
+
     def chat_run_of(self, run_id: str, box_id: str) -> Run:
         """`box_id`'s chat run `run_id`, or `UnknownEntityError`: the door names
         the box whose socket it heard, and nothing else is its to touch."""
