@@ -11,15 +11,21 @@ So printing is decided by `resolve_mailer`, not by the absence of a key alone:
 a keyless control plane (loopback only, `check_bind` sees to that) prints, and
 anything else prints only when `$FLOTTA_PRINT_SIGN_IN_LINKS=1` says so. With
 neither, no link is created at all, and the log says sign-in is off.
+
+Every email's HTML goes through `layout` (FLOTTA-168), so each one looks like
+the web app it comes from; the plain-text part says the same thing in words.
 """
 
 from __future__ import annotations
 
+import base64
+import functools
 import html
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from importlib import resources
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -70,6 +76,156 @@ def sign_in_url(app_url: str, secret: str) -> str:
     return f"{app_url.rstrip('/')}/sign-in#{secret}"
 
 
+# -- the look -----------------------------------------------------------------
+#
+# Every email is the web app's identity ("Flotta — Identity & UX v1", the
+# palette in flotta-cloud's `globals.css`): a warm ground, one white panel, ink
+# text, and a single tide-blue button for the one thing the email is for. It is
+# built from tables with inline styles, because that is all Gmail, Outlook and
+# Apple Mail agree on: no `<style>` block, no SVG, no web font (Geist is named
+# first for a client that has it, and the system face stands in elsewhere).
+
+GROUND = "#f5f4ef"
+PANEL = "#ffffff"
+SUNKEN = "#efede6"
+LINE = "#e4e1d8"
+INK = "#0e1726"
+MUTED = "#5a6270"
+SUBTLE = "#8a909a"
+ACCENT = "#2346e0"
+BUOY = "#ff6a3d"
+FONT = "'Geist',-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+
+#: The mark rides along as an inline attachment, referred to by this id: a
+#: remote image would depend on wherever the web app is hosted and be blocked
+#: by default, and Gmail and Outlook show no SVG at all.
+MARK_CID = "flotta-mark"
+MARK_FILE = "mark.png"
+
+
+@functools.cache
+def mark_png() -> bytes:
+    """The mark as the app's lockup draws it: an ink pole and pennant, and a buoy-orange one."""
+    return resources.files("flotta").joinpath("mail_assets", MARK_FILE).read_bytes()
+
+
+def esc(value: str) -> str:
+    """Text for an email's HTML: whatever a person typed arrives inert."""
+    return html.escape(value, quote=True)
+
+
+def paragraph(inner: str) -> str:
+    """One paragraph of the body. `inner` is HTML, so escape what it quotes."""
+    return (
+        f'<p style="margin:0 0 16px;font-family:{FONT};font-size:15px;line-height:24px;'
+        f'color:{INK};">{inner}</p>'
+    )
+
+
+def quote(inner: str) -> str:
+    """Someone's own words, set apart (a reason given for a decision)."""
+    return (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        'style="margin:0 0 16px;"><tr>'
+        f'<td style="background:{SUNKEN};border-left:3px solid {LINE};border-radius:4px;'
+        f'padding:12px 16px;font-family:{FONT};font-size:15px;line-height:24px;color:{INK};">'
+        f"{inner}</td></tr></table>"
+    )
+
+
+def _button(label: str, url: str) -> str:
+    href = esc(url)
+    return (
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        'style="margin:8px 0 0;"><tr>'
+        f'<td align="center" bgcolor="{ACCENT}" style="border-radius:6px;background:{ACCENT};">'
+        f'<a href="{href}" target="_blank" style="display:inline-block;padding:12px 22px;'
+        f"font-family:{FONT};font-size:15px;line-height:20px;font-weight:600;color:#ffffff;"
+        f'text-decoration:none;border-radius:6px;">{esc(label)}</a></td></tr></table>'
+    )
+
+
+def layout(
+    *,
+    title: str,
+    heading: str,
+    body: Sequence[str],
+    preheader: str,
+    footer: str,
+    action: tuple[str, str] | None = None,
+    note: str | None = None,
+    show_link: bool = False,
+    eyebrow: str | None = None,
+) -> str:
+    """A whole email in Flotta's look.
+
+    `title`, `heading`, `preheader`, `footer`, `note`, `eyebrow` and the
+    action's label are text and are escaped here; `body` is HTML fragments from
+    `paragraph` / `quote`, whose callers escape what they quote. `show_link`
+    repeats the action's address under the button, for the mail client that
+    shows a button as nothing and a reader who would rather paste it.
+    """
+    small = f"font-family:{FONT};font-size:13px;line-height:20px;color:{MUTED};"
+    parts = []
+    if eyebrow:
+        parts.append(
+            f'<p style="margin:0 0 8px;font-family:{FONT};font-size:12px;line-height:16px;'
+            f'font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:{MUTED};">'
+            # Buoy orange marks what needs a person; as a dot, since orange text
+            # this small is too faint to read.
+            f'<span style="color:{BUOY};">&#9679;</span>&nbsp;{esc(eyebrow)}</p>'
+        )
+    parts.append(
+        f'<h1 style="margin:0 0 16px;font-family:{FONT};font-size:22px;line-height:30px;'
+        f'font-weight:600;letter-spacing:-0.01em;color:{INK};">{esc(heading)}</h1>'
+    )
+    parts.extend(body)
+    if action:
+        parts.append(_button(*action))
+    if note:
+        parts.append(f'<p style="margin:20px 0 0;{small}">{esc(note)}</p>')
+    if action and show_link:
+        url = esc(action[1])
+        parts.append(
+            f'<p style="margin:20px 0 0;{small}">Or paste this link into your browser:<br>'
+            f'<a href="{url}" target="_blank" style="color:{ACCENT};word-break:break-all;">'
+            f"{url}</a></p>"
+        )
+    return (
+        "<!doctype html>"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="color-scheme" content="light">'
+        '<meta name="supported-color-schemes" content="light">'
+        f"<title>{esc(title)}</title></head>"
+        f'<body style="margin:0;padding:0;background:{GROUND};">'
+        # What an inbox shows after the subject; hidden in the email itself.
+        f'<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">'
+        f"{esc(preheader)}</div>"
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        f'bgcolor="{GROUND}" style="background:{GROUND};"><tr>'
+        '<td align="center" style="padding:32px 16px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        'style="max-width:520px;">'
+        # The lockup: the mark, then the name typed the way it is, lowercase.
+        '<tr><td style="padding:0 4px 20px;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
+        f'<td style="vertical-align:middle;"><img src="cid:{MARK_CID}" width="28" height="28" '
+        'alt="" style="display:block;border:0;"></td>'
+        f'<td style="vertical-align:middle;padding-left:8px;font-family:{FONT};font-size:20px;'
+        f'line-height:28px;font-weight:600;letter-spacing:-0.02em;color:{INK};">flotta</td>'
+        "</tr></table></td></tr>"
+        f'<tr><td bgcolor="{PANEL}" style="background:{PANEL};border:1px solid {LINE};'
+        f'border-radius:12px;padding:32px 28px;">{"".join(parts)}</td></tr>'
+        f'<tr><td style="padding:20px 4px 0;font-family:{FONT};font-size:12px;line-height:18px;'
+        f'color:{SUBTLE};">{esc(footer)}</td></tr>'
+        "</table></td></tr></table></body></html>"
+    )
+
+
+# -- what is sent --------------------------------------------------------------
+
+
 def sign_in_message(to: str, url: str) -> Message:
     minutes = "15 minutes"
     return Message(
@@ -80,10 +236,17 @@ def sign_in_message(to: str, url: str) -> Message:
             f"The link works once, for {minutes}. If you did not ask for it, "
             "ignore this email; nobody can use it without this inbox."
         ),
-        html=(
-            f'<p><a href="{url}">Sign in to Flotta</a></p>'
-            f"<p>The link works once, for {minutes}. If you did not ask for it, "
-            "ignore this email; nobody can use it without this inbox.</p>"
+        html=layout(
+            title="Your Flotta sign-in link",
+            preheader=f"The link works once, for {minutes}.",
+            heading="Sign in to Flotta",
+            body=[paragraph(f"Here is your sign-in link. It works once, for {minutes}.")],
+            action=("Sign in", url),
+            show_link=True,
+            footer=(
+                "Someone asked to sign in to Flotta with this address. If it was not "
+                "you, ignore this email; nobody can use the link without this inbox."
+            ),
         ),
         link=url,
     )
@@ -106,11 +269,22 @@ def sign_up_message(to: str, url: str) -> Message:
             "straight away, and create agents once we approve it. If you did not "
             "ask for this, ignore this email."
         ),
-        html=(
-            f'<p><a href="{url}">Finish signing up for Flotta</a></p>'
-            "<p>The link works once, for 15 minutes. Your agency can invite its team "
-            "straight away, and create agents once we approve it. If you did not "
-            "ask for this, ignore this email.</p>"
+        html=layout(
+            title="Finish signing up for Flotta",
+            preheader="Confirm your address to create your agency.",
+            heading="Finish signing up",
+            body=[
+                paragraph("Confirm this address to create your agency on Flotta."),
+                paragraph(
+                    "Your agency can invite its team straight away, and create agents "
+                    "once we approve it."
+                ),
+            ],
+            action=("Finish signing up", url),
+            note="The link works once, for 15 minutes.",
+            show_link=True,
+            footer="Someone signed up for Flotta with this address. If it was not you, "
+            "ignore this email.",
         ),
         link=url,
     )
@@ -131,11 +305,20 @@ def invite_message(to: str, url: str, org_name: str, role: str) -> Message:
             "The link works once, for 7 days. If you were not expecting it, ignore "
             "this email."
         ),
-        html=(
-            f'<p><a href="{url}">Join {html.escape(org_name)} on Flotta</a> '
-            f"as a {html.escape(shown)}.</p>"
-            "<p>The link works once, for 7 days. If you were not expecting it, ignore "
-            "this email.</p>"
+        html=layout(
+            title=f"You are invited to {org_name} on Flotta",
+            preheader=f"Join {org_name} on Flotta as a {shown}.",
+            heading=f"Join {org_name} on Flotta",
+            body=[
+                paragraph(
+                    f"You are invited to join <strong>{esc(org_name)}</strong> as a {esc(shown)}."
+                )
+            ],
+            action=("Accept the invitation", url),
+            note="The link works once, for 7 days.",
+            show_link=True,
+            footer=f"{org_name} invited this address to Flotta. If you were not "
+            "expecting it, ignore this email.",
         ),
         link=url,
     )
@@ -163,12 +346,21 @@ def approved_message(
             "Creating one takes about a minute: pick a client, give it a name, "
             "and start talking to it."
         ),
-        html=(
-            f"<p>You're in: <strong>{html.escape(org_name)}</strong> can now create agents "
-            "for its clients.</p>"
-            f'<p><a href="{home}">Create your first agent</a></p>'
-            "<p>It takes about a minute: pick a client, give it a name, and start "
-            "talking to it.</p>"
+        html=layout(
+            title=f"{org_name} is approved on Flotta",
+            preheader=f"{org_name} can now create agents for its clients.",
+            heading="You're in",
+            body=[
+                paragraph(
+                    f"<strong>{esc(org_name)}</strong> can now create agents for its clients."
+                ),
+                paragraph(
+                    "It takes about a minute: pick a client, give it a name, and start "
+                    "talking to it."
+                ),
+            ],
+            action=("Create your first agent", home),
+            footer=f"You are getting this because you own {org_name} on Flotta.",
         ),
         link=home,
         kind="approval email",
@@ -188,12 +380,20 @@ def declined_message(
     """
     home = app_url.rstrip("/") + "/"
     why_text = f"\n\nWhy: {reason}" if reason else ""
-    why_html = f"<p>Why: {html.escape(reason)}</p>" if reason else ""
     after = (
         "You can still sign in, and reply to this email if you think we got it wrong."
         if reply_to
         else "You can still sign in."
     )
+    body = [
+        paragraph(
+            f"We can't take <strong>{esc(org_name)}</strong> on Flotta at the moment, "
+            "so it won't be able to create agents."
+        )
+    ]
+    if reason:
+        body.append(quote(esc(reason)))
+    body.append(paragraph(esc(after)))
     return Message(
         to=to,
         subject=f"About {org_name} on Flotta",
@@ -201,9 +401,12 @@ def declined_message(
             f"We can't take {org_name} on Flotta at the moment, so it won't be able "
             f"to create agents.{why_text}\n\n{after}"
         ),
-        html=(
-            f"<p>We can't take <strong>{html.escape(org_name)}</strong> on Flotta at the "
-            f"moment, so it won't be able to create agents.</p>{why_html}<p>{after}</p>"
+        html=layout(
+            title=f"About {org_name} on Flotta",
+            preheader=f"An answer about {org_name} on Flotta.",
+            heading=f"About {org_name}",
+            body=body,
+            footer=f"You are getting this because you signed {org_name} up for Flotta.",
         ),
         link=home,
         kind="decline email",
@@ -242,6 +445,14 @@ def resend_mailer(
         }
         if message.reply_to:
             payload["reply_to"] = message.reply_to
+        if f"cid:{MARK_CID}" in message.html:
+            payload["attachments"] = [
+                {
+                    "filename": MARK_FILE,
+                    "content": base64.b64encode(mark_png()).decode("ascii"),
+                    "content_id": MARK_CID,
+                }
+            ]
         status = caller(
             RESEND_URL,
             headers={"Authorization": f"Bearer {api_key}"},

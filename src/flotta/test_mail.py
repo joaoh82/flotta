@@ -91,3 +91,79 @@ def test_defaults():
     assert resolve_app_url({}) == DEFAULT_APP_URL == "http://localhost:3001"
     assert resolve_app_url({"FLOTTA_APP_URL": "https://app.flotta.dev"}) == "https://app.flotta.dev"
     assert "flotta.dev" in DEFAULT_FROM
+
+
+# -- the look (FLOTTA-168) ------------------------------------------------------
+
+from flotta.mail import (  # noqa: E402
+    MARK_CID,
+    approved_message,
+    declined_message,
+    invite_message,
+    mark_png,
+    sign_up_message,
+)
+
+_EVERY = {
+    "sign-in": lambda: sign_in_message("a@b.co", "https://app/sign-in#s3cret"),
+    "sign-up": lambda: sign_up_message("a@b.co", "https://app/sign-in#s3cret"),
+    "invite": lambda: invite_message("a@b.co", "https://app/sign-in#s3cret", "Acme", "member"),
+    "approved": lambda: approved_message("a@b.co", "https://app", "Acme"),
+    "declined": lambda: declined_message("a@b.co", "https://app", "Acme", "EU only"),
+}
+
+
+@pytest.mark.parametrize("kind", list(_EVERY))
+def test_every_email_wears_the_identity(kind):
+    """The warm ground, the white panel and the mark, in every message."""
+    page = _EVERY[kind]().html
+    assert page.startswith("<!doctype html>")
+    assert "#f5f4ef" in page and "#ffffff" in page
+    assert f'src="cid:{MARK_CID}"' in page
+    assert ">flotta</td>" in page
+
+
+@pytest.mark.parametrize("kind", ["sign-in", "sign-up", "invite"])
+def test_a_link_that_signs_in_is_a_button_and_the_address_itself(kind):
+    """A client that drops the button still leaves an address to paste."""
+    page = _EVERY[kind]().html
+    assert page.count('href="https://app/sign-in#s3cret"') == 2
+    assert "Or paste this link" in page
+
+
+def test_the_mark_is_packaged_as_a_png():
+    assert mark_png().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_resend_carries_the_mark_inline():
+    import base64
+
+    calls = []
+    resend_mailer("re_test", post=lambda url, **kw: calls.append(kw) or 200)(
+        sign_in_message("a@b.co", "https://app/sign-in#s")
+    )
+    [attachment] = calls[0]["json"]["attachments"]
+    assert attachment["content_id"] == MARK_CID
+    assert base64.b64decode(attachment["content"]) == mark_png()
+
+
+def test_html_without_the_mark_is_sent_without_an_attachment():
+    from flotta.mail import Message
+
+    calls = []
+    message = Message(to="a@b.co", subject="s", text="t", html="<p>t</p>", link="u")
+    resend_mailer("re_test", post=lambda url, **kw: calls.append(kw) or 200)(message)
+    assert "attachments" not in calls[0]["json"]
+
+
+def test_a_name_someone_chose_is_inert_everywhere_it_appears():
+    """The org's name is now in the title, heading, preheader and footer too."""
+    name = '<img src=x onerror="1">'
+    for message in (
+        invite_message("a@b.co", "https://app/s#x", name, "member"),
+        approved_message("a@b.co", "https://app", name),
+        declined_message("a@b.co", "https://app", name, '<a href="x">why</a>'),
+    ):
+        assert "<img src=x" not in message.html
+        assert '<a href="x">' not in message.html
+        assert "&lt;img src=x onerror=&quot;1&quot;&gt;" in message.html
