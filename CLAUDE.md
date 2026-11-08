@@ -840,7 +840,10 @@ conventions, and the sharp edges below.
   (FLOTTA-125).** `flotta.mcp` (catalogue, grants, the `flotta-<server>` entries written
   to `config.yaml` through the FLOTTA-124 writer), `flotta.gateway.mcp` (`/mcp/<server>`:
   the grant every request, `tools/list` filtered, an ungranted `tools/call` refused before
-  it goes out, the credential swapped in, a row in `mcp_calls`), `flotta.mcp_oauth` (Flotta
+  it goes out, the credential swapped in, a row in `mcp_calls`; a `tools/call` to a
+  catalogue server the agent isn't granted, which is what the next call after a revoke
+  is, is a `refused` row too, while the handshake, `tools/list` and an unknown name leave
+  none), `flotta.mcp_oauth` (Flotta
   as the OAuth client: discovery, registration, PKCE, refresh under a per-connection lock)
   and `flotta.sealed` (AES-GCM under `$FLOTTA_SECRETS_KEY`, else a key HKDF-derived from
   the signing key, bound to its row, failing closed; FLOTTA-102 is meant to reuse it).
@@ -855,7 +858,10 @@ conventions, and the sharp edges below.
   agent's config is made from its grants read under `_rules_lock` (`rewrite_mcp_config`),
   so a revoke meanwhile stands. **Nothing MCP wakes a sleeping agent**: `exec` starts a
   stopped Fly machine, so its config is marked pending (`box_mcp_config_pending`) and
-  `wake_box` writes it. Connections from before migration 24 are bound to the
+  `wake_box` writes it. When that wake started the machine, the reload goes with
+  `--wait` and waits (up to 120 s) for Hermes to listen: sent at once, it found Hermes
+  still booting and recorded `mcp_reload_failed` for nothing (#193, seen live on `eng-r`).
+  Only a refused connection is waited out. Connections from before migration 24 are bound to the
   catalogue's address when that migration is applied; an unbound one is refused.
   The box's token is its own `mcp:call`, written
   literally into the entry: the agent reading it learns nothing it can't already use.
