@@ -27,6 +27,7 @@ from flotta.door.app import BoxUnavailable, ControlPlane, create_door
 from flotta.door.conversation import (
     METHOD_REFUSED,
     SESSION_NOT_FOUND,
+    WAITING_EVENT,
     ConversationGate,
     latest_of_the_agency,
 )
@@ -286,6 +287,13 @@ def test_a_clients_chat_waits_for_the_agency_who_answers_from_outside_it(fleet, 
                 break
         assert "Approved (once)" in json.dumps(frame)
         assert not [f for f in seen if f.get("method") == "approval"]
+        # FLOTTA-170: told it waits on the agency, then that it no longer does.
+        notices = [
+            (f["params"]["session_id"], f["params"]["payload"]["waiting"])
+            for f in seen
+            if (f.get("params") or {}).get("type") == WAITING_EVENT
+        ]
+        assert notices == [(live, True), (live, False)]
     assert fleet["api"].get("/api/approvals", headers=owner).json() == {"approvals": []}
 
 
@@ -787,3 +795,129 @@ def test_a_compressed_conversation_is_still_the_clients():
     ]
     assert latest_of_the_agency(rows, {"root"})["id"] == "ours"
     assert latest_of_the_agency(rows[:2], {"root"}) is None
+
+
+# -- FLOTTA-170: a socket that may not answer is told its chat waits on the agency --
+
+
+def _notices(gate):
+    return [
+        (n["params"]["session_id"], n["params"]["payload"]) for n in map(json.loads, gate.notices())
+    ]
+
+
+def _box(gate, **frame):
+    return _run(gate.from_box(json.dumps({"jsonrpc": "2.0", **frame})))
+
+
+def _approval_request(srq="srq-1", request_id="r-1", live="live"):
+    return {
+        "id": srq,
+        "method": "approval",
+        "params": {"request_id": request_id, "session_id": live, "command": "rm -rf /x"},
+    }
+
+
+def _event(kind, live="live", **payload):
+    return {"method": "event", "params": {"type": kind, "session_id": live, "payload": payload}}
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        _approval_request(),
+        _event("approval.request", request_id="r-1", command="rm -rf /x"),
+    ],
+    ids=["request", "event"],
+)
+def test_a_client_is_told_its_chat_waits_and_nothing_of_the_question(ask):
+    gate = _gate()
+    assert _box(gate, **ask) is None
+    sent = gate.notices()
+    assert len(sent) == 1
+    notice = json.loads(sent[0])
+    assert notice == {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": WAITING_EVENT, "session_id": "live", "payload": {"waiting": True}},
+    }
+    assert "rm -rf" not in sent[0] and "r-1" not in sent[0] and "srq" not in sent[0]
+
+
+def test_told_once_while_it_waits_however_often_it_is_asked():
+    gate = _gate()
+    _box(gate, **_approval_request())
+    _box(gate, **_event("approval.request", request_id="r-1"))
+    _box(gate, **_approval_request(srq="srq-2", request_id="r-2"))
+    assert _notices(gate) == [("live", {"waiting": True})]
+
+
+@pytest.mark.parametrize(
+    "settle",
+    [
+        _event("request.cancel", id="srq-1", method="approval"),
+        _event("approval.resolved", request_id="r-1"),
+        _event("tool.complete", name="terminal"),
+        _event("message.complete", text="done"),
+    ],
+    ids=["withdrawn", "resolved", "went-on", "turn-ended"],
+)
+def test_told_when_it_no_longer_waits(settle):
+    gate = _gate()
+    _box(gate, **_approval_request())
+    gate.notices()
+    _box(gate, **settle)
+    assert _notices(gate) == [("live", {"waiting": False})]
+
+
+def test_answered_from_outside_the_chat_takes_the_waiting_line_down():
+    gate = _gate()
+    _box(gate, **_approval_request())
+    gate.notices()
+    done = gate.answered_elsewhere("srq-1", "live")
+    assert json.loads(done)["params"] == {
+        "type": WAITING_EVENT,
+        "session_id": "live",
+        "payload": {"waiting": False},
+    }
+
+
+def test_another_sessions_turn_ending_doesnt_clear_it():
+    gate = _gate()
+    _box(gate, **_approval_request())
+    gate.notices()
+    _box(gate, **_event("message.complete", live="other"))
+    assert _notices(gate) == []
+
+
+def test_a_resume_while_it_waits_says_so_after_the_snapshot():
+    snapshot = {
+        "session_id": "live",
+        "pending_approval": {"request_id": "r-1", "command": "rm -rf /x"},
+        "open_requests": [{"id": "srq-1", "method": "approval", "params": {"request_id": "r-1"}}],
+    }
+    gate = _gate()
+    said = json.loads(_box(gate, id=1, result=snapshot))
+    assert "pending_approval" not in said["result"]
+    assert _notices(gate) == [("live", {"waiting": True})]
+
+
+def test_the_waiting_line_is_no_way_to_answer():
+    gate = _gate()
+    gate._live.add("live")
+    _box(gate, **_approval_request())
+    gate.notices()
+    for answer in (
+        json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}}),
+        _frame("request.answer", id="srq-1", result={"choice": "once"}),
+        _frame("approval.respond", session_id="live", request_id="r-1", choice="once"),
+    ):
+        assert _run(gate.from_client(answer)).to_box is None
+
+
+def test_a_socket_that_may_answer_gets_the_card_and_no_waiting_line():
+    for gate in (_approver(), _gate(conversation_only=False)):
+        frame = _approval_request()
+        assert json.loads(_box(gate, **frame)) == {"jsonrpc": "2.0", **frame}
+        _box(gate, **_event("message.complete"))
+        assert gate.notices() == []

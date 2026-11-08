@@ -631,7 +631,11 @@ def test_an_answer_from_outside_reaches_the_box_on_this_socket(
             "reason": "answered",
         }
     else:
-        assert to_client == []
+        # Never shown the question, it is told only that it no longer waits (FLOTTA-170).
+        (done,) = [json.loads(f) for f in to_client]
+        assert done["params"]["type"] == "flotta.waiting_for_agency"
+        assert done["params"]["payload"] == {"waiting": False}
+        assert "srq-1" not in json.dumps(done)
 
 
 def test_from_outside_only_once_or_deny_reaches_the_box(quick):

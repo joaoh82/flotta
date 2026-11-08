@@ -40,6 +40,24 @@ question and may answer it, but only with `CLIENT_APPROVAL_CHOICES`, and the
 answer is rebuilt so that only the choice reaches the box: "all" in it would settle
 every approval waiting, and "always" outlives the person who said it.
 
+**What a socket kept from the question is told instead (FLOTTA-170).** Without
+it, a client's person watches "thinking…" for as long as the agency takes, up to
+the agent's hour. So the door tells that socket, in an event of its own, that the
+conversation waits on the agency, and again when it no longer does:
+
+    {"jsonrpc": "2.0", "method": "event", "params": {"type": "flotta.waiting_for_agency",
+     "session_id": <live id>, "payload": {"waiting": true | false}}}
+
+`true` once per session while anything there waits, however many times or ways
+the box asks; `false` when the last of it is settled: withdrawn
+(`request.cancel`), resolved by an `approval.*` event, answered from outside the
+conversation (FLOTTA-166's `answered_elsewhere`), or the agent going on in that
+session (`tool.complete`, `message.complete`), which is how an answer from the
+agency's own socket shows here. A resume of a session that still waits says
+`true` after the snapshot. It carries nothing of the question, no id and no
+command, so it is no way to answer: every answer this socket sends is refused
+exactly as before. A socket that may answer gets the card, and none of this.
+
 `approval.respond` names its approval, and it must be one this socket was asked,
 in the session it was asked in. A live id alone isn't enough: when it has gone
 stale Hermes looks for the `request_id` in *every* live session, so an id
@@ -103,6 +121,9 @@ ANSWERED_BY_A_CLIENT = frozenset({"clarify"})
 APPROVAL_METHOD = "approval"
 
 #: Requests the door itself sends the box. A client can't use one as its own id.
+#: The door's own event telling a socket that may not answer an approval that
+#: its conversation waits on the agency's (FLOTTA-170). See the module.
+WAITING_EVENT = "flotta.waiting_for_agency"
 LIST_ID_PREFIX = "flotta-door-list-"
 _DOOR_ID_PREFIX = "flotta-door-"
 LIST_METHOD = "session.list"
@@ -208,6 +229,13 @@ class ConversationGate:
         #: asked in, and a request's `srq-` id -> its `request_id`.
         self._approvals: dict[str, str] = {}
         self._approval_of: dict[str, str] = {}
+        #: Approvals kept from this socket and not yet settled (FLOTTA-170): a key
+        #: (Hermes's `request_id`, else the box's `srq-` id) -> the live id, and
+        #: each `srq-` id -> its key.
+        self._withheld: dict[str, str] = {}
+        self._withheld_srq: dict[str, str] = {}
+        #: Frames of the door's own for this socket, sent after the one in hand.
+        self._notices: list[str] = []
 
     # -- from the client ---------------------------------------------------------
 
@@ -365,6 +393,8 @@ class ConversationGate:
         """What to send the client for a frame from the box, if anything."""
         if self._turns is not None:
             self._turns.heard_box(frame)
+        if self._withheld and ('"message.complete"' in frame or '"tool.complete"' in frame):
+            self._agent_went_on(frame)
         if self.conversation_only:
             kept = self._without_approvals(frame)
             if kept is None:
@@ -398,12 +428,14 @@ class ConversationGate:
             if not _is_about_an_approval(parsed.get("params")):
                 return frame
             if not self.answers_approvals:
+                self._withhold_event(parsed.get("params"))
                 return None
             self._hear_approval_event(parsed.get("params"))
             return frame
         if isinstance(method, str) and isinstance(rid, str):
             if method == APPROVAL_METHOD:
                 if not self.answers_approvals:
+                    self._withhold(parsed.get("params"), rid)
                     return None
                 self._hear_approval(parsed.get("params"), rid)
             self._open[rid] = method
@@ -420,6 +452,13 @@ class ConversationGate:
         waiting = result.get("open_requests")
         requests = [r for r in waiting if isinstance(r, dict)] if isinstance(waiting, list) else []
         kept = [r for r in requests if self.answers_approvals or r.get("method") != APPROVAL_METHOD]
+        if not self.answers_approvals:
+            for request in requests:
+                if request.get("method") == APPROVAL_METHOD and isinstance(request.get("id"), str):
+                    self._withhold(request.get("params"), request["id"], result.get("session_id"))
+            pending = result.get("pending_approval")
+            if isinstance(pending, dict):
+                self._withhold({**pending, "session_id": result.get("session_id")})
         for request in kept:
             if isinstance(request.get("id"), str) and isinstance(request.get("method"), str):
                 self._open[request["id"]] = request["method"]
@@ -507,11 +546,16 @@ class ConversationGate:
     def answered_elsewhere(self, srq: str, session: str) -> str | None:
         """The box's approval `srq` was answered from outside this conversation
         (FLOTTA-166), and the door has sent the box that answer. What the client
-        is sent to take its card down, or None for a socket never shown one."""
+        is sent: its card taken down, or, for a socket never shown one, that it no
+        longer waits (FLOTTA-170); None when it wasn't told either."""
         self._open.pop(srq, None)
         self._answered(srq)
         if self.conversation_only and not self.answers_approvals:
-            return None
+            before = len(self._notices)
+            self._release(self._withheld_srq.get(srq, srq))
+            done = self._notices[before:]
+            del self._notices[before:]
+            return done[-1] if done else None
         return json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -524,8 +568,82 @@ class ConversationGate:
             }
         )
 
+    # -- what a socket that may not answer is told (FLOTTA-170) ---------------------
+
+    def notices(self) -> list[str]:
+        """The door's own frames for this socket, to send after the last one."""
+        out, self._notices = self._notices, []
+        return out
+
+    def _withhold(self, params: Any, srq: str | None = None, live: Any = None) -> None:
+        """An approval kept from this socket: tell it, once, that the agency is asked."""
+        params = params if isinstance(params, dict) else {}
+        session = params.get("session_id") or live
+        request_id = params.get("request_id")
+        key = request_id if isinstance(request_id, str) and request_id else srq
+        if not (isinstance(key, str) and isinstance(session, str) and session):
+            return
+        if srq is not None:
+            self._withheld_srq[srq] = key
+        if key in self._withheld:
+            return
+        first = session not in self._withheld.values()
+        self._withheld[key] = session
+        if first:
+            self._notices.append(_waiting(session, True))
+
+    def _withhold_event(self, params: Any) -> None:
+        """An approval event kept from this socket: asked, or settled."""
+        if not isinstance(params, dict):
+            return
+        kind, payload = params.get("type"), params.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        if kind == "approval.request":
+            self._withhold({**payload, "session_id": params.get("session_id")})
+        elif kind == "request.cancel":
+            srq = payload.get("id")
+            if isinstance(srq, str):
+                self._release(self._withheld_srq.get(srq, srq))
+        elif isinstance(payload.get("request_id"), str):
+            self._release(payload["request_id"])
+
+    def _agent_went_on(self, frame: str) -> None:
+        """A tool finished or the turn ended: what this session waited on is over."""
+        parsed = _parse(frame)
+        params = parsed.get("params") if parsed else None
+        if not isinstance(params, dict) or params.get("type") not in (
+            "message.complete",
+            "tool.complete",
+        ):
+            return
+        session = params.get("session_id")
+        for key in [k for k, s in self._withheld.items() if s == session]:
+            self._release(key)
+
+    def _release(self, key: str) -> None:
+        session = self._withheld.pop(key, None)
+        for srq in [s for s, k in self._withheld_srq.items() if k == key]:
+            del self._withheld_srq[srq]
+        if session is not None and session not in self._withheld.values():
+            self._notices.append(_waiting(session, False))
+
     def _note(self, what: str) -> None:
         _log.warning("refused %s from %s on %s", what, self._subject, self._box_id)
+
+
+def _waiting(session: str, waiting: bool) -> str:
+    """The door's event: this conversation waits on the agency's OK, or no longer."""
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": WAITING_EVENT,
+                "session_id": session,
+                "payload": {"waiting": waiting},
+            },
+        }
+    )
 
 
 def _parse(frame: str) -> dict[str, Any] | None:

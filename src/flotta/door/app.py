@@ -1204,6 +1204,8 @@ def create_door(
                             answer = await gate.from_box(message)
                             if answer is not None:
                                 await websocket.send_text(answer)
+                            for notice in gate.notices():
+                                await websocket.send_text(notice)
                         else:
                             await websocket.send_bytes(message)
 
