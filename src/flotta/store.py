@@ -4440,13 +4440,23 @@ class FleetStore:
         client: str | None = None,
         box: str | None = None,
         since: datetime | None = None,
+        statuses: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[Run]:
         """`org`'s runs, newest first. `org` is always required, as in `spend`:
         a client's id is only unique within its org, and a box filter must not
-        reach past it."""
+        reach past it. `statuses` keeps only the runs in one of them, so a
+        reader counting failures is not capped by the runs that went well."""
         where = ["org_id = ?", "trigger_kind IS NOT NULL"]
         params: list[Any] = [org]
+        if statuses is not None:
+            unknown = sorted(set(statuses) - TASK_STATUSES)
+            if unknown:
+                raise ValueError(f"no run status {unknown[0]!r}")
+            if not statuses:
+                return []
+            where.append(f"status IN ({','.join('?' * len(statuses))})")
+            params.extend(statuses)
         if client is not None:
             where.append("client_id = ?")
             params.append(client)

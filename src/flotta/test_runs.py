@@ -714,3 +714,15 @@ def test_a_batch_costs_each_run_as_reading_it_alone_would(agency):
         }.items()
     } == {"first": 4, "second": 2, "delivered": 1, "going": 2, "other": 1}
     assert agency.run_costs([]) == {}
+
+
+def test_runs_are_listed_by_how_they_ended(agency):
+    done = _started(agency, at=T0)
+    agency.finish_run(done.id, "done", output="Done.", now=T0 + timedelta(minutes=1))
+    broke = _started(agency, at=T0 + timedelta(minutes=2))
+    agency.finish_run(broke.id, "failed", error_class="agent", now=T0 + timedelta(minutes=3))
+
+    assert [r.id for r in agency.list_runs(org="studio-nord", statuses=["failed"])] == [broke.id]
+    assert agency.list_runs(org="studio-nord", statuses=[]) == []
+    with pytest.raises(ValueError):
+        agency.list_runs(org="studio-nord", statuses=["broken"])
