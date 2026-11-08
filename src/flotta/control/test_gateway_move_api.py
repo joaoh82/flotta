@@ -44,7 +44,7 @@ def _api(fleet, *, background=False):
 
 
 def _headers(*scopes, **claims):
-    token = mint(scopes=set(scopes), key=KEY, ttl_s=300, subject="p", **claims)
+    token = mint(scopes=set(scopes), key=KEY, subject="p", **claims)
     return {"Authorization": f"Bearer {token}"}
 
 
