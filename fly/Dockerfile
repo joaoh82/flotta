@@ -173,8 +173,10 @@ RUN chmod +x /usr/local/bin/gh \
     && test -x "$HERMES_VENV/bin/flotta-repos" \
     && test -x "$HERMES_VENV/bin/flotta-ask" \
     && test -x "$HERMES_VENV/bin/flotta-pr" \
+    && test -x "$HERMES_VENV/bin/flotta-request" \
     && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-github-access/SKILL.md \
-    && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-colleagues/SKILL.md
+    && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-colleagues/SKILL.md \
+    && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-requests/SKILL.md
 
 # tini as PID 1 so a process the agent spawns and abandons is reaped rather
 # than accumulating as a zombie. An agent that runs `npm test` in a loop for a

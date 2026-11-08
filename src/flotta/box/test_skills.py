@@ -92,6 +92,7 @@ SHIPPED = {
     "flotta-github-access": ("flotta-repos", "flotta.box.repos:main"),
     "flotta-colleagues": ("flotta-ask", "flotta.box.ask:main"),
     "flotta-projects": ("flotta-workdir", "flotta.box.workdir:main"),
+    "flotta-requests": ("flotta-request", "flotta.box.requests:main"),
 }
 
 

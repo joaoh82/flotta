@@ -124,6 +124,11 @@ def message(run: Run) -> str:
         from flotta import pulls
 
         return pulls.message(run.prompt, run.input)
+    if run.trigger_kind == "request":
+        # A client's words, approved by the agency: fenced the same way (FLOTTA-173).
+        from flotta import work_requests
+
+        return work_requests.message(run.prompt, run.input)
     if run.input is None:
         return run.prompt
     return f"{run.prompt}\n\nInput:\n```json\n{json.dumps(run.input, indent=2)}\n```"

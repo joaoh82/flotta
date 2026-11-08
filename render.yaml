@@ -72,6 +72,10 @@ projects:
               # Optional: GitHub identity for agents (step 7a).
               - key: FLOTTA_GITHUB_TOKEN
                 sync: false
+              # Optional: Jev judges agents' requests (step 11). Unset, every
+              # request waits for a person.
+              - key: TYPESAFE_API_KEY
+                sync: false
               # Optional: agencies connect their own GitHub (step 7d).
               - key: FLOTTA_GITHUB_APP_SLUG
                 sync: false

@@ -234,6 +234,10 @@ BOX_ROUTES = [
     ("GET", "/api/boxes/{b}/pull-requests", SCOPE_FLEET_READ, None),
     ("GET", "/api/boxes/{b}/pr-policy", SCOPE_FLEET_READ, None),
     ("PUT", "/api/boxes/{b}/pr-policy", SCOPE_FLEET_WRITE, {"may_merge": True}),
+    ("POST", "/api/boxes/{b}/requests", SCOPE_BOX_PEER, {"title": "Rebuild it all"}),
+    ("GET", "/api/boxes/{b}/requests", SCOPE_FLEET_READ, None),
+    ("GET", "/api/boxes/{b}/request-policy", SCOPE_FLEET_READ, None),
+    ("PUT", "/api/boxes/{b}/request-policy", SCOPE_FLEET_WRITE, {"auto_level": 4}),
 ]
 
 

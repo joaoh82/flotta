@@ -177,7 +177,7 @@ def test_finish_takes_only_an_ending(agency):
 
 
 def test_a_run_needs_a_known_trigger_kind(agency):
-    assert {"api", "chat", "peer", "review", "schedule", "webhook"} == TRIGGER_KINDS
+    assert {"api", "chat", "peer", "request", "review", "schedule", "webhook"} == TRIGGER_KINDS
     with pytest.raises(ValueError, match="trigger"):
         _run(agency, kind="cron")
 

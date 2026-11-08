@@ -907,6 +907,58 @@ class PrPolicy:
     follow_reviews: bool = True
 
 
+#: Where a request stands (FLOTTA-173). More steps will come between these.
+REQUEST_STATES: frozenset[str] = frozenset({"waiting", "approved", "declined"})
+
+#: The longest a request's title and details may be, and a decision's note.
+REQUEST_TITLE_MAX = 200
+REQUEST_DETAILS_MAX = 8_000
+REQUEST_NOTE_MAX = 2_000
+
+
+@dataclass(frozen=True, slots=True)
+class WorkRequest:
+    """Work a client asked an agent for, as filed, judged and decided (FLOTTA-173)."""
+
+    id: str
+    box_id: str
+    org: str
+    client: str
+    title: str
+    details: str
+    #: The conversation's turn it was filed in, its conversation, and who asked.
+    run_id: str | None
+    session_id: str | None
+    asked_by: str | None
+    #: Jev's verdict: a `flotta.judge.KINDS` key and level indexes. None unjudged.
+    kind: str | None
+    complexity: int | None
+    priority: int | None
+    #: How likely Jev thought it was within the agent's level when it was filed.
+    within: float | None
+    verdict: dict[str, Any] | None
+    judge_error: str | None
+    #: `waiting`, `approved` or `declined`.
+    status: str
+    #: Approved by the agent's level and Jev's verdict, not by a person.
+    auto: bool
+    #: Why it was started or held, in words.
+    why: str
+    decided_by: str | None
+    decided_at: str | None
+    note: str | None
+    work_run_id: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class RequestPolicy:
+    """The most complex work one agent may start without asking (`flotta.judge`)."""
+
+    auto_level: int
+    min_confidence: float
+
+
 #: The longest an API key's name may be: a label in a list, like "crm".
 API_KEY_NAME_MAX = 64
 
@@ -4914,6 +4966,179 @@ class FleetStore:
         )
         return self.pr_policy(box_id)
 
+    # -- requests (FLOTTA-173) -------------------------------------------------
+
+    def file_request(
+        self,
+        box_id: str,
+        *,
+        title: str,
+        details: str,
+        verdict: Any,
+        judge_error: str | None,
+        within: float | None,
+        approved: bool,
+        why: str,
+        now: datetime | None = None,
+    ) -> WorkRequest:
+        """A request `box_id` filed, judged (`verdict` is a `judge.Verdict` or
+        None) and decided already: `approved` by the agent's level, or waiting.
+
+        Filed during a conversation's turn, it names that turn, its
+        conversation and its person, from the run the box is doing.
+        """
+        title, details = title.strip(), details.strip()
+        if not title:
+            raise ValueError("a request needs a title: what is being asked for, in a line")
+        if len(title) > REQUEST_TITLE_MAX:
+            raise ValueError(f"a request's title is at most {REQUEST_TITLE_MAX} characters")
+        if len(details) > REQUEST_DETAILS_MAX:
+            raise ValueError(f"a request's details are at most {REQUEST_DETAILS_MAX} characters")
+        box = self._get_box_or_raise(box_id)
+        if box.status in BOX_TERMINAL:
+            raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+        live = self.live_run(box.id)
+        given = live.input if live is not None and isinstance(live.input, dict) else {}
+        session = given.get("session_id") if live and live.trigger_kind == "chat" else None
+        by = given.get("by") if live and live.trigger_kind == "chat" else None
+        moment = _instant(now) if now else _utcnow()
+        request_id = f"rq-{uuid.uuid4().hex[:12]}"
+        self._conn.execute(
+            "INSERT INTO requests (id, box_id, org_id, client_id, title, details, run_id, "
+            "session_id, asked_by, kind, complexity, priority, within, verdict_json, "
+            "judge_error, status, auto, why, decided_by, decided_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                box.id,
+                box.org,
+                box.client,
+                title,
+                details,
+                live.id if live else None,
+                session if isinstance(session, str) else None,
+                by if isinstance(by, str) else None,
+                verdict.kind if verdict else None,
+                verdict.complexity if verdict else None,
+                verdict.priority if verdict else None,
+                within,
+                json.dumps(verdict.as_dict()) if verdict else None,
+                judge_error,
+                "approved" if approved else "waiting",
+                1 if approved else 0,
+                why,
+                "flotta" if approved else None,
+                moment if approved else None,
+                moment,
+            ),
+        )
+        found = self.get_request(request_id)
+        assert found is not None
+        return found
+
+    def get_request(self, request_id: str) -> WorkRequest | None:
+        row = self._conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
+        return _request_from_row(row) if row else None
+
+    def decide_request(
+        self,
+        request_id: str,
+        *,
+        approve: bool,
+        by: str,
+        note: str | None = None,
+        now: datetime | None = None,
+    ) -> WorkRequest:
+        """A person's answer to a waiting request. Answered once: a second is refused."""
+        if note is not None and len(note) > REQUEST_NOTE_MAX:
+            raise ValueError(f"a note is at most {REQUEST_NOTE_MAX} characters")
+        with self._conn.transaction(guard="requests"):
+            current = self.get_request(request_id)
+            if current is None:
+                raise UnknownEntityError(f"no request {request_id!r}")
+            if current.status != "waiting":
+                raise ValueError(f"this request is already {current.status}")
+            self._conn.execute(
+                "UPDATE requests SET status = ?, decided_by = ?, decided_at = ?, note = ? "
+                "WHERE id = ?",
+                (
+                    "approved" if approve else "declined",
+                    by,
+                    _instant(now) if now else _utcnow(),
+                    (note or "").strip() or None,
+                    request_id,
+                ),
+            )
+        found = self.get_request(request_id)
+        assert found is not None
+        return found
+
+    def set_request_work(self, request_id: str, run_id: str) -> WorkRequest:
+        self._conn.execute("UPDATE requests SET work_run_id = ? WHERE id = ?", (run_id, request_id))
+        found = self.get_request(request_id)
+        if found is None:
+            raise UnknownEntityError(f"no request {request_id!r}")
+        return found
+
+    def list_requests(
+        self,
+        *,
+        org: str,
+        client: str | None = None,
+        box: str | None = None,
+        limit: int = 200,
+    ) -> list[WorkRequest]:
+        """An org's requests, or one client's or one agent's: every waiting one,
+        oldest first, then the decided ones, newest first, up to `limit` in all."""
+        where, args = ["org_id = ?"], [org]
+        if client is not None:
+            where.append("client_id = ?")
+            args.append(client)
+        if box is not None:
+            where.append("box_id = ?")
+            args.append(box)
+        clause = " AND ".join(where)
+        rows = self._conn.execute(
+            f"SELECT * FROM requests WHERE {clause} AND status = 'waiting' ORDER BY created_at ASC",
+            tuple(args),
+        ).fetchall()
+        room = max(0, limit - len(rows))
+        if room:
+            rows += self._conn.execute(
+                f"SELECT * FROM requests WHERE {clause} AND status <> 'waiting' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (*args, room),
+            ).fetchall()
+        return [_request_from_row(r) for r in rows]
+
+    def request_policy(self, box_id: str) -> RequestPolicy:
+        from flotta.judge import DEFAULT_AUTO_LEVEL, DEFAULT_MIN_CONFIDENCE
+
+        row = self._conn.execute(
+            "SELECT auto_level, min_confidence FROM box_request_policy WHERE box_id = ?",
+            (box_id,),
+        ).fetchone()
+        if row is None:
+            return RequestPolicy(DEFAULT_AUTO_LEVEL, DEFAULT_MIN_CONFIDENCE)
+        return RequestPolicy(int(row["auto_level"]), float(row["min_confidence"]))
+
+    def set_request_policy(self, box_id: str, policy: RequestPolicy) -> RequestPolicy:
+        from flotta.judge import COMPLEXITY, NEVER
+
+        if not NEVER <= policy.auto_level < len(COMPLEXITY):
+            raise ValueError(f"a level is {NEVER} (none) to {len(COMPLEXITY) - 1}")
+        if not 0.5 <= policy.min_confidence <= 0.99:
+            raise ValueError("how sure Jev must be is between 0.5 and 0.99")
+        self._get_box_or_raise(box_id)
+        self._conn.execute(
+            "INSERT INTO box_request_policy (box_id, auto_level, min_confidence, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (box_id) DO UPDATE SET "
+            "auto_level = EXCLUDED.auto_level, min_confidence = EXCLUDED.min_confidence, "
+            "updated_at = EXCLUDED.updated_at",
+            (box_id, policy.auto_level, policy.min_confidence, _utcnow()),
+        )
+        return self.request_policy(box_id)
+
     # -- triggers (FLOTTA-148) ----------------------------------------------
 
     def create_trigger(
@@ -6144,6 +6369,35 @@ def _api_key_from_row(row: db.Row) -> ApiKey:
         created_at=row["created_at"],
         last_used_at=row["last_used_at"],
         revoked_at=row["revoked_at"],
+    )
+
+
+def _request_from_row(row: db.Row) -> WorkRequest:
+    raw = row["verdict_json"]
+    return WorkRequest(
+        id=row["id"],
+        box_id=row["box_id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        title=row["title"],
+        details=row["details"],
+        run_id=row["run_id"],
+        session_id=row["session_id"],
+        asked_by=row["asked_by"],
+        kind=row["kind"],
+        complexity=row["complexity"],
+        priority=row["priority"],
+        within=row["within"],
+        verdict=json.loads(raw) if raw else None,
+        judge_error=row["judge_error"],
+        status=row["status"],
+        auto=bool(row["auto"]),
+        why=row["why"],
+        decided_by=row["decided_by"],
+        decided_at=row["decided_at"],
+        note=row["note"],
+        work_run_id=row["work_run_id"],
+        created_at=row["created_at"],
     )
 
 

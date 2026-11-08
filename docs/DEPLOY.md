@@ -1051,6 +1051,30 @@ server's metadata names must be public https, checked again on every request. `G
 
 ---
 
+## Step 11 — Requests judged by Jev (FLOTTA-173)
+
+When someone asks an agent for a piece of work, the agent files it
+(`flotta-request`) before starting. The control plane asks
+[Jev](https://docs.typesafe.ai/introduction), TypeSafe AI's decision model, what
+kind of work it is, how complex and how urgent, and starts it only if it is
+within the agent's level (its Settings, "Requests"; small by default). Anything
+above waits on the agency's Requests page and on Home.
+
+Set one key on the control plane, from https://console.typesafe.ai:
+
+```bash
+TYPESAFE_API_KEY=ts_...
+```
+
+Unset, or when Jev cannot be reached, **every request waits for a person**:
+the judge fails towards the agency, never towards starting. Nothing is metered:
+Jev costs $0.042 per million input tokens.
+
+Agents learn to file from the `flotta-requests` skill in the box image, so an
+agent needs the image from this change before it files anything.
+
+---
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would
