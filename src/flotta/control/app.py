@@ -5239,29 +5239,54 @@ def create_app(
         finally:
             store.close()
 
+    def _runs_since(raw: str | None) -> datetime | None:
+        """`?since=`: a day (its midnight in UTC) or a moment that says its zone."""
+        if raw is None:
+            return None
+        from flotta.usage_report import BadReport, parse_instant
+
+        try:
+            return parse_instant(raw, "since")
+        except BadReport as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/api/boxes/{box_id}/runs")
-    def list_box_runs(box_id: str, limit: int = 50, token: Token | None = needs_run_read) -> Any:
-        """An agent's runs, newest first."""
+    def list_box_runs(
+        box_id: str,
+        limit: int = 50,
+        since: str | None = None,
+        token: Token | None = needs_run_read,
+    ) -> Any:
+        """An agent's runs, newest first, each with what it cost; `?since=` the
+        ones made from then on."""
+        after = _runs_since(since)
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
             _run_reader(token)
-            runs = store.list_runs(org=box.org, box=box.id, limit=min(limit, 200))
-            return {"runs": [_run_view(r) for r in runs]}
+            runs = store.list_runs(org=box.org, box=box.id, since=after, limit=min(limit, 200))
+            return {"runs": [_run_view(r, store.run_cost(r.id)) for r in runs]}
         finally:
             store.close()
 
     @app.get("/api/clients/{client_id}/runs")
-    def list_client_runs(client_id: str, limit: int = 50, token: Token | None = needs_read) -> Any:
-        """A client's runs in the caller's org, newest first."""
+    def list_client_runs(
+        client_id: str,
+        limit: int = 50,
+        since: str | None = None,
+        token: Token | None = needs_read,
+    ) -> Any:
+        """A client's runs in the caller's org, newest first, each with what it
+        cost; `?since=` the ones made from then on."""
         org = (token.org if token else None) or DEFAULT_ORG
         if token is not None and token.client is not None and token.client != client_id:
             raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
         _run_reader(token)
+        after = _runs_since(since)
         store = store_factory()
         try:
-            runs = store.list_runs(org=org, client=client_id, limit=min(limit, 200))
-            return {"runs": [_run_view(r) for r in runs]}
+            runs = store.list_runs(org=org, client=client_id, since=after, limit=min(limit, 200))
+            return {"runs": [_run_view(r, store.run_cost(r.id)) for r in runs]}
         finally:
             store.close()
 

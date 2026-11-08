@@ -34,7 +34,7 @@ def parse_group(raw: str | None) -> tuple[str, ...]:
     return names
 
 
-def _instant(raw: str, what: str) -> datetime:
+def parse_instant(raw: str, what: str) -> datetime:
     """A day, which is its midnight in UTC, or a moment that says its timezone."""
     try:
         moment = datetime.fromisoformat(raw)
@@ -51,8 +51,8 @@ def parse_window(
     raw_from: str | None, raw_to: str | None, now: datetime
 ) -> tuple[datetime, datetime]:
     """The window asked for. Asked for nothing, it is this month so far."""
-    since = _instant(raw_from, "from") if raw_from else period_start("month", now)
-    until = _instant(raw_to, "to") if raw_to else now
+    since = parse_instant(raw_from, "from") if raw_from else period_start("month", now)
+    until = parse_instant(raw_to, "to") if raw_to else now
     if since >= until:
         raise BadReport("from has to come before to")
     if until - since > timedelta(days=MOST_DAYS):

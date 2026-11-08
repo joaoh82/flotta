@@ -30,7 +30,7 @@ Send it as a bearer token, `Authorization: Bearer flotta_key_…`. It starts and
 | --- | --- |
 | `POST /api/boxes/<agent>/runs` | `{"prompt": "…", "input": …}` starts a run. `202` with the run, `pending` until the agent is free. |
 | `GET /api/runs/<run id>` | The run: its status, steps, output and cost. |
-| `GET /api/boxes/<agent>/runs` | The agent's runs, newest first. |
+| `GET /api/boxes/<agent>/runs` | The agent's runs, newest first, each with what it cost. `?since=2026-11-01` (a day, or a moment with its zone) lists those made from then on, and `?limit=` up to 200. |
 
 `GET /api/me` answers a key too, as it answers any live credential: with the key's own claims, its subject (`key:<id>`), org, client and `run:create`. Its `expires_at` is about a minute away, because a key is turned into a token for each request. The key itself doesn't expire: revoking it is what stops it.
 
