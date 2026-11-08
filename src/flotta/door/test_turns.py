@@ -65,6 +65,12 @@ class Plane:
         self.hang = hang
         self.released = asyncio.Event()
         self._n = 0
+        self.asked: list[dict] = []
+        self.settled: list[dict] = []
+        self.delivered: list[str] = []
+        #: What `held_chat_approvals` answers: the rows as the control plane has them.
+        self.rows: list[dict] = []
+        self.polls = 0
 
     async def open_chat_run(self, box_id, *, prompt, session_id, by, client, started_at):
         if self.hang:
@@ -82,6 +88,21 @@ class Plane:
         if self.hang:
             await self.released.wait()
         self.finished.append({"box": box_id, "run": run_id, **ending})
+
+    # A turn's approvals (FLOTTA-166).
+    async def ask_chat_approval(self, box_id, run_id, *, request_id, params):
+        self.asked.append({**params, "box": box_id, "run": run_id, "request_id": request_id})
+        return f"a-{len(self.asked)}"
+
+    async def held_chat_approvals(self, box_id, run_id):
+        self.polls += 1
+        return [dict(row) for row in self.rows]
+
+    async def settle_chat_approval(self, box_id, run_id, *, request_id, choice, by):
+        self.settled.append({"run": run_id, "request_id": request_id, "choice": choice, "by": by})
+
+    async def chat_approval_delivered(self, box_id, run_id, approval_id):
+        self.delivered.append(approval_id)
 
     # The gate's own questions, unused by these turns.
     async def client_conversations(self, box_id):
@@ -483,3 +504,186 @@ def test_every_turn_opened_keeps_room_for_its_end_however_many_are_open():
 
     assert plane.opened
     assert len(plane.finished) == len(plane.opened), "an opened turn was never ended"
+
+
+# -- a turn's approvals, listed and answered from outside (FLOTTA-166) ----------
+
+
+@pytest.fixture
+def quick(monkeypatch):
+    monkeypatch.setattr("flotta.door.turns.ANSWER_POLL_S", 0.01)
+
+
+async def _until(check, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while not check():
+        assert time.monotonic() < deadline, "never happened"
+        await asyncio.sleep(0.01)
+
+
+def test_an_approval_asked_in_a_turn_is_recorded_on_its_run():
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, client=True)
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await _until(lambda: plane.asked)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    (asked,) = plane.asked
+    assert (asked["run"], asked["request_id"], asked["command"]) == (
+        "t-1",
+        "srq-1",
+        "rm -rf build/",
+    )
+
+
+def test_answered_in_the_conversation_it_is_settled_with_who_answered():
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:ops")
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await gate.from_client(
+            json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}})
+        )
+        await _until(lambda: plane.settled)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    assert plane.settled == [
+        {"run": "t-1", "request_id": "srq-1", "choice": "once", "by": "user:ops"}
+    ]
+
+
+def test_withdrawn_by_the_box_it_is_settled_with_no_answer():
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, client=True)
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await gate.from_box(
+            _event("request.cancel", {"id": "srq-1", "method": "approval", "reason": "timeout"})
+        )
+        await _until(lambda: plane.settled)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+
+    assert plane.settled[0]["choice"] is None
+
+
+@pytest.mark.parametrize(
+    ("client", "answers", "card_taken_down"),
+    [(True, False, False), (True, True, True), (False, False, True)],
+    ids=["client-never-shown", "client-who-answers", "agency"],
+)
+def test_an_answer_from_outside_reaches_the_box_on_this_socket(
+    quick, client, answers, card_taken_down
+):
+    """The guard: the box hears the answer as the reply to its own request,
+    the step says who gave it, and a card shown here comes down."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, client=client, answers=answers)
+        to_box: list[str] = []
+        to_client: list[str] = []
+
+        async def deliver(srq, session, choice):
+            to_box.append(json.dumps({"jsonrpc": "2.0", "id": srq, "result": {"choice": choice}}))
+            withdrawn = gate.answered_elsewhere(srq, session)
+            if withdrawn is not None:
+                to_client.append(withdrawn)
+
+        recorder.attach(deliver)
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await _until(lambda: plane.asked)
+        plane.rows = [
+            {"id": "a-1", "status": "answered", "choice": "once", "answered_by": "user:boss"}
+        ]
+        await _until(lambda: plane.delivered)
+        await gate.from_box(_event("message.complete", {"text": "Done.", "status": "complete"}))
+        await _settle(recorder)
+        return plane, to_box, to_client
+
+    plane, to_box, to_client = asyncio.run(go())
+
+    assert [json.loads(f) for f in to_box] == [
+        {"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "once"}}
+    ]
+    assert plane.delivered == ["a-1"]
+    (step,) = plane.finished[0]["steps"]
+    assert (step["answer"], step["answered_by"]) == ("once", "user:boss")
+    if card_taken_down:
+        (cancel,) = [json.loads(f) for f in to_client]
+        assert cancel["params"]["type"] == "request.cancel"
+        assert cancel["params"]["payload"] == {
+            "id": "srq-1",
+            "method": "approval",
+            "reason": "answered",
+        }
+    else:
+        assert to_client == []
+
+
+def test_from_outside_only_once_or_deny_reaches_the_box(quick):
+    """The control plane takes nothing else for a conversation; the door holds
+    the same line, so a row saying `always` is carried as a no."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane)
+        sent: list[str] = []
+
+        async def deliver(srq, session, choice):
+            sent.append(choice)
+
+        recorder.attach(deliver)
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await _until(lambda: plane.asked)
+        plane.rows = [{"id": "a-1", "status": "answered", "choice": "always"}]
+        await _until(lambda: sent)
+        await _settle(recorder)
+        return sent
+
+    assert asyncio.run(go()) == ["deny"]
+
+
+def test_nothing_is_looked_for_once_nothing_waits(quick):
+    """Answered here, the door stops asking the control plane about it."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:ops")
+        carried: list[str] = []
+
+        async def deliver(srq, session, choice):
+            carried.append(srq)
+
+        recorder.attach(deliver)
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await _until(lambda: plane.asked)
+        await gate.from_client(
+            json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "deny"}})
+        )
+        await asyncio.sleep(0.05)
+        polls = plane.polls
+        plane.rows = [{"id": "a-1", "status": "answered", "choice": "once"}]
+        await asyncio.sleep(0.05)
+        await _settle(recorder)
+        return plane, polls, carried
+
+    plane, polls, carried = asyncio.run(go())
+
+    assert plane.polls == polls
+    assert carried == []

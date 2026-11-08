@@ -26,6 +26,20 @@ the queue, and what doesn't fit is dropped. Every frame still goes through at
 once. Losing a turn's record costs a line in a report, while slowing the relay
 would cost the person their conversation.
 
+## An approval asked in a turn (FLOTTA-166)
+
+What the agent asks a person here is recorded against the turn's run, as a
+delivered run's is (`flotta.runner`), so the agency's Home lists it with the
+person's name and answers it from there. The door is what holds this socket, so
+it carries that answer: while something waits it reads the run's approvals
+every `ANSWER_POLL_S` (which also says it still holds the socket, or nothing
+could answer), and an answer it finds goes to the box as the reply to the box's
+own request, then to the person as a `request.cancel` so a card shown here
+comes down. Only `once` or `deny` ever: `session`, `always` and `all` outlive
+the question the person saw. Answered here, withdrawn by the box, or the turn
+over, it is settled and nothing more is looked for. Only the request form
+(Hermes v0.22) is recorded; an `approval.request` event is still a step.
+
 ## What is not recorded
 
 - A turn while the agent is doing another run. The control plane answers 409,
@@ -49,6 +63,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -84,6 +99,19 @@ MAX_REPLY = 64_000
 #: What `close` puts on the queue, to wake a worker waiting on an empty one.
 _STOP = object()
 
+#: How often a socket with an approval waiting looks for an answer given from
+#: outside the conversation (FLOTTA-166). Each look also says the door still
+#: holds the socket, well inside `store.APPROVAL_HELD_S`.
+ANSWER_POLL_S = 2.0
+
+#: What an answer from outside may tell the box: never `session`, `always` or
+#: `all`, which outlive the question the person saw.
+OUTSIDE_CHOICES = ("once", "deny")
+
+#: Sends the box an answer from outside, on this socket: the request's id, its
+#: live session, and the choice.
+Deliver = Callable[[str, str, str], Awaitable[None]]
+
 
 class Recorder(Protocol):
     """What the door asks the control plane for a turn."""
@@ -112,6 +140,18 @@ class Recorder(Protocol):
         ended_at: str,
     ) -> None: ...
 
+    async def ask_chat_approval(
+        self, box_id: str, run_id: str, *, request_id: str, params: dict[str, Any]
+    ) -> str: ...
+
+    async def held_chat_approvals(self, box_id: str, run_id: str) -> list[dict[str, Any]]: ...
+
+    async def settle_chat_approval(
+        self, box_id: str, run_id: str, *, request_id: str, choice: str | None, by: str | None
+    ) -> None: ...
+
+    async def chat_approval_delivered(self, box_id: str, run_id: str, approval_id: str) -> None: ...
+
 
 def records(subject: str) -> bool:
     """Whether a socket held by `subject` is a conversation to record."""
@@ -136,6 +176,20 @@ class _Turn:
     ending: dict[str, Any] | None = None
 
 
+@dataclass
+class _Asked:
+    """An approval the box asked on this socket, as a request (FLOTTA-166)."""
+
+    session: str
+    turn: _Turn
+    params: dict[str, Any]
+    #: Set once the control plane has recorded it.
+    approval_id: str | None = None
+    run_id: str | None = None
+    #: Answered or withdrawn on this socket, carried from outside, or its turn over.
+    settled: bool = False
+
+
 class TurnRecorder:
     """One socket's turns, each recorded as a `chat` run on its box."""
 
@@ -154,6 +208,14 @@ class TurnRecorder:
         self._closed = False
         #: Places kept on the queue for the ends of turns opened and not ended.
         self._reserved = 0
+        #: The approvals asked here, by the box's request id (FLOTTA-166).
+        self._asked: dict[str, _Asked] = {}
+        self._deliver: Deliver | None = None
+        self._poller: asyncio.Task[None] | None = None
+
+    def attach(self, deliver: Deliver) -> None:
+        """How an answer given from outside reaches the box on this socket."""
+        self._deliver = deliver
 
     # -- what passes through ------------------------------------------------
 
@@ -188,6 +250,16 @@ class TurnRecorder:
         if isinstance(rpc_id, str) and choice is not None:
             for turn in self._turns.values():
                 turn.steps.answered(rpc_id, choice, self._subject)
+            self._settle(rpc_id, str(choice))
+
+    def _settle(self, rpc_id: str, choice: str | None) -> None:
+        """Settled on this socket: the person here answered, or the box withdrew it."""
+        asked = self._asked.get(rpc_id)
+        if asked is None or asked.settled:
+            return
+        asked.settled = True
+        if self._room(1):
+            self._send("settle", asked.session, asked.turn, (rpc_id, choice))
 
     def heard_box(self, frame: str) -> None:
         """A frame from the agent, before the gate decides what the person sees."""
@@ -199,6 +271,12 @@ class TurnRecorder:
         params = parsed.get("params")
         session = params.get("session_id") if isinstance(params, dict) else None
         kind = params.get("type") if isinstance(params, dict) else None
+        if kind == "request.cancel":
+            # The box stopped waiting (its own timeout said no). Not always sent
+            # with a session, so read before the session is asked for.
+            payload = params.get("payload") if isinstance(params, dict) else None
+            if isinstance(payload, dict) and isinstance(payload.get("id"), str):
+                self._settle(payload["id"], None)
         if not isinstance(session, str) or not session:
             return
         if kind == "message.start":
@@ -213,6 +291,21 @@ class TurnRecorder:
             self._end(session, payload)
             return
         turn.steps.hear(parsed)
+        rid = parsed.get("id")
+        if parsed.get("method") == "approval" and isinstance(rid, str) and rid:
+            self._ask(session, turn, rid, params)
+
+    def _ask(self, session: str, turn: _Turn, rpc_id: str, params: dict[str, Any]) -> None:
+        """The box asked a person, on this socket: recorded so it can be listed
+        and answered from outside the conversation (FLOTTA-166)."""
+        if not turn.admitted or rpc_id in self._asked or not self._room(1):
+            return
+        self._asked[rpc_id] = _Asked(session=session, turn=turn, params=params)
+        self._send("ask", session, turn, rpc_id)
+
+    def _room(self, calls: int) -> bool:
+        """Room on the queue for `calls` more, past the places kept for ends."""
+        return self._queue.qsize() + self._reserved + calls <= QUEUE_LIMIT
 
     async def close(self) -> None:
         """The socket closed: end what is open, and send the last calls.
@@ -232,6 +325,8 @@ class TurnRecorder:
         for session in list(self._turns):
             self._end(session, None)
         self._closed = True
+        if self._poller is not None:
+            self._poller.cancel()
         worker = self._worker
         if worker is None or worker.done():
             return
@@ -267,16 +362,20 @@ class TurnRecorder:
         if turn is None or not turn.admitted:
             return
         turn.steps.unanswered()
+        for asked in self._asked.values():
+            if asked.turn is turn:
+                # Its run's end expires what is still waiting (`finish_chat_run`).
+                asked.settled = True
         turn.ending = payload
         turn.ended_at = datetime.now(UTC)
         self._reserved -= 1
         self._send("end", session, turn)
 
-    def _send(self, what: str, session: str, turn: _Turn) -> None:
+    def _send(self, what: str, session: str, turn: _Turn, extra: Any = None) -> None:
         if self._worker is None:
             self._worker = asyncio.get_running_loop().create_task(self._work())
         try:
-            self._queue.put_nowait((what, session, turn))
+            self._queue.put_nowait((what, session, turn, extra))
         except asyncio.QueueFull:  # not reached: `_begin` keeps room for every end
             if what == "open" and not turn.run_id.done():
                 turn.run_id.set_result(None)
@@ -292,10 +391,14 @@ class TurnRecorder:
             item = await self._queue.get()
             if item is _STOP:
                 continue
-            what, session, turn = item
+            what, session, turn, extra = item
             try:
                 if what == "open":
                     await self._open(session, turn)
+                elif what == "ask":
+                    await self._record_ask(extra)
+                elif what == "settle":
+                    await self._record_settle(*extra)
                 else:
                     await self._finish(turn)
             except Exception as exc:  # best effort: see the module
@@ -315,6 +418,71 @@ class TurnRecorder:
                 started_at=turn.started_at.isoformat(),
             )
         turn.run_id.set_result(run_id)
+
+    async def _record_ask(self, rpc_id: str) -> None:
+        asked = self._asked[rpc_id]
+        run_id = asked.turn.run_id.result() if asked.turn.run_id.done() else None
+        if run_id is None:
+            return
+        async with asyncio.timeout(CALL_TIMEOUT_S):
+            approval_id = await self._plane.ask_chat_approval(
+                self._box_id, run_id, request_id=rpc_id, params=asked.params
+            )
+        asked.run_id, asked.approval_id = run_id, approval_id
+        if (
+            self._deliver is not None
+            and not self._closed
+            and (self._poller is None or self._poller.done())
+        ):
+            self._poller = asyncio.get_running_loop().create_task(self._poll())
+
+    async def _record_settle(self, rpc_id: str, choice: str | None) -> None:
+        asked = self._asked.get(rpc_id)
+        if asked is None or asked.run_id is None:
+            return
+        async with asyncio.timeout(CALL_TIMEOUT_S):
+            await self._plane.settle_chat_approval(
+                self._box_id,
+                asked.run_id,
+                request_id=rpc_id,
+                choice=choice,
+                by=self._subject if choice is not None else None,
+            )
+
+    async def _poll(self) -> None:
+        """While an approval waits here, look for an answer given from outside
+        the conversation, and carry it to the box (FLOTTA-166)."""
+        while True:
+            waiting = [
+                (rid, a) for rid, a in self._asked.items() if a.approval_id and not a.settled
+            ]
+            if not waiting:
+                return
+            for run_id in {a.run_id for _, a in waiting if a.run_id}:
+                try:
+                    async with asyncio.timeout(CALL_TIMEOUT_S):
+                        rows = await self._plane.held_chat_approvals(self._box_id, run_id)
+                    for row in rows:
+                        await self._carry(row, waiting)
+                except Exception as exc:  # best effort: see the module
+                    _log.info("looking for answers on %s failed: %s", self._box_id, exc)
+            await asyncio.sleep(ANSWER_POLL_S)
+
+    async def _carry(self, row: dict[str, Any], waiting: list[tuple[str, _Asked]]) -> None:
+        for rpc_id, asked in waiting:
+            if asked.approval_id != row.get("id") or asked.settled:
+                continue
+            if row.get("status") == "expired":
+                asked.settled = True
+            elif row.get("status") == "answered" and self._deliver is not None:
+                asked.settled = True
+                choice = row.get("choice") if row.get("choice") in OUTSIDE_CHOICES else "deny"
+                await self._deliver(rpc_id, asked.session, choice)
+                asked.turn.steps.answered(rpc_id, choice, row.get("answered_by"))
+                async with asyncio.timeout(CALL_TIMEOUT_S):
+                    await self._plane.chat_approval_delivered(
+                        self._box_id, asked.run_id or "", asked.approval_id
+                    )
 
     async def _finish(self, turn: _Turn) -> None:
         run_id = turn.run_id.result() if turn.run_id.done() else None

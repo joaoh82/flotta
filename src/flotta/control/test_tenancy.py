@@ -183,6 +183,25 @@ BOX_ROUTES = [
         SCOPE_FLEET_ROUTE,
         {"steps": [], "status": "done"},
     ),
+    (
+        "POST",
+        "/api/boxes/{b}/runs/t-000000000000/approvals",
+        SCOPE_FLEET_ROUTE,
+        {"request_id": "srq-1", "command": "rm -rf /"},
+    ),
+    ("GET", "/api/boxes/{b}/runs/t-000000000000/approvals", SCOPE_FLEET_ROUTE, None),
+    (
+        "POST",
+        "/api/boxes/{b}/runs/t-000000000000/approvals/settled",
+        SCOPE_FLEET_ROUTE,
+        {"request_id": "srq-1", "choice": "always"},
+    ),
+    (
+        "POST",
+        "/api/boxes/{b}/runs/t-000000000000/approvals/a-000000000000/delivered",
+        SCOPE_FLEET_ROUTE,
+        None,
+    ),
     ("POST", "/api/boxes/{b}/sleep", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/unpause", SCOPE_ORG_ADMIN, None),
     ("POST", "/api/boxes/{b}/ticket", SCOPE_BOX_CHAT, None),
@@ -222,7 +241,8 @@ def test_every_box_route_is_here(api):
             method,
             path.replace("/acme/secrets", "/{owner}/{name}")
             .replace("/eng-a", "/{peer}")
-            .replace("/t-000000000000", "/{run_id}"),
+            .replace("/t-000000000000", "/{run_id}")
+            .replace("/a-000000000000", "/{approval_id}"),
         )
         for method, path, _, _ in BOX_ROUTES
     }
