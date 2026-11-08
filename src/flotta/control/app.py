@@ -1622,6 +1622,42 @@ def create_app(
             store.close()
         return {"org": org_id, "members": members}
 
+    @app.patch("/api/orgs/{org_id}/members/{user_id}")
+    def change_member(
+        org_id: str, user_id: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Give someone already in an org another role: `{"role", "client"?}`.
+
+        Both fields say what the membership becomes, so a client left out is
+        "every client" rather than "as before". It takes effect on the person's
+        next request, because a session re-reads its membership on every one.
+        Not its last owner, as for a removal.
+        """
+        _admin_of(token, org_id)
+        role = str(body.get("role") or "")
+        client = body.get("client")
+        client = str(client).strip() or None if client is not None else None
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            changed = store.change_membership(user_id, org_id, role, client_id=client)
+        except InvalidAccountError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except LastOwnerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return {
+            "changed": {
+                "user": changed.user_id,
+                "org": org_id,
+                "role": changed.role,
+                "client": changed.client,
+            }
+        }
+
     @app.delete("/api/orgs/{org_id}/members/{user_id}")
     def remove_member(org_id: str, user_id: str, token: Token | None = needs_admin) -> Any:
         """Take someone out of an org. Their sessions there end with it.

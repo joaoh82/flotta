@@ -544,6 +544,60 @@ def test_removing_a_member_withdraws_their_invites_to_that_org(agency):
     assert agency.redeem_login_link(other).org == "other"
 
 
+def test_a_member_changes_role_and_client(agency):
+    lee, _, _ = agency.add_person("lee@example.com", "studio-nord", "member")
+
+    viewer = agency.change_membership(lee.id, "studio-nord", "client_user", client_id="acme")
+    assert (viewer.role, viewer.client) == ("client_user", "acme")
+
+    owner = agency.change_membership(lee.id, "studio-nord", "owner")
+    assert (owner.role, owner.client) == ("owner", None)
+    assert agency.membership(lee.id, "studio-nord") == owner
+
+
+def test_a_role_change_keeps_the_sessions(agency):
+    """The membership is re-read on every request, so nobody is signed out."""
+    lee, _, _ = agency.add_person("lee@example.com", "studio-nord", "member")
+    secret = agency.create_session(lee.id, "studio-nord")
+
+    agency.change_membership(lee.id, "studio-nord", "client_viewer", client_id="acme")
+
+    assert agency.session(secret) is not None
+
+
+@pytest.mark.parametrize(
+    ("role", "client", "refusal"),
+    [
+        ("client_viewer", None, InvalidAccountError),
+        ("owner", "acme", InvalidAccountError),
+        ("admin", None, InvalidAccountError),
+        ("client_user", "nope", UnknownEntityError),
+    ],
+)
+def test_a_role_change_follows_the_rules_of_a_membership(agency, role, client, refusal):
+    lee, _, _ = agency.add_person("lee@example.com", "studio-nord", "member")
+    with pytest.raises(refusal):
+        agency.change_membership(lee.id, "studio-nord", role, client_id=client)
+    assert agency.membership(lee.id, "studio-nord").role == "member"
+
+
+def test_only_someone_in_the_org_has_a_role_changed(agency):
+    lee = agency.create_user("lee@example.com")
+    with pytest.raises(UnknownEntityError):
+        agency.change_membership(lee.id, "studio-nord", "member")
+
+
+def test_an_org_keeps_its_last_owner_through_a_role_change(agency):
+    _, ana, _ = agency.add_person("ana@example.com", "studio-nord", "owner")
+    with pytest.raises(LastOwnerError):
+        agency.change_membership(ana.user_id, "studio-nord", "member")
+    # Owner to owner is no demotion.
+    agency.change_membership(ana.user_id, "studio-nord", "owner")
+
+    agency.add_person("lee@example.com", "studio-nord", "owner")
+    assert agency.change_membership(ana.user_id, "studio-nord", "member").role == "member"
+
+
 def test_an_org_keeps_its_last_owner(agency):
     _, owner, _ = agency.add_person("ana@example.com", "studio-nord", "owner")
     with pytest.raises(LastOwnerError):
