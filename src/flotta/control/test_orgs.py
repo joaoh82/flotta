@@ -27,7 +27,7 @@ KEY = "a-signing-key-for-org-tests"
 
 def _bearer(*scopes, **claims):
     claims.setdefault("subject", "test")
-    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, ttl_s=300, **claims)}"}
+    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, **claims)}"}
 
 
 def _as(role, **claims):

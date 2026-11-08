@@ -126,7 +126,6 @@ def viewer(request, fleet):
         token = mint(
             scopes={SCOPE_FLEET_READ},
             key=KEY,
-            ttl_s=300,
             subject="acme",
             org="agency-x",
             client="acme",
@@ -208,7 +207,6 @@ def _member(fleet):
     token = mint(
         scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE},
         key=KEY,
-        ttl_s=300,
         subject="m",
         org="agency-x",
     )

@@ -245,7 +245,7 @@ def api(fleet, github, machine, monkeypatch):
 
 def _bearer(*scopes, **claims):
     claims.setdefault("subject", "person-olivia")
-    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, ttl_s=300, **claims)}"}
+    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, **claims)}"}
 
 
 def _owner(org="agency-x", subject="person-olivia"):

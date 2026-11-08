@@ -207,7 +207,7 @@ def test_one_caller_is_limited_across_addresses(api):
 
 
 def _relay(key=KEY, **claims):
-    token = mint(subject="web", scopes={SCOPE_AUTH_RELAY}, key=key, ttl_s=300, **claims)
+    token = mint(subject="web", scopes={SCOPE_AUTH_RELAY}, key=key, **claims)
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -272,10 +272,7 @@ def test_emptying_the_direct_bucket_does_not_stop_the_web_app(api):
         ({}, 401),
         ({"Authorization": "Bearer not-a-token"}, 401),
         (
-            {
-                "Authorization": "Bearer "
-                + mint(subject="x", scopes={SCOPE_ORG_ADMIN}, key=KEY, ttl_s=300)
-            },
+            {"Authorization": "Bearer " + mint(subject="x", scopes={SCOPE_ORG_ADMIN}, key=KEY)},
             403,
         ),
         # An agency's token: no role holds the scope, and a token minted with
@@ -465,7 +462,7 @@ def test_switching_to_an_org_one_is_not_in_is_a_404_and_keeps_the_session(api, o
 
 
 def test_a_token_has_no_org_to_switch(api):
-    token = mint(subject="josh", scopes={SCOPE_ORG_ADMIN}, key=KEY, ttl_s=300)
+    token = mint(subject="josh", scopes={SCOPE_ORG_ADMIN}, key=KEY)
     response = api.post(
         "/api/auth/switch", json={"org": "default"}, headers={"Authorization": f"Bearer {token}"}
     )
@@ -476,7 +473,7 @@ def test_a_token_has_no_org_to_switch(api):
 
 
 def _operator():
-    token = mint(subject="josh", scopes={SCOPE_ORG_ADMIN}, key=KEY, ttl_s=300)
+    token = mint(subject="josh", scopes={SCOPE_ORG_ADMIN}, key=KEY)
     return {"Authorization": f"Bearer {token}"}
 
 

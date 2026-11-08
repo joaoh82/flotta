@@ -89,7 +89,7 @@ def api(fleet, machine):
 
 def _headers(*scopes, **claims):
     claims.setdefault("subject", "p")
-    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, ttl_s=300, **claims)}"}
+    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, **claims)}"}
 
 
 OPERATOR = _headers(SCOPE_FLEET_READ, SCOPE_FLEET_WRITE)

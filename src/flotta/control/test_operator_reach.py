@@ -86,9 +86,7 @@ def substrate(monkeypatch):
 
 
 def _token(**claims):
-    token = mint(
-        scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE}, key=KEY, ttl_s=300, subject="p", **claims
-    )
+    token = mint(scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE}, key=KEY, subject="p", **claims)
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -99,9 +97,7 @@ CLIENT_SCOPED = _token(client=DEFAULT_CLIENT)  # the default org, but confined t
 
 @pytest.fixture
 def box_token():
-    token = mint(
-        scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE}, key=KEY, ttl_s=300, subject="box:eng-a"
-    )
+    token = mint(scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE}, key=KEY, subject="box:eng-a")
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -298,7 +294,6 @@ def test_an_agencys_own_cli_still_cannot_move_its_agent(cli_on, moves, monkeypat
     token = mint(
         scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE},
         key=KEY,
-        ttl_s=300,
         subject="p",
         org="agency-x",
     )
@@ -315,7 +310,6 @@ def test_another_agencys_cli_still_finds_no_such_agent(cli_on, moves, monkeypatc
     token = mint(
         scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE},
         key=KEY,
-        ttl_s=300,
         subject="p",
         org="agency-y",
     )

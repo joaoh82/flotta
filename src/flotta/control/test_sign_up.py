@@ -60,7 +60,7 @@ def _built(fleet, *, mailer=None, background=False, signing_key=KEY):
 
 
 def _operator(*scopes):
-    token = mint(subject="josh", scopes=set(scopes) or {SCOPE_ORG_ADMIN}, key=KEY, ttl_s=300)
+    token = mint(subject="josh", scopes=set(scopes) or {SCOPE_ORG_ADMIN}, key=KEY)
     return {"Authorization": f"Bearer {token}"}
 
 
