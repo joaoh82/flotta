@@ -30,14 +30,13 @@ lists it with Allow once and Deny. No secret, so the email can be forwarded.
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from flotta.mail import Mailer, Message
+from flotta.mail import Mailer, Message, code, esc, layout, paragraph
 from flotta.store import FleetStore, RunApproval
 
 _log = logging.getLogger(__name__)
@@ -126,21 +125,28 @@ def approval_message(
         "to everyone who can answer it. Once someone has, the rest have nothing to do."
     )
     text = "\n\n".join([*lines, footer])
-    parts = [f"<p>{html.escape(lines[0])}</p>"]
+    body = [paragraph(esc(lines[0]))]
     if wants:
-        parts.append(f"<p>What it wants: <strong>{html.escape(wants)}</strong></p>")
+        body.append(paragraph(f"What it wants: <strong>{esc(wants)}</strong>"))
     if command and command != wants:
-        parts.append(f"<p>The command:</p><pre>{html.escape(command)}</pre>")
-    parts.append(f"<p>{html.escape(lines[-2])}</p>")
-    parts.append(
-        f'<p><a href="{html.escape(link, quote=True)}">Answer it on {html.escape(where)}</a></p>'
+        body.append(paragraph("The command:"))
+        body.append(code(command))
+    body.append(paragraph(esc(lines[-2])))
+    page = layout(
+        title=subject,
+        eyebrow="Needs you",
+        heading=subject,
+        preheader=lines[0],
+        body=body,
+        action=("Answer it", link),
+        note=f"It is on {where}.",
+        footer=footer,
     )
-    parts.append(f'<p style="color:#666;font-size:12px">{html.escape(footer)}</p>')
     return Message(
         to=to.email,
         subject=subject,
         text=text,
-        html="".join(parts),
+        html=page,
         link=link,
         kind=subject,
     )

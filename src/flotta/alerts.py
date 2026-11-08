@@ -36,7 +36,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import html
 import ipaddress
 import json
 import logging
@@ -49,7 +48,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from flotta.auth import webhook_secret
-from flotta.mail import Mailer, Message
+from flotta.mail import Mailer, Message, esc, layout, paragraph
 from flotta.store import AlertDelivery, BudgetEvent, FleetStore
 
 _log = logging.getLogger(__name__)
@@ -238,9 +237,15 @@ def alert_message(to: str, event: BudgetEvent, *, app_url: str) -> Message:
         to=to,
         subject=subject,
         text=f"{sentence}\n\n{resets}\n\nSee it in Flotta: {link}",
-        html=(
-            f"<p>{html.escape(sentence)}</p><p>{html.escape(resets)}</p>"
-            f'<p><a href="{html.escape(link, quote=True)}">See it in Flotta</a></p>'
+        html=layout(
+            title=subject,
+            eyebrow="Budget limit reached" if limit else "Budget alert",
+            heading=subject,
+            preheader=sentence,
+            body=[paragraph(esc(sentence)), paragraph(esc(resets))],
+            action=("See it in Flotta", link),
+            footer="You are getting this because this address is where budget alerts "
+            "go for an agency on Flotta. An owner can change that in Flotta.",
         ),
         link=link,
         kind=subject,
