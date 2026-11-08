@@ -120,7 +120,9 @@ def test_within_the_agents_level_it_starts():
 def test_above_the_agents_level_it_waits():
     decision = decide(_verdict([0, 0.1, 0.2, 0.6, 0.1]), auto_level=1, min_confidence=0.7)
     assert not decision.starts
-    assert "large" in decision.why and "more than this agent may start" in decision.why
+    assert "judged large" in decision.why and "more than this agent may start" in decision.why
+    project = decide(_verdict([0, 0, 0, 0, 1]), auto_level=1, min_confidence=0.7)
+    assert "judged a project" in project.why
 
 
 def test_probably_small_possibly_large_waits():

@@ -60,6 +60,8 @@ COMPLEXITY: tuple[str, ...] = (
 
 #: The words the agency sees for each complexity level.
 COMPLEXITY_NAMES: tuple[str, ...] = ("trivial", "small", "medium", "large", "project")
+#: The same, as a sentence says them: "judged a project".
+_SAID: tuple[str, ...] = ("trivial", "small", "medium", "large", "a project")
 
 #: How urgent it is, low to high.
 PRIORITY: tuple[str, ...] = (
@@ -242,8 +244,8 @@ def decide(verdict: Verdict | None, *, auto_level: int, min_confidence: float) -
         return Decision(False, "it could not be judged, so a person decides")
     if auto_level < 0:
         return Decision(False, "every request this agent is given waits for the agency")
-    name = COMPLEXITY_NAMES[verdict.complexity]
-    limit = COMPLEXITY_NAMES[min(auto_level, len(COMPLEXITY_NAMES) - 1)]
+    name = _SAID[verdict.complexity]
+    limit = _SAID[min(auto_level, len(_SAID) - 1)]
     within = verdict.within(auto_level)
     if within >= min_confidence:
         return Decision(
