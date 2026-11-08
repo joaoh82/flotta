@@ -252,6 +252,43 @@ def test_a_client_neither_sees_nor_answers_an_approval_and_the_agency_does(fleet
         assert "Approved" in json.dumps(frame)
 
 
+def test_a_clients_chat_waits_for_the_agency_who_answers_from_outside_it(fleet, monkeypatch):
+    """FLOTTA-166, end to end: the client never sees the question, the agency
+    finds it in its list and answers it there, and the client's chat goes on."""
+    import time
+
+    monkeypatch.setattr("flotta.door.turns.ANSWER_POLL_S", 0.05)
+    owner = _bearer(fleet["tokens"]["owner"])
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        ana.socket.send_text(_frame("prompt.submit", 90, session_id=live, text="!approve go"))
+        deadline = time.monotonic() + 5
+        while not (listed := fleet["api"].get("/api/approvals", headers=owner).json()["approvals"]):
+            assert time.monotonic() < deadline, "the approval was never listed"
+            time.sleep(0.05)
+        (waiting,) = listed
+        assert (waiting["kind"], waiting["session_id"]) == ("chat", live)
+        assert "flotta-standin-probe" in waiting["command"]
+        assert fleet["api"].get(
+            "/api/approvals", headers=_bearer(fleet["tokens"]["ana"])
+        ).json() == {"approvals": []}
+
+        answered = fleet["api"].post(
+            f"/api/runs/{waiting['run_id']}/approval", json={"choice": "once"}, headers=owner
+        )
+
+        assert answered.status_code == 200, answered.text
+        seen = []
+        while True:
+            frame = json.loads(ana.socket.receive_text())
+            seen.append(frame)
+            if (frame.get("params") or {}).get("type") == "message.complete":
+                break
+        assert "Approved (once)" in json.dumps(frame)
+        assert not [f for f in seen if f.get("method") == "approval"]
+    assert fleet["api"].get("/api/approvals", headers=owner).json() == {"approvals": []}
+
+
 def _until(talk, wanted):
     while True:
         frame = json.loads(talk.socket.receive_text())

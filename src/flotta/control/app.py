@@ -44,6 +44,7 @@ from typing import Any
 from flotta import db
 from flotta.address import parse as parse_address
 from flotta.alerts import WebhookRefused, allow_local_webhooks, check_webhook_url, run_alert_loop
+from flotta.approval_mail import run_approval_mail_loop
 from flotta.auth import (
     CHAT_PROTOCOL,
     DEFAULT_CLIENT,
@@ -1026,6 +1027,7 @@ def create_app(
     async def lifespan(app: Any):
         task: asyncio.Task | None = None
         alerts: asyncio.Task | None = None
+        notices: asyncio.Task | None = None
         runs: asyncio.Task | None = None
         if run_loop:
             # `loop_runner` makes the *interesting* failure testable: a loop
@@ -1044,6 +1046,10 @@ def create_app(
                     signing_key=key,
                     allow_local=local_webhooks,
                 )
+            )
+            # Approvals waiting past a minute, emailed to whoever can answer (FLOTTA-167).
+            notices = asyncio.create_task(
+                run_approval_mail_loop(store_factory, mailer=deliver_link, app_url=link_base)
             )
             if carry_run is not None:
                 from flotta.runner import run_run_loop
@@ -1066,6 +1072,10 @@ def create_app(
                 alerts.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await alerts
+            if notices is not None:
+                notices.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await notices
 
     app = FastAPI(title="Flotta control plane", lifespan=lifespan)
     app.state.loop_state = state
@@ -5355,6 +5365,12 @@ def create_app(
                     raise HTTPException(
                         status_code=403, detail=f"answering needs {SCOPE_FLEET_WRITE}"
                     )
+            if run.trigger_kind == "chat":
+                # A person's conversation: the door carries only these to the
+                # box, so nothing else is taken (FLOTTA-166).
+                from flotta.door.turns import OUTSIDE_CHOICES
+
+                allowed = frozenset(OUTSIDE_CHOICES) & (allowed or frozenset(OUTSIDE_CHOICES))
             waiting = [a for a in store.run_approvals(run.id) if a.status == "waiting"]
             named = body.get("approval")
             if named is not None:
@@ -5392,7 +5408,6 @@ def create_app(
         The agency's: every one in its org. A client's people: their client's,
         on the agents the agency lets them answer for.
         """
-        from dataclasses import asdict
 
         if token is not None and (token.box is not None or subject_box(token.subject)):
             raise HTTPException(status_code=403, detail="an agent answers no approval")
@@ -5408,9 +5423,35 @@ def create_app(
                     if store.clients_answer_approvals(b.id)
                 ]
                 found = store.waiting_approvals(org=org, client=token.client, boxes=boxes)
-            return {"approvals": [asdict(a) for a in found]}
+            return {"approvals": [_approval_view(store, a) for a in found]}
         finally:
             store.close()
+
+    def _approval_view(store: FleetStore, approval: Any) -> dict[str, Any]:
+        """An approval, with where it was asked (FLOTTA-166): `kind` is `run`
+        or `chat`; a chat's also has `session_id`, the conversation, and
+        `whose`, the person in it, by name or email when they are a user."""
+        from dataclasses import asdict
+
+        view: dict[str, Any] = {**asdict(approval), "kind": "run"}
+        trigger, given = store.asked_in(approval)
+        if trigger == "chat":
+            session, by = given.get("session_id"), given.get("by")
+            view["kind"] = "chat"
+            view["session_id"] = session if isinstance(session, str) else None
+            view["whose"] = _person(store, by)
+        return view
+
+    def _person(store: FleetStore, subject: Any) -> str | None:
+        """A token's subject as a person's name or email, when it is a user's."""
+        from flotta.auth import USER_SUBJECT_PREFIX
+
+        if not isinstance(subject, str) or not subject.startswith(USER_SUBJECT_PREFIX):
+            return None
+        user = store.get_user(subject.removeprefix(USER_SUBJECT_PREFIX))
+        if user is None:
+            return None
+        return user.name or user.email
 
     # -- triggers (M14.3) ------------------------------------------------------
     #
@@ -6231,6 +6272,118 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             store.add_event("task", run.id, status, {"trigger": "chat"})
             return {"id": run.id, "status": run.status}
+        finally:
+            store.close()
+
+    # -- a conversation's approvals (FLOTTA-166) --------------------------------
+    # The door holds a person's conversation, so it records what the agent asks
+    # there against the turn's chat run: then `GET /api/approvals` lists it next
+    # to a delivered run's, and `POST /api/runs/{id}/approval` answers it, which
+    # the door carries to the box on that socket. Only the door, for the box
+    # whose socket it heard, and only a chat run of that box.
+
+    def _door_chat_run(store: FleetStore, token: Token | None, box_id: str, run_id: str) -> Any:
+        box = _routable_box(store, token, box_id)
+        try:
+            return store.chat_run_of(run_id, box.id)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=f"no chat run {run_id!r}") from exc
+
+    @app.post("/api/boxes/{box_id}/runs/{run_id}/approvals", status_code=201)
+    def ask_chat_approval(
+        box_id: str, run_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
+    ) -> Any:
+        """`{request_id, command?, description?, choices?}`: the agent asked a
+        person, in this turn, as the box's request `request_id`."""
+        from flotta.box.approvals import FLOTTA_APPROVAL_TIMEOUT_S
+        from flotta.runner import DEFAULT_CHOICES
+
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not 0 < len(request_id) <= 200:
+            raise HTTPException(status_code=422, detail="request_id is the box's request id")
+        choices = body.get("choices")
+        if isinstance(choices, list) and choices and all(isinstance(c, str) for c in choices):
+            offered = [c[:40] for c in choices[:10]]
+        else:
+            offered = list(DEFAULT_CHOICES)
+
+        def text(value: Any) -> str | None:
+            return value[:2000] if isinstance(value, str) else None
+
+        store = store_factory()
+        try:
+            run = _door_chat_run(store, token, box_id, run_id)
+            if run.status != "running":
+                raise HTTPException(status_code=409, detail=f"run {run_id!r} is {run.status}")
+            approval = store.ask_approval(
+                run.id,
+                request_id=request_id,
+                command=text(body.get("command")),
+                description=text(body.get("description")),
+                choices=offered,
+                expires_at=datetime.now(UTC) + timedelta(seconds=FLOTTA_APPROVAL_TIMEOUT_S),
+            )
+            return {"id": approval.id, "status": approval.status}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/runs/{run_id}/approvals")
+    def held_chat_approvals(
+        box_id: str, run_id: str, token: Token | None = needs_fleet_route
+    ) -> Any:
+        """The turn's approvals, for the door that holds its socket: reading them
+        says it is still listening (`hold_approvals`), so they stay answerable."""
+        from dataclasses import asdict
+
+        store = store_factory()
+        try:
+            run = _door_chat_run(store, token, box_id, run_id)
+            store.hold_approvals(run.id)
+            return {"approvals": [asdict(a) for a in store.run_approvals(run.id)]}
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/runs/{run_id}/approvals/settled")
+    def settle_chat_approval(
+        box_id: str, run_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
+    ) -> Any:
+        """`{request_id, choice?, by?}`: settled on the socket itself. With a
+        `choice`, the person there answered it; without, the box withdrew it."""
+        from dataclasses import asdict
+
+        request_id, choice, by = body.get("request_id"), body.get("choice"), body.get("by")
+        if not isinstance(request_id, str) or not request_id:
+            raise HTTPException(status_code=422, detail="request_id is the box's request id")
+        if choice is not None and not isinstance(choice, str):
+            raise HTTPException(status_code=422, detail="choice is a string")
+        store = store_factory()
+        try:
+            run = _door_chat_run(store, token, box_id, run_id)
+            settled = store.settle_approval(
+                run.id,
+                request_id,
+                choice=choice[:40] if choice else None,
+                by=by[:200] if isinstance(by, str) else None,
+            )
+            if settled is None:
+                raise HTTPException(status_code=404, detail=f"no approval {request_id!r}")
+            return asdict(settled)
+        finally:
+            store.close()
+
+    @app.post("/api/boxes/{box_id}/runs/{run_id}/approvals/{approval_id}/delivered")
+    def chat_approval_delivered(
+        box_id: str, run_id: str, approval_id: str, token: Token | None = needs_fleet_route
+    ) -> Any:
+        """The door carried a person's answer from outside to the box."""
+        store = store_factory()
+        try:
+            run = _door_chat_run(store, token, box_id, run_id)
+            approval = store.get_approval(approval_id)
+            if approval is None or approval.run_id != run.id:
+                raise HTTPException(status_code=404, detail=f"no approval {approval_id!r}")
+            store.mark_delivered(approval.id)
+            return {"id": approval.id}
         finally:
             store.close()
 

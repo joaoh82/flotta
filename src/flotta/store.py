@@ -4409,9 +4409,10 @@ class FleetStore:
         whose socket it heard, and a run of any other box, or one the control
         plane delivers, is `UnknownEntityError` to it.
         """
-        run = self.get_run(run_id)
-        if run is None or run.box_id != box_id or run.trigger_kind != "chat":
-            raise UnknownEntityError(f"no chat run {run_id!r} on box {box_id!r}")
+        self.chat_run_of(run_id, box_id)
+        # The turn is over, and the box denied on its way out whatever it was
+        # still asking: the rows say the same (FLOTTA-166).
+        self.expire_approvals(run_id, now=now)
         return self.finish_run(
             run_id,
             status,
@@ -5128,6 +5129,67 @@ class FleetStore:
                 )
         return [self._get_approval_or_raise(i) for i in ids]
 
+    def settle_approval(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        choice: str | None,
+        by: str | None,
+        now: datetime | None = None,
+    ) -> RunApproval | None:
+        """A conversation's approval settled on its own socket (FLOTTA-166).
+
+        `choice` is what the person there answered, which the box has already
+        heard, so it is answered and delivered at once. None is the box
+        withdrawing it (`request.cancel`), as it does when its own timeout
+        denies it. Only a waiting one changes: an answer from outside that got
+        there first stands. None when the run never recorded `request_id`.
+        """
+        moment = _instant(now) if now else _utcnow()
+        with self._conn.transaction(guard="run_approvals"):
+            row = self._conn.execute(
+                "SELECT id, status FROM run_approvals WHERE run_id = ? AND request_id = ?",
+                (run_id, request_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "waiting":
+                if choice is None:
+                    self._conn.execute(
+                        "UPDATE run_approvals SET status = 'expired', answered_at = ? WHERE id = ?",
+                        (moment, row["id"]),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE run_approvals SET status = 'answered', choice = ?, "
+                        "answered_by = ?, answered_at = ?, delivered_at = ? WHERE id = ?",
+                        (choice, by, moment, moment, row["id"]),
+                    )
+        return self._get_approval_or_raise(row["id"])
+
+    def asked_in(self, approval: RunApproval) -> tuple[str, dict[str, Any]]:
+        """Where `approval` was asked: its run's trigger and input (FLOTTA-166).
+
+        Read within the approval's own org, so it says nothing of anyone else's.
+        """
+        row = self._conn.execute(
+            "SELECT trigger_kind, input_json FROM tasks WHERE id = ? AND org_id = ?",
+            (approval.run_id, approval.org),
+        ).fetchone()
+        if row is None:
+            return "run", {}
+        given = json.loads(row["input_json"]) if row["input_json"] is not None else None
+        return row["trigger_kind"] or "run", given if isinstance(given, dict) else {}
+
+    def chat_run_of(self, run_id: str, box_id: str) -> Run:
+        """`box_id`'s chat run `run_id`, or `UnknownEntityError`: the door names
+        the box whose socket it heard, and nothing else is its to touch."""
+        run = self.get_run(run_id)
+        if run is None or run.box_id != box_id or run.trigger_kind != "chat":
+            raise UnknownEntityError(f"no chat run {run_id!r} on box {box_id!r}")
+        return run
+
     def get_approval(self, approval_id: str) -> RunApproval | None:
         row = self._conn.execute(
             "SELECT * FROM run_approvals WHERE id = ?", (approval_id,)
@@ -5175,6 +5237,41 @@ class FleetStore:
             params,
         ).fetchall()
         return [_approval_from_row(r) for r in rows]
+
+    def approvals_to_notify(self, *, older_than: datetime, now: datetime) -> list[RunApproval]:
+        """Approvals still waiting and answerable, asked before `older_than`, whose
+        people have not been emailed yet (FLOTTA-167), oldest first, in every org.
+
+        Answerable as `waiting_approvals` means it: not past its time, and held,
+        so an email never points at something Home won't list.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM run_approvals WHERE status = 'waiting' AND notified_at IS NULL "
+            "AND asked_at <= ? AND expires_at > ? AND held_at >= ? ORDER BY asked_at, id",
+            (
+                _instant(older_than),
+                _instant(now),
+                _instant(now - timedelta(seconds=APPROVAL_HELD_S)),
+            ),
+        ).fetchall()
+        return [_approval_from_row(r) for r in rows]
+
+    def claim_approval_notice(self, approval_id: str, *, now: datetime) -> bool:
+        """Mark `approval_id` as emailed, if nobody has: True for the one caller
+        who gets to send it. Two control planes overlapping on a deploy can't
+        both send."""
+        taken = self._conn.execute(
+            "UPDATE run_approvals SET notified_at = ? WHERE id = ? AND notified_at IS NULL "
+            "RETURNING id",
+            (_instant(now), approval_id),
+        ).fetchone()
+        return taken is not None
+
+    def release_approval_notice(self, approval_id: str) -> None:
+        """The email could not be sent: the next sweep may try again."""
+        self._conn.execute(
+            "UPDATE run_approvals SET notified_at = NULL WHERE id = ?", (approval_id,)
+        )
 
     def _get_approval_or_raise(self, approval_id: str) -> RunApproval:
         approval = self.get_approval(approval_id)

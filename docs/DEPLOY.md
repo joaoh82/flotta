@@ -764,7 +764,7 @@ To send links, set on the control plane:
 - `FLOTTA_APP_URL`: the web app, e.g. `https://app.flotta.dev`; links point at
   `<it>/sign-in#<secret>`.
 
-Budget alerts (`docs/ALERTS.md`) use the same mail settings and need nothing more. Never set `FLOTTA_ALLOW_LOCAL_WEBHOOKS` on a deployed control plane: it lets a webhook reach the control plane's own network.
+Budget alerts (`docs/ALERTS.md`) use the same mail settings and need nothing more, and so does the email to whoever can answer an approval left waiting over a minute (FLOTTA-167, `flotta.approval_mail`), which links to `FLOTTA_APP_URL`. Never set `FLOTTA_ALLOW_LOCAL_WEBHOOKS` on a deployed control plane: it lets a webhook reach the control plane's own network.
 
 Without a Resend key a deployed control plane makes **no** links, and says so
 at startup. It does not print them: a link in a log signs its address in for

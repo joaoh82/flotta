@@ -696,6 +696,15 @@ def _run_approvals() -> tuple[str, ...]:
     )
 
 
+def _approval_notices() -> tuple[str, ...]:
+    """When the people who can answer an approval were emailed (FLOTTA-167).
+
+    Null until then. Set before the email goes, as a claim, and cleared again if
+    it could not be sent, so the next sweep tries and no approval is told twice.
+    """
+    return ("ALTER TABLE run_approvals ADD COLUMN notified_at TEXT",)
+
+
 def _triggers() -> tuple[str, ...]:
     """What starts a run on its own (FLOTTA-148): schedules now, webhooks next.
 
@@ -900,6 +909,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         _mcp_catalogue(),
     ),
     Migration(25, "api keys: a client's own systems start one agent's runs", _api_keys()),
+    Migration(26, "approval notices: when a waiting approval was emailed", _approval_notices()),
 )
 
 

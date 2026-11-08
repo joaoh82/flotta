@@ -42,6 +42,11 @@ still open when the run ends is denied and marked `expired`: silence is not
 consent. The agent's own timeout is longer than a run (`flotta.box.approvals`),
 so it is this loop, not Hermes, that ends the wait.
 
+A person's conversation is a run too (a `chat` run, one per turn), but its
+socket is the door's, not this loop's, so the door records and carries its
+approvals the same way (`flotta.door.turns`, FLOTTA-166), and one list and one
+route answer both.
+
 ## When the control plane stops mid-run
 
 Stopped on purpose, as on every deploy, it knows its own deliveries: each run
