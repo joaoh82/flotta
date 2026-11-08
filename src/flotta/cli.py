@@ -516,9 +516,10 @@ def _operated_ref(box_id: str) -> str:
 
     The routes the operator may use on any org's agent (`_operated_box` in the
     control plane: moving it onto the gateway, upgrading it, its author, its
-    timeline) resolve a name or an id on their own. Asking `_remote_box` first
-    asks `GET /api/boxes/{ref}`, which keeps to the token's org, so the operator
-    met a 404 for every agency's agent before the act was even sent (FLOTTA-162).
+    timeline, its repository grants) resolve a name or an id on their own.
+    Asking `_remote_box` first asks `GET /api/boxes/{ref}`, which keeps to the
+    token's org, so the operator met a 404 for every agency's agent before the
+    act was even sent (FLOTTA-162).
     Anyone else meets the same 404 from the route itself.
     """
     from urllib.parse import quote
@@ -1918,18 +1919,21 @@ def repo_grant(
 
     if control_url():
         try:
-            box = _remote_box(box_id)
+            # Not `_remote_box`: see `_operated_ref`. An agency's agent then meets
+            # the route's own 403 for the operator (FLOTTA-83), not a 404.
             body = control_request(
                 "POST",
-                f"/api/boxes/{box['id']}/repos",
+                f"/api/boxes/{_operated_ref(box_id)}/repos",
                 scopes=(SCOPE_FLEET_WRITE,),
                 body={"repo": repo},
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
+        # The route names no box, so the line says the one that was typed.
+        name = body.get("name") or box_id
         emit(
-            {"box_id": box["id"], "name": box["name"], "repos": body["repos"]},
-            f"{box['name']} may now use {normalise_repo(repo)}",
+            {"box_id": body["box_id"], "name": name, "repos": body["repos"]},
+            f"{name} may now use {normalise_repo(repo)}",
             as_json=as_json,
         )
         return
@@ -1971,17 +1975,19 @@ def repo_revoke(
     if control_url():
         try:
             slug = normalise_repo(repo)
-            box = _remote_box(box_id)
             body = control_request(
-                "DELETE", f"/api/boxes/{box['id']}/repos/{slug}", scopes=(SCOPE_FLEET_WRITE,)
+                "DELETE",
+                f"/api/boxes/{_operated_ref(box_id)}/repos/{slug}",
+                scopes=(SCOPE_FLEET_WRITE,),
             )
         except ValueError as exc:
             raise _fail(exc, code=2) from exc
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
+        name = body.get("name") or box_id
         emit(
-            {"box_id": box["id"], "revoked": body["revoked"], "repos": body["repos"]},
-            f"{box['name']} {'no longer uses' if body['revoked'] else 'was not using'} {slug}",
+            {"box_id": body["box_id"], "revoked": body["revoked"], "repos": body["repos"]},
+            f"{name} {'no longer uses' if body['revoked'] else 'was not using'} {slug}",
             as_json=as_json,
         )
         return
@@ -2009,15 +2015,14 @@ def repo_list(
 
     if control_url():
         try:
-            box = _remote_box(box_id)
             body = control_request(
-                "GET", f"/api/boxes/{box['id']}/repos", scopes=(SCOPE_FLEET_READ,)
+                "GET", f"/api/boxes/{_operated_ref(box_id)}/repos", scopes=(SCOPE_FLEET_READ,)
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
         repos = body["repos"]
         emit(
-            {"box_id": box["id"], "name": box["name"], "repos": repos},
+            {"box_id": body["box_id"], "name": body.get("name") or box_id, "repos": repos},
             "\n".join(f"  {r}" for r in repos) or "  (none — public repositories only)",
             as_json=as_json,
         )

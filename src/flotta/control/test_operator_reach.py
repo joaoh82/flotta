@@ -245,6 +245,52 @@ def test_the_operators_cli_upgrades_an_agency_agent(cli_on, substrate):
     assert substrate == [("upgrade", None)]
 
 
+def test_the_operators_cli_refreshes_an_agency_agents_author(cli_on, fleet, monkeypatch):
+    from typer.testing import CliRunner
+
+    import flotta.provision as provision
+
+    asked: list[str] = []
+
+    def refresh_author(box_id, *, store):
+        asked.append(box_id)
+        return {"box_id": box_id, "name": store.get_box(box_id).name, "changed": False}
+
+    monkeypatch.setattr(provision, "refresh_author", refresh_author)
+    with FleetStore(fleet) as store:
+        box_id = store.get_box_by_name(AGENCY_BOX).id
+    result = CliRunner().invoke(cli_on.app, ["author", "refresh", AGENCY_BOX])
+    assert result.exit_code == 0, result.output
+    assert f"{AGENCY_BOX}  already commits as itself" in result.output
+    assert asked == [box_id]
+
+
+def test_the_operators_cli_lists_and_revokes_an_agency_agents_repositories(cli_on):
+    """FLOTTA-162 review: `repo` asked the same scoped lookup first."""
+    from typer.testing import CliRunner
+
+    # Nothing granted: a grant on an agency's agent needs the agency's own GitHub,
+    # which this fleet has not got. What is asserted is that the routes answer.
+    listed = CliRunner().invoke(cli_on.app, ["repo", "list", AGENCY_BOX, "--json"])
+    assert listed.exit_code == 0, listed.output
+    assert '"repos": []' in listed.output
+
+    revoked = CliRunner().invoke(cli_on.app, ["repo", "revoke", AGENCY_BOX, "joaoh82/flotta"])
+    assert revoked.exit_code == 0, revoked.output
+    assert f"{AGENCY_BOX} was not using joaoh82/flotta" in revoked.output
+
+
+def test_the_operators_cli_gets_the_routes_reason_for_an_agency_grant(cli_on):
+    """The route refuses the operator a grant on an agency's agent (FLOTTA-83).
+    The CLI now shows that reason, not the 404 its lookup answered first."""
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(cli_on.app, ["repo", "grant", AGENCY_BOX, "joaoh82/flotta"])
+    assert result.exit_code != 0
+    assert "403" in result.output
+    assert "not available yet" in result.output
+
+
 def test_an_agencys_own_cli_still_cannot_move_its_agent(cli_on, moves, monkeypatch):
     """Moving is the fleet's bill and key: the agency finds its agent, and is refused."""
     from typer.testing import CliRunner
