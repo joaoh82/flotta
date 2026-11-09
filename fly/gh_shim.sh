@@ -29,7 +29,8 @@
 # root, `/usr/bin/gh` is right there, and so is the REST API.
 #
 # `gh pr create` that succeeds is followed by `flotta-pr report <url>`, so the
-# agency sees the pull request and its reviews come back to the agent. It
+# agency sees the pull request and its reviews come back to the agent: on every
+# path, with a token of the shell's own or the one fetched here. It
 # prints nothing when that works and one `flotta:` line when it does not; the
 # pull request is made either way, and `gh`'s exit status is the shim's.
 #
@@ -62,9 +63,48 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = merge ]; then
   fi
 fi
 
+# `gh` as asked, with `token` in its environment when there is one. Every path
+# below ends here, so a `gh pr create` that succeeds is reported however this
+# shell was authenticated.
+run_gh() {
+  local token=$1
+  shift
+  local -a with=()
+  if [ -n "$token" ]; then with=("GH_TOKEN=$token"); fi
+  if [ "${1:-}" != pr ] || [ "${2:-}" != create ]; then
+    exec env ${with[@]+"${with[@]}"} "$REAL_GH" "$@"
+  fi
+
+  # `gh pr create`: made as asked, then the agency is told which pull request.
+  env ${with[@]+"${with[@]}"} "$REAL_GH" "$@"
+  local status=$?
+  if [ "$status" -eq 0 ]; then
+    local head="" repo="" dry=0 previous="" arg url
+    for arg in "$@"; do
+      case "$previous" in -H | --head) head=$arg ;; -R | --repo) repo=$arg ;; esac
+      case "$arg" in
+        --head=*) head=${arg#--head=} ;;
+        --repo=*) repo=${arg#--repo=} ;;
+        --dry-run | --web | -w) dry=1 ;;
+      esac
+      previous=$arg
+    done
+    if [ "$dry" -eq 0 ]; then
+      local -a view=(pr view)
+      [ -n "$head" ] && view+=("$head")
+      [ -n "$repo" ] && view+=(--repo "$repo")
+      url=$(env ${with[@]+"${with[@]}"} "$REAL_GH" "${view[@]}" --json url --jq .url 2>/dev/null || true)
+      if [ -z "$url" ] || ! flotta-pr report "$url" >/dev/null 2>&1; then
+        echo "flotta: the agency was not told about this pull request. Run: flotta-pr report <its url>" >&2
+      fi
+    fi
+  fi
+  exit "$status"
+}
+
 # Something already authenticated this shell. Its choice wins.
 if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
-  exec "$REAL_GH" "$@"
+  run_gh "" "$@"
 fi
 
 # A control-plane round trip is only worth it inside a repository that lives on
@@ -72,7 +112,7 @@ fi
 remote=$(git config --get remote.origin.url 2>/dev/null || true)
 case "$remote" in
   *github.com[:/]*) ;;
-  *) exec "$REAL_GH" "$@" ;;
+  *) run_gh "" "$@" ;;
 esac
 
 path=${remote#*github.com}
@@ -92,36 +132,4 @@ token=$(printf '%s\n' "$credential" | sed -n 's/^password=//p' | head -1)
 
 # No credential is not an error here. `gh` says "not logged in" far better than
 # this script could, and for a public repo some subcommands work regardless.
-if [ -z "$token" ]; then
-  exec "$REAL_GH" "$@"
-fi
-
-# `gh pr create`: made as asked, then the agency is told which pull request.
-if [ "${1:-}" = pr ] && [ "${2:-}" = create ]; then
-  env GH_TOKEN="$token" "$REAL_GH" "$@"
-  status=$?
-  if [ "$status" -eq 0 ]; then
-    head="" repo="" dry=0 previous=""
-    for arg in "$@"; do
-      case "$previous" in -H | --head) head=$arg ;; -R | --repo) repo=$arg ;; esac
-      case "$arg" in
-        --head=*) head=${arg#--head=} ;;
-        --repo=*) repo=${arg#--repo=} ;;
-        --dry-run | --web | -w) dry=1 ;;
-      esac
-      previous=$arg
-    done
-    if [ "$dry" -eq 0 ]; then
-      view=(pr view)
-      [ -n "$head" ] && view+=("$head")
-      [ -n "$repo" ] && view+=(--repo "$repo")
-      url=$(env GH_TOKEN="$token" "$REAL_GH" "${view[@]}" --json url --jq .url 2>/dev/null || true)
-      if [ -z "$url" ] || ! flotta-pr report "$url" >/dev/null 2>&1; then
-        echo "flotta: the agency was not told about this pull request. Run: flotta-pr report <its url>" >&2
-      fi
-    fi
-  fi
-  exit "$status"
-fi
-
-exec env GH_TOKEN="$token" "$REAL_GH" "$@"
+run_gh "$token" "$@"

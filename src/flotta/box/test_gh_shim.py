@@ -40,8 +40,9 @@ def box(tmp_path):
     _script(
         bin_ / "git",
         'case "$1 $2" in\n'
-        '  "config --get") echo "https://github.com/acme/app.git" ;;\n'
-        '  "credential fill") cat >/dev/null; printf "username=x\\npassword=tok-1\\n" ;;\n'
+        '  "config --get") echo "${FAKE_REMOTE-https://github.com/acme/app.git}" ;;\n'
+        '  "credential fill") cat >/dev/null; '
+        '[ -n "${FAKE_NO_CREDENTIAL:-}" ] || printf "username=x\\npassword=tok-1\\n" ;;\n'
         "esac\n",
     )
     _script(
@@ -102,6 +103,32 @@ def test_the_report_looks_up_the_branch_and_repository_it_was_given(box):
         FAKE_PR_URL="https://github.com/acme/app/pull/8",
     )
     assert any(c.startswith("gh pr view fix-1 --repo acme/app --json url") for c in calls)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"GH_TOKEN": "mine"},
+        {"GITHUB_TOKEN": "mine"},
+        {"FAKE_REMOTE": "https://gitlab.com/acme/app.git"},
+        {"FAKE_NO_CREDENTIAL": "1"},
+    ],
+    ids=["GH_TOKEN", "GITHUB_TOKEN", "not-on-github", "no-credential"],
+)
+def test_a_pull_request_is_reported_however_gh_was_authenticated(box, env):
+    """The pull request is made either way; the agency is told either way."""
+    code, err, calls = box(
+        "pr",
+        "create",
+        "--repo",
+        "acme/app",
+        "--fill",
+        FAKE_PR_URL="https://github.com/acme/app/pull/7",
+        **env,
+    )
+    assert code == 0 and err == ""
+    assert "flotta-pr report https://github.com/acme/app/pull/7" in calls
+    assert not any("token=tok-1" in c for c in calls)
 
 
 def test_a_failed_create_reports_nothing_and_keeps_its_status(box):

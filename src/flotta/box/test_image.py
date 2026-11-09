@@ -200,8 +200,10 @@ def test_the_gh_shim_falls_through_rather_than_failing():
     """It shadows /usr/bin/gh, so every path it cannot help with must end in
     the real gh, unchanged. `gh --version` must stay `gh --version`."""
     shim = _gh_shim()
-    assert shim.count('exec "$REAL_GH" "$@"') >= 3
-    assert 'exec env GH_TOKEN="$token" "$REAL_GH" "$@"' in shim
+    # Every path ends in `run_gh`, which execs the real gh with the arguments it
+    # was given, adding only a token (`test_gh_shim.py` runs each path).
+    assert 'exec env ${with[@]+"${with[@]}"} "$REAL_GH" "$@"' in shim
+    assert shim.count('run_gh "" "$@"') == 2 and shim.count('run_gh "$token" "$@"') == 1
 
 
 def test_the_gh_shim_does_not_shadow_the_binary_it_wraps():

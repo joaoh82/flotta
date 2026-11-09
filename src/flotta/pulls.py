@@ -28,8 +28,8 @@ never read again.
 New feedback from a person on an open PR starts a run on its agent
 (`trigger_kind="review"`), so nobody has to tell it to go and look. What counts:
 
-- a review that requests changes, or comments with something to say; a bare
-  approval asks for nothing;
+- a review that requests changes, or approves or comments with something to
+  say ("ship it, but rename this first"); a bare approval asks for nothing;
 - a comment on a line, or on the PR's conversation;
 - from someone with a say in the repository (owner, member or collaborator):
   on a public repository anyone can comment, and a stranger's comment must not
@@ -49,6 +49,7 @@ looping. A paused agent, or one held by a budget, holds the run as it would any.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -59,6 +60,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from flotta.github import API_HEADERS, API_ROOT
+from flotta.runs import MAX_INPUT
 
 _log = logging.getLogger(__name__)
 
@@ -78,6 +80,10 @@ MAX_PAGES = 5
 MAX_FEEDBACK_CHARS = 4_000
 #: Characters of all of it, so a long review cannot fill a run's input.
 MAX_FEEDBACK_TOTAL = 40_000
+#: Characters of JSON all of it may take, under a run's own limit: many short
+#: comments are mostly field names and quotes, and non-ASCII text is escaped,
+#: so the text alone does not say whether it fits.
+MAX_FEEDBACK_JSON = MAX_INPUT - 1_000
 #: Bounded: this runs on a timer, and a slow GitHub must not stall it.
 TIMEOUT_S = 10.0
 #: How long a repository token is reused by the sweep. GitHub's last an hour.
@@ -216,7 +222,7 @@ class Feedback:
     author: str
     at: str
     body: str
-    #: The review's verdict: `changes_requested` or `commented`. None otherwise.
+    #: The review's verdict: `changes_requested`, `approved` or `commented`. None otherwise.
     verdict: str | None = None
     #: Where a line comment is.
     path: str | None = None
@@ -264,6 +270,13 @@ def review_state(reviews: list[dict[str, Any]], *, author: str | None) -> str | 
     return "commented" if commented else None
 
 
+_VERDICTS = {
+    "CHANGES_REQUESTED": "changes_requested",
+    "APPROVED": "approved",
+    "COMMENTED": "commented",
+}
+
+
 def feedback_from(
     reviews: list[dict[str, Any]],
     lines: list[dict[str, Any]],
@@ -296,14 +309,14 @@ def feedback_from(
         body = str(review.get("body") or "").strip()
         if not counts(review, at):
             continue
-        if state == "CHANGES_REQUESTED" or (state == "COMMENTED" and body):
+        if state == "CHANGES_REQUESTED" or (state in ("COMMENTED", "APPROVED") and body):
             out.append(
                 Feedback(
                     kind="review",
                     author=_login(review.get("user")) or "",
                     at=at or "",
                     body=body,
-                    verdict="changes_requested" if state == "CHANGES_REQUESTED" else "commented",
+                    verdict=_VERDICTS[state],
                     url=review.get("html_url"),
                 )
             )
@@ -361,15 +374,22 @@ def followup_prompt(pr: Any, *, may_merge: bool) -> str:
 
 
 def run_input(feedback: list[Feedback]) -> dict[str, Any]:
-    """What the run keeps of the feedback, cut to fit a run's input."""
+    """What the run keeps of the feedback, cut to fit a run's input.
+
+    Cut by the text and by the JSON it makes, oldest first; what is left out is
+    counted, so the agent is told to read the rest on the pull request.
+    """
     kept: list[dict[str, Any]] = []
-    room = MAX_FEEDBACK_TOTAL
+    text_room = MAX_FEEDBACK_TOTAL
+    json_room = MAX_FEEDBACK_JSON
     for item in feedback:
         entry = asdict(item)
         entry["body"] = item.body[:MAX_FEEDBACK_CHARS]
-        room -= len(entry["body"])
-        if room < 0:
+        size = len(json.dumps(entry)) + 2  # and the ", " between entries
+        if len(entry["body"]) > text_room or size > json_room:
             break
+        text_room -= len(entry["body"])
+        json_room -= size
         kept.append(entry)
     return {"feedback": kept, "left_out": len(feedback) - len(kept)}
 
@@ -391,8 +411,8 @@ def message(prompt: str, input: Any, *, fence: str | None = None) -> str:
         kind = item.get("kind")
         who = item.get("author") or "someone"
         if kind == "review":
-            verdict = (
-                "requested changes" if item.get("verdict") == "changes_requested" else "reviewed"
+            verdict = {"changes_requested": "requested changes", "approved": "approved"}.get(
+                str(item.get("verdict")), "reviewed"
             )
             head = f"{who} {verdict}"
         elif kind == "line":
@@ -531,7 +551,16 @@ def follow_up(store: Any, pr: Any, feedback: list[Feedback], *, now: datetime) -
             input=run_input(feedback),
             now=now,
         )
-    except Exception as exc:  # noqa: BLE001 - a destroyed agent, or bad input: say so
+    except ValueError as exc:
+        # Input a run refuses would be refused again on every sweep, and what was
+        # said after it would wait behind it: move past it, and say so.
+        _log.warning("pull request %s: follow-up refused, skipped: %s", pr.id, exc)
+        return store.update_pull_request(
+            pr.id,
+            feedback_seen_at=newest,
+            check_error=f"review feedback could not be sent to the agent: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001 - a destroyed agent: say so
         _log.warning("pull request %s: no follow-up run: %s", pr.id, exc)
         return store.update_pull_request(pr.id, check_error=f"could not start a follow-up: {exc}")
     store.add_event(
