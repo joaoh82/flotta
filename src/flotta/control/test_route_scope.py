@@ -45,7 +45,15 @@ import pytest
 #: `get_run` too: a run is a box's, and its id reaches across orgs (M14.2).
 #: `get_trigger` likewise (M14.3), and `get_api_key` (M14.5).
 UNSCOPED_READS = frozenset(
-    {"get_box", "get_box_by_name", "list_boxes", "get_run", "get_trigger", "get_api_key"}
+    {
+        "get_box",
+        "get_box_by_name",
+        "list_boxes",
+        "get_run",
+        "get_trigger",
+        "get_api_key",
+        "get_pull_request",
+    }
 )
 
 #: Where a box lookup is allowed to happen, because the tenant check happens
@@ -62,6 +70,7 @@ SCOPE_FUNCTIONS: frozenset[str] = frozenset(
         "_scoped_run",  # one run, if the token's tenant may act on its box
         "_scoped_trigger",  # one trigger, likewise
         "_scoped_key",  # one API key, likewise (M14.5)
+        "_scoped_pull",  # one pull request, likewise (FLOTTA-171)
         "_hooked_trigger",  # a webhook, if the caller proves its secret (below)
     }
 )

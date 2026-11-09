@@ -172,6 +172,7 @@ RUN chmod +x /usr/local/bin/gh \
     && test -x "$HERMES_VENV/bin/git-credential-flotta" \
     && test -x "$HERMES_VENV/bin/flotta-repos" \
     && test -x "$HERMES_VENV/bin/flotta-ask" \
+    && test -x "$HERMES_VENV/bin/flotta-pr" \
     && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-github-access/SKILL.md \
     && test -f /app/src/flotta/box/hermes_skills/flotta/flotta-colleagues/SKILL.md
 

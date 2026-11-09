@@ -1,7 +1,7 @@
 ---
 name: flotta-github-access
-description: "Which GitHub repos you can clone/push: run flotta-repos"
-version: 1.0.0
+description: "GitHub repos you may use (flotta-repos); PRs (flotta-pr)"
+version: 1.1.0
 author: Flotta
 license: AGPL-3.0
 metadata:
@@ -54,6 +54,24 @@ the same way for granted repositories.
   prints a line starting with `flotta:` that names the repository and says it
   is not granted.
 - **Public and not granted:** anonymous clone and fetch still work. Pushing does not.
+
+## Pull requests
+
+The agency sees every pull request you open, and its reviews come back to you.
+
+- **Open them with `gh pr create`.** `gh` tells the agency about the pull
+  request once it exists; you do nothing more. If it prints a line starting
+  `flotta: the agency was not told`, or you opened one any other way (`gh api`,
+  a GitHub tool), run `flotta-pr report <its url>`.
+- **You do not need to check for reviews.** New feedback from the repository's
+  people on an open pull request of yours is sent to you as a piece of work of
+  its own, with the comments quoted. Address it on the same branch, push, and
+  reply on the pull request. Nobody has to ask you to look.
+- **Merging is the agency's choice.** `gh pr merge` asks first and is refused
+  unless the agency lets this agent merge its own pull requests. When it is
+  refused, leave the pull request open and say it is ready: the agency merges
+  it from Flotta. Do not try to merge it another way.
+- `flotta-pr list` shows your pull requests and where each stands.
 
 ## When the repository someone wants is not listed
 

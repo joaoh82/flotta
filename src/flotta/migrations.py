@@ -705,6 +705,68 @@ def _approval_notices() -> tuple[str, ...]:
     return ("ALTER TABLE run_approvals ADD COLUMN notified_at TEXT",)
 
 
+def _pull_requests() -> tuple[str, ...]:
+    """The pull requests agents open, and what each agent may do with its own
+    (FLOTTA-171, FLOTTA-172).
+
+    A row is made when a box reports a PR it opened (`flotta-pr report`, which
+    the box's `gh` runs after `gh pr create`), from what GitHub says rather than
+    what the box said, and kept up to date by `flotta.pulls`'s sweep. `state` is
+    `open`, `closed` or `merged`; `review_state` the reviewers' standing verdict.
+
+    `feedback_seen_at` is the newest review or comment already answered (or
+    already there when the PR was reported), so one comment never starts two
+    follow-ups; `followups` counts them and `followup_run_id` is the latest, so
+    a second never starts while one is still going. `merged_by_person` is set
+    when someone merged it from Flotta rather than GitHub.
+
+    `box_pr_policy` holds the agency's choices for one agent. No row is the
+    default: it may not merge its own PRs, and it does follow their reviews.
+    """
+    return (
+        """
+        CREATE TABLE pull_requests (
+            id               TEXT PRIMARY KEY,
+            box_id           TEXT NOT NULL REFERENCES boxes(id),
+            org_id           TEXT NOT NULL,
+            client_id        TEXT NOT NULL,
+            repo             TEXT NOT NULL,
+            number           INTEGER NOT NULL,
+            url              TEXT NOT NULL,
+            title            TEXT NOT NULL,
+            author_login     TEXT,
+            head_ref         TEXT,
+            base_ref         TEXT,
+            state            TEXT NOT NULL,
+            draft            INTEGER NOT NULL DEFAULT 0,
+            review_state     TEXT,
+            opened_at        TEXT NOT NULL,
+            merged_at        TEXT,
+            merged_by        TEXT,
+            merged_by_person TEXT,
+            closed_at        TEXT,
+            reported_at      TEXT NOT NULL,
+            checked_at       TEXT,
+            check_error      TEXT,
+            feedback_seen_at TEXT NOT NULL,
+            followups        INTEGER NOT NULL DEFAULT 0,
+            followup_run_id  TEXT,
+            UNIQUE (repo, number)
+        )
+        """,
+        "CREATE INDEX idx_pull_requests_org ON pull_requests(org_id, state, opened_at)",
+        "CREATE INDEX idx_pull_requests_box ON pull_requests(box_id)",
+        """
+        CREATE TABLE box_pr_policy (
+            box_id         TEXT PRIMARY KEY REFERENCES boxes(id),
+            may_merge      INTEGER NOT NULL DEFAULT 0,
+            follow_reviews INTEGER NOT NULL DEFAULT 1,
+            updated_at     TEXT NOT NULL
+        )
+        """,
+    )
+
+
 def _triggers() -> tuple[str, ...]:
     """What starts a run on its own (FLOTTA-148): schedules now, webhooks next.
 
@@ -910,6 +972,9 @@ MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(25, "api keys: a client's own systems start one agent's runs", _api_keys()),
     Migration(26, "approval notices: when a waiting approval was emailed", _approval_notices()),
+    Migration(
+        27, "pull requests: what agents open, and whether each may merge its own", _pull_requests()
+    ),
 )
 
 
