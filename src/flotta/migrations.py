@@ -25,9 +25,14 @@ a table is added. Migrations are numbered steps *on top of* that baseline, each 
 tables it has: a column change to one of them is a migration from now on, or a
 fresh store and an upgraded one would disagree.
 
-**They run at open, like the baseline does.** The control plane opens a store
-per request and the CLI per command, so there is no "deploy, then remember to
-migrate" step to forget — and the single-operator path stays one command.
+**They run at open, like the baseline does.** The CLI opens a store per
+command, and the control plane on its first open in a process, so there is no
+"deploy, then remember to migrate" step to forget, and the single-operator path
+stays one command. A deploy is a new process, so a new migration runs on its
+first request. **The control plane's later Postgres opens only connect**
+(FLOTTA-178, `control.app._store_factory`): preparing on every request held the
+schema lock each time and queued every request behind every other one. Don't
+put that back. SQLite is still prepared on every open.
 
 **One transaction per migration, under a lock.** Two control-plane workers
 opening the store at the same moment must not both apply step 3. Each pending
