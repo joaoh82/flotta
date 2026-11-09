@@ -228,11 +228,14 @@ gateway-smoke:
 # reached by agents over 6PN at http://$FLOTTA_GATEWAY_APP.internal:8080/v1.
 # Creates the app and its static egress IP (the database admits only that
 # address) the first time. Costs money: an always-on machine plus the IP.
+# $FLOTTA_GATEWAY_REGION moves both, together: an egress IP serves only machines
+# in its own region, and Fly had none left in iad when staging asked (M14.8).
 gateway-deploy: fly-whoami
     #!/usr/bin/env bash
     set -euo pipefail
     ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
     APP="${FLOTTA_GATEWAY_APP:-flotta-gateway}"
+    REGION="${FLOTTA_GATEWAY_REGION:-iad}"
     # Exact match on parsed JSON, for the reason door-deploy records.
     if ! flyctl apps list --json \
       | uv run python -c "import json,sys; sys.exit(0 if any(a.get('Name')=='$APP' for a in json.load(sys.stdin)) else 1)"; then
@@ -242,16 +245,16 @@ gateway-deploy: fly-whoami
     # Before the first deploy, so the first boot already has the address the
     # database's allowlist names.
     if ! flyctl ips list --app "$APP" --json \
-      | uv run python -c "import json,sys; sys.exit(0 if any('egress' in (i.get('Type') or '').lower() for i in json.load(sys.stdin)) else 1)"; then
-      echo "allocating a static egress IP for $APP in iad"
-      flyctl ips allocate-egress --app "$APP" --region iad --yes
+      | uv run python -c "import json,sys; sys.exit(0 if any('egress' in (i.get('Type') or '').lower() and i.get('Region')=='$REGION' for i in json.load(sys.stdin)) else 1)"; then
+      echo "allocating a static egress IP for $APP in $REGION"
+      flyctl ips allocate-egress --app "$APP" --region "$REGION" --yes
     fi
     echo ""
     echo "Deploying $APP — ONE always-on machine. Ctrl-C to stop."
     sleep 3
     # --ha=false: a second instance would not see the first one's unwritten usage.
     flyctl deploy --config fly/gateway/fly.toml --dockerfile fly/gateway/Dockerfile \
-      --app "$APP" --ha=false .
+      --app "$APP" --primary-region "$REGION" --ha=false .
     echo ""
     echo "Egress IPs (add the IPv4 to the database's ipAllowList in render.yaml):"
     flyctl ips list --app "$APP"
