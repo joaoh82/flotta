@@ -270,3 +270,23 @@ def test_a_delivered_runs_approval_is_listed_as_a_run(api, fleet):
 
     (listed,) = _listed(api)
     assert listed["kind"] == "run" and "session_id" not in listed
+
+
+def test_an_answer_from_home_needs_none_of_the_doors_code(api, fleet, monkeypatch):
+    """The control plane's image has no `websockets`, which the door needs on import.
+
+    Answering from Home once imported the allowed choices from `flotta.door`, so
+    every answer in production was a 500 while this suite, which has the package,
+    passed. Hide it and drop the door's modules, and the answer must still land.
+    """
+    import sys
+
+    for name in [m for m in sys.modules if m == "flotta.door" or m.startswith("flotta.door.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "websockets", None)
+    run_id = _turn(api, fleet)
+    _ask(api, run_id)
+
+    answer = api.post(f"/api/runs/{run_id}/approval", json={"choice": "once"}, headers=AGENCY_X)
+    assert answer.status_code == 200, answer.text
+    assert not any(m.startswith("flotta.door") for m in sys.modules)

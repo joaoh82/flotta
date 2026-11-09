@@ -68,6 +68,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from flotta.approval_choices import OUTSIDE_CHOICES
 from flotta.steps import Steps
 
 _log = logging.getLogger("flotta.door")
@@ -109,9 +110,6 @@ _STOP = object()
 #: holds the socket, well inside `store.APPROVAL_HELD_S`.
 ANSWER_POLL_S = 2.0
 
-#: What an answer from outside may tell the box: never `session`, `always` or
-#: `all`, which outlive the question the person saw.
-OUTSIDE_CHOICES = ("once", "deny")
 
 #: Sends the box an answer from outside, on this socket: the request's id, its
 #: live session, and the choice.
