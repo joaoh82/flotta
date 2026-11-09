@@ -353,23 +353,32 @@ _prepared: set[str] = set()
 
 
 def _store_factory() -> FleetStore:
-    """A fresh store per request, **prepared once per process**.
+    """A fresh store per request, **prepared once per process**, on a reused
+    connection.
 
-    Per-request rather than one long-lived connection, for the same reason the
+    Per-request rather than one long-lived store, for the same reason the
     dashboard opens SQLite per request: a pinned snapshot served to a polling
-    UI is stale in the one way a fleet view must never be.
+    UI is stale in the one way a fleet view must never be. Reusing the
+    *connection* underneath does not change that; each store still reads the
+    database as it is now.
 
-    **Connecting is cheap; preparing is not, on Postgres.** Opening a store
-    lays the schema and applies migrations under a fleet-wide advisory lock,
-    and a signed-in request opens two stores (the session, then the route).
-    Done on every open, that lock queued every request behind every other: a
-    page asking ten things at once got them back one by one, and each click in
-    the web app waited about a second per round trip on Render. So the first
-    open in this process prepares, and every later one only connects. A deploy
-    is a new process, so new migrations still apply on its first request.
+    **Preparing, on Postgres, takes a lock.** Opening a store lays the schema
+    and applies migrations under a fleet-wide advisory lock, so doing it per
+    request queued every request behind every other. The first open in this
+    process prepares, and every later one only connects. A deploy is a new
+    process, so new migrations still apply on its first request.
+
+    **And connecting is not cheap either** (FLOTTA-178). Removing the lock
+    changed nothing measurable on Render: a signed-in request opens two stores
+    (the session, then the route), and opening a Postgres connection was 82%
+    of the control plane's CPU, more when a page's dozen requests connect at
+    once. On half a CPU that is a second and a half per page. So the stores
+    here reuse idle connections (`db.connect`'s `reuse`), which took a page's
+    burst from 391 ms to 18 ms on a server held to half a CPU.
 
     SQLite is prepared on every open, as before: it is a local file, which can
-    be deleted under a running server, and preparing it costs nothing.
+    be deleted under a running server, and preparing it costs nothing. It has
+    no connections worth keeping, either.
 
     Two first requests at once may both prepare, which is what every request
     did before and is safe for the same reason (the lock).
@@ -380,11 +389,10 @@ def _store_factory() -> FleetStore:
     # $FLOTTA_STORE, and served an empty fleet from a file nobody meant while
     # `flotta ps` in the same shell listed the real one.
     url = postgres_target()
-    if url is not None and url in _prepared:
-        return FleetStore(prepare=False)
-    store = FleetStore()
-    if url is not None:
-        _prepared.add(url)
+    if url is None:
+        return FleetStore()
+    store = FleetStore(prepare=url not in _prepared, reuse=True)
+    _prepared.add(url)
     return store
 
 

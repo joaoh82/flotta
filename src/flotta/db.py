@@ -40,12 +40,34 @@ Local development and the whole test suite run on a file, so `just check` needs
 no server, no container and no network — the property that has made every
 milestone cheap to verify. Postgres engages only when `$FLOTTA_DATABASE_URL` is
 set, which is also what §8.3's Railway template supplies.
+
+## Reusing Postgres connections (FLOTTA-178)
+
+The control plane opens a store per request, and a signed-in request opens two
+(the session, then the route). Connecting to Postgres is the expensive part of
+that: profiled locally it was 82% of the server's CPU, and a connection's cost
+**grows when several open at once** (1.9 ms of CPU alone, 10 ms each with
+eleven at once, which is one page). On Render's half a CPU, a page's burst of
+requests spent its whole CPU budget connecting and came back over a second
+and a half.
+
+So `connect(..., reuse=True)` hands out an idle connection when this process
+has one, and `close()` keeps a clean one for the next caller instead of
+closing it (`_IdleConnections`). It is a cache, never a gate: with nothing idle
+it connects, exactly as before, so there is no pool size to wait on and no way
+for a request holding one store and opening a second to deadlock. A connection
+is kept only if it is idle (not mid-transaction), and checked with a round
+trip before it is handed out, so one a database restart killed is replaced
+rather than served. Only the control plane asks for reuse; the CLI and SQLite
+do not.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -185,16 +207,25 @@ def resolve_url(explicit: str | None = None, env: dict[str, str] | None = None) 
     return (explicit or env.get(DATABASE_URL_ENV) or "").strip() or None
 
 
-def connect(target: str | Path | None = None, *, env: dict[str, str] | None = None) -> Connection:
+def connect(
+    target: str | Path | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    reuse: bool = False,
+) -> Connection:
     """Open the fleet store, choosing an engine from what it was given.
 
     A Postgres URL selects Postgres; anything else is a SQLite path. Routing on
     the value rather than a separate flag means one variable configures the
     store and there is no way to say two contradictory things.
+
+    `reuse` takes an idle Postgres connection when this process has one and
+    keeps this one when it is closed ("Reusing Postgres connections" above).
+    SQLite ignores it: opening a file costs nothing.
     """
     url = resolve_url(str(target) if target is not None else None, env)
     if is_postgres_url(url):
-        return PostgresConnection(url)  # type: ignore[arg-type]
+        return PostgresConnection(url, reuse=reuse)  # type: ignore[arg-type]
     return SqliteConnection(target if target is not None else "fleet.db")
 
 
@@ -299,6 +330,75 @@ def to_postgres_sql(sql: str) -> str:
     return "".join(out)
 
 
+#: The most idle connections one process keeps for each database. A page asks
+#: about a dozen things at once; more than that would only hold connections
+#: open, against Render's 100 on the plan the fleet uses.
+IDLE_CONNECTIONS_MAX = 16
+
+
+class _IdleConnections:
+    """Postgres connections this process has finished with, kept for reuse.
+
+    Keyed by URL. Thread-safe, because the control plane serves requests on a
+    pool of threads. See "Reusing Postgres connections" above for why.
+    """
+
+    def __init__(self, limit: int = IDLE_CONNECTIONS_MAX) -> None:
+        self.limit = limit
+        self._lock = threading.Lock()
+        self._by_url: dict[str, list[Any]] = {}
+
+    def take(self, url: str) -> Any | None:
+        """The most recently returned connection to `url`, or None."""
+        with self._lock:
+            idle = self._by_url.get(url)
+            return idle.pop() if idle else None
+
+    def give(self, url: str, raw: Any, idle_status: Any) -> bool:
+        """Keep `raw` for the next caller, if it is clean and there is room.
+
+        Clean means open, not broken, and not in a transaction: a connection
+        returned mid-transaction would hand its open transaction, and any locks
+        it holds, to whichever request comes next.
+        """
+        if raw.closed or raw.broken or raw.info.transaction_status != idle_status:
+            return False
+        with self._lock:
+            idle = self._by_url.setdefault(url, [])
+            if len(idle) >= self.limit:
+                return False
+            idle.append(raw)
+            return True
+
+    def drop(self, url: str) -> None:
+        """Close every idle connection to `url`."""
+        with self._lock:
+            idle = self._by_url.pop(url, [])
+        for raw in idle:
+            with contextlib.suppress(Exception):  # closing a dead socket
+                raw.close()
+
+    def count(self, url: str) -> int:
+        with self._lock:
+            return len(self._by_url.get(url, ()))
+
+
+_IDLE = _IdleConnections()
+
+
+class _Returned:
+    """What a closed store's connection becomes once it has been handed back.
+
+    The connection now belongs to whoever takes it next, so a store used after
+    `close()` must fail rather than run its query on someone else's connection.
+    """
+
+    closed = True
+
+    def __getattr__(self, name: str) -> Any:
+        raise DatabaseError("this store is closed: its connection went back for reuse")
+
+
 class PostgresConnection:
     """Fleet state on a server, so it is not on anyone's laptop.
 
@@ -308,7 +408,16 @@ class PostgresConnection:
 
     placeholder = "%s"
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, *, reuse: bool = False) -> None:
+        """Connect to `url`, or with `reuse` take an idle connection to it.
+
+        A reused connection never prepares statements on the server
+        (`prepare_threshold=None`, which is what a connection used once and
+        closed got in practice). One kept for the life of a process would, and
+        a prepared `SELECT *` fails with "cached plan must not change result
+        type" once a deploy's migration adds a column while this process is
+        still serving.
+        """
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - depends on install extras
@@ -318,8 +427,29 @@ class PostgresConnection:
             ) from exc
 
         self._psycopg = psycopg
+        self._url = url
+        self._reuse = reuse
+        if reuse:
+            raw = _IDLE.take(url)
+            if raw is not None:
+                try:
+                    raw.execute("SELECT 1")
+                except psycopg.Error:
+                    # Dead: most likely the database restarted, which killed
+                    # every idle connection to it, so drop them all at once
+                    # rather than discovering it one request at a time.
+                    raw.close()
+                    _IDLE.drop(url)
+                else:
+                    self._conn = raw
+                    return
         try:
-            self._conn = psycopg.connect(url, autocommit=True, row_factory=psycopg.rows.dict_row)
+            self._conn = psycopg.connect(
+                url,
+                autocommit=True,
+                row_factory=psycopg.rows.dict_row,
+                **({"prepare_threshold": None} if reuse else {}),
+            )
         except Exception as exc:
             # The URL carries a password and this message reaches stderr.
             # psycopg's own errors do not echo conninfo today, but "today" is
@@ -393,4 +523,10 @@ class PostgresConnection:
         cursor.execute("COMMIT")
 
     def close(self) -> None:
-        self._conn.close()
+        raw = self._conn
+        if isinstance(raw, _Returned):
+            return  # closed already; giving it back twice would share it
+        if self._reuse and _IDLE.give(self._url, raw, self._psycopg.pq.TransactionStatus.IDLE):
+            self._conn = _Returned()
+            return
+        raw.close()
