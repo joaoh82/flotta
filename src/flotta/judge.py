@@ -80,6 +80,9 @@ DEFAULT_AUTO_LEVEL = 1
 NEVER = -1
 #: How sure Jev must be that the work is within the agent's level.
 DEFAULT_MIN_CONFIDENCE = 0.7
+#: How far from 1 a score's probabilities may add up before the answer is not
+#: trusted: rounding, not a missing share.
+SUM_TOLERANCE = 0.02
 
 #: `(url, *, headers, json, timeout) -> (status, body)`.
 Post = Callable[..., tuple[int, Any]]
@@ -168,14 +171,18 @@ def _levels(answer: Any, count: int) -> tuple[int, tuple[float, ...]]:
         raise JudgeError("Jev's answer had no probabilities")
     probabilities = []
     for level in range(count):
-        raw = answer["probabilities"].get(str(level), 0.0)
-        if not isinstance(raw, int | float) or not 0 <= raw <= 1:
+        raw = answer["probabilities"].get(str(level))
+        if raw is None:
+            # Scaling the others up to fill the gap could carry the request under
+            # the agent's level when the missing share sat above it.
+            raise JudgeError(f"Jev's answer had no probability for level {level}")
+        if isinstance(raw, bool) or not isinstance(raw, int | float) or not 0 <= raw <= 1:
             raise JudgeError(f"Jev's probability for level {level} is not one")
         probabilities.append(float(raw))
     total = sum(probabilities)
-    if total <= 0:
-        raise JudgeError("Jev's probabilities add up to nothing")
-    probabilities = [p / total for p in probabilities]
+    if abs(total - 1) > SUM_TOLERANCE:
+        raise JudgeError(f"Jev's probabilities add up to {total:.3f}, not 1")
+    probabilities = [p / total for p in probabilities]  # only rounding is taken out
     best = max(range(count), key=lambda i: probabilities[i])
     return best, tuple(round(p, 4) for p in probabilities)
 

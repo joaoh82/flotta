@@ -36,6 +36,13 @@ def _answer(complexity=(0.1, 0.8, 0.1, 0, 0), priority=(0, 1, 0, 0), kind="featu
     }
 
 
+def _missing_levels() -> dict:
+    """Small, with a tenth left out above it: scaled up, it would look 100% small."""
+    body = _answer()
+    body["answers"]["complexity"]["probabilities"] = {"0": 0.5, "1": 0.4}
+    return body
+
+
 class Jev:
     def __init__(self, status=200, body=None):
         self.status, self.body, self.asked = status, body or _answer(), []
@@ -76,15 +83,21 @@ def test_without_a_key_nothing_is_asked():
         (Jev(status=429, body={"message": "rate limited"}), "429: rate limited"),
         (Jev(body={"answers": None}), "no answers"),
         (Jev(body={"answers": {"kind": {}, "complexity": {}, "priority": {}}}), "no probabilities"),
-        (
-            Jev(body=_answer(complexity=(0, 0, 0, 0, 0))),
-            "add up to nothing",
-        ),
+        (Jev(body=_answer(complexity=(0, 0, 0, 0, 0))), "add up to 0.000, not 1"),
+        (Jev(body=_answer(complexity=(0.3, 0.3, 0, 0, 0))), "add up to 0.600, not 1"),
+        (Jev(body=_missing_levels()), "no probability for level 2"),
     ],
 )
 def test_an_answer_that_cannot_be_used_is_a_failure(jev, match):
     with pytest.raises(JudgeError, match=match):
         judge.judge("x", "", env=ENV, post=jev)
+
+
+def test_probabilities_that_are_only_rounded_are_used():
+    verdict = judge.judge(
+        "x", "", env=ENV, post=Jev(body=_answer(complexity=(0.1, 0.8, 0.09, 0, 0)))
+    )
+    assert verdict.within(1) == pytest.approx(0.9 / 0.99, abs=1e-3)
 
 
 def test_jev_being_down_is_a_failure():

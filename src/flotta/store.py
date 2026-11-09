@@ -74,6 +74,7 @@ from flotta.runs import (
     MAX_CHAT_PROMPT,
     MAX_OUTPUT,
     cap_steps,
+    chat_conversation,
     check_input_size,
     check_trigger_kind,
     clip_text,
@@ -4999,7 +5000,7 @@ class FleetStore:
             raise UnknownEntityError(f"box {box_id!r} has been destroyed")
         live = self.live_run(box.id)
         given = live.input if live is not None and isinstance(live.input, dict) else {}
-        session = given.get("session_id") if live and live.trigger_kind == "chat" else None
+        session = chat_conversation(given) if live and live.trigger_kind == "chat" else None
         by = given.get("by") if live and live.trigger_kind == "chat" else None
         moment = _instant(now) if now else _utcnow()
         request_id = f"rq-{uuid.uuid4().hex[:12]}"
@@ -5099,8 +5100,9 @@ class FleetStore:
             args.append(box)
         clause = " AND ".join(where)
         rows = self._conn.execute(
-            f"SELECT * FROM requests WHERE {clause} AND status = 'waiting' ORDER BY created_at ASC",
-            tuple(args),
+            f"SELECT * FROM requests WHERE {clause} AND status = 'waiting' "
+            "ORDER BY created_at ASC LIMIT ?",
+            (*args, limit),
         ).fetchall()
         room = max(0, limit - len(rows))
         if room:

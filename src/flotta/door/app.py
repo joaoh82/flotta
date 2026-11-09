@@ -579,6 +579,7 @@ class ControlPlane:
         by: str,
         client: bool,
         started_at: str,
+        stored_session_id: str | None = None,
     ) -> str | None:
         """A turn began on `box_id`: its `chat` run's id, or None while the agent
         is doing another run (M14.6, `flotta.door.turns`)."""
@@ -592,6 +593,8 @@ class ControlPlane:
             "client": client,
             "started_at": started_at,
         }
+        if stored_session_id:
+            body["stored_session_id"] = stored_session_id
         async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
             response = await http.post(url, headers=self._headers(), json=body)
         if response.status_code == 409:

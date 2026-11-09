@@ -202,6 +202,18 @@ def test_filed_in_a_conversation_it_names_the_conversation_and_the_person(api, f
     assert filed["whose"] is None, "u-7 is nobody this store knows"
 
 
+def test_a_conversation_is_named_by_the_id_it_is_opened_by(api, fleet, jev):
+    """A resumed conversation's turn runs under a live id the agency never lists."""
+    with FleetStore(fleet) as store:
+        store.open_chat_run(
+            _id(fleet),
+            "Can you add an export?",
+            input={"session_id": "live-9", "stored_session_id": "s-42", "by": "u", "client": True},
+            started_at=datetime.now(UTC),
+        )
+    assert _file(api, fleet).json()["request"]["session_id"] == "s-42"
+
+
 def test_who_asked_is_named_when_they_sign_in(api, fleet, jev):
     with FleetStore(fleet) as store:
         user = store.create_user("ana@acme.example", name="Ana")
@@ -242,3 +254,34 @@ def test_who_may_do_what(api, fleet, jev):
 def test_a_request_needs_a_title(api, fleet):
     assert _file(api, fleet, title="  ").status_code == 422
     assert _file(api, fleet, title="x" * 201).status_code == 422
+
+
+def test_the_list_is_capped_even_when_everything_is_waiting(tmp_path):
+    """Waiting ones come first, but `limit` holds for them too."""
+    with FleetStore(tmp_path / "fleet.db") as store:
+        box = store.create_box("eng-a")
+        for i in range(5):
+            store.file_request(
+                box.id,
+                title=f"r{i}",
+                details="",
+                verdict=None,
+                judge_error="down",
+                within=None,
+                approved=False,
+                why="waits",
+                now=datetime(2026, 11, 8, 12, i, tzinfo=UTC),
+            )
+        store.file_request(
+            box.id,
+            title="done",
+            details="",
+            verdict=None,
+            judge_error=None,
+            within=None,
+            approved=True,
+            why="small",
+        )
+        listed = store.list_requests(org=box.org, limit=3)
+        assert [r.title for r in listed] == ["r0", "r1", "r2"]
+        assert [r.title for r in store.list_requests(org=box.org, limit=6)][-1] == "done"

@@ -97,7 +97,7 @@ from flotta.relay import (
     deliver_through_door,
     envelope,
 )
-from flotta.runs import RUN_DEADLINE_S
+from flotta.runs import RUN_DEADLINE_S, chat_conversation
 from flotta.store import (
     AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
@@ -5535,9 +5535,9 @@ def create_app(
         view: dict[str, Any] = {**asdict(approval), "kind": "run"}
         trigger, given = store.asked_in(approval)
         if trigger == "chat":
-            session, by = given.get("session_id"), given.get("by")
             view["kind"] = "chat"
-            view["session_id"] = session if isinstance(session, str) else None
+            view["session_id"] = chat_conversation(given)
+            by = given.get("by")
             view["whose"] = _person(store, by)
         return view
 
@@ -6671,7 +6671,9 @@ def create_app(
     def open_chat_run(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{prompt, session_id, by, client, started_at}`: a turn began. 409 while the agent
+        """`{prompt, session_id, by, client, started_at, stored_session_id?}`: a turn
+        began; `stored_session_id` is the conversation it is listed and opened
+        by, when the door heard which (FLOTTA-173). 409 while the agent
         is doing another run, and the turn is then not recorded: its model
         calls belong to that run (`FleetStore._run_for_call`)."""
         session_id, by = body.get("session_id"), body.get("by")
@@ -6680,6 +6682,11 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail=f"{name} is a name of 1 to 200 characters"
                 )
+        stored = body.get("stored_session_id")
+        if stored is not None and (not isinstance(stored, str) or not 0 < len(stored) <= 200):
+            raise HTTPException(
+                status_code=422, detail="stored_session_id is a name of 1 to 200 characters"
+            )
         prompt = body.get("prompt")
         prompt = prompt if isinstance(prompt, str) and prompt.strip() else CHAT_NO_PROMPT
         started_at = _door_time(body.get("started_at"), "started_at")
@@ -6690,7 +6697,12 @@ def create_app(
                 run = store.open_chat_run(
                     box.id,
                     prompt,
-                    input={"session_id": session_id, "by": by, "client": bool(body.get("client"))},
+                    input={
+                        "session_id": session_id,
+                        "by": by,
+                        "client": bool(body.get("client")),
+                        **({"stored_session_id": stored} if stored else {}),
+                    },
                     started_at=started_at,
                 )
             except BoxBusyError as exc:

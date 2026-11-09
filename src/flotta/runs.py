@@ -65,6 +65,18 @@ RUN_TIMEOUT_S = 50 * 60
 _CUT = "…"
 
 
+def chat_conversation(given: Any) -> str | None:
+    """The conversation a chat run's turn was in, by the id it is listed and
+    opened by: Hermes's stored id when the door heard it, else the live one."""
+    if not isinstance(given, dict):
+        return None
+    for key in ("stored_session_id", "session_id"):
+        value = given.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def check_trigger_kind(kind: str) -> None:
     if kind not in TRIGGER_KINDS:
         raise ValueError(f"trigger kind must be one of {sorted(TRIGGER_KINDS)}, got {kind!r}")
