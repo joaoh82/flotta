@@ -6,6 +6,10 @@
 # `scripts/staging_check.py` and records the verdict on the commit as the
 # status `staging`. `promote.yml` refuses a commit without a green `staging`.
 #
+# Green means staging ran exactly this commit. A commit that a later merge
+# overtook before its check gets `failure` (never tested), and the later
+# commit's own run is the one that can be promoted.
+#
 # Secrets (repository, never printed):
 #   FLY_API_TOKEN_STAGING  an org token for `flotta-staging` only, so nothing
 #                          here can reach a production machine
@@ -46,6 +50,9 @@ env:
 jobs:
   deploy:
     name: deploy staging (gateway, door, agent image)
+    # Staging is main's. A dispatch from another branch would put that
+    # branch's gateway, door and image on the shared staging apps.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_STAGING }}
@@ -62,7 +69,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
       - uses: extractions/setup-just@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: superfly/flyctl-actions/setup-flyctl@1.5
 
       # The same recipes a person runs with `just staging <recipe>`; every
       # name they act on comes from the env above.
@@ -84,8 +91,8 @@ jobs:
     env:
       FLOTTA_TOKEN: ${{ secrets.STAGING_CHECK_TOKEN }}
     steps:
-      # Full history: a later merge may already be on staging, and the check
-      # passes when that commit contains this one.
+      # Full history: the check tells "staging has moved past this commit"
+      # (fail at once) from "not deployed yet" (wait).
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -96,7 +103,7 @@ jobs:
   verdict:
     name: record the verdict
     needs: [deploy, check]
-    if: always()
+    if: always() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Set the staging status

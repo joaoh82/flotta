@@ -6,9 +6,12 @@ Run by `.github/workflows/staging.yml` after every push to `main` deploys
 staging, and by hand from a laptop with `.env.staging` loaded. Promotion to
 production (`promote.yml`) refuses a commit this did not pass.
 
-1. The control plane is running **this** commit. Render deploys it on its own,
-   so this waits for `/health` to report it, and for the reconcile loop to be
-   sweeping.
+1. The control plane is running **exactly this** commit. Render deploys it on
+   its own, so this waits for `/health` to report it, and for the reconcile
+   loop to be sweeping. A later commit is not good enough: `staging` on a
+   commit means that commit ran here, and promotion ships that commit's tree.
+   So if staging has already moved past it, this fails at once, and the later
+   commit's own run is the one that can pass.
 2. The web app answers (Render's free plan sleeps; the first request wakes it).
 3. A conversation: one message through the door (`*.staging.flotta.dev`) to the
    test agent, through staging's gateway to a model, and its reply back.
@@ -64,19 +67,22 @@ def _until(what: str, check, *, timeout_s: float, every_s: float = 15) -> object
     return None
 
 
-def _contains(build: str, commit: str) -> bool:
-    """Whether `build` is `commit` or a later commit with it in its history.
+def _where(build: str, commit: str) -> str:
+    """`this` when staging runs `commit`, `past` when it runs a later commit,
+    else `not yet` (an earlier one, or nothing known).
 
-    A merge after this one supersedes it on staging before this check reads it;
-    staging then runs this change too, so that passes. Needs the history, which
-    the workflow's checkout fetches in full.
+    `build` is `/health`'s: the first 12 characters, the same prefix test
+    `production.yml` makes. `past` needs the history, which the workflow's
+    checkout fetches in full.
     """
     if len(build) < 7:
-        return False
+        return "not yet"
     if commit.startswith(build):
-        return True
+        return "this"
     git = ["git", "merge-base", "--is-ancestor", commit, build]
-    return subprocess.run(git, capture_output=True).returncode == 0
+    if subprocess.run(git, capture_output=True).returncode == 0:
+        return "past"
+    return "not yet"
 
 
 def control_runs_commit(control: str, commit: str) -> None:
@@ -84,7 +90,13 @@ def control_runs_commit(control: str, commit: str) -> None:
         health = httpx.get(f"{control}/health", timeout=30).json()
         loop = health.get("reconcile_loop") or {}
         build = str(health.get("build") or "")
-        if not _contains(build, commit):
+        where = _where(build, commit)
+        if where == "past":
+            _fail(
+                f"staging already runs {build}, a later commit, so {commit[:12]} was never "
+                "checked there and stays unpromotable; the later commit's own run decides"
+            )
+        if where != "this":
             subprocess.run(["git", "fetch", "-q", "origin", "main"], capture_output=True)
             return None, f"control plane runs {build or 'nothing known'}"
         if health.get("status") != "ok" or not loop.get("running") or loop.get("stale"):
@@ -133,22 +145,22 @@ def a_run(http: httpx.Client) -> None:
 
     run = _until(f"run {run_id}", check, timeout_s=600, every_s=10)
     if run["status"] != "done":
-        _fail(f"run {run_id} ended {run['status']}: {run.get('error')}")
-    _ok(f"run {run_id} delivered and done")
+        _fail(f"run {run_id} ended {run['status']}: {run.get('error_class')}")
+    if "run-ok" not in (run.get("output") or ""):
+        _fail(f"run {run_id} is done but did not reply run-ok: {(run.get('output') or '')[:200]!r}")
+    _ok(f"run {run_id} delivered, done, and replied run-ok")
 
 
 def a_schedule_fired(http: httpx.Client) -> None:
     triggers = http.get(f"/api/boxes/{AGENT}/triggers").json()["triggers"]
     if not any(t.get("kind") == "schedule" and t.get("enabled", True) for t in triggers):
         _fail(f"{AGENT} has no schedule (run `just staging staging-seed`)")
-    runs = http.get(f"/api/boxes/{AGENT}/runs").json()["runs"]
+    # Only the window, as many as the API gives: every check adds runs, and a
+    # first page of everything would push the schedule's off it.
     since = dt.datetime.now(dt.UTC) - SCHEDULE_WINDOW
-    fired = [
-        r
-        for r in runs
-        if r.get("trigger_kind") == "schedule"
-        and dt.datetime.fromisoformat(r["created_at"]) >= since
-    ]
+    params = {"since": since.isoformat(), "limit": 200}
+    runs = http.get(f"/api/boxes/{AGENT}/runs", params=params).json()["runs"]
+    fired = [r for r in runs if r.get("trigger_kind") == "schedule"]
     if not fired:
         _fail(f"no scheduled run of {AGENT} in the last 26 hours")
     newest = fired[0]

@@ -65,7 +65,12 @@ def test_every_seeded_person_is_a_test_address():
     assert all(email.endswith("@staging.flotta.dev") for email, *_ in seed.PEOPLE)
 
 
-def test_a_later_build_containing_the_commit_counts(tmp_path, monkeypatch):
+def test_only_the_exact_commit_passes(tmp_path, monkeypatch):
+    """A green `staging` means that commit ran on staging: promotion ships its tree.
+
+    A later commit on staging, say one that fixes this one, must not paint this
+    one green (flotta #209 review): it is `past`, and the check fails at once.
+    """
     check = _script("staging_check")
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
@@ -76,13 +81,26 @@ def test_a_later_build_containing_the_commit_counts(tmp_path, monkeypatch):
         head = ["git", "rev-parse", "HEAD"]
         shas.append(subprocess.check_output(head, cwd=tmp_path, text=True).strip())
     monkeypatch.chdir(tmp_path)
-    first, middle, last = shas
+    first, broken, fixed = shas
 
-    assert check._contains(middle[:12], middle)
-    assert check._contains(last[:12], middle), "a later merge on staging carries this one"
-    assert not check._contains(first[:12], middle), "an older build does not"
-    assert not check._contains("", middle)
-    assert not check._contains("abc", "abc123456")
+    assert check._where(broken[:12], broken) == "this"
+    assert check._where(fixed[:12], broken) == "past", "a later fix does not certify this"
+    assert check._where(first[:12], broken) == "not yet"
+    assert check._where("", broken) == "not yet"
+    assert check._where("abc", "abc123456") == "not yet"
+
+
+def test_a_check_on_a_superseded_commit_fails_at_once(monkeypatch):
+    check = _script("staging_check")
+    monkeypatch.setattr(check, "_where", lambda build, commit: "past")
+    monkeypatch.setattr(
+        check.httpx,
+        "get",
+        lambda *a, **k: type("R", (), {"json": lambda self: {"build": "f" * 12}})(),
+    )
+
+    with pytest.raises(SystemExit):
+        check.control_runs_commit("https://flotta-control-staging.example", "a" * 40)
 
 
 def _workflow(name: str) -> dict:
@@ -96,6 +114,14 @@ def test_staging_deploys_to_the_staging_org_with_the_staging_token():
     assert "staging" in flow["env"]["FLOTTA_CONTROL_URL"]
     assert flow["jobs"]["deploy"]["env"]["FLY_API_TOKEN"] == "${{ secrets.FLY_API_TOKEN_STAGING }}"
     assert flow["concurrency"]["cancel-in-progress"] is False
+    assert flow["jobs"]["deploy"]["if"] == "github.ref == 'refs/heads/main'", "staging is main's"
+    assert "refs/heads/main" in flow["jobs"]["verdict"]["if"]
+
+
+def test_every_action_is_pinned_to_a_tag():
+    for name in ("staging.yml", "production.yml", "promote.yml"):
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "@master" not in text and "@main" not in text, name
 
 
 def test_production_deploys_only_what_passed_staging():
