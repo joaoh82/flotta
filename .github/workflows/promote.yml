@@ -1,0 +1,105 @@
+# Promote a commit to production (M14.8): the only way `production` moves.
+#
+# Run by hand (Actions → "Promote to production" → Run workflow), on Josh's
+# word. With no commit given it takes the newest commit on main whose `staging`
+# status is green. It refuses a commit that:
+#   - is not on main,
+#   - did not pass `staging` (`staging.yml` sets that status),
+#   - or is not a fast-forward of `production`.
+# Then it pushes that commit to `production`, and production deploys itself
+# from there: Render follows the branch, and `production.yml` deploys the rest.
+#
+# The push uses a deploy key (secret PRODUCTION_DEPLOY_KEY, in the
+# `production` environment), because the branch's ruleset lets nothing else
+# update it. The same file is in flotta and flotta-cloud; promote flotta first
+# when a web-app change needs a new API (docs/ENVIRONMENTS.md in flotta_parent).
+
+name: Promote to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit on main to promote. Empty: the newest that passed staging."
+        required: false
+        default: ""
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  statuses: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.PRODUCTION_DEPLOY_KEY }}
+
+      - name: Choose the commit and check it may go
+        id: choose
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WANTED: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          # The newest `staging` status on a commit: success, failure, pending or empty.
+          staging() {
+            gh api "repos/$REPO/commits/$1/status" \
+              --jq '[.statuses[] | select(.context == "staging")][0].state // ""'
+          }
+
+          if [ -n "$WANTED" ]; then
+            sha=$(git rev-parse --verify "${WANTED}^{commit}") || fail "no commit $WANTED"
+          else
+            sha=""
+            for c in $(git rev-list --first-parent -n 40 origin/main); do
+              if [ "$(staging "$c")" = success ]; then sha=$c; break; fi
+            done
+            [ -n "$sha" ] || fail "none of main's last 40 commits passed staging"
+          fi
+
+          git merge-base --is-ancestor "$sha" origin/main || fail "$sha is not on main"
+          state=$(staging "$sha")
+          [ "$state" = success ] || fail "$sha has not passed staging (status: ${state:-none})"
+
+          if git rev-parse -q --verify origin/production >/dev/null; then
+            current=$(git rev-parse origin/production)
+            if [ "$current" = "$sha" ]; then
+              echo "production is already at $sha"
+              echo "push=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git merge-base --is-ancestor "$current" "$sha" \
+              || fail "$sha is not a fast-forward of production ($current)"
+            range="$current..$sha"
+          else
+            echo "production does not exist yet; this creates it at $sha"
+            range="-20 $sha"
+          fi
+
+          {
+            echo "### Promoting \`${sha:0:12}\` to production"
+            echo
+            echo '```'
+            # shellcheck disable=SC2086
+            git log --oneline --first-parent $range
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "push=true" >> "$GITHUB_OUTPUT"
+
+      - name: Move production
+        if: steps.choose.outputs.push == 'true'
+        run: |
+          git push origin "${{ steps.choose.outputs.sha }}:refs/heads/production"
+          echo "production is now ${{ steps.choose.outputs.sha }}"

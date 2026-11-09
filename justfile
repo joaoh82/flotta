@@ -25,6 +25,12 @@ staging +ARGS:
     export FLOTTA_DOTENV=.env.staging JUST_NO_DOTENV=true
     exec just {{ARGS}}
 
+# Refuses anything but staging. Mints its own hour-long operator token from
+# staging's key, and leaves anything already there alone, so it can run again.
+# M14.8 — staging's test accounts and test agent: `just staging staging-seed`
+staging-seed:
+    uv run python scripts/staging_seed.py
+
 # Binds `::` and refuses to start without $FLOTTA_SIGNING_KEY — a front door has
 # no unauthenticated mode. Needs a running control plane ($FLOTTA_CONTROL_URL)
 # and its own token ($FLOTTA_CONTROL_TOKEN) with fleet:route (M11.6a).
