@@ -539,6 +539,32 @@ def _newest_event_id(box_id: str) -> int:
     return max((int(e.get("id") or 0) for e in events), default=0)
 
 
+#: The events `upgrade_box` writes when an upgrade ends, one way or the other.
+UPGRADE_OUTCOMES = ("reimaged", "upgrade_failed")
+#: How often `flotta upgrade` asks the timeline how a background upgrade went.
+UPGRADE_POLL_S = 3.0
+
+
+def _upgrade_outcome(box_id: str, since: int) -> dict[str, Any] | None:
+    """The `reimaged` or `upgrade_failed` event newer than `since`, if any.
+
+    Both are written by `upgrade_box` only once the substrate call returns, so
+    an event newer than the marker is this attempt's answer — and the only one
+    there is when the control plane re-images on a thread and replies `202`
+    before it knows.
+    """
+    from flotta.auth import SCOPE_FLEET_READ
+
+    try:
+        body = control_request("GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,))
+    except Exception:  # noqa: BLE001 - an unreadable timeline is "no answer yet"
+        return None
+    for event in reversed((body or {}).get("events") or []):
+        if event.get("type") in UPGRADE_OUTCOMES and int(event.get("id") or 0) > since:
+            return event
+    return None
+
+
 def _upgrade_landed(box_id: str, since: int) -> dict[str, Any] | None:
     """The `reimaged` event this attempt produced, if the work happened anyway.
 
@@ -551,16 +577,47 @@ def _upgrade_landed(box_id: str, since: int) -> dict[str, Any] | None:
     substrate call returns, so an event newer than the marker means the upgrade
     landed and the connection is what broke.
     """
+    event = _upgrade_outcome(box_id, since)
+    if event is None or event.get("type") != "reimaged":
+        return None
+    return event.get("payload") or {}
+
+
+def _machine_image(box_id: str) -> tuple[str | None, str | None]:
+    """What the box's machine runs and what the fleet builds, as the substrate says.
+
+    Best-effort: `(None, None)` whenever either cannot be read. Asked before an
+    upgrade because the control plane re-images on a thread, and that thread
+    finds "already on this image" without writing anything — so a caller
+    waiting on the timeline for an agent that is already current would wait
+    for an event that never comes.
+    """
     from flotta.auth import SCOPE_FLEET_READ
 
     try:
-        body = control_request("GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,))
-    except Exception:  # noqa: BLE001 - report the original failure instead
-        return None
-    for event in reversed((body or {}).get("events") or []):
-        if event.get("type") == "reimaged" and int(event.get("id") or 0) > since:
-            return event.get("payload") or {}
-    return None
+        body = control_request("GET", f"/api/boxes/{box_id}/machine", scopes=(SCOPE_FLEET_READ,))
+    except Exception:  # noqa: BLE001 - the upgrade itself still decides
+        return None, None
+    body = body or {}
+    machine = body.get("machine") or {}
+    image = machine.get("image") if isinstance(machine, dict) else None
+    fleet = body.get("fleet_image")
+    return (
+        image if isinstance(image, str) and image else None,
+        fleet if isinstance(fleet, str) and fleet else None,
+    )
+
+
+def _await_upgrade(box_id: str, since: int, timeout_s: float) -> dict[str, Any] | None:
+    """Poll the timeline until this upgrade's outcome is written, or `None` at the deadline."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        event = _upgrade_outcome(box_id, since)
+        if event is not None:
+            return event
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(UPGRADE_POLL_S)
 
 
 def _fail(exc: Exception, code: int = 1):
@@ -1544,6 +1601,10 @@ def upgrade(
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
     reason: str = typer.Option("cli", "--reason", help="Recorded on the reimaged event"),
+    wait: bool = typer.Option(
+        True, "--wait/--no-wait", help="Wait for the upgrade to land or fail (deployed fleet)"
+    ),
+    timeout_s: int = typer.Option(360, "--timeout-s", help="How long --wait waits for the outcome"),
 ) -> None:
     """Move an agent onto a new image, keeping everything it remembers.
 
@@ -1559,16 +1620,36 @@ def upgrade(
     the alternative is putting the production database URL on a laptop. Shipped
     without this once — which made the command unusable against every fleet
     that actually exists.
+
+    The control plane re-images on a thread and answers `202` before it knows
+    how it went, so this waits on the agent's timeline for `reimaged` or
+    `upgrade_failed` and reports that. It once printed `(unknown) -> <image>`
+    for the `202` itself, and an upgrade Fly refused with a 408 read exactly
+    like one that landed. Exit 1 when it failed or no outcome arrived in
+    `--timeout-s`; `--no-wait` says only that it started.
     """
     from flotta.auth import SCOPE_FLEET_WRITE
 
     if control_url():
+        from flotta.provision import _same_image
+
         # Not `_remote_box`: see `_operated_ref`. The timeline's route finds the
         # box by name or id too.
         ref = _operated_ref(box_id)
         # What the timeline said before the attempt, so a request that dies in
         # transit can still be answered truthfully. See `_upgrade_landed`.
         before_events = _newest_event_id(ref)
+        current, fleet_image = _machine_image(ref)
+        wanted = image or fleet_image
+        if current and wanted and _same_image(current, wanted):
+            # Answered here because the background thread answers it with
+            # silence: no event, so a wait would only ever time out.
+            emit(
+                {"box_id": box_id, "image": wanted, "already_current": True},
+                f"{box_id}  already on {wanted}",
+                as_json=as_json,
+            )
+            return
         try:
             body = control_request(
                 "POST",
@@ -1599,9 +1680,51 @@ def upgrade(
         if body.get("already_current"):
             emit(body, f"{box_id}  already on {body['image']}", as_json=as_json)
             return
+        if not body.get("started"):
+            # A control plane that upgraded before answering.
+            emit(
+                body,
+                f"{box_id}  {body.get('previous_image') or '(unknown)'} -> {body['image']}",
+                as_json=as_json,
+            )
+            return
+        if not wait:
+            emit(
+                {**body, "outcome": "started"},
+                f"{box_id}  upgrade to {body['image']} started; its timeline will say how it went",
+                as_json=as_json,
+            )
+            return
+        if not as_json:
+            typer.secho(
+                f"{box_id}  upgrading to {body['image']} — waiting for it to land",
+                fg=typer.colors.BRIGHT_BLACK,
+                err=True,
+            )
+        event = _await_upgrade(ref, before_events, timeout_s)
+        if event is None:
+            typer.secho(
+                f"{box_id}  no outcome after {timeout_s}s. The upgrade may still be "
+                "under way; its timeline will record `reimaged` or `upgrade_failed`.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        payload = event.get("payload") or {}
+        if event.get("type") == "upgrade_failed":
+            # The payload's `from` is what it still runs: the upgrade changes
+            # nothing when it fails, and that is the way back.
+            typer.secho(
+                f"{box_id}  upgrade failed: {payload.get('error') or 'no reason recorded'}. "
+                f"It still runs {payload.get('from') or current or '(unknown)'}.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        landed = payload.get("to") or body["image"]
         emit(
-            body,
-            f"{box_id}  {body.get('previous_image') or '(unknown)'} -> {body['image']}",
+            {"box_id": box_id, "image": landed, "previous_image": payload.get("from") or current},
+            f"{box_id}  {payload.get('from') or current or '(unknown)'} -> {landed}",
             as_json=as_json,
         )
         return
