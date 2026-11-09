@@ -5387,7 +5387,7 @@ def create_app(
         """
         from dataclasses import asdict
 
-        from flotta.door.conversation import CLIENT_APPROVAL_CHOICES
+        from flotta.approval_choices import CLIENT_APPROVAL_CHOICES
         from flotta.store import ApprovalClosedError
 
         choice = body.get("choice")
@@ -5417,7 +5417,7 @@ def create_app(
             if run.trigger_kind == "chat":
                 # A person's conversation: the door carries only these to the
                 # box, so nothing else is taken (FLOTTA-166).
-                from flotta.door.turns import OUTSIDE_CHOICES
+                from flotta.approval_choices import OUTSIDE_CHOICES
 
                 allowed = frozenset(OUTSIDE_CHOICES) & (allowed or frozenset(OUTSIDE_CHOICES))
             waiting = [a for a in store.run_approvals(run.id) if a.status == "waiting"]

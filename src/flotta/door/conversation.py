@@ -90,6 +90,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+from flotta.approval_choices import CLIENT_APPROVAL_CHOICES
+
 if TYPE_CHECKING:
     from flotta.door.turns import TurnRecorder
 
@@ -114,8 +116,6 @@ CONVERSATION_METHODS: dict[str, frozenset[str]] = {
 #: The extra method of a ticket that may answer approvals.
 APPROVAL_RESPOND = "approval.respond"
 _APPROVAL_RESPOND_PARAMS = frozenset({"session_id", "choice", "request_id"})
-#: Never "always": see the module's note.
-CLIENT_APPROVAL_CHOICES = frozenset({"once", "session", "deny"})
 
 #: The ones that act on a session, and so must name a live id of this socket's.
 _ON_A_SESSION = frozenset(
