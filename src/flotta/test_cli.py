@@ -1212,6 +1212,83 @@ def test_an_older_outcome_is_not_this_upgrades(tmp_path, monkeypatch):
     assert "no outcome after 0s" in result.output
 
 
+def _upgrade_with_unreadable_marker(tmp_path, monkeypatch, argv, *, post_fails=False):
+    """The timeline cannot be read before the attempt, and can be afterwards,
+    carrying an old `reimaged` — the review's case: a blip at the start."""
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setattr(cli, "UPGRADE_POLL_S", 0.0)
+    old = {"id": 4, "type": "reimaged", "payload": {"from": "a", "to": "registry/flotta:mid"}}
+    calls: list[tuple[str, str]] = []
+    reads = {"events": 0}
+
+    def fake(method, path, *, scopes, body=None, **kw):
+        calls.append((method, path))
+        if "/events" in path:
+            reads["events"] += 1
+            if reads["events"] == 1:
+                raise cli.ControlPlaneError("GET /events -> 503: try again")
+            return {"events": [old]}
+        if "/upgrade" in path:
+            if post_fails:
+                raise cli.ControlPlaneError("POST /upgrade -> 502: Application failed to respond")
+            return _STARTED
+        return {}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    return calls, CliRunner().invoke(cli.app, argv)
+
+
+def test_an_unreadable_marker_refuses_to_wait_and_sends_nothing(tmp_path, monkeypatch):
+    """A marker that could not be read is not an empty timeline. Treated as 0,
+    the old `reimaged` (id 4) would answer for this upgrade: `-> mid`, exit 0,
+    while this one is still running or has failed."""
+    calls, result = _upgrade_with_unreadable_marker(
+        tmp_path, monkeypatch, ["upgrade", "eng-g", "--image", "registry/flotta:new"]
+    )
+    assert result.exit_code == 1
+    assert "could not read its timeline" in result.output
+    assert "->" not in result.output
+    assert not any(m == "POST" for m, _ in calls), "nothing sent"
+
+
+def test_an_unreadable_marker_gets_no_recovery(tmp_path, monkeypatch):
+    """--no-wait still sends; a dropped POST then keeps its own error rather
+    than being "recovered" by an old `reimaged`."""
+    _, result = _upgrade_with_unreadable_marker(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g", "--image", "registry/flotta:new", "--no-wait"],
+        post_fails=True,
+    )
+    assert result.exit_code == 1
+    assert "502" in result.output
+    assert "upgrade landed" not in result.output
+
+
+def test_an_empty_timeline_is_a_real_marker(tmp_path, monkeypatch):
+    """The other half of the split: a box with no events yet still waits, and
+    its first outcome is the answer."""
+    _, result = _upgrade(
+        tmp_path,
+        monkeypatch,
+        ["upgrade", "eng-g", "--image", "registry/flotta:new"],
+        responses={
+            "/upgrade": _STARTED,
+            "/events": {
+                "events": [{"id": 1, "type": "reimaged", "payload": {"to": "registry/flotta:new"}}]
+            },
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert "-> registry/flotta:new" in result.output
+
+
 def test_no_wait_says_it_only_started(tmp_path, monkeypatch):
     calls, result = _upgrade(
         tmp_path,

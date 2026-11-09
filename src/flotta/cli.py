@@ -527,14 +527,21 @@ def _operated_ref(box_id: str) -> str:
     return quote(box_id, safe="")
 
 
-def _newest_event_id(box_id: str) -> int:
-    """The id of the box's newest event, or 0. Best-effort by construction."""
+def _newest_event_id(box_id: str) -> int | None:
+    """The id of the box's newest event: 0 for an empty timeline, None if unreadable.
+
+    The two must not be the same answer. An outcome is "this attempt's" only
+    when it is newer than the real newest id from before the attempt; a read
+    that failed and came back as 0 would make every past `reimaged` or
+    `upgrade_failed` look newer, and a box whose last upgrade landed would
+    report this one as landed too (FLOTTA-176 review).
+    """
     from flotta.auth import SCOPE_FLEET_READ
 
     try:
         body = control_request("GET", f"/api/boxes/{box_id}/events", scopes=(SCOPE_FLEET_READ,))
-    except Exception:  # noqa: BLE001 - a marker that cannot be read is just 0
-        return 0
+    except Exception:  # noqa: BLE001 - the caller decides what no marker means
+        return None
     events = (body or {}).get("events") or []
     return max((int(e.get("id") or 0) for e in events), default=0)
 
@@ -1639,6 +1646,18 @@ def upgrade(
         # What the timeline said before the attempt, so a request that dies in
         # transit can still be answered truthfully. See `_upgrade_landed`.
         before_events = _newest_event_id(ref)
+        if before_events is None and wait:
+            # Without a marker no outcome on the timeline can be told apart
+            # from an earlier upgrade's, so a wait could only guess. Refused
+            # before anything is sent, so there is nothing half-done to explain.
+            typer.secho(
+                f"{box_id}  could not read its timeline, so this upgrade's outcome could "
+                "not be told apart from an earlier one's. Nothing was sent. Try again, "
+                "or pass --no-wait to start it without waiting.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
         current, fleet_image = _machine_image(ref)
         wanted = image or fleet_image
         if current and wanted and _same_image(current, wanted):
@@ -1666,7 +1685,8 @@ def upgrade(
             # repeat that lie, ask the box what happened: the `reimaged` event
             # is written on success, so the timeline is the ground truth and a
             # dropped connection does not have to mean a failed upgrade.
-            landed = _upgrade_landed(ref, before_events)
+            # No marker, no recovery: the original error is the honest answer.
+            landed = None if before_events is None else _upgrade_landed(ref, before_events)
             if landed is None:
                 raise _fail(exc) from exc
             emit(
@@ -1701,11 +1721,13 @@ def upgrade(
                 fg=typer.colors.BRIGHT_BLACK,
                 err=True,
             )
+        # `before_events` is a real marker here: waiting without one was refused above.
         event = _await_upgrade(ref, before_events, timeout_s)
         if event is None:
             typer.secho(
                 f"{box_id}  no outcome after {timeout_s}s. The upgrade may still be "
-                "under way; its timeline will record `reimaged` or `upgrade_failed`.",
+                "under way, and its timeline will record `reimaged` or `upgrade_failed`; "
+                "or it was already on that image, which records nothing.",
                 fg=typer.colors.YELLOW,
                 err=True,
             )
