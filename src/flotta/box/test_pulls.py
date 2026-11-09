@@ -10,9 +10,7 @@ from flotta.box.pulls import PrError, describe, main
 
 ENV = {
     "FLOTTA_CONTROL_URL": "https://control.example/",
-    "FLOTTA_BOX_TOKEN": mint(
-        subject=box_subject("b-1"), scopes={SCOPE_GIT_CREDENTIAL}, key="k", ttl_s=300
-    ),
+    "FLOTTA_BOX_TOKEN": mint(subject=box_subject("b-1"), scopes={SCOPE_GIT_CREDENTIAL}, key="k"),
 }
 
 
