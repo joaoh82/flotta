@@ -11,9 +11,7 @@ from flotta.box.requests import describe, main
 
 ENV = {
     "FLOTTA_CONTROL_URL": "https://control.example",
-    "FLOTTA_BOX_TOKEN": mint(
-        subject=box_subject("b-1"), scopes={SCOPE_BOX_PEER}, key="k", ttl_s=300
-    ),
+    "FLOTTA_BOX_TOKEN": mint(subject=box_subject("b-1"), scopes={SCOPE_BOX_PEER}, key="k"),
 }
 
 
