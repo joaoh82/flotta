@@ -650,8 +650,23 @@ class FlyBackend:
     # -- observation -------------------------------------------------------
 
     def state(self, box_id: str) -> str:
+        """The machine's state, or `gone` when a listing that worked lacks it.
+
+        **A listing that failed raises `BackendError`; it never says `gone`**
+        (FLOTTA-179). The reconcile sweep reads `gone` as "destroyed outside
+        Flotta" and writes `torn_down`, which is terminal: a lenient listing
+        here once turned one failed `flyctl machines list` into a live staging
+        agent nobody could reach, whose schedules then stopped firing. Both
+        callers already treat `BackendError` as "the substrate could not
+        answer" (`_correct_running`, `_observed_state`). The lifecycle helpers
+        below keep the lenient `_state`: they act, and a guard after them fails
+        safely.
+        """
         app, mid = self._addr(box_id)
-        return self._state(app, mid)
+        for machine in self._machines(app, strict=True):
+            if machine.get("id") == mid:
+                return machine.get("state") or "unknown"
+        return "gone"
 
     def endpoint(self, box_id: str) -> str:
         app, mid = self._addr(box_id)

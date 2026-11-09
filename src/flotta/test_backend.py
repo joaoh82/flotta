@@ -893,6 +893,34 @@ def test_inspect_raises_when_the_listing_fails_rather_than_saying_gone():
         backend.inspect("fly://joaoh82-flotta-eng-g/815990c9246728")
 
 
+def test_state_raises_when_the_listing_fails_rather_than_saying_gone():
+    """FLOTTA-179. `gone` is what the reconcile sweep turns into `torn_down`,
+    which nothing undoes. On staging a single failed `machines list` did that
+    to a live agent while its machine was `started`; "could not ask" must stay
+    a different answer from "not there"."""
+    import subprocess
+
+    def flaky(cmd, *, timeout, check, stdin=None):
+        reason = "Error: timed out talking to api.machines.dev"
+        return subprocess.CompletedProcess(cmd, 1, "", reason)
+
+    backend = FlyBackend(config=_offline_config(), runner=flaky)
+    with pytest.raises(BackendError, match="could not list machines"):
+        backend.state("fly://joaoh82-flotta-eng-g/815990c9246728")
+
+
+def test_state_says_gone_only_when_a_listing_that_worked_lacks_the_machine():
+    import json
+    import subprocess
+
+    def listed(cmd, *, timeout, check, stdin=None):
+        listing = json.dumps([{"id": "other", "state": "started"}])
+        return subprocess.CompletedProcess(cmd, 0, listing, "")
+
+    backend = FlyBackend(config=_offline_config(), runner=listed)
+    assert backend.state("fly://joaoh82-flotta-eng-g/815990c9246728") == "gone"
+
+
 def test_inspect_carries_flyctls_own_reason():
     """So the panel can say *why* it could not ask. "Something went wrong" sends
     someone to check the fleet; "no access token" sends them to `fly auth`."""

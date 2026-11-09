@@ -2395,6 +2395,27 @@ def test_an_unreadable_substrate_is_not_a_verdict(store):
     assert store.get_box(box.id).status == "running"
 
 
+def test_a_failed_fly_listing_does_not_tear_down_a_running_agent(store):
+    """FLOTTA-179, end to end with the real `FlyBackend`: the fake above raises
+    by itself, and the real one never did. One failed `machines list` read as
+    `gone` and closed a live staging agent for good."""
+    import subprocess
+
+    from flotta.backends.fly_backend import FlyBackend
+    from flotta.provision import reconcile_boxes
+    from flotta.test_backend import _offline_config
+
+    box = _aged(store, "eng-x", "running", minutes=1, endpoint="fly://flotta-eng-x/m1")
+
+    def flaky(cmd, *, timeout, check, stdin=None):
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: timed out")
+
+    fly = FlyBackend(config=_offline_config(), runner=flaky)
+    assert reconcile_boxes(store, backend_for=lambda _: fly) == []
+    assert store.get_box(box.id).status == "running"
+    assert "torn_down" not in [e.type for e in store.get_events("box", box.id)]
+
+
 def test_reserving_a_box_touches_no_substrate(store):
     """What makes an immediate 202 honest: the row exists before any machine
     does, so there is something real to poll."""
