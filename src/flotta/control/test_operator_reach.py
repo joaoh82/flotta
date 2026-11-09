@@ -233,12 +233,17 @@ def test_the_operators_cli_moves_an_agency_agent_onto_the_gateway(cli_on, moves,
 
 
 def test_the_operators_cli_upgrades_an_agency_agent(cli_on, substrate):
-    """`flotta upgrade` asked the same scoped lookup first (FLOTTA-162)."""
+    """`flotta upgrade` asked the same scoped lookup first (FLOTTA-162).
+
+    It reads the machine first (FLOTTA-176: an agent already on the image is
+    answered without posting), so that read has to reach an agency's agent too.
+    """
     from typer.testing import CliRunner
 
     result = CliRunner().invoke(cli_on.app, ["upgrade", AGENCY_BOX])
     assert result.exit_code == 0, result.output
-    assert substrate == [("upgrade", None)]
+    assert [call[0] for call in substrate] == ["inspect", "upgrade"]
+    assert substrate[-1] == ("upgrade", None)
 
 
 def test_the_operators_cli_refreshes_an_agency_agents_author(cli_on, fleet, monkeypatch):
