@@ -97,7 +97,7 @@ from flotta.relay import (
     deliver_through_door,
     envelope,
 )
-from flotta.runs import RUN_DEADLINE_S
+from flotta.runs import RUN_DEADLINE_S, chat_conversation
 from flotta.store import (
     AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
@@ -604,6 +604,9 @@ def create_app(
     #: Reads and merges the pull requests agents open (FLOTTA-171), as
     #: `pulls.Fetch`. Injected for the reason `reachable` is; `None` is GitHub.
     github_fetch: Any = None,
+    #: Judges a request before its agent starts (FLOTTA-173): `judge.judge`'s
+    #: signature. Injected for the reason `reachable` is; `None` asks Jev.
+    judge_request: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -5532,9 +5535,9 @@ def create_app(
         view: dict[str, Any] = {**asdict(approval), "kind": "run"}
         trigger, given = store.asked_in(approval)
         if trigger == "chat":
-            session, by = given.get("session_id"), given.get("by")
             view["kind"] = "chat"
-            view["session_id"] = session if isinstance(session, str) else None
+            view["session_id"] = chat_conversation(given)
+            by = given.get("by")
             view["whose"] = _person(store, by)
         return view
 
@@ -6298,6 +6301,227 @@ def create_app(
         finally:
             store.close()
 
+    # -- requests (FLOTTA-173) ---------------------------------------------------
+
+    needs_peer_or_read = Depends(require(SCOPE_FLEET_READ, SCOPE_BOX_PEER, any_of=True))
+
+    def _scoped_request(store: Any, token: Token | None, request_id: str) -> Any:
+        """A request `token` may act on, or 404, as `_scoped_box` is for a box."""
+        found = store.get_request(request_id)
+        if found is None or (
+            token is not None
+            and (
+                admits_tenant(token, org=found.org, client=found.client) is not None
+                or (token.box is not None and token.box != found.box_id)
+            )
+        ):
+            raise HTTPException(status_code=404, detail=f"no request {request_id!r}")
+        return found
+
+    def _request_policy_view(policy: Any) -> dict[str, Any]:
+        from flotta.judge import COMPLEXITY_NAMES
+
+        level = policy.auto_level
+        return {
+            "auto_level": level,
+            "auto_level_name": COMPLEXITY_NAMES[level] if level >= 0 else None,
+            "min_confidence": policy.min_confidence,
+            "levels": list(COMPLEXITY_NAMES),
+        }
+
+    @app.post("/api/boxes/{box_id}/requests", status_code=201)
+    def file_request(box_id: str, body: dict[str, Any], token: Token | None = needs_peer) -> Any:
+        """A piece of work someone in a conversation asked this agent for.
+        `{"title": "…", "details": "…"}`. Its own box files it (`flotta-request`).
+
+        Judged by Jev, then decided against the agent's level: `starts` says
+        whether the agent may go ahead now, `why` why, in words the agent can
+        pass on. Anything that cannot be judged waits for a person.
+        """
+        from flotta import judge as jev
+        from flotta import work_requests
+
+        title, details = body.get("title"), body.get("details", "")
+        if not isinstance(title, str) or not isinstance(details, str):
+            raise HTTPException(status_code=422, detail="send a title, and details as text")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "file requests for")
+            policy = store.request_policy(box.id)
+            verdict, error = None, None
+            try:
+                verdict = (judge_request or jev.judge)(title, details)
+            except jev.JudgeError as exc:
+                error = str(exc)
+            decision = jev.decide(
+                verdict, auto_level=policy.auto_level, min_confidence=policy.min_confidence
+            )
+            try:
+                filed = store.file_request(
+                    box.id,
+                    title=title,
+                    details=details,
+                    verdict=verdict,
+                    judge_error=error,
+                    within=verdict.within(policy.auto_level) if verdict else None,
+                    approved=decision.starts,
+                    why=decision.why,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event(
+                "box",
+                box.id,
+                "request_filed",
+                {
+                    "request": filed.id,
+                    "title": filed.title[:EVENT_TEXT_CHARS],
+                    "starts": decision.starts,
+                },
+            )
+            return {
+                "request": work_requests.view(store, filed),
+                "starts": decision.starts,
+                "why": decision.why,
+            }
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/requests")
+    def box_requests(box_id: str, token: Token | None = needs_peer_or_read) -> Any:
+        """This agent's requests: every waiting one, then the latest decided."""
+        from flotta import work_requests
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "read the requests of")
+            found = store.list_requests(org=box.org, box=box.id)
+            return {"requests": [work_requests.view(store, r) for r in found]}
+        finally:
+            store.close()
+
+    @app.get("/api/requests")
+    def list_requests(token: Token | None = needs_read) -> Any:
+        """Every request the caller's agents filed: the org's for the agency, one
+        client's for its people. Waiting first, oldest first."""
+        from flotta import work_requests
+
+        if token is not None and (token.box is not None or subject_box(token.subject)):
+            raise HTTPException(status_code=403, detail="an agent reads its own, on its own box")
+        org = (token.org if token else None) or DEFAULT_ORG
+        store = store_factory()
+        try:
+            found = store.list_requests(org=org, client=token.client if token else None)
+            return {"requests": [work_requests.view(store, r) for r in found]}
+        finally:
+            store.close()
+
+    @app.post("/api/requests/{request_id}/decision")
+    def decide_request(
+        request_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """The agency's answer to a waiting request: `{"approve": true|false, "note": "…"}`.
+
+        Approved, the work becomes a run on the agent, with the note; declined,
+        the note is kept for the agent to pass on when the person asks.
+        """
+        from flotta import work_requests
+
+        approve, note = body.get("approve"), body.get("note")
+        if not isinstance(approve, bool):
+            raise HTTPException(status_code=422, detail='send {"approve": true} or false')
+        if note is not None and not isinstance(note, str):
+            raise HTTPException(status_code=422, detail="a note is text")
+        store = store_factory()
+        try:
+            found = _scoped_request(store, token, request_id)
+            who = (_person(store, token.subject) if token is not None else None) or (
+                token.subject if token is not None else "the operator"
+            )
+            try:
+                decided = store.decide_request(found.id, approve=approve, by=who, note=note)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if approve:
+                try:
+                    run = store.create_run(
+                        decided.box_id,
+                        work_requests.work_prompt(decided, note=decided.note),
+                        trigger_kind="request",
+                        trigger_id=decided.id,
+                        input=work_requests.run_input(decided),
+                    )
+                    decided = store.set_request_work(decided.id, run.id)
+                except UnknownEntityError:
+                    pass  # its agent is gone: the decision stands, with nothing to run it
+            store.add_event(
+                "box",
+                decided.box_id,
+                "request_approved" if approve else "request_declined",
+                {"request": decided.id, "by": who, "run": decided.work_run_id},
+            )
+            return {"request": work_requests.view(store, decided)}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/request-policy")
+    def get_request_policy(box_id: str, token: Token | None = needs_peer_or_read) -> Any:
+        """The most complex work this agent may start without the agency's OK."""
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "read the request policy of")
+            return _request_policy_view(store.request_policy(box.id))
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/request-policy")
+    def put_request_policy(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """`{"auto_level": -1..4, "min_confidence": 0.5..0.99}`: -1 is "always ask"."""
+        from flotta.store import RequestPolicy
+
+        unknown = set(body) - {"auto_level", "min_confidence"}
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"no setting {sorted(unknown)[0]!r}")
+        level, sure = body.get("auto_level"), body.get("min_confidence")
+        if level is not None and (isinstance(level, bool) or not isinstance(level, int)):
+            raise HTTPException(status_code=422, detail="auto_level is a whole number")
+        if sure is not None and (isinstance(sure, bool) or not isinstance(sure, int | float)):
+            raise HTTPException(status_code=422, detail="min_confidence is a number")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            current = store.request_policy(box.id)
+            try:
+                policy = store.set_request_policy(
+                    box.id,
+                    RequestPolicy(
+                        auto_level=current.auto_level if level is None else level,
+                        min_confidence=current.min_confidence if sure is None else float(sure),
+                    ),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            store.add_event(
+                "box",
+                box.id,
+                "request_policy_set",
+                {
+                    "auto_level": policy.auto_level,
+                    "min_confidence": policy.min_confidence,
+                    "by": token.subject if token is not None else "operator",
+                },
+            )
+            return _request_policy_view(policy)
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}/github/repositories")
     def github_repositories(
         box_id: str, suggest: bool = True, token: Token | None = needs_write
@@ -6447,7 +6671,9 @@ def create_app(
     def open_chat_run(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{prompt, session_id, by, client, started_at}`: a turn began. 409 while the agent
+        """`{prompt, session_id, by, client, started_at, stored_session_id?}`: a turn
+        began; `stored_session_id` is the conversation it is listed and opened
+        by, when the door heard which (FLOTTA-173). 409 while the agent
         is doing another run, and the turn is then not recorded: its model
         calls belong to that run (`FleetStore._run_for_call`)."""
         session_id, by = body.get("session_id"), body.get("by")
@@ -6456,6 +6682,11 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail=f"{name} is a name of 1 to 200 characters"
                 )
+        stored = body.get("stored_session_id")
+        if stored is not None and (not isinstance(stored, str) or not 0 < len(stored) <= 200):
+            raise HTTPException(
+                status_code=422, detail="stored_session_id is a name of 1 to 200 characters"
+            )
         prompt = body.get("prompt")
         prompt = prompt if isinstance(prompt, str) and prompt.strip() else CHAT_NO_PROMPT
         started_at = _door_time(body.get("started_at"), "started_at")
@@ -6466,7 +6697,12 @@ def create_app(
                 run = store.open_chat_run(
                     box.id,
                     prompt,
-                    input={"session_id": session_id, "by": by, "client": bool(body.get("client"))},
+                    input={
+                        "session_id": session_id,
+                        "by": by,
+                        "client": bool(body.get("client")),
+                        **({"stored_session_id": stored} if stored else {}),
+                    },
                     started_at=started_at,
                 )
             except BoxBusyError as exc:

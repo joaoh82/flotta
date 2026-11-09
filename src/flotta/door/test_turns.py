@@ -72,12 +72,15 @@ class Plane:
         self.rows: list[dict] = []
         self.polls = 0
 
-    async def open_chat_run(self, box_id, *, prompt, session_id, by, client, started_at):
+    async def open_chat_run(
+        self, box_id, *, prompt, session_id, by, client, started_at, stored_session_id=None
+    ):
         if self.hang:
             await self.released.wait()
         self.opened.append(
             {"box": box_id, "prompt": prompt, "session": session_id, "by": by, "client": client}
         )
+        self.stored = stored_session_id
         self.started_at = started_at
         if self.busy:
             return None
@@ -260,6 +263,7 @@ def test_a_turn_is_a_run_with_its_prompt_steps_and_reply():
         "by": "user:u-9",
         "client": True,
     }
+    assert plane.stored == "s-1", "the conversation as it is listed and opened"
     (finished,) = plane.finished
     assert (finished["run"], finished["status"], finished["output"]) == (
         "t-1",
@@ -268,6 +272,31 @@ def test_a_turn_is_a_run_with_its_prompt_steps_and_reply():
     )
     (step,) = finished["steps"]
     assert (step["kind"], step["name"], step["exit_code"]) == ("tool", "terminal", 0)
+
+
+def test_a_resumed_conversation_is_recorded_by_its_stored_id():
+    """Hermes answers a resumed conversation under a new live id; the agency
+    lists and opens it by the stored one it was resumed by."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:u-9", client=False)
+        resume = {"session_id": "s-old"}
+        await gate.from_client(
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "session.resume", "params": resume})
+        )
+        await gate.from_box(
+            json.dumps({"jsonrpc": "2.0", "id": 4, "result": {"session_id": "live-2"}})
+        )
+        await gate.from_client(_submit("Again?", session="live-2"))
+        for frame in _turn(session="live-2", tool=False):
+            await gate.from_box(frame)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+    (opened,) = plane.opened
+    assert opened["session"] == "live-2" and plane.stored == "s-old"
 
 
 def test_each_turn_is_its_own_run():

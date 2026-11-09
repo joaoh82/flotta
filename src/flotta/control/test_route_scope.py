@@ -53,6 +53,7 @@ UNSCOPED_READS = frozenset(
         "get_trigger",
         "get_api_key",
         "get_pull_request",
+        "get_request",
     }
 )
 
@@ -71,6 +72,7 @@ SCOPE_FUNCTIONS: frozenset[str] = frozenset(
         "_scoped_trigger",  # one trigger, likewise
         "_scoped_key",  # one API key, likewise (M14.5)
         "_scoped_pull",  # one pull request, likewise (FLOTTA-171)
+        "_scoped_request",  # one request, likewise (FLOTTA-173)
         "_hooked_trigger",  # a webhook, if the caller proves its secret (below)
     }
 )

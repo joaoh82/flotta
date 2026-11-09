@@ -767,6 +767,65 @@ def _pull_requests() -> tuple[str, ...]:
     )
 
 
+def _requests() -> tuple[str, ...]:
+    """Work a client asked an agent for, judged before it starts (FLOTTA-173).
+
+    The agent files one from a conversation (`flotta-request`); `run_id` is the
+    turn it was filed in, and `session_id` / `asked_by` that turn's
+    conversation and person. Jev's verdict is `kind`, `complexity` and
+    `priority` (levels in `flotta.judge`), the whole answer in `verdict_json`,
+    or `judge_error` when it could not be asked.
+
+    `status` is `waiting` (for the agency), `approved` or `declined`; `auto`
+    says an approval was the agent's level and Jev's, not a person's. More
+    steps will come between filing and starting, so it is text, not a flag.
+    `work_run_id` is the run an approval started, when the agent was not already
+    on it in the conversation.
+
+    `box_request_policy.auto_level` is the most complex work the agent may start
+    on its own, `-1` for none; no row is `flotta.judge.DEFAULT_AUTO_LEVEL`.
+    """
+    return (
+        """
+        CREATE TABLE requests (
+            id             TEXT PRIMARY KEY,
+            box_id         TEXT NOT NULL REFERENCES boxes(id),
+            org_id         TEXT NOT NULL,
+            client_id      TEXT NOT NULL,
+            title          TEXT NOT NULL,
+            details        TEXT NOT NULL,
+            run_id         TEXT,
+            session_id     TEXT,
+            asked_by       TEXT,
+            kind           TEXT,
+            complexity     INTEGER,
+            priority       INTEGER,
+            within         REAL,
+            verdict_json   TEXT,
+            judge_error    TEXT,
+            status         TEXT NOT NULL,
+            auto           INTEGER NOT NULL DEFAULT 0,
+            why            TEXT NOT NULL,
+            decided_by     TEXT,
+            decided_at     TEXT,
+            note           TEXT,
+            work_run_id    TEXT,
+            created_at     TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_requests_org ON requests(org_id, status, created_at)",
+        "CREATE INDEX idx_requests_box ON requests(box_id, created_at)",
+        """
+        CREATE TABLE box_request_policy (
+            box_id         TEXT PRIMARY KEY REFERENCES boxes(id),
+            auto_level     INTEGER NOT NULL,
+            min_confidence REAL NOT NULL,
+            updated_at     TEXT NOT NULL
+        )
+        """,
+    )
+
+
 def _triggers() -> tuple[str, ...]:
     """What starts a run on its own (FLOTTA-148): schedules now, webhooks next.
 
@@ -975,6 +1034,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         27, "pull requests: what agents open, and whether each may merge its own", _pull_requests()
     ),
+    Migration(28, "requests: work a client asked for, judged before it starts", _requests()),
 )
 
 

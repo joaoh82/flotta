@@ -84,14 +84,19 @@ CALL_TIMEOUT_S = 10.0
 #: How long a closed socket's last calls may take, after the person's socket closed.
 DRAIN_S = 15.0
 
+#: Sessions one socket keeps the stored id of, and resumes it waits on: a
+#: socket holds one or two conversations, so this only bounds a misbehaving one.
+MAX_RESUMING = 64
+
 #: Subjects whose sockets are not a person's conversation (see the module).
 NOT_A_CONVERSATION = ("run:", "relay", "box:")
 
 #: The frames a turn's record reads. Anything else, `message.delta` above all,
 #: is passed without being parsed.
 _HEARD = ('"message.start"', '"message.complete"', '"tool.start"', '"tool.complete"', "approval")
-#: The person's frames it reads: a prompt, or an answer to an approval.
-_HEARD_FROM_CLIENT = ('"prompt.submit"', '"choice"')
+#: The person's frames it reads: a prompt, an answer to an approval, or the
+#: resume that says which stored conversation a live session is.
+_HEARD_FROM_CLIENT = ('"prompt.submit"', '"choice"', '"session.resume"')
 
 #: Characters of a reply kept on the run; the store clips again.
 MAX_REPLY = 64_000
@@ -125,6 +130,7 @@ class Recorder(Protocol):
         by: str,
         client: bool,
         started_at: str,
+        stored_session_id: str | None = None,
     ) -> str | None: ...
 
     async def finish_chat_run(
@@ -202,6 +208,11 @@ class TurnRecorder:
         self._prompts: dict[str, str] = {}
         #: The turn going on in each live session.
         self._turns: dict[str, _Turn] = {}
+        #: Each live session's stored id, the one a conversation is listed and
+        #: opened by: Hermes answers a turn under one and keeps it under the other.
+        self._stored: dict[str, str] = {}
+        #: Resumes asked and not yet answered: the request's id, and the stored id.
+        self._resuming: dict[str, str] = {}
         self._queue: asyncio.Queue[Any] = asyncio.Queue(QUEUE_LIMIT)
         self._worker: asyncio.Task[None] | None = None
         self._dropped = False
@@ -234,6 +245,15 @@ class TurnRecorder:
             session, text = params.get("session_id"), params.get("text")
             if isinstance(session, str) and session and isinstance(text, str):
                 self._prompts[session] = text
+        elif method == "session.resume":
+            rid, stored = parsed.get("id"), params.get("session_id")
+            if (
+                isinstance(rid, str | int)
+                and isinstance(stored, str)
+                and stored
+                and len(self._resuming) < MAX_RESUMING
+            ):
+                self._resuming[str(rid)] = stored
         elif method == "approval.respond":
             request_id = params.get("request_id")
             if isinstance(request_id, str):
@@ -263,6 +283,8 @@ class TurnRecorder:
 
     def heard_box(self, frame: str) -> None:
         """A frame from the agent, before the gate decides what the person sees."""
+        if '"stored_session_id"' in frame or (self._resuming and '"result"' in frame):
+            self._hear_session(frame)
         if not any(marker in frame for marker in _HEARD):
             return
         parsed = _parse(frame)
@@ -294,6 +316,19 @@ class TurnRecorder:
         rid = parsed.get("id")
         if parsed.get("method") == "approval" and isinstance(rid, str) and rid:
             self._ask(session, turn, rid, params)
+
+    def _hear_session(self, frame: str) -> None:
+        """A session made or resumed: which stored conversation its live id is."""
+        parsed = _parse(frame)
+        result = parsed.get("result") if parsed is not None else None
+        if not isinstance(result, dict):
+            return
+        rid = parsed.get("id") if parsed is not None else None
+        asked = self._resuming.pop(str(rid), None) if isinstance(rid, str | int) else None
+        live, stored = result.get("session_id"), result.get("stored_session_id") or asked
+        known = isinstance(live, str) and (live in self._stored or len(self._stored) < MAX_RESUMING)
+        if known and live and isinstance(stored, str) and stored:
+            self._stored[str(live)] = stored
 
     def _ask(self, session: str, turn: _Turn, rpc_id: str, params: dict[str, Any]) -> None:
         """The box asked a person, on this socket: recorded so it can be listed
@@ -416,6 +451,7 @@ class TurnRecorder:
                 by=self._subject,
                 client=self._client,
                 started_at=turn.started_at.isoformat(),
+                stored_session_id=self._stored.get(session),
             )
         turn.run_id.set_result(run_id)
 

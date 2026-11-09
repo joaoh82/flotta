@@ -19,8 +19,11 @@ from typing import Any
 
 #: What can start a run. `api` is a person or a client's system asking through
 #: the fleet API; `peer` is another agent; `chat` a conversation (M14.6);
-#: `review` new feedback on a pull request the agent opened (FLOTTA-172).
-TRIGGER_KINDS: frozenset[str] = frozenset({"api", "chat", "peer", "review", "schedule", "webhook"})
+#: `review` new feedback on a pull request the agent opened (FLOTTA-172);
+#: `request` work a client asked for, once the agency approved it (FLOTTA-173).
+TRIGGER_KINDS: frozenset[str] = frozenset(
+    {"api", "chat", "peer", "request", "review", "schedule", "webhook"}
+)
 
 #: Steps kept per run, half from the start and half from the end: how it began
 #: and how it ended are what someone reading a run needs, and a loop's middle
@@ -60,6 +63,18 @@ RUN_DEADLINE_S = 3600
 RUN_TIMEOUT_S = 50 * 60
 
 _CUT = "…"
+
+
+def chat_conversation(given: Any) -> str | None:
+    """The conversation a chat run's turn was in, by the id it is listed and
+    opened by: Hermes's stored id when the door heard it, else the live one."""
+    if not isinstance(given, dict):
+        return None
+    for key in ("stored_session_id", "session_id"):
+        value = given.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def check_trigger_kind(kind: str) -> None:
