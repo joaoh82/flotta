@@ -39,6 +39,21 @@ then missing, never borrowed from production. What staging is made of, and how
 a change moves from it to production, is in `docs/ENVIRONMENTS.md` in
 flotta_parent.
 
+**Deploys are workflows now, not these recipes run by hand.** A push to `main`
+runs `.github/workflows/staging.yml`: it deploys staging's gateway, door and
+agent image, then `scripts/staging_check.py` waits for the staging control plane
+to run the commit and holds one conversation and one run with the test agent,
+and reads its daily schedule's last run. The verdict is the commit status
+`staging`. **Promote to production** (`promote.yml`, run by hand) moves the
+`production` branch to a commit that passed it, and `production.yml` deploys
+production from that branch. Run a recipe against production by hand only
+when something is broken.
+
+```bash
+just staging staging-seed                     # staging's test accounts, agent and schedule
+uv run python scripts/staging_check.py <sha>  # the check, from a laptop (needs $FLOTTA_TOKEN)
+```
+
 ---
 
 ## Step 0 — Generate every secret at once

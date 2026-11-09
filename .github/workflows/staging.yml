@@ -1,0 +1,115 @@
+# Every push to main reaches staging, and is checked there (M14.8).
+#
+# flotta_parent docs/ENVIRONMENTS.md is the design. Render deploys staging's
+# control plane from main on its own; this deploys the rest — the gateway, the
+# door and the agent image, all in the `flotta-staging` Fly org — then runs
+# `scripts/staging_check.py` and records the verdict on the commit as the
+# status `staging`. `promote.yml` refuses a commit without a green `staging`.
+#
+# Secrets (repository, never printed):
+#   FLY_API_TOKEN_STAGING  an org token for `flotta-staging` only, so nothing
+#                          here can reach a production machine
+#   STAGING_CHECK_TOKEN    staging's check token: the test client only,
+#                          fleet:read + fleet:write + box:chat, signed by
+#                          staging's key (production refuses it)
+
+name: Staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One at a time and never cancelled: each commit keeps its verdict, and two
+# deploys to the same Fly apps at once would race.
+concurrency:
+  group: staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  statuses: write
+
+env:
+  FLOTTA_ENVIRONMENT: staging
+  FLOTTA_FLY_ORG: flotta-staging
+  FLOTTA_FLY_APP: flotta-staging-images
+  FLOTTA_FLY_APP_PREFIX: flotta-stg
+  FLOTTA_DOOR_APP: flotta-door-staging
+  FLOTTA_GATEWAY_APP: flotta-gateway-staging
+  # Fly had no egress IPs left in iad; the database admits this one (ord).
+  FLOTTA_GATEWAY_REGION: ord
+  FLOTTA_DOMAIN: staging.flotta.dev
+  FLOTTA_CONTROL_URL: https://flotta-control-staging.onrender.com
+  UV_FROZEN: "1"
+
+jobs:
+  deploy:
+    name: deploy staging (gateway, door, agent image)
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_STAGING }}
+    steps:
+      - name: Mark the commit pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state=pending -f context=staging \
+            -f description="deploying to staging" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >/dev/null
+
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: extractions/setup-just@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # The same recipes a person runs with `just staging <recipe>`; every
+      # name they act on comes from the env above.
+      - name: Gateway
+        run: just gateway-deploy
+      - name: Door
+        run: just door-deploy
+      # The build machine mounts the image app's volume, which is in ams; left
+      # to detect, a runner would pick a US region with no volume in it.
+      - name: Agent image
+        env:
+          FLOTTA_FLY_REGION: ams
+        run: just fly-build
+
+  check:
+    name: check staging
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      FLOTTA_TOKEN: ${{ secrets.STAGING_CHECK_TOKEN }}
+    steps:
+      # Full history: a later merge may already be on staging, and the check
+      # passes when that commit contains this one.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10.0.1
+      - name: Staging check
+        run: uv run python scripts/staging_check.py "${{ github.sha }}"
+
+  verdict:
+    name: record the verdict
+    needs: [deploy, check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set the staging status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PASSED: ${{ needs.deploy.result == 'success' && needs.check.result == 'success' }}
+        run: |
+          if [ "$PASSED" = "true" ]; then
+            state=success; description="ran on staging and passed its check"
+          else
+            state=failure; description="did not pass on staging"
+          fi
+          gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="$state" -f context=staging -f description="$description" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >/dev/null
+          echo "staging: $state"

@@ -1,0 +1,91 @@
+# Production deploys itself from the `production` branch (M14.8).
+#
+# `promote.yml` moves the branch; Render deploys the control plane from it on
+# its own; this deploys the rest — gateway, door and agent image, in the
+# personal Fly org — and then waits for the control plane to report the commit.
+#
+# Agents already running keep their image: a new one is released for agents
+# created from now on, and moving an existing agent stays `flotta upgrade`,
+# first on staging (docs/ENVIRONMENTS.md in flotta_parent).
+#
+# Secret FLY_API_TOKEN_PRODUCTION, in the `production` environment: a Fly
+# token for the personal org.
+
+name: Production
+
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  statuses: read
+
+env:
+  FLOTTA_FLY_ORG: personal
+  FLOTTA_FLY_APP: joaoh82-flotta-images
+  FLOTTA_DOOR_APP: flotta-door
+  FLOTTA_GATEWAY_APP: flotta-gateway
+  FLOTTA_GATEWAY_REGION: iad
+  FLOTTA_DOMAIN: flotta.dev
+  FLOTTA_CONTROL_URL: https://flotta-control.onrender.com
+  UV_FROZEN: "1"
+
+jobs:
+  deploy:
+    name: deploy production (gateway, door, agent image)
+    if: github.ref == 'refs/heads/production'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PRODUCTION }}
+    steps:
+      # Promotion checked this already; checked again so a commit that reached
+      # the branch any other way still does not deploy.
+      - name: Refuse a commit that did not pass staging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/status" \
+            --jq '[.statuses[] | select(.context == "staging")][0].state // ""')
+          if [ "$state" != success ]; then
+            echo "::error::${{ github.sha }} has not passed staging (status: ${state:-none})"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: extractions/setup-just@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Gateway
+        run: just gateway-deploy
+      - name: Door
+        run: just door-deploy
+      # The image app's build volume is in ams, as on staging.
+      - name: Agent image
+        env:
+          FLOTTA_FLY_REGION: ams
+        run: just fly-build
+
+  control-plane:
+    name: control plane runs this commit
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Render
+        run: |
+          for i in $(seq 1 100); do
+            build=$(curl -fsS "$FLOTTA_CONTROL_URL/health" | jq -r '.build // ""') || build=""
+            case "${{ github.sha }}" in
+              "$build"*) [ ${#build} -ge 7 ] && { echo "control plane runs $build"; exit 0; } ;;
+            esac
+            sleep 15
+          done
+          echo "::error::the control plane still runs ${build:-nothing known} after 25 minutes"
+          exit 1
