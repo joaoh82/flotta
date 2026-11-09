@@ -663,10 +663,7 @@ class FlyBackend:
         safely.
         """
         app, mid = self._addr(box_id)
-        for machine in self._machines(app, strict=True):
-            if machine.get("id") == mid:
-                return machine.get("state") or "unknown"
-        return "gone"
+        return self._state(app, mid, strict=True)
 
     def endpoint(self, box_id: str) -> str:
         app, mid = self._addr(box_id)
@@ -795,8 +792,10 @@ class FlyBackend:
                 f"changed: {(result.stdout or '')[:120]!r}"
             ) from exc
 
-    def _state(self, app: str, machine_id: str) -> str:
-        for machine in self._machines(app):
+    def _state(self, app: str, machine_id: str, *, strict: bool = False) -> str:
+        """`gone` if the listing lacks the machine. With `strict`, a listing
+        that failed raises instead (see `state`); without it, it reads as empty."""
+        for machine in self._machines(app, strict=strict):
             if machine.get("id") == machine_id:
                 return machine.get("state") or "unknown"
         return "gone"

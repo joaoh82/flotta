@@ -921,6 +921,29 @@ def test_state_says_gone_only_when_a_listing_that_worked_lacks_the_machine():
     assert backend.state("fly://joaoh82-flotta-eng-g/815990c9246728") == "gone"
 
 
+def test_state_reports_the_machine_a_listing_that_worked_contains():
+    """The other side of the two tests above: neither fails if every successful
+    listing answered `gone`, which is the direction that tears a machine down
+    while it is in the list. A blank state is `unknown`, which the sweep leaves
+    alone."""
+    import json
+    import subprocess
+
+    def listing(machines):
+        def run(cmd, *, timeout, check, stdin=None):
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(machines), "")
+
+        return run
+
+    endpoint = "fly://joaoh82-flotta-eng-g/815990c9246728"
+    started = [{"id": "other", "state": "stopped"}, {"id": "815990c9246728", "state": "started"}]
+    assert (
+        FlyBackend(config=_offline_config(), runner=listing(started)).state(endpoint) == "started"
+    )
+    blank = [{"id": "815990c9246728", "state": ""}]
+    assert FlyBackend(config=_offline_config(), runner=listing(blank)).state(endpoint) == "unknown"
+
+
 def test_inspect_carries_flyctls_own_reason():
     """So the panel can say *why* it could not ask. "Something went wrong" sends
     someone to check the fleet; "no access token" sends them to `fly auth`."""
