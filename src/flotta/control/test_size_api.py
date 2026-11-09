@@ -20,9 +20,7 @@ Y = "support--acme--agency-y"
 
 
 def _as(role, org, client=None):
-    token = mint(
-        scopes=set(ROLES[role]), key=KEY, ttl_s=300, subject="test", org=org, client=client
-    )
+    token = mint(scopes=set(ROLES[role]), key=KEY, subject="test", org=org, client=client)
     return {"Authorization": f"Bearer {token}"}
 
 

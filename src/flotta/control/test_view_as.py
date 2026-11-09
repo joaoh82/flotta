@@ -254,7 +254,7 @@ def test_only_the_operator_may_view_as(api, fleet, org, role, client):
 
 
 def test_viewing_as_is_for_a_person_not_a_token(api):
-    token = mint(subject="josh", scopes={SCOPE_FLEET_READ}, key=KEY, ttl_s=300)
+    token = mint(subject="josh", scopes={SCOPE_FLEET_READ}, key=KEY)
     answer = api.post("/api/orgs/agency-x/view-as", headers={"Authorization": f"Bearer {token}"})
     assert answer.status_code == 403
     assert "signed-in person" in answer.json()["detail"]

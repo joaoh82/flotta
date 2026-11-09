@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from flotta.auth import DEFAULT_TTL_S
 from flotta.control.app import InsecureBindError, check_bind, create_app
 from flotta.store import FleetStore
 
@@ -500,7 +501,7 @@ def secured(fleet):
         yield c
 
 
-def _token(*scopes, subject="test", ttl_s=300, org=None, client=None):
+def _token(*scopes, subject="test", ttl_s=DEFAULT_TTL_S, org=None, client=None):
     from flotta.auth import mint
 
     return mint(

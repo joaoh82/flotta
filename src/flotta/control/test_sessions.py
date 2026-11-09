@@ -68,7 +68,7 @@ def _person(fleet, email, org, role, client=None, **session):
 
 
 def _operator():
-    token = mint(subject="josh", scopes={SCOPE_ORG_ADMIN}, key=KEY, ttl_s=300)
+    token = mint(subject="josh", scopes={SCOPE_ORG_ADMIN}, key=KEY)
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -246,7 +246,7 @@ def test_me_names_the_person_their_orgs_and_this_session(api, fleet):
 
 
 def test_me_with_a_token_names_no_person(api):
-    token = mint(subject="ci", scopes={SCOPE_FLEET_READ}, key=KEY, ttl_s=300, org="agency-x")
+    token = mint(subject="ci", scopes={SCOPE_FLEET_READ}, key=KEY, org="agency-x")
 
     me = api.get("/api/me", headers={"Authorization": f"Bearer {token}"}).json()
 

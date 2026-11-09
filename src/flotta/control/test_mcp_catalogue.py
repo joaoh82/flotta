@@ -51,7 +51,6 @@ def _operator():
         subject="josh",
         scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN},
         key=KEY,
-        ttl_s=300,
     )
     return {"Authorization": f"Bearer {token}"}
 

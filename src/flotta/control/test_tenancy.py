@@ -41,7 +41,7 @@ Y = "support--acme--agency-y"
 
 def _bearer(*scopes, **claims):
     claims.setdefault("subject", "test")
-    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, ttl_s=300, **claims)}"}
+    return {"Authorization": f"Bearer {mint(scopes=set(scopes), key=KEY, **claims)}"}
 
 
 def _role_for(scope, client):

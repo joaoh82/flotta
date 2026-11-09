@@ -83,7 +83,7 @@ def secured(fleet):
 
 
 def _agency(*scopes):
-    token = mint(scopes=set(scopes), key=KEY, ttl_s=300, subject="m", org="agency-x")
+    token = mint(scopes=set(scopes), key=KEY, subject="m", org="agency-x")
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -141,9 +141,7 @@ def test_with_no_list_only_the_default_is_allowed(api, monkeypatch, reached):
 
 def test_anyone_who_can_read_the_fleet_reads_the_list(secured):
     """A client viewer too: which models exist is not the agency's secret."""
-    token = mint(
-        scopes={SCOPE_FLEET_READ}, key=KEY, ttl_s=300, subject="v", org="agency-x", client="acme"
-    )
+    token = mint(scopes={SCOPE_FLEET_READ}, key=KEY, subject="v", org="agency-x", client="acme")
     response = secured.get("/api/models", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     assert response.json() == {"models": [DEFAULT, LISTED], "default": DEFAULT}
