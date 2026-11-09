@@ -1346,7 +1346,13 @@ def postgres_target(db_path: str | Path | None = None) -> str | None:
 class FleetStore:
     """Fleet-state store bound to one SQLite database file (or ':memory:')."""
 
-    def __init__(self, db_path: str | Path | None = None, *, prepare: bool = True) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        *,
+        prepare: bool = True,
+        reuse: bool = False,
+    ) -> None:
         """Open the fleet store.
 
         Takes a SQLite path or a `postgres://` URL — the same value
@@ -1362,6 +1368,11 @@ class FleetStore:
         advisory lock and runs the whole schema script under it, so every
         request queued behind every other one, and a page asking ten things at
         once got its answers one at a time, about a second apart on Render.
+
+        `reuse=True` takes an idle Postgres connection this process kept, and
+        `close()` keeps this one for the next store (`db.connect`). Also the
+        control plane's: connecting was most of a request's CPU (FLOTTA-178).
+        SQLite ignores it.
         """
         db_path, url = _resolve_target(db_path)
         self.is_postgres = db.is_postgres_url(url)
@@ -1369,7 +1380,7 @@ class FleetStore:
         #: connection to the same place — which is the only way to test that
         #: the concurrency guard actually serialises anything.
         self._url = url or str(db_path or DEFAULT_DB_PATH)
-        self._conn = db.connect(url or db_path or DEFAULT_DB_PATH)
+        self._conn = db.connect(url or db_path or DEFAULT_DB_PATH, reuse=reuse)
         if not prepare:
             self.migrations_applied: list[int] = []
             return

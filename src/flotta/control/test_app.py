@@ -347,41 +347,43 @@ def test_the_factory_prepares_a_postgres_store_once(monkeypatch):
     """
     from flotta.control import app as control_app
 
-    opened: list[bool] = []
+    opened: list[tuple[bool, bool]] = []
 
     class Recorder:
-        def __init__(self, *, prepare: bool = True) -> None:
-            opened.append(prepare)
+        def __init__(self, *, prepare: bool = True, reuse: bool = False) -> None:
+            opened.append((prepare, reuse))
 
     monkeypatch.setattr(control_app, "_prepared", set())
     monkeypatch.setattr(control_app, "FleetStore", Recorder)
     monkeypatch.setattr(control_app, "postgres_target", lambda: "postgresql://db/fleet")
     for _ in range(3):
         control_app._store_factory()
-    assert opened == [True, False, False]
+    # And every one of them on a reused connection: connecting was most of a
+    # request's CPU (FLOTTA-178).
+    assert opened == [(True, True), (False, True), (False, True)]
 
     # Another database is prepared on its own first open.
     monkeypatch.setattr(control_app, "postgres_target", lambda: "postgresql://db/other")
     control_app._store_factory()
-    assert opened[-1] is True
+    assert opened[-1] == (True, True)
 
 
 def test_the_factory_prepares_sqlite_on_every_open(monkeypatch):
     """A local file can be deleted under a running server, and preparing it is free."""
     from flotta.control import app as control_app
 
-    opened: list[bool] = []
+    opened: list[tuple[bool, bool]] = []
 
     class Recorder:
-        def __init__(self, *, prepare: bool = True) -> None:
-            opened.append(prepare)
+        def __init__(self, *, prepare: bool = True, reuse: bool = False) -> None:
+            opened.append((prepare, reuse))
 
     monkeypatch.setattr(control_app, "_prepared", set())
     monkeypatch.setattr(control_app, "FleetStore", Recorder)
     monkeypatch.setattr(control_app, "postgres_target", lambda: None)
     for _ in range(2):
         control_app._store_factory()
-    assert opened == [True, True]
+    assert opened == [(True, False), (True, False)]
 
 
 def test_a_store_opened_unprepared_leaves_the_schema_alone(tmp_path):
