@@ -173,7 +173,7 @@ def test_a_key_in_dotenv_is_never_answered_with_generate_a_new_one(tmp_path):
     with pytest.raises(NoSigningKey) as exc:
         _require_key(None, env={}, dotenv_path=str(env_file))
 
-    assert "in .env but not in this process" in str(exc.value)
+    assert f"in {env_file} but not in this process" in str(exc.value)
     assert "Do NOT generate a new key" in str(exc.value)
     assert "flotta token key" not in str(exc.value), "still suggests the dangerous fix"
 

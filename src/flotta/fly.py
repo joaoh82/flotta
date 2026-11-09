@@ -197,7 +197,7 @@ class FlyConfig:
     def from_env(
         cls,
         env: Mapping[str, str] | None = None,
-        dotenv: str | Path = DEFAULT_DOTENV,
+        dotenv: str | Path | None = None,
     ) -> FlyConfig:
         env = os.environ if env is None else env
 
@@ -317,7 +317,7 @@ def _clean(value: str | None) -> str | None:
     return v or None
 
 
-def read_dotenv_value(key: str, path: str | Path = DEFAULT_DOTENV) -> str | None:
+def read_dotenv_value(key: str, path: str | Path | None = None) -> str | None:
     """Read one key from a dotenv file, or None if absent/unreadable.
 
     Delegates to `flotta.dotenv`, which imports nothing but the standard

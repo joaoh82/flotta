@@ -132,6 +132,7 @@ import hmac
 import json
 import os
 import secrets
+import shlex
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -519,19 +520,22 @@ def _require_key(
     # a new key invalidates every token already deployed — so the advice could
     # break a working fleet while appearing to fix a missing one. Never suggest
     # minting a key over the top of one that exists.
-    from flotta.dotenv import DEFAULT_DOTENV, read_dotenv_value
+    from flotta import dotenv
 
-    if read_dotenv_value(SIGNING_KEY_ENV, dotenv_path or DEFAULT_DOTENV):
+    # The file actually read: under `just staging` it is `.env.staging`, and
+    # telling that shell to source `.env` would hand it production's key.
+    path = str(dotenv_path or dotenv.dotenv_path())
+    if dotenv.read_dotenv_value(SIGNING_KEY_ENV, path):
         raise NoSigningKey(
-            f"${SIGNING_KEY_ENV} is in .env but not in this process's "
+            f"${SIGNING_KEY_ENV} is in {path} but not in this process's "
             f"environment. Run the command through `just`, or export it with "
-            f"`set -a; source .env; set +a`.\n"
+            f'`eval "$(uv run python -m flotta.dotenv exports {shlex.quote(path)})"`.\n'
             f"Do NOT generate a new key — it would invalidate every token "
             f"already issued from this one."
         )
     raise NoSigningKey(
         f"no signing key: set ${SIGNING_KEY_ENV}. Generate one with "
-        f"`flotta token key` and put it in .env — the same value must be "
+        f"`flotta token key` and put it in {path} — the same value must be "
         f"set wherever the control plane runs, or tokens minted here will "
         f"not verify there."
     )

@@ -5,6 +5,26 @@
 # That file is the single place to look for machine-local config.
 set dotenv-load := true
 
+# Reads .env.staging INSTEAD of .env (docs/ENVIRONMENTS.md in flotta_parent):
+# every FLOTTA_ variable this shell or .env set is dropped first, `just` is told
+# to load no .env (nested recipes included), and the CLI reads $FLOTTA_DOTENV.
+# So a value staging lacks is missing, never production's.
+# M14.8 — run any recipe against STAGING: `just staging door-deploy`
+staging +ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f .env.staging ] || { echo "no .env.staging here: copy it from the vault (wiki/dot env staging.md)" >&2; exit 1; }
+    for v in $(compgen -e); do
+      case "$v" in FLOTTA_*|FLY_API_TOKEN|FLY_ACCESS_TOKEN) unset "$v" ;; esac
+    done
+    # Parsed, never sourced: `.` would run the file, so `$(...)` in it executes
+    # and a `$` inside a secret dies under `set -u`. These are flotta's own
+    # parse, shell-quoted; the same parse refuses a file not saying staging.
+    EXPORTS=$(uv run python -m flotta.dotenv exports .env.staging --require FLOTTA_ENVIRONMENT=staging)
+    eval "$EXPORTS"
+    export FLOTTA_DOTENV=.env.staging JUST_NO_DOTENV=true
+    exec just {{ARGS}}
+
 # Binds `::` and refuses to start without $FLOTTA_SIGNING_KEY — a front door has
 # no unauthenticated mode. Needs a running control plane ($FLOTTA_CONTROL_URL)
 # and its own token ($FLOTTA_CONTROL_TOKEN) with fleet:route (M11.6a).
@@ -142,17 +162,18 @@ door-dns:
 cli-setup:
     #!/usr/bin/env bash
     set -euo pipefail
-    [ -f .env ] || { echo "no .env here — copy the fleet's (vault: wiki/dot env.md) or .env.example"; exit 1; }
+    DOTENV="${FLOTTA_DOTENV:-.env}"
+    [ -f "$DOTENV" ] || { echo "no $DOTENV here — copy the fleet's (vault: wiki/dot env.md) or .env.example"; exit 1; }
     : "${FLOTTA_CONTROL_URL:?set FLOTTA_CONTROL_URL in .env — the deployed control plane}"
     : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env — the SAME value the control plane has}"
     uv sync --quiet
-    if ! grep -q '^FLOTTA_TOKEN=.' .env; then
+    if ! grep -q '^FLOTTA_TOKEN=.' "$DOTENV"; then
       # A year of box:chat only. Read and write through the fleet API mint
       # their own five-minute tokens from the signing key per command.
       TOKEN=$(uv run flotta token mint "$USER" --scope box:chat --days 365 --json \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-      printf 'FLOTTA_TOKEN=%s\n' "$TOKEN" >> .env
-      echo "added a 1-year chat token to .env (value not echoed)"
+      printf 'FLOTTA_TOKEN=%s\n' "$TOKEN" >> "$DOTENV"
+      echo "added a 1-year chat token to $DOTENV (value not echoed)"
     fi
     echo "fleet at $FLOTTA_CONTROL_URL:"
     uv run flotta ps
@@ -209,11 +230,14 @@ gateway-smoke:
 # reached by agents over 6PN at http://$FLOTTA_GATEWAY_APP.internal:8080/v1.
 # Creates the app and its static egress IP (the database admits only that
 # address) the first time. Costs money: an always-on machine plus the IP.
+# $FLOTTA_GATEWAY_REGION moves both, together: an egress IP serves only machines
+# in its own region, and Fly had none left in iad when staging asked (M14.8).
 gateway-deploy: fly-whoami
     #!/usr/bin/env bash
     set -euo pipefail
     ORG=$(uv run python -c "from flotta.fly import FlyConfig; print(FlyConfig.from_env().org)")
     APP="${FLOTTA_GATEWAY_APP:-flotta-gateway}"
+    REGION="${FLOTTA_GATEWAY_REGION:-iad}"
     # Exact match on parsed JSON, for the reason door-deploy records.
     if ! flyctl apps list --json \
       | uv run python -c "import json,sys; sys.exit(0 if any(a.get('Name')=='$APP' for a in json.load(sys.stdin)) else 1)"; then
@@ -223,16 +247,16 @@ gateway-deploy: fly-whoami
     # Before the first deploy, so the first boot already has the address the
     # database's allowlist names.
     if ! flyctl ips list --app "$APP" --json \
-      | uv run python -c "import json,sys; sys.exit(0 if any('egress' in (i.get('Type') or '').lower() for i in json.load(sys.stdin)) else 1)"; then
-      echo "allocating a static egress IP for $APP in iad"
-      flyctl ips allocate-egress --app "$APP" --region iad --yes
+      | uv run python -c "import json,sys; sys.exit(0 if any('egress' in (i.get('Type') or '').lower() and i.get('Region')=='$REGION' for i in json.load(sys.stdin)) else 1)"; then
+      echo "allocating a static egress IP for $APP in $REGION"
+      flyctl ips allocate-egress --app "$APP" --region "$REGION" --yes
     fi
     echo ""
     echo "Deploying $APP — ONE always-on machine. Ctrl-C to stop."
     sleep 3
     # --ha=false: a second instance would not see the first one's unwritten usage.
     flyctl deploy --config fly/gateway/fly.toml --dockerfile fly/gateway/Dockerfile \
-      --app "$APP" --ha=false .
+      --app "$APP" --primary-region "$REGION" --ha=false .
     echo ""
     echo "Egress IPs (add the IPv4 to the database's ipAllowList in render.yaml):"
     flyctl ips list --app "$APP"
