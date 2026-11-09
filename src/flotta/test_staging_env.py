@@ -19,6 +19,7 @@ import subprocess
 import pytest
 
 from flotta import client, dotenv, fleet_key, sealed
+from flotta.auth import NoSigningKey, _require_key
 from flotta.fly import FlyConfig
 
 _JUSTFILE = pathlib.Path(__file__).resolve().parents[2] / "justfile"
@@ -98,6 +99,9 @@ def _just(tmp_path, *args: str) -> subprocess.CompletedProcess[str]:
         + '    @echo "nested key=${FLOTTA_SIGNING_KEY:-} token=${FLOTTA_TOKEN:-}"\n'
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FLOTTA_", "JUST_"))}
+    # The recipe parses the file with this checkout's `flotta`, from a
+    # justfile that is not in it.
+    env["UV_PROJECT"] = str(_JUSTFILE.parent)
     env["FLOTTA_LEAK"] = "from-the-shell"
     env["FLOTTA_SIGNING_KEY"] = "exported-production-key"
     return subprocess.run(
@@ -125,3 +129,67 @@ def test_the_recipe_refuses_a_file_that_does_not_say_staging(two_files):
     assert ran.returncode != 0
     assert "FLOTTA_ENVIRONMENT=staging" in ran.stderr
     assert "key=" not in ran.stdout
+
+
+_NEEDS_JUST = pytest.mark.skipif(
+    shutil.which("just") is None, reason="needs `just`, which CI installs"
+)
+
+
+@_NEEDS_JUST
+def test_the_file_is_read_as_values_and_never_run(two_files):
+    """`.` ran the file: `$(...)` executed and a `$` in a secret killed `set -u`."""
+    marker = two_files / "ran"
+    (two_files / ".env.staging").write_text(
+        "FLOTTA_ENVIRONMENT=staging\n"
+        f"FLOTTA_LEAK=$(touch {marker})\n"
+        "FLOTTA_SIGNING_KEY=abc$def`id`\n"
+    )
+
+    ran = _just(two_files, "staging", "probe")
+
+    assert not marker.exists(), "a command in .env.staging ran"
+    assert ran.returncode == 0, ran.stderr
+    assert ran.stdout.splitlines()[0] == (
+        f"key=abc$def`id` token= shell=$(touch {marker}) file=.env.staging"
+    )
+
+
+@_NEEDS_JUST
+@pytest.mark.parametrize(
+    "line",
+    [
+        "export FLOTTA_ENVIRONMENT=staging",
+        'FLOTTA_ENVIRONMENT="staging"',
+        "FLOTTA_ENVIRONMENT='staging'",
+    ],
+)
+def test_the_guard_takes_what_the_parser_takes(two_files, line):
+    (two_files / ".env.staging").write_text(line + "\nFLOTTA_SIGNING_KEY=staging-key\n")
+
+    ran = _just(two_files, "staging", "probe")
+
+    assert ran.returncode == 0, ran.stderr
+    assert ran.stdout.startswith("key=staging-key ")
+
+
+def test_exports_quote_every_value_for_a_shell(tmp_path):
+    values = {"A": "FlyV1 fm2_x,y", "B": "a$b`c`'d\"e", "C": "$(echo no)", "bad name": "x"}
+
+    script = dotenv.shell_exports(values) + 'printf "%s|%s|%s" "$A" "$B" "$C"'
+    out = subprocess.run(["bash", "-euc", script], capture_output=True, text=True, check=True)
+
+    assert out.stdout == "FlyV1 fm2_x,y|a$b`c`'d\"e|$(echo no)"
+    assert "bad name" not in dotenv.shell_exports(values)
+
+
+def test_the_key_hint_names_the_file_that_was_read(two_files, monkeypatch):
+    monkeypatch.setenv("FLOTTA_DOTENV", ".env.staging")
+
+    with pytest.raises(NoSigningKey) as exc:
+        _require_key(None, env={})
+
+    message = str(exc.value)
+    assert "in .env.staging but not" in message
+    assert "exports .env.staging" in message
+    assert "source .env" not in message

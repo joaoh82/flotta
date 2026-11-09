@@ -14,12 +14,14 @@ staging +ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     [ -f .env.staging ] || { echo "no .env.staging here: copy it from the vault (wiki/dot env staging.md)" >&2; exit 1; }
-    grep -qx 'FLOTTA_ENVIRONMENT=staging' .env.staging \
-      || { echo ".env.staging does not say FLOTTA_ENVIRONMENT=staging; refusing to run" >&2; exit 1; }
     for v in $(compgen -e); do
       case "$v" in FLOTTA_*|FLY_API_TOKEN|FLY_ACCESS_TOKEN) unset "$v" ;; esac
     done
-    set -a; . ./.env.staging; set +a
+    # Parsed, never sourced: `.` would run the file, so `$(...)` in it executes
+    # and a `$` inside a secret dies under `set -u`. These are flotta's own
+    # parse, shell-quoted; the same parse refuses a file not saying staging.
+    EXPORTS=$(uv run python -m flotta.dotenv exports .env.staging --require FLOTTA_ENVIRONMENT=staging)
+    eval "$EXPORTS"
     export FLOTTA_DOTENV=.env.staging JUST_NO_DOTENV=true
     exec just {{ARGS}}
 

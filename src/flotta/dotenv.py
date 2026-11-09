@@ -20,7 +20,11 @@ CLI framework.
 
 from __future__ import annotations
 
+import argparse
 import os
+import re
+import shlex
+import sys
 from pathlib import Path
 
 DEFAULT_DOTENV = ".env"
@@ -89,3 +93,49 @@ def load_dotenv(path: str | Path | None = None, env: dict[str, str] | None = Non
             target[name] = value
             loaded.append(name)
     return loaded
+
+
+_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def shell_exports(values: dict[str, str]) -> str:
+    """`values` as `export NAME='value'` lines a shell can `eval` (M14.8).
+
+    For `just staging`, which used to `.` the file: that runs it as a script,
+    so `FLOTTA_X=$(cmd)` executed `cmd` and a `$` inside a secret aborted
+    under `set -u`. This is the parse `flotta` itself uses, quoted, so a value
+    is only ever a value. A name a shell cannot hold is left out.
+    """
+    return "".join(
+        f"export {name}={shlex.quote(value)}\n"
+        for name, value in values.items()
+        if _SHELL_NAME.match(name)
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m flotta.dotenv exports FILE [--require NAME=VALUE]`."""
+    parser = argparse.ArgumentParser(prog="python -m flotta.dotenv")
+    commands = parser.add_subparsers(dest="command", required=True)
+    exports = commands.add_parser("exports", help="print FILE as shell exports")
+    exports.add_argument("file")
+    exports.add_argument("--require", action="append", default=[], metavar="NAME=VALUE")
+    args = parser.parse_args(argv)
+
+    try:
+        text = Path(args.file).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"cannot read {args.file}: {exc.strerror}", file=sys.stderr)
+        return 1
+    values = parse_dotenv(text)
+    for required in args.require:
+        name, _, value = required.partition("=")
+        if values.get(name) != value:
+            print(f"{args.file} does not say {name}={value}; refusing to run", file=sys.stderr)
+            return 1
+    print(shell_exports(values), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
