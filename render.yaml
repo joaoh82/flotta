@@ -31,6 +31,12 @@ projects:
             region: virginia
             plan: starter
             healthCheckPath: /health
+            # Production follows `production`, which only promote.yml moves
+            # (M14.8): a merge to `main` reaches staging, and production gets a
+            # commit only once staging has passed it. The staging service
+            # follows `main` and is set up by hand (docs/ENVIRONMENTS.md in
+            # flotta_parent).
+            branch: production
             autoDeploy: true
             envVars:
               # The image honours Render's injected PORT; do not set one.
