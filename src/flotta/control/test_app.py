@@ -338,6 +338,83 @@ def test_the_service_and_the_cli_resolve_the_same_store(tmp_path, monkeypatch):
         served.close()
 
 
+def test_the_factory_prepares_a_postgres_store_once(monkeypatch):
+    """Preparing takes a fleet-wide lock, so doing it per request queued them all.
+
+    Every request opened a store that laid the schema and checked migrations
+    under one advisory lock, and a page's ten parallel requests came back one
+    at a time. The first open in a process prepares; the rest only connect.
+    """
+    from flotta.control import app as control_app
+
+    opened: list[bool] = []
+
+    class Recorder:
+        def __init__(self, *, prepare: bool = True) -> None:
+            opened.append(prepare)
+
+    monkeypatch.setattr(control_app, "_prepared", set())
+    monkeypatch.setattr(control_app, "FleetStore", Recorder)
+    monkeypatch.setattr(control_app, "postgres_target", lambda: "postgresql://db/fleet")
+    for _ in range(3):
+        control_app._store_factory()
+    assert opened == [True, False, False]
+
+    # Another database is prepared on its own first open.
+    monkeypatch.setattr(control_app, "postgres_target", lambda: "postgresql://db/other")
+    control_app._store_factory()
+    assert opened[-1] is True
+
+
+def test_the_factory_prepares_sqlite_on_every_open(monkeypatch):
+    """A local file can be deleted under a running server, and preparing it is free."""
+    from flotta.control import app as control_app
+
+    opened: list[bool] = []
+
+    class Recorder:
+        def __init__(self, *, prepare: bool = True) -> None:
+            opened.append(prepare)
+
+    monkeypatch.setattr(control_app, "_prepared", set())
+    monkeypatch.setattr(control_app, "FleetStore", Recorder)
+    monkeypatch.setattr(control_app, "postgres_target", lambda: None)
+    for _ in range(2):
+        control_app._store_factory()
+    assert opened == [True, True]
+
+
+def test_a_store_opened_unprepared_leaves_the_schema_alone(tmp_path):
+    """`prepare=False` connects and nothing else: a dropped table stays dropped."""
+    path = tmp_path / "fleet.db"
+    store = FleetStore(path)
+    store._conn.execute("DROP TABLE box_models")
+    store.close()
+
+    unprepared = FleetStore(path, prepare=False)
+    try:
+        assert unprepared.migrations_applied == []
+        rows = unprepared._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {r["name"] for r in rows}
+        assert "box_models" not in tables
+    finally:
+        unprepared.close()
+    FleetStore(path).close()  # and a prepared open lays it again
+
+
+def test_postgres_target_is_the_url_a_store_opens(monkeypatch, tmp_path):
+    from flotta.store import postgres_target
+
+    monkeypatch.delenv("FLOTTA_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FLOTTA_STORE", str(tmp_path / "fleet.db"))
+    assert postgres_target() is None
+    monkeypatch.setenv("FLOTTA_DATABASE_URL", "postgresql://db/fleet")
+    # $FLOTTA_STORE wins, as it does for the store itself.
+    assert postgres_target() is None
+    monkeypatch.delenv("FLOTTA_STORE")
+    assert postgres_target() == "postgresql://db/fleet"
+
+
 # -- creating a box over the API (M8 prerequisite) --------------------------
 
 

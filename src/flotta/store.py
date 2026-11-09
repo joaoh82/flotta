@@ -1324,26 +1324,55 @@ def is_terminal(kind: EntityKind, status: str) -> bool:
     return status in _TERMINAL[kind]
 
 
+def _resolve_target(db_path: str | Path | None) -> tuple[str | Path | None, str | None]:
+    """What `FleetStore(db_path)` opens: the path it was given or `$FLOTTA_STORE`,
+    and `$FLOTTA_DATABASE_URL` (or the path itself) when that is a URL."""
+    if db_path is None:
+        db_path = os.environ.get(STORE_ENV_VAR, "").strip() or None
+    return db_path, db.resolve_url(str(db_path) if db_path is not None else None)
+
+
+def postgres_target(db_path: str | Path | None = None) -> str | None:
+    """The Postgres URL `FleetStore(db_path)` would open, or None for SQLite.
+
+    The same resolution the constructor uses, so a caller that remembers which
+    stores it has prepared (`control.app._store_factory`) keys on exactly what
+    gets opened.
+    """
+    _, url = _resolve_target(db_path)
+    return url if db.is_postgres_url(url) else None
+
+
 class FleetStore:
     """Fleet-state store bound to one SQLite database file (or ':memory:')."""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(self, db_path: str | Path | None = None, *, prepare: bool = True) -> None:
         """Open the fleet store.
 
         Takes a SQLite path or a `postgres://` URL — the same value
         `$FLOTTA_DATABASE_URL` carries, so one variable configures the store and
         there is no way to say two contradictory things. SQLite stays the
         default so local work and the whole test suite need no server.
+
+        `prepare=False` only connects: it neither lays the schema nor applies
+        migrations, so it is for a caller that has already opened this same
+        store once with `prepare=True` in this process. That caller is the
+        control plane (`control.app._store_factory`), which opens a store per
+        request. **On Postgres preparing is not free:** it takes a fleet-wide
+        advisory lock and runs the whole schema script under it, so every
+        request queued behind every other one, and a page asking ten things at
+        once got its answers one at a time, about a second apart on Render.
         """
-        if db_path is None:
-            db_path = os.environ.get(STORE_ENV_VAR, "").strip() or None
-        url = db.resolve_url(str(db_path) if db_path is not None else None)
+        db_path, url = _resolve_target(db_path)
         self.is_postgres = db.is_postgres_url(url)
         #: What this store was opened with, so a caller can open a *second*
         #: connection to the same place — which is the only way to test that
         #: the concurrency guard actually serialises anything.
         self._url = url or str(db_path or DEFAULT_DB_PATH)
         self._conn = db.connect(url or db_path or DEFAULT_DB_PATH)
+        if not prepare:
+            self.migrations_applied: list[int] = []
+            return
         if not self.is_postgres:
             # A pre-M0 file is refused rather than rendered as an empty fleet.
             # Postgres cannot be in that state: there is no legacy deployment.
@@ -1356,7 +1385,7 @@ class FleetStore:
             self._conn.executescript(_SCHEMA_TEMPLATE.format(events_id=_EVENTS_ID[dialect]))
         try:
             #: What opening this store applied — `flotta db migrate` reports it.
-            self.migrations_applied: list[int] = migrations.apply(self._conn, dialect=dialect)
+            self.migrations_applied = migrations.apply(self._conn, dialect=dialect)
             if MCP_BIND_MIGRATION in self.migrations_applied:
                 self._bind_mcp_connections()
         except BaseException:

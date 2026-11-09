@@ -116,6 +116,7 @@ from flotta.store import (
     UnknownEntityError,
     is_terminal,
     normalize_email,
+    postgres_target,
     reaches_fleet_github,
 )
 
@@ -346,20 +347,45 @@ def check_bind(host: str, *, env: dict[str, str] | None = None) -> None:
     )
 
 
+#: The Postgres stores this process has prepared (schema laid, migrations
+#: applied), by URL. `_store_factory` prepares each once.
+_prepared: set[str] = set()
+
+
 def _store_factory() -> FleetStore:
-    """A fresh store per request.
+    """A fresh store per request, **prepared once per process**.
 
     Per-request rather than one long-lived connection, for the same reason the
     dashboard opens SQLite per request: a pinned snapshot served to a polling
-    UI is stale in the one way a fleet view must never be. Connecting is cheap
-    on both engines.
+    UI is stale in the one way a fleet view must never be.
+
+    **Connecting is cheap; preparing is not, on Postgres.** Opening a store
+    lays the schema and applies migrations under a fleet-wide advisory lock,
+    and a signed-in request opens two stores (the session, then the route).
+    Done on every open, that lock queued every request behind every other: a
+    page asking ten things at once got them back one by one, and each click in
+    the web app waited about a second per round trip on Render. So the first
+    open in this process prepares, and every later one only connects. A deploy
+    is a new process, so new migrations still apply on its first request.
+
+    SQLite is prepared on every open, as before: it is a local file, which can
+    be deleted under a running server, and preparing it costs nothing.
+
+    Two first requests at once may both prepare, which is what every request
+    did before and is safe for the same reason (the lock).
     """
     # No argument on purpose: FleetStore owns the $FLOTTA_DATABASE_URL /
     # $FLOTTA_STORE / ./fleet.db chain. This function used to re-implement it
     # and got it wrong — the service honoured the database URL but not
     # $FLOTTA_STORE, and served an empty fleet from a file nobody meant while
     # `flotta ps` in the same shell listed the real one.
-    return FleetStore()
+    url = postgres_target()
+    if url is not None and url in _prepared:
+        return FleetStore(prepare=False)
+    store = FleetStore()
+    if url is not None:
+        _prepared.add(url)
+    return store
 
 
 #: Do not write an `addressed` event more often than this. Without a floor,
