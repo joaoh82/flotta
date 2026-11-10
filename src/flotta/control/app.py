@@ -2718,15 +2718,18 @@ def create_app(
         # Declined since it was sent: the decline is the later word.
         if org is None or org.status == "declined":
             raise refused
-        # Before the link is spent: an org whose seats filled since the invite
-        # was sent refuses it now (402), and the invite is still there for
-        # when its owner raises the limit (FLOTTA-183).
+        # An org whose seats filled since the invite was sent answers 402 here,
+        # before the link is touched. This is only the early answer: the check
+        # that holds is inside `join_by_invite`, which spends the link and
+        # takes the seat in one write, so a seat taken after this line still
+        # leaves the invite there for when the limit is raised (FLOTTA-183).
         if link.role in SEAT_ROLES and (user is None or store.membership(user.id, org.id) is None):
             store.require_room(org.id, "seats")
-        if store.redeem_login_link(offered) is None:
-            raise refused
         try:
-            user, _membership = store.accept_invite(link)
+            joined = store.join_by_invite(offered)
+            if joined is None:
+                raise refused
+            _link, user, _membership = joined
             secret = store.create_session(user.id, link.org)
         except (InvalidAccountError, UnknownEntityError) as exc:
             raise refused from exc

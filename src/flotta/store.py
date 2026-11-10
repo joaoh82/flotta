@@ -1540,10 +1540,14 @@ class FleetStore:
     ) -> Box:
         """Insert a new box in status ``provisioning`` and return it.
 
-        Deliberately uncapped. v0.1 capped worker creation at one because a
-        worker was a running container; a box is a machine you *have*, and the
-        fleet arithmetic in the pivot doc assumes tens of them. What is worth
-        capping is concurrent execution — see `create_workspace`.
+        **Capped by the org's agents limit** (FLOTTA-183): the count and the
+        insert share `boxes`' guard, so two creates cannot both take the last
+        slot, and `LimitReachedError` leaves no row. That is a plan's limit,
+        and an org with none set (every org from before M15) has no cap. The
+        fleet itself sets no cap: v0.1 capped worker creation at one because a
+        worker was a running container, but a box is a machine you *have*,
+        and the fleet arithmetic in the pivot doc assumes tens of them. What
+        the fleet caps is concurrent execution — see `create_workspace`.
 
         The name is validated **here**, before the insert, so every caller
         inherits it — the CLI, ``POST /api/boxes`` and the app — rather than
@@ -2159,30 +2163,63 @@ class FleetStore:
         were removed since it was redeemed, the removal took the link with it
         (`remove_membership`), and the invite grants nothing.
         """
+        with self._conn.transaction(guard="users"):
+            return self._grant_invite(link)
+
+    def join_by_invite(
+        self, secret: str, *, now: datetime | None = None
+    ) -> tuple[LoginLink, User, Membership] | None:
+        """Redeem the invite `secret` opens and grant its membership, as one write.
+
+        `None` as `redeem_login_link`: unknown, used, expired, or not an
+        invite. **The link is spent only if the seat is taken** (FLOTTA-183).
+        Redeeming and then accepting were two transactions, so a seat that
+        went to someone else in between left this person out with their link
+        used, and raising the limit could not bring it back. Now a full org
+        raises `LimitReachedError` and rolls the redeem back with it.
+
+        Under both guards, `users` first: `accept_invite` and
+        `remove_membership` hold it and then write `login_links`, and taking
+        them the other way round could deadlock against either on Postgres.
+        """
+        if not secret:
+            return None
+        moment = now or datetime.now(UTC)
+        with self._conn.transaction(guard=("users", "login_links")):
+            row = self._live_link_row(secret, moment)
+            if row is None or row["purpose"] != "invite":
+                return None
+            self._conn.execute(
+                "UPDATE login_links SET used_at = ? WHERE token_hash = ?",
+                (_stamp(moment), row["token_hash"]),
+            )
+            link = _link_from_row(row)
+            user, membership = self._grant_invite(link)
+        return link, user, membership
+
+    def _grant_invite(self, link: LoginLink) -> tuple[User, Membership]:
+        """`accept_invite`'s body. The caller holds `users`' guard."""
         if link.purpose != "invite" or link.org is None or link.role is None:
             raise InvalidAccountError("only an invite grants a membership")
-        with self._conn.transaction(guard="users"):
-            kept = self._conn.execute(
-                "SELECT 1 FROM login_links WHERE token_hash = ?", (link.token_hash,)
-            ).fetchone()
-            if kept is None:
-                raise InvalidAccountError("this invite was withdrawn")
-            user = self.get_user_by_email(link.email)
-            if user is not None and user.disabled_at is not None:
-                raise InvalidAccountError(f"the account for {link.email} is disabled")
-            if user is None:
-                user = self.create_user(link.email)
-            membership = self.membership(user.id, link.org)
-            if membership is None:
-                membership = self.add_membership(
-                    user.id, link.org, link.role, client_id=link.client
-                )
-            # They are in now: any other invite to this org is not still open.
-            self._conn.execute(
-                "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
-                "AND used_at IS NULL",
-                (link.org, link.email),
-            )
+        kept = self._conn.execute(
+            "SELECT 1 FROM login_links WHERE token_hash = ?", (link.token_hash,)
+        ).fetchone()
+        if kept is None:
+            raise InvalidAccountError("this invite was withdrawn")
+        user = self.get_user_by_email(link.email)
+        if user is not None and user.disabled_at is not None:
+            raise InvalidAccountError(f"the account for {link.email} is disabled")
+        if user is None:
+            user = self.create_user(link.email)
+        membership = self.membership(user.id, link.org)
+        if membership is None:
+            membership = self.add_membership(user.id, link.org, link.role, client_id=link.client)
+        # They are in now: any other invite to this org is not still open.
+        self._conn.execute(
+            "DELETE FROM login_links WHERE purpose = 'invite' AND org_id = ? AND email = ? "
+            "AND used_at IS NULL",
+            (link.org, link.email),
+        )
         return user, membership
 
     def open_invites(self, org_id: str, *, now: datetime | None = None) -> list[Invite]:

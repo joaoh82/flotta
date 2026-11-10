@@ -207,6 +207,82 @@ def test_an_invite_sent_before_the_org_filled_is_refused_and_kept(api, fleet, ou
     assert _counts(fleet)["seats"] == 2
 
 
+def _seat_taken_after_the_early_check(monkeypatch, take):
+    """Run `take` right after `_join`'s early `require_room` passes: the window
+    between the check that answers early and the insert that holds."""
+    early = FleetStore.require_room
+
+    def then_taken(self, org_id, kind):
+        early(self, org_id, kind)
+        take()
+
+    monkeypatch.setattr(FleetStore, "require_room", then_taken)
+
+
+def _invite(api, outbox, email):
+    sent = api.post(
+        "/api/orgs/agency-x/invites", json={"email": email, "role": "member"}, headers=OWNER
+    )
+    assert sent.status_code == 202, sent.text
+    return outbox.secret()
+
+
+@pytest.mark.parametrize("taker", ["add_person", "another_invite"])
+def test_a_seat_taken_while_an_invite_is_redeemed_leaves_the_link_unspent(
+    api, fleet, outbox, monkeypatch, taker
+):
+    """The review of #218: the early check passed, then the last seat went (to
+    `add_person`, or to a second invite sent while there was room), and the
+    redeem spent the link anyway. The link and the seat are one write now, so
+    the 402 leaves the link as it was, and raising the limit lets it in."""
+    bo = _invite(api, outbox, "bo@example.com")
+    cy = _invite(api, outbox, "cy@example.com")
+    _limit(fleet, seats=2)
+
+    def take():
+        with FleetStore(fleet) as store:
+            if taker == "add_person":
+                store.add_person("di@example.com", "agency-x", "member")
+            else:
+                assert store.join_by_invite(cy) is not None
+
+    with monkeypatch.context() as patched:
+        _seat_taken_after_the_early_check(patched, take)
+        refused = api.post("/api/auth/redeem", json={"secret": bo})
+    assert refused.status_code == 402, refused.text
+    assert _counts(fleet)["seats"] == 2
+    with FleetStore(fleet) as store:
+        assert store.get_user_by_email("bo@example.com") is None
+        assert store.login_link(bo) is not None, "the refused redeem spent the invite"
+
+    _limit(fleet, seats=3)
+    joined = api.post("/api/auth/redeem", json={"secret": bo})
+    assert joined.status_code == 200, joined.text
+    assert _counts(fleet)["seats"] == 3
+
+
+def test_joining_by_invite_in_the_store_spends_the_link_only_with_the_seat(fleet):
+    with FleetStore(fleet) as store:
+        secret = store.create_login_link(
+            "bo@example.com", purpose="invite", org_id="agency-x", role="member"
+        )
+        store.set_org_limits("agency-x", {"seats": 1})
+        with pytest.raises(LimitReachedError):
+            store.join_by_invite(secret)
+        assert store.login_link(secret) is not None
+        assert store.get_user_by_email("bo@example.com") is None
+
+        store.set_org_limits("agency-x", {"seats": 2})
+        link, user, membership = store.join_by_invite(secret)
+        assert (link.email, user.email, membership.role) == (
+            "bo@example.com",
+            "bo@example.com",
+            "member",
+        )
+        assert store.login_link(secret) is None
+        assert store.join_by_invite(secret) is None
+
+
 def test_a_full_org_moves_nobody_into_a_seat(api, fleet):
     with FleetStore(fleet) as store:
         viewer = store.create_user("cy@acme.test")

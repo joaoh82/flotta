@@ -266,6 +266,32 @@ def test_an_orgs_last_seat_goes_to_one_of_two_in_a_real_race(pg_store):
     assert pg_store.org_counts("agency-x")["seats"] == 2
 
 
+def test_two_invites_racing_for_the_last_seat_spend_only_the_winners_link(pg_store):
+    """The review of #218: `join_by_invite` spends the link and takes the seat
+    under one lock of `users` and `login_links`. As two transactions, both
+    links were spent and only one person joined."""
+    _full_but_one(pg_store)
+    pg_store.add_person("ana@example.com", "agency-x", "owner")
+    # Both sent while there was room for both; the limit came after.
+    secrets = [
+        pg_store.create_login_link(
+            f"p{i}@example.com", purpose="invite", org_id="agency-x", role="member"
+        )
+        for i in range(2)
+    ]
+    pg_store.set_org_limits("agency-x", {"seats": 2})
+
+    def join(fleet, i):
+        if fleet.join_by_invite(secrets[i]) is None:
+            raise LookupError("not redeemed")
+
+    outcomes = _race(pg_store, join)
+
+    assert sorted(outcomes) == ["LimitReachedError", "created"], outcomes
+    live = [s for s in secrets if pg_store.login_link(s) is not None]
+    assert len(live) == 1, "the refused invite was spent"
+
+
 def test_concurrent_status_changes_do_not_both_win(pg_store):
     """`update_box_status` is a read-check-write too.
 
