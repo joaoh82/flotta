@@ -1040,6 +1040,17 @@ MIGRATIONS: tuple[Migration, ...] = (
         27, "pull requests: what agents open, and whether each may merge its own", _pull_requests()
     ),
     Migration(28, "requests: work a client asked for, judged before it starts", _requests()),
+    Migration(
+        29,
+        "org limits: how many clients, seats and agents an org may have",
+        # FLOTTA-183 (M15.1). NULL is unlimited, which is what every org that
+        # exists already gets: limits arrive with a plan, never by migration.
+        (
+            "ALTER TABLE orgs ADD COLUMN max_clients INTEGER",
+            "ALTER TABLE orgs ADD COLUMN max_seats INTEGER",
+            "ALTER TABLE orgs ADD COLUMN max_agents INTEGER",
+        ),
+    ),
 )
 
 

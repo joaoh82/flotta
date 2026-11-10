@@ -156,13 +156,18 @@ class Connection(Protocol):
         """Insert and return the generated integer id."""
         ...
 
-    def transaction(self, *, guard: str | None = None) -> Any:
+    def transaction(self, *, guard: str | tuple[str, ...] | None = None) -> Any:
         """A transaction context.
 
         ``guard`` names a table whose read-then-write must be serialised — the
         concurrency caps. On SQLite that is `BEGIN IMMEDIATE`; on Postgres it
         is an explicit lock on that table. Passing None is an ordinary
         transaction.
+
+        A tuple guards several tables at once, for a write whose checks span
+        them (an invite's link and its seat, FLOTTA-183). Postgres locks them
+        in the order given, in one statement, so name them in the order other
+        transactions already reach them, or two can deadlock.
         """
         ...
 
@@ -280,7 +285,7 @@ class SqliteConnection:
         return int(cursor.lastrowid or 0)
 
     @contextmanager
-    def transaction(self, *, guard: str | None = None) -> Iterator[None]:
+    def transaction(self, *, guard: str | tuple[str, ...] | None = None) -> Iterator[None]:
         # BEGIN IMMEDIATE takes the write lock up front, which is what makes a
         # count-then-insert atomic. A plain BEGIN would let two spawns both
         # read "room available" and both proceed.
@@ -484,7 +489,7 @@ class PostgresConnection:
         return int(row["id"]) if row else 0
 
     @contextmanager
-    def transaction(self, *, guard: str | None = None) -> Iterator[None]:
+    def transaction(self, *, guard: str | tuple[str, ...] | None = None) -> Iterator[None]:
         cursor = self._conn.cursor()
         cursor.execute("BEGIN")
         try:
@@ -494,7 +499,8 @@ class PostgresConnection:
                 # silently reintroducing the race the concurrency cap exists to
                 # prevent. SHARE ROW EXCLUSIVE blocks other writers while still
                 # allowing reads.
-                cursor.execute(f"LOCK TABLE {guard} IN SHARE ROW EXCLUSIVE MODE")
+                tables = guard if isinstance(guard, str) else ", ".join(guard)
+                cursor.execute(f"LOCK TABLE {tables} IN SHARE ROW EXCLUSIVE MODE")
             yield
         except BaseException:
             cursor.execute("ROLLBACK")

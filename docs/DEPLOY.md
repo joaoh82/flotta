@@ -781,6 +781,29 @@ Roles map to scopes when minted (`flotta.auth.ROLES`). Revocation is still
 rotating the one signing key, which revokes every token in every org — keep
 lifetimes short (`--days`).
 
+### An agency's limits (FLOTTA-183)
+
+An org may be limited in how many **clients**, **seats** (owners and members;
+a client's own people are free) and **agents** (not torn down) it has. Every
+org starts unlimited. A limit is held in the store, so the API, the CLI,
+invites and sign-up all meet it, and a create past it answers **402** naming
+the limit:
+
+```bash
+just org-limits agency-x                                  # what it has, of what it may
+just org-limits agency-x --clients 5 --seats 1 --agents none
+```
+
+Lowering a limit below what an org holds takes nothing away; it refuses the
+next one. The org's own owner can read its limits and cannot set them.
+
+On the hosted product the web app's billing sets these from each agency's plan
+(M15), holding a token with **`org:govern`**, alone: it may read and set any
+org's limits and do nothing else, and it is never treated as the operator.
+`just govern-token` mints one for a year with this machine's signing key: run it
+with the key of the environment it is for (staging and production each have
+their own) and put the output straight into that web app's environment.
+
 ---
 
 ## Step 9 — People who sign in (M12.3)

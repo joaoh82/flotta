@@ -214,6 +214,84 @@ def test_the_workspace_cap_survives_a_real_race(pg_store):
     assert pg_store.count_live_workspaces() == 1
 
 
+def _full_but_one(store, **limits):
+    """agency-x, with a client, at one short of each limit it is given."""
+    store.create_org("agency-x", "Agency X")
+    store.create_client("agency-x", "acme", "Acme")
+    store.set_org_limits("agency-x", limits)
+
+
+def test_an_orgs_last_agent_slot_goes_to_one_of_two_in_a_real_race(pg_store):
+    """FLOTTA-183: `create_box` counts and inserts under the boxes table's lock.
+    Without it both sessions count one agent of a limit of two, and both insert."""
+    _full_but_one(pg_store, agents=2)
+    pg_store.create_box("support", org="agency-x", client="acme")
+    outcomes = _race(
+        pg_store,
+        lambda fleet, i: fleet.create_box(f"agent-{i}", org="agency-x", client="acme"),
+    )
+
+    assert sorted(outcomes) == ["LimitReachedError", "created"], (
+        f"expected exactly one winner, got {outcomes}: the agents limit is racy"
+    )
+    assert pg_store.org_counts("agency-x")["agents"] == 2
+
+
+def test_an_orgs_last_client_slot_goes_to_one_of_two_in_a_real_race(pg_store):
+    """The same guarantee on the clients table's own lock."""
+    _full_but_one(pg_store, clients=2)
+    outcomes = _race(
+        pg_store, lambda fleet, i: fleet.create_client("agency-x", f"client-{i}", f"C{i}")
+    )
+
+    assert sorted(outcomes) == ["LimitReachedError", "created"], (
+        f"expected exactly one winner, got {outcomes}: the clients limit is racy"
+    )
+    assert pg_store.org_counts("agency-x")["clients"] == 2
+
+
+def test_an_orgs_last_seat_goes_to_one_of_two_in_a_real_race(pg_store):
+    """Seats are held by the users guard `add_person` takes: two people added
+    at once to an org with one seat left, and only one joins."""
+    _full_but_one(pg_store, seats=2)
+    pg_store.add_person("ana@example.com", "agency-x", "owner")
+    outcomes = _race(
+        pg_store,
+        lambda fleet, i: fleet.add_person(f"p{i}@example.com", "agency-x", "member"),
+    )
+
+    assert sorted(outcomes) == ["LimitReachedError", "created"], (
+        f"expected exactly one winner, got {outcomes}: the seats limit is racy"
+    )
+    assert pg_store.org_counts("agency-x")["seats"] == 2
+
+
+def test_two_invites_racing_for_the_last_seat_spend_only_the_winners_link(pg_store):
+    """The review of #218: `join_by_invite` spends the link and takes the seat
+    under one lock of `users` and `login_links`. As two transactions, both
+    links were spent and only one person joined."""
+    _full_but_one(pg_store)
+    pg_store.add_person("ana@example.com", "agency-x", "owner")
+    # Both sent while there was room for both; the limit came after.
+    secrets = [
+        pg_store.create_login_link(
+            f"p{i}@example.com", purpose="invite", org_id="agency-x", role="member"
+        )
+        for i in range(2)
+    ]
+    pg_store.set_org_limits("agency-x", {"seats": 2})
+
+    def join(fleet, i):
+        if fleet.join_by_invite(secrets[i]) is None:
+            raise LookupError("not redeemed")
+
+    outcomes = _race(pg_store, join)
+
+    assert sorted(outcomes) == ["LimitReachedError", "created"], outcomes
+    live = [s for s in secrets if pg_store.login_link(s) is not None]
+    assert len(live) == 1, "the refused invite was spent"
+
+
 def test_concurrent_status_changes_do_not_both_win(pg_store):
     """`update_box_status` is a read-check-write too.
 

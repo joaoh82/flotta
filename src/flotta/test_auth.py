@@ -209,7 +209,10 @@ def test_the_known_scopes_are_exactly_these():
     `config.yaml`, and one that leaks from there should spend nothing on models
     — and for M14.5's `run:create`, because an API key sits in a client's own
     systems and should start its one agent's runs and do nothing else, not even
-    open a conversation, which `box:chat` would.
+    open a conversation, which `box:chat` would — and for FLOTTA-183's
+    `org:govern`, because the hosted product's billing must set what an agency
+    may create from its plan, and `org:admin` would have let it read and change
+    every agency's agents as well; it is held alone, and is never the operator.
     """
     assert {
         "fleet:read",
@@ -224,6 +227,7 @@ def test_the_known_scopes_are_exactly_these():
         "model:call",
         "mcp:call",
         "run:create",
+        "org:govern",
     } == SCOPES
 
 

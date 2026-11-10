@@ -319,6 +319,15 @@ token-mint SUBJECT SCOPE:
 token-role SUBJECT ROLE ORG CLIENT="":
     uv run flotta token mint "{{SUBJECT}}" --role {{ROLE}} --org {{ORG}} {{ if CLIENT == "" { "" } else { "--client " + CLIENT } }}
 
+# FLOTTA-183 — the hosted product's billing credential: `org:govern`, alone, for a
+# year (a 30-day token is how the door once went dark). It reads and sets orgs'
+# limits and nothing else. Minted with this machine's $FLOTTA_SIGNING_KEY, so run
+# it with the signing key of the environment it is for, and put the output
+# straight into that web app's FLOTTA_GOVERN_TOKEN; never paste it anywhere else.
+# Rotate before it expires: the date is in `flotta token inspect`.
+govern-token:
+    uv run flotta token mint billing --scope org:govern --days 365
+
 # The operator's; through the control plane when $FLOTTA_CONTROL_URL is set,
 # else the local store — as every org and client recipe below.
 # M11.7 — add an org (an agency), e.g. `just org-create agency-x "Agency X"`
@@ -328,6 +337,11 @@ org-create ID NAME:
 # M11.7 — every org on this control plane
 org-list:
     uv run flotta org list
+
+# FLOTTA-183 — an org's limits, or set them: `just org-limits agency-x`,
+# `just org-limits agency-x --clients 5 --seats 1 --agents none`
+org-limits ORG *ARGS:
+    uv run flotta org limits {{ORG}} {{ARGS}}
 
 # M12.4 — sign-ups waiting for an answer, and the answer
 org-pending:

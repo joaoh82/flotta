@@ -70,6 +70,7 @@ from .store import (
     InvalidBoxNameError,
     InvalidTenantError,
     LegacyStoreError,
+    LimitReachedError,
     OrgNotActiveError,
     Task,
     UnknownEntityError,
@@ -656,7 +657,11 @@ TunnelOpt = typer.Option(
     "(needs flyctl and org membership; for debugging a broken door)",
 )
 ScopeOpt = typer.Option(
-    None, "--scope", "-s", help="Repeatable. fleet:read | fleet:write | box:destroy"
+    None,
+    "--scope",
+    "-s",
+    help="Repeatable. fleet:read | fleet:write | box:destroy | ... | "
+    "org:govern (the hosted product's billing: held alone)",
 )
 
 
@@ -1128,6 +1133,7 @@ def create(
             UnknownEntityError,
             DuplicateBoxError,
             OrgNotActiveError,
+            LimitReachedError,
             InvalidModel,
         ) as exc:
             # Exit 2: the caller asked for something impossible, which is a
@@ -2342,6 +2348,88 @@ def org_decline(
     _decide_org(org_id, approve=False, store=store, as_json=as_json, reason=reason)
 
 
+def _limit_arg(raw: str | None, kind: str) -> tuple[bool, int | None]:
+    """`--clients 5` is five, `--clients none` is unlimited; absent is unchanged."""
+    if raw is None:
+        return False, None
+    if raw.strip().lower() in ("none", "unlimited"):
+        return True, None
+    if not raw.strip().isdigit():
+        typer.secho(f"--{kind} is a whole number from 0, or none", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    return True, int(raw)
+
+
+def _limits_lines(view: dict[str, Any]) -> str:
+    lines = []
+    for kind in ("clients", "seats", "agents"):
+        limit = view["limits"][kind]
+        held = view["counts"][kind]
+        shown = f"{held}, unlimited" if limit is None else f"{held} of {limit}"
+        over = "  (over the limit: nothing is taken away; the next is refused)"
+        lines.append(f"  {kind:<8} {shown}{over if view['over'][kind] else ''}")
+    return "\n".join(lines)
+
+
+@org_app.command("limits")
+def org_limits(
+    org_id: str = typer.Argument(..., help="Whose limits"),
+    clients: str | None = typer.Option(None, "--clients", help="How many clients, or none"),
+    seats: str | None = typer.Option(
+        None, "--seats", help="How many owners and members, or none; a client's people are free"
+    ),
+    agents: str | None = typer.Option(
+        None, "--agents", help="How many agents not torn down, or none"
+    ),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Show an org's limits, or set them (FLOTTA-183). Setting is the operator's act.
+
+    A limit below what the org already holds takes nothing away: it refuses the
+    next one. On the hosted product its billing sets these from the org's plan.
+    """
+    from flotta.auth import SCOPE_FLEET_READ, SCOPE_ORG_ADMIN
+    from flotta.store import LIMIT_KINDS, InvalidTenantError, UnknownEntityError
+
+    wanted: dict[str, int | None] = {}
+    for kind, raw in (("clients", clients), ("seats", seats), ("agents", agents)):
+        given, value = _limit_arg(raw, kind)
+        if given:
+            wanted[kind] = value
+    if control_url():
+        try:
+            if wanted:
+                view = control_request(
+                    "PUT", f"/api/orgs/{org_id}/limits", scopes=(SCOPE_ORG_ADMIN,), body=wanted
+                )
+            else:
+                view = control_request(
+                    "GET", f"/api/orgs/{org_id}/limits", scopes=(SCOPE_FLEET_READ,)
+                )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                org = fleet.set_org_limits(org_id, wanted) if wanted else fleet.get_org(org_id)
+            except InvalidTenantError as exc:
+                raise _fail(exc, code=2) from exc
+            except UnknownEntityError as exc:
+                raise _fail(exc) from exc
+            if org is None:
+                raise _fail(UnknownEntityError(f"no org with id {org_id!r}"))
+            counts = fleet.org_counts(org_id)
+        limits = {kind: org.limit(kind) for kind in LIMIT_KINDS}
+        view = {
+            "org": org_id,
+            "limits": limits,
+            "counts": counts,
+            "over": {k: limits[k] is not None and counts[k] > limits[k] for k in LIMIT_KINDS},
+        }
+    emit(view, f"limits of org {org_id}:\n{_limits_lines(view)}", as_json=as_json)
+
+
 @client_app.command("create")
 def client_create(
     org_id: str = typer.Argument(..., help="The org it belongs to"),
@@ -2370,7 +2458,7 @@ def client_create(
                 created = fleet.create_client(org_id, client_id, name)
             except InvalidTenantError as exc:
                 raise _fail(exc, code=2) from exc
-            except (DuplicateTenantError, UnknownEntityError) as exc:
+            except (DuplicateTenantError, UnknownEntityError, LimitReachedError) as exc:
                 raise _fail(exc) from exc
             client = {
                 "org": created.org,
@@ -2463,7 +2551,7 @@ def user_add(
                 )
             except InvalidAccountError as exc:
                 raise _fail(exc, code=2) from exc
-            except (UnknownEntityError, DuplicateMembershipError) as exc:
+            except (UnknownEntityError, DuplicateMembershipError, LimitReachedError) as exc:
                 raise _fail(exc) from exc
         added = {
             "user": {"id": user.id, "email": user.email, "name": user.name},

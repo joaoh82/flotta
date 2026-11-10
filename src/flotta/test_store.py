@@ -562,8 +562,9 @@ def test_state_survives_reopen(tmp_path):
 # -- concurrency cap --------------------------------------------------------
 
 
-def test_boxes_are_uncapped(store):
-    """Forty agents is the product. Only work gets rationed."""
+def test_boxes_are_uncapped_without_an_agents_limit(store):
+    """Forty agents is the product. Only work gets rationed by the fleet; an
+    org's plan may set an agents limit (FLOTTA-183, `test_org_limits.py`)."""
     for i in range(40):
         store.create_box(f"eng-{i}")
     assert len(store.list_boxes()) == 40

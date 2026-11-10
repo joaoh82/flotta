@@ -58,6 +58,7 @@ from flotta.auth import (
     SCOPE_FLEET_WRITE,
     SCOPE_GIT_CREDENTIAL,
     SCOPE_ORG_ADMIN,
+    SCOPE_ORG_GOVERN,
     SCOPE_RUN_CREATE,
     SIGNING_KEY_ENV,
     TICKET_PROTOCOL_PREFIX,
@@ -68,6 +69,7 @@ from flotta.auth import (
     admits,
     admits_tenant,
     is_api_key,
+    is_governor,
     key_token,
     mint,
     mint_ticket,
@@ -101,7 +103,9 @@ from flotta.runs import RUN_DEADLINE_S, chat_conversation
 from flotta.store import (
     AGENCY_GITHUB_UNAVAILABLE,
     INVITE_TTL_S,
+    LIMIT_KINDS,
     LINK_TTL_S,
+    SEAT_ROLES,
     TASK_STATUSES,
     BoxBusyError,
     DuplicateMembershipError,
@@ -111,6 +115,7 @@ from flotta.store import (
     InvalidTenantError,
     InvalidTransitionError,
     LastOwnerError,
+    LimitReachedError,
     NotOperatorError,
     OrgNotActiveError,
     UnknownEntityError,
@@ -917,6 +922,10 @@ def create_app(
     needs_git = Depends(require(SCOPE_GIT_CREDENTIAL))
     needs_peer = Depends(require(SCOPE_BOX_PEER))
     needs_admin = Depends(require(SCOPE_ORG_ADMIN))
+    #: An org's limits (FLOTTA-183): read by its own people, the operator or
+    #: the hosted product's billing (`org:govern`); set by the last two.
+    needs_limits_read = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
+    needs_limits_write = Depends(require(SCOPE_ORG_ADMIN, SCOPE_ORG_GOVERN, any_of=True))
     #: The agency's people, or a client's person who talks to agents: who may
     #: answer a run's approval, before the rules of `answer_run_approval`.
     needs_answer = Depends(require(SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, any_of=True))
@@ -951,6 +960,11 @@ def create_app(
         """
         if token is None:
             return True
+        if is_governor(token):
+            # The hosted product's billing credential is the default org's and
+            # unconfined, so it looks like the operator's. It is not one: it
+            # may read and set orgs' limits and nothing else (FLOTTA-183).
+            return False
         return (
             (token.org or DEFAULT_ORG) == DEFAULT_ORG
             and token.client is None
@@ -1154,6 +1168,23 @@ def create_app(
     app = FastAPI(title="Flotta control plane", lifespan=lifespan)
     app.state.loop_state = state
 
+    @app.exception_handler(LimitReachedError)
+    def _limit_reached(_request: Request, exc: LimitReachedError) -> Any:
+        """402 wherever an org's limit refuses a create (FLOTTA-183).
+
+        One handler rather than a catch in every route, because the store is
+        where the limit is held and any route that reaches it must answer the
+        same way: a route added later that creates a client, a seat or an
+        agent cannot forget to. 402, like a budget's refusal: what is asked for
+        is more than the org's plan has, and raising the limit is the fix.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=402,
+            content={"detail": str(exc), "limit": {"kind": exc.kind, "limit": exc.limit}},
+        )
+
     @app.get("/health")
     def health() -> Any:
         """Liveness, and whether the reconcile loop is actually sweeping.
@@ -1248,6 +1279,79 @@ def create_app(
         finally:
             store.close()
         return {"org": asdict(org)}
+
+    # -- limits (FLOTTA-183, M15.1) -------------------------------------------
+    #
+    # How many clients, seats and agents an org may have. Held in the store, so
+    # every path that creates one meets it; set here by the operator, or by the
+    # hosted product's billing from the org's plan with an `org:govern` token,
+    # which can do this and nothing else (`control/test_govern.py`).
+
+    def _limits_view(store: Any, org: Any) -> dict[str, Any]:
+        counts = store.org_counts(org.id)
+        limits = {kind: org.limit(kind) for kind in LIMIT_KINDS}
+        return {
+            "org": org.id,
+            "limits": limits,
+            "counts": counts,
+            # Over, not at: a limit lowered below what the org already holds.
+            # Nothing is taken away; the next one is refused.
+            "over": {
+                kind: limits[kind] is not None and counts[kind] > limits[kind]
+                for kind in LIMIT_KINDS
+            },
+        }
+
+    @app.get("/api/orgs/{org_id}/limits")
+    def get_org_limits(org_id: str, token: Token | None = needs_limits_read) -> Any:
+        """An org's limits and what it holds of each: `{limits, counts, over}`.
+
+        For the org's own people (not a client's: a client sees its agents,
+        not its agency's plan), the operator, and `org:govern`. Anyone else's
+        org is the 404 every tenant route gives.
+        """
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            assert token is not None
+            if token.client is not None or (token.org or DEFAULT_ORG) != org_id:
+                raise HTTPException(status_code=404, detail=f"no org with id {org_id!r}")
+        store = store_factory()
+        try:
+            return _limits_view(store, _org_or_404(store, org_id))
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/limits")
+    def put_org_limits(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_limits_write
+    ) -> Any:
+        """Set an org's limits: `{"clients": 5, "seats": 1, "agents": null}`.
+
+        A limit left out is kept and `null` is none. Below what the org holds is
+        allowed: it refuses the next one and removes nothing. The operator's,
+        or the hosted product's billing (`org:govern`); not an org's own owner,
+        whose limits are its plan's.
+        """
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            raise HTTPException(
+                status_code=403,
+                detail="only the fleet's operator, or its billing, may set an org's limits",
+            )
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            try:
+                org = store.set_org_limits(org_id, dict(body))
+            except InvalidTenantError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            _log.info(
+                "limits of %s set by %s: %s",
+                org_id,
+                token.subject if token is not None else "the operator",
+                {kind: org.limit(kind) for kind in LIMIT_KINDS},
+            )
+            return _limits_view(store, org)
+        finally:
+            store.close()
 
     @app.post("/api/orgs/{org_id}/approve")
     def approve_org(org_id: str, tasks: BackgroundTasks, token: Token | None = needs_admin) -> Any:
@@ -2243,7 +2347,7 @@ def create_app(
         subject = str(body.get("subject") or "").strip()
         if not subject:
             raise HTTPException(status_code=422, detail="who is this token for? name a subject")
-        if subject_box(subject) is not None or subject == "relay":
+        if subject_box(subject) is not None or subject in ("relay", "billing"):
             raise HTTPException(
                 status_code=422,
                 detail=f"{subject!r} names a machine; a box's token is minted when it is created",
@@ -2618,10 +2722,18 @@ def create_app(
         # Declined since it was sent: the decline is the later word.
         if org is None or org.status == "declined":
             raise refused
-        if store.redeem_login_link(offered) is None:
-            raise refused
+        # An org whose seats filled since the invite was sent answers 402 here,
+        # before the link is touched. This is only the early answer: the check
+        # that holds is inside `join_by_invite`, which spends the link and
+        # takes the seat in one write, so a seat taken after this line still
+        # leaves the invite there for when the limit is raised (FLOTTA-183).
+        if link.role in SEAT_ROLES and (user is None or store.membership(user.id, org.id) is None):
+            store.require_room(org.id, "seats")
         try:
-            user, _membership = store.accept_invite(link)
+            joined = store.join_by_invite(offered)
+            if joined is None:
+                raise refused
+            _link, user, _membership = joined
             secret = store.create_session(user.id, link.org)
         except (InvalidAccountError, UnknownEntityError) as exc:
             raise refused from exc
@@ -3203,6 +3315,9 @@ def create_app(
                 tenant_store.require_active_org(org)
             except OrgNotActiveError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
+            # The same early answer for an org at its limit on agents: the
+            # store refuses the row as well, under its guard (FLOTTA-183).
+            tenant_store.require_room(org, "agents")
         finally:
             tenant_store.close()
 
@@ -3382,6 +3497,8 @@ def create_app(
                 # A *live* box holds the name — a destroyed one no longer does,
                 # because teardown releases it.
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except LimitReachedError:
+                raise  # 402, from its handler: not a conflict over the name
             except Exception as exc:
                 raise HTTPException(
                     status_code=409,
