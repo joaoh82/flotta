@@ -1842,8 +1842,10 @@ def serve(
     # proxy_headers off: uvicorn would otherwise believe X-Forwarded-For from
     # loopback on its own, and `$FLOTTA_TRUSTED_PROXY_HOPS` is meant to be the
     # one answer to "which proxies are trusted" (`control.app.caller_address`).
+    from flotta.provision import warm_release_cache
+
     uvicorn.run(
-        create_app(interval_s=interval_s),
+        create_app(interval_s=interval_s, warm_release_cache=warm_release_cache),
         host=host,
         port=port,
         log_level="info",

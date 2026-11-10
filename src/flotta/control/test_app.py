@@ -1850,6 +1850,24 @@ def test_a_machine_read_that_failed_is_timed_too(client, monkeypatch, caplog):
     assert "not authenticated" not in line
 
 
+def test_the_machine_read_takes_a_stale_fleet_image(client, monkeypatch):
+    """FLOTTA-182: the Settings tab is a read, so it may be a click behind a new
+    build while the refresh runs, rather than waiting 1–1.5 s on `flyctl`."""
+    import flotta.provision as provision
+    from flotta.backend import MachineInfo
+
+    _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started"))
+    asked: list[bool] = []
+
+    def recording(env=None, **kw):
+        asked.append(kw.get("stale_ok", False))
+        return "registry/x:fleet"
+
+    monkeypatch.setattr(provision, "_fleet_image", recording)
+    assert client.get("/api/boxes/eng-a/machine").status_code == 200
+    assert asked == [True]
+
+
 def test_servers_log_the_machine_timing_under_the_name_the_route_uses():
     from flotta.control.app import MACHINE_TIMING_LOG
     from flotta.server_logs import log_config
@@ -1964,7 +1982,7 @@ def test_an_upgrade_answers_before_the_substrate_does(async_client, monkeypatch)
         return {"box_id": box_id}
 
     monkeypatch.setattr(provision, "upgrade_box", slow)
-    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None, **kw: "registry/x:new")
 
     response = async_client.post("/api/boxes/eng-a/upgrade")
 
@@ -1973,6 +1991,24 @@ def test_an_upgrade_answers_before_the_substrate_does(async_client, monkeypatch)
     assert body["image"] == "registry/x:new"
     assert body["started"] is True
     assert started.wait(timeout=5), "the upgrade should be running on a thread"
+
+
+def test_the_upgrade_waits_for_a_fresh_fleet_image(async_client, monkeypatch):
+    """The Upgrade button the Settings tab offers builds a machine from the
+    image, so it is not allowed the read's staleness (FLOTTA-182)."""
+    import flotta.provision as provision
+
+    asked: list[bool] = []
+
+    def recording(env=None, **kw):
+        asked.append(kw.get("stale_ok", False))
+        return "registry/x:new"
+
+    monkeypatch.setattr(provision, "upgrade_box", lambda box_id, **kw: {"box_id": box_id})
+    monkeypatch.setattr(provision, "_fleet_image", recording)
+
+    assert async_client.post("/api/boxes/eng-a/upgrade").status_code == 202
+    assert asked == [False]
 
 
 def test_a_box_that_cannot_be_upgraded_is_refused_in_the_reply(async_client, fleet):
@@ -1996,7 +2032,7 @@ def test_an_upgrade_with_no_image_anywhere_is_refused_rather_than_started(
     that fails where nobody is looking."""
     import flotta.provision as provision
 
-    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: None)
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None, **kw: None)
     response = async_client.post("/api/boxes/eng-a/upgrade")
 
     assert response.status_code == 409
@@ -2013,7 +2049,7 @@ def test_an_explicit_image_wins_over_the_fleet_default(async_client, monkeypatch
         return {"box_id": box_id}
 
     monkeypatch.setattr(provision, "upgrade_box", record)
-    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:fleet")
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None, **kw: "registry/x:fleet")
 
     body = async_client.post("/api/boxes/eng-a/upgrade", json={"image": "registry/x:pinned"}).json()
 
@@ -2030,7 +2066,7 @@ def test_the_machine_endpoint_says_whether_the_agent_is_on_the_fleet_image(clien
     import flotta.provision as provision
     from flotta.backend import MachineInfo
 
-    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None, **kw: "registry/x:new")
     _fake_backend(
         monkeypatch,
         lambda box_id: MachineInfo(state="started", image="registry/x:new@sha256:abc"),
@@ -2045,7 +2081,7 @@ def test_an_agent_on_an_older_image_is_reported_as_behind(client, monkeypatch):
     import flotta.provision as provision
     from flotta.backend import MachineInfo
 
-    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: "registry/x:new")
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None, **kw: "registry/x:new")
     _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old"))
 
     assert client.get("/api/boxes/eng-a/machine").json()["image_current"] is False
@@ -2058,7 +2094,7 @@ def test_an_unknown_side_is_not_reported_as_behind(client, monkeypatch):
     import flotta.provision as provision
     from flotta.backend import MachineInfo
 
-    monkeypatch.setattr(provision, "_fleet_image", lambda env=None: None)
+    monkeypatch.setattr(provision, "_fleet_image", lambda env=None, **kw: None)
     _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started", image="registry/x:old"))
 
     assert client.get("/api/boxes/eng-a/machine").json()["image_current"] is None
@@ -3478,3 +3514,37 @@ def test_the_202_path_writes_the_tenancy_and_probes_the_address(fleet, agencies,
     with FleetStore(fleet) as store:
         box = store.get_box(response.json()["box_id"])
     assert (box.name, box.org, box.client) == ("support--acme--agency-x", "agency-x", "acme")
+
+
+def test_the_server_warms_the_fleet_image_when_it_starts(fleet):
+    """FLOTTA-182: the first Settings tab after a deploy should not wait on
+    `flyctl releases`. Off unless a server asks for it, so the suite never runs
+    `flyctl` because `$FLOTTA_FLY_APP` was in the environment it inherited."""
+    warmed: list[int] = []
+
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        reachable=_unchecked,
+        known_model=_uncatalogued,
+        warm_release_cache=lambda: warmed.append(1),
+    )
+    with TestClient(app):
+        assert warmed == [1]
+
+
+def test_a_warmer_that_fails_does_not_stop_the_server(fleet):
+    def boom():
+        raise RuntimeError("no threads today")
+
+    app = create_app(
+        store_factory=lambda: FleetStore(fleet),
+        run_loop=False,
+        background=False,
+        reachable=_unchecked,
+        known_model=_uncatalogued,
+        warm_release_cache=boom,
+    )
+    with TestClient(app) as c:
+        assert c.get("/health").status_code == 200
