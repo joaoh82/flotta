@@ -603,6 +603,12 @@ def create_app(
     background: bool = True,
     interval_s: float | None = None,
     loop_runner: Any = None,
+    #: Starts the first fleet-image lookup when the server starts, so the first
+    #: Settings tab after a deploy does not wait on `flyctl releases`
+    #: (FLOTTA-182). `None` warms nothing — the suite's default, because the
+    #: real one runs `flyctl` whenever `$FLOTTA_FLY_APP` is in the environment
+    #: a test inherited. The servers pass `provision.warm_release_cache`.
+    warm_release_cache: Any = None,
     signing_key: str | None = None,
     #: Asks GitHub whether the fleet token can reach a repository, before a
     #: grant is stored. Injected for the same reason every Fly touchpoint is:
@@ -1095,6 +1101,12 @@ def create_app(
         notices: asyncio.Task | None = None
         runs: asyncio.Task | None = None
         pulls_task: asyncio.Task | None = None
+        if warm_release_cache is not None:
+            # On its own thread: startup does not wait for it, and a lookup
+            # that fails costs the first panel a wait, which is what it cost
+            # before.
+            with contextlib.suppress(Exception):
+                warm_release_cache()
         if run_loop:
             # `loop_runner` makes the *interesting* failure testable: a loop
             # that is configured and supposed to be running, but is not
@@ -2906,7 +2918,8 @@ def create_app(
             store.close()
 
         found = report(fleet_ref=built.hermes_ref if built else None)
-        fleet_image, source = resolve_fleet_image()
+        # A read, so a stale image with a refresh behind it will do (FLOTTA-182).
+        fleet_image, source = resolve_fleet_image(stale_ok=True)
 
         # What the build app last released, reported even when the environment
         # won — because the two disagreeing *is* the trap. A deployment
@@ -2916,7 +2929,7 @@ def create_app(
         newest = None
         app = (os.environ.get("FLOTTA_FLY_APP") or "").strip() or None
         if app:
-            newest = _newest_release_image(app)
+            newest = _newest_release_image(app, stale_ok=True)
 
         return {
             "pinned": found.pinned,
@@ -4279,14 +4292,17 @@ def create_app(
 
         Timed on `MACHINE_TIMING_LOG` (FLOTTA-182): how long asking the
         substrate took, and how long finding the fleet's image took, which
-        without `$FLOTTA_FLY_IMAGE` is a `flyctl releases` once a minute.
+        without `$FLOTTA_FLY_IMAGE` was a `flyctl releases` of 1.0–1.5 s once
+        a minute. It is a read, so it takes a stale image and lets the refresh
+        run behind it (`provision._RELEASE_STALE_MAX_S`); an upgrade still
+        waits for a fresh one.
         """
         from flotta.backend import BackendError, backend_for
         from flotta.provision import _fleet_image, _same_image
 
         def timed_fleet_image(inspect_ms: float, outcome: str) -> str | None:
             started = time.perf_counter()
-            image = _fleet_image()
+            image = _fleet_image(stale_ok=True)
             logging.getLogger(MACHINE_TIMING_LOG).info(
                 "machine read for %s: %s in %.0f ms, fleet image in %.0f ms",
                 box.id,
@@ -4318,7 +4334,7 @@ def create_app(
                     "box": row,
                     "machine": None,
                     "unavailable": "this agent has no machine yet",
-                    "fleet_image": _fleet_image(),
+                    "fleet_image": _fleet_image(stale_ok=True),
                     "image_current": None,
                 }
             asked = time.perf_counter()
@@ -7139,4 +7155,12 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> None:  # pragma: no cove
     )
     _log.info("control plane on %s:%s, fleet state in %s", host, port, described)
     # proxy_headers off: `caller_address` is the one reader of X-Forwarded-For.
-    uvicorn.run(create_app(), host=host, port=port, proxy_headers=False, log_config=log_config())
+    from flotta.provision import warm_release_cache
+
+    uvicorn.run(
+        create_app(warm_release_cache=warm_release_cache),
+        host=host,
+        port=port,
+        proxy_headers=False,
+        log_config=log_config(),
+    )

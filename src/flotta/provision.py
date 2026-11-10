@@ -3065,11 +3065,33 @@ def resize_box(
     return {"box_id": box.id, "name": box.name, "memory_mb": wanted}
 
 
-#: How long a resolved release image is reused. The lookup is a `flyctl`
+#: How long a resolved release image is fresh. The lookup is a `flyctl`
 #: subprocess and the answer changes only when somebody builds, so a minute of
 #: staleness costs nothing and saves a subprocess per Info panel opened.
 _RELEASE_CACHE_S = 60.0
+
+#: How long a **read** may be answered from a stale image while a refresh runs
+#: behind it (FLOTTA-182). `flyctl releases` took 1.0–1.5 s on the control
+#: plane's half CPU, and a Settings tab opened more than a minute after the last
+#: one waited for all of it. A read now gets the last answer at once and starts
+#: the refresh on a thread, so the panel is at most one open behind a new build.
+#: The cap is for a refresh that keeps failing: past it, a read waits for the
+#: lookup again rather than vouching for an image nobody has confirmed in a
+#: quarter of an hour.
+_RELEASE_STALE_MAX_S = 15 * 60.0
+
 _release_cache: tuple[float, str, str | None] | None = None
+
+#: Held for the whole of any lookup, so only one `flyctl releases` runs at a
+#: time. Two Settings tabs opened in the same second both found the cache
+#: expired and started one each — 1058 ms and 1470 ms on production, the second
+#: slower for sharing the CPU with the first. A waiter re-reads the cache once
+#: it has the lock, and finds the answer the first lookup just stored.
+_release_lookup = threading.Lock()
+
+
+def _spawn_thread(work: Callable[[], None]) -> None:
+    threading.Thread(target=work, name="flotta-release-refresh", daemon=True).start()
 
 
 def resolve_fleet_image(
@@ -3077,6 +3099,8 @@ def resolve_fleet_image(
     *,
     lookup: Callable[[str], str | None] | None = None,
     now: float | None = None,
+    stale_ok: bool = False,
+    spawn: Callable[[Callable[[], None]], None] | None = None,
 ) -> tuple[str | None, str]:
     """The image an upgrade moves onto, and **where that answer came from**.
 
@@ -3102,6 +3126,12 @@ def resolve_fleet_image(
     globally unique. Resolving a release from a guessed app would mean reading
     a stranger's registry and handing the fleet whatever they last built. So
     this reads `$FLOTTA_FLY_APP` directly and refuses to guess.
+
+    `stale_ok` is for **reads** — a panel showing which image the fleet builds.
+    It may answer from a stale cache while a refresh runs behind it (see
+    `_RELEASE_STALE_MAX_S`). Creating or upgrading a box leaves it off, and so
+    waits for an answer no older than `_RELEASE_CACHE_S`, as before: the image
+    a machine is built from should not be a click behind.
     """
     from flotta.fly import APP_ENV, IMAGE_ENV
 
@@ -3115,8 +3145,101 @@ def resolve_fleet_image(
     if not app:
         return None, "none"
 
-    found = _newest_release_image(app, lookup=lookup, now=now)
+    found = _newest_release_image(app, lookup=lookup, now=now, stale_ok=stale_ok, spawn=spawn)
     return (found, "release") if found else (None, "none")
+
+
+def warm_release_cache(
+    env: Mapping[str, str] | None = None,
+    *,
+    lookup: Callable[[str], str | None] | None = None,
+    spawn: Callable[[Callable[[], None]], None] | None = None,
+) -> bool:
+    """Start the first release lookup on a thread, so the first Settings tab
+    opened after a deploy does not wait for it.
+
+    Whether a lookup was started: not when `$FLOTTA_FLY_IMAGE` answers the
+    question, not when there is no build app to ask (`resolve_fleet_image`
+    refuses to guess one), and not when a lookup is already running.
+    """
+    from flotta.fly import APP_ENV, IMAGE_ENV
+
+    source = os.environ if env is None else env
+    if (source.get(IMAGE_ENV) or "").strip():
+        return False
+    app = (source.get(APP_ENV) or "").strip()
+    if not app:
+        return False
+    return _refresh_in_background(app, _release_reader(lookup), time.monotonic(), spawn)
+
+
+def _release_reader(lookup: Callable[[str], str | None] | None) -> Callable[[str], str | None]:
+    if lookup is not None:
+        return lookup
+
+    def reader(name: str) -> str | None:
+        impl = _backend_for("fly://")
+        current = getattr(impl, "current_image", None)
+        # A substrate with no notion of "the app's last release" is not a
+        # failure; it just has no answer to this question.
+        return current(name) if callable(current) else None
+
+    return reader
+
+
+def _cached_release(app: str, moment: float, within: float) -> tuple[bool, str | None]:
+    cached = _release_cache
+    if cached is not None and cached[1] == app and moment - cached[0] < within:
+        return True, cached[2]
+    return False, None
+
+
+def _look_up_release(app: str, reader: Callable[[str], str | None], moment: float) -> str | None:
+    """One lookup, stored. Called with `_release_lookup` held."""
+    global _release_cache
+    try:
+        found = reader(app)
+    except Exception:  # noqa: BLE001 - see `_newest_release_image`
+        return None
+    found = (found or "").strip() or None
+    _release_cache = (moment, app, found)
+    return found
+
+
+def _refresh_in_background(
+    app: str,
+    reader: Callable[[str], str | None],
+    moment: float,
+    spawn: Callable[[Callable[[], None]], None] | None,
+) -> bool:
+    """Refresh the cached image on a thread, unless a lookup is already
+    running — in which case that one's answer is the refresh."""
+    if not _release_lookup.acquire(blocking=False):
+        return False
+
+    def work() -> None:
+        global _release_cache
+        try:
+            had = _release_cache
+            try:
+                found = (reader(app) or "").strip() or None
+            except Exception:  # noqa: BLE001 - a background refresh has nobody to tell
+                found = None
+            # `current_image` answers None when `flyctl` fails, so a refresh
+            # that found nothing keeps the image it already had rather than
+            # blanking a panel over one bad minute. `_RELEASE_STALE_MAX_S`
+            # bounds how long that can go on.
+            if found is not None or had is None or had[1] != app:
+                _release_cache = (moment, app, found)
+        finally:
+            _release_lookup.release()
+
+    try:
+        (spawn or _spawn_thread)(work)
+    except Exception:  # noqa: BLE001 - no thread is no refresh, not a failed read
+        _release_lookup.release()
+        return False
+    return True
 
 
 def _newest_release_image(
@@ -3124,50 +3247,47 @@ def _newest_release_image(
     *,
     lookup: Callable[[str], str | None] | None = None,
     now: float | None = None,
+    stale_ok: bool = False,
+    spawn: Callable[[Callable[[], None]], None] | None = None,
 ) -> str | None:
     """The build app's newest complete release, cached briefly.
 
     Never raises: this feeds a panel and an upgrade's default, and a `flyctl`
     that is having a bad minute should cost "we do not know" rather than an
     exception on a read somebody asked for.
+
+    Fresh within `_RELEASE_CACHE_S`. Past that, a `stale_ok` read gets the
+    cached answer and starts a refresh on a thread; anything else waits for a
+    lookup — one at a time, sharing the answer (`_release_lookup`).
     """
-    global _release_cache
-
     moment = time.monotonic() if now is None else now
-    if (
-        _release_cache is not None
-        and _release_cache[1] == app
-        and moment - _release_cache[0] < _RELEASE_CACHE_S
-    ):
-        return _release_cache[2]
+    reader = _release_reader(lookup)
 
-    reader = lookup
-    if reader is None:
+    hit, found = _cached_release(app, moment, _RELEASE_CACHE_S)
+    if hit:
+        return found
+    if stale_ok:
+        hit, found = _cached_release(app, moment, _RELEASE_STALE_MAX_S)
+        if hit:
+            _refresh_in_background(app, reader, moment, spawn)
+            return found
 
-        def reader(name: str) -> str | None:
-            impl = _backend_for("fly://")
-            current = getattr(impl, "current_image", None)
-            # A substrate with no notion of "the app's last release" is not a
-            # failure; it just has no answer to this question.
-            return current(name) if callable(current) else None
-
-    try:
-        found = reader(app)
-    except Exception:  # noqa: BLE001 - see the docstring
-        return None
-
-    found = (found or "").strip() or None
-    _release_cache = (moment, app, found)
-    return found
+    with _release_lookup:
+        # Somebody else may have been looking it up while this waited.
+        hit, found = _cached_release(app, moment, _RELEASE_CACHE_S)
+        if hit:
+            return found
+        return _look_up_release(app, reader, moment)
 
 
-def _fleet_image(env: Mapping[str, str] | None = None) -> str | None:
+def _fleet_image(env: Mapping[str, str] | None = None, *, stale_ok: bool = False) -> str | None:
     """The image this fleet builds — never from a box's own app.
 
     Kept as the one-value form because every caller that only needs the image
-    should not have to unpack a source it does not use.
+    should not have to unpack a source it does not use. `stale_ok` is
+    `resolve_fleet_image`'s: for showing the image, not for building from it.
     """
-    return resolve_fleet_image(env)[0]
+    return resolve_fleet_image(env, stale_ok=stale_ok)[0]
 
 
 def _same_image(a: str, b: str) -> bool:

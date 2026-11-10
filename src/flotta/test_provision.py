@@ -2891,6 +2891,259 @@ def test_the_cache_is_keyed_by_app():
     )
 
 
+def _run_inline():
+    """A `spawn` that runs the refresh before returning, and remembers it ran."""
+    ran: list[int] = []
+
+    def spawn(work):
+        ran.append(1)
+        work()
+
+    return spawn, ran
+
+
+def _held():
+    """A `spawn` that keeps the refresh, to run when the test says."""
+    kept = []
+    return kept, (lambda work: kept.append(work))
+
+
+def test_a_stale_read_answers_at_once_and_refreshes_behind_it():
+    """FLOTTA-182: `flyctl releases` took 1.0–1.5 s on production, and a
+    Settings tab opened a minute after the last one waited for all of it. A
+    read now gets the last answer while the refresh runs on a thread."""
+    from flotta.provision import _RELEASE_CACHE_S, _newest_release_image
+
+    _newest_release_image("build-app", lookup=lambda app: "registry/x:old", now=100.0)
+
+    kept, spawn = _held()
+    later = 100.0 + _RELEASE_CACHE_S + 1
+    assert (
+        _newest_release_image(
+            "build-app", lookup=lambda app: "registry/x:new", now=later, stale_ok=True, spawn=spawn
+        )
+        == "registry/x:old"
+    )
+    assert len(kept) == 1, "the stale read should have started exactly one refresh"
+
+    kept[0]()
+
+    # Fresh again, from the refresh, with no lookup of its own.
+    def must_not_run(app):  # pragma: no cover - the cache this test checks
+        raise AssertionError("looked up an image the refresh had just stored")
+
+    assert _newest_release_image("build-app", lookup=must_not_run, now=later) == "registry/x:new"
+
+
+def test_a_build_still_waits_for_a_fresh_image():
+    """Creating or upgrading a box is not a panel. The image a machine is built
+    from should not be a click behind, so without `stale_ok` a stale cache is
+    looked up again before answering, exactly as before."""
+    from flotta.provision import _RELEASE_CACHE_S, _newest_release_image
+
+    _newest_release_image("build-app", lookup=lambda app: "registry/x:old", now=100.0)
+
+    def must_not_spawn(work):  # pragma: no cover - the guard this test exists for
+        raise AssertionError("a build read went to the background")
+
+    assert (
+        _newest_release_image(
+            "build-app",
+            lookup=lambda app: "registry/x:new",
+            now=100.0 + _RELEASE_CACHE_S + 1,
+            spawn=must_not_spawn,
+        )
+        == "registry/x:new"
+    )
+
+
+def test_a_read_waits_again_once_the_image_is_too_old_to_vouch_for():
+    """A refresh that keeps failing must not let a panel show an image nobody
+    has confirmed for a quarter of an hour."""
+    from flotta.provision import _RELEASE_STALE_MAX_S, _newest_release_image
+
+    _newest_release_image("build-app", lookup=lambda app: "registry/x:old", now=100.0)
+
+    def must_not_spawn(work):  # pragma: no cover - the guard this test exists for
+        raise AssertionError("served an image past the stale cap")
+
+    assert (
+        _newest_release_image(
+            "build-app",
+            lookup=lambda app: "registry/x:new",
+            now=100.0 + _RELEASE_STALE_MAX_S + 1,
+            stale_ok=True,
+            spawn=must_not_spawn,
+        )
+        == "registry/x:new"
+    )
+
+
+def test_a_read_with_nothing_cached_waits_rather_than_answering_nothing():
+    """Stale-while-refreshing needs something stale. With nothing cached, the
+    honest answer is the lookup, not a blank panel and a promise."""
+    from flotta.provision import _newest_release_image
+
+    assert (
+        _newest_release_image(
+            "build-app", lookup=lambda app: "registry/x:new", now=1.0, stale_ok=True
+        )
+        == "registry/x:new"
+    )
+
+
+def test_stale_reads_together_start_one_refresh():
+    """The two reads at 13:46:11 on production each started a `flyctl` of
+    their own. While a refresh is running, another stale read leaves it be."""
+    from flotta.provision import _RELEASE_CACHE_S, _newest_release_image
+
+    _newest_release_image("build-app", lookup=lambda app: "registry/x:old", now=100.0)
+    kept, spawn = _held()
+    later = 100.0 + _RELEASE_CACHE_S + 1
+    for _ in range(3):
+        assert (
+            _newest_release_image(
+                "build-app", lookup=lambda app: "x", now=later, stale_ok=True, spawn=spawn
+            )
+            == "registry/x:old"
+        )
+    assert len(kept) == 1
+    kept[0]()
+
+
+def test_lookups_together_run_flyctl_once_and_share_the_answer():
+    """Two reads that both have to wait — nothing cached, or a build — must not
+    each start a subprocess. The second waits for the first and reads its
+    answer from the cache."""
+    import threading
+
+    from flotta.provision import _newest_release_image
+
+    inside = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def slow(app):
+        calls.append(app)
+        inside.set()
+        release.wait(5)
+        return "registry/x:newest"
+
+    answers: list[str | None] = []
+
+    def ask():
+        answers.append(_newest_release_image("build-app", lookup=slow, now=1.0))
+
+    first = threading.Thread(target=ask)
+    first.start()
+    assert inside.wait(5)
+    second = threading.Thread(target=ask)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive(), "the second lookup should be waiting for the first"
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert calls == ["build-app"]
+    assert answers == ["registry/x:newest", "registry/x:newest"]
+
+
+def test_a_refresh_that_finds_nothing_keeps_the_image_it_had():
+    """`current_image` answers None when `flyctl` fails. One bad minute should
+    not blank a panel that had a perfectly good answer."""
+    import flotta.provision as provision
+    from flotta.provision import _RELEASE_CACHE_S, _newest_release_image
+
+    _newest_release_image("build-app", lookup=lambda app: "registry/x:old", now=100.0)
+    later = 100.0 + _RELEASE_CACHE_S + 1
+
+    def boom(app):
+        raise RuntimeError("flyctl fell over")
+
+    for broken in (lambda app: None, boom):
+        spawn, ran = _run_inline()
+        assert (
+            _newest_release_image("build-app", lookup=broken, now=later, stale_ok=True, spawn=spawn)
+            == "registry/x:old"
+        )
+        assert ran
+        assert provision._release_cache is not None
+        assert provision._release_cache[2] == "registry/x:old"
+    # Still stale, so the next read tries again rather than trusting it.
+    assert provision._release_cache[0] == 100.0
+    assert not provision._release_lookup.locked()
+
+
+def test_a_refresh_that_could_not_start_does_not_hold_the_lock():
+    """A thread that never started would otherwise leave every later lookup
+    waiting forever."""
+    import flotta.provision as provision
+    from flotta.provision import _RELEASE_CACHE_S, _newest_release_image
+
+    _newest_release_image("build-app", lookup=lambda app: "registry/x:old", now=100.0)
+
+    def no_threads(work):
+        raise RuntimeError("can't start new thread")
+
+    assert (
+        _newest_release_image(
+            "build-app",
+            lookup=lambda app: "x",
+            now=100.0 + _RELEASE_CACHE_S + 1,
+            stale_ok=True,
+            spawn=no_threads,
+        )
+        == "registry/x:old"
+    )
+    assert not provision._release_lookup.locked()
+
+
+def test_reads_ask_for_a_stale_image_and_builds_do_not(monkeypatch):
+    """Which callers may be a click behind is the decision; pin it through the
+    one-value form, which is what the routes call."""
+    import flotta.provision as provision
+
+    seen: list[bool] = []
+
+    def recording(env=None, **kw):
+        seen.append(kw.get("stale_ok", False))
+        return ("registry/x:fleet", "release")
+
+    monkeypatch.setattr(provision, "resolve_fleet_image", recording)
+    assert provision._fleet_image(stale_ok=True) == "registry/x:fleet"
+    assert provision._fleet_image() == "registry/x:fleet"
+    assert seen == [True, False]
+
+
+def test_warming_starts_the_first_lookup_on_a_thread():
+    """So the first Settings tab after a deploy finds an answer waiting."""
+    import flotta.provision as provision
+    from flotta.provision import warm_release_cache
+
+    spawn, ran = _run_inline()
+    assert warm_release_cache(
+        {"FLOTTA_FLY_APP": "build-app"}, lookup=lambda app: "registry/x:newest", spawn=spawn
+    )
+    assert ran
+    assert provision._release_cache is not None
+    assert provision._release_cache[1:] == ("build-app", "registry/x:newest")
+
+
+def test_warming_asks_nothing_it_would_not_ask_on_a_read():
+    """`$FLOTTA_FLY_IMAGE` answers without a lookup, and with no build app
+    there is nothing to ask that would not be a guess."""
+    from flotta.provision import warm_release_cache
+
+    def must_not_spawn(work):  # pragma: no cover - the guard this test exists for
+        raise AssertionError("warmed a cache nothing reads")
+
+    assert not warm_release_cache(
+        {"FLOTTA_FLY_IMAGE": "registry/x:t", "FLOTTA_FLY_APP": "build-app"}, spawn=must_not_spawn
+    )
+    assert not warm_release_cache({}, spawn=must_not_spawn)
+
+
 def test_fleet_image_keeps_its_one_value_shape():
     """`upgrade_box` and the machine endpoint only want the image; they should
     not have to unpack a source they do not use."""
