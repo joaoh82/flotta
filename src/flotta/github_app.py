@@ -302,13 +302,29 @@ def _load_rsa_key(pem: str) -> Any:
 def call_shape(url: str) -> str:
     """`url`'s path with every segment that could name someone hidden, and no query.
 
-    Installation ids stay: they are not secret, and they say which account
-    was slow.
+    By position, not by spelling: the segment after `orgs/` and the two after
+    `repos/` are always hidden, because `installation` and `404` are a
+    repository and an organization too. Only an installation id, the digits
+    after `installations/`, is shown: it is not secret, and it says which
+    account was slow. Anywhere else, only GitHub's own words are shown.
     """
-    segments = urlsplit(url).path.split("/")
-    return "/".join(
-        part if not part or part in _SHOWN_SEGMENTS or part.isdigit() else "…" for part in segments
-    )
+    shown: list[str] = []
+    hide_next = 0
+    id_next = False
+    for part in urlsplit(url).path.split("/"):
+        if not part:
+            shown.append(part)
+        elif hide_next:
+            shown.append("…")
+            hide_next -= 1
+        elif id_next:
+            shown.append(part if part.isdigit() else "…")
+            id_next = False
+        else:
+            shown.append(part if part in _SHOWN_SEGMENTS else "…")
+            hide_next = {"repos": 2, "orgs": 1}.get(part, 0)
+            id_next = part == "installations"
+    return "/".join(shown)
 
 
 def _expiry(raw: Any) -> float | None:

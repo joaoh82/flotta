@@ -605,6 +605,12 @@ def test_every_request_goes_through_the_one_http_client(monkeypatch):
         ),
         ("https://api.github.com/user/memberships/orgs/acme-gh", "/user/memberships/orgs/…"),
         ("https://github.com/login/oauth/access_token", "/login/oauth/access_token"),
+        # Names that are GitHub's words, or digits, are still names where they sit.
+        ("https://api.github.com/repos/app/installation/installation", "/repos/…/…/installation"),
+        ("https://api.github.com/repos/123/456/installation", "/repos/…/…/installation"),
+        ("https://api.github.com/user/memberships/orgs/404", "/user/memberships/orgs/…"),
+        ("https://api.github.com/app/installations/not-an-id", "/app/installations/…"),
+        ("https://api.github.com/somewhere/12345", "/…/…"),
     ],
 )
 def test_a_calls_shape_names_nobody(url, shape):
