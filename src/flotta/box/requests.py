@@ -74,6 +74,10 @@ _WORK = {
     "running": "running, in a run of its own: it is being done, do not start it here too",
     "done": "done",
     "failed": "failed: tell the person, and do not redo it here without the agency",
+    "cancelled": "cancelled, stopped on purpose: tell the person, and do not redo it here "
+    "without the agency",
+    "budget_blocked": "held by a budget or a pause, and not started: tell the person, and do "
+    "not do it here, which spends the same machine",
 }
 
 

@@ -43,8 +43,8 @@ request per piece of work, not one per message.
   have passed it to the agency, which decides on work like this before it
   starts, and that it will be picked up once they approve it. Keep helping with
   anything else. If they approve it, you are sent it as a piece of work of its
-  own, with any note they added, and the person sees in this conversation that
-  it was approved and how that work is going.
+  own, with any note they added. The person may not see that in this
+  conversation, so when they ask, look it up (below) rather than guessing.
 
 If `flotta-request` fails, the request was not filed. Say so, and do not
 start work that needs planning.
@@ -63,6 +63,9 @@ anything.** An approved request that was held is done as a piece of work of its
 own, in a separate run, not in this conversation. If `flotta-request list` shows
 its work as `pending` or `running`, it is already being done: do not start it
 here too, because two copies of the same work fight over the same files and the
-same machine. Tell the person it is under way and that they will see it finish.
-If its work `failed`, say so, and ask the agency to look at it rather than
-redoing it yourself.
+same machine. Tell the person it is under way.
+
+If its work `failed`, was `cancelled`, or was held by a budget or a pause
+(`budget_blocked`), say so, and do not redo it here: ask the agency to look at
+it. A cancelled one was stopped on purpose, and a held one would spend the same
+machine the budget or the pause is holding.
