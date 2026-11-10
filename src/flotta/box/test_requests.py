@@ -84,6 +84,34 @@ def test_the_list_says_how_each_was_answered():
     assert code == 0 and json.loads(out) == found
 
 
+def test_work_already_under_way_is_not_to_be_started_again():
+    """FLOTTA-194: told "the agency approved" in the conversation, an agent started
+    the same work a second time beside the run already doing it."""
+    for status in ("pending", "running"):
+        text = describe([{"title": "Banners", "status": "approved", "work_status": status}])
+        assert f"its work: {status}" in text
+        assert "do not start it here too" in text
+    for status in ("failed", "cancelled"):
+        stopped = describe([{"title": "Banners", "status": "approved", "work_status": status}])
+        assert "do not redo it here" in stopped
+    held = describe([{"title": "Banners", "status": "approved", "work_status": "budget_blocked"}])
+    assert "do not do it here" in held
+    done = describe([{"title": "Banners", "status": "approved", "work_status": "done"}])
+    assert "its work: done" in done and "do not" not in done
+
+
+def test_the_skill_says_to_look_before_acting_on_an_approval():
+    from pathlib import Path
+
+    skill = Path(__file__).parent / "hermes_skills/flotta/flotta-requests/SKILL.md"
+    text = " ".join(skill.read_text().split())  # how it is wrapped says nothing
+    assert "When someone tells you a request was approved, look here before doing" in text
+    assert "do not start it here too" in text
+    for status in ("`failed`", "`cancelled`", "`budget_blocked`"):
+        assert status in text
+    assert "do not redo it here" in text
+
+
 def test_anything_else_is_usage():
     for argv in ([], ["--details", "x"], ["a", "b"], ["list", "x"]):
         code, _, err = _run(argv, call=lambda *a, **k: {})
