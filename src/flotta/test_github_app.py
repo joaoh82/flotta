@@ -667,3 +667,270 @@ def test_servers_log_the_github_timing_and_nothing_else_of_flottas_at_info():
     assert loggers["flotta.github_app"]["level"] == "INFO"
     assert loggers["flotta.github_app"]["handlers"] == ["default"]
     assert "flotta" not in loggers
+
+
+# -- suggesting repositories from what is kept (FLOTTA-193) -----------------------
+
+
+def _listed(*names, total=None):
+    return (
+        200,
+        {
+            "total_count": len(names) if total is None else total,
+            "repositories": [{"full_name": n} for n in names],
+        },
+    )
+
+
+def _suggesting(*answers, spawn=None):
+    """An App with a clock the test moves, and a `spawn` that keeps each
+    refresh for the test to run (or runs it inline, if one is given)."""
+    clock = [float(NOW)]
+    kept: list = []
+    fetch, seen = _github(*answers)
+    app = GitHubApp(
+        slug="s",
+        client_id="c",
+        client_secret="x",
+        private_key=PEM,
+        fetch=fetch,
+        now=lambda: clock[0],
+        spawn=spawn or kept.append,
+    )
+    return app, seen, clock, kept
+
+
+def _gets(seen):
+    return [r for r in seen if r["method"] == "GET"]
+
+
+def test_a_repeat_suggestion_within_a_minute_does_not_ask_github():
+    """0.85-1 s on production for every open of the Settings tab, with a kept
+    token. The list barely changes; the second open should not pay for it."""
+    from flotta.github_app import _LISTING_FRESH_S
+
+    app, seen, clock, _ = _suggesting(_listing_token(), _listed("acme/site"))
+    first = app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S - 1
+    second = app.suggested_repositories("77")
+
+    assert (first.names, first.source) == (("acme/site",), "github")
+    assert (second.names, second.source) == (("acme/site",), "kept")
+    assert len(_gets(seen)) == 1
+
+
+def test_a_stale_list_answers_at_once_and_refreshes_behind_it():
+    from flotta.github_app import _LISTING_FRESH_S
+
+    app, seen, clock, kept = _suggesting(
+        _listing_token(), _listed("acme/site"), _listed("acme/site", "acme/new")
+    )
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S + 1
+
+    stale = app.suggested_repositories("77")
+    assert (stale.names, stale.source) == (("acme/site",), "stale")
+    assert len(kept) == 1 and len(_gets(seen)) == 1, "the refresh should not have run yet"
+
+    kept[0]()
+    after = app.suggested_repositories("77")
+    assert (after.names, after.source) == (("acme/site", "acme/new"), "kept")
+
+
+def test_stale_reads_together_start_one_refresh():
+    """The panel's opens arrive in bursts; each must not start its own ask."""
+    from flotta.github_app import _LISTING_FRESH_S
+
+    app, seen, clock, kept = _suggesting(_listing_token(), _listed("a/b"), _listed("a/b"))
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S + 1
+    for _ in range(3):
+        assert app.suggested_repositories("77").source == "stale"
+    assert len(kept) == 1
+    kept[0]()
+    assert len(_gets(seen)) == 2
+
+
+def test_a_list_too_old_to_vouch_for_waits_for_github_again():
+    from flotta.github_app import _LISTING_STALE_MAX_S
+
+    app, seen, clock, kept = _suggesting(_listing_token(), _listed("a/b"), _listed("a/c"))
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_STALE_MAX_S + 1
+
+    answer = app.suggested_repositories("77")
+    assert (answer.names, answer.source) == (("a/c",), "github")
+    assert kept == []
+
+
+def test_with_nothing_kept_a_github_that_cannot_answer_is_an_error():
+    """Stale-while-refreshing needs something stale. The route turns this into
+    the account's name under `problems`, as before."""
+    app, _, _, _ = _suggesting(OSError("no route to GitHub"))
+    with pytest.raises(GitHubAppError):
+        app.suggested_repositories("77")
+
+
+def test_a_refresh_that_fails_keeps_the_last_list_and_its_age():
+    """A bad minute at GitHub should not blank the picker, and should not make
+    the list look fresh either: the stale cap still has to run out."""
+    from flotta.github_app import _LISTING_FRESH_S
+
+    app, _, clock, kept = _suggesting(
+        _listing_token(), _listed("a/b"), OSError("down"), _listed("a/c")
+    )
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S + 1
+    app.suggested_repositories("77")
+    kept[0]()  # GitHub is down for this one
+    assert app._kept.repository_list("77")[0] == NOW, "the failed refresh made it look fresh"
+
+    again = app.suggested_repositories("77")
+    assert (again.names, again.source) == (("a/b",), "stale")
+    assert len(kept) == 2, "still stale, so the next read tries again"
+    kept[1]()  # and this one works
+
+    assert app.suggested_repositories("77").names == ("a/c",)
+
+
+def test_a_refresh_that_finds_the_app_removed_forgets_the_list():
+    """Not a bad minute: those names can never be granted, so the next open
+    should ask, and say the account is a problem."""
+    from flotta.github_app import _LISTING_FRESH_S, InstallationGone
+
+    app, _, clock, kept = _suggesting(
+        _listing_token(), _listed("a/b"), (401, {}), (404, {}), (404, {})
+    )
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S + 1
+    app.suggested_repositories("77")
+    kept[0]()
+
+    assert app._kept.repository_list("77") is None
+    with pytest.raises(InstallationGone):
+        app.suggested_repositories("77")
+
+
+def test_forgetting_a_list_makes_the_next_suggestion_ask():
+    """Connecting an account again is somebody who just picked repositories
+    on GitHub: they should see them on the next open."""
+    app, seen, _, _ = _suggesting(_listing_token(), _listed("a/b"), _listed("a/b", "a/new"))
+    app.suggested_repositories("77")
+    app.forget_repositories("77")
+
+    answer = app.suggested_repositories("77")
+    assert (answer.names, answer.source) == (("a/b", "a/new"), "github")
+    assert len(_gets(seen)) == 2
+
+
+def test_a_refresh_does_not_bring_back_a_list_forgotten_while_it_ran():
+    """A disconnect during a refresh must stay a disconnect."""
+    from flotta.github_app import _LISTING_FRESH_S
+
+    app, _, clock, kept = _suggesting(_listing_token(), _listed("a/b"), _listed("a/b"))
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S + 1
+    app.suggested_repositories("77")
+    app.forget_repositories("77")
+    kept[0]()
+
+    assert app._kept.repository_list("77") is None
+
+
+def test_each_installation_keeps_its_own_list():
+    app, _, _, _ = _suggesting(
+        _listing_token("ghs_77"), _listed("a/one"), _listing_token("ghs_88"), _listed("b/two")
+    )
+    assert app.suggested_repositories("77").names == ("a/one",)
+    assert app.suggested_repositories("88").names == ("b/two",)
+    assert app.suggested_repositories("77").source == "kept"
+
+
+def test_reads_that_must_wait_share_one_ask():
+    """Two opens with nothing kept: the second waits for the first and reads
+    its answer, rather than asking GitHub twice."""
+    import threading
+
+    inside = threading.Event()
+    release = threading.Event()
+    asks: list[str] = []
+
+    def fetch(method, url, **kwargs):
+        if method == "POST":
+            return _listing_token()
+        asks.append(url)
+        inside.set()
+        release.wait(5)
+        return _listed("a/b")
+
+    app = GitHubApp(
+        slug="s", client_id="c", client_secret="x", private_key=PEM, fetch=fetch, now=lambda: NOW
+    )
+    answers: list = []
+
+    def ask():
+        answers.append(app.suggested_repositories("77"))
+
+    first = threading.Thread(target=ask)
+    first.start()
+    assert inside.wait(5)
+    second = threading.Thread(target=ask)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive(), "the second read should be waiting for the first"
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert len(asks) == 1
+    assert sorted(a.source for a in answers) == ["github", "kept"]
+
+
+def test_a_refresh_that_could_not_start_does_not_hold_the_installation():
+    """A thread that never started would otherwise leave every later read of
+    that installation waiting forever."""
+    from flotta.github_app import _LISTING_FRESH_S, _LISTING_STALE_MAX_S
+
+    def no_threads(work):
+        raise RuntimeError("can't start new thread")
+
+    app, _, clock, _ = _suggesting(
+        _listing_token(), _listed("a/b"), _listed("a/c"), spawn=no_threads
+    )
+    app.suggested_repositories("77")
+    clock[0] += _LISTING_FRESH_S + 1
+    assert app.suggested_repositories("77").source == "stale"
+    assert not app._kept.asking("77").locked()
+
+    clock[0] = NOW + _LISTING_STALE_MAX_S + 1
+    assert app.suggested_repositories("77").names == ("a/c",)
+
+
+def test_a_listing_that_says_there_are_more_keeps_saying_so():
+    app, _, _, _ = _suggesting(_listing_token(), _listed("a/b", total=250))
+    assert app.suggested_repositories("77").more is True
+    assert app.suggested_repositories("77").more is True
+
+
+def test_a_read_does_not_wait_forever_behind_a_stuck_ask(monkeypatch):
+    """A refresh stuck on GitHub must not hang the Settings tab: past
+    `_LISTING_WAIT_S`, a read that has to wait asks GitHub itself."""
+    import flotta.github_app as module
+    from flotta.github_app import _LISTING_STALE_MAX_S
+
+    monkeypatch.setattr(module, "_LISTING_WAIT_S", 0.05)
+    app, _, clock, kept = _suggesting(_listing_token(), _listed("a/b"), _listed("a/c"))
+    app.suggested_repositories("77")
+    app._kept.asking("77").acquire()  # an ask that never finishes
+    clock[0] += _LISTING_STALE_MAX_S + 1
+
+    import threading
+
+    answers: list = []
+    reader = threading.Thread(
+        target=lambda: answers.append(app.suggested_repositories("77")), daemon=True
+    )
+    reader.start()
+    reader.join(5)
+    assert not reader.is_alive(), "the read is waiting forever behind the stuck ask"
+    assert answers[0].names == ("a/c",)

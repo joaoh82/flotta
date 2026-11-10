@@ -1252,6 +1252,125 @@ def test_a_page_redrawing_itself_logs_nothing_about_github(api, fleet, caplog):
     assert [r for r in caplog.records if r.name == "flotta.github_app"] == []
 
 
+def _suggested(api, fleet, name=ACME_AGENT):
+    response = api.get(f"/api/boxes/{_box_id(fleet, name)}/github/repositories", headers=_member())
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_a_repeat_open_does_not_ask_github_again(api, fleet, github):
+    """FLOTTA-193: 0.85-1 s on production for every open, with the token kept.
+    The second open answers from the list the first one got."""
+    _connect(api)
+    assert _suggested(api, fleet)["repositories"] == ["acme-gh/api", "acme-gh/site"]
+
+    github.down = True
+    again = _suggested(api, fleet)
+    assert again["repositories"] == ["acme-gh/api", "acme-gh/site"]
+    assert again["problems"] == []
+
+
+def test_connecting_again_shows_repositories_just_picked_on_github(api, fleet, github):
+    """Somebody who just added a repository on GitHub's screen and came back
+    through Flotta should see it on the next open, not a minute later."""
+    _connect(api)
+    _suggested(api, fleet)
+    github.installations["77"]["repos"].add("new")
+
+    _reconnect(api)
+    assert "acme-gh/new" in _suggested(api, fleet)["repositories"]
+
+
+def test_disconnecting_forgets_the_list(fleet, github, monkeypatch):
+    monkeypatch.setenv("FLOTTA_GITHUB_TOKEN", PAT)
+    app = GitHubApp(
+        slug="flotta-test",
+        client_id="Iv1.client",
+        client_secret="the-client-secret",
+        private_key=PEM,
+        fetch=github,
+    )
+    with TestClient(_make_api(fleet, app)) as client:
+        _connect(client)
+        _suggested(client, fleet)
+        assert app._kept.repository_list("77") is not None
+
+        response = client.delete("/api/orgs/agency-x/github/77", headers=_owner())
+        assert response.status_code == 200, response.text
+        assert app._kept.repository_list("77") is None
+
+
+def test_the_listing_line_says_where_each_answer_came_from(api, fleet, caplog):
+    _connect(api)
+    with caplog.at_level("INFO", logger="flotta.github_app"):
+        _suggested(api, fleet)
+        _suggested(api, fleet)
+    summary = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "flotta.github_app" and r.getMessage().startswith("github repositories for ")
+    ]
+    assert len(summary) == 2
+    assert "(github), 0 problem(s)" in summary[0]
+    assert "(kept), 0 problem(s)" in summary[1]
+
+
+def test_several_accounts_are_asked_side_by_side(fleet):
+    """With N accounts to wait for, one after another is N times as slow."""
+    import threading
+
+    from flotta.github_app import Listing
+
+    with FleetStore(fleet) as store:
+        for number, account in (("77", "acme-gh"), ("88", "beta-gh")):
+            store.connect_github(
+                number,
+                org="agency-x",
+                client="acme",
+                account=account,
+                account_type="Organization",
+                connected_by="person-olivia",
+            )
+
+    both = threading.Barrier(2, timeout=5)
+
+    class SideBySide:
+        def suggested_repositories(self, installation):
+            both.wait()  # raises BrokenBarrierError if asked one at a time
+            return Listing((f"{installation}/repo",), False, "github")
+
+    with TestClient(_make_api(fleet, SideBySide())) as client:
+        answer = _suggested(client, fleet)
+    assert answer["repositories"] == ["77/repo", "88/repo"]
+    assert answer["problems"] == []
+
+
+def test_one_account_failing_still_names_only_that_one(fleet):
+    from flotta.github_app import GitHubAppError, Listing
+
+    with FleetStore(fleet) as store:
+        for number, account in (("77", "acme-gh"), ("88", "beta-gh")):
+            store.connect_github(
+                number,
+                org="agency-x",
+                client="acme",
+                account=account,
+                account_type="Organization",
+                connected_by="person-olivia",
+            )
+
+    class HalfDown:
+        def suggested_repositories(self, installation):
+            if installation == "88":
+                raise GitHubAppError("GitHub answered 502 listing repositories")
+            return Listing(("acme-gh/site",), False, "github")
+
+    with TestClient(_make_api(fleet, HalfDown())) as client:
+        answer = _suggested(client, fleet)
+    assert answer["repositories"] == ["acme-gh/site"]
+    assert answer["problems"] == ["beta-gh"]
+
+
 def test_the_token_for_listing_can_only_read_metadata(api, fleet, github):
     _connect(api)
     api.get(f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories", headers=_member())
