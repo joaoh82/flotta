@@ -459,6 +459,23 @@ class OrgNotActiveError(StoreError):
     """
 
 
+class LimitReachedError(StoreError):
+    """Raised when creating a client, a seat or an agent would pass the org's limit.
+
+    The org keeps everything it has: a limit lowered below what an org already
+    holds refuses the next one and removes nothing (FLOTTA-183).
+    """
+
+    def __init__(self, org_id: str, kind: str, limit: int, count: int) -> None:
+        self.org_id = org_id
+        self.kind = kind
+        self.limit = limit
+        self.count = count
+        super().__init__(
+            f"org {org_id!r} has {count} of its {limit} {kind}; raise the limit to add another"
+        )
+
+
 class NotOperatorError(StoreError):
     """Raised when someone who is not the fleet's operator asks for what only they may do.
 
@@ -552,6 +569,26 @@ class Org:
     status: str = "active"
     #: What the operator said when declining it, if anything (FLOTTA-143).
     decline_reason: str | None = None
+    #: How many clients, seats and agents it may have (FLOTTA-183): `None` is
+    #: unlimited. Set by the operator, or by the hosted product's billing
+    #: (`org:govern`) from the org's plan; enforced here, in the store, so no
+    #: path that creates one can skip it. See `LIMIT_KINDS`.
+    max_clients: int | None = None
+    max_seats: int | None = None
+    max_agents: int | None = None
+
+    def limit(self, kind: str) -> int | None:
+        """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
+        return getattr(self, f"max_{kind}")
+
+
+#: What an org's plan limits (FLOTTA-183), in the order they are shown.
+LIMIT_KINDS: tuple[str, ...] = ("clients", "seats", "agents")
+
+#: The roles that take a seat: the agency's own people. A client's people
+#: (`client_viewer`, `client_user`) are free, so an agency never has to choose
+#: between its team and letting a client look.
+SEAT_ROLES: frozenset[str] = frozenset({"owner", "member"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1531,17 +1568,23 @@ class FleetStore:
         label = box_label(name, org=org, client=client)
         if self.get_client(org, client) is None:
             raise UnknownEntityError(f"org {org!r} has no client {client!r}")
-        # The guard M12.4 rests on, here because every way to make an agent
-        # writes this row first: a pending org's agent never gets one, so it
-        # never gets a machine either.
-        self.require_active_org(org)
         bid = box_id or f"b-{uuid.uuid4().hex[:12]}"
         try:
-            self._conn.execute(
-                "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (bid, label, "provisioning", _utcnow(), org, client),
-            )
+            # Under the boxes guard, so the count and the insert are one step:
+            # two creates racing for an org's last agent cannot both see it
+            # free (FLOTTA-183).
+            with self._conn.transaction(guard="boxes"):
+                # The guard M12.4 rests on, here because every way to make an
+                # agent writes this row first: a pending org's agent never gets
+                # one, so it never gets a machine either. The org's limit on
+                # agents is held the same way, for the same reason.
+                self.require_active_org(org)
+                self._check_room(org, "agents")
+                self._conn.execute(
+                    "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (bid, label, "provisioning", _utcnow(), org, client),
+                )
         except db.UniqueViolation as exc:
             # Two different collisions land here. Reporting a duplicate *id* as
             # a duplicate *name* sends the caller looking for the wrong thing —
@@ -1686,6 +1729,100 @@ class FleetStore:
             )
         return org
 
+    # -- limits (FLOTTA-183) -------------------------------------------------
+
+    def org_counts(self, org_id: str) -> dict[str, int]:
+        """What `org_id` holds of each of `LIMIT_KINDS`, as its limits count it.
+
+        Clients are every client it has (clients are never deleted), seats its
+        owners and members, agents its boxes that are not torn down.
+        """
+        clients = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM clients WHERE org_id = ?", (org_id,)
+        ).fetchone()["n"]
+        seats = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM memberships WHERE org_id = ? AND role IN ("
+            + ", ".join("?" for _ in SEAT_ROLES)
+            + ")",
+            (org_id, *sorted(SEAT_ROLES)),
+        ).fetchone()["n"]
+        agents = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM boxes WHERE org_id = ? AND status NOT IN ("
+            + ", ".join("?" for _ in BOX_TERMINAL)
+            + ")",
+            (org_id, *sorted(BOX_TERMINAL)),
+        ).fetchone()["n"]
+        return {"clients": int(clients), "seats": int(seats), "agents": int(agents)}
+
+    def set_org_limits(self, org_id: str, limits: dict[str, int | None]) -> Org:
+        """Set the limits named in `limits` (`clients`, `seats`, `agents`).
+
+        A kind left out keeps its limit; `None` makes it unlimited. A limit
+        below what the org holds is allowed: it refuses the next one and takes
+        nothing away, which is what a plan changed downwards must do.
+        """
+        unknown = sorted(set(limits) - set(LIMIT_KINDS))
+        if unknown:
+            raise InvalidTenantError(
+                f"unknown limit(s) {', '.join(unknown)}; expected {', '.join(LIMIT_KINDS)}"
+            )
+        for kind, value in limits.items():
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise InvalidTenantError(
+                    f"a limit on {kind} is a whole number from 0, or null for none"
+                )
+        with self._conn.transaction(guard="orgs"):
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            for kind, value in limits.items():
+                # `kind` is one of LIMIT_KINDS, checked above: never caller text.
+                self._conn.execute(f"UPDATE orgs SET max_{kind} = ? WHERE id = ?", (value, org_id))
+        org = self.get_org(org_id)
+        assert org is not None
+        return org
+
+    def require_room(self, org_id: str, kind: str) -> None:
+        """`LimitReachedError` unless `org_id` may have one more of `kind`.
+
+        The early answer, for a caller about to spend something first (a
+        `flyctl` probe, a link): the store's own writes check again under
+        their guard, which is the check that holds (`_check_room`).
+        """
+        self._check_room(org_id, kind)
+
+    def _check_room(self, org_id: str, kind: str, *, invited_except: str | None = None) -> None:
+        """`LimitReachedError` unless `org_id` may have one more of `kind`.
+
+        Where it is the check that holds, its caller holds the write guard that
+        serialises the insert after it (`create_box`, `create_client`, and
+        `add_membership` and `change_membership` under the users guard), so
+        two creates cannot both see the last slot free. An invite is checked
+        when it is sent without one, and again, under the guard, when it is
+        redeemed: two invites sent at once can both go out, and only as many
+        people as there are seats can join. For seats,
+        `invited_except` counts the org's other open invites to a seat as well,
+        leaving out that address's own: sending an invite is promising a seat.
+        """
+        org = self.get_org(org_id)
+        if org is None:
+            raise UnknownEntityError(f"no org with id {org_id!r}")
+        limit = org.limit(kind)
+        if limit is None:
+            return
+        count = self.org_counts(org_id)[kind]
+        if kind == "seats" and invited_except is not None:
+            count += sum(
+                1
+                for invite in self.open_invites(org_id)
+                if not invite.expired
+                and invite.role in SEAT_ROLES
+                and invite.email != invited_except
+            )
+        if count >= limit:
+            raise LimitReachedError(org_id, kind, limit, count)
+
     def decide_org(self, org_id: str, *, approve: bool, reason: str | None = None) -> Org:
         """Approve or decline a pending org. Once: both answers are final.
 
@@ -1714,19 +1851,23 @@ class FleetStore:
     def create_client(self, org_id: str, client_id: str, name: str) -> Client:
         """Insert a client of `org_id`. Its id is unique within the org only.
 
-        No transaction for the existence check: orgs are never deleted, so the
-        org cannot disappear between the read and the insert, and the foreign
-        key refuses the insert on both engines if it somehow did.
+        Under the clients guard, for the org's limit on clients (FLOTTA-183):
+        two adds racing for the last one cannot both see it free. Orgs are
+        never deleted, so the org cannot disappear between the read and the
+        insert, and the foreign key refuses the insert on both engines if it
+        somehow did.
         """
         client_id = validate_tenant_id(client_id, kind="client")
         name = _tenant_name(name, kind="client")
         if self.get_org(org_id) is None:
             raise UnknownEntityError(f"no org with id {org_id!r}")
         try:
-            self._conn.execute(
-                "INSERT INTO clients (org_id, id, name, created_at) VALUES (?, ?, ?, ?)",
-                (org_id, client_id, name, _utcnow()),
-            )
+            with self._conn.transaction(guard="clients"):
+                self._check_room(org_id, "clients")
+                self._conn.execute(
+                    "INSERT INTO clients (org_id, id, name, created_at) VALUES (?, ?, ?, ?)",
+                    (org_id, client_id, name, _utcnow()),
+                )
         except db.UniqueViolation as exc:
             raise DuplicateTenantError(
                 f"org {org_id!r} already has a client {client_id!r}"
@@ -1829,6 +1970,11 @@ class FleetStore:
             raise UnknownEntityError(f"no org with id {org_id!r}")
         if client_id is not None and self.get_client(org_id, client_id) is None:
             raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+        # The org's limit on seats (FLOTTA-183). No transaction of its own:
+        # every caller (`add_person`, `sign_up`, `redeem_invite`) already holds
+        # the users guard, which serialises this count with the insert below.
+        if role in SEAT_ROLES:
+            self._check_room(org_id, "seats")
         try:
             self._conn.execute(
                 "INSERT INTO memberships (user_id, org_id, client_id, role, created_at) "
@@ -1924,6 +2070,10 @@ class FleetStore:
                 raise UnknownEntityError(f"user {user_id!r} is not in org {org_id!r}")
             if client_id is not None and self.get_client(org_id, client_id) is None:
                 raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+            # Into a seat from a free role: the org's limit on seats applies,
+            # as it does to a new member (FLOTTA-183).
+            if role in SEAT_ROLES and membership.role not in SEAT_ROLES:
+                self._check_room(org_id, "seats")
             if membership.role == "owner" and role != "owner":
                 owners = [m for m in self.members_of(org_id) if m.role == "owner"]
                 if len(owners) == 1:
@@ -2154,6 +2304,7 @@ class FleetStore:
                 role=found.role,
                 ttl_s=ttl_s,
                 now=moment,
+                new_seat=False,
             )
         return secret, Invite(
             email=email,
@@ -2174,8 +2325,14 @@ class FleetStore:
         org_name: str | None = None,
         ttl_s: int = LINK_TTL_S,
         now: datetime | None = None,
+        new_seat: bool = True,
     ) -> str:
         """A new link for `email`. Returns its secret, which is not stored.
+
+        An invite to a seat (`SEAT_ROLES`) is refused when the org's seats,
+        with its other open invites to one, are at its limit (FLOTTA-183).
+        `new_seat=False` is for resending an invite already open, which
+        promises no seat it had not already.
 
         A sign-in link grants nothing beyond proving the address. An invite
         also names the membership redeeming it creates, checked now so a bad
@@ -2202,6 +2359,8 @@ class FleetStore:
                 raise OrgNotActiveError(f"org {org_id!r} was declined; it cannot invite anyone")
             if client_id is not None and self.get_client(org_id, client_id) is None:
                 raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+            if new_seat and role in SEAT_ROLES:
+                self._check_room(org_id, "seats", invited_except=email)
         elif purpose == "sign_up":
             if org_id is None or org_name is None:
                 raise InvalidAccountError("a sign-up names the org it creates: an id and a name")
@@ -6014,6 +6173,11 @@ def _org_from_row(row: db.Row) -> Org:
         created_at=row["created_at"],
         status=row["status"],
         decline_reason=row["decline_reason"],
+        # `get`: a store read part-way through its migrations, before 29 (the
+        # migration tests do), has no limits yet, which is no limit.
+        max_clients=row.get("max_clients"),
+        max_seats=row.get("max_seats"),
+        max_agents=row.get("max_agents"),
     )
 
 

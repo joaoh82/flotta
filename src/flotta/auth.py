@@ -161,6 +161,13 @@ SCOPE_MCP_CALL = "mcp:call"
 #: API key carries (M14.5). No role holds it and `mint` refuses it, so a request
 #: that has it was made with a key, confined to that key's one agent.
 SCOPE_RUN_CREATE = "run:create"
+#: Governing orgs on the hosted product's behalf (FLOTTA-183, M15.1): reading
+#: and setting an org's plan limits, and nothing else. Held by the web app's
+#: billing server, never by a person and never beside another scope (`mint`),
+#: so a leaked one can change what an agency may create and cannot read, reach
+#: or change a single agent. Not the operator either, though its token is the
+#: default org's and unconfined: see `is_governor`.
+SCOPE_ORG_GOVERN = "org:govern"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -175,13 +182,14 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_MODEL_CALL,
         SCOPE_MCP_CALL,
         SCOPE_RUN_CREATE,
+        SCOPE_ORG_GOVERN,
     }
 )
 
 #: What a person may do, by role (M11.7). Mapped to scopes at mint time, so a
 #: token is still a flat list and nothing on the hot path knows roles exist.
 #: No box scopes (`git:credential`, `box:peer`, `model:call`, `mcp:call`), no `fleet:route`,
-#: no `auth:relay` and no `run:create`: those are
+#: no `auth:relay`, no `run:create` and no `org:govern`: those are
 #: held by machines, never handed to a person.
 ROLES: dict[str, frozenset[str]] = {
     "owner": frozenset(
@@ -364,6 +372,17 @@ class Token:
 
     def allows(self, scope: str) -> bool:
         return scope in self.scopes
+
+
+def is_governor(token: Token) -> bool:
+    """Whether `token` is the hosted product's billing credential (`org:govern`).
+
+    Such a token is the default org's and confined to no client, which is
+    exactly what the operator's looks like; anything that asks "is this the
+    operator?" must ask this first, or a credential that may set an agency's
+    limits would read as one that may do anything to the fleet.
+    """
+    return SCOPE_ORG_GOVERN in token.scopes
 
 
 def is_client_person(token: Token) -> bool:
@@ -652,6 +671,17 @@ def mint(
         raise AuthError(
             f"{SCOPE_ORG_ADMIN} is the whole org's; a token confined to one client cannot hold it"
         )
+    if SCOPE_ORG_GOVERN in wanted:
+        if wanted != {SCOPE_ORG_GOVERN}:
+            raise AuthError(
+                f"{SCOPE_ORG_GOVERN} is held alone: a token that governs orgs does nothing else"
+            )
+        elsewhere = org is not None and org.strip() != DEFAULT_ORG
+        if client is not None or box is not None or elsewhere:
+            raise AuthError(
+                f"{SCOPE_ORG_GOVERN} governs every org, for the fleet; "
+                "it names no org, client or box"
+            )
 
     issued = int(time.time()) if now is None else now
     claims: dict[str, Any] = {
