@@ -286,15 +286,14 @@ def door_base(box_name: str, env: dict[str, str] | None = None) -> str:
     return f"{'https' if scheme == 'wss' else 'http'}://{box_name}.{where}"
 
 
-async def through_door(
-    box: Box, text: str, *, token: str, talk: Talk, timeout_s: float, title: str = ""
-) -> str:
-    """Hold one run's turn with its agent through the front door.
+#: How long to wait before each reconnect when the agent's socket closes under a
+#: run (FLOTTA-196). Five tries over about two minutes, inside the run's deadline.
+RECONNECT_DELAYS_S = (2.0, 5.0, 15.0, 30.0, 60.0)
 
-    The relay's path (`relay.deliver_through_door`), with two differences: it
-    hears every frame for the run's steps, and it answers the approvals a
-    person gave while the turn waits on them.
-    """
+
+@contextlib.asynccontextmanager
+async def door_socket(box: Box, token: str):
+    """One socket to `box`'s agent through the front door, past its handshake."""
     from flotta import client
 
     base_url = door_base(box.name)
@@ -303,28 +302,136 @@ async def through_door(
         await client.login(session, base_url, token=token)
         ticket = await client.ws_ticket(session, base_url, token=token)
         socket = await client.open_agent_socket(session, base_url, ticket, token=token)
-        relaying: asyncio.Task | None = None
         try:
             await client.await_ready(socket, timeout_s=120)
-            created = await client.create_session(socket, title=title, timeout_s=120)
-            relaying = asyncio.create_task(talk.relay(socket.send_str))
-            turn = await client.send_turn(
-                socket,
-                str(created.get("session_id") or ""),
-                text,
-                timeout_s=timeout_s,
-                hear=talk.hear,
-            )
-            return turn.response
+            yield socket
         finally:
-            if relaying is not None:
-                relaying.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await relaying
-            await talk.withdraw(socket.send_str)
             await socket.close()
     finally:
         await session.close()
+
+
+async def through_door(
+    box: Box,
+    text: str,
+    *,
+    token: str,
+    talk: Talk,
+    timeout_s: float,
+    title: str = "",
+    connect: Callable[[Box, str], Any] = door_socket,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+) -> str:
+    """Hold one run's turn with its agent through the front door.
+
+    The relay's path (`relay.deliver_through_door`), with two differences: it
+    hears every frame for the run's steps, and it answers the approvals a
+    person gave while the turn waits on them.
+
+    **A socket that closes under the turn is not the end of it** (FLOTTA-196).
+    On 2026-11-10 the door dropped a stalled box's socket, the run failed at
+    once, and the agent went on working for 27 minutes with nobody listening.
+    So it reconnects (`RECONNECT_DELAYS_S`) and resumes the session by its
+    stored id: a turn still at work is heard to its end on the new socket, and
+    one that ended meanwhile is read from the session's messages. **The prompt
+    is never sent twice**: once it went, only a resume follows, and a session
+    that kept no reply to it fails the run rather than doing the work again.
+    """
+    from flotta import client
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    live = ""
+    stored: str | None = None
+    submitted = False
+    tries = 0
+    while True:
+        connected = False
+        try:
+            async with connect(box, token) as socket:
+                connected = True
+                relaying: asyncio.Task | None = None
+                withdraw = True
+                try:
+                    rid: int | None
+                    if not submitted:
+                        created = await client.create_session(socket, title=title, timeout_s=120)
+                        live = str(created.get("session_id") or "")
+                        stored = str(created.get("stored_session_id") or "") or None
+                        relaying = asyncio.create_task(talk.relay(socket.send_str))
+                        rid = await client.submit_turn(socket, live, text)
+                        submitted = True
+                    else:
+                        assert stored is not None  # checked before reconnecting
+                        resumed = await client.resume_session(socket, stored, timeout_s=120)
+                        live = str(resumed.get("session_id") or "") or live
+                        if not client.turn_running(resumed):
+                            reply = client.reply_in(resumed, text)
+                            if reply is None:
+                                raise ChatError(
+                                    "the agent's socket closed during the run, and its turn "
+                                    "ended with no reply"
+                                )
+                            return reply
+                        relaying = asyncio.create_task(talk.relay(socket.send_str))
+                        rid = None
+                    turn = await client.await_turn(
+                        socket,
+                        live,
+                        rid=rid,
+                        timeout_s=max(deadline - loop.time(), 0.0),
+                        hear=talk.hear,
+                    )
+                    return turn.response
+                except client.SocketClosed:
+                    withdraw = False  # nothing to say it on, and the questions stay open
+                    raise
+                finally:
+                    if relaying is not None:
+                        relaying.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await relaying
+                    if withdraw:
+                        await talk.withdraw(socket.send_str)
+        except client.SocketClosed as exc:
+            wait = _reconnect_wait(exc, tries, submitted, stored, deadline - loop.time())
+        except (ChatError, OSError, _client_errors()) as exc:
+            # Reaching the door again can fail too while the box recovers: a wake,
+            # a restart. Only reaching it, and only on a reconnect: a first
+            # connection fails as it did, and so does anything the turn itself said.
+            if connected or tries == 0 or (isinstance(exc, ChatError) and exc.status == 402):
+                raise
+            wait = _reconnect_wait(exc, tries, submitted, stored, deadline - loop.time())
+        tries += 1
+        _log.warning(
+            "run %s lost %s's socket; reconnecting in %.0fs (try %d of %d)",
+            talk.run.id,
+            box.name,
+            wait,
+            tries,
+            len(RECONNECT_DELAYS_S),
+        )
+        await sleep(wait)
+
+
+def _client_errors() -> type[BaseException]:
+    import aiohttp
+
+    return aiohttp.ClientError
+
+
+def _reconnect_wait(
+    exc: BaseException, tries: int, submitted: bool, stored: str | None, left_s: float
+) -> float:
+    """How long to wait before reconnecting, or `exc` raised again as the run's end."""
+    if tries >= len(RECONNECT_DELAYS_S):
+        raise ChatError(f"{exc}, and {tries} reconnects did not get the agent back") from exc
+    if submitted and stored is None:
+        raise ChatError(f"{exc}; the agent named no stored session to resume") from exc
+    wait = RECONNECT_DELAYS_S[tries]
+    if wait >= left_s:
+        raise ChatError(f"{exc}, with no time left in the run to reconnect") from exc
+    return wait
 
 
 def fire_schedules(store: FleetStore, *, now: datetime) -> list[Run]:
