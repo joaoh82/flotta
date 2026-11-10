@@ -68,6 +68,14 @@ def told(answer: dict[str, Any]) -> str:
 
 _STATUS = {"waiting": "waiting for the agency", "approved": "approved", "declined": "declined"}
 
+#: How a held request's work run is going, said so the agent does not do it twice.
+_WORK = {
+    "pending": "pending, a run of its own waiting to start: do not start it here too",
+    "running": "running, in a run of its own: it is being done, do not start it here too",
+    "done": "done",
+    "failed": "failed: tell the person, and do not redo it here without the agency",
+}
+
 
 def describe(found: list[dict[str, Any]]) -> str:
     if not found:
@@ -80,8 +88,9 @@ def describe(found: list[dict[str, Any]]) -> str:
         lines.append(f"  {r.get('title')!r}: {status}")
         if r.get("note"):
             lines.append(f"    note from the agency: {r['note']}")
-        if r.get("work_status"):
-            lines.append(f"    its work: {r['work_status']}")
+        work = r.get("work_status")
+        if work:
+            lines.append(f"    its work: {_WORK.get(str(work), str(work))}")
     return "\n".join(lines) + "\n"
 
 
