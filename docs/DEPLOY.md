@@ -119,6 +119,10 @@ FLOTTA_FLY_APP=<the app `just fly-up` deploys the image into>
 FLOTTA_FLY_ORG=personal
 ```
 
+`FLY_API_TOKEN` is what `flyctl` uses for every change to a machine, and what
+the control plane sends to Fly's Machines API to list an app's machines
+(FLOTTA-182). An org token (`FlyV1 fm2_…`) works for both.
+
 Wire `FLOTTA_DATABASE_URL` **by reference** where the host allows it (the
 Blueprint's `fromDatabase` does) rather than pasting a literal, so it survives
 a credential rotation.

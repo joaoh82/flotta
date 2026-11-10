@@ -15,16 +15,42 @@ deliberate M1 choice, not laziness:
 
 The cost is honest: `flyctl` must be on PATH, and its JSON shapes are not a
 stable contract. Both are checked loudly rather than assumed.
+
+## Listing machines over HTTP (FLOTTA-182)
+
+**Reads moved; writes did not.** `_machines`, the one listing behind
+`inspect`, `state`, `image_of`, `existing_endpoint` and every settle-and-wait
+loop, asks the Machines API (`GET /v1/apps/{app}/machines`) whenever the
+environment holds the token `flyctl` itself would use (`$FLY_API_TOKEN` or
+`$FLY_ACCESS_TOKEN`), which on the control plane it always does. Measured on
+2026-11-10: 177 ms against 681 ms for `flyctl machines list`, and no
+subprocess, which cost 70-90 ms of CPU each on a control plane with half a
+CPU. Every verb that changes a machine still goes through `flyctl`, where the
+lessons above live.
+
+The JSON is the same: `flyctl machines list --json` re-encodes the API's own
+machine objects. Compared field by field on a live agent, the API returns
+everything `flyctl` did, with the same values, plus `incomplete_config` and
+an id per event, which nothing here reads.
+
+Without a token in the environment (a laptop logged in with `fly auth
+login`), and whenever a `runner` is injected (every test), listing stays on
+`flyctl` exactly as before.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import quote
 
 from flotta.backend import (
     BackendError,
@@ -54,6 +80,115 @@ _MIN_MB_PER_CPU = {"shared": 256, "performance": 2048}
 
 DEFAULT_SETTLE_TIMEOUT_S = 90
 DEFAULT_WAIT_TIMEOUT_S = 120
+
+MACHINES_API_ROOT = "https://api.machines.dev"
+#: The variables `flyctl` reads its token from, in the order it reads them.
+TOKEN_ENVS = ("FLY_ACCESS_TOKEN", "FLY_API_TOKEN")
+#: A listing is small, and a settle loop asks again in half a second.
+MACHINES_API_TIMEOUT_S = 15.0
+
+
+def authorization_for(token: str) -> str:
+    """The `Authorization` header Fly expects for `token`, as `flyctl` builds it.
+
+    An org or deploy token (`fly tokens create`) is a macaroon, sent under its
+    own scheme, `FlyV1`; a personal access token is a bearer token.
+    """
+    token = token.strip()
+    if token.startswith("FlyV1 "):
+        return token
+    if token.startswith(("fm1", "fm2")):
+        return f"FlyV1 {token}"
+    return f"Bearer {token}"
+
+
+_CLIENT: Any = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _httpx_get(url: str, *, headers: dict[str, str], timeout: float) -> tuple[int, Any]:
+    """One GET on a client kept for the process, so Fly's TLS is paid once."""
+    global _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is None:
+            import httpx
+
+            _CLIENT = httpx.Client()
+        client = _CLIENT
+    response = client.get(url, headers=headers, timeout=timeout)
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, None
+
+
+class MachinesApi:
+    """The one read this backend makes over HTTP: an app's machines."""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        get: Callable[..., tuple[int, Any]] = _httpx_get,
+        root: str = MACHINES_API_ROOT,
+    ) -> None:
+        self._authorization = authorization_for(token)
+        self._get = get
+        self._root = root.rstrip("/")
+
+    def __repr__(self) -> str:
+        return f"MachinesApi(root={self._root!r})"
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> MachinesApi | None:
+        """An API client if the environment holds a Fly token, else None."""
+        env = os.environ if env is None else env
+        for name in TOKEN_ENVS:
+            token = (env.get(name) or "").strip()
+            if token:
+                return cls(token)
+        return None
+
+    def machines(self, app: str) -> list[dict]:
+        """The app's machines, or `BackendError` saying why they could not be listed.
+
+        The error names what Fly said and never what was sent: the token is
+        in a header, and no header is ever quoted.
+        """
+        url = f"{self._root}/v1/apps/{quote(app, safe='')}/machines"
+        try:
+            status, body = self._get(
+                url,
+                headers={"Authorization": self._authorization},
+                timeout=MACHINES_API_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - any transport failure is "could not ask"
+            raise BackendError(
+                f"could not list machines for {app}: could not reach Fly ({type(exc).__name__})"
+            ) from None
+        if status != 200:
+            said = body.get("error") if isinstance(body, dict) else None
+            reason = f": {str(said)[:200]}" if said else ""
+            raise BackendError(f"could not list machines for {app}: Fly answered {status}{reason}")
+        if not isinstance(body, list):
+            raise _ShapeChanged(
+                "Fly's machine listing was not a list; its shape may have changed: "
+                f"{json.dumps(body)[:120] if body is not None else 'not JSON'}"
+            )
+        return body
+
+
+class _ShapeChanged(BackendError):
+    """A listing that answered, in a shape this backend cannot read.
+
+    Raised even by a lenient listing, as `flyctl` output that is not JSON
+    always was: an answer we cannot parse is not "no machines".
+    """
+
+
+#: `FlyBackend(machines_api=...)` left out: build one from the environment,
+#: unless a `runner` is injected (a test), which keeps listing on it.
+_FROM_ENV: Any = object()
 
 
 def endpoint_for(app: str, machine_id: str) -> str:
@@ -146,11 +281,16 @@ class FlyBackend:
         config: FlyConfig | None = None,
         *,
         runner: object | None = None,
+        machines_api: MachinesApi | None = _FROM_ENV,
     ) -> None:
         self.config = config or FlyConfig.from_env()
         # Injected in tests so the whole suite stays hermetic and $0 — the same
         # discipline the Modal path has used since M3.
         self._run = runner or _run_flyctl
+        # A test that fakes `flyctl` lists through its fake, never over HTTP.
+        if machines_api is _FROM_ENV:
+            machines_api = None if runner is not None else MachinesApi.from_env()
+        self._api = machines_api
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -775,7 +915,20 @@ class FlyBackend:
         into a confident lie: the machine is up, and the panel says it is safe
         to destroy and recreate the agent. Whoever needs to tell those apart
         must ask for it, at the call site, where the difference is visible.
+
+        Over the Machines API when there is a token for it (FLOTTA-182), with
+        the same two answers: a failed listing raises only when `strict`, and
+        a listing that is not a list raises either way.
         """
+        if self._api is not None:
+            try:
+                return self._api.machines(app)
+            except _ShapeChanged:
+                raise
+            except BackendError:
+                if strict:
+                    raise
+                return []
         result = self._flyctl("machines", "list", "--json", app=app, check=False)
         if result.returncode != 0:
             if strict:
