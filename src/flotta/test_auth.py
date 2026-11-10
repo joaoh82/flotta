@@ -211,7 +211,8 @@ def test_the_known_scopes_are_exactly_these():
     systems and should start its one agent's runs and do nothing else, not even
     open a conversation, which `box:chat` would — and for FLOTTA-183's
     `org:govern`, because the hosted product's billing must set what an agency
-    may create from its plan, and suspend it when it does not pay (FLOTTA-184),
+    may create from its plan, suspend it when it does not pay (FLOTTA-184), and
+    approve it, always capped, when it does (FLOTTA-185),
     and `org:admin` would have let it read and change every agency's agents as
     well; it is held alone, and is never the operator.
     """

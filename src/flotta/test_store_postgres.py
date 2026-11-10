@@ -312,6 +312,25 @@ def test_two_suspends_at_once_change_the_org_once(pg_store):
     assert kinds.count("org_suspended") == 1
 
 
+def test_two_approvals_at_once_leave_one_starting_cap(pg_store):
+    """FLOTTA-185: billing's approval webhook, delivered twice at the same moment.
+    One approves and writes the cap in that transaction; the other finds the org
+    decided and writes nothing. Never two caps, and never an org approved without one."""
+    pg_store.create_org("agency-x", "Agency X", status="pending")
+
+    def approve(fleet, i):
+        fleet.decide_org("agency-x", approve=True, starting_cap_eur_nano=50 * 10**9, by="billing")
+
+    outcomes = _race(pg_store, approve)
+
+    assert sorted(outcomes) == ["InvalidTransitionError", "created"], outcomes
+    assert pg_store.get_org("agency-x").status == "active"
+    caps = [b for b in pg_store.budgets_for_org("agency-x") if b.starting_cap]
+    assert [b.limit_eur_nano for b in caps] == [50 * 10**9]
+    kinds = [e.type for e in pg_store.budget_events("agency-x")]
+    assert kinds == ["starting_cap_set"]
+
+
 def test_a_suspend_and_a_resume_at_once_leave_one_answer(pg_store):
     _full_but_one(pg_store)
     pg_store.suspend_org("agency-x")

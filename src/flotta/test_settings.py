@@ -71,6 +71,10 @@ def test_every_catalogued_setting_actually_changes_something():
     assert {s.key for s in SETTINGS} == {
         "FLOTTA_IDLE_AFTER_S",
         "FLOTTA_RECONCILE_INTERVAL_S",
+        # Read by `settings.starting_cap_eur_nano`, through `layered`, on every
+        # approval by billing (`POST /api/orgs/{id}/approve` with `org:govern`)
+        # and on `flotta org approve --starting-cap` (FLOTTA-185).
+        "FLOTTA_STARTING_CAP_EUR",
         # Both read by `provision.resolve_box_resources` and carried to the
         # machine in `BoxSpec`. The volume one was *not* wired when this test
         # was written — `FlyConfig.volume_gb` was read by nothing but the

@@ -48,6 +48,10 @@ GOVERN_ROUTES = frozenset(
         # FLOTTA-184: how a final failed payment ends, and how paying undoes it.
         ("POST", "/api/orgs/{org_id}/suspend"),
         ("POST", "/api/orgs/{org_id}/resume"),
+        # FLOTTA-185: a self-serve approval, which always comes with a starting
+        # cap, and lifting that cap once a renewal is paid.
+        ("POST", "/api/orgs/{org_id}/approve"),
+        ("DELETE", "/api/orgs/{org_id}/starting-cap"),
     }
 )
 #: What any valid credential may ask about itself: who it is and what it holds.
@@ -135,7 +139,7 @@ def test_the_sweep_finds_the_routes():
         ("DELETE", "/api/boxes/{box_id}"),
         ("POST", "/api/boxes/{box_id}/ticket"),
         ("GET", "/api/orgs"),
-        ("POST", "/api/orgs/{org_id}/approve"),
+        ("POST", "/api/orgs/{org_id}/decline"),
         ("GET", "/api/orgs/{org_id}/members"),
         ("GET", "/api/orgs/{org_id}/usage"),
         ("POST", "/api/orgs/{org_id}/clients"),

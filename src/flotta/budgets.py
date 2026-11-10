@@ -148,6 +148,7 @@ def budget_dict(budget: Budget) -> dict[str, Any]:
         "soft_pct": budget.soft_pct,
         "action": budget.action,
         "fallback_model": budget.fallback_model,
+        "starting_cap": budget.starting_cap,
     }
 
 

@@ -94,7 +94,8 @@ OPERATOR_ROUTES = frozenset(
         "update_hermes",
         "create_org",
         "add_user",
-        "approve_org",
+        # Not `approve_org` (FLOTTA-185): billing approves too, holding
+        # `org:govern`, and its approval always carries a starting cap.
         "decline_org",
         # The operator's view (M12.9): everyone, every org's agents, and a
         # read-only session in an agency.
