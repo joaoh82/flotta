@@ -837,6 +837,53 @@ def test_a_refresh_does_not_bring_back_a_list_forgotten_while_it_ran():
     assert app._kept.repository_list("77") is None
 
 
+def test_a_cold_read_answered_before_a_reconnect_is_not_kept_after_it():
+    """The #221 review's race. A read with nothing kept is waiting on GitHub
+    when the account is connected again; the answer it then gets is from
+    before the reconnect, and keeping it would hide what was just picked."""
+    import threading
+
+    answered = threading.Event()
+    release = threading.Event()
+    lists = [_listed("acme/old"), _listed("acme/old", "acme/new")]
+    asks: list[str] = []
+
+    def fetch(method, url, **kwargs):
+        if method == "POST":
+            return _listing_token()
+        asks.append(url)
+        if len(asks) == 1:
+            answered.set()
+            release.wait(5)
+        return lists[len(asks) - 1]
+
+    app = GitHubApp(
+        slug="s", client_id="c", client_secret="x", private_key=PEM, fetch=fetch, now=lambda: NOW
+    )
+    first: list = []
+    cold = threading.Thread(target=lambda: first.append(app.suggested_repositories("77")))
+    cold.start()
+    assert answered.wait(5)
+    app.forget_repositories("77")  # what claim does
+    release.set()
+    cold.join(5)
+
+    assert first[0].names == ("acme/old",)
+    after = app.suggested_repositories("77")
+    assert (after.names, after.source) == (("acme/old", "acme/new"), "github")
+    assert len(asks) == 2
+
+
+def test_an_older_answer_does_not_replace_a_newer_one():
+    """A refresh stuck past `_LISTING_WAIT_S` can finish after a read that
+    gave up waiting and asked for itself."""
+    app, _, _, _ = _suggesting()
+    gen = app._kept.generation("77")
+    assert app._kept.keep_repository_list("77", (NOW + 10, ("a/new",), False), generation=gen)
+    assert not app._kept.keep_repository_list("77", (NOW, ("a/old",), False), generation=gen)
+    assert app._kept.repository_list("77")[1] == ("a/new",)
+
+
 def test_each_installation_keeps_its_own_list():
     app, _, _, _ = _suggesting(
         _listing_token("ghs_77"), _listed("a/one"), _listing_token("ghs_88"), _listed("b/two")

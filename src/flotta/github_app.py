@@ -309,6 +309,11 @@ class _Kept:
         self._lists: dict[str, tuple[float, tuple[str, ...], bool]] = {}
         #: installation -> held for the whole of one ask of GitHub for its list
         self._asking: dict[str, threading.Lock] = {}
+        #: installation -> how many times its list has been forgotten. An ask
+        #: notes it before asking and keeps its answer only if it is unchanged,
+        #: so an answer GitHub gave before a reconnect or a disconnect cannot
+        #: be kept after it — whether nothing was kept when it started or not.
+        self._generations: dict[str, int] = {}
 
     def key(self, pem: str) -> Any:
         with self._lock:
@@ -335,17 +340,24 @@ class _Kept:
         with self._lock:
             return self._lists.get(installation)
 
+    def generation(self, installation: str) -> int:
+        with self._lock:
+            return self._generations.get(installation, 0)
+
     def keep_repository_list(
         self,
         installation: str,
         kept: tuple[float, tuple[str, ...], bool],
         *,
-        if_still: tuple[float, tuple[str, ...], bool] | None = None,
+        generation: int,
     ) -> bool:
-        """Keep a list. A refresh passes what it started from as `if_still`, so
-        a list forgotten (or replaced) while it was asking GitHub stays so."""
+        """Keep a list asked for at `generation`, unless it has been forgotten
+        since, or a list asked for later is already kept."""
         with self._lock:
-            if if_still is not None and self._lists.get(installation) is not if_still:
+            if self._generations.get(installation, 0) != generation:
+                return False
+            current = self._lists.get(installation)
+            if current is not None and current[0] > kept[0]:
                 return False
             self._lists[installation] = kept
             return True
@@ -353,6 +365,7 @@ class _Kept:
     def forget_repository_list(self, installation: str) -> None:
         with self._lock:
             self._lists.pop(installation, None)
+            self._generations[installation] = self._generations.get(installation, 0) + 1
 
     def asking(self, installation: str) -> threading.Lock:
         with self._lock:
@@ -582,7 +595,7 @@ class GitHubApp:
             if age < _LISTING_FRESH_S:
                 return Listing(kept[1], kept[2], "kept")
             if age < _LISTING_STALE_MAX_S:
-                self._refresh_repository_list(installation, kept)
+                self._refresh_repository_list(installation)
                 return Listing(kept[1], kept[2], "stale")
 
         asking = self._kept.asking(installation)
@@ -592,8 +605,13 @@ class GitHubApp:
             kept = self._kept.repository_list(installation)
             if kept is not None and now - kept[0] < _LISTING_FRESH_S:
                 return Listing(kept[1], kept[2], "kept")
+            # Noted before asking: a reconnect while GitHub answers this one
+            # forgets the list, and this answer, from before it, is not kept.
+            generation = self._kept.generation(installation)
             names, more = self.repositories(installation)
-            self._kept.keep_repository_list(installation, (now, tuple(names), more))
+            self._kept.keep_repository_list(
+                installation, (now, tuple(names), more), generation=generation
+            )
             return Listing(tuple(names), more, "github")
         finally:
             if held:
@@ -604,14 +622,13 @@ class GitHubApp:
         or disconnected."""
         self._kept.forget_repository_list(installation)
 
-    def _refresh_repository_list(
-        self, installation: str, had: tuple[float, tuple[str, ...], bool]
-    ) -> None:
+    def _refresh_repository_list(self, installation: str) -> None:
         asking = self._kept.asking(installation)
         if not asking.acquire(blocking=False):
             return  # one is already running, and its answer is the refresh
 
         started = self.now()
+        generation = self._kept.generation(installation)
 
         def work() -> None:
             try:
@@ -631,7 +648,7 @@ class GitHubApp:
                 self._kept.keep_repository_list(
                     installation,
                     (started, tuple(names), more),
-                    if_still=had,
+                    generation=generation,
                 )
             finally:
                 asking.release()
