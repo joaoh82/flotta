@@ -165,6 +165,15 @@ HEARTBEAT_S = 120.0
 #: `addressed` at most once a minute, so a sooner touch moves nothing, and each one
 #: asks the substrate about the machine.
 TOUCH_GAP_S = 60.0
+#: How often the door pings the box's socket, and how long it waits for the pong
+#: before calling the box gone (FLOTTA-195). These were websockets' defaults, 20 s
+#: and 20 s, and a box compiling on a shared CPU starves Hermes's event loop for
+#: longer than that: on 2026-11-10 a 43 s stall dropped a run whose agent went on
+#: working for another 27 minutes. A stalled agent is not a dead one. The ping is
+#: kept for a box that has truly gone without closing its socket, and five
+#: minutes is longer than any stall but a runaway one.
+BOX_PING_INTERVAL_S = 20.0
+BOX_PING_TIMEOUT_S = 300.0
 #: What a page sends to keep its socket through Cloudflare. Nobody is behind it.
 KEEPALIVE_METHOD = "gateway.ping"
 #: Longest frame read as a keepalive. A ping is short, and an upload needn't be parsed.
@@ -1165,6 +1174,8 @@ def create_door(
                 additional_headers=headers,
                 proxy=None,
                 max_size=BOX_FRAME_LIMIT,
+                ping_interval=BOX_PING_INTERVAL_S,
+                ping_timeout=BOX_PING_TIMEOUT_S,
             ) as upstream:
                 liveness.connected(upstream.send)
 
