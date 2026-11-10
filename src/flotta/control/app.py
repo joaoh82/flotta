@@ -131,6 +131,10 @@ except ImportError:  # pragma: no cover - create_app's own import says so
 
 _log = logging.getLogger("flotta.control")
 
+#: How long `/machine`'s two slow reads took (FLOTTA-182). `server_logs` turns
+#: it on at INFO beside the GitHub timing; the rest of flotta's INFO stays off.
+MACHINE_TIMING_LOG = "flotta.control.machine"
+
 #: What a read-only session may still be used for (M12.9). Looking, and
 #: ending itself: signing out changes nothing about the org being viewed.
 _LOOKING = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -4269,12 +4273,28 @@ def create_app(
         (`unavailable`), not a failed request. The row is always returned, so
         the panel has something to show either way.
 
-        Not polled, and it must not become polled: it is a subprocess per call.
-        The list view stays on the store, which is cheap and, for status, kept
-        current by every verb that touches a box.
+        Not polled, and it must not become polled: it is a call to Fly each
+        time. The list view stays on the store, which is cheap and, for status,
+        kept current by every verb that touches a box.
+
+        Timed on `MACHINE_TIMING_LOG` (FLOTTA-182): how long asking the
+        substrate took, and how long finding the fleet's image took, which
+        without `$FLOTTA_FLY_IMAGE` is a `flyctl releases` once a minute.
         """
         from flotta.backend import BackendError, backend_for
         from flotta.provision import _fleet_image, _same_image
+
+        def timed_fleet_image(inspect_ms: float, outcome: str) -> str | None:
+            started = time.perf_counter()
+            image = _fleet_image()
+            logging.getLogger(MACHINE_TIMING_LOG).info(
+                "machine read for %s: %s in %.0f ms, fleet image in %.0f ms",
+                box.id,
+                outcome,
+                inspect_ms,
+                (time.perf_counter() - started) * 1000,
+            )
+            return image
 
         store = store_factory()
         try:
@@ -4301,6 +4321,7 @@ def create_app(
                     "fleet_image": _fleet_image(),
                     "image_current": None,
                 }
+            asked = time.perf_counter()
             try:
                 info = backend_for(box.endpoint).inspect(box.endpoint)
             except (BackendError, OSError, NotImplementedError) as exc:
@@ -4308,9 +4329,12 @@ def create_app(
                     "box": row,
                     "machine": None,
                     "unavailable": str(exc),
-                    "fleet_image": _fleet_image(),
+                    "fleet_image": timed_fleet_image(
+                        (time.perf_counter() - asked) * 1000, "unavailable"
+                    ),
                     "image_current": None,
                 }
+            inspect_ms = (time.perf_counter() - asked) * 1000
             from dataclasses import asdict
 
             # Whether this agent is on the image the fleet builds — computed
@@ -4322,7 +4346,7 @@ def create_app(
             # implementation in TypeScript would be the fourth. `None` means
             # one side is unknown, which is not the same as "behind" and must
             # not put an Upgrade button in front of somebody.
-            fleet_image = _fleet_image()
+            fleet_image = timed_fleet_image(inspect_ms, info.state)
             current: bool | None = None
             if fleet_image and info.image:
                 current = _same_image(info.image, fleet_image)
