@@ -2794,12 +2794,21 @@ def test_an_agent_on_that_image_is_not_restarted_for_nothing(store):
 @pytest.fixture(autouse=True)
 def _no_release_cache():
     """The cache is process-global; without this one test's answer leaks into
-    the next and the "refuses to guess" tests pass for the wrong reason."""
+    the next and the "refuses to guess" tests pass for the wrong reason.
+
+    The lookup lock too: a test that keeps a refresh with `_held()` releases it
+    only when it runs that refresh, so one that fails first would leave every
+    later lookup in the process waiting forever. A new lock rather than a
+    release, because the holder may be a thread that is still running."""
+    import threading
+
     import flotta.provision as provision
 
     provision._release_cache = None
+    provision._release_lookup = threading.Lock()
     yield
     provision._release_cache = None
+    provision._release_lookup = threading.Lock()
 
 
 def test_an_explicit_image_still_wins():
