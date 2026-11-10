@@ -583,3 +583,87 @@ def test_every_request_goes_through_the_one_http_client(monkeypatch):
     assert module._httpx_fetch("GET", "https://api.github.com/x", timeout=1) == (200, {"ok": True})
     assert module._httpx_fetch("GET", "https://api.github.com/y", timeout=1) == (200, {"ok": True})
     assert asked == [("GET", "https://api.github.com/x"), ("GET", "https://api.github.com/y")]
+
+
+# -- timing each ask (FLOTTA-180) ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "shape"),
+    [
+        (
+            "https://api.github.com/app/installations/77/access_tokens",
+            "/app/installations/77/access_tokens",
+        ),
+        (
+            "https://api.github.com/installation/repositories?per_page=100",
+            "/installation/repositories",
+        ),
+        (
+            "https://api.github.com/repos/acme-gh/secret-site/installation",
+            "/repos/…/…/installation",
+        ),
+        ("https://api.github.com/user/memberships/orgs/acme-gh", "/user/memberships/orgs/…"),
+        ("https://github.com/login/oauth/access_token", "/login/oauth/access_token"),
+        # Names that are GitHub's words, or digits, are still names where they sit.
+        ("https://api.github.com/repos/app/installation/installation", "/repos/…/…/installation"),
+        ("https://api.github.com/repos/123/456/installation", "/repos/…/…/installation"),
+        ("https://api.github.com/user/memberships/orgs/404", "/user/memberships/orgs/…"),
+        ("https://api.github.com/app/installations/not-an-id", "/app/installations/…"),
+        ("https://api.github.com/somewhere/12345", "/…/…"),
+    ],
+)
+def test_a_calls_shape_names_nobody(url, shape):
+    from flotta.github_app import call_shape
+
+    assert call_shape(url) == shape
+
+
+def _timing(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "flotta.github_app"]
+
+
+def test_every_ask_is_timed_with_its_status_and_no_token(caplog):
+    app, _ = _app(_listing_token("ghs_dont_log_me"), LISTED)
+    with caplog.at_level("INFO", logger="flotta.github_app"):
+        app.repositories("77")
+    lines = _timing(caplog)
+
+    assert lines[0].startswith("github POST /app/installations/77/access_tokens: 201 in ")
+    assert lines[1].startswith("github GET /installation/repositories: 200 in ")
+    assert lines[2].startswith("github listing for installation 77: minted token, status 200, ")
+    assert all(line.endswith(" ms") for line in lines)
+    assert not any("ghs_" in line or "Bearer" in line or "a/b" in line for line in lines)
+
+
+def test_a_listing_says_its_token_was_kept_or_replaced(caplog):
+    app, _ = _app(_listing_token(), LISTED, LISTED, (401, {}), _listing_token("ghs_new"), LISTED)
+    with caplog.at_level("INFO", logger="flotta.github_app"):
+        app.repositories("77")
+        app.repositories("77")
+        app.repositories("77")
+    listings = [line for line in _timing(caplog) if line.startswith("github listing")]
+
+    assert [line.split(": ")[1].split(" token")[0] for line in listings] == [
+        "minted",
+        "kept",
+        "kept, refused, minted",
+    ]
+
+
+def test_an_ask_that_could_not_reach_github_is_timed_by_its_failure(caplog):
+    app, _ = _app(OSError("connect to https://api.github.com/secret failed"))
+    with caplog.at_level("INFO", logger="flotta.github_app"), pytest.raises(GitHubAppError):
+        app.account("77")
+    (line,) = _timing(caplog)
+    assert line.startswith("github GET /app/installations/77: failed (OSError) after ")
+    assert "secret" not in line
+
+
+def test_servers_log_the_github_timing_and_nothing_else_of_flottas_at_info():
+    from flotta.server_logs import log_config
+
+    loggers = log_config()["loggers"]
+    assert loggers["flotta.github_app"]["level"] == "INFO"
+    assert loggers["flotta.github_app"]["handlers"] == ["default"]
+    assert "flotta" not in loggers

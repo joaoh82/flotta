@@ -53,6 +53,12 @@ of them needed to be paid more than once:
 `app_from_env` returns the same App for the same settings, which is what
 makes the first two last beyond one request.
 
+**Each ask is timed in the logs** (`TIMING_LOG`): the call's shape, GitHub's
+status and how long it took, and for a listing whether its token was kept or
+minted. The shape keeps the API's own words and installation ids and hides
+every other segment, so no repository, organization or person is named, and
+nothing from a header or a body is ever written.
+
 `fetch` is injected, so the suite never reaches GitHub.
 """
 
@@ -63,6 +69,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -70,7 +77,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from flotta.github import API_HEADERS, API_ROOT, Person, person_from
 
@@ -95,6 +102,18 @@ _JWT_TTL_S = 540
 _REPOSITORIES_PER_PAGE = 100
 
 DEFAULT_TIMEOUT_S = 5.0
+
+#: The logger every ask to GitHub is timed on (FLOTTA-180). `server_logs`
+#: turns it on at INFO; nothing else in flotta logs at INFO on a server.
+TIMING_LOG = "flotta.github_app"
+_log = logging.getLogger(TIMING_LOG)
+
+#: Path segments a timing line may show: GitHub's own vocabulary. Anything
+#: else (an owner, a repository, an organization) is shown as `…`.
+_SHOWN_SEGMENTS = frozenset(
+    {"app", "installations", "access_tokens", "installation", "repositories", "repos"}
+    | {"user", "memberships", "orgs", "login", "oauth", "access_token"}
+)
 
 #: A kept token is used only while it has at least this long left: a listing
 #: that starts with a token about to expire could otherwise end with a 401.
@@ -280,6 +299,34 @@ def _load_rsa_key(pem: str) -> Any:
     return key
 
 
+def call_shape(url: str) -> str:
+    """`url`'s path with every segment that could name someone hidden, and no query.
+
+    By position, not by spelling: the segment after `orgs/` and the two after
+    `repos/` are always hidden, because `installation` and `404` are a
+    repository and an organization too. Only an installation id, the digits
+    after `installations/`, is shown: it is not secret, and it says which
+    account was slow. Anywhere else, only GitHub's own words are shown.
+    """
+    shown: list[str] = []
+    hide_next = 0
+    id_next = False
+    for part in urlsplit(url).path.split("/"):
+        if not part:
+            shown.append(part)
+        elif hide_next:
+            shown.append("…")
+            hide_next -= 1
+        elif id_next:
+            shown.append(part if part.isdigit() else "…")
+            id_next = False
+        else:
+            shown.append(part if part in _SHOWN_SEGMENTS else "…")
+            hide_next = {"repos": 2, "orgs": 1}.get(part, 0)
+            id_next = part == "installations"
+    return "/".join(shown)
+
+
 def _expiry(raw: Any) -> float | None:
     """GitHub's `expires_at` as a Unix time, or None for anything else."""
     try:
@@ -411,12 +458,22 @@ class GitHubApp:
         GitHub refuses a kept one (the App was removed, or the token revoked),
         it is dropped and a fresh one asked for once, which says why.
         """
+        started = time.perf_counter()
         kept = self._kept.listing_token(installation, self.now())
         token = kept or self._listing_token(installation)
         status, body = self._list_repositories(token)
+        how = "kept" if kept is not None else "minted"
         if status == 401 and kept is not None:
             self._kept.forget_listing_token(installation)
             status, body = self._list_repositories(self._listing_token(installation))
+            how = "kept, refused, minted"
+        _log.info(
+            "github listing for installation %s: %s token, status %s, %.0f ms",
+            installation,
+            how,
+            status,
+            (time.perf_counter() - started) * 1000,
+        )
         if status == 401:
             # Kept when it was minted, before GitHub refused it: the next ask
             # should start with a fresh one, not spend a request on this.
@@ -496,11 +553,26 @@ class GitHubApp:
         return f"{signing_input}.{_b64(signature)}"
 
     def _ask(self, method: str, url: str, **kwargs: Any) -> tuple[int, Any]:
+        started = time.perf_counter()
         try:
             status, body = self.fetch(method, url, timeout=DEFAULT_TIMEOUT_S, **kwargs)
         except Exception as exc:  # noqa: BLE001 - any transport failure is "could not ask"
+            _log.info(
+                "github %s %s: failed (%s) after %.0f ms",
+                method,
+                call_shape(url),
+                type(exc).__name__,
+                (time.perf_counter() - started) * 1000,
+            )
             # The type alone: a transport error can quote the request it failed on.
             raise GitHubAppError(f"could not reach GitHub ({type(exc).__name__})") from None
+        _log.info(
+            "github %s %s: %s in %.0f ms",
+            method,
+            call_shape(url),
+            status,
+            (time.perf_counter() - started) * 1000,
+        )
         return status, body if isinstance(body, dict) else {}
 
 
