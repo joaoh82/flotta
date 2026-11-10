@@ -85,6 +85,11 @@ class Setting:
             )
 
 
+#: What a self-serve approval's starting cap is when nothing says otherwise
+#: (FLOTTA-185), in euros. Also what a value that is not more than zero falls
+#: back to: a billing approval is never uncapped.
+STARTING_CAP_EUR_DEFAULT = "50"
+
 #: Every setting the fleet exposes. Adding one here is what makes it settable —
 #: there is deliberately no way to write a key that is not in this list.
 SETTINGS: tuple[Setting, ...] = (
@@ -190,6 +195,18 @@ SETTINGS: tuple[Setting, ...] = (
         ),
         kind="money",
         default="",
+    ),
+    Setting(
+        key="FLOTTA_STARTING_CAP_EUR",
+        label="Starting cap",
+        help=(
+            "Euros of model spend a month an agency approved by billing may use "
+            "until its first renewal is paid, after which billing lifts it. It "
+            "bounds what a card that pays once and is then disputed can spend on "
+            "the fleet's own model key. Applies to approvals from now on."
+        ),
+        kind="money",
+        default=STARTING_CAP_EUR_DEFAULT,
     ),
     Setting(
         key="FLOTTA_FLY_VOLUME_GB",
@@ -449,3 +466,28 @@ def describe(store: Any, env: Mapping[str, str] | None = None) -> list[dict[str,
             }
         )
     return out
+
+
+def starting_cap_eur_nano(store: Any, env: Mapping[str, str] | None = None) -> int:
+    """The starting cap a self-serve approval gives an org, in euro nanos.
+
+    Never zero and never missing: a value that is unset, unreadable or not more
+    than zero is the default, with a warning, because the cap exists so that
+    no approval by billing goes out without one (FLOTTA-185).
+    """
+    import logging
+    from decimal import Decimal, InvalidOperation
+
+    raw = layered(store, env).get("FLOTTA_STARTING_CAP_EUR") or STARTING_CAP_EUR_DEFAULT
+    try:
+        euros = Decimal(str(raw).strip())
+    except InvalidOperation:
+        euros = Decimal(0)
+    if not euros.is_finite() or euros <= 0:
+        logging.getLogger("flotta.settings").warning(
+            "FLOTTA_STARTING_CAP_EUR is %r, which is no cap; using €%s",
+            raw,
+            STARTING_CAP_EUR_DEFAULT,
+        )
+        euros = Decimal(STARTING_CAP_EUR_DEFAULT)
+    return int(euros * 10**9)

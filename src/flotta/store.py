@@ -1175,6 +1175,10 @@ class Budget:
     action: str
     fallback_model: str | None
     updated_at: str
+    #: The starting cap a self-serve approval gives an org (FLOTTA-185): its own
+    #: row, which its owners cannot change, until billing or the operator lifts
+    #: it. See `FleetStore.decide_org` and `lift_starting_cap`.
+    starting_cap: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1842,10 +1846,25 @@ class FleetStore:
         if count >= limit:
             raise LimitReachedError(org_id, kind, limit, count)
 
-    def decide_org(self, org_id: str, *, approve: bool, reason: str | None = None) -> Org:
+    def decide_org(
+        self,
+        org_id: str,
+        *,
+        approve: bool,
+        reason: str | None = None,
+        starting_cap_eur_nano: int | None = None,
+        by: str | None = None,
+    ) -> Org:
         """Approve or decline a pending org. Once: both answers are final.
 
         A decline keeps `reason`, the operator's words, on the org.
+
+        `starting_cap_eur_nano` approves it with a starting cap (FLOTTA-185): an
+        org-wide monthly model budget that pauses at that many euros, written in
+        the same transaction, so an org approved this way is never active
+        without it. What a self-serve approval (`org:govern`) always passes:
+        every model call is on the fleet's key, and a card that pays one month
+        and is then disputed would otherwise spend it without bound.
 
         Under the org table's guard, so an approve and a decline arriving
         together cannot both succeed and leave the answer to whichever wrote
@@ -1863,6 +1882,8 @@ class FleetStore:
                 "UPDATE orgs SET status = ?, decline_reason = ? WHERE id = ?",
                 ("active" if approve else "declined", None if approve else reason, org_id),
             )
+            if approve and starting_cap_eur_nano is not None:
+                self._set_starting_cap(org_id, starting_cap_eur_nano, by=by)
         decided = self.get_org(org_id)
         assert decided is not None
         return decided
@@ -4007,6 +4028,8 @@ class FleetStore:
             action=row["action"],
             fallback_model=row["fallback_model"],
             updated_at=row["updated_at"],
+            # `get`: a store part-way through its migrations, before 31, has none.
+            starting_cap=bool(row.get("starting_cap") or 0),
         )
 
     def _budget_scope(
@@ -4088,6 +4111,64 @@ class FleetStore:
         )
         row = self._conn.execute("SELECT * FROM budgets WHERE id = ?", (budget_id,)).fetchone()
         return self._budget_from(row)
+
+    @classmethod
+    def _starting_cap_id(cls, org: str) -> str:
+        """Beside the org's own monthly budget, never in its place: no scope and
+        period an owner can name reaches this id."""
+        return cls._budget_id(org, None, None, "month") + "-cap"
+
+    def _set_starting_cap(self, org: str, limit_eur_nano: int, *, by: str | None) -> Budget:
+        """The cap row and its event. The caller holds the transaction."""
+        if limit_eur_nano <= 0:
+            raise InvalidBudgetError("a starting cap must be more than zero")
+        budget_id = self._starting_cap_id(org)
+        self._conn.execute(
+            "INSERT INTO budgets (id, org_id, client_id, box_id, period, limit_eur_nano, "
+            "soft_pct, action, fallback_model, updated_at, starting_cap) "
+            "VALUES (?, ?, NULL, NULL, 'month', ?, 0.8, 'pause', NULL, ?, 1) "
+            "ON CONFLICT (id) DO UPDATE SET limit_eur_nano = excluded.limit_eur_nano, "
+            "updated_at = excluded.updated_at",
+            (budget_id, org, limit_eur_nano, _utcnow()),
+        )
+        cap = self.starting_cap(org)
+        assert cap is not None
+        self.record_budget_event(
+            cap,
+            "starting_cap_set",
+            period_start=datetime.now(UTC),
+            payload={"limit_eur_nano": limit_eur_nano, "by": by},
+        )
+        return cap
+
+    def starting_cap(self, org: str) -> Budget | None:
+        """The org's starting cap, while it has one."""
+        row = self._conn.execute(
+            "SELECT * FROM budgets WHERE id = ?", (self._starting_cap_id(org),)
+        ).fetchone()
+        return self._budget_from(row) if row else None
+
+    def lift_starting_cap(self, org: str, *, by: str | None = None) -> bool:
+        """Remove the org's starting cap (FLOTTA-185). Returns whether it had one.
+
+        Billing's, once a renewal invoice is paid, or the operator's. Every
+        budget the org set itself stays; a box the cap paused is released by
+        the next budget sweep, as for any budget removed. Lifting a cap that is
+        not there writes nothing, so a renewal webhook delivered twice is
+        harmless.
+        """
+        with self._conn.transaction(guard="budgets"):
+            cap = self.starting_cap(org)
+            if cap is None:
+                return False
+            self._conn.execute("DELETE FROM budgets WHERE id = ?", (cap.id,))
+            self.record_budget_event(
+                cap,
+                "starting_cap_lifted",
+                period_start=datetime.now(UTC),
+                payload={"limit_eur_nano": cap.limit_eur_nano, "by": by},
+            )
+        return True
 
     def delete_budget(
         self, org: str, *, period: str, client: str | None = None, box: str | None = None

@@ -1062,6 +1062,14 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE orgs ADD COLUMN suspend_reason TEXT",
         ),
     ),
+    Migration(
+        31,
+        "starting caps: the model budget a self-serve approval arrives with",
+        # FLOTTA-185 (M15.3). Its own row beside the org's own budgets, under
+        # an id no scope-and-period addresses, so an owner can neither change
+        # nor remove it. Every budget that exists already is an org's own: 0.
+        ("ALTER TABLE budgets ADD COLUMN starting_cap INTEGER NOT NULL DEFAULT 0",),
+    ),
 )
 
 

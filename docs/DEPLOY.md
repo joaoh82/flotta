@@ -824,6 +824,26 @@ token when Stripe's retries give up, and again when the agency pays. A repeated
 suspend or resume changes nothing and emails nobody, so a webhook delivered
 twice is harmless. The default org is the operator's own and is never suspended.
 
+### Self-serve approval and the starting cap (FLOTTA-185)
+
+On the hosted product an agency is approved by billing, not by you, once its
+first invoice is paid. **Billing's approval always comes with a starting
+cap**: an org-wide model budget of `FLOTTA_STARTING_CAP_EUR` (a fleet setting,
+default €50) a month that pauses its agents at the limit. Every model call is
+on the fleet's own key, so this bounds what a card that pays once and is then
+disputed can spend. Billing lifts it once a renewal is paid.
+
+The cap is its own budget, beside any the agency sets: its owners see it in
+their budgets (`starting_cap: true`) and cannot change or remove it. Your own
+approvals come without one unless you ask:
+
+```bash
+uv run flotta org approve agency-x --starting-cap   # approve it capped
+just org-lift-cap agency-x                          # lift it; its own budgets stay
+```
+
+A setting that is not more than zero means the default, never no cap.
+
 ---
 
 ## Step 9 — People who sign in (M12.3)

@@ -2289,6 +2289,7 @@ def _decide_org(
     store: str | None,
     as_json: bool,
     reason: str | None = None,
+    starting_cap: bool = False,
 ) -> None:
     """Decide through the control plane, which tells the org's owners (FLOTTA-143).
 
@@ -2306,7 +2307,13 @@ def _decide_org(
                 "POST",
                 f"/api/orgs/{org_id}/{verb}",
                 scopes=(SCOPE_ORG_ADMIN,),
-                body={"reason": reason} if reason else None,
+                body=(
+                    {"reason": reason}
+                    if reason
+                    else {"starting_cap": True}
+                    if starting_cap
+                    else None
+                ),
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
@@ -2316,9 +2323,16 @@ def _decide_org(
         else:
             note = f"{told} owner{'' if told == 1 else 's'} told"
     else:
+        from flotta.settings import starting_cap_eur_nano
+
         with _open_store(store) as fleet:
+            cap = starting_cap_eur_nano(fleet) if starting_cap else None
             try:
-                org = _org_view(fleet.decide_org(org_id, approve=approve, reason=reason))
+                org = _org_view(
+                    fleet.decide_org(
+                        org_id, approve=approve, reason=reason, starting_cap_eur_nano=cap, by="cli"
+                    )
+                )
             except (UnknownEntityError, InvalidTransitionError) as exc:
                 raise _fail(exc) from exc
         told = 0
@@ -2330,11 +2344,49 @@ def _decide_org(
 @org_app.command("approve")
 def org_approve(
     org_id: str = typer.Argument(..., help="A pending org: `flotta org list --pending`"),
+    starting_cap: bool = typer.Option(
+        False, "--starting-cap", help="Approve it with the starting cap on model spend"
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
-    """Let a signed-up org create agents. The operator's act, and final."""
-    _decide_org(org_id, approve=True, store=store, as_json=as_json)
+    """Let a signed-up org create agents. The operator's act, and final.
+
+    `--starting-cap` gives it the model budget a self-serve approval by billing
+    always comes with (FLOTTA-185): `FLOTTA_STARTING_CAP_EUR` a month, pausing
+    at the limit, until `flotta org lift-cap`.
+    """
+    _decide_org(org_id, approve=True, store=store, as_json=as_json, starting_cap=starting_cap)
+
+
+@org_app.command("lift-cap")
+def org_lift_cap(
+    org_id: str = typer.Argument(..., help="The org whose starting cap to lift"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Lift an org's starting cap (FLOTTA-185). Its own budgets stay."""
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import UnknownEntityError
+
+    if control_url():
+        try:
+            view = control_request(
+                "DELETE", f"/api/orgs/{org_id}/starting-cap", scopes=(SCOPE_ORG_ADMIN,)
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            if fleet.get_org(org_id) is None:
+                raise _fail(UnknownEntityError(f"no org with id {org_id!r}"))
+            view = {"org": org_id, "lifted": fleet.lift_starting_cap(org_id, by="cli")}
+    line = (
+        f"the starting cap of {org_id} is lifted"
+        if view["lifted"]
+        else f"{org_id} has no starting cap; nothing changed"
+    )
+    emit(view, line, as_json=as_json)
 
 
 @org_app.command("decline")

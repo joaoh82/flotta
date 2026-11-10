@@ -1382,10 +1382,66 @@ def create_app(
             store.close()
 
     @app.post("/api/orgs/{org_id}/approve")
-    def approve_org(org_id: str, tasks: BackgroundTasks, token: Token | None = needs_admin) -> Any:
-        """Let a signed-up org create agents. The operator's alone, and final."""
-        _require_operator(token, "approve an org")
-        return _decide(org_id, tasks, approve=True)
+    def approve_org(
+        org_id: str,
+        tasks: BackgroundTasks,
+        body: dict[str, Any] | None = None,
+        token: Token | None = needs_limits_write,
+    ) -> Any:
+        """Let a signed-up org create agents. Final.
+
+        The operator's, or the hosted product's billing (`org:govern`) once an
+        agency's first invoice is paid (FLOTTA-185). **Billing's approval always
+        comes with a starting cap**: an org-wide model budget of
+        `FLOTTA_STARTING_CAP_EUR` a month that pauses at the limit, until billing
+        lifts it at the first renewal (`DELETE …/starting-cap`). The operator's
+        comes without one unless asked, with `{"starting_cap": true}`.
+        """
+        from flotta.settings import starting_cap_eur_nano
+
+        governed = token is not None and is_governor(token)
+        if not (governed or _is_operator(token)):
+            raise HTTPException(
+                status_code=403,
+                detail="only the fleet's operator, or its billing, may approve an org",
+            )
+        asked = (body or {}).get("starting_cap", False)
+        if not isinstance(asked, bool):
+            raise HTTPException(status_code=422, detail="starting_cap is true or false")
+        cap: int | None = None
+        if governed or asked:
+            store = store_factory()
+            try:
+                cap = starting_cap_eur_nano(store)
+            finally:
+                store.close()
+        by = token.subject if token is not None else "operator"
+        return _decide(org_id, tasks, approve=True, starting_cap_eur_nano=cap, by=by)
+
+    @app.delete("/api/orgs/{org_id}/starting-cap")
+    def lift_starting_cap(org_id: str, token: Token | None = needs_limits_write) -> Any:
+        """Lift the starting cap a self-serve approval gave an org (FLOTTA-185).
+
+        Billing's, once a renewal invoice is paid, or the operator's; never the
+        org's own, whose cap it is. Every budget the org set itself stays.
+        `{"lifted": false}` when there is none, so a webhook delivered twice is
+        harmless.
+        """
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            raise HTTPException(
+                status_code=403,
+                detail="only the fleet's operator, or its billing, may lift a starting cap",
+            )
+        by = token.subject if token is not None else "operator"
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            lifted = store.lift_starting_cap(org_id, by=by)
+        finally:
+            store.close()
+        if lifted:
+            _log.info("the starting cap of %s was lifted by %s", org_id, by)
+        return {"org": org_id, "lifted": lifted}
 
     @app.post("/api/orgs/{org_id}/decline")
     def decline_org(
@@ -1408,7 +1464,13 @@ def create_app(
         return _decide(org_id, tasks, approve=False, reason=reason or None)
 
     def _decide(
-        org_id: str, tasks: BackgroundTasks, *, approve: bool, reason: str | None = None
+        org_id: str,
+        tasks: BackgroundTasks,
+        *,
+        approve: bool,
+        reason: str | None = None,
+        starting_cap_eur_nano: int | None = None,
+        by: str | None = None,
     ) -> Any:
         """Decide, then tell the org's owners (FLOTTA-143).
 
@@ -1423,8 +1485,15 @@ def create_app(
 
         store = store_factory()
         try:
-            org = store.decide_org(org_id, approve=approve, reason=reason)
+            org = store.decide_org(
+                org_id,
+                approve=approve,
+                reason=reason,
+                starting_cap_eur_nano=starting_cap_eur_nano,
+                by=by,
+            )
             owners = _owners(store, org_id)
+            cap = store.starting_cap(org_id) if approve else None
         except UnknownEntityError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except InvalidTransitionError as exc:
@@ -1441,7 +1510,12 @@ def create_app(
                 for email in owners
             ],
         )
-        return {"org": asdict(org), "told": told}
+        answer: dict[str, Any] = {"org": asdict(org), "told": told}
+        if approve:
+            from flotta.budgets import budget_dict
+
+            answer["starting_cap"] = budget_dict(cap) if cap is not None else None
+        return answer
 
     def _owners(store: Any, org_id: str) -> list[str]:
         """The addresses of an org's owners whose accounts are not disabled."""
