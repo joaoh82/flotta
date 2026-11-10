@@ -34,6 +34,25 @@ Three checks stand between that and a stored row:
 
 The store then allows an installation to one tenant at a time.
 
+## Asking GitHub cheaply (FLOTTA-180)
+
+The agent Settings tab asks which repositories an installation covers, and
+every git fetch an agent makes asks for a token, so this module is on the
+path of a click and of every fetch. Three things made each ask slow, and none
+of them needed to be paid more than once:
+
+- **The App's key is read once per App**, not once per JWT. Parsing the PEM
+  is ~23 ms of CPU, on a control plane with half a CPU.
+- **One HTTP client is kept per process**, so GitHub's TLS handshake (~30-40
+  ms) is paid once per connection rather than once per request.
+- **The read-only token that lists repositories is kept until shortly before
+  it expires.** It can read metadata and nothing else, so keeping it gives
+  nothing away; a token for one repository is still minted per ask, because
+  that one can push.
+
+`app_from_env` returns the same App for the same settings, which is what
+makes the first two last beyond one request.
+
 `fetch` is injected, so the suite never reaches GitHub.
 """
 
@@ -44,9 +63,12 @@ import binascii
 import hashlib
 import hmac
 import json
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
+from functools import lru_cache
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -73,6 +95,10 @@ _JWT_TTL_S = 540
 _REPOSITORIES_PER_PAGE = 100
 
 DEFAULT_TIMEOUT_S = 5.0
+
+#: A kept token is used only while it has at least this long left: a listing
+#: that starts with a token about to expire could otherwise end with a 401.
+_TOKEN_MARGIN_S = 5 * 60
 
 #: Separates a state's signature from a token's, which share the signing key.
 _STATE_DOMAIN = b"flotta-github-state\0"
@@ -177,15 +203,89 @@ def _unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+_CLIENT: Any = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _http_client() -> Any:
+    """One `httpx.Client` per process: its pool keeps connections to GitHub open.
+
+    `httpx.Client` is safe to share between threads, and the control plane's
+    routes run on a thread pool.
+    """
+    global _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is None:
+            import httpx
+
+            _CLIENT = httpx.Client()
+        return _CLIENT
+
+
 def _httpx_fetch(method: str, url: str, **kwargs: Any) -> tuple[int, Any]:
     """The status and the parsed body. Lazy: the CLI imports the control plane."""
-    import httpx
-
-    response = httpx.request(method, url, **kwargs)
+    response = _http_client().request(method, url, **kwargs)
     try:
         return response.status_code, response.json()
     except ValueError:
         return response.status_code, {}
+
+
+class _Kept:
+    """What one App keeps between asks: its parsed key and its listing tokens.
+
+    Mutable inside a frozen App, and locked, because one App serves every
+    request thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._key: Any = None
+        #: installation -> (token, when it expires, as a Unix time)
+        self._listing: dict[str, tuple[str, float]] = {}
+
+    def key(self, pem: str) -> Any:
+        with self._lock:
+            if self._key is None:
+                self._key = _load_rsa_key(pem)
+            return self._key
+
+    def listing_token(self, installation: str, now: float) -> str | None:
+        with self._lock:
+            kept = self._listing.get(installation)
+        if kept is None or kept[1] - _TOKEN_MARGIN_S <= now:
+            return None
+        return kept[0]
+
+    def keep_listing_token(self, installation: str, token: str, expires: float) -> None:
+        with self._lock:
+            self._listing[installation] = (token, expires)
+
+    def forget_listing_token(self, installation: str) -> None:
+        with self._lock:
+            self._listing.pop(installation, None)
+
+
+def _load_rsa_key(pem: str) -> Any:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    try:
+        key = serialization.load_pem_private_key(pem.encode(), password=None)
+    except ValueError:
+        # Not the exception's text: nothing near a key gets printed.
+        raise GitHubAppError(f"${PRIVATE_KEY_ENV} is not a readable PEM key") from None
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise GitHubAppError(f"${PRIVATE_KEY_ENV} is not an RSA key")
+    return key
+
+
+def _expiry(raw: Any) -> float | None:
+    """GitHub's `expires_at` as a Unix time, or None for anything else."""
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +300,7 @@ class GitHubApp:
     api_root: str = API_ROOT
     web_root: str = WEB_ROOT
     now: Callable[[], float] = time.time
+    _kept: _Kept = field(default_factory=_Kept, init=False, repr=False, compare=False)
 
     # -- where a person goes ---------------------------------------------------
 
@@ -305,18 +406,34 @@ class GitHubApp:
     def repositories(self, installation: str) -> tuple[list[str], bool]:
         """`owner/name` for what it covers, and whether there are more than these.
 
-        The token only reads this list and is then dropped, so it can do nothing else.
+        The token can read metadata and nothing else, so it is kept until
+        shortly before it expires rather than minted for every listing. If
+        GitHub refuses a kept one (the App was removed, or the token revoked),
+        it is dropped and a fresh one asked for once, which says why.
         """
-        token = self._installation_token(installation, {"permissions": {"metadata": "read"}})
-        status, body = self._ask(
-            "GET",
-            f"{self.api_root}/installation/repositories?per_page={_REPOSITORIES_PER_PAGE}",
-            headers={**API_HEADERS, "Authorization": f"Bearer {token}"},
-        )
+        kept = self._kept.listing_token(installation, self.now())
+        token = kept or self._listing_token(installation)
+        status, body = self._list_repositories(token)
+        if status == 401 and kept is not None:
+            self._kept.forget_listing_token(installation)
+            status, body = self._list_repositories(self._listing_token(installation))
         if status != 200:
             raise GitHubAppError(f"GitHub answered {status} listing repositories")
         names = [str(r["full_name"]).lower() for r in body.get("repositories") or []]
         return names, int(body.get("total_count") or 0) > len(names)
+
+    def _listing_token(self, installation: str) -> str:
+        token, expires = self._mint(installation, {"permissions": {"metadata": "read"}})
+        if expires is not None:
+            self._kept.keep_listing_token(installation, token, expires)
+        return token
+
+    def _list_repositories(self, token: str) -> tuple[int, Any]:
+        return self._ask(
+            "GET",
+            f"{self.api_root}/installation/repositories?per_page={_REPOSITORIES_PER_PAGE}",
+            headers={**API_HEADERS, "Authorization": f"Bearer {token}"},
+        )
 
     def installation_of(self, repository: str) -> str | None:
         """Which installation of this App covers `owner/name`, if any."""
@@ -334,11 +451,15 @@ class GitHubApp:
             raise GitHubAppError(f"GitHub answered {status} removing installation {installation}")
 
     def _installation_token(self, installation: str, body: dict[str, Any]) -> str:
+        return self._mint(installation, body)[0]
+
+    def _mint(self, installation: str, body: dict[str, Any]) -> tuple[str, float | None]:
+        """A new installation token, and when GitHub says it expires."""
         status, reply = self._as_app(
             "POST", f"/app/installations/{quote(installation)}/access_tokens", json=body
         )
         if status == 201 and reply.get("token"):
-            return str(reply["token"])
+            return str(reply["token"]), _expiry(reply.get("expires_at"))
         if status == 404:
             raise InstallationGone(f"GitHub has no installation {installation}")
         if status == 403:
@@ -353,8 +474,8 @@ class GitHubApp:
 
     def jwt(self) -> str:
         """The App signing as itself: RS256, with the client id as issuer."""
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
 
         moment = int(self.now())
         header = {"alg": "RS256", "typ": "JWT"}
@@ -366,13 +487,7 @@ class GitHubApp:
         signing_input = ".".join(
             _b64(json.dumps(part, separators=(",", ":")).encode()) for part in (header, claims)
         )
-        try:
-            key = serialization.load_pem_private_key(self.private_key.encode(), password=None)
-        except ValueError:
-            # Not the exception's text: nothing near a key gets printed.
-            raise GitHubAppError(f"${PRIVATE_KEY_ENV} is not a readable PEM key") from None
-        if not isinstance(key, rsa.RSAPrivateKey):
-            raise GitHubAppError(f"${PRIVATE_KEY_ENV} is not an RSA key")
+        key = self._kept.key(self.private_key)
         signature = key.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
         return f"{signing_input}.{_b64(signature)}"
 
@@ -391,13 +506,25 @@ def missing_settings(env: Mapping[str, str]) -> list[str]:
 
 
 def app_from_env(env: Mapping[str, str]) -> GitHubApp | None:
-    """The App this deployment is registered as, or `None` if it is not."""
+    """The App this deployment is registered as, or `None` if it is not.
+
+    The same settings give the same App, so what it keeps (its parsed key,
+    its listing tokens) lasts for the process rather than one request. New
+    settings give a new App, with nothing kept from the old one.
+    """
     if missing_settings(env):
         return None
-    return GitHubApp(
-        slug=env[SLUG_ENV].strip(),
-        client_id=env[CLIENT_ID_ENV].strip(),
-        client_secret=env[CLIENT_SECRET_ENV].strip(),
+    return _app_for(
+        env[SLUG_ENV].strip(),
+        env[CLIENT_ID_ENV].strip(),
+        env[CLIENT_SECRET_ENV].strip(),
         # A hosting dashboard may keep a PEM's line breaks as the two characters.
-        private_key=env[PRIVATE_KEY_ENV].strip().replace("\\n", "\n"),
+        env[PRIVATE_KEY_ENV].strip().replace("\\n", "\n"),
+    )
+
+
+@lru_cache(maxsize=4)
+def _app_for(slug: str, client_id: str, client_secret: str, private_key: str) -> GitHubApp:
+    return GitHubApp(
+        slug=slug, client_id=client_id, client_secret=client_secret, private_key=private_key
     )
