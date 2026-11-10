@@ -1819,6 +1819,45 @@ def test_the_machine_endpoint_reports_a_substrate_failure_rather_than_500ing(cli
     assert body["box"]["name"] == "eng-a"
 
 
+def _machine_timing(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "flotta.control.machine"]
+
+
+def test_a_machine_read_logs_how_long_fly_and_the_fleet_image_took(client, monkeypatch, caplog):
+    """FLOTTA-182: the page knew only when `/machine` finished, not what it waited on."""
+    from flotta.backend import MachineInfo
+
+    _fake_backend(monkeypatch, lambda box_id: MachineInfo(state="started"))
+    with caplog.at_level("INFO", logger="flotta.control.machine"):
+        client.get("/api/boxes/eng-a/machine")
+    (line,) = _machine_timing(caplog)
+    assert line.startswith("machine read for ")
+    assert " started in " in line and ", fleet image in " in line and line.endswith(" ms")
+
+
+def test_a_machine_read_that_failed_is_timed_too(client, monkeypatch, caplog):
+    from flotta.backend import BackendError
+
+    def boom(box_id):
+        raise BackendError("flyctl: not authenticated with secret-ish detail")
+
+    _fake_backend(monkeypatch, boom)
+    with caplog.at_level("INFO", logger="flotta.control.machine"):
+        client.get("/api/boxes/eng-a/machine")
+    (line,) = _machine_timing(caplog)
+    assert " unavailable in " in line
+    # The reason is the response's to carry, not the log's.
+    assert "not authenticated" not in line
+
+
+def test_servers_log_the_machine_timing_under_the_name_the_route_uses():
+    from flotta.control.app import MACHINE_TIMING_LOG
+    from flotta.server_logs import log_config
+
+    assert log_config()["loggers"][MACHINE_TIMING_LOG]["level"] == "INFO"
+    assert "flotta" not in log_config()["loggers"]
+
+
 def test_a_box_with_no_machine_yet_is_not_an_error(client, fleet, monkeypatch):
     """`provisioning` has a row and no endpoint. Saying "no machine yet" is the
     truth; an error about the substrate would be a lie about a creation that is
