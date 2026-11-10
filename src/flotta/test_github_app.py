@@ -426,3 +426,160 @@ def test_install_and_authorize_urls_carry_the_state():
         app.authorize_url("a.b+c")
         == "https://github.com/login/oauth/authorize?client_id=Iv1.client&state=a.b%2Bc"
     )
+
+
+# -- asking GitHub cheaply (FLOTTA-180) ---------------------------------------------
+
+
+def _at(moment):
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(moment, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+LISTED = (200, {"total_count": 1, "repositories": [{"full_name": "a/b"}]})
+
+
+def _listing_token(name="ghs_list", expires=NOW + 3600):
+    return (201, {"token": name, "expires_at": _at(expires)})
+
+
+def test_the_key_is_read_once_per_app(monkeypatch):
+    import flotta.github_app as module
+
+    reads = []
+    real = module._load_rsa_key
+    monkeypatch.setattr(module, "_load_rsa_key", lambda pem: reads.append(pem) or real(pem))
+    app, _ = _app()
+    first, second = app.jwt(), app.jwt()
+
+    assert len(reads) == 1
+    assert first.count(".") == second.count(".") == 2
+
+
+def test_an_unreadable_key_is_refused_every_time_not_kept_as_nothing():
+    app = GitHubApp(slug="s", client_id="c", client_secret="x", private_key="not-a-pem")
+    for _ in range(2):
+        with pytest.raises(GitHubAppError, match="not a readable PEM key"):
+            app.jwt()
+
+
+def test_the_listing_token_is_kept_until_shortly_before_it_expires():
+    clock = [NOW]
+    fetch, seen = _github(_listing_token(), LISTED, LISTED, _listing_token("ghs_new"), LISTED)
+    app = GitHubApp(
+        slug="s",
+        client_id="c",
+        client_secret="x",
+        private_key=PEM,
+        fetch=fetch,
+        now=lambda: clock[0],
+    )
+
+    app.repositories("77")
+    app.repositories("77")
+    assert [r["method"] for r in seen] == ["POST", "GET", "GET"]
+    assert seen[2]["headers"]["Authorization"] == "Bearer ghs_list"
+
+    clock[0] = NOW + 3600 - 299  # under five minutes left: not worth starting with
+    app.repositories("77")
+    assert [r["method"] for r in seen[3:]] == ["POST", "GET"]
+    assert seen[4]["headers"]["Authorization"] == "Bearer ghs_new"
+
+
+def test_each_installation_keeps_its_own_listing_token():
+    app, seen = _app(_listing_token("ghs_77"), LISTED, _listing_token("ghs_88"), LISTED, LISTED)
+    app.repositories("77")
+    app.repositories("88")
+    app.repositories("77")
+
+    assert seen[-1]["headers"]["Authorization"] == "Bearer ghs_77"
+    assert "/installations/88/" in seen[2]["url"]
+
+
+def test_a_kept_token_github_refuses_is_replaced_once():
+    app, seen = _app(
+        _listing_token("ghs_old"), LISTED, (401, {}), _listing_token("ghs_new"), LISTED
+    )
+    app.repositories("77")
+
+    assert app.repositories("77") == (["a/b"], False)
+    assert [r["method"] for r in seen[2:]] == ["GET", "POST", "GET"]
+    assert seen[-1]["headers"]["Authorization"] == "Bearer ghs_new"
+
+
+def test_a_kept_token_for_a_removed_installation_ends_as_gone():
+    app, _ = _app(_listing_token(), LISTED, (401, {}), (404, {}))
+    app.repositories("77")
+    with pytest.raises(InstallationGone):
+        app.repositories("77")
+
+
+def test_a_fresh_token_refused_is_an_error_not_a_retry():
+    app, seen = _app(_listing_token(), (401, {}))
+    with pytest.raises(GitHubAppError, match="401"):
+        app.repositories("77")
+    assert len(seen) == 2
+
+
+def test_a_token_with_no_readable_expiry_is_not_kept():
+    app, seen = _app(
+        (201, {"token": "ghs_a", "expires_at": "later"}), LISTED, (201, {"token": "ghs_b"}), LISTED
+    )
+    app.repositories("77")
+    app.repositories("77")
+    assert [r["method"] for r in seen] == ["POST", "GET", "POST", "GET"]
+
+
+def test_a_token_that_can_push_is_never_kept():
+    app, seen = _app(_listing_token("ghs_one"), _listing_token("ghs_two"))
+    assert app.token_for("77", "site") == "ghs_one"
+    assert app.token_for("77", "site") == "ghs_two"
+    assert len(seen) == 2
+
+
+def test_the_same_settings_give_the_same_app_and_new_ones_a_new_app():
+    first = app_from_env(_env())
+    assert app_from_env(_env()) is first
+    assert app_from_env(_env() | {"FLOTTA_GITHUB_APP_SLUG": "other"}) is not first
+
+
+def test_what_an_app_keeps_stays_out_of_its_repr_and_equality():
+    import dataclasses
+
+    app, _ = _app(_listing_token("ghs_secretish"), LISTED)
+    app.repositories("77")
+    assert "ghs_secretish" not in repr(app)
+    assert dataclasses.replace(app) == app
+
+
+def test_a_fresh_token_refused_is_not_kept_for_the_next_ask():
+    app, seen = _app(_listing_token("ghs_refused"), (401, {}), _listing_token("ghs_new"), LISTED)
+    with pytest.raises(GitHubAppError):
+        app.repositories("77")
+
+    assert app.repositories("77") == (["a/b"], False)
+    assert [r["method"] for r in seen[2:]] == ["POST", "GET"]
+    assert seen[-1]["headers"]["Authorization"] == "Bearer ghs_new"
+
+
+def test_every_request_goes_through_the_one_http_client(monkeypatch):
+    import flotta.github_app as module
+
+    asked = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True}
+
+    class Client:
+        def request(self, method, url, **kwargs):
+            asked.append((method, url))
+            return Response()
+
+    monkeypatch.setattr(module, "_CLIENT", Client())
+    assert module._httpx_fetch("GET", "https://api.github.com/x", timeout=1) == (200, {"ok": True})
+    assert module._httpx_fetch("GET", "https://api.github.com/y", timeout=1) == (200, {"ok": True})
+    assert asked == [("GET", "https://api.github.com/x"), ("GET", "https://api.github.com/y")]
