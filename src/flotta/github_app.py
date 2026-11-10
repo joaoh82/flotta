@@ -53,6 +53,23 @@ of them needed to be paid more than once:
 `app_from_env` returns the same App for the same settings, which is what
 makes the first two last beyond one request.
 
+## Suggesting repositories without asking GitHub (FLOTTA-193)
+
+With the token kept, the listing itself was still 0.85-1 s on production, with
+the odd 4 s, on every open of the Settings tab. `suggested_repositories`
+keeps each installation's list:
+
+- **Fresh for `_LISTING_FRESH_S`.** Answered from what is kept.
+- **Then stale, up to `_LISTING_STALE_MAX_S`.** Answered from what is kept at
+  once, while one refresh runs on a thread. The panel is at most one open
+  behind GitHub.
+- **Past that, or with nothing kept,** the read waits for GitHub, one ask per
+  installation at a time: reads that arrive together share it.
+
+It is only a suggestion — a name missing from it can still be typed, and a
+grant is checked against GitHub when it is made — which is what makes a list a
+minute old harmless. Connecting or disconnecting an account forgets its list.
+
 **Each ask is timed in the logs** (`TIMING_LOG`): the call's shape, GitHub's
 status and how long it took, and for a listing whether its token was kept or
 minted. The shape keeps the API's own words and installation ids and hides
@@ -119,6 +136,21 @@ _SHOWN_SEGMENTS = frozenset(
 #: that starts with a token about to expire could otherwise end with a 401.
 _TOKEN_MARGIN_S = 5 * 60
 
+#: How long a kept repository list is answered as it is (FLOTTA-193).
+_LISTING_FRESH_S = 60.0
+
+#: How long a stale list may be answered while a refresh runs behind it. Past
+#: this a read waits for GitHub again, so a refresh that keeps failing cannot
+#: go on suggesting a list nobody has confirmed for a quarter of an hour.
+_LISTING_STALE_MAX_S = 15 * 60.0
+
+#: How long a read waits for another ask of the same installation's list
+#: before asking GitHub itself. One listing is at most three requests of
+#: `DEFAULT_TIMEOUT_S` each (a refused token, a new one, the list again), so
+#: an ask still running after this is stuck, and waiting on it would make the
+#: Settings tab hang behind a refresh nobody is watching.
+_LISTING_WAIT_S = 3 * DEFAULT_TIMEOUT_S + 5
+
 #: Separates a state's signature from a token's, which share the signing key.
 _STATE_DOMAIN = b"flotta-github-state\0"
 
@@ -137,6 +169,17 @@ class RepositoryNotSelected(GitHubAppError):
 
 class NotProven(GitHubAppError):
     """GitHub did not confirm that this person may connect that account."""
+
+
+@dataclass(frozen=True, slots=True)
+class Listing:
+    """What an installation covers, as suggested, and where the answer came from."""
+
+    names: tuple[str, ...]
+    #: Whether GitHub has more than this page.
+    more: bool
+    #: `kept` (fresh), `stale` (a refresh is running behind it) or `github`.
+    source: str
 
 
 class BadState(ValueError):
@@ -262,6 +305,15 @@ class _Kept:
         self._key: Any = None
         #: installation -> (token, when it expires, as a Unix time)
         self._listing: dict[str, tuple[str, float]] = {}
+        #: installation -> (when it was asked for, names, whether there are more)
+        self._lists: dict[str, tuple[float, tuple[str, ...], bool]] = {}
+        #: installation -> held for the whole of one ask of GitHub for its list
+        self._asking: dict[str, threading.Lock] = {}
+        #: installation -> how many times its list has been forgotten. An ask
+        #: notes it before asking and keeps its answer only if it is unchanged,
+        #: so an answer GitHub gave before a reconnect or a disconnect cannot
+        #: be kept after it — whether nothing was kept when it started or not.
+        self._generations: dict[str, int] = {}
 
     def key(self, pem: str) -> Any:
         with self._lock:
@@ -283,6 +335,45 @@ class _Kept:
     def forget_listing_token(self, installation: str) -> None:
         with self._lock:
             self._listing.pop(installation, None)
+
+    def repository_list(self, installation: str) -> tuple[float, tuple[str, ...], bool] | None:
+        with self._lock:
+            return self._lists.get(installation)
+
+    def generation(self, installation: str) -> int:
+        with self._lock:
+            return self._generations.get(installation, 0)
+
+    def keep_repository_list(
+        self,
+        installation: str,
+        kept: tuple[float, tuple[str, ...], bool],
+        *,
+        generation: int,
+    ) -> bool:
+        """Keep a list asked for at `generation`, unless it has been forgotten
+        since, or a list asked for later is already kept."""
+        with self._lock:
+            if self._generations.get(installation, 0) != generation:
+                return False
+            current = self._lists.get(installation)
+            if current is not None and current[0] > kept[0]:
+                return False
+            self._lists[installation] = kept
+            return True
+
+    def forget_repository_list(self, installation: str) -> None:
+        with self._lock:
+            self._lists.pop(installation, None)
+            self._generations[installation] = self._generations.get(installation, 0) + 1
+
+    def asking(self, installation: str) -> threading.Lock:
+        with self._lock:
+            return self._asking.setdefault(installation, threading.Lock())
+
+
+def _spawn_thread(work: Callable[[], None]) -> None:
+    threading.Thread(target=work, name="flotta-github-listing", daemon=True).start()
 
 
 def _load_rsa_key(pem: str) -> Any:
@@ -347,6 +438,11 @@ class GitHubApp:
     api_root: str = API_ROOT
     web_root: str = WEB_ROOT
     now: Callable[[], float] = time.time
+    #: Runs a stale list's refresh. A daemon thread; the suite runs it inline,
+    #: or keeps it to run when a test says.
+    spawn: Callable[[Callable[[], None]], None] = field(
+        default=_spawn_thread, repr=False, compare=False
+    )
     _kept: _Kept = field(default_factory=_Kept, init=False, repr=False, compare=False)
 
     # -- where a person goes ---------------------------------------------------
@@ -482,6 +578,85 @@ class GitHubApp:
             raise GitHubAppError(f"GitHub answered {status} listing repositories")
         names = [str(r["full_name"]).lower() for r in body.get("repositories") or []]
         return names, int(body.get("total_count") or 0) > len(names)
+
+    def suggested_repositories(self, installation: str) -> Listing:
+        """What `installation` covers, to suggest while granting — kept briefly.
+
+        See "Suggesting repositories without asking GitHub" above. Raises
+        `GitHubAppError` only when it had to wait for GitHub and GitHub could
+        not answer. A stale list is answered without one, and a refresh that
+        fails keeps it, unless GitHub says the installation is gone, which
+        forgets it so the next open says so.
+        """
+        now = self.now()
+        kept = self._kept.repository_list(installation)
+        if kept is not None:
+            age = now - kept[0]
+            if age < _LISTING_FRESH_S:
+                return Listing(kept[1], kept[2], "kept")
+            if age < _LISTING_STALE_MAX_S:
+                self._refresh_repository_list(installation)
+                return Listing(kept[1], kept[2], "stale")
+
+        asking = self._kept.asking(installation)
+        held = asking.acquire(timeout=_LISTING_WAIT_S)
+        try:
+            # Somebody else may have been asking while this waited.
+            kept = self._kept.repository_list(installation)
+            if kept is not None and now - kept[0] < _LISTING_FRESH_S:
+                return Listing(kept[1], kept[2], "kept")
+            # Noted before asking: a reconnect while GitHub answers this one
+            # forgets the list, and this answer, from before it, is not kept.
+            generation = self._kept.generation(installation)
+            names, more = self.repositories(installation)
+            self._kept.keep_repository_list(
+                installation, (now, tuple(names), more), generation=generation
+            )
+            return Listing(tuple(names), more, "github")
+        finally:
+            if held:
+                asking.release()
+
+    def forget_repositories(self, installation: str) -> None:
+        """Ask GitHub on the next suggestion: the account was connected again,
+        or disconnected."""
+        self._kept.forget_repository_list(installation)
+
+    def _refresh_repository_list(self, installation: str) -> None:
+        asking = self._kept.asking(installation)
+        if not asking.acquire(blocking=False):
+            return  # one is already running, and its answer is the refresh
+
+        started = self.now()
+        generation = self._kept.generation(installation)
+
+        def work() -> None:
+            try:
+                names, more = self.repositories(installation)
+            except InstallationGone:
+                # Not a bad minute: the App is off that account. Suggesting
+                # its repositories for another quarter of an hour would be a
+                # list of names that can never be granted.
+                self._kept.forget_repository_list(installation)
+            except Exception as exc:  # noqa: BLE001 - nobody to tell but the log
+                _log.info(
+                    "github listing for installation %s: refresh failed (%s), kept the last",
+                    installation,
+                    type(exc).__name__,
+                )
+            else:
+                self._kept.keep_repository_list(
+                    installation,
+                    (started, tuple(names), more),
+                    generation=generation,
+                )
+            finally:
+                asking.release()
+
+        try:
+            self.spawn(work)
+        except Exception:  # noqa: BLE001 - no thread is no refresh, not a failed read
+            asking.release()
 
     def _listing_token(self, installation: str) -> str:
         token, expires = self._mint(installation, {"permissions": {"metadata": "read"}})

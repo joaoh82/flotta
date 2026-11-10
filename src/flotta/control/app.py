@@ -1753,6 +1753,9 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
+        # Somebody who just picked repositories on GitHub should see them on the
+        # next open, not a minute later (FLOTTA-193).
+        app_.forget_repositories(state.installation)
         _refresh_authors(held.org, held.client, "connected")
         return {"org": held.org, "client": held.client, "account": held.account}
 
@@ -1803,13 +1806,15 @@ def create_app(
             held = store.github_installation(org_id, installation_id)
             if held is None:
                 raise HTTPException(status_code=404, detail="no such GitHub connection")
+            app_ = _configured_github_app()
             try:
-                _configured_github_app().uninstall(installation_id)
+                app_.uninstall(installation_id)
             except GitHubAppError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             store.disconnect_github(org_id, installation_id)
         finally:
             store.close()
+        app_.forget_repositories(installation_id)
         # The grants ended with the row; the name on its boxes ends here.
         _refresh_authors(org_id, held.client, "disconnected")
         return {"disconnected": installation_id}
@@ -6723,6 +6728,12 @@ def create_app(
         remembering one. Only a suggestion: `problems` says which accounts could
         not be asked, and a name missing here can still be typed and checked.
         `suggest=false` skips GitHub, for a page redrawing itself on a timer.
+
+        Each account's list is kept briefly (FLOTTA-193,
+        `GitHubApp.suggested_repositories`): a repeat open answers from it, and
+        one more than a minute later answers from it while a refresh runs.
+        Accounts that do have to wait for GitHub are asked side by side rather
+        than one after another.
         """
         from flotta.github_app import TIMING_LOG, GitHubAppError
 
@@ -6738,24 +6749,40 @@ def create_app(
         problems: list[str] = []
         asked = connected if suggest else []
         started = time.perf_counter()
-        for installation in asked:
-            if app_ is None:
-                problems.append(installation.account)
-                continue
-            try:
-                listed, more = app_.repositories(installation.installation_id)
-            except GitHubAppError:
-                problems.append(installation.account)
-                continue
-            names += listed
-            truncated = truncated or more
+        sources: list[str] = []
+        if app_ is None:
+            problems += [installation.account for installation in asked]
+        else:
+
+            def suggest_from(installation: Any) -> Any:
+                try:
+                    return app_.suggested_repositories(installation.installation_id)
+                except GitHubAppError:
+                    return None
+
+            if len(asked) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=min(len(asked), 4)) as pool:
+                    answers = list(pool.map(suggest_from, asked))
+            else:
+                answers = [suggest_from(installation) for installation in asked]
+            for installation, listing in zip(asked, answers, strict=True):
+                if listing is None:
+                    problems.append(installation.account)
+                    continue
+                names += listing.names
+                truncated = truncated or listing.more
+                sources.append(listing.source)
         if asked:
-            # One line per page: how many accounts were asked, one after another (FLOTTA-180).
+            # One line per page: how many accounts were asked, and whether each
+            # answer was kept, stale or GitHub's (FLOTTA-180, FLOTTA-193).
             logging.getLogger(TIMING_LOG).info(
-                "github repositories for %s: %d account(s) asked in %.0f ms, %d problem(s)",
+                "github repositories for %s: %d account(s) asked in %.0f ms (%s), %d problem(s)",
                 box.id,
                 len(asked),
                 (time.perf_counter() - started) * 1000,
+                ", ".join(sources) or "no answers",
                 len(problems),
             )
         return {
