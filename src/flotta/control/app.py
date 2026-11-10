@@ -965,7 +965,8 @@ def create_app(
         if is_governor(token):
             # The hosted product's billing credential is the default org's and
             # unconfined, so it looks like the operator's. It is not one: it
-            # may read and set orgs' limits and nothing else (FLOTTA-183).
+            # may read and set orgs' limits (FLOTTA-183) and suspend and resume
+            # them (FLOTTA-184), and nothing else.
             return False
         return (
             (token.org or DEFAULT_ORG) == DEFAULT_ORG
@@ -3747,7 +3748,7 @@ def create_app(
         after saving — `changed_at` is what lets it decide, by comparing
         against the session it was about to resume.
         """
-        from flotta.provision import ProvisionError
+        from flotta.provision import OrgSuspended, ProvisionError
         from flotta.provision import set_instructions as write_soul
         from flotta.store import InvalidBoxMetaError
 
@@ -3763,6 +3764,9 @@ def create_app(
                 return {**written, "changed_at": _epoch(written["changed_at"])}
             except InvalidBoxMetaError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except OrgSuspended as exc:
+                # What the wake answers, so the web app reads one status (FLOTTA-184).
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 # 409, not 500: the fleet is fine and the request was
                 # well-formed — this box could not be written to right now.
@@ -3795,7 +3799,7 @@ def create_app(
         A full replace: a list left out is emptied. The enforced half reaches the
         agent's next command, the guidance its next conversation.
         """
-        from flotta.provision import ProvisionError, set_rules
+        from flotta.provision import OrgSuspended, ProvisionError, set_rules
         from flotta.rules import RulesError, parse_rules, rules_from_json
 
         store = store_factory()
@@ -3810,6 +3814,8 @@ def create_app(
             by = token.subject if token is not None else "operator"
             try:
                 written = set_rules(box.id, rules, store=store, by=by)
+            except OrgSuspended as exc:
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             return {**written, "changed_at": _epoch(written["changed_at"])}
@@ -5234,6 +5240,7 @@ def create_app(
         from fastapi.responses import JSONResponse
 
         from flotta.provision import (
+            OrgSuspended,
             ProvisionError,
             UpgradeFailed,
             gateway_url,
@@ -5257,6 +5264,8 @@ def create_app(
                 )
             try:
                 movable_box(box.id, store)
+            except OrgSuspended as exc:
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if not background:

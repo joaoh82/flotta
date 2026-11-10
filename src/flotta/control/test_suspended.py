@@ -282,6 +282,31 @@ def test_its_running_agents_are_put_to_sleep_and_their_runs_end(fleet, machine):
     assert machine.calls == ["suspend"]
 
 
+def test_an_agent_a_budget_already_paused_is_put_to_sleep_too(fleet, machine):
+    """The review of #220. A budget moves the row to `paused` at once and leaves
+    the machine up until it is quiet, and never stops it under a live task. So
+    the agency a failed payment finds may well have an agent `paused` with its
+    machine up and a run going, which a sweep of `running` boxes never sees."""
+    from flotta.provision import sleep_suspended_orgs
+
+    box = _box(fleet)
+    with FleetStore(fleet) as store:
+        store.update_box_status(box.id, "running")
+        run = store.create_run(box.id, "a long job", trigger_kind="api")
+        store.start_run(run.id)
+        store.update_box_status(box.id, "paused")
+    machine.machine_state = "started"
+    _suspend(fleet)
+    with FleetStore(fleet) as store:
+        assert sleep_suspended_orgs(store) == [{"box_id": box.id, "slept": True}]
+        assert store.get_run(run.id).status == "budget_blocked"
+        # Still the budget's to release: suspension only stopped the machine.
+        assert store.get_box(box.id).status == "paused"
+        # Asleep now, so the next sweep has nothing to do.
+        assert sleep_suspended_orgs(store) == []
+    assert machine.calls == ["suspend"]
+
+
 def test_suspending_through_the_api_sleeps_its_agents_after_answering(api, fleet, machine):
     box = _box(fleet)
     with FleetStore(fleet) as store:
@@ -356,6 +381,39 @@ def test_an_invite_sent_before_it_was_suspended_joins_nobody_and_is_kept(api, fl
         assert store.login_link(secret) is not None
     _resume(fleet)
     assert api.post("/api/auth/redeem", json={"secret": secret}).status_code == 200
+
+
+def test_nobody_is_moved_into_a_seat(api, fleet):
+    """The review of #220: a role change is the other way a free role becomes a
+    seat, and the seat limit already counts it as one."""
+    with FleetStore(fleet) as store:
+        viewer = store.create_user("cy@acme.test")
+        store.add_membership(viewer.id, "agency-x", "client_viewer", client_id="acme")
+    _suspend(fleet)
+    refused = api.patch(
+        f"/api/orgs/agency-x/members/{viewer.id}", headers=OWNER, json={"role": "member"}
+    )
+    assert refused.status_code == 403, refused.text
+    assert "suspended" in refused.json()["detail"]
+    with FleetStore(fleet) as store:
+        assert store.membership(viewer.id, "agency-x").role == "client_viewer"
+        with pytest.raises(OrgNotActiveError):
+            store.change_membership(viewer.id, "agency-x", "owner")
+
+
+def test_writing_to_its_agents_says_why_with_a_402(api, fleet, machine):
+    """Instructions and rules reach the machine, so they meet the same refusal as
+    a wake, and answer it the same way: 402, which is what the web app reads."""
+    _suspend(fleet)
+    box = _box(fleet)
+    answer = api.put(
+        f"/api/boxes/{box.id}/instructions", headers=OWNER, json={"instructions": "Be brief."}
+    )
+    assert answer.status_code == 402, answer.text
+    assert "suspended" in answer.json()["detail"]
+    rules = api.put(f"/api/boxes/{box.id}/rules", headers=OWNER, json={"always": ["be kind"]})
+    assert rules.status_code == 402, rules.text
+    assert machine.calls == []
 
 
 def test_its_people_still_sign_in_and_read(api, fleet):

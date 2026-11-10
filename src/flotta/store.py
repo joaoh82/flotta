@@ -2172,6 +2172,9 @@ class FleetStore:
             # Into a seat from a free role: the org's limit on seats applies,
             # as it does to a new member (FLOTTA-183).
             if role in SEAT_ROLES and membership.role not in SEAT_ROLES:
+                # A seat is made here as much as in `add_membership`, so a
+                # suspended org is refused here too (FLOTTA-184).
+                self._refuse_suspended(org_id, "move anyone into a seat")
                 self._check_room(org_id, "seats")
             if membership.role == "owner" and role != "owner":
                 owners = [m for m in self.members_of(org_id) if m.role == "owner"]

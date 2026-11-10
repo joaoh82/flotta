@@ -4027,23 +4027,41 @@ def sleep_suspended_orgs(
     outcomes: list[dict[str, Any]] = []
     for org in orgs:
         for box in store.list_boxes_in(org.id):
-            if box.status != "running":
+            if box.status not in ("running", "paused"):
                 continue
             try:
-                for task in store.list_tasks(box_id=box.id):
-                    if is_terminal("task", task.status):
-                        continue
-                    with contextlib.suppress(InvalidTransitionError):
-                        store.finish_run(task.id, "budget_blocked", error_class="suspended")
-                        store.add_event(
-                            "task", task.id, "budget_blocked", {"error": "its org was suspended"}
-                        )
-                result = stop_box(box.id, store=store, reason="org_suspended", backend=backend)
-                outcomes.append({"box_id": box.id, "slept": not result["already_stopped"]})
+                if box.status == "running":
+                    _end_live_runs(store, box)
+                    result = stop_box(box.id, store=store, reason="org_suspended", backend=backend)
+                    outcomes.append({"box_id": box.id, "slept": not result["already_stopped"]})
+                    continue
+                # Paused by a budget, which moves the row at once and leaves the
+                # machine up until it is quiet, and never stops it under a live
+                # task. `stop_box` takes only a running box, so the machine is
+                # stopped here; the row stays `paused`, the budget's to release.
+                impl = _resolve_backend(box, backend)
+                target = box.endpoint or box.id
+                if _observed_state(impl, target, assume="unknown") != "started":
+                    continue
+                _end_live_runs(store, box)
+                method = _pause(impl, target, prefer_suspend=True)
+                store.add_event("box", box.id, "org_suspended_machine_slept", {"method": method})
+                outcomes.append({"box_id": box.id, "slept": True})
             except (ProvisionError, BackendError) as exc:
                 _log.warning("could not put %s of suspended %s to sleep: %s", box.name, org.id, exc)
                 outcomes.append({"box_id": box.id, "error": str(exc)})
     return outcomes
+
+
+def _end_live_runs(store: FleetStore, box: Box) -> None:
+    """A suspended org's agent's unfinished runs, ended `budget_blocked` as
+    `suspended`: they would only fail once its machine stopped."""
+    for task in store.list_tasks(box_id=box.id):
+        if is_terminal("task", task.status):
+            continue
+        with contextlib.suppress(InvalidTransitionError):  # its own end got there first
+            store.finish_run(task.id, "budget_blocked", error_class="suspended")
+            store.add_event("task", task.id, "budget_blocked", {"error": "its org was suspended"})
 
 
 def _a_turn(store: FleetStore, task_id: str) -> bool:
