@@ -553,7 +553,33 @@ def test_what_an_app_keeps_stays_out_of_its_repr_and_equality():
     assert dataclasses.replace(app) == app
 
 
-def test_one_http_client_serves_every_request():
+def test_a_fresh_token_refused_is_not_kept_for_the_next_ask():
+    app, seen = _app(_listing_token("ghs_refused"), (401, {}), _listing_token("ghs_new"), LISTED)
+    with pytest.raises(GitHubAppError):
+        app.repositories("77")
+
+    assert app.repositories("77") == (["a/b"], False)
+    assert [r["method"] for r in seen[2:]] == ["POST", "GET"]
+    assert seen[-1]["headers"]["Authorization"] == "Bearer ghs_new"
+
+
+def test_every_request_goes_through_the_one_http_client(monkeypatch):
     import flotta.github_app as module
 
-    assert module._http_client() is module._http_client()
+    asked = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True}
+
+    class Client:
+        def request(self, method, url, **kwargs):
+            asked.append((method, url))
+            return Response()
+
+    monkeypatch.setattr(module, "_CLIENT", Client())
+    assert module._httpx_fetch("GET", "https://api.github.com/x", timeout=1) == (200, {"ok": True})
+    assert module._httpx_fetch("GET", "https://api.github.com/y", timeout=1) == (200, {"ok": True})
+    assert asked == [("GET", "https://api.github.com/x"), ("GET", "https://api.github.com/y")]

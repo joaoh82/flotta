@@ -417,6 +417,10 @@ class GitHubApp:
         if status == 401 and kept is not None:
             self._kept.forget_listing_token(installation)
             status, body = self._list_repositories(self._listing_token(installation))
+        if status == 401:
+            # Kept when it was minted, before GitHub refused it: the next ask
+            # should start with a fresh one, not spend a request on this.
+            self._kept.forget_listing_token(installation)
         if status != 200:
             raise GitHubAppError(f"GitHub answered {status} listing repositories")
         names = [str(r["full_name"]).lower() for r in body.get("repositories") or []]
