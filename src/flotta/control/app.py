@@ -683,9 +683,11 @@ def create_app(
         resolve_app_url,
         resolve_mailer,
         resolve_reply_to,
+        resumed_message,
         sign_in_message,
         sign_in_url,
         sign_up_message,
+        suspended_message,
     )
 
     resolved_interval = interval_s
@@ -969,7 +971,8 @@ def create_app(
         if is_governor(token):
             # The hosted product's billing credential is the default org's and
             # unconfined, so it looks like the operator's. It is not one: it
-            # may read and set orgs' limits and nothing else (FLOTTA-183).
+            # may read and set orgs' limits (FLOTTA-183) and suspend and resume
+            # them (FLOTTA-184), and nothing else.
             return False
         return (
             (token.org or DEFAULT_ORG) == DEFAULT_ORG
@@ -1197,6 +1200,19 @@ def create_app(
             content={"detail": str(exc), "limit": {"kind": exc.kind, "limit": exc.limit}},
         )
 
+    @app.exception_handler(OrgNotActiveError)
+    def _org_not_active(_request: Request, exc: OrgNotActiveError) -> Any:
+        """403 wherever an org that is not active is refused a create.
+
+        The routes that met it before (agents, invites) caught it themselves.
+        A suspended org is refused in more places (FLOTTA-184: clients, people,
+        an invite's redeem), and the store is where it is held, so one handler
+        answers for every route that reaches it, as for an org's limits.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
     @app.get("/health")
     def health() -> Any:
         """Liveness, and whether the reconcile loop is actually sweeping.
@@ -1408,13 +1424,114 @@ def create_app(
         store = store_factory()
         try:
             org = store.decide_org(org_id, approve=approve, reason=reason)
-            owners = [
-                user.email
-                for m in store.members_of(org_id)
-                if m.role == "owner"
-                and (user := store.get_user(m.user_id)) is not None
-                and user.disabled_at is None
-            ]
+            owners = _owners(store, org_id)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        told = _tell_owners(
+            tasks,
+            org_id,
+            [
+                approved_message(email, link_base, org.name, reply_to=reply_to)
+                if approve
+                else declined_message(email, link_base, org.name, reason, reply_to=reply_to)
+                for email in owners
+            ],
+        )
+        return {"org": asdict(org), "told": told}
+
+    def _owners(store: Any, org_id: str) -> list[str]:
+        """The addresses of an org's owners whose accounts are not disabled."""
+        return [
+            user.email
+            for m in store.members_of(org_id)
+            if m.role == "owner"
+            and (user := store.get_user(m.user_id)) is not None
+            and user.disabled_at is None
+        ]
+
+    def _tell_owners(tasks: BackgroundTasks, org_id: str, messages: list[Message]) -> int | None:
+        """Queue each owner's message for after the response; how many, as `told`.
+
+        `null` when messages are printed to the log rather than emailed, and 0
+        when there is no way to send them.
+        """
+        if deliver_link is None:
+            return 0
+        for message in messages:
+            tasks.add_task(_tell_owner, message, org_id)
+        return None if deliver_link is print_mailer else len(messages)
+
+    def _tell_owner(message: Message, org_id: str) -> None:
+        """One owner's message, after the response. A failure is logged, never raised."""
+        assert deliver_link is not None
+        try:
+            deliver_link(message)
+        except Exception:  # noqa: BLE001 - the change stands; the log says who was not told
+            _log.exception("could not tell %s about %s (%s)", message.to, org_id, message.kind)
+
+    # -- suspending an org (FLOTTA-184, M15.2) --------------------------------
+    #
+    # How a final failed payment ends: the hosted product's billing suspends an
+    # org once its payment's retries give up, and resumes it when it pays. The
+    # store holds the rule; these say who may, and tell the owners.
+
+    @app.post("/api/orgs/{org_id}/suspend")
+    def suspend_org(
+        org_id: str,
+        tasks: BackgroundTasks,
+        body: dict[str, Any] | None = None,
+        token: Token | None = needs_limits_write,
+    ) -> Any:
+        """Suspend an active org: nothing of it runs or is created until resumed.
+
+        `{"reason": "..."}` is optional, kept on the org and sent to its owners.
+        Its running agents are put to sleep after the response. Suspending one
+        already suspended answers `changed: false` and tells nobody again, so a
+        billing webhook delivered twice is harmless. The operator's, or billing's.
+        """
+        reason = str((body or {}).get("reason") or "").strip()
+        if len(reason) > DECLINE_REASON_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=f"a reason has at most {DECLINE_REASON_MAX} characters",
+            )
+        return _set_suspended(org_id, tasks, token, suspend=True, reason=reason or None)
+
+    @app.post("/api/orgs/{org_id}/resume")
+    def resume_org(
+        org_id: str, tasks: BackgroundTasks, token: Token | None = needs_limits_write
+    ) -> Any:
+        """Resume a suspended org. Wakes nothing: its agents wake when next addressed."""
+        return _set_suspended(org_id, tasks, token, suspend=False)
+
+    def _set_suspended(
+        org_id: str,
+        tasks: BackgroundTasks,
+        token: Token | None,
+        *,
+        suspend: bool,
+        reason: str | None = None,
+    ) -> Any:
+        from dataclasses import asdict
+
+        verb = "suspend" if suspend else "resume"
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            raise HTTPException(
+                status_code=403,
+                detail=f"only the fleet's operator, or its billing, may {verb} an org",
+            )
+        by = token.subject if token is not None else "operator"
+        store = store_factory()
+        try:
+            if suspend:
+                org, changed = store.suspend_org(org_id, reason=reason, by=by)
+            else:
+                org, changed = store.resume_org(org_id, by=by)
+            owners = _owners(store, org_id) if changed else []
         except UnknownEntityError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except InvalidTransitionError as exc:
@@ -1422,24 +1539,34 @@ def create_app(
         finally:
             store.close()
         told: int | None = 0
-        if deliver_link is not None:
-            for email in owners:
-                message = (
-                    approved_message(email, link_base, org.name, reply_to=reply_to)
-                    if approve
-                    else declined_message(email, link_base, org.name, reason, reply_to=reply_to)
-                )
-                tasks.add_task(_tell_decided, message, org_id)
-            told = None if deliver_link is print_mailer else len(owners)
-        return {"org": asdict(org), "told": told}
+        if changed:
+            _log.info("%s %sed by %s%s", org_id, verb, by, f": {reason}" if reason else "")
+            if suspend:
+                tasks.add_task(_sleep_suspended, org_id)
+            told = _tell_owners(
+                tasks,
+                org_id,
+                [
+                    suspended_message(email, link_base, org.name, reason, reply_to=reply_to)
+                    if suspend
+                    else resumed_message(email, link_base, org.name, reply_to=reply_to)
+                    for email in owners
+                ],
+            )
+        return {"org": asdict(org), "changed": changed, "told": told}
 
-    def _tell_decided(message: Message, org_id: str) -> None:
-        """One owner's message, after the response. A failure is logged, never raised."""
-        assert deliver_link is not None
+    def _sleep_suspended(org_id: str) -> None:
+        """After a suspend's response: its running agents to sleep now. The
+        reconcile loop does the same each sweep, for anything this misses."""
+        from flotta.provision import sleep_suspended_orgs
+
+        store = store_factory()
         try:
-            deliver_link(message)
-        except Exception:  # noqa: BLE001 - the decision stands; the log says who was not told
-            _log.exception("could not tell %s that %s was decided", message.to, org_id)
+            sleep_suspended_orgs(store, org_id=org_id)
+        except Exception:  # noqa: BLE001 - the loop tries again next sweep
+            _log.exception("could not put %s's agents to sleep after suspending it", org_id)
+        finally:
+            store.close()
 
     # -- the operator's view (M12.9) ------------------------------------------
     #
@@ -3639,7 +3766,7 @@ def create_app(
         after saving — `changed_at` is what lets it decide, by comparing
         against the session it was about to resume.
         """
-        from flotta.provision import ProvisionError
+        from flotta.provision import OrgSuspended, ProvisionError
         from flotta.provision import set_instructions as write_soul
         from flotta.store import InvalidBoxMetaError
 
@@ -3655,6 +3782,9 @@ def create_app(
                 return {**written, "changed_at": _epoch(written["changed_at"])}
             except InvalidBoxMetaError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except OrgSuspended as exc:
+                # What the wake answers, so the web app reads one status (FLOTTA-184).
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 # 409, not 500: the fleet is fine and the request was
                 # well-formed — this box could not be written to right now.
@@ -3687,7 +3817,7 @@ def create_app(
         A full replace: a list left out is emptied. The enforced half reaches the
         agent's next command, the guidance its next conversation.
         """
-        from flotta.provision import ProvisionError, set_rules
+        from flotta.provision import OrgSuspended, ProvisionError, set_rules
         from flotta.rules import RulesError, parse_rules, rules_from_json
 
         store = store_factory()
@@ -3702,6 +3832,8 @@ def create_app(
             by = token.subject if token is not None else "operator"
             try:
                 written = set_rules(box.id, rules, store=store, by=by)
+            except OrgSuspended as exc:
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             return {**written, "changed_at": _epoch(written["changed_at"])}
@@ -5129,6 +5261,7 @@ def create_app(
         from fastapi.responses import JSONResponse
 
         from flotta.provision import (
+            OrgSuspended,
             ProvisionError,
             UpgradeFailed,
             gateway_url,
@@ -5152,6 +5285,8 @@ def create_app(
                 )
             try:
                 movable_box(box.id, store)
+            except OrgSuspended as exc:
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
             except ProvisionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if not background:
@@ -7119,12 +7254,18 @@ def create_app(
         from datetime import UTC
 
         from flotta.budgets import paused_message
-        from flotta.provision import BoxPaused, ProvisionError, wake_box
+        from flotta.provision import BoxPaused, ProvisionError, suspended_wake_message, wake_box
 
         store = store_factory()
         try:
             box = _routable_box(store, token, box_id)
-            # Before the activity: a tab left open must not hold a paused machine awake.
+            # Before the activity: a tab left open must not hold a paused machine
+            # awake, or a suspended org's (FLOTTA-184). 402 for both, which the door
+            # closes with as 4402 and the control plane's words; the web app tells
+            # them apart by the org's status on `/api/me`.
+            owner = store.get_org(box.org)
+            if owner is not None and owner.status == "suspended":
+                raise HTTPException(status_code=402, detail=suspended_wake_message(box, owner.id))
             if box.status == "paused":
                 raise HTTPException(
                     status_code=402, detail=paused_message(store, box, datetime.now(UTC))

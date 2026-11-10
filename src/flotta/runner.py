@@ -28,7 +28,10 @@ a socket and a machine awake.
 A run for a paused agent, or for one a stopping budget holds, ends
 `budget_blocked` without being delivered. Delivering is what wakes the machine,
 so a schedule must not undo what the budget did. A 402 from the door, a pause
-that landed between the check and the wake, ends the same way.
+that landed between the check and the wake, ends the same way. So does a run
+for a suspended org's agent (FLOTTA-184), as `budget_blocked` with
+`error_class="suspended"`: a run its agency hasn't paid for, which is what the
+status already says.
 
 ## An approval waits for a person
 
@@ -81,6 +84,7 @@ from flotta.store import (
     InvalidTransitionError,
     Run,
     is_terminal,
+    suspended_refusal,
 )
 
 _log = logging.getLogger("flotta.runner")
@@ -432,6 +436,19 @@ class RunLoop:
     def _blocked(self, store: FleetStore, run: Run, box: Box) -> bool:
         """End `run` as `budget_blocked` if its agent may not be woken now."""
         now = datetime.now(UTC)
+        org = store.get_org(box.org)
+        if org is not None and org.status == "suspended":
+            # FLOTTA-184: delivering would wake it. `budget_blocked`, not a status
+            # of its own: it is a run that was never delivered because of what
+            # the agency owes, which is what the status already means.
+            self._end(
+                store,
+                run.id,
+                "budget_blocked",
+                error_class="suspended",
+                output=suspended_refusal(org, "run its agents"),
+            )
+            return True
         if box.status == "paused":
             error_class = "paused"
         elif budgets.holding(store, box, now):

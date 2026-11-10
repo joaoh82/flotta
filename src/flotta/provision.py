@@ -86,6 +86,7 @@ from flotta.rules import Rules, config_changes, rules_from_json
 from flotta.runs import RUN_DEADLINE_S
 from flotta.store import (
     INSTRUCTIONS_CHANGED,
+    SUSPENDED_HINT,
     Box,
     FleetStore,
     InvalidTransitionError,
@@ -1675,7 +1676,7 @@ def set_instructions(
     # `exec` starts the machine itself. Only a torn-down box has no volume to
     # write to — refusing a sleeping one would refuse the normal case. A paused
     # one is another matter, since that start would wake it.
-    _refuse_paused(box)
+    _refuse_held(store, box)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
 
@@ -1750,7 +1751,7 @@ def _writable_box(box_id: str, store: FleetStore) -> Box:
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
     if box is None:
         raise ProvisionError(f"no box {box_id!r}")
-    _refuse_paused(box)
+    _refuse_held(store, box)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box.name} is {box.status}, so there is no volume to write to")
     if not box.endpoint:
@@ -2515,7 +2516,7 @@ def movable_box(box_id: str, store: FleetStore) -> tuple[Box, str]:
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to update.")
     # Removing a secret on Fly seems to start a stopped machine (FLOTTA-112).
-    _refuse_paused(box)
+    _refuse_held(store, box)
     if box.status == "provisioning" or not box.endpoint:
         raise ProvisionError(f"box {box_id} is still being created; wait for it to settle.")
     # Both write `FLOTTA_MODEL`, so a move landing last would undo the change while
@@ -3357,6 +3358,8 @@ def start_box(
     if box.status == "running":
         return {"box_id": box_id, "status": "running", "already_running": True}
 
+    # The operator's verb too: a suspended org's agent is not started by anyone.
+    _refuse_held(store, box)
     if box.status != "stopped":
         raise ProvisionError(
             f"box {box_id} is {box.status!r}; only a stopped box can be started. "
@@ -3394,10 +3397,27 @@ class BudgetHolds(ProvisionError):
     """A budget still keeps this box paused, so it can't be unpaused yet."""
 
 
-def _refuse_paused(box: Box) -> None:
-    """For anything that would start a paused box's machine as a side effect."""
+class OrgSuspended(BoxPaused):
+    """The box's org is suspended, and nothing of it may run (FLOTTA-184).
+
+    A `BoxPaused`, so every caller that refuses a paused box with a 402 refuses
+    this one the same way without knowing about it.
+    """
+
+
+def _refuse_held(store: FleetStore, box: Box) -> None:
+    """For anything that would start a box's machine, as its point or as a side
+    effect: refused while a budget pauses the box or its org is suspended."""
     if box.status == "paused":
         raise BoxPaused(f"{box.name} is paused by budget, so it was not woken.")
+    org = store.get_org(box.org)
+    if org is not None and org.status == "suspended":
+        raise OrgSuspended(suspended_wake_message(box, org.id))
+
+
+def suspended_wake_message(box: Box, org_id: str) -> str:
+    """What the door says when it closes a suspended org's conversation."""
+    return f"{box.name} was not woken: org {org_id!r} is suspended. {SUSPENDED_HINT.capitalize()}."
 
 
 def wake_box(
@@ -3437,7 +3457,7 @@ def wake_box(
     box = _require_box(store, box_id)
 
     # Legality first, before anything can happen to the machine.
-    _refuse_paused(box)
+    _refuse_held(store, box)
     if box.status not in ("running", "stopped"):
         raise ProvisionError(
             f"box {box_id} is {box.status!r}; only a running or stopped box can be addressed"
@@ -4099,6 +4119,69 @@ def enforce_budgets(
             _log.warning("budget action on %s failed: %s", box.name, exc)
             outcomes.append({"box_id": box.id, "error": str(exc)})
     return outcomes
+
+
+def sleep_suspended_orgs(
+    store: FleetStore,
+    *,
+    org_id: str | None = None,
+    backend: Backend | None = None,
+) -> list[dict[str, Any]]:
+    """Put every running agent of a suspended org to sleep now (FLOTTA-184).
+
+    Not when it goes quiet, as the idle sweep would: a suspended org pays for
+    nothing. Its live runs end first, `budget_blocked` as `suspended`, because
+    `stop_box` refuses under live work and that work would only fail once the
+    machine stopped. The gateway already refuses its model calls by then.
+
+    `org_id` for the one org just suspended (the suspend route runs it after
+    answering); without it, every suspended org, from the reconcile loop, for
+    anything woken in between. One box the substrate refuses doesn't stop the
+    rest, and comes round again next sweep.
+    """
+    if org_id is not None:
+        org = store.get_org(org_id)
+        orgs = [org] if org is not None and org.status == "suspended" else []
+    else:
+        orgs = store.list_orgs(status="suspended")
+    outcomes: list[dict[str, Any]] = []
+    for org in orgs:
+        for box in store.list_boxes_in(org.id):
+            if box.status not in ("running", "paused"):
+                continue
+            try:
+                if box.status == "running":
+                    _end_live_runs(store, box)
+                    result = stop_box(box.id, store=store, reason="org_suspended", backend=backend)
+                    outcomes.append({"box_id": box.id, "slept": not result["already_stopped"]})
+                    continue
+                # Paused by a budget, which moves the row at once and leaves the
+                # machine up until it is quiet, and never stops it under a live
+                # task. `stop_box` takes only a running box, so the machine is
+                # stopped here; the row stays `paused`, the budget's to release.
+                impl = _resolve_backend(box, backend)
+                target = box.endpoint or box.id
+                if _observed_state(impl, target, assume="unknown") != "started":
+                    continue
+                _end_live_runs(store, box)
+                method = _pause(impl, target, prefer_suspend=True)
+                store.add_event("box", box.id, "org_suspended_machine_slept", {"method": method})
+                outcomes.append({"box_id": box.id, "slept": True})
+            except (ProvisionError, BackendError) as exc:
+                _log.warning("could not put %s of suspended %s to sleep: %s", box.name, org.id, exc)
+                outcomes.append({"box_id": box.id, "error": str(exc)})
+    return outcomes
+
+
+def _end_live_runs(store: FleetStore, box: Box) -> None:
+    """A suspended org's agent's unfinished runs, ended `budget_blocked` as
+    `suspended`: they would only fail once its machine stopped."""
+    for task in store.list_tasks(box_id=box.id):
+        if is_terminal("task", task.status):
+            continue
+        with contextlib.suppress(InvalidTransitionError):  # its own end got there first
+            store.finish_run(task.id, "budget_blocked", error_class="suspended")
+            store.add_event("task", task.id, "budget_blocked", {"error": "its org was suspended"})
 
 
 def _a_turn(store: FleetStore, task_id: str) -> bool:

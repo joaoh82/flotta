@@ -1051,6 +1051,17 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE orgs ADD COLUMN max_agents INTEGER",
         ),
     ),
+    Migration(
+        30,
+        "suspended orgs: when an org was suspended, and why",
+        # FLOTTA-184 (M15.2). `orgs.status` gains `suspended`, which needs no
+        # step: the column has no CHECK. These say when and why, for the web
+        # app's billing page; both are NULL while the org is not suspended.
+        (
+            "ALTER TABLE orgs ADD COLUMN suspended_at TEXT",
+            "ALTER TABLE orgs ADD COLUMN suspend_reason TEXT",
+        ),
+    ),
 )
 
 

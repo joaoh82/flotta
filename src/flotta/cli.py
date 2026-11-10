@@ -2432,6 +2432,74 @@ def org_limits(
     emit(view, f"limits of org {org_id}:\n{_limits_lines(view)}", as_json=as_json)
 
 
+@org_app.command("suspend")
+def org_suspend(
+    org_id: str = typer.Argument(..., help="The org to suspend"),
+    reason: str | None = typer.Option(None, "--reason", help="Why, kept and sent to its owners"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Suspend an active org (FLOTTA-184): nothing of it runs or is created.
+
+    Its data and sign-in are kept, and `flotta org resume` restores it. Through
+    the control plane, its owners are emailed; against a local store they are
+    not, and its running agents are put to sleep from here.
+    """
+    _org_suspension(org_id, suspend=True, reason=reason, store=store, as_json=as_json)
+
+
+@org_app.command("resume")
+def org_resume(
+    org_id: str = typer.Argument(..., help="The org to resume"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Resume a suspended org. Wakes nothing: its agents wake when next addressed."""
+    _org_suspension(org_id, suspend=False, reason=None, store=store, as_json=as_json)
+
+
+def _org_suspension(
+    org_id: str, *, suspend: bool, reason: str | None, store: str | None, as_json: bool
+) -> None:
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import InvalidTransitionError, UnknownEntityError
+
+    verb = "suspend" if suspend else "resume"
+    if control_url():
+        try:
+            view = control_request(
+                "POST",
+                f"/api/orgs/{org_id}/{verb}",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"reason": reason} if suspend and reason else {},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        from flotta.provision import sleep_suspended_orgs
+
+        with _open_store(store) as fleet:
+            try:
+                if suspend:
+                    org, changed = fleet.suspend_org(org_id, reason=reason, by="cli")
+                else:
+                    org, changed = fleet.resume_org(org_id, by="cli")
+            except (UnknownEntityError, InvalidTransitionError) as exc:
+                raise _fail(exc) from exc
+            if suspend and changed:
+                sleep_suspended_orgs(fleet, org_id=org_id)
+        view = {"org": asdict(org), "changed": changed, "told": None}
+    state = "suspended" if suspend else "active"
+    line = (
+        f"org {org_id} is {state}"
+        if view["changed"]
+        else f"org {org_id} was already {state}; nothing changed"
+    )
+    emit(view, line, as_json=as_json)
+
+
 @client_app.command("create")
 def client_create(
     org_id: str = typer.Argument(..., help="The org it belongs to"),

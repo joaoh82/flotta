@@ -804,6 +804,26 @@ org's limits and do nothing else, and it is never treated as the operator.
 with the key of the environment it is for (staging and production each have
 their own) and put the output straight into that web app's environment.
 
+### Suspending an agency (FLOTTA-184)
+
+An agency whose payment finally fails is **suspended**, not deleted. It keeps
+its data and its sign-in, and nothing of it runs or is created: its agents
+are not woken (the door closes their conversations with 4402 and says why),
+running ones are put to sleep at once, its schedules, webhooks and API runs end
+`budget_blocked` as `suspended` without being delivered, the gateway refuses
+its model calls, and it adds no clients, agents or people. Its owners are
+emailed both ways. Resuming wakes nothing; its agents wake when next talked to.
+
+```bash
+just org-suspend agency-x --reason "the payment for November failed"
+just org-resume agency-x
+```
+
+On the hosted product the web app's billing does this with its `org:govern`
+token when Stripe's retries give up, and again when the agency pays. A repeated
+suspend or resume changes nothing and emails nobody, so a webhook delivered
+twice is harmless. The default org is the operator's own and is never suspended.
+
 ---
 
 ## Step 9 — People who sign in (M12.3)

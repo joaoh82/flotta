@@ -162,7 +162,8 @@ SCOPE_MCP_CALL = "mcp:call"
 #: that has it was made with a key, confined to that key's one agent.
 SCOPE_RUN_CREATE = "run:create"
 #: Governing orgs on the hosted product's behalf (FLOTTA-183, M15.1): reading
-#: and setting an org's plan limits, and nothing else. Held by the web app's
+#: and setting an org's plan limits, and suspending and resuming it when its
+#: payment fails and is settled (FLOTTA-184), and nothing else. Held by the web app's
 #: billing server, never by a person and never beside another scope (`mint`),
 #: so a leaked one can change what an agency may create and cannot read, reach
 #: or change a single agent. Not the operator either, though its token is the

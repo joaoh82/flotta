@@ -176,6 +176,7 @@ async def run_reconcile_loop(
     sleeper: Callable[..., list[dict[str, Any]]] | None = None,
     box_sweeper: Callable[..., list[dict[str, Any]]] | None = None,
     budget_enforcer: Callable[..., list[dict[str, Any]]] | None = None,
+    suspension_enforcer: Callable[..., list[dict[str, Any]]] | None = None,
     machine_meter: Callable[..., list[dict[str, Any]]] | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep,
     max_sweeps: int | None = None,
@@ -207,6 +208,10 @@ async def run_reconcile_loop(
         from flotta.provision import enforce_budgets
 
         budget_enforcer = enforce_budgets
+    if suspension_enforcer is None:
+        from flotta.provision import sleep_suspended_orgs
+
+        suspension_enforcer = sleep_suspended_orgs
     if machine_meter is None:
         from flotta.metering import meter_machines
 
@@ -275,6 +280,15 @@ async def run_reconcile_loop(
                         _log.info("acted on budgets for %d box(es)", len(acted))
                 except Exception as exc:
                     _log.warning("budget sweep failed: %s: %s", type(exc).__name__, exc)
+
+                # Suspended orgs (FLOTTA-184): their agents to sleep now. The suspend
+                # route does this once on the spot; this catches anything woken since.
+                try:
+                    acted = suspension_enforcer(store)
+                    if acted:
+                        _log.info("slept %d box(es) of suspended orgs", len(acted))
+                except Exception as exc:
+                    _log.warning("suspension sweep failed: %s: %s", type(exc).__name__, exc)
                 return stranded, slept
             finally:
                 store.close()

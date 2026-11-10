@@ -42,7 +42,13 @@ KEY = "a-signing-key-for-govern-tests"
 
 #: What a governing token may do: an org's limits, and nothing more.
 GOVERN_ROUTES = frozenset(
-    {("GET", "/api/orgs/{org_id}/limits"), ("PUT", "/api/orgs/{org_id}/limits")}
+    {
+        ("GET", "/api/orgs/{org_id}/limits"),
+        ("PUT", "/api/orgs/{org_id}/limits"),
+        # FLOTTA-184: how a final failed payment ends, and how paying undoes it.
+        ("POST", "/api/orgs/{org_id}/suspend"),
+        ("POST", "/api/orgs/{org_id}/resume"),
+    }
 )
 #: What any valid credential may ask about itself: who it is and what it holds.
 #: Answered for a governing token too, saying it is not the operator.
@@ -140,7 +146,7 @@ def test_the_sweep_finds_the_routes():
 
 
 @pytest.mark.parametrize(("method", "path"), _routes())
-def test_a_governing_token_reaches_no_route_but_the_limits(api, fleet, method, path):
+def test_a_governing_token_reaches_no_route_but_its_own(api, fleet, method, path):
     with FleetStore(fleet) as store:
         box = store.get_box_by_name("support--acme--agency-x")
     # Real ids where a route takes them, so a missing guard reaches the route

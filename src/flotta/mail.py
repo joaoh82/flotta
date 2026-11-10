@@ -424,6 +424,78 @@ def declined_message(
     )
 
 
+def suspended_message(
+    to: str, app_url: str, org_name: str, reason: str | None, *, reply_to: str | None = None
+) -> Message:
+    """Telling an owner their agency was suspended (FLOTTA-184).
+
+    How a final failed payment ends, so the message says what stopped, that
+    nothing was lost, and how to come back. The link is the web app's home,
+    which carries no secret, and not a billing page: there is none to link to
+    until the web app has one (M15). `reason` is escaped like the org's name.
+    """
+    home = app_url.rstrip("/") + "/"
+    stopped = (
+        "Its agents are asleep and won't wake, its schedules and webhooks don't run, "
+        "and it can't add clients, agents or people."
+    )
+    kept = "Nothing was deleted: sign in to settle the payment, and everything picks up again."
+    why_text = f"\n\nWhy: {reason}" if reason else ""
+    body = [
+        paragraph(f"<strong>{esc(org_name)}</strong> is suspended on Flotta."),
+        paragraph(esc(stopped)),
+    ]
+    if reason:
+        body.append(quote(esc(reason)))
+    body.append(paragraph(esc(kept)))
+    return Message(
+        to=to,
+        subject=f"{org_name} is suspended on Flotta",
+        text=f"{org_name} is suspended on Flotta. {stopped}{why_text}\n\n{kept}\n\n{home}",
+        html=layout(
+            title=f"{org_name} is suspended on Flotta",
+            preheader=f"{org_name}'s agents are asleep until its payment is settled.",
+            heading=f"{org_name} is suspended",
+            body=body,
+            action=("Sign in to Flotta", home),
+            footer=f"You are getting this because you own {org_name} on Flotta.",
+        ),
+        link=home,
+        kind="suspension email",
+        reply_to=reply_to,
+    )
+
+
+def resumed_message(
+    to: str, app_url: str, org_name: str, *, reply_to: str | None = None
+) -> Message:
+    """Telling an owner their agency is running again (FLOTTA-184)."""
+    home = app_url.rstrip("/") + "/"
+    back = (
+        "Its agents wake when they are next talked to, and its schedules and "
+        "webhooks run again from now. Runs missed while it was suspended are not replayed."
+    )
+    return Message(
+        to=to,
+        subject=f"{org_name} is running again on Flotta",
+        text=f"{org_name} is no longer suspended. {back}\n\n{home}",
+        html=layout(
+            title=f"{org_name} is running again on Flotta",
+            preheader=f"{org_name} is no longer suspended.",
+            heading="You're back",
+            body=[
+                paragraph(f"<strong>{esc(org_name)}</strong> is no longer suspended."),
+                paragraph(esc(back)),
+            ],
+            action=("Open Flotta", home),
+            footer=f"You are getting this because you own {org_name} on Flotta.",
+        ),
+        link=home,
+        kind="resume email",
+        reply_to=reply_to,
+    )
+
+
 def print_mailer(message: Message) -> None:
     """Local development: the message goes to the log, link and all."""
     _log.warning(
