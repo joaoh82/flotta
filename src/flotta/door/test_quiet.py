@@ -44,13 +44,20 @@ def box():
     """Hermes's socket on a real port: it answers `session.active_list` as `seen` says."""
     from aiohttp import WSMsgType, web
 
-    seen: dict = {"asked": 0, "frames": [], "statuses": ["idle"], "answer": "statuses"}
+    seen: dict = {
+        "asked": 0,
+        "frames": [],
+        "statuses": ["idle"],
+        "answer": "statuses",
+        "stalled": False,
+    }
 
     async def ready(_request):
         return web.json_response({"ok": True})
 
     async def agent(request):
-        ws = web.WebSocketResponse()
+        # `stalled`: a Hermes whose event loop is starved answers no ping (FLOTTA-195).
+        ws = web.WebSocketResponse(autoping=not seen["stalled"])
         await ws.prepare(request)
         await ws.send_str('{"method":"event","params":{"type":"gateway.ready"}}')
         async for message in ws:
@@ -637,3 +644,35 @@ def test_only_a_ping_is_a_keepalive():
 )
 def test_what_an_answer_says(frame, working):
     assert read_working(frame) is working
+
+
+# -- a stalled agent is not a dead one (FLOTTA-195) --------------------------
+
+
+#: Real time in the test is this much of the door's: 1 s here is 100 s there.
+_SCALE = 0.01
+
+
+def test_a_box_that_answers_no_ping_for_a_while_keeps_its_conversation(box, monkeypatch):
+    """On 2026-11-10 a 43 s stall on a compiling box dropped a run, under websockets'
+    20 s + 20 s defaults. Here a 90 s stall, at the door's own settings scaled down."""
+    monkeypatch.setattr(door, "BOX_PING_INTERVAL_S", door.BOX_PING_INTERVAL_S * _SCALE)
+    monkeypatch.setattr(door, "BOX_PING_TIMEOUT_S", door.BOX_PING_TIMEOUT_S * _SCALE)
+    box[1]["stalled"] = True
+    with _Open(box) as tab:
+        time.sleep(90 * _SCALE)
+        tab.ws.send_text('{"method":"prompt.submit"}')
+        assert _receive(tab.ws) == 'echo:{"method":"prompt.submit"}'
+
+
+def test_a_box_gone_quiet_for_longer_than_the_patience_is_let_go(box, monkeypatch):
+    """The ping is still there for a box that vanished without closing its socket."""
+    monkeypatch.setattr(door, "BOX_PING_INTERVAL_S", 0.05)
+    monkeypatch.setattr(door, "BOX_PING_TIMEOUT_S", 0.2)
+    box[1]["stalled"] = True
+    with _Open(box) as tab:
+        assert _closes(tab.ws)
+
+
+def test_the_patience_outlasts_a_build_on_a_shared_cpu():
+    assert door.BOX_PING_TIMEOUT_S >= 300
