@@ -459,6 +459,15 @@ class OrgNotActiveError(StoreError):
     """
 
 
+#: What a suspended org is told it cannot do, and where to go (FLOTTA-184).
+SUSPENDED_HINT = "an owner can settle its payment in billing to resume it"
+
+
+def suspended_refusal(org: Org, doing: str) -> str:
+    """Why a suspended org may not do `doing`, in words a person can act on."""
+    return f"org {org.id!r} is suspended, so it cannot {doing}; {SUSPENDED_HINT}"
+
+
 class LimitReachedError(StoreError):
     """Raised when creating a client, a seat or an agent would pass the org's limit.
 
@@ -576,6 +585,10 @@ class Org:
     max_clients: int | None = None
     max_seats: int | None = None
     max_agents: int | None = None
+    #: When it was suspended and why (FLOTTA-184), while `status` is
+    #: `suspended`; `None` otherwise. See `FleetStore.suspend_org`.
+    suspended_at: str | None = None
+    suspend_reason: str | None = None
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -729,7 +742,7 @@ LINK_PURPOSES = frozenset({"sign_in", "invite", "sign_up"})
 #: An org's lifecycle (M12.4). `pending` is a sign-up waiting for the operator,
 #: who makes it `active` or `declined`; both are final. An org made by the
 #: operator starts `active`.
-ORG_STATUSES = ("pending", "active", "declined")
+ORG_STATUSES = ("pending", "active", "declined", "suspended")
 
 #: Which level's key paid for a model call (D19).
 KEY_SCOPES = frozenset({"fleet", "org", "client"})
@@ -1728,6 +1741,8 @@ class FleetStore:
                 + (
                     "it can create agents once the operator approves it"
                     if org.status == "pending"
+                    else f"it cannot create agents; {SUSPENDED_HINT}"
+                    if org.status == "suspended"
                     else "it cannot create agents"
                 )
             )
@@ -1852,6 +1867,84 @@ class FleetStore:
         assert decided is not None
         return decided
 
+    def suspend_org(
+        self, org_id: str, *, reason: str | None = None, by: str | None = None
+    ) -> tuple[Org, bool]:
+        """Suspend an active org (FLOTTA-184): `(org, changed)`.
+
+        How a final failed payment ends. The org keeps its data and sign-in,
+        and nothing of it runs or is created until `resume_org`: its agents are
+        not woken (`provision._refuse_held`), its runs end `budget_blocked`,
+        its model calls are refused, and its running machines are put to sleep
+        (`provision.sleep_suspended_orgs`).
+
+        Suspending a suspended org changes nothing and answers `changed=False`,
+        so a billing webhook delivered twice tells nobody twice. Anything but
+        `active` or `suspended` is `InvalidTransitionError`, and so is the
+        default org, which is the operator's own fleet.
+        """
+        return self._set_suspended(org_id, True, reason=reason, by=by)
+
+    def resume_org(self, org_id: str, *, by: str | None = None) -> tuple[Org, bool]:
+        """Resume a suspended org: `(org, changed)`, as `suspend_org`.
+
+        Wakes nothing. Its agents wake when they are next addressed, as any
+        sleeping agent does.
+        """
+        return self._set_suspended(org_id, False, by=by)
+
+    def _set_suspended(
+        self, org_id: str, suspend: bool, *, reason: str | None = None, by: str | None = None
+    ) -> tuple[Org, bool]:
+        wanted = "suspended" if suspend else "active"
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.id == DEFAULT_ORG:
+                raise InvalidTransitionError(
+                    "the default org is the operator's own fleet; it is never suspended"
+                )
+            if org.status == wanted:
+                return org, False
+            if org.status != ("active" if suspend else "suspended"):
+                verb = "suspended" if suspend else "resumed"
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is {org.status}; only "
+                    + ("an active" if suspend else "a suspended")
+                    + f" org can be {verb}"
+                )
+            self._conn.execute(
+                "UPDATE orgs SET status = ?, suspended_at = ?, suspend_reason = ? WHERE id = ?",
+                (
+                    wanted,
+                    _utcnow() if suspend else None,
+                    reason if suspend else None,
+                    org_id,
+                ),
+            )
+            # On each of its agents' timelines, which is where the agency looks:
+            # `events` takes boxes, workspaces and tasks, not orgs. The org row
+            # keeps when and why, and the control plane logs who.
+            payload: dict[str, Any] = {"by": by}
+            if suspend:
+                payload["reason"] = reason
+            kind = "org_suspended" if suspend else "org_resumed"
+            for box in self.list_boxes_in(org_id):
+                if box.status not in BOX_TERMINAL:
+                    self.add_event("box", box.id, kind, payload)
+        changed = self.get_org(org_id)
+        assert changed is not None
+        return changed, True
+
+    def _refuse_suspended(self, org_id: str, doing: str) -> None:
+        """`OrgNotActiveError` if `org_id` is suspended. For the creates that a
+        pending org may still do (clients, invites, seats), which a suspended
+        one may not."""
+        org = self.get_org(org_id)
+        if org is not None and org.status == "suspended":
+            raise OrgNotActiveError(suspended_refusal(org, doing))
+
     def create_client(self, org_id: str, client_id: str, name: str) -> Client:
         """Insert a client of `org_id`. Its id is unique within the org only.
 
@@ -1867,6 +1960,7 @@ class FleetStore:
             raise UnknownEntityError(f"no org with id {org_id!r}")
         try:
             with self._conn.transaction(guard="clients"):
+                self._refuse_suspended(org_id, "add a client")
                 self._check_room(org_id, "clients")
                 self._conn.execute(
                     "INSERT INTO clients (org_id, id, name, created_at) VALUES (?, ?, ?, ?)",
@@ -1974,6 +2068,7 @@ class FleetStore:
             raise UnknownEntityError(f"no org with id {org_id!r}")
         if client_id is not None and self.get_client(org_id, client_id) is None:
             raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
+        self._refuse_suspended(org_id, "add anyone")
         # The org's limit on seats (FLOTTA-183). No transaction of its own:
         # every caller (`add_person`, `sign_up`, `redeem_invite`) already holds
         # the users guard, which serialises this count with the insert below.
@@ -2394,6 +2489,8 @@ class FleetStore:
                 raise UnknownEntityError(f"no org with id {org_id!r}")
             if org.status == "declined":
                 raise OrgNotActiveError(f"org {org_id!r} was declined; it cannot invite anyone")
+            if org.status == "suspended":
+                raise OrgNotActiveError(suspended_refusal(org, "invite anyone"))
             if client_id is not None and self.get_client(org_id, client_id) is None:
                 raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
             if new_seat and role in SEAT_ROLES:
@@ -6215,6 +6312,8 @@ def _org_from_row(row: db.Row) -> Org:
         max_clients=row.get("max_clients"),
         max_seats=row.get("max_seats"),
         max_agents=row.get("max_agents"),
+        suspended_at=row.get("suspended_at"),
+        suspend_reason=row.get("suspend_reason"),
     )
 
 

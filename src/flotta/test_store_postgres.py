@@ -292,6 +292,46 @@ def test_two_invites_racing_for_the_last_seat_spend_only_the_winners_link(pg_sto
     assert len(live) == 1, "the refused invite was spent"
 
 
+def test_two_suspends_at_once_change_the_org_once(pg_store):
+    """FLOTTA-184: billing's webhook, delivered twice at the same moment. Under the
+    orgs table's lock one changes it and one finds it suspended already, so the
+    owners are told once; without the lock both read `active` and both 'change' it."""
+    _full_but_one(pg_store)
+    pg_store.create_box("support", org="agency-x", client="acme")
+    changed: list[bool] = []
+
+    def suspend(fleet, i):
+        changed.append(fleet.suspend_org("agency-x", reason="unpaid")[1])
+
+    outcomes = _race(pg_store, suspend)
+
+    assert outcomes == ["created", "created"], outcomes
+    assert sorted(changed) == [False, True], f"both suspends changed the org: {changed}"
+    box = pg_store.get_box_by_name("support--acme--agency-x")
+    kinds = [e.type for e in pg_store.get_events("box", box.id)]
+    assert kinds.count("org_suspended") == 1
+
+
+def test_a_suspend_and_a_resume_at_once_leave_one_answer(pg_store):
+    _full_but_one(pg_store)
+    pg_store.suspend_org("agency-x")
+    pg_store.resume_org("agency-x")
+
+    def flip(fleet, i):
+        if i == 0:
+            fleet.suspend_org("agency-x")
+        else:
+            fleet.resume_org("agency-x")
+
+    outcomes = _race(pg_store, flip)
+
+    assert set(outcomes) <= {"created", "InvalidTransitionError"}, outcomes
+    org = pg_store.get_org("agency-x")
+    assert org.status in ("active", "suspended")
+    # The row agrees with itself: a suspended org says when, an active one doesn't.
+    assert (org.status == "suspended") == (org.suspended_at is not None)
+
+
 def test_concurrent_status_changes_do_not_both_win(pg_store):
     """`update_box_status` is a read-check-write too.
 

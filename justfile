@@ -321,7 +321,7 @@ token-role SUBJECT ROLE ORG CLIENT="":
 
 # FLOTTA-183 — the hosted product's billing credential: `org:govern`, alone, for a
 # year (a 30-day token is how the door once went dark). It reads and sets orgs'
-# limits and nothing else. Minted with this machine's $FLOTTA_SIGNING_KEY, so run
+# limits, and suspends and resumes them (FLOTTA-184), and nothing else. Minted with this machine's $FLOTTA_SIGNING_KEY, so run
 # it with the signing key of the environment it is for, and put the output
 # straight into that web app's FLOTTA_GOVERN_TOKEN; never paste it anywhere else.
 # Rotate before it expires: the date is in `flotta token inspect`.
@@ -342,6 +342,14 @@ org-list:
 # `just org-limits agency-x --clients 5 --seats 1 --agents none`
 org-limits ORG *ARGS:
     uv run flotta org limits {{ORG}} {{ARGS}}
+
+# FLOTTA-184 — suspend an org (nothing of it runs or is created) and resume it:
+# `just org-suspend agency-x --reason "payment failed"`, `just org-resume agency-x`
+org-suspend ORG *ARGS:
+    uv run flotta org suspend {{ORG}} {{ARGS}}
+
+org-resume ORG:
+    uv run flotta org resume {{ORG}}
 
 # M12.4 — sign-ups waiting for an answer, and the answer
 org-pending:

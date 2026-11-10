@@ -82,7 +82,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from flotta.pricing import NANO, to_eur_nano
-from flotta.store import Box, Budget, FleetStore, InvalidBudgetError
+from flotta.store import Box, Budget, FleetStore, InvalidBudgetError, suspended_refusal
 
 #: The actions that stop calls at the limit, and so pause the boxes they cover.
 STOPPING_ACTIONS = frozenset({"pause", "kill"})
@@ -281,7 +281,18 @@ def check_budgets(
     """Why this box may not call `model` now, the model to call instead, or `None`.
 
     `unsettled` is the boxes with a finished call whose row is not in the store.
+
+    A suspended org's agents call nothing (FLOTTA-184), whatever its budgets
+    say: this is how an agent mid-turn stops spending the moment it is
+    suspended, before the sweep puts its machine to sleep.
     """
+    org = store.get_org(box.org)
+    if org is not None and org.status == "suspended":
+        return Refusal(
+            "org_suspended",
+            suspended_refusal(org, "call a model"),
+            key=("org_suspended", org.id, org.suspended_at or ""),
+        )
     covering = store.budgets_covering(box)
     if not covering:
         return None
