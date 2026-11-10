@@ -66,6 +66,15 @@ class ChatError(Exception):
         self.status = status
 
 
+class SocketClosed(ChatError):
+    """The agent's socket closed under a turn (FLOTTA-196).
+
+    Not that the agent stopped: on 2026-11-10 the door dropped a stalled box's
+    socket and the agent went on working for 27 minutes. A caller that knows
+    the session can reconnect and resume it rather than give the turn up.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Turn:
     """One exchange with a box."""
@@ -502,7 +511,7 @@ async def _next_json(ws, *, timeout_s: float, what: str = "the agent") -> dict:
     except TimeoutError as exc:
         raise ChatError(f"{what} did not respond within {timeout_s:.0f}s") from exc
     if message.type is not aiohttp.WSMsgType.TEXT:
-        raise ChatError(f"the agent socket closed ({message.type.name})")
+        raise SocketClosed(f"the agent socket closed ({message.type.name})")
     try:
         return json.loads(message.data)
     except json.JSONDecodeError as exc:
@@ -564,11 +573,27 @@ async def send_turn(
     deltas would make this client responsible for a rendering concern it has
     no business holding.
     """
+    rid = await submit_turn(ws, session_id, text)
+    return await await_turn(ws, session_id, rid=rid, timeout_s=timeout_s, hear=hear)
+
+
+async def submit_turn(ws, session_id: str, text: str) -> int:
+    """Send one message; the id its acknowledgement, or refusal, will carry."""
     if not session_id:
         raise ChatError("cannot send a turn without a session id")
+    return await _rpc(ws, "prompt.submit", {"session_id": session_id, "text": text})
 
-    rid = await _rpc(ws, "prompt.submit", {"session_id": session_id, "text": text})
 
+async def await_turn(
+    ws,
+    session_id: str,
+    *,
+    rid: int | None = None,
+    timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
+    hear: Callable[[dict], None] | None = None,
+) -> Turn:
+    """Wait for the turn in `session_id` to complete: on the socket it was
+    submitted on (`rid`), or on one that resumed it (`rid=None`)."""
     deadline = asyncio.get_running_loop().time() + timeout_s
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -585,21 +610,110 @@ async def send_turn(
         # a JSON-RPC error against our id, never as a `message.complete`.
         # Treating it as noise means waiting out the whole turn deadline for an
         # answer that was refused in milliseconds.
-        if frame.get("id") == rid and "error" in frame:
+        if rid is not None and frame.get("id") == rid and "error" in frame:
             raise ChatError(f"prompt.submit was rejected: {frame['error']}")
         if hear is not None:
             # Everything the turn streams, for a caller keeping its steps (M14.2).
             hear(frame)
 
-        params = frame.get("params") or {}
-        if params.get("type") != COMPLETE_EVENT:
+        turn = completed_turn(frame, session_id)
+        if turn is not None:
+            return turn
+
+
+def completed_turn(frame: dict, session_id: str) -> Turn | None:
+    """The turn a `message.complete` frame ends, or None for any other frame."""
+    params = frame.get("params") or {}
+    if params.get("type") != COMPLETE_EVENT:
+        return None
+    payload = params.get("payload") or {}
+    status = payload.get("status")
+    reply = payload.get("text") or ""
+    if status and status != "complete":
+        # A provider failure comes back as a normal completion carrying an
+        # error string — surfacing it as a reply would print an error
+        # message as if the agent had said it.
+        raise ChatError(f"the agent could not answer ({status}): {reply[:300]}")
+    return Turn(session_id=session_id, response=reply, raw=payload)
+
+
+@dataclass(frozen=True, slots=True)
+class Resumed:
+    """A `session.resume` result, and the turn it ended before its result came."""
+
+    result: dict
+    #: A `message.complete` heard while waiting for the result (FLOTTA-196 review).
+    #: Hermes attaches the socket, notes `running`, then reads the transcript, so a
+    #: turn ending in between puts its complete on the socket first, and the result
+    #: can still say `running: true`.
+    finished: dict | None = None
+
+
+async def resume_session(
+    ws,
+    stored_id: str,
+    *,
+    timeout_s: float = 120.0,
+    hear: Callable[[dict], None] | None = None,
+) -> Resumed:
+    """Attach to a stored session: the `session.resume` result.
+
+    **Asked by the stored id, answered with the live one** (`session_id`): Hermes
+    has two, and each refuses the other's (flotta's CLAUDE.md). The result also
+    says whether a turn is still running (`running`, `status`) and holds the
+    session's `messages`.
+
+    **Frames before the result are the turn's, not noise.** The socket is
+    attached before the result is written, so each goes to `hear`, and a
+    `message.complete` among them is kept rather than dropped.
+    """
+    rid = await _rpc(ws, "session.resume", {"session_id": stored_id, "inline_images": False})
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    finished: dict | None = None
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise ChatError(f"session.resume was not answered within {timeout_s:.0f}s")
+        frame = await _next_json(ws, timeout_s=remaining, what="session.resume")
+        if frame.get("id") != rid:
+            if hear is not None:
+                hear(frame)
+            if (frame.get("params") or {}).get("type") == COMPLETE_EVENT:
+                finished = frame
             continue
-        payload = params.get("payload") or {}
-        status = payload.get("status")
-        reply = payload.get("text") or ""
-        if status and status != "complete":
-            # A provider failure comes back as a normal completion carrying an
-            # error string — surfacing it as a reply would print an error
-            # message as if the agent had said it.
-            raise ChatError(f"the agent could not answer ({status}): {reply[:300]}")
-        return Turn(session_id=session_id, response=reply, raw=payload)
+        if "error" in frame:
+            raise ChatError(f"session.resume failed: {frame['error']}")
+        result = frame.get("result")
+        return Resumed(result if isinstance(result, dict) else {}, finished)
+
+
+#: How a resume says a turn is still at work, besides `running: true`.
+_RUNNING_STATUSES = frozenset({"starting", "waiting", "working", "streaming"})
+
+
+def turn_running(resumed: dict) -> bool:
+    """Whether a `session.resume` result says a turn is still at work."""
+    return resumed.get("running") is True or resumed.get("status") in _RUNNING_STATUSES
+
+
+def reply_in(resumed: dict, asked: str) -> str | None:
+    """The agent's reply to `asked`, from a resumed session's messages: the
+    last assistant text after the last message that is `asked`. None when the
+    session holds no such exchange."""
+    messages = resumed.get("messages")
+    if not isinstance(messages, list):
+        return None
+    rows = [m for m in messages if isinstance(m, dict)]
+    want = asked.strip()
+    at = None
+    for i, row in enumerate(rows):
+        if row.get("role") == "user" and str(row.get("text") or "").strip() == want:
+            at = i
+    if at is None:
+        return None
+    replies = [
+        str(row.get("text") or "")
+        for row in rows[at + 1 :]
+        if row.get("role") == "assistant" and str(row.get("text") or "").strip()
+    ]
+    return replies[-1] if replies else None
