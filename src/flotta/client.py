@@ -616,41 +616,75 @@ async def await_turn(
             # Everything the turn streams, for a caller keeping its steps (M14.2).
             hear(frame)
 
-        params = frame.get("params") or {}
-        if params.get("type") != COMPLETE_EVENT:
-            continue
-        payload = params.get("payload") or {}
-        status = payload.get("status")
-        reply = payload.get("text") or ""
-        if status and status != "complete":
-            # A provider failure comes back as a normal completion carrying an
-            # error string — surfacing it as a reply would print an error
-            # message as if the agent had said it.
-            raise ChatError(f"the agent could not answer ({status}): {reply[:300]}")
-        return Turn(session_id=session_id, response=reply, raw=payload)
+        turn = completed_turn(frame, session_id)
+        if turn is not None:
+            return turn
 
 
-async def resume_session(ws, stored_id: str, *, timeout_s: float = 120.0) -> dict:
-    """Attach to a stored session and return the `session.resume` result.
+def completed_turn(frame: dict, session_id: str) -> Turn | None:
+    """The turn a `message.complete` frame ends, or None for any other frame."""
+    params = frame.get("params") or {}
+    if params.get("type") != COMPLETE_EVENT:
+        return None
+    payload = params.get("payload") or {}
+    status = payload.get("status")
+    reply = payload.get("text") or ""
+    if status and status != "complete":
+        # A provider failure comes back as a normal completion carrying an
+        # error string — surfacing it as a reply would print an error
+        # message as if the agent had said it.
+        raise ChatError(f"the agent could not answer ({status}): {reply[:300]}")
+    return Turn(session_id=session_id, response=reply, raw=payload)
+
+
+@dataclass(frozen=True, slots=True)
+class Resumed:
+    """A `session.resume` result, and the turn it ended before its result came."""
+
+    result: dict
+    #: A `message.complete` heard while waiting for the result (FLOTTA-196 review).
+    #: Hermes attaches the socket, notes `running`, then reads the transcript, so a
+    #: turn ending in between puts its complete on the socket first, and the result
+    #: can still say `running: true`.
+    finished: dict | None = None
+
+
+async def resume_session(
+    ws,
+    stored_id: str,
+    *,
+    timeout_s: float = 120.0,
+    hear: Callable[[dict], None] | None = None,
+) -> Resumed:
+    """Attach to a stored session: the `session.resume` result.
 
     **Asked by the stored id, answered with the live one** (`session_id`): Hermes
     has two, and each refuses the other's (flotta's CLAUDE.md). The result also
     says whether a turn is still running (`running`, `status`) and holds the
     session's `messages`.
+
+    **Frames before the result are the turn's, not noise.** The socket is
+    attached before the result is written, so each goes to `hear`, and a
+    `message.complete` among them is kept rather than dropped.
     """
     rid = await _rpc(ws, "session.resume", {"session_id": stored_id, "inline_images": False})
     deadline = asyncio.get_running_loop().time() + timeout_s
+    finished: dict | None = None
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise ChatError(f"session.resume was not answered within {timeout_s:.0f}s")
         frame = await _next_json(ws, timeout_s=remaining, what="session.resume")
         if frame.get("id") != rid:
+            if hear is not None:
+                hear(frame)
+            if (frame.get("params") or {}).get("type") == COMPLETE_EVENT:
+                finished = frame
             continue
         if "error" in frame:
             raise ChatError(f"session.resume failed: {frame['error']}")
         result = frame.get("result")
-        return result if isinstance(result, dict) else {}
+        return Resumed(result if isinstance(result, dict) else {}, finished)
 
 
 #: How a resume says a turn is still at work, besides `running: true`.

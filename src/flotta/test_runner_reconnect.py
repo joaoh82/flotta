@@ -247,3 +247,27 @@ def test_questions_are_withdrawn_once_on_the_socket_the_run_ends_on():
     talk = _Talk()
     _deliver(door, talk)
     assert talk.withdrawn_on == [door.sockets[1].send_str]
+
+
+def test_a_turn_that_ends_while_the_resume_is_answered_is_not_waited_for():
+    """Review on #225: Hermes attaches the socket, notes `running`, then reads the
+    transcript, so a turn ending in between sends its complete before the result,
+    and the result still says running. Dropped, the run waited out its deadline."""
+    door = _Door(
+        [CREATED, ACK, DROP],
+        [_event("tool.complete"), _complete("Banners done."), _resumed(running=True)],
+    )
+    talk = _Talk()
+    reply, slept = _deliver(door, talk)
+    assert reply == "Banners done."
+    assert slept == [RECONNECT_DELAYS_S[0]]
+    # What came before the result is the turn's, and reaches its steps.
+    types = [f.get("params", {}).get("type") for f in talk.heard]
+    assert types[-2:] == ["tool.complete", "message.complete"]
+
+
+def test_a_provider_failure_before_the_resume_result_still_fails_the_run():
+    failed = _event("message.complete", {"text": "rate limited", "status": "error"})
+    door = _Door([CREATED, ACK, DROP], [failed, _resumed(running=True)])
+    with pytest.raises(ChatError, match="could not answer"):
+        _deliver(door)

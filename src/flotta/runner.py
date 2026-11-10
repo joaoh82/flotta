@@ -363,8 +363,16 @@ async def through_door(
                         submitted = True
                     else:
                         assert stored is not None  # checked before reconnecting
-                        resumed = await client.resume_session(socket, stored, timeout_s=120)
+                        attached = await client.resume_session(
+                            socket, stored, timeout_s=120, hear=talk.hear
+                        )
+                        resumed = attached.result
                         live = str(resumed.get("session_id") or "") or live
+                        if attached.finished is not None:
+                            # Ended before the result came, whatever the result says.
+                            done = client.completed_turn(attached.finished, live)
+                            assert done is not None
+                            return done.response
                         if not client.turn_running(resumed):
                             reply = client.reply_in(resumed, text)
                             if reply is None:
