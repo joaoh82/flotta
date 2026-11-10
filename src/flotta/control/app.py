@@ -6567,7 +6567,7 @@ def create_app(
         not be asked, and a name missing here can still be typed and checked.
         `suggest=false` skips GitHub, for a page redrawing itself on a timer.
         """
-        from flotta.github_app import GitHubAppError
+        from flotta.github_app import TIMING_LOG, GitHubAppError
 
         store = store_factory()
         try:
@@ -6579,7 +6579,9 @@ def create_app(
         names: list[str] = []
         truncated = False
         problems: list[str] = []
-        for installation in connected if suggest else []:
+        asked = connected if suggest else []
+        started = time.perf_counter()
+        for installation in asked:
             if app_ is None:
                 problems.append(installation.account)
                 continue
@@ -6590,6 +6592,15 @@ def create_app(
                 continue
             names += listed
             truncated = truncated or more
+        if asked:
+            # One line per page: how many accounts were asked, one after another (FLOTTA-180).
+            logging.getLogger(TIMING_LOG).info(
+                "github repositories for %s: %d account(s) asked in %.0f ms, %d problem(s)",
+                box.id,
+                len(asked),
+                (time.perf_counter() - started) * 1000,
+                len(problems),
+            )
         return {
             "box_id": box.id,
             "available": app_ is not None,

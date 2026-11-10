@@ -1230,6 +1230,28 @@ def test_a_page_redrawing_itself_does_not_ask_github(api, fleet, github):
     assert github.issued == []
 
 
+def test_a_listing_page_logs_how_many_accounts_it_asked_and_how_long(api, fleet, caplog):
+    _connect(api)
+    with caplog.at_level("INFO", logger="flotta.github_app"):
+        api.get(f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories", headers=_member())
+    lines = [r.getMessage() for r in caplog.records if r.name == "flotta.github_app"]
+    summary = [line for line in lines if line.startswith("github repositories for ")]
+    assert len(summary) == 1
+    assert "1 account(s) asked in " in summary[0] and summary[0].endswith("0 problem(s)")
+    # Which account is the store's to say, not the log's.
+    assert not any("acme-gh" in line for line in lines)
+
+
+def test_a_page_redrawing_itself_logs_nothing_about_github(api, fleet, caplog):
+    _connect(api)
+    with caplog.at_level("INFO", logger="flotta.github_app"):
+        api.get(
+            f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories?suggest=false",
+            headers=_member(),
+        )
+    assert [r for r in caplog.records if r.name == "flotta.github_app"] == []
+
+
 def test_the_token_for_listing_can_only_read_metadata(api, fleet, github):
     _connect(api)
     api.get(f"/api/boxes/{_box_id(fleet, ACME_AGENT)}/github/repositories", headers=_member())

@@ -50,8 +50,13 @@ def log_config() -> dict[str, Any]:
     """uvicorn's own logging config, with `HideQueryValues` on every handler."""
     from uvicorn.config import LOGGING_CONFIG
 
+    from flotta.github_app import TIMING_LOG
+
     config = copy.deepcopy(LOGGING_CONFIG)
     config.setdefault("filters", {})["hide_query_values"] = {"()": HideQueryValues}
     for handler in config["handlers"].values():
         handler.setdefault("filters", []).append("hide_query_values")
+    # How long each ask to GitHub took (FLOTTA-180). Only this logger: turning
+    # on all of `flotta` at INFO would change what the door and gateway write.
+    config["loggers"][TIMING_LOG] = {"handlers": ["default"], "level": "INFO", "propagate": False}
     return config
