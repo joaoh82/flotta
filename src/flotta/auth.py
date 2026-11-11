@@ -122,6 +122,17 @@ reaches every box in its tenant.
 A ticket opens a conversation, and no more, unless it says `"access": "full"`
 (FLOTTA-123). Only the control plane says so, and only for a caller who can
 change the agent anyway. See `flotta.door.conversation`.
+
+## What a ticket may do with the agent's screen (FLOTTA-209)
+
+An agent with a screen has a desktop a person can watch and take over
+(`docs/AGENT_SCREEN.md` in the parent repo). Taking over is its own power, not a
+side effect of chatting: **whatever a person signs in to on that screen, the
+agency's agent keeps afterwards.** So a ticket carries a screen grant, one of
+`SCREEN_GRANTS`, in a `"screen"` claim: `watch` or `control`, and absent for
+`none`. `screen_grant` decides it when the ticket is minted; the door enforces
+it. A ticket that says nothing, which is every ticket minted before this, may
+do nothing with a screen.
 """
 
 from __future__ import annotations
@@ -223,6 +234,13 @@ def scopes_for_role(role: str, *, client: str | None = None) -> frozenset[str]:
         raise AuthError("a client user talks to one client's agents; name the client")
     return ROLES[role]
 
+
+#: What a ticket may do with its agent's screen, narrowest first. `none` is
+#: also what a ticket that says nothing means. See `screen_grant`.
+SCREEN_NONE = "none"
+SCREEN_WATCH = "watch"
+SCREEN_CONTROL = "control"
+SCREEN_GRANTS: tuple[str, ...] = (SCREEN_NONE, SCREEN_WATCH, SCREEN_CONTROL)
 
 #: A chat ticket's lifetime. It only has to last from the web app's server
 #: minting it to the browser opening the socket; the conversation outlives it.
@@ -372,6 +390,9 @@ class Token:
     #: A conversation-only ticket whose holder may also answer the agent's
     #: approvals, because the agency allows it for this agent (FLOTTA-124).
     answers_approvals: bool = False
+    #: What a ticket's holder may do with the agent's screen: one of
+    #: `SCREEN_GRANTS` (FLOTTA-209). Only a ticket says anything else.
+    screen: str = SCREEN_NONE
 
     def allows(self, scope: str) -> bool:
         return scope in self.scopes
@@ -386,6 +407,30 @@ def is_governor(token: Token) -> bool:
     limits would read as one that may do anything to the fleet.
     """
     return SCOPE_ORG_GOVERN in token.scopes
+
+
+def screen_grant(token: Token | None, *, has_screen: bool, client_control: bool) -> str:
+    """What `token`'s holder may do with an agent's screen, for its ticket (FLOTTA-209).
+
+    - **No screen:** `none`, whoever asks.
+    - **The agency** (anyone who can change the agent, `fleet:write`, and the
+      keyless operator): `control`.
+    - **A client's people** (`is_client_person`): `watch`, and `control` only
+      when the agency allows it for this agent (`client_control`). A client
+      viewer holds no `box:chat` and gets no ticket at all.
+    - **Anything else that may chat** (a box's own token, an operator's
+      `box:chat`-only one): `watch`. Driving is granted, never assumed.
+
+    `token` must already be admitted to the agent (`admits`): this says what,
+    not to whom.
+    """
+    if not has_screen:
+        return SCREEN_NONE
+    if token is None or token.allows(SCOPE_FLEET_WRITE):
+        return SCREEN_CONTROL
+    if is_client_person(token) and client_control:
+        return SCREEN_CONTROL
+    return SCREEN_WATCH
 
 
 def is_client_person(token: Token) -> bool:
@@ -718,6 +763,7 @@ def mint_ticket(
     now: int | None = None,
     full_access: bool = False,
     answers_approvals: bool = False,
+    screen: str = SCREEN_NONE,
 ) -> str:
     """A chat ticket: `box:chat` on `box_id` alone, for minutes (M12.5).
 
@@ -725,10 +771,15 @@ def mint_ticket(
     it exactly as for a token. `subject` is whoever asked, for the door's log;
     it grants nothing, which is why a person's `user:` subject is allowed here
     when `mint` refuses it.
+
+    `screen` is what it may do with the agent's screen (`screen_grant`); `none`
+    is written as no claim at all, the same as a ticket from before screens.
     """
     signing_key = _require_key(key, env)
     if not 0 < ttl_s <= TICKET_MAX_TTL_S:
         raise AuthError(f"a ticket lasts minutes: 1 to {TICKET_MAX_TTL_S} seconds")
+    if screen not in SCREEN_GRANTS:
+        raise AuthError(f"unknown screen grant {screen!r}. Known: {', '.join(SCREEN_GRANTS)}")
     for claim, value in (("box", box_id), ("org", org), ("client", client)):
         if not value or not value.strip():
             raise AuthError(f"a ticket names its box's {claim}")
@@ -745,6 +796,7 @@ def mint_ticket(
             "exp": issued + ttl_s,
             **({"access": "full"} if full_access else {}),
             **({"approvals": "answer"} if answers_approvals else {}),
+            **({"screen": screen} if screen != SCREEN_NONE else {}),
         }
     )
     return f"{TICKET_PREFIX}{payload}.{_sign(_TICKET_DOMAIN + payload, signing_key)}"
@@ -760,7 +812,9 @@ def verify_ticket(
     """A chat ticket's claims, or `AuthError`. Refuses every token.
 
     What comes back always names one box, and holds `box:chat` and nothing
-    else, whatever the payload says: a ticket is never more than that.
+    else, whatever the payload says: a ticket is never more than that. Its
+    `screen` is `none` unless the ticket names a known grant, so one from
+    before screens reaches none.
     """
     signing_key = _require_key(key, env)
     if not ticket or not ticket.startswith(TICKET_PREFIX):
@@ -782,7 +836,13 @@ def verify_ticket(
         box=box,
         full_access=claims.get("access") == "full",
         answers_approvals=claims.get("approvals") == "answer",
+        screen=_screen_claim(claims.get("screen")),
     )
+
+
+def _screen_claim(value: Any) -> str:
+    """A ticket's screen grant: one of `SCREEN_GRANTS`, and `none` for anything else."""
+    return value if isinstance(value, str) and value in SCREEN_GRANTS else SCREEN_NONE
 
 
 def _encode(claims: dict[str, Any]) -> str:
