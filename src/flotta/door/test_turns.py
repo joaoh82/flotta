@@ -788,3 +788,116 @@ def test_a_held_socket_waits_for_the_turn_that_asked_not_every_turn(quick):
         return still
 
     assert asyncio.run(go()) is True
+
+
+# -- a turn's end, on the way to the control plane (FLOTTA-218) -------------------
+# The production case: a client's socket closed mid-turn, and the run stayed
+# `running` until idle sleep ended it. No call reached the control plane, and
+# the door said nothing, because its failures were INFO lines nothing printed.
+
+
+class _Answered(Exception):
+    """What `httpx.Response.raise_for_status` raises: the answer, on `.response`."""
+
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
+class Flaky(Plane):
+    """A control plane whose ends fail as `faults` says, one per try, then land."""
+
+    def __init__(self, faults, *, landed_before=()):
+        super().__init__()
+        self.faults = list(faults)
+        #: Tries that reach the store and lose their answer on the way back.
+        self.landed_before = set(landed_before)
+        self.tries = 0
+
+    async def finish_chat_run(self, box_id, run_id, **ending):
+        self.tries += 1
+        if self.tries in self.landed_before:
+            self.finished.append({"box": box_id, "run": run_id, **ending})
+        if self.faults:
+            raise self.faults.pop(0)
+        if any(f["run"] == run_id for f in self.finished):
+            raise _Answered(409)
+        self.finished.append({"box": box_id, "run": run_id, **ending})
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    monkeypatch.setattr("flotta.door.turns.FINISH_BACKOFF_S", (0.0,))
+
+
+def _closed_mid_turn(plane):
+    async def go():
+        gate, recorder = _gate(plane)
+        await gate.from_client(_submit("Clean up."))
+        await gate.from_box(_event("message.start"))
+        await _until(lambda: plane.opened)
+        await recorder.close()
+
+    asyncio.run(go())
+
+
+def test_a_turn_end_that_fails_on_the_way_is_tried_again(no_backoff, caplog):
+    plane = Flaky([ConnectionError("refused"), TimeoutError(), _Answered(502)])
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(plane)
+
+    (finished,) = plane.finished
+    assert (finished["status"], finished["error_class"]) == ("failed", "disconnected")
+    assert plane.tries == 4
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "on try 4" in caplog.text
+
+
+def test_an_end_that_landed_but_lost_its_answer_is_recorded_once(no_backoff, caplog):
+    plane = Flaky([TimeoutError()], landed_before={1})
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(plane)
+
+    assert len(plane.finished) == 1
+    assert plane.tries == 2
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_an_end_that_never_lands_is_said_at_warning(no_backoff, caplog):
+    from flotta.door.turns import FINISH_TRIES
+
+    plane = Flaky([ConnectionError("refused")] * 10)
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(plane)
+
+    assert plane.finished == []
+    assert plane.tries == FINISH_TRIES
+    (warning,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "t-1 stays running" in warning.getMessage()
+    assert "disconnected" in warning.getMessage()
+    assert "ConnectionError: refused" in warning.getMessage()
+
+
+def test_an_end_the_control_plane_refuses_is_not_tried_again(no_backoff, caplog):
+    plane = Flaky([_Answered(404)] * 10)
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(plane)
+
+    assert plane.tries == 1
+    assert [r.levelname for r in caplog.records if "stays running" in r.getMessage()] == [
+        "WARNING"
+    ]
+
+
+def test_an_end_already_closed_elsewhere_is_not_a_warning(no_backoff, caplog):
+    plane = Flaky([_Answered(409)])
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(plane)
+
+    assert plane.tries == 1
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

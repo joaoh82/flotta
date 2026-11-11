@@ -142,3 +142,20 @@ def test_flotta_chat_sends_its_token_in_a_header_not_the_url():
     assert TOKEN not in seen["url"]
     assert seen["url"] == "https://eng-d.flotta.dev/api/ws?ticket=t1"
     assert seen["headers"] == {"Authorization": f"Bearer {TOKEN}"}
+
+
+def test_the_doors_own_lines_are_written(capfd):
+    """FLOTTA-218: uvicorn's config sets up only its own loggers, so every INFO
+    line the door wrote about a conversation (a turn ended disconnected, an
+    approval settled, a turn's end that went unrecorded) went nowhere, and a
+    lost turn end left no trace. Under the servers' config, they're written."""
+    import logging.config
+
+    logging.config.dictConfig(log_config())
+    door = logging.getLogger("flotta.door.turns")
+    door.info("b-1's socket closed mid-turn: 1 turn(s) end disconnected")
+    door.warning("b-1's run t-1 stays running")
+
+    err = capfd.readouterr().err
+    assert "b-1's socket closed mid-turn" in err
+    assert "t-1 stays running" in err
