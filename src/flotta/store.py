@@ -3092,6 +3092,18 @@ class FleetStore:
             latest[str(row["entity_id"])] = _event_from_row(row)
         return latest
 
+    def box_events_of_type(self, type: str, *, limit: int = 500) -> list[Event]:
+        """The newest `limit` box events of one type, fleet-wide, newest first.
+
+        For a record kept on each agent's timeline and read across the fleet:
+        the agents an update passed by (FLOTTA-211), listed on its build.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM events WHERE entity_kind = 'box' AND type = ? ORDER BY id DESC LIMIT ?",
+            (type, limit),
+        ).fetchall()
+        return [_event_from_row(row) for row in rows]
+
     # -- builds -------------------------------------------------------------
 
     def start_build(self, hermes_ref: str, *, now: datetime | None = None) -> Build:

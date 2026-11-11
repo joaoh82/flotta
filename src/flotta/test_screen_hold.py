@@ -130,6 +130,37 @@ def test_a_new_takeover_after_a_lapse_holds_again(store):
     assert idle_boxes(store, idle_after_s=1800) == []
 
 
+@pytest.mark.parametrize("bookkeeping", ["upgrade_skipped", "screen_hold_forced"])
+def test_what_the_fleet_did_about_an_agent_moves_neither_clock(store, bookkeeping):
+    """Each press of "Update agents" would otherwise buy a forgotten takeover
+    four more hours, and an idle agent another half hour."""
+    box = _taken_over(store, quiet_s=SCREEN_HOLD_CAP_S + 60)
+    store.add_event("box", box.id, bookkeeping, {"build_id": "bld-1"})
+
+    assert screen_hold(store, box.id) is None or screen_hold(store, box.id).lapsed
+    assert [b.id for b, _ in idle_boxes(store, idle_after_s=1800)] == [box.id]
+
+
+def test_a_force_ends_the_hold(store):
+    box = _taken_over(store, quiet_s=60)
+    store.add_event("box", box.id, "screen_hold_forced", {"verb": "re-image"})
+    assert screen_hold(store, box.id) is None
+    # Until the screen changes hands again.
+    record_screen_lease(store, box.id, holder="human", since=TAKEN + timedelta(hours=1))
+    assert screen_hold(store, box.id).lapsed is False
+
+
+def test_box_events_of_one_type_are_read_fleet_wide_newest_first(store):
+    first, second = _agent(store, "eng-a"), _agent(store, "eng-b")
+    store.add_event("box", first.id, "upgrade_skipped", {"n": 1})
+    store.add_event("box", second.id, "upgrade_skipped", {"n": 2})
+    store.add_event("box", first.id, "addressed", {})
+
+    found = store.box_events_of_type("upgrade_skipped")
+    assert [(e.entity_id, e.payload["n"]) for e in found] == [(second.id, 2), (first.id, 1)]
+    assert len(store.box_events_of_type("upgrade_skipped", limit=1)) == 1
+
+
 # -- the door's reports ---------------------------------------------------------
 
 

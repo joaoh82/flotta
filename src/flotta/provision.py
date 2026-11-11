@@ -4234,6 +4234,8 @@ def last_activity_at(store: FleetStore, box_id: str) -> datetime | None:
     """
     newest: datetime | None = None
     for event in store.get_box_timeline(box_id):
+        if event.type in NOT_ACTIVITY:
+            continue
         stamped = _parse_ts(event.ts)
         if stamped is not None and (newest is None or stamped > newest):
             newest = stamped
@@ -4259,6 +4261,12 @@ SCREEN_HOLD_LAPSED_EVENT = "screen_hold_lapsed"
 SCREEN_HOLD_FORCED_EVENT = "screen_hold_forced"
 #: Written when "Update agents" passed an agent by because of one.
 UPGRADE_SKIPPED_EVENT = "upgrade_skipped"
+#: What the fleet did *about* an agent, not anything happening on it: none of
+#: these moves its idle clock or the hold's cap, or every press of "Update
+#: agents" would buy a forgotten takeover four more hours.
+NOT_ACTIVITY = frozenset(
+    {UPGRADE_SKIPPED_EVENT, SCREEN_HOLD_FORCED_EVENT, SCREEN_HOLD_LAPSED_EVENT}
+)
 #: Hermes's holders. Anything else the door reports is refused.
 SCREEN_HUMAN = "human"
 SCREEN_AGENT = "agent"
@@ -4298,10 +4306,13 @@ def screen_hold(
 ) -> ScreenHold | None:
     """Whether a person holds this agent's screen. `None` when nobody does.
 
-    The newest `screen_lease` decides, unless a lapse was recorded after it.
+    The newest `screen_lease` decides, unless a lapse or a force was recorded
+    after it: either ends that hold, until the screen changes hands again.
     `seen` is `last_activity_at` when the caller has it already.
     """
-    latest = store.latest_box_events([box_id], [SCREEN_LEASE_EVENT, SCREEN_HOLD_LAPSED_EVENT])
+    latest = store.latest_box_events(
+        [box_id], [SCREEN_LEASE_EVENT, SCREEN_HOLD_LAPSED_EVENT, SCREEN_HOLD_FORCED_EVENT]
+    )
     event = latest.get(box_id)
     if event is None or event.type != SCREEN_LEASE_EVENT:
         return None

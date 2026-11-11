@@ -38,6 +38,7 @@ import math
 import os
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1126,13 +1127,18 @@ def create_app(
 
     def _refuse_screen_held(
         store: Any, box: Any, token: Token | None, *, force: bool, verb: str
-    ) -> None:
+    ) -> Callable[[], None]:
         """409 if a person holds this awake agent's screen (FLOTTA-211), unless forced.
 
         Before anything is begun or written, so a refusal leaves nothing behind.
-        `force` is the operator's alone: an agency's people hand the screen back
-        from the screen, which a stop or restart would not do for them. A forced
-        one is recorded, with whose hold it ended.
+
+        `force` is the operator's, or the agent's own org owner's: a member's is
+        a 403. An owner may because the agent can write Hermes's `lease.json`
+        itself, and a lease it holds would otherwise refuse its own agency every
+        verb until the cap. Returns what the route calls once the verb has gone
+        ahead (answered, or handed to its thread): only then is the force
+        recorded, as `screen_hold_forced`, which ends the hold
+        (`provision.screen_hold`). Unforced, or with nothing held, it does nothing.
         """
         from flotta.provision import (
             SCREEN_HOLD_FORCED_EVENT,
@@ -1141,25 +1147,36 @@ def create_app(
             refuse_while_screen_held,
         )
 
-        if force:
-            if not _is_operator(token):
-                raise HTTPException(
-                    status_code=403,
-                    detail="only the fleet's operator may force this past a person on its screen",
-                )
-            hold = held_screen(store, box)
-            if hold is not None:
-                store.add_event(
-                    "box",
-                    box.id,
-                    SCREEN_HOLD_FORCED_EVENT,
-                    {**hold.details(), "verb": verb, "forced_by": token.subject if token else None},
-                )
-            return
-        try:
-            refuse_while_screen_held(store, box, verb=verb)
-        except ScreenHeld as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not force:
+            try:
+                refuse_while_screen_held(store, box, verb=verb)
+            except ScreenHeld as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return lambda: None
+        if not (_is_operator(token) or (token is not None and token.allows(SCOPE_ORG_ADMIN))):
+            raise HTTPException(
+                status_code=403,
+                detail="only the org's owner or the fleet's operator may force this past a "
+                "person on its screen",
+            )
+        hold = held_screen(store, box)
+        if hold is None:
+            return lambda: None
+        payload = {**hold.details(), "verb": verb, "forced_by": token.subject if token else None}
+        recorded: list[bool] = []
+
+        def went_ahead() -> None:
+            if recorded:
+                return
+            recorded.append(True)
+            # Its own store: a backgrounded route has closed its own by now.
+            inner = store_factory()
+            try:
+                inner.add_event("box", box.id, SCREEN_HOLD_FORCED_EVENT, payload)
+            finally:
+                inner.close()
+
+        return went_ahead
 
     def _occupant(store: Any, token: Token | None, endpoint: str) -> str | None:
         """Why a machine is taken, as far as `token` may be told; `None` if free.
@@ -3382,18 +3399,17 @@ def create_app(
             from flotta.provision import UPGRADE_SKIPPED_EVENT
 
             builds = store.list_builds()
-            # The agents an update passed by (FLOTTA-211), from their timelines:
-            # a build is a row of its own, and what it skipped is each agent's.
-            boxes = {b.id: b for b in store.list_boxes()}
+            # The agents each update passed by (FLOTTA-211), from their
+            # timelines: a build is a row of its own, and what it skipped is
+            # each agent's. Every listed build's, oldest skip first.
+            names = {b.id: b.name for b in store.list_boxes()}
             skipped: dict[str, list[dict[str, Any]]] = {}
-            for box_id, event in store.latest_box_events(
-                list(boxes), [UPGRADE_SKIPPED_EVENT]
-            ).items():
+            for event in reversed(store.box_events_of_type(UPGRADE_SKIPPED_EVENT)):
                 payload = event.payload or {}
                 skipped.setdefault(str(payload.get("build_id")), []).append(
                     {
-                        "box_id": box_id,
-                        "name": boxes[box_id].name,
+                        "box_id": event.entity_id,
+                        "name": names.get(event.entity_id),
                         "reason": payload.get("reason"),
                         "since": payload.get("since"),
                         "at": event.ts,
@@ -5274,7 +5290,9 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            _refuse_screen_held(store, box, token, force=force, verb="change the model of")
+            went_ahead = _refuse_screen_held(
+                store, box, token, force=force, verb="change the model of"
+            )
             with _model_changes_lock:
                 if box.id in _model_changes_running:
                     raise HTTPException(
@@ -5317,12 +5335,14 @@ def create_app(
                         raise HTTPException(status_code=502, detail=str(exc)) from exc
                     except ProvisionError as exc:
                         raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    went_ahead()
                     return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
                 answer = {**started, "started": True, "box": _with_meta(store, box)}
                 worker = threading.Thread(target=change, name=f"model-{box.name}", daemon=True)
                 _provisioning.add(worker)
                 worker.start()
                 handed_over = True
+                went_ahead()
                 return JSONResponse(answer, status_code=202)
             except HTTPException:
                 raise
@@ -5376,7 +5396,7 @@ def create_app(
         try:
             box = _scoped_box(store, token, box_id)
             _require_owner(token, "resize an agent")
-            _refuse_screen_held(store, box, token, force=force, verb="resize")
+            went_ahead = _refuse_screen_held(store, box, token, force=force, verb="resize")
             with _resizes_lock:
                 if box.id in _resizes_running:
                     raise HTTPException(
@@ -5427,6 +5447,7 @@ def create_app(
                         raise HTTPException(status_code=502, detail=str(exc)) from exc
                     except ProvisionError as exc:
                         raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    went_ahead()
                     return {
                         "box_id": box.id,
                         "memory_mb": memory_mb,
@@ -5442,6 +5463,7 @@ def create_app(
                 _provisioning.add(worker)
                 worker.start()
                 handed_over = True
+                went_ahead()
                 return JSONResponse(answer, status_code=202)
             except HTTPException:
                 raise
@@ -5496,7 +5518,9 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            _refuse_screen_held(store, box, token, force=force, verb="change the screen of")
+            went_ahead = _refuse_screen_held(
+                store, box, token, force=force, verb="change the screen of"
+            )
             with _resizes_lock:
                 if box.id in _resizes_running:
                     raise HTTPException(
@@ -5547,12 +5571,14 @@ def create_app(
                         # holds back every resize until it goes stale.
                         _record_unfinished_screen(store_factory, box.id, started, exc)
                         raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    went_ahead()
                     return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
                 answer = {**started, "started": True, "box": _with_meta(store, box)}
                 worker = threading.Thread(target=change, name=f"screen-{box.name}", daemon=True)
                 _provisioning.add(worker)
                 worker.start()
                 handed_over = True
+                went_ahead()
                 return JSONResponse(answer, status_code=202)
             except HTTPException:
                 raise
@@ -5597,7 +5623,7 @@ def create_app(
                     status_code=409,
                     detail=f"box {box.name} has no settled machine to repair ({box.status}).",
                 )
-            _refuse_screen_held(store, box, token, force=force, verb="restart")
+            went_ahead = _refuse_screen_held(store, box, token, force=force, verb="restart")
             if not (os.environ.get("FLOTTA_CONTROL_URL") or "").strip():
                 raise HTTPException(
                     status_code=409,
@@ -5616,7 +5642,9 @@ def create_app(
                 )
             if not background:
                 try:
-                    return repair_connection(box.id, store=store)
+                    repaired = repair_connection(box.id, store=store)
+                    went_ahead()
+                    return repaired
                 except UpgradeFailed as exc:
                     raise HTTPException(status_code=502, detail=str(exc)) from exc
                 except ProvisionError as exc:
@@ -5637,6 +5665,7 @@ def create_app(
         worker = threading.Thread(target=repair, name=f"repair-{box.name}", daemon=True)
         _provisioning.add(worker)
         worker.start()
+        went_ahead()
         return JSONResponse({"box_id": box.id, "name": box.name, "started": True}, status_code=202)
 
     def _move_provider(box_id: str, token: Token | None, *, join: bool, force: bool) -> Any:
@@ -5666,7 +5695,7 @@ def create_app(
                     status_code=409,
                     detail="there is no gateway. Set $FLOTTA_GATEWAY_URL where this runs.",
                 )
-            _refuse_screen_held(store, box, token, force=force, verb="restart")
+            went_ahead = _refuse_screen_held(store, box, token, force=force, verb="restart")
             try:
                 movable_box(box.id, store)
             except OrgSuspended as exc:
@@ -5675,7 +5704,9 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if not background:
                 try:
-                    return move(box.id, store=store)
+                    moved = move(box.id, store=store)
+                    went_ahead()
+                    return moved
                 except UpgradeFailed as exc:
                     raise HTTPException(status_code=502, detail=str(exc)) from exc
                 except ProvisionError as exc:
@@ -5696,6 +5727,7 @@ def create_app(
         worker = threading.Thread(target=run, name=f"move-{box.name}", daemon=True)
         _provisioning.add(worker)
         worker.start()
+        went_ahead()
         return JSONResponse({"box_id": box.id, "name": box.name, "started": True}, status_code=202)
 
     @app.post("/api/boxes/{box_id}/gateway")
@@ -5739,9 +5771,11 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            _refuse_screen_held(store, box, token, force=force, verb="restart")
+            went_ahead = _refuse_screen_held(store, box, token, force=force, verb="restart")
             try:
-                return rotate_identity(box.id, store=store)
+                rotated = rotate_identity(box.id, store=store)
+                went_ahead()
+                return rotated
             except UpgradeFailed as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             except ProvisionError as exc:
@@ -5837,11 +5871,15 @@ def create_app(
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
-            _refuse_screen_held(store, box, token, force=force, verb="re-image")
+            went_ahead = _refuse_screen_held(store, box, token, force=force, verb="re-image")
             if background:
-                return _upgrade_in_background(box, image)
+                started = _upgrade_in_background(box, image)
+                went_ahead()
+                return started
             try:
-                return upgrade_box(box.id, store=store, image=image)
+                upgraded = upgrade_box(box.id, store=store, image=image)
+                went_ahead()
+                return upgraded
             except UpgradeFailed as exc:
                 # The substrate broke. 502, matching what `POST /api/boxes`
                 # answers for the same class of failure — and *not* 409, which
@@ -7925,12 +7963,13 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            _refuse_screen_held(store, box, token, force=force, verb="put to sleep")
+            went_ahead = _refuse_screen_held(store, box, token, force=force, verb="put to sleep")
             try:
                 result = stop_box(box.id, store=store, reason="asked")
             except ProvisionError as exc:
                 status = 502 if str(exc).startswith("could not stop") else 409
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
+            went_ahead()
             return {"box": _box_dict(_scoped_box(store, token, box.id)), **result}
         finally:
             store.close()

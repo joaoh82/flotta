@@ -38,6 +38,7 @@ def _bearer(token):
 OPERATOR = _bearer(mint(scopes=set(ROLES["owner"]) | {SCOPE_FLEET_ROUTE}, key=KEY, subject="josh"))
 DOOR = _bearer(mint(scopes={SCOPE_FLEET_ROUTE}, key=KEY, subject="door"))
 OWNER = _bearer(mint(scopes=set(ROLES["owner"]), key=KEY, subject="ana", org="agency-x"))
+MEMBER = _bearer(mint(scopes=set(ROLES["member"]), key=KEY, subject="bo", org="agency-x"))
 ENG = "eng-a"
 SUPPORT = "support--acme--agency-x"
 
@@ -166,14 +167,57 @@ def test_a_forced_upgrade_goes_ahead(api, fleet, monkeypatch):
     assert upgraded == [box.id]
 
 
-def test_only_the_operator_may_force_it(api, fleet, machine):
-    """An agency's people hand the screen back from the screen."""
+def test_an_org_owner_may_force_it_too(api, fleet, machine):
+    """The agent can write Hermes's `lease.json` itself, and a lease it holds
+    would otherwise refuse its own agency every verb until the cap."""
+    assert api.post(f"/api/boxes/{SUPPORT}/sleep", headers=OWNER).status_code == 409
     response = api.post(f"/api/boxes/{SUPPORT}/sleep?force=true", headers=OWNER)
+    assert response.status_code == 200, response.text
+    assert _box(fleet, SUPPORT).status == "stopped"
+    forced = [e for e in _events(fleet, SUPPORT) if e.type == SCREEN_HOLD_FORCED_EVENT]
+    assert [e.payload["forced_by"] for e in forced] == ["ana"]
+
+
+def test_a_member_may_not_force_it(api, fleet, machine):
+    """A member hands the screen back from the screen."""
+    response = api.post(f"/api/boxes/{SUPPORT}/sleep?force=true", headers=MEMBER)
     assert response.status_code == 403
     assert _box(fleet, SUPPORT).status == "running"
-    # And unforced, the owner is told what the operator is.
-    response = api.post(f"/api/boxes/{SUPPORT}/sleep", headers=OWNER)
+    assert response.json()["detail"].startswith("only the org's owner")
+
+
+def test_a_force_that_did_not_go_ahead_records_nothing_and_ends_nothing(api, fleet, machine):
+    """Forced past the screen, and then refused for a task still running."""
+    with FleetStore(fleet) as store:
+        task = store.create_task(_box(fleet).id, "add OAuth")
+        store.update_task_status(task.id, "running")
+
+    response = api.post(f"/api/boxes/{_box(fleet).id}/sleep?force=true", headers=OPERATOR)
+
     assert response.status_code == 409
+    assert "task" in response.json()["detail"]
+    assert SCREEN_HOLD_FORCED_EVENT not in [e.type for e in _events(fleet)]
+    # Still held: an unforced verb is still refused for the screen.
+    again = api.post(f"/api/boxes/{_box(fleet).id}/upgrade", json={}, headers=OPERATOR)
+    assert again.status_code == 409 and "screen" in again.json()["detail"]
+
+
+def test_a_forced_restart_ends_the_hold(api, fleet, monkeypatch):
+    """Or the agent, re-imaged under the person, would still be held after."""
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "upgrade_box", lambda box_id, **kw: {"box_id": box_id})
+    box = _box(fleet)
+    forced = api.post(f"/api/boxes/{box.id}/upgrade?force=true", json={}, headers=OPERATOR)
+    assert forced.status_code == 200, forced.text
+
+    assert api.post(f"/api/boxes/{box.id}/upgrade", json={}, headers=OPERATOR).status_code == 200
+    # And the same lease, reported again by the door, doesn't bring it back.
+    since = TAKEN.timestamp()
+    api.post(
+        f"/api/boxes/{box.id}/screen-lease", json={"holder": "human", "since": since}, headers=DOOR
+    )
+    assert api.post(f"/api/boxes/{box.id}/upgrade", json={}, headers=OPERATOR).status_code == 200
 
 
 # -- "Update agents" -------------------------------------------------------------
@@ -224,6 +268,26 @@ def test_update_agents_passes_by_an_agent_whose_screen_a_person_holds(fleet, mon
             "since": TAKEN.isoformat(),
             "at": skipped[0].ts,
         }
+    ]
+
+
+def test_every_build_keeps_the_agents_it_passed_by(api, fleet):
+    with FleetStore(fleet) as store:
+        box = _box(fleet)
+        for ref in ("v1", "v2"):
+            build = store.start_build(ref)
+            store.add_event(
+                "box",
+                box.id,
+                UPGRADE_SKIPPED_EVENT,
+                {"build_id": build.id, "reason": "screen_held", "since": TAKEN.isoformat()},
+            )
+            store.finish_build(build.id, image=f"registry/x:{ref}")
+
+    builds = api.get("/api/hermes/builds", headers=OPERATOR).json()["builds"]
+    assert [(b["hermes_ref"], [s["name"] for s in b["skipped"]]) for b in builds] == [
+        ("v2", [ENG]),
+        ("v1", [ENG]),
     ]
 
 

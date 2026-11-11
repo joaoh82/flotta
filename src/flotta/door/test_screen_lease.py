@@ -25,6 +25,11 @@ from flotta.door.test_screen import HOST, SCREEN_PATH, WEB_APP, _door, _offer, _
 from flotta.door.test_tickets import _protocols
 
 KEY_EVENT = bytes([4, 1, 0, 0, 0, 0, 0, 0x61])
+#: QEMU's Extended KeyEvent: how noVNC sends a key once Xvnc offers it.
+QEMU_KEY = bytes([255, 0, 0, 1, 0, 0, 0, 0x61, 0, 0, 0, 0x1E])
+CONTINUOUS_UPDATES = bytes([150, 1, 0, 0, 0, 0, 4, 0, 3, 0])
+FENCE = bytes([248, 0, 0, 0, 0, 0, 0, 0, 3]) + b"abc"
+DESKTOP_SIZE = bytes([251, 0, 4, 0, 3, 0, 1, 0]) + bytes(16)
 POINTER = bytes([5, 1, 0, 10, 0, 20])
 CUT_TEXT = bytes([6, 0, 0, 0, 0, 0, 0, 5]) + b"hello"
 UPDATE_REQUEST = bytes([3, 1, 0, 0, 0, 0, 4, 0, 3, 0])
@@ -35,7 +40,7 @@ ENCODINGS = bytes([2, 0, 0, 2]) + bytes(8)
 # -- a person, or only the viewer ------------------------------------------------
 
 
-@pytest.mark.parametrize("frame", [KEY_EVENT, POINTER, CUT_TEXT, CUT_TEXT[:8]])
+@pytest.mark.parametrize("frame", [KEY_EVENT, POINTER, CUT_TEXT, CUT_TEXT[:8], QEMU_KEY])
 def test_a_key_the_pointer_or_the_clipboard_is_a_person(frame):
     assert is_presence(frame)
 
@@ -54,6 +59,11 @@ def test_a_key_the_pointer_or_the_clipboard_is_a_person(frame):
         KEY_EVENT[:7],
         b"",
         bytes([250, 0, 0, 0, 0, 0, 0, 0, 0]),
+        QEMU_KEY[:11],
+        CONTINUOUS_UPDATES,
+        FENCE,
+        FENCE[:8],
+        DESKTOP_SIZE,
     ],
 )
 def test_the_viewer_asking_for_frames_is_nobody(frame):
@@ -62,7 +72,13 @@ def test_the_viewer_asking_for_frames_is_nobody(frame):
 
 @pytest.mark.parametrize(
     "frame",
-    [UPDATE_REQUEST + POINTER, PIXEL_FORMAT + ENCODINGS + KEY_EVENT, UPDATE_REQUEST * 2 + CUT_TEXT],
+    [
+        UPDATE_REQUEST + POINTER,
+        PIXEL_FORMAT + ENCODINGS + KEY_EVENT,
+        UPDATE_REQUEST * 2 + CUT_TEXT,
+        QEMU_KEY + POINTER,
+        CONTINUOUS_UPDATES + FENCE + DESKTOP_SIZE + POINTER,
+    ],
 )
 def test_a_person_batched_behind_the_viewers_own_messages_is_still_one(frame):
     assert is_presence(frame)
@@ -172,7 +188,23 @@ def test_who_took_it_is_reported_even_after_the_broadcast_was():
     """Hermes broadcasts the change before it answers the acquire."""
     broadcast = _event("display.lease", {"lease": _lease()})
     taken = json.dumps({"id": 9, "result": {"lease": _lease()}})
-    assert _watch([broadcast, taken], asked=[ACQUIRE]) == [("b-1", "human", 1000.5, "user:u-1")]
+    assert _watch([broadcast, taken], asked=[ACQUIRE]) == [
+        ("b-1", "human", 1000.5, None),
+        ("b-1", "human", 1000.5, "user:u-1"),
+    ]
+
+
+def test_a_refused_acquire_credits_nobody_with_the_next_takeover():
+    """Hermes said no to this socket, and then someone else took over."""
+    refused = json.dumps({"id": 9, "error": {"code": 5300, "message": "no"}})
+    someone_else = _event("display.lease", {"lease": _lease()})
+    assert _watch([refused, someone_else], asked=[ACQUIRE]) == [("b-1", "human", 1000.5, None)]
+
+
+def test_only_the_answer_to_this_sockets_acquire_names_it():
+    """A lease in another answer (a `display.status` the page asked) is not it."""
+    status = json.dumps({"id": 10, "result": {"lease": _lease()}})
+    assert _watch([status], asked=[ACQUIRE]) == [("b-1", "human", 1000.5, None)]
 
 
 def test_a_control_plane_that_fails_costs_the_socket_nothing():

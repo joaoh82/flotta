@@ -369,7 +369,8 @@ conventions, and the sharp edges below.
 - **Nothing sleeps, stops, restarts or re-images an agent under a person on its
   screen (FLOTTA-211).** A takeover runs no turn, so the door holds the agent
   awake two other ways. An open `/api/display/ws` touches only for a person's
-  RFB input since the last beat (key, pointer, clipboard; `is_presence`), never
+  RFB input since the last beat (key, QEMU extended key, pointer, clipboard;
+  `is_presence`, framed as Hermes's `rfb_filter.py` frames them), never
   for noVNC's endless FramebufferUpdateRequests, so a forgotten tab sleeps. And
   the door reads Hermes's lease off every `/api/ws` it relays (`LeaseWatch`;
   plus a `display.status` of its own after a page closes its screen, which can
@@ -380,9 +381,12 @@ conventions, and the sharp edges below.
   of no activity at all**, then it sleeps and `screen_hold_lapsed` is written,
   which disarms that lease until the screen changes hands again. While held,
   sleep, upgrade, model, size, screen, connection, gateway and identity answer
-  409 naming who and since when; `?force=true` is the operator's alone and
-  writes `screen_hold_forced`. "Update agents" passes such an agent by with
-  `upgrade_skipped`, listed on its build as `skipped`.
+  409 naming who and since when. `?force=true` is the operator's or the org
+  owner's (the agent can write `lease.json` itself, an accepted residual risk);
+  `screen_hold_forced` is written only once the verb went ahead, and ends the
+  hold. "Update agents" passes such an agent by with `upgrade_skipped`, listed
+  on its build as `skipped`. Skips, forces and lapses are `NOT_ACTIVITY`: they
+  move neither the idle clock nor the cap.
 - **The projects folder is on the rootfs and is lost on every image update.**
   `$FLOTTA_WORKDIR` (default `/workspace`) is created by the entrypoint on the
   machine's disk, not on `/data`, because a `node_modules` on the 1 GB memory

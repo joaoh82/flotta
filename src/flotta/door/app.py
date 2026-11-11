@@ -382,12 +382,16 @@ class Liveness:
 # -- a person on the screen (FLOTTA-211) ---------------------------------------
 
 #: RFB client messages a person sends, by type, with the bytes each needs to be
-#: one: KeyEvent, PointerEvent and ClientCutText (its header; the text follows).
-PRESENCE_MESSAGES: dict[int, int] = {4: 8, 5: 6, 6: 8}
-#: The fixed-size client messages a viewer sends on its own: SetPixelFormat, and
-#: FramebufferUpdateRequest, which noVNC sends for as long as a tab is open.
-#: SetEncodings (2) is sized by its count. Past anything else, nothing is read.
-_VIEWER_MESSAGES: dict[int, int] = {0: 20, 3: 10}
+#: one: KeyEvent, PointerEvent, ClientCutText (its header; the text follows),
+#: and QEMU's Extended KeyEvent, which noVNC sends keys as once Xvnc offers it.
+#: Hermes's `tools/bot_desktop/rfb_filter.py` frames the same messages.
+PRESENCE_MESSAGES: dict[int, int] = {4: 8, 5: 6, 6: 8, 255: 12}
+#: The fixed-size client messages a viewer sends on its own: SetPixelFormat,
+#: FramebufferUpdateRequest, which noVNC sends for as long as a tab is open, and
+#: TigerVNC's EnableContinuousUpdates. SetEncodings (2), Fence (248) and
+#: SetDesktopSize (251, a window resized) are sized by their own bytes. Past
+#: anything else, nothing is read.
+_VIEWER_MESSAGES: dict[int, int] = {0: 20, 3: 10, 150: 10}
 
 
 def is_presence(frame: bytes) -> bool:
@@ -407,6 +411,14 @@ def is_presence(frame: bytes) -> bool:
             if left < 4:
                 return False
             size = 4 + 4 * int.from_bytes(frame[at + 2 : at + 4], "big")
+        elif kind == 248:
+            if left < 9:
+                return False
+            size = 9 + frame[at + 8]
+        elif kind == 251:
+            if left < 8:
+                return False
+            size = 8 + 16 * frame[at + 6]
         elif kind in _VIEWER_MESSAGES:
             size = _VIEWER_MESSAGES[kind]
         else:
@@ -509,15 +521,18 @@ class LeaseWatch:
     reports only what it hasn't, and the control plane writes only news. The
     report is its own task: a slow control plane holds up no frame.
 
-    **Who took it** is known on the socket that asked: the next person's lease
-    it hears after a `display.lease.acquire` of its own is its subject's.
+    **Who took it** is known on the socket that asked, and only from Hermes's
+    answer to that `display.lease.acquire`, matched by its JSON-RPC id: a
+    broadcast names nobody, and a refused acquire names nobody either, so
+    someone else's takeover afterwards is never credited to this socket.
     """
 
     def __init__(self, *, box_id: str, subject: str | None, plane: Any) -> None:
         self._box_id = box_id
         self._subject = subject
         self._plane = plane
-        self._taking = False
+        #: The ids of this socket's acquires still unanswered.
+        self._taking: set[str] = set()
         self._reported: tuple[str, float, str | None] | None = None
 
     def asked(self, frame: str | bytes) -> None:
@@ -527,16 +542,36 @@ class LeaseWatch:
         with contextlib.suppress(ValueError):
             parsed = json.loads(frame)
             if isinstance(parsed, dict) and parsed.get("method") == "display.lease.acquire":
-                self._taking = True
+                rid = parsed.get("id")
+                if rid is not None and len(self._taking) < 16:
+                    self._taking.add(json.dumps(rid))
+
+    def _answers_acquire(self, frame: str) -> bool:
+        """Whether this frame is Hermes's answer to one of this socket's acquires.
+
+        Taken off the list either way: an error ends it as surely as a result.
+        """
+        if not self._taking or '"id"' not in frame:
+            return False
+        try:
+            parsed = json.loads(frame)
+        except ValueError:
+            return False
+        if not isinstance(parsed, dict) or ("result" not in parsed and "error" not in parsed):
+            return False
+        rid = json.dumps(parsed.get("id"))
+        if rid not in self._taking:
+            return False
+        self._taking.discard(rid)
+        return "result" in parsed
 
     def heard(self, frame: str) -> None:
         """A frame from the box, on its way to the client."""
+        answered = self._answers_acquire(frame)
         lease = read_lease(frame)
         if lease is None:
             return
-        by = None
-        if lease["holder"] == "human" and self._taking:
-            by, self._taking = self._subject, False
+        by = self._subject if answered and lease["holder"] == "human" else None
         key = (str(lease["holder"]), float(lease["since"]), by)
         if self._reported is not None and key[:2] == self._reported[:2] and by is None:
             return
