@@ -398,3 +398,49 @@ def test_the_agent_is_told_a_resolved_request_is_settled():
     assert "resolved by the agency: Done in #132" in said
     assert "do not do it again" in said
     assert "failed" not in said
+
+
+def test_two_clicks_on_run_again_start_the_work_once(api, fleet, jev, monkeypatch):
+    """The review of #228: both used to pass the checks before either wrote,
+    and each started a run. The claim on the old attempt lets one through."""
+    from flotta.store import FleetStore as Store
+
+    failed = _approved_and_failed(api, fleet, jev)
+    real = Store.get_request
+    seen = []
+
+    def stale(self, request_id):
+        # The second click reads the request as the first one did: before it wrote.
+        found = real(self, request_id)
+        if seen:
+            return seen[0]
+        seen.append(found)
+        return found
+
+    monkeypatch.setattr(Store, "get_request", stale)
+    first = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    second = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    monkeypatch.setattr(Store, "get_request", real)
+
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    with FleetStore(fleet) as store:
+        runs = [
+            r
+            for r in store.list_tasks()
+            if store.get_run(r.id) and store.get_run(r.id).trigger_id == failed["id"]
+        ]
+    assert len(runs) == 2, "the failed attempt and exactly one new one"
+
+
+def test_a_request_being_run_again_is_not_resolved_under_it(api, fleet, jev):
+    failed = _approved_and_failed(api, fleet, jev)
+    with FleetStore(fleet) as store:
+        # A Run again has claimed the old attempt and not yet pointed the request at the new one.
+        store._conn.execute(
+            "UPDATE tasks SET resolved_at = ?, resolved_note = 'run again (x)' WHERE id = ?",
+            ("2026-11-11T10:00:00+00:00", failed["work_run_id"]),
+        )
+    resolved = api.post(
+        f"/api/requests/{failed['id']}/resolve", json={}, headers=_as(SCOPE_FLEET_WRITE)
+    )
+    assert resolved.status_code == 409

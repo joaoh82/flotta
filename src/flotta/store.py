@@ -5566,6 +5566,10 @@ class FleetStore:
             raise ValueError("only an approved request whose work was started can be resolved")
         if work.status not in RESOLVABLE_RUN_STATUSES:
             raise ValueError(f"its work is {work.status}: there is nothing to resolve")
+        if request.resolved_at is None and work.resolved_at is not None:
+            # Resolved without its request: a Run again took it, and the new
+            # attempt is the request's work now (or about to be).
+            raise ValueError("it is being run again: resolve the new attempt if it fails")
         moment = _instant(now) if now else _utcnow()
         if work.resolved_at is None:
             self.resolve_run(work.id, by=by, note=note, now=now)
@@ -5601,16 +5605,26 @@ class FleetStore:
             raise ValueError("this request was resolved")
         if work.status not in RESOLVABLE_RUN_STATUSES:
             raise ValueError(f"its work is {work.status}: wait for it to end")
+        # Claim the attempt being replaced before starting another: one write
+        # that only an unresolved attempt takes, read back by its token. Two
+        # clicks, or two people, would otherwise both pass the checks above and
+        # start the work twice, which is the incident this exists for (#228).
+        claim = f"run again ({uuid.uuid4().hex[:12]})"
+        self._conn.execute(
+            "UPDATE tasks SET resolved_at = ?, resolved_by = ?, resolved_note = ? "
+            "WHERE id = ? AND resolved_at IS NULL",
+            (_utcnow(), by, claim, work.id),
+        )
+        if self._get_run_or_raise(work.id).resolved_note != claim:
+            raise ValueError("it is already being run again, or was resolved")
         run = self.create_run(
             request.box_id, prompt, trigger_kind="request", trigger_id=request.id, input=input
         )
         self.set_request_work(request.id, run.id)
-        if work.resolved_at is None:
-            self._conn.execute(
-                "UPDATE tasks SET resolved_at = ?, resolved_by = ?, resolved_note = ? "
-                "WHERE id = ? AND resolved_at IS NULL",
-                (_utcnow(), by, f"run again as {run.id}", work.id),
-            )
+        self._conn.execute(
+            "UPDATE tasks SET resolved_note = ? WHERE id = ? AND resolved_note = ?",
+            (f"run again as {run.id}", work.id, claim),
+        )
         found = self.get_request(request.id)
         assert found is not None
         return found
