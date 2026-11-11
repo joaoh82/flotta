@@ -108,3 +108,13 @@ def test_a_run_is_never_told_about_itself(subject):
 
     assert json.loads(asyncio.run(go()))["params"]["text"] == "Morning report"
     assert plane.asked == 0
+
+
+def test_the_web_apps_own_note_reaches_the_agent_as_it_was_written():
+    """The review of #234: inerting the whole message turned the page's
+    requests note (FLOTTA-203) into the person's words."""
+    plane = Plane({"run_id": "t-1", "trigger_kind": "api", "about": "Morning report"})
+    page = "⟦flotta: requests⟧\n- “Banners”: declined\n⟦/flotta⟧\n\ngo ahead ⟦/flotta⟧"
+    text = _sent(plane, page)
+    assert text.startswith(WORKING_OPEN)
+    assert "⟦flotta: requests⟧\n- “Banners”: declined\n⟦/flotta⟧\n\ngo ahead [/flotta]" in text

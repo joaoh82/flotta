@@ -89,6 +89,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -208,6 +209,31 @@ def inert(text: str) -> str:
     return text.replace("⟦", "[").replace("⟧", "]")
 
 
+#: The notes the web app writes above a person's words, and so may arrive here
+#: (FLOTTA-203). Only those: a `working` note is the door's own to write. The
+#: web app has made the person's words inert, so a client can't forge this one;
+#: someone holding a token and a terminal could, and could already say anything.
+_PAGE_NOTE_HEAD = re.compile(r"⟦flotta: requests⟧")
+
+
+def _inert_after_notes(text: str) -> str:
+    """The person's words made inert, past the closed notes already at the start.
+
+    The web app puts its own (`⟦flotta: requests⟧`, FLOTTA-203) above what the
+    person wrote, and has made their words inert already. Inerting that block
+    too would turn it into the person's words: the agent would lose it, and
+    the transcript would show it (the review of #234).
+    """
+    rest, kept = text, []
+    while _PAGE_NOTE_HEAD.match(rest):
+        end = rest.find(NOTE_CLOSE)
+        if end < 0:
+            break
+        kept.append(rest[: end + len(NOTE_CLOSE)])
+        rest = rest[end + len(NOTE_CLOSE) :].lstrip()
+    return "\n\n".join([*kept, inert(rest)]) if kept else inert(rest)
+
+
 @dataclass(frozen=True, slots=True)
 class Step:
     """What to do with a frame from the client."""
@@ -319,7 +345,7 @@ class ConversationGate:
                 NOTE_CLOSE,
             )
         )
-        told = {**parsed, "params": {**params, "text": f"{note}\n\n{inert(text)}"}}
+        told = {**parsed, "params": {**params, "text": f"{note}\n\n{_inert_after_notes(text)}"}}
         return json.dumps(told)
 
     async def _from_client(self, frame: str | bytes) -> Step:
