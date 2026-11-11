@@ -69,8 +69,12 @@ def view(store: Any, request: Any, *, for_client: bool = False) -> dict[str, Any
     once it is done, its output, which is the summary the agent was asked to
     end with (`work_prompt`). Approved within the agent's level there is no
     run of its own: the agent goes on in the conversation it was asked in.
-    Its pull requests are those its agent reported during that conversation's
-    turn or during the work's run.
+    Its pull requests are those its agent reported during the work's run; or,
+    for one that started on its own, during the conversation's turn it was
+    filed in. Never the turn's when that turn was some other run (an agent
+    filing a follow-up while it works on an approved request is filing during
+    *that* request's run, whose pull requests are that request's), and none
+    while it waits or once it was declined.
     """
     from flotta import pulls
 
@@ -92,7 +96,7 @@ def view(store: Any, request: Any, *, for_client: bool = False) -> dict[str, Any
         else None
     )
     out["whose"] = whose(store, request.asked_by)
-    opened = store.pull_requests_of_runs([request.run_id, request.work_run_id])
+    opened = store.pull_requests_of_runs(_runs_of(store, request))
     out["pull_requests"] = [
         pulls.view(store, pr, for_client=for_client) for pr in opened if pr.box_id == request.box_id
     ]
@@ -100,6 +104,19 @@ def view(store: Any, request: Any, *, for_client: bool = False) -> dict[str, Any
         for key in AGENCY_ONLY:
             out.pop(key, None)
     return out
+
+
+def _runs_of(store: Any, request: Any) -> list[str]:
+    """The runs whose pull requests are this request's (see `view`)."""
+    if request.status != "approved":
+        return []
+    if request.work_run_id:
+        return [request.work_run_id]
+    if request.auto and request.run_id:
+        turn = store.get_run(request.run_id)
+        if turn is not None and turn.trigger_kind == "chat":
+            return [request.run_id]
+    return []
 
 
 def whose(store: Any, subject: str | None) -> str | None:

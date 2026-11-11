@@ -549,3 +549,67 @@ def test_a_request_shows_the_pull_requests_its_work_opened(api, fleet, jev):
     assert "check_error" not in listed and listed["deploy_state"] == "success"
     (agency,) = api.get("/api/pull-requests", headers=_as(SCOPE_FLEET_READ)).json()["pull_requests"]
     assert agency["check_error"].startswith("GitHub would not")
+
+
+def test_a_request_filed_during_other_work_does_not_take_its_pull_requests(api, fleet, jev):
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    first = _file(api, fleet, title="Dark mode").json()["request"]
+    api.post(
+        f"/api/requests/{first['id']}/decision",
+        json={"approve": True},
+        headers=_as(SCOPE_FLEET_WRITE),
+    )
+    with FleetStore(fleet) as store:
+        box = _id(fleet)
+        run = store.get_request(first["id"]).work_run_id
+        store.start_run(run)
+        store.record_pull_request(
+            box,
+            repo="acme/app",
+            number=13,
+            url="https://github.com/acme/app/pull/13",
+            title="Dark mode",
+            author_login="flotta[bot]",
+            head_ref="dark",
+            base_ref="main",
+            state="open",
+            draft=False,
+            opened_at=datetime.now(UTC).isoformat(),
+        )
+    # While it works on that, the agent files a follow-up: filed during that run.
+    jev.verdict = _verdict()
+    follow = _file(api, fleet, title="Dark mode for emails too").json()["request"]
+    by_title = {
+        r["title"]: r for r in api.get("/api/requests", headers=_as_client()).json()["requests"]
+    }
+    assert [p["number"] for p in by_title["Dark mode"]["pull_requests"]] == [13]
+    assert by_title[follow["title"]]["pull_requests"] == [], "the PR is the other request's"
+
+
+def test_a_request_started_in_a_conversation_has_that_turns_pull_requests(api, fleet, jev):
+    with FleetStore(fleet) as store:
+        box = _id(fleet)
+        store.open_chat_run(
+            box,
+            "Can you add an export?",
+            input={"session_id": "s-42", "by": "user:u-7", "client": True},
+            started_at=datetime.now(UTC),
+        )
+    filed = _file(api, fleet).json()["request"]
+    assert filed["auto"] is True
+    with FleetStore(fleet) as store:
+        store.record_pull_request(
+            box,
+            repo="acme/app",
+            number=14,
+            url="https://github.com/acme/app/pull/14",
+            title="CSV export",
+            author_login="flotta[bot]",
+            head_ref="csv",
+            base_ref="main",
+            state="open",
+            draft=False,
+            opened_at=datetime.now(UTC).isoformat(),
+        )
+    (seen,) = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    assert [p["number"] for p in seen["pull_requests"]] == [14]
