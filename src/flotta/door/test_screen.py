@@ -526,15 +526,43 @@ def test_a_token_opens_the_screen_too(screen_box):
         assert ws.receive_bytes() == b"RFB 003.008\n"
 
 
-def test_an_open_screen_holds_its_agent_awake(screen_box, monkeypatch):
+#: A PointerEvent: a person moving on the screen.
+POINTER = bytes([5, 0, 0, 10, 0, 20])
+#: A FramebufferUpdateRequest: noVNC asking for the next frame, with nobody there.
+UPDATE_REQUEST = bytes([3, 1, 0, 0, 0, 0, 4, 0, 3, 0])
+
+
+def test_a_person_on_an_open_screen_holds_its_agent_awake(screen_box, monkeypatch):
     port, _ = screen_box
     monkeypatch.setattr(door, "HEARTBEAT_S", 0.03)
     app, plane = _door(port)
     client, path, kwargs = _open(app, _ticket())
     with client, client.websocket_connect(path, **kwargs) as ws:
         ws.receive_bytes()
+        for _ in range(3):
+            ws.send_bytes(POINTER)
+            ws.receive_bytes()
+            time.sleep(0.05)
         assert _wait_for(lambda: len(plane.touched) >= 2)
     assert set(plane.touched) == {"b-1"}
+
+
+def test_an_open_screen_with_nobody_at_it_lets_its_agent_sleep(screen_box, monkeypatch):
+    """FLOTTA-210's review: a forgotten tab asks for frames for ever, and the
+    door touched for it every beat, so its agent never slept."""
+    port, _ = screen_box
+    monkeypatch.setattr(door, "HEARTBEAT_S", 0.03)
+    app, plane = _door(port)
+    client, path, kwargs = _open(app, _ticket())
+    with client, client.websocket_connect(path, **kwargs) as ws:
+        ws.receive_bytes()
+        for _ in range(8):
+            ws.send_bytes(UPDATE_REQUEST)
+            ws.receive_bytes()
+            time.sleep(0.03)
+        # Beats went by: the box was asked about, and never touched.
+        assert _wait_for(lambda: len(plane.resolved) >= 4)
+    assert plane.touched == []
 
 
 def test_a_screen_whose_agent_went_to_sleep_is_closed_not_woken(screen_box, monkeypatch):

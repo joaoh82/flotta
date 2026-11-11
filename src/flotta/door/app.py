@@ -106,6 +106,24 @@ own address (`websockets` sets it from the URL) and **no `Origin`**: Hermes's
 `_ws_request_is_allowed` lets a socket with no `Origin` through, and checks one
 that has against the address it bound, which the web app's origin is not. The
 browser's `Origin` is the door's to check, and is checked here.
+
+## Nothing sleeps under a person on the screen (FLOTTA-211)
+
+A takeover is the one time a person needs an agent with no turn running, so
+`Liveness` can't see it. Two things hold the agent awake instead:
+
+- **Someone moving on an open screen.** The page's own RFB messages say so: a
+  key, the pointer or the clipboard (`is_presence`). noVNC asks for the next
+  frame for as long as a tab is open, so an update request is nobody, and a
+  forgotten tab with the screen open lets its agent sleep like a quiet
+  conversation does (`Presence`).
+- **A person holding the screen**, connected or not: Hermes keeps their lease
+  when the link drops, because they may be mid-login. The door reads each
+  change of it on the agent's socket (`LeaseWatch`) and reports it to the
+  control plane, which holds the agent awake and refuses to stop, restart or
+  re-image it (`flotta.provision.screen_hold`). When a page closes its screen,
+  which can hand the lease back with no conversation left to hear it, the door
+  asks the agent itself (`probe_lease`).
 """
 
 from __future__ import annotations
@@ -359,6 +377,240 @@ class Liveness:
             self._warned = True
             _log.warning("%s did not say whether it is working; holding it awake", self._name)
         return working is not False
+
+
+# -- a person on the screen (FLOTTA-211) ---------------------------------------
+
+#: RFB client messages a person sends, by type, with the bytes each needs to be
+#: one: KeyEvent, PointerEvent, ClientCutText (its header; the text follows),
+#: and QEMU's Extended KeyEvent, which noVNC sends keys as once Xvnc offers it.
+#: Hermes's `tools/bot_desktop/rfb_filter.py` frames the same messages.
+PRESENCE_MESSAGES: dict[int, int] = {4: 8, 5: 6, 6: 8, 255: 12}
+#: The fixed-size client messages a viewer sends on its own: SetPixelFormat,
+#: FramebufferUpdateRequest, which noVNC sends for as long as a tab is open, and
+#: TigerVNC's EnableContinuousUpdates. SetEncodings (2), Fence (248) and
+#: SetDesktopSize (251, a window resized) are sized by their own bytes. Past
+#: anything else, nothing is read.
+_VIEWER_MESSAGES: dict[int, int] = {0: 20, 3: 10, 150: 10}
+
+
+def is_presence(frame: bytes) -> bool:
+    """Whether a frame from the page carries a person's input, not only the viewer's own.
+
+    noVNC sends one message a frame, and this reads past the viewer's own to
+    the next anyway, so a batched frame still counts. A frame too short for the
+    message it starts is no message: the handshake's one-byte security choice
+    can be a 5 or a 6. Text is never RFB.
+    """
+    at = 0
+    while at < len(frame):
+        kind, left = frame[at], len(frame) - at
+        if kind in PRESENCE_MESSAGES:
+            return left >= PRESENCE_MESSAGES[kind]
+        if kind == 2:
+            if left < 4:
+                return False
+            size = 4 + 4 * int.from_bytes(frame[at + 2 : at + 4], "big")
+        elif kind == 248:
+            if left < 9:
+                return False
+            size = 9 + frame[at + 8]
+        elif kind == 251:
+            if left < 8:
+                return False
+            size = 8 + 16 * frame[at + 6]
+        elif kind in _VIEWER_MESSAGES:
+            size = _VIEWER_MESSAGES[kind]
+        else:
+            return False
+        at += size
+    return False
+
+
+class Presence:
+    """Whether a person did anything on an open screen since the last beat."""
+
+    def __init__(self) -> None:
+        self._since_beat = False
+
+    def heard(self, frame: bytes | str) -> None:
+        """A frame from the page, on its way to the box."""
+        if isinstance(frame, bytes) and is_presence(frame):
+            self._since_beat = True
+
+    def took(self) -> bool:
+        """Whether this beat counts, and the next one starts afresh."""
+        present, self._since_beat = self._since_beat, False
+        return present
+
+
+#: Hermes's lease holders (`tools/bot_desktop/lease.py`).
+LEASE_HOLDERS = frozenset({"human", "agent"})
+#: The events that carry a lease: `display.lease` for each change, and the two
+#: that carry a whole status snapshot.
+LEASE_EVENTS = frozenset({"display.lease", "display.status", "display.install.done"})
+#: The id of the door's own `display.status`, on a socket of its own.
+LEASE_PROBE_ID = "flotta-door-lease"
+#: How long after a page closes its screen the door asks: Hermes hands a lease
+#: back as it tears the stream down, which can land after the close.
+LEASE_PROBE_DELAY_S = 1.0
+LEASE_PROBE_TIMEOUT_S = 20.0
+#: Screens open, and reports and probes under way: kept so a task outliving the
+#: handler that started it isn't collected.
+_LEASE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _lease_in(holder: Any) -> dict[str, Any] | None:
+    lease = holder.get("lease") if isinstance(holder, dict) else None
+    if not isinstance(lease, dict) or lease.get("holder") not in LEASE_HOLDERS:
+        return None
+    since = lease.get("since")
+    if isinstance(since, bool) or not isinstance(since, int | float):
+        return None
+    return lease
+
+
+def read_lease(frame: str) -> dict[str, Any] | None:
+    """The screen's lease a frame from the box carries, if it carries one.
+
+    An answer with a `lease` (`display.status`, `display.lease.acquire` and
+    `release`), or one of `LEASE_EVENTS`. Anything else, or anything not
+    plainly a lease, is `None`.
+    """
+    if "holder" not in frame or "lease" not in frame:
+        return None
+    try:
+        parsed = json.loads(frame)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if "result" in parsed:
+        return _lease_in(parsed.get("result"))
+    params = parsed.get("params")
+    if parsed.get("method") != "event" or not isinstance(params, dict):
+        return None
+    if params.get("type") not in LEASE_EVENTS:
+        return None
+    payload = params.get("payload")
+    found = _lease_in(payload)
+    if found is None and isinstance(payload, dict):
+        found = _lease_in(payload.get("status"))
+    return found
+
+
+def _keep(task: asyncio.Task[None]) -> None:
+    _LEASE_TASKS.add(task)
+    task.add_done_callback(_LEASE_TASKS.discard)
+
+
+async def _report_lease(plane: Any, box_id: str, lease: dict[str, Any], by: str | None) -> None:
+    """Best effort, as a heartbeat is: a lost report costs a refusal or a hold."""
+    try:
+        await plane.report_screen_lease(
+            box_id, holder=lease["holder"], since=float(lease["since"]), by=by
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.info("could not report %s's screen lease: %s", box_id, type(exc).__name__)
+
+
+class LeaseWatch:
+    """Who holds an agent's screen, read off one socket to it, and told to the fleet.
+
+    Every socket on the agent hears each change (Hermes broadcasts it), so each
+    reports only what it hasn't, and the control plane writes only news. The
+    report is its own task: a slow control plane holds up no frame.
+
+    **Who took it** is known on the socket that asked, and only from Hermes's
+    answer to that `display.lease.acquire`, matched by its JSON-RPC id: a
+    broadcast names nobody, and a refused acquire names nobody either, so
+    someone else's takeover afterwards is never credited to this socket.
+    """
+
+    def __init__(self, *, box_id: str, subject: str | None, plane: Any) -> None:
+        self._box_id = box_id
+        self._subject = subject
+        self._plane = plane
+        #: The ids of this socket's acquires still unanswered.
+        self._taking: set[str] = set()
+        self._reported: tuple[str, float, str | None] | None = None
+
+    def asked(self, frame: str | bytes) -> None:
+        """A frame from the client, on its way to the box."""
+        if isinstance(frame, bytes) or "display.lease.acquire" not in frame:
+            return
+        with contextlib.suppress(ValueError):
+            parsed = json.loads(frame)
+            if isinstance(parsed, dict) and parsed.get("method") == "display.lease.acquire":
+                rid = parsed.get("id")
+                if rid is not None and len(self._taking) < 16:
+                    self._taking.add(json.dumps(rid))
+
+    def _answers_acquire(self, frame: str) -> bool:
+        """Whether this frame is Hermes's answer to one of this socket's acquires.
+
+        Taken off the list either way: an error ends it as surely as a result.
+        """
+        if not self._taking or '"id"' not in frame:
+            return False
+        try:
+            parsed = json.loads(frame)
+        except ValueError:
+            return False
+        if not isinstance(parsed, dict) or ("result" not in parsed and "error" not in parsed):
+            return False
+        rid = json.dumps(parsed.get("id"))
+        if rid not in self._taking:
+            return False
+        self._taking.discard(rid)
+        return "result" in parsed
+
+    def heard(self, frame: str) -> None:
+        """A frame from the box, on its way to the client."""
+        answered = self._answers_acquire(frame)
+        lease = read_lease(frame)
+        if lease is None:
+            return
+        by = self._subject if answered and lease["holder"] == "human" else None
+        key = (str(lease["holder"]), float(lease["since"]), by)
+        if self._reported is not None and key[:2] == self._reported[:2] and by is None:
+            return
+        if key == self._reported:
+            return
+        self._reported = key
+        _keep(
+            asyncio.get_running_loop().create_task(
+                _report_lease(self._plane, self._box_id, lease, by)
+            )
+        )
+
+
+async def probe_lease(base: str, credentials: tuple[str, str] | None) -> dict[str, Any] | None:
+    """Ask the box who holds its screen, on a socket of the door's own.
+
+    For a page that closed its screen: a clean close hands a person's lease back,
+    and the conversation that would have heard it may have closed first. `None`
+    if the box doesn't say.
+    """
+    from urllib.parse import urlencode
+
+    query = ""
+    if credentials is not None:
+        query = "?" + urlencode([("ticket", await hermes_ticket(f"http://{base}", credentials))])
+    question = {"jsonrpc": "2.0", "id": LEASE_PROBE_ID, "method": "display.status", "params": {}}
+    async with asyncio.timeout(LEASE_PROBE_TIMEOUT_S):
+        async with websockets.connect(
+            f"ws://{base}/{AGENT_SOCKET_PATH}{query}", proxy=None, max_size=BOX_FRAME_LIMIT
+        ) as ws:
+            await ws.send(json.dumps(question))
+            async for frame in ws:
+                if not isinstance(frame, str) or LEASE_PROBE_ID not in frame:
+                    continue
+                with contextlib.suppress(ValueError):
+                    parsed = json.loads(frame)
+                    if isinstance(parsed, dict) and parsed.get("id") == LEASE_PROBE_ID:
+                        return _lease_in(parsed.get("result"))
+    return None
 
 
 async def _is_down(plane: Any, box: str) -> bool:
@@ -632,6 +884,15 @@ class ControlPlane:
         response = await self._call("GET", f"/api/boxes/{box_id}/working", name=box_id, verb="read")
         found = response.json().get("working")
         return found if isinstance(found, dict) else None
+
+    async def report_screen_lease(
+        self, box_id: str, *, holder: str, since: float, by: str | None = None
+    ) -> None:
+        """Who holds this agent's screen, as a socket to it just heard (FLOTTA-211)."""
+        body: dict[str, Any] = {"holder": holder, "since": since}
+        if by:
+            body["by"] = by
+        await self._door_post(f"/api/boxes/{box_id}/screen-lease", body)
 
     async def record_client_conversation(self, box_id: str, session_id: str) -> None:
         """A session a client just made is the client's from now on."""
@@ -1002,7 +1263,8 @@ async def relay_screen(
     name: str,
     headers: dict[str, str],
     hold: Callable[[], Awaitable[None]],
-) -> None:
+    heard: Callable[[bytes | str], None] | None = None,
+) -> bool:
     """Splice an accepted page socket to the box's `/api/display/ws`, both ways.
 
     Binary frames, as RFB is, and text passed through for Hermes to refuse.
@@ -1010,8 +1272,11 @@ async def relay_screen(
     the last one is sent, and `websockets` holds at most `max_queue` frames from
     the box before TCP pushes back. One connection to the box per page socket.
 
-    `hold` keeps the box awake while the screen is open and returns if it went
-    to sleep anyway, which ends the socket: see `create_door`.
+    `hold` keeps the box awake while someone is on the screen and returns if
+    it went to sleep anyway, which ends the socket: see `create_door`. `heard`
+    is shown each frame from the page before it goes on (`Presence`).
+
+    Returns whether the page closed it, which can hand a lease back.
 
     A `watch` page's input reaches Hermes too, and is dropped there: Hermes's
     `rfb_filter.py` passes input only from the viewer holding the lease, and
@@ -1034,12 +1299,12 @@ async def relay_screen(
         status = exc.response.status_code
         _log.info("%s's screen refused the door: HTTP %s", name, status)
         await websocket.close(code=4000 + min(status, 999), reason="the agent's screen refused")
-        return
+        return False
     except Exception as exc:
         # Not the URL: it carries Hermes's ticket, and this log is the door's own.
         _log.warning("%s's screen did not answer: %s", name, type(exc).__name__)
         await websocket.close(code=SCREEN_UNREACHABLE, reason="the agent's screen did not answer")
-        return
+        return False
 
     #: How the page closed, once it has: what the box is told, even if the door
     #: is stopped before it finishes telling it.
@@ -1058,6 +1323,8 @@ async def relay_screen(
             if data is None:
                 data = message.get("text")
             if data is not None:
+                if heard is not None:
+                    heard(data)
                 await upstream.send(data)
 
     async def box_to_page() -> None:
@@ -1097,6 +1364,7 @@ async def relay_screen(
         )
         with contextlib.suppress(Exception):
             await upstream.close(code, reason)
+    return bool(said)
 
 
 # -- the app ----------------------------------------------------------------
@@ -1211,6 +1479,17 @@ def create_door(
             f"http://{authority(target.host, target.port)}", timeout_s=ready_timeout_s
         )
         return target
+
+    async def _after_screen(target: Target, base: str, own: tuple[str, str] | None) -> None:
+        """A page closed its screen: ask the box who holds it now, and say."""
+        await asyncio.sleep(LEASE_PROBE_DELAY_S)
+        try:
+            found = await probe_lease(base, own)
+        except Exception as exc:  # noqa: BLE001
+            _log.info("%s did not say who holds its screen: %s", target.name, type(exc).__name__)
+            return
+        if found is not None:
+            await _report_lease(plane, target.box_id, found, None)
 
     @app.get("/_door/health")
     def health() -> Any:
@@ -1340,34 +1619,52 @@ def create_door(
         if screen:
             from urllib.parse import urlencode
 
+            presence = Presence()
+
             async def hold_screen() -> None:
-                """An open screen is in use: touch the box each beat (FLOTTA-210).
+                """Someone on the screen is using it: touch the box (FLOTTA-210, -211).
 
                 Watching or driving says nothing on the conversation, so
-                `Liveness` can't see it, and a screen's own socket is not a
-                conversation's: the conversation's quiet beats stop touching,
-                but close nothing while the box is up, and this keeps it up.
-                FLOTTA-211 is the busy logic proper. Returns if the box went to
-                sleep anyway, because a touch is a wake (FLOTTA-121).
+                `Liveness` can't see it. A beat touches only if a person did
+                something on the screen since the last one (`Presence`): an
+                open tab asks for frames for ever, and touching for that held a
+                forgotten tab's agent awake for ever. The sweep then sleeps the
+                agent its idle threshold after the last of them, unless a
+                person holds the screen (`LeaseWatch`). Returns if the box went
+                to sleep anyway, because a touch is a wake (FLOTTA-121).
                 """
                 while True:
                     await asyncio.sleep(HEARTBEAT_S)
                     if await _is_down(plane, target.box_id):
                         _log.info("%s is asleep; closing its screen", target.name)
                         return
-                    await plane.touch(target.box_id)
+                    if presence.took():
+                        await plane.touch(target.box_id)
 
+            base = authority(target.host, target.port)
             query = urlencode([(DISPLAY_TICKET_PARAM, display_ticket)])
-            await relay_screen(
-                websocket,
-                f"ws://{authority(target.host, target.port)}/{DISPLAY_SOCKET_PATH}?{query}",
-                name=target.name,
-                headers={"Authorization": _basic(*own)} if own else {},
-                hold=hold_screen,
-            )
+
+            async def watch_screen() -> None:
+                page_closed = await relay_screen(
+                    websocket,
+                    f"ws://{base}/{DISPLAY_SOCKET_PATH}?{query}",
+                    name=target.name,
+                    headers={"Authorization": _basic(*own)} if own else {},
+                    hold=hold_screen,
+                    heard=presence.heard,
+                )
+                if page_closed:
+                    await _after_screen(target, base, own)
+
+            # Through a shield, as a conversation is: a handler cancelled as the
+            # page's socket goes must not take the question after it along.
+            screen_task = asyncio.create_task(watch_screen())
+            _keep(screen_task)
+            await asyncio.shield(screen_task)
             return
 
         liveness = Liveness(target.name)
+        lease = LeaseWatch(box_id=target.box_id, subject=token.subject, plane=plane)
         # Tokens that reach this far aren't a client's: see `authorize`.
         a_clients = ticketed and not token.full_access
         # Each turn of a person's conversation becomes a `chat` run (M14.6).
@@ -1489,6 +1786,7 @@ def create_door(
                             step = await gate.from_client(frame)
                             if step.to_box is not None:
                                 liveness.heard(step.to_box)
+                                lease.asked(step.to_box)
                                 await upstream.send(step.to_box)
                             if step.to_client is not None:
                                 await websocket.send_text(step.to_client)
@@ -1498,6 +1796,7 @@ def create_door(
                             if isinstance(message, str):
                                 if liveness.take_answer(message):
                                     continue
+                                lease.heard(message)
                                 # Heard even with nobody to tell: it is how the turn's
                                 # end, and an answer's arrival, are recorded.
                                 answer = await gate.from_box(message)

@@ -4234,10 +4234,180 @@ def last_activity_at(store: FleetStore, box_id: str) -> datetime | None:
     """
     newest: datetime | None = None
     for event in store.get_box_timeline(box_id):
+        if event.type in NOT_ACTIVITY:
+            continue
         stamped = _parse_ts(event.ts)
         if stamped is not None and (newest is None or stamped > newest):
             newest = stamped
     return newest
+
+
+# -- a person on the agent's screen (FLOTTA-211) --------------------------------
+#
+# A takeover is the one time a person needs an agent with no turn running: the
+# agent asked for a sign-in and ended its turn. So the sweep, which reads only
+# turns and activity, would put the machine to sleep under them, and a stop,
+# restart or re-image ends their sign-in halfway. Hermes keeps who holds the
+# screen in its lease (`tools/bot_desktop/lease.py`), and **keeps a person's
+# lease when their connection drops**, because they may be mid-login. The door
+# sees each change of it on the agent's socket and reports it here as
+# `screen_lease`: the door is a reader, the control plane writes (D10).
+
+#: The door's report of who holds an agent's screen: `{holder, since, by?}`.
+SCREEN_LEASE_EVENT = "screen_lease"
+#: Written when a person's hold stopped holding a quiet agent awake.
+SCREEN_HOLD_LAPSED_EVENT = "screen_hold_lapsed"
+#: Written when the operator stopped, restarted or re-imaged an agent anyway.
+SCREEN_HOLD_FORCED_EVENT = "screen_hold_forced"
+#: Written when "Update agents" passed an agent by because of one.
+UPGRADE_SKIPPED_EVENT = "upgrade_skipped"
+#: What the fleet did *about* an agent, not anything happening on it: none of
+#: these moves its idle clock or the hold's cap, or every press of "Update
+#: agents" would buy a forgotten takeover four more hours.
+NOT_ACTIVITY = frozenset(
+    {UPGRADE_SKIPPED_EVENT, SCREEN_HOLD_FORCED_EVENT, SCREEN_HOLD_LAPSED_EVENT}
+)
+#: Hermes's holders. Anything else the door reports is refused.
+SCREEN_HUMAN = "human"
+SCREEN_AGENT = "agent"
+SCREEN_HOLDERS = frozenset({SCREEN_HUMAN, SCREEN_AGENT})
+#: How long a person's hold keeps an agent awake with nothing else happening on
+#: it: no one moving on its screen, no conversation, no run. Generous, because a
+#: sign-in can wait on a code from someone else, and bounded, because a person
+#: who took over and walked away would otherwise keep a 4 GB machine billing
+#: for ever. Past it the agent sleeps like any other, the lapse is recorded, and
+#: the hold holds nothing more until the screen changes hands again.
+SCREEN_HOLD_CAP_S = 4 * 3600
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenHold:
+    """A person holding an agent's screen, as the door last reported it."""
+
+    #: When they took it, ISO, from Hermes's clock.
+    since: str | None
+    #: Who, when the door saw them take it: a token's subject (`user:<id>`).
+    by: str | None
+    #: How long nothing has happened on the agent. `None` with no timeline.
+    quiet_s: float | None
+    #: Past `SCREEN_HOLD_CAP_S`: it holds nothing.
+    lapsed: bool
+
+    def details(self) -> dict[str, Any]:
+        return {"since": self.since, "by": self.by}
+
+
+def screen_hold(
+    store: FleetStore,
+    box_id: str,
+    *,
+    now: datetime | None = None,
+    seen: datetime | None = None,
+) -> ScreenHold | None:
+    """Whether a person holds this agent's screen. `None` when nobody does.
+
+    The newest `screen_lease` decides, unless a lapse or a force was recorded
+    after it: either ends that hold, until the screen changes hands again.
+    `seen` is `last_activity_at` when the caller has it already.
+    """
+    latest = store.latest_box_events(
+        [box_id], [SCREEN_LEASE_EVENT, SCREEN_HOLD_LAPSED_EVENT, SCREEN_HOLD_FORCED_EVENT]
+    )
+    event = latest.get(box_id)
+    if event is None or event.type != SCREEN_LEASE_EVENT:
+        return None
+    payload = event.payload or {}
+    if payload.get("holder") != SCREEN_HUMAN:
+        return None
+    current = now or datetime.now(UTC)
+    seen = seen or last_activity_at(store, box_id)
+    quiet = (current - seen).total_seconds() if seen is not None else None
+    since, by = payload.get("since"), payload.get("by")
+    return ScreenHold(
+        since=since if isinstance(since, str) else None,
+        by=by if isinstance(by, str) else None,
+        quiet_s=quiet,
+        lapsed=quiet is not None and quiet >= SCREEN_HOLD_CAP_S,
+    )
+
+
+def record_screen_lease(
+    store: FleetStore, box_id: str, *, holder: str, since: datetime, by: str | None = None
+) -> bool:
+    """The door saw who holds this agent's screen. Whether it was news.
+
+    Written only when it is: every door socket on the agent hears the same
+    change, and each report is activity, which a repeated one would turn into
+    an agent that never sleeps. Nothing is written for an agent nobody has
+    ever taken over, so a fleet without screens gets no events from this. A
+    report that only adds who took it is written, so a refusal can say.
+    """
+    if holder not in SCREEN_HOLDERS:
+        raise ProvisionError(f"a screen is held by one of {sorted(SCREEN_HOLDERS)}, not {holder!r}")
+    stamp = since.astimezone(UTC).isoformat()
+    by = by if holder == SCREEN_HUMAN and by else None
+    latest = store.latest_box_events([box_id], [SCREEN_LEASE_EVENT]).get(box_id)
+    before = (latest.payload or {}) if latest is not None else None
+    if before is None and holder == SCREEN_AGENT:
+        return False
+    if (
+        before is not None
+        and before.get("holder") == holder
+        and before.get("since") == stamp
+        and (by is None or before.get("by") == by)
+    ):
+        return False
+    payload: dict[str, Any] = {"holder": holder, "since": stamp}
+    if by:
+        payload["by"] = by
+    store.add_event("box", box_id, SCREEN_LEASE_EVENT, payload)
+    return True
+
+
+class ScreenHeld(ProvisionError):
+    """A person holds this agent's screen, and the verb would end what they are doing."""
+
+
+def _holder_named(store: FleetStore, by: str | None) -> str:
+    """Who holds a screen, as a refusal says it: a person's email when it is known."""
+    from flotta.auth import USER_SUBJECT_PREFIX
+
+    if not by:
+        return "A person"
+    if by.startswith(USER_SUBJECT_PREFIX):
+        with contextlib.suppress(Exception):
+            user = store.get_user(by[len(USER_SUBJECT_PREFIX) :])
+            if user is not None:
+                return user.email
+    return by
+
+
+def held_screen(store: FleetStore, box: Box, *, now: datetime | None = None) -> ScreenHold | None:
+    """The hold that refuses a stop, restart or re-image of this agent, if any.
+
+    Only an awake agent's: an asleep one's sign-in has ended already, and
+    re-imaging it while it sleeps ends nothing more. A lapsed hold refuses
+    nothing, for the reason it no longer keeps the agent awake.
+    """
+    if box.status != "running":
+        return None
+    hold = screen_hold(store, box.id, now=now)
+    return None if hold is None or hold.lapsed else hold
+
+
+def refuse_while_screen_held(
+    store: FleetStore, box: Box, *, verb: str, now: datetime | None = None
+) -> None:
+    """Raise `ScreenHeld`, saying who and since when, if `held_screen` finds a hold."""
+    hold = held_screen(store, box, now=now)
+    if hold is None:
+        return
+    since = f" (in control since {hold.since})" if hold.since else ""
+    raise ScreenHeld(
+        f"{_holder_named(store, hold.by)} is using {box.name}'s screen{since}: to {verb} "
+        "it now would end what they are doing there, a sign-in perhaps. Wait for them to "
+        "hand the screen back, or the fleet's operator can force it."
+    )
 
 
 def idle_boxes(
@@ -4284,6 +4454,12 @@ def idle_boxes(
         if seen is None:
             # No timeline at all is not evidence of idleness — it is evidence
             # of a box this code does not understand. Leave it alone.
+            continue
+        # A person holding its screen (FLOTTA-211), with no turn running and
+        # perhaps nobody connected: a dropped link keeps the hold, by Hermes's
+        # design. Until `SCREEN_HOLD_CAP_S` of nothing at all.
+        hold = screen_hold(store, box.id, now=current, seen=seen)
+        if hold is not None and not hold.lapsed:
             continue
         quiet_for = (current - seen).total_seconds()
         if quiet_for >= threshold:
@@ -4526,7 +4702,9 @@ def sleep_idle_boxes(
     """
     outcomes: list[dict[str, Any]] = []
     for box, quiet_for in idle_boxes(store, now=now, idle_after_s=idle_after_s):
-        detail = {"idle_s": round(quiet_for, 1), "reason": "idle"}
+        detail: dict[str, Any] = {"idle_s": round(quiet_for, 1), "reason": "idle"}
+        # Idle with a person's hold on its screen: only a lapsed one.
+        lapsed = screen_hold(store, box.id, now=now)
         try:
             result = stop_box(box.id, store=store, backend=backend, prefer_suspend=prefer_suspend)
         except (ProvisionError, BackendError) as exc:
@@ -4534,5 +4712,16 @@ def sleep_idle_boxes(
             # is having trouble with is exactly the one still costing money.
             outcomes.append({**detail, "box_id": box.id, "slept": False, "error": str(exc)})
             continue
+        if lapsed is not None and lapsed.lapsed:
+            # After the stop: until the machine is asleep the hold still held.
+            # Holds nothing more from here (`screen_hold`), until the screen
+            # changes hands again, so the next wake isn't four more hours.
+            store.add_event(
+                "box",
+                box.id,
+                SCREEN_HOLD_LAPSED_EVENT,
+                {**lapsed.details(), "quiet_s": round(quiet_for, 1)},
+            )
+            detail["screen_hold_lapsed"] = True
         outcomes.append({**detail, "box_id": box.id, "slept": True, "method": result.get("method")})
     return outcomes
