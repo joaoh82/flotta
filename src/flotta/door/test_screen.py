@@ -10,6 +10,7 @@ opens to a ticket. Then the relay, end to end, against a stand-in for Hermes's
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -152,12 +153,27 @@ def test_control_opens_taking_over_handing_back_and_starting():
     assert json.loads(_send(gate, _frame("display.start")).to_box)["method"] == "display.start"
 
 
-def test_a_full_access_ticket_with_a_grant_is_otherwise_forwarded_unread():
+def test_a_full_access_tickets_screen_calls_are_rebuilt_too():
+    """Never `profile`, from any ticket: Hermes's profile-scoped handlers would
+    answer for whichever profile it named."""
     gate = _gate(SCREEN_CONTROL, conversation_only=False)
-    frame = _frame("display.observe", profile="p")
-    assert _send(gate, frame).to_box == frame
+    step = _send(gate, _frame("display.observe", rid=7, viewer_id="v-1", profile="p"))
+    assert json.loads(step.to_box) == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "display.observe",
+        "params": {"viewer_id": "v-1"},
+    }
+    step = _send(gate, _frame("display.lease.release", viewer_id="v-1", force=True, profile="p"))
+    assert json.loads(step.to_box)["params"] == {"viewer_id": "v-1", "force": True}
+
+
+def test_a_full_access_ticket_is_otherwise_forwarded_unread():
+    gate = _gate(SCREEN_CONTROL, conversation_only=False)
     prompt = _frame("prompt.submit", session_id="s", text="what is on the display?")
     assert _send(gate, prompt).to_box == prompt
+    other = _frame("config.get", profile="p")
+    assert _send(gate, other).to_box == other
 
 
 def test_a_token_socket_is_left_to_hermes():
@@ -477,7 +493,7 @@ def test_the_pages_clean_close_reaches_hermes_as_one(screen_box):
     with client, client.websocket_connect(path, **kwargs) as ws:
         ws.receive_bytes()
         ws.close(code=1000)
-    assert _wait_for(lambda: seen["closed_by_door"] is not None)
+        assert _wait_for(lambda: seen["closed_by_door"] is not None)
     assert seen["closed_by_door"] == 1000
 
 
@@ -535,3 +551,77 @@ def test_a_screen_whose_agent_went_to_sleep_is_closed_not_woken(screen_box, monk
             ws.receive_bytes()
     assert closed.value.code == door.SCREEN_GONE
     assert plane.touched == []
+
+
+# -- the door's own close never hands the lease back ---------------------------
+
+
+class _Page:
+    """An accepted page socket that says nothing, and whose sends may fail."""
+
+    def __init__(self, *, send_fails=False):
+        self.send_fails = send_fails
+        self.sent: list[bytes] = []
+        self.closed: int | None = None
+
+    async def receive(self):
+        await asyncio.Event().wait()
+
+    async def send_bytes(self, data):
+        if self.send_fails:
+            raise RuntimeError("the laptop's lid closed")
+        self.sent.append(data)
+
+    async def send_text(self, data):
+        await self.send_bytes(data.encode())
+
+    async def close(self, code=1000, reason=""):
+        self.closed = code
+
+
+async def _forever():
+    await asyncio.Event().wait()
+
+
+def _relay(port, page, *, hold=_forever):
+    url = f"ws://127.0.0.1:{port}/api/display/ws?display_ticket=hermes-display-1"
+    return door.relay_screen(page, url, name="eng-a", headers={}, hold=hold)
+
+
+def test_a_page_gone_mid_send_keeps_the_lease(screen_box):
+    """A lid closing mid-login is a dropped link to Hermes, not a hand-back."""
+    port, seen = screen_box
+    asyncio.run(_relay(port, _Page(send_fails=True)))
+    assert _wait_for(lambda: seen["closed_by_door"] is not None)
+    assert seen["closed_by_door"] == door.SCREEN_GONE
+
+
+def test_a_box_gone_to_sleep_keeps_the_lease(screen_box):
+    port, seen = screen_box
+    page = _Page()
+
+    async def asleep():
+        while not page.sent:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_relay(port, page, hold=asleep))
+    assert page.closed == door.SCREEN_GONE
+    assert _wait_for(lambda: seen["closed_by_door"] is not None)
+    assert seen["closed_by_door"] == door.SCREEN_GONE
+
+
+def test_a_door_stopping_keeps_the_lease(screen_box):
+    port, seen = screen_box
+    page = _Page()
+
+    async def stopped():
+        relay = asyncio.create_task(_relay(port, page))
+        while not page.sent:
+            await asyncio.sleep(0.01)
+        relay.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await relay
+
+    asyncio.run(stopped())
+    assert _wait_for(lambda: seen["closed_by_door"] is not None)
+    assert seen["closed_by_door"] == door.SCREEN_GONE

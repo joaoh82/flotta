@@ -327,9 +327,9 @@ class ConversationGate:
         if self.conversation_only:
             return await self._confined(frame)
         if self.screen is not None:
-            refused = self._screen_refusal(frame)
-            if refused is not None:
-                return refused
+            screened = self._screen_frame(frame)
+            if screened is not None:
+                return screened
         if isinstance(frame, bytes) or "session.most_recent" not in frame:
             return Step(to_box=frame)
         parsed = _parse(frame)
@@ -337,25 +337,33 @@ class ConversationGate:
             return Step(to_box=frame)
         return await self._agency_latest(parsed.get("id"), frame)
 
-    def _screen_refusal(self, frame: str | bytes) -> Step | None:
-        """A full-access ticket's frame naming a `display.*` method its grant doesn't open.
+    def _screen_frame(self, frame: str | bytes) -> Step | None:
+        """A full-access ticket's `display.*` call: refused, or rebuilt. `None` for anything else.
 
-        Read only when it could name one: a method's name has `display` in it
-        unless a character of it is a JSON `\\u` escape. Hermes reads text frames
-        alone, one object each, so a binary frame or a batch calls nothing.
+        Refused unless its grant opens it, and rebuilt from the method's
+        parameters as a client's is, so `profile` never reaches Hermes's
+        profile-scoped handlers from any ticket. Read only when it could name
+        one: a method's name has `display` in it unless a character of it is a
+        JSON `\\u` escape. Hermes reads text frames alone, one object each, so a
+        binary frame or a batch calls nothing.
         """
         if isinstance(frame, bytes) or ("display" not in frame and "\\u" not in frame):
             return None
         parsed = _parse(frame)
         method = parsed.get("method") if parsed is not None else None
-        if not isinstance(method, str) or not method.startswith(SCREEN_PREFIX):
+        if parsed is None or not isinstance(method, str) or not method.startswith(SCREEN_PREFIX):
             return None
-        if method in self._screen_methods:
-            return None
-        self._note(f"the method {method[:80]!r}")
-        return Step(
-            to_client=_error(parsed.get("id"), METHOD_REFUSED, "that is not open to this ticket")
-        )
+        rid = parsed.get("id")
+        allowed = self._screen_methods.get(method)
+        if allowed is None:
+            self._note(f"the method {method[:80]!r}")
+            return Step(to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket"))
+        raw = parsed.get("params")
+        params = {k: v for k, v in raw.items() if k in allowed} if isinstance(raw, dict) else {}
+        rebuilt: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+        if "id" in parsed:
+            rebuilt["id"] = rid
+        return Step(to_box=json.dumps(rebuilt))
 
     async def _agency_latest(self, rid: Any, frame: str) -> Step:
         try:

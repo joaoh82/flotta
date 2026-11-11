@@ -1035,13 +1035,18 @@ async def relay_screen(
         await websocket.close(code=SCREEN_UNREACHABLE, reason="the agent's screen did not answer")
         return
 
+    #: How the page closed, once it has: what the box is told, even if the door
+    #: is stopped before it finishes telling it.
+    said: dict[str, Any] = {}
+
     async def page_to_box() -> None:
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 code = close_for_box(message.get("code"))
-                reason = _reason(message.get("reason")) if code is not None else ""
-                await upstream.close(code, reason)  # type: ignore[arg-type]
+                said["code"] = code
+                said["reason"] = _reason(message.get("reason")) if code is not None else ""
+                await upstream.close(said["code"], said["reason"])
                 return
             data = message.get("bytes")
             if data is None:
@@ -1076,8 +1081,16 @@ async def relay_screen(
             with contextlib.suppress(Exception):
                 await websocket.close(code=code, reason=_reason(reason))
     finally:
+        # Never a clean close of the door's own: Hermes reads 1000 and 1001 as
+        # the person closing the window and hands their lease back. Only the
+        # page says that (`said`). A page gone mid-send, a box gone to sleep, a
+        # door stopping: a dropped link, which keeps the lease for someone who
+        # may be mid-login. A no-op once either side has closed.
+        code, reason = (
+            (said["code"], said["reason"]) if said else (SCREEN_GONE, "the page's side went")
+        )
         with contextlib.suppress(Exception):
-            await upstream.close()
+            await upstream.close(code, reason)
 
 
 # -- the app ----------------------------------------------------------------
