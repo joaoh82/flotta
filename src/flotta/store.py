@@ -604,6 +604,9 @@ class Org:
     #: `suspended`; `None` otherwise. See `FleetStore.suspend_org`.
     suspended_at: str | None = None
     suspend_reason: str | None = None
+    #: Who suspended it (FLOTTA-190): `BILLING` for the hosted product's
+    #: billing, otherwise who did. Billing resumes only its own.
+    suspended_by: str | None = None
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -1265,6 +1268,14 @@ class UsageSum:
     tokens_out: int
     tokens_cached: int
     machine_seconds: int
+
+
+#: `Org.suspended_by` for a suspension the hosted product's billing made (FLOTTA-190).
+BILLING = "billing"
+
+
+class HeldByOperatorError(InvalidTransitionError):
+    """Billing asked to lift a suspension the operator made, which only the operator lifts."""
 
 
 class BuildInProgressError(RuntimeError):
@@ -1940,7 +1951,12 @@ class FleetStore:
         return decided
 
     def suspend_org(
-        self, org_id: str, *, reason: str | None = None, by: str | None = None
+        self,
+        org_id: str,
+        *,
+        reason: str | None = None,
+        by: str | None = None,
+        as_billing: bool = False,
     ) -> tuple[Org, bool]:
         """Suspend an active org (FLOTTA-184): `(org, changed)`.
 
@@ -1955,18 +1971,30 @@ class FleetStore:
         `active` or `suspended` is `InvalidTransitionError`, and so is the
         default org, which is the operator's own fleet.
         """
-        return self._set_suspended(org_id, True, reason=reason, by=by)
+        return self._set_suspended(org_id, True, reason=reason, by=by, as_billing=as_billing)
 
-    def resume_org(self, org_id: str, *, by: str | None = None) -> tuple[Org, bool]:
+    def resume_org(
+        self, org_id: str, *, by: str | None = None, as_billing: bool = False
+    ) -> tuple[Org, bool]:
         """Resume a suspended org: `(org, changed)`, as `suspend_org`.
 
         Wakes nothing. Its agents wake when they are next addressed, as any
         sleeping agent does.
+
+        `as_billing`: the hosted product's billing, which may lift only a
+        suspension of its own (FLOTTA-190). One the operator made raises
+        `HeldByOperatorError`, and nothing changes.
         """
-        return self._set_suspended(org_id, False, by=by)
+        return self._set_suspended(org_id, False, by=by, as_billing=as_billing)
 
     def _set_suspended(
-        self, org_id: str, suspend: bool, *, reason: str | None = None, by: str | None = None
+        self,
+        org_id: str,
+        suspend: bool,
+        *,
+        reason: str | None = None,
+        by: str | None = None,
+        as_billing: bool = False,
     ) -> tuple[Org, bool]:
         wanted = "suspended" if suspend else "active"
         with self._conn.transaction(guard="orgs"):
@@ -1979,6 +2007,10 @@ class FleetStore:
                 )
             if org.status == wanted:
                 return org, False
+            if not suspend and as_billing and (org.suspended_by or BILLING) != BILLING:
+                raise HeldByOperatorError(
+                    f"org {org_id!r} was suspended by the operator; only the operator can resume it"
+                )
             if org.status != ("active" if suspend else "suspended"):
                 verb = "suspended" if suspend else "resumed"
                 raise InvalidTransitionError(
@@ -1987,11 +2019,13 @@ class FleetStore:
                     + f" org can be {verb}"
                 )
             self._conn.execute(
-                "UPDATE orgs SET status = ?, suspended_at = ?, suspend_reason = ? WHERE id = ?",
+                "UPDATE orgs SET status = ?, suspended_at = ?, suspend_reason = ?, "
+                "suspended_by = ? WHERE id = ?",
                 (
                     wanted,
                     _utcnow() if suspend else None,
                     reason if suspend else None,
+                    (BILLING if as_billing else (by or "operator")) if suspend else None,
                     org_id,
                 ),
             )
@@ -6665,6 +6699,7 @@ def _org_from_row(row: db.Row) -> Org:
         max_agents=row.get("max_agents"),
         suspended_at=row.get("suspended_at"),
         suspend_reason=row.get("suspend_reason"),
+        suspended_by=row.get("suspended_by"),
     )
 
 

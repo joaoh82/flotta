@@ -1107,6 +1107,17 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX idx_pull_requests_run ON pull_requests(run_id)",
         ),
     ),
+    Migration(
+        34,
+        "suspended by: who suspended an org, so billing lifts only its own",
+        # FLOTTA-190 (M15.8). `billing` when the hosted product's billing
+        # (`org:govern`) suspended it, for a failed payment or an ended
+        # subscription; otherwise who did (the operator). Billing may resume
+        # only its own (Josh, 11 Nov 2026). NULL while the org is not
+        # suspended, and for one suspended before this, which is billing's,
+        # since nothing else suspended an org until now.
+        ("ALTER TABLE orgs ADD COLUMN suspended_by TEXT",),
+    ),
 )
 
 

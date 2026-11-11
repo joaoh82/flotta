@@ -1604,10 +1604,15 @@ def create_app(
         by = token.subject if token is not None else "operator"
         store = store_factory()
         try:
+            # Billing lifts only a suspension of its own (FLOTTA-190): one the
+            # operator made answers 409 to it, and nothing changes.
+            as_billing = token is not None and is_governor(token)
             if suspend:
-                org, changed = store.suspend_org(org_id, reason=reason, by=by)
+                org, changed = store.suspend_org(
+                    org_id, reason=reason, by=by, as_billing=as_billing
+                )
             else:
-                org, changed = store.resume_org(org_id, by=by)
+                org, changed = store.resume_org(org_id, by=by, as_billing=as_billing)
             owners = _owners(store, org_id) if changed else []
         except UnknownEntityError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
