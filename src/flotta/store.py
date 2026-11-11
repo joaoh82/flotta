@@ -4868,6 +4868,11 @@ class FleetStore:
 
         Steps are capped (`flotta.runs.cap_steps`) and the output clipped, so a
         loop that runs a thousand tools makes a row someone can still read.
+
+        What the run was still asking a person is closed with it (FLOTTA-200),
+        however it ended: by its door, its delivery, its agent's sleep, a
+        reap or a teardown. A question its run can no longer hear an answer
+        to must not go on waiting on the agency's Requests and Home.
         """
         if status not in TASK_TERMINAL:
             raise ValueError(f"a run's ending is one of {sorted(TASK_TERMINAL)}, got {status!r}")
@@ -4889,6 +4894,7 @@ class FleetStore:
                     run_id,
                 ),
             )
+        self.expire_approvals(run_id, now=now)
         return self._get_run_or_raise(run_id)
 
     def open_chat_run(
@@ -6211,6 +6217,23 @@ class FleetStore:
             params,
         ).fetchall()
         return [_approval_from_row(r) for r in rows]
+
+    def boxes_awaiting_answers(self, *, now: datetime | None = None) -> set[str]:
+        """Agents with a question to a person still open (FLOTTA-200): an
+        approval waiting, not yet expired, whose run's socket is still held.
+
+        Across every org, since idle sleep is: an agent waiting on a person is
+        not idle, whoever the person is. Held, as `waiting_approvals` reads it,
+        so a turn whose door died stops counting within `APPROVAL_HELD_S`
+        rather than keeping its agent billing until the approval expires.
+        """
+        moment = now or datetime.now(UTC)
+        rows = self._conn.execute(
+            "SELECT DISTINCT box_id FROM run_approvals "
+            "WHERE status = 'waiting' AND expires_at > ? AND held_at >= ?",
+            (_instant(moment), _instant(moment - timedelta(seconds=APPROVAL_HELD_S))),
+        ).fetchall()
+        return {r["box_id"] for r in rows}
 
     def approvals_to_notify(self, *, older_than: datetime, now: datetime) -> list[RunApproval]:
         """Approvals still waiting and answerable, asked before `older_than`, whose

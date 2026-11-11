@@ -3967,6 +3967,13 @@ def idle_boxes(
         for t in store.list_tasks()
         if not is_terminal("task", t.status) and not _a_turn(store, t.id)
     }
+    # A turn waiting for a person's answer is the exception (FLOTTA-200): while
+    # a socket still holds its approval, someone can answer it, so the agent
+    # must be there to hear it, however quiet the conversation is. Held only:
+    # once the socket is gone nothing can carry an answer (FLOTTA-204), which
+    # is what happened on 2026-11-11, and keeping the agent awake would only
+    # bill for it.
+    occupied |= store.boxes_awaiting_answers(now=current)
 
     idle: list[tuple[Box, float]] = []
     for box in store.list_boxes():
