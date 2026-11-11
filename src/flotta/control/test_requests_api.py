@@ -10,7 +10,16 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from flotta.auth import SCOPE_BOX_PEER, SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, box_subject, mint
+from flotta import work_requests
+from flotta.auth import (
+    DEFAULT_CLIENT,
+    DEFAULT_ORG,
+    SCOPE_BOX_PEER,
+    SCOPE_FLEET_READ,
+    SCOPE_FLEET_WRITE,
+    box_subject,
+    mint,
+)
 from flotta.control.app import create_app
 from flotta.control.test_app import _uncatalogued, _unchecked
 from flotta.judge import JudgeError, Verdict
@@ -444,3 +453,99 @@ def test_a_request_being_run_again_is_not_resolved_under_it(api, fleet, jev):
         f"/api/requests/{failed['id']}/resolve", json={}, headers=_as(SCOPE_FLEET_WRITE)
     )
     assert resolved.status_code == 409
+
+
+# -- what a client's people see (FLOTTA-174) -----------------------------------
+
+
+def _as_client():
+    return _as(SCOPE_FLEET_READ, org=DEFAULT_ORG, client=DEFAULT_CLIENT)
+
+
+def test_a_clients_people_see_the_outcome_not_the_agencys_reasons(api, fleet, jev):
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    filed = _file(api, fleet, title="Rebuild the dashboard").json()["request"]
+    waiting = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    assert [r["status"] for r in waiting] == ["waiting"]
+    for key in work_requests.AGENCY_ONLY:
+        assert key not in waiting[0], key
+    api.post(
+        f"/api/requests/{filed['id']}/decision",
+        json={"approve": True, "note": "Keep the old URLs"},
+        headers=_as(SCOPE_FLEET_WRITE),
+    )
+    with FleetStore(fleet) as store:
+        run = store.get_request(filed["id"]).work_run_id
+        store.start_run(run)
+        store.finish_run(run, "done", output="Rebuilt it; the old URLs redirect.")
+    (seen,) = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    assert seen["status"] == "approved" and seen["note"] == "Keep the old URLs"
+    assert seen["decided_at"] and seen["work_started_at"] and seen["work_finished_at"]
+    assert (seen["work_status"], seen["work_summary"]) == (
+        "done",
+        "Rebuilt it; the old URLs redirect.",
+    )
+    by_box = api.get(f"/api/boxes/{_id(fleet)}/requests", headers=_as_client()).json()
+    assert "why" not in by_box["requests"][0]
+
+    agency = api.get("/api/requests", headers=_as(SCOPE_FLEET_READ)).json()["requests"][0]
+    assert agency["why"] and agency["complexity_name"] == "large", "the agency still sees it all"
+    agent = api.get(f"/api/boxes/{_id(fleet)}/requests", headers=_as_box(fleet)).json()
+    assert agent["requests"][0]["why"], "and so does the agent, about its own"
+
+
+def test_a_failed_works_output_is_not_a_summary(api, fleet, jev):
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    filed = _file(api, fleet).json()["request"]
+    api.post(
+        f"/api/requests/{filed['id']}/decision",
+        json={"approve": True},
+        headers=_as(SCOPE_FLEET_WRITE),
+    )
+    with FleetStore(fleet) as store:
+        run = store.get_request(filed["id"]).work_run_id
+        store.start_run(run)
+        store.finish_run(run, "failed", output="Traceback (most recent call last): …")
+    (seen,) = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    assert seen["work_status"] == "failed" and seen["work_summary"] is None
+
+
+def test_a_request_shows_the_pull_requests_its_work_opened(api, fleet, jev):
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    filed = _file(api, fleet).json()["request"]
+    api.post(
+        f"/api/requests/{filed['id']}/decision",
+        json={"approve": True},
+        headers=_as(SCOPE_FLEET_WRITE),
+    )
+    with FleetStore(fleet) as store:
+        box = _id(fleet)
+        run = store.get_request(filed["id"]).work_run_id
+        store.start_run(run)
+        store.grant_repo(box, "acme/app", fleet_token=True)
+        pr, _ = store.record_pull_request(
+            box,
+            repo="acme/app",
+            number=12,
+            url="https://github.com/acme/app/pull/12",
+            title="CSV export",
+            author_login="flotta[bot]",
+            head_ref="csv",
+            base_ref="main",
+            state="open",
+            draft=False,
+            opened_at=datetime.now(UTC).isoformat(),
+        )
+        store.update_pull_request(
+            pr.id,
+            check_error="GitHub would not show acme/app's deployments",
+            deploy_state="success",
+        )
+    (seen,) = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    (opened,) = seen["pull_requests"]
+    assert (opened["number"], opened["deploy_state"]) == (12, "success")
+    assert "check_error" not in opened, "why GitHub refused is the agency's to fix"
+    (listed,) = api.get("/api/pull-requests", headers=_as_client()).json()["pull_requests"]
+    assert "check_error" not in listed and listed["deploy_state"] == "success"
+    (agency,) = api.get("/api/pull-requests", headers=_as(SCOPE_FLEET_READ)).json()["pull_requests"]
+    assert agency["check_error"].startswith("GitHub would not")

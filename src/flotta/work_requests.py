@@ -36,8 +36,44 @@ from flotta.judge import COMPLEXITY_NAMES, KINDS, PRIORITY_NAMES
 MAX_SHOWN = 8_000
 
 
-def view(store: Any, request: Any) -> dict[str, Any]:
-    """A request as the API says it: with its levels named, and how the work went."""
+#: Characters of the work's summary a request carries. The run keeps more.
+MAX_SUMMARY = 4_000
+
+#: What a client's people are not shown of a request (FLOTTA-174): Jev's
+#: verdict and the agency's reasons for holding it were written for the agency,
+#: and who asked is said by name (`whose`) rather than by subject.
+AGENCY_ONLY: frozenset[str] = frozenset(
+    {
+        "kind",
+        "complexity",
+        "priority",
+        "within",
+        "verdict",
+        "judge_error",
+        "why",
+        "kind_name",
+        "complexity_name",
+        "priority_name",
+        "asked_by",
+        "run_id",
+        "work_run_id",
+    }
+)
+
+
+def view(store: Any, request: Any, *, for_client: bool = False) -> dict[str, Any]:
+    """A request as the API says it: with its levels named, how the work went
+    and the pull requests it opened. `for_client` leaves out `AGENCY_ONLY`.
+
+    The work is the approved request's run: when it started and finished, and,
+    once it is done, its output, which is the summary the agent was asked to
+    end with (`work_prompt`). Approved within the agent's level there is no
+    run of its own: the agent goes on in the conversation it was asked in.
+    Its pull requests are those its agent reported during that conversation's
+    turn or during the work's run.
+    """
+    from flotta import pulls
+
     out = asdict(request)
     out["kind_name"] = request.kind if request.kind in KINDS else None
     out["complexity_name"] = (
@@ -48,7 +84,21 @@ def view(store: Any, request: Any) -> dict[str, Any]:
     )
     work = store.get_run(request.work_run_id) if request.work_run_id else None
     out["work_status"] = work.status if work is not None else None
+    out["work_started_at"] = work.started_at if work is not None else None
+    out["work_finished_at"] = work.finished_at if work is not None else None
+    out["work_summary"] = (
+        (work.output or "")[:MAX_SUMMARY] or None
+        if work is not None and work.status == "done"
+        else None
+    )
     out["whose"] = whose(store, request.asked_by)
+    opened = store.pull_requests_of_runs([request.run_id, request.work_run_id])
+    out["pull_requests"] = [
+        pulls.view(store, pr, for_client=for_client) for pr in opened if pr.box_id == request.box_id
+    ]
+    if for_client:
+        for key in AGENCY_ONLY:
+            out.pop(key, None)
     return out
 
 

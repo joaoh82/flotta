@@ -925,7 +925,17 @@ _PULL_FIELDS: frozenset[str] = frozenset(
         "feedback_seen_at",
         "followups",
         "followup_run_id",
+        "merge_sha",
+        "deploy_state",
+        "deploy_environment",
+        "deploy_url",
+        "deployed_at",
     }
+)
+
+#: GitHub's deployment states (`/deployments/{id}/statuses`), as a PR keeps its own.
+DEPLOY_STATES: frozenset[str] = frozenset(
+    {"queued", "pending", "in_progress", "success", "failure", "error", "inactive"}
 )
 
 
@@ -966,6 +976,17 @@ class PullRequest:
     feedback_seen_at: str
     followups: int
     followup_run_id: str | None
+    #: The commit GitHub made on the base branch when it merged (FLOTTA-174).
+    merge_sha: str | None = None
+    #: The run its agent was doing when it reported it, if any.
+    run_id: str | None = None
+    #: GitHub's deployment of `merge_sha`, production first: its latest state
+    #: (`DEPLOY_STATES`), the environment's name, where it can be seen, and
+    #: when it first succeeded. All None while nothing deployed it that we saw.
+    deploy_state: str | None = None
+    deploy_environment: str | None = None
+    deploy_url: str | None = None
+    deployed_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5266,6 +5287,7 @@ class FleetStore:
         merged_at: str | None = None,
         merged_by: str | None = None,
         closed_at: str | None = None,
+        merge_sha: str | None = None,
         now: datetime | None = None,
     ) -> tuple[PullRequest, bool]:
         """The pull request `box_id` opened, made if it is new; and whether it was.
@@ -5275,7 +5297,8 @@ class FleetStore:
         reported by a *different* agent is refused, since a PR is one agent's.
         Whose it is comes from the box's row. Feedback already on the PR when
         it is reported counts as seen: the agent is answering a review, not
-        being sent the history of one.
+        being sent the history of one. The run the box was doing as it reported
+        (a conversation's turn counts) is kept, so a request finds its PRs.
         """
         if state not in PULL_STATES:
             raise ValueError(f"a pull request is {sorted(PULL_STATES)}, not {state!r}")
@@ -5297,11 +5320,12 @@ class FleetStore:
             if box.status in BOX_TERMINAL:
                 raise UnknownEntityError(f"box {box_id!r} has been destroyed")
             pull_id = f"pr-{uuid.uuid4().hex[:12]}"
+            run_id = self._run_for_call(box.id, None, datetime.fromisoformat(reported))
             self._conn.execute(
                 "INSERT INTO pull_requests (id, box_id, org_id, client_id, repo, number, url, "
                 "title, author_login, head_ref, base_ref, state, draft, opened_at, merged_at, "
-                "merged_by, closed_at, reported_at, feedback_seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "merged_by, closed_at, reported_at, feedback_seen_at, merge_sha, run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     pull_id,
                     box.id,
@@ -5322,6 +5346,8 @@ class FleetStore:
                     closed_at,
                     reported,
                     reported,
+                    merge_sha,
+                    run_id,
                 ),
             )
         found = self.get_pull_request(pull_id)
@@ -5339,6 +5365,9 @@ class FleetStore:
             raise ValueError(f"a pull request has no field {sorted(unknown)[0]!r} to change")
         if "state" in fields and fields["state"] not in PULL_STATES:
             raise ValueError(f"a pull request is {sorted(PULL_STATES)}, not {fields['state']!r}")
+        deploy = fields.get("deploy_state")
+        if deploy is not None and deploy not in DEPLOY_STATES:
+            raise ValueError(f"a deployment is {sorted(DEPLOY_STATES)} or none, not {deploy!r}")
         review = fields.get("review_state")
         if review is not None and review not in REVIEW_STATES:
             raise ValueError(f"a review is {sorted(REVIEW_STATES)} or none, not {review!r}")
@@ -5388,14 +5417,45 @@ class FleetStore:
             ).fetchall()
         return [_pull_from_row(r) for r in rows]
 
-    def pulls_to_check(self, *, before: datetime, limit: int = 50) -> list[PullRequest]:
+    def pulls_to_check(
+        self,
+        *,
+        before: datetime,
+        limit: int = 50,
+        deploys: tuple[tuple[datetime, datetime], ...] = (),
+    ) -> list[PullRequest]:
         """Open pull requests last looked at before `before`, or never, the
-        longest-unchecked first. A merged or closed one is never looked at again."""
+        longest-unchecked first. A closed one is never looked at again.
+
+        A merged one is looked at for its deployment (FLOTTA-174) while one of
+        `deploys`, `(merged after, last looked at before)`, covers it and no
+        deployment of it has succeeded: so soon after a merge it is read as
+        often as an open one, and later less often, until it stops.
+        """
+        clauses = ["(state = 'open' AND (checked_at IS NULL OR checked_at < ?))"]
+        args: list[Any] = [_instant(before)]
+        for merged_after, checked_before in deploys:
+            clauses.append(
+                "(state = 'merged' AND COALESCE(deploy_state, '') <> 'success' "
+                "AND merged_at >= ? AND (checked_at IS NULL OR checked_at < ?))"
+            )
+            args += [_instant(merged_after), _instant(checked_before)]
         rows = self._conn.execute(
-            "SELECT * FROM pull_requests WHERE state = 'open' "
-            "AND (checked_at IS NULL OR checked_at < ?) "
+            f"SELECT * FROM pull_requests WHERE {' OR '.join(clauses)} "
             "ORDER BY COALESCE(checked_at, '') ASC LIMIT ?",
-            (_instant(before), limit),
+            (*args, limit),
+        ).fetchall()
+        return [_pull_from_row(r) for r in rows]
+
+    def pull_requests_of_runs(self, run_ids: list[str]) -> list[PullRequest]:
+        """The pull requests reported during any of `run_ids`, oldest first."""
+        wanted = sorted({r for r in run_ids if r})
+        if not wanted:
+            return []
+        marks = ", ".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            f"SELECT * FROM pull_requests WHERE run_id IN ({marks}) ORDER BY opened_at ASC",
+            tuple(wanted),
         ).fetchall()
         return [_pull_from_row(r) for r in rows]
 
@@ -7020,6 +7080,12 @@ def _pull_from_row(row: db.Row) -> PullRequest:
         feedback_seen_at=row["feedback_seen_at"],
         followups=int(row["followups"] or 0),
         followup_run_id=row["followup_run_id"],
+        merge_sha=row["merge_sha"],
+        run_id=row["run_id"],
+        deploy_state=row["deploy_state"],
+        deploy_environment=row["deploy_environment"],
+        deploy_url=row["deploy_url"],
+        deployed_at=row["deployed_at"],
     )
 
 

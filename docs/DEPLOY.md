@@ -673,7 +673,7 @@ owned by whoever runs this deployment:
 | Setup URL | `<web app>/github/callback`, the same page |
 | Redirect on update | **On** |
 | Webhook | **Off** |
-| Repository permissions | Contents: read and write. Pull requests: read and write. Metadata: read (GitHub adds it). |
+| Repository permissions | Contents: read and write. Pull requests: read and write. Deployments: read. Metadata: read (GitHub adds it). |
 | Organization permissions | Members: read |
 | Where can this App be installed | Any account |
 
@@ -681,6 +681,12 @@ Each permission is there for a reason:
 
 - **Members: read** is how Flotta confirms the person connecting an organization
   owns it. Without it nobody can connect an organization.
+- **Deployments: read** is how a client sees that a merged pull request went
+  live (FLOTTA-174): the control plane reads GitHub's deployments of the merge
+  commit, which Vercel, Netlify, Render and Actions environments record. Added
+  to an App that already exists, GitHub asks each installation's owner to
+  accept it; until they do, that account's merged PRs say "merged" and the
+  agency's page says why.
 - **Workflows is left off on purpose.** With it an agent could change what runs
   in a customer's CI. Pushes touching `.github/workflows/` are refused by GitHub.
 - **Two URLs, one page, and OAuth off** because a connection takes two trips to

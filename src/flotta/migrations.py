@@ -1086,6 +1086,26 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE requests ADD COLUMN resolved_note TEXT",
         ),
     ),
+    Migration(
+        33,
+        "deploys: a merged pull request's deployment, and the run it was opened in",
+        # FLOTTA-174. A client sees what happened to the work they asked for:
+        # approved, merged, then deployed. `merge_sha` is the commit GitHub
+        # made on the base branch, which is what a deploy is of; the `deploy_*`
+        # columns are GitHub's deployment of it, production first (see
+        # `flotta.pulls.read_deployment`). `run_id` is the run its agent was in
+        # when it reported the PR, which is how a request finds what its work
+        # opened. All NULL on what exists: nothing was deployed that we know of.
+        (
+            "ALTER TABLE pull_requests ADD COLUMN merge_sha TEXT",
+            "ALTER TABLE pull_requests ADD COLUMN run_id TEXT",
+            "ALTER TABLE pull_requests ADD COLUMN deploy_state TEXT",
+            "ALTER TABLE pull_requests ADD COLUMN deploy_environment TEXT",
+            "ALTER TABLE pull_requests ADD COLUMN deploy_url TEXT",
+            "ALTER TABLE pull_requests ADD COLUMN deployed_at TEXT",
+            "CREATE INDEX idx_pull_requests_run ON pull_requests(run_id)",
+        ),
+    ),
 )
 
 

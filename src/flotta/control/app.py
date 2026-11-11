@@ -6583,6 +6583,17 @@ def create_app(
         finally:
             store.close()
 
+    def _clients_person(token: Token | None) -> bool:
+        """Whether the caller is one of a client's people or systems, who see a
+        request's or PR's outcome and not the agency's notes on it (FLOTTA-174).
+        An agent is not: it reads its own requests, reasons and all."""
+        return (
+            token is not None
+            and token.client is not None
+            and token.box is None
+            and subject_box(token.subject) is None
+        )
+
     @app.get("/api/boxes/{box_id}/pull-requests")
     def box_pull_requests(box_id: str, token: Token | None = needs_box_or_read) -> Any:
         """This agent's pull requests: every open one, then the latest others."""
@@ -6593,7 +6604,8 @@ def create_app(
             box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "read the pull requests of")
             found = store.pull_requests(org=box.org, box=box.id)
-            return {"pull_requests": [pulls.view(store, pr) for pr in found]}
+            mine = _clients_person(token)
+            return {"pull_requests": [pulls.view(store, pr, for_client=mine) for pr in found]}
         finally:
             store.close()
 
@@ -6609,7 +6621,8 @@ def create_app(
         store = store_factory()
         try:
             found = store.pull_requests(org=org, client=token.client if token else None)
-            return {"pull_requests": [pulls.view(store, pr) for pr in found]}
+            mine = _clients_person(token)
+            return {"pull_requests": [pulls.view(store, pr, for_client=mine) for pr in found]}
         finally:
             store.close()
 
@@ -6649,7 +6662,11 @@ def create_app(
             with contextlib.suppress(pulls.PullError):
                 fresh = pulls.read_pull(_github_fetch, github, pr.repo, pr.number)
                 if fresh["state"] == "merged":
-                    changes.update(merged_at=fresh["merged_at"], merged_by=fresh["merged_by"])
+                    changes.update(
+                        merged_at=fresh["merged_at"],
+                        merged_by=fresh["merged_by"],
+                        merge_sha=fresh["merge_sha"],
+                    )
             pr = store.update_pull_request(pr.id, **changes)
             store.add_event(
                 "box",
@@ -6812,7 +6829,8 @@ def create_app(
             box = _scoped_box(store, token, box_id)
             confine_to_box(token, box, "read the requests of")
             found = store.list_requests(org=box.org, box=box.id)
-            return {"requests": [work_requests.view(store, r) for r in found]}
+            mine = _clients_person(token)
+            return {"requests": [work_requests.view(store, r, for_client=mine) for r in found]}
         finally:
             store.close()
 
@@ -6828,7 +6846,8 @@ def create_app(
         store = store_factory()
         try:
             found = store.list_requests(org=org, client=token.client if token else None)
-            return {"requests": [work_requests.view(store, r) for r in found]}
+            mine = _clients_person(token)
+            return {"requests": [work_requests.view(store, r, for_client=mine) for r in found]}
         finally:
             store.close()
 
