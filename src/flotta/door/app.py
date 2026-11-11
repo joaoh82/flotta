@@ -172,6 +172,12 @@ TOUCH_GAP_S = 60.0
 #: working for another 27 minutes. A stalled agent is not a dead one. The ping is
 #: kept for a box that has truly gone without closing its socket, and five
 #: minutes is longer than any stall but a runaway one.
+#: Longest the door keeps an agent's socket after the person's has gone, while
+#: a turn of theirs waits on an answer someone else may give (FLOTTA-204): the
+#: approval's hour (`flotta.box.approvals`), and a quarter more to finish.
+HELD_AFTER_LEAVING_S = 3600.0 + 900.0
+#: Conversations going on, kept so a task outliving its handler isn't collected.
+_CONVERSATIONS: set[asyncio.Task[None]] = set()
 BOX_PING_INTERVAL_S = 20.0
 BOX_PING_TIMEOUT_S = 300.0
 #: What a page sends to keep its socket through Cloudflare. Nobody is behind it.
@@ -1168,92 +1174,142 @@ def create_door(
         )
         headers = {"Authorization": _basic(*own)} if own else {}
 
-        try:
-            async with websockets.connect(
-                upstream_url,
-                additional_headers=headers,
-                proxy=None,
-                max_size=BOX_FRAME_LIMIT,
-                ping_interval=BOX_PING_INTERVAL_S,
-                ping_timeout=BOX_PING_TIMEOUT_S,
-            ) as upstream:
-                liveness.connected(upstream.send)
+        async def converse() -> None:
+            """The relay, and whatever outlives the person's socket (FLOTTA-204)."""
+            try:
+                async with websockets.connect(
+                    upstream_url,
+                    additional_headers=headers,
+                    proxy=None,
+                    max_size=BOX_FRAME_LIMIT,
+                    ping_interval=BOX_PING_INTERVAL_S,
+                    ping_timeout=BOX_PING_TIMEOUT_S,
+                ) as upstream:
+                    liveness.connected(upstream.send)
 
-                async def deliver(srq: str, session: str, choice: str) -> None:
-                    """An answer given from outside the conversation (FLOTTA-166):
-                    to the box as the reply to its own request, then the card down."""
-                    reply = {"jsonrpc": "2.0", "id": srq, "result": {"choice": choice}}
-                    await upstream.send(json.dumps(reply))
-                    withdrawn = gate.answered_elsewhere(srq, session)
-                    if withdrawn is not None:
-                        with contextlib.suppress(Exception):
-                            await websocket.send_text(withdrawn)
+                    # Set once the person's socket has gone while the agent's is
+                    # kept for an answer (FLOTTA-204): nothing more goes their way.
+                    left = asyncio.Event()
 
-                if turns is not None:
-                    turns.attach(deliver)
+                    async def to_person(frame: str) -> None:
+                        if not left.is_set():
+                            await websocket.send_text(frame)
 
-                async def downstream_to_box() -> None:
-                    while True:
-                        message = await websocket.receive()
-                        if message["type"] == "websocket.disconnect":
-                            await upstream.close()
-                            return
-                        frame = message.get("text")
-                        if frame is None:
-                            frame = message.get("bytes")
-                        if frame is None:
-                            continue
-                        step = await gate.from_client(frame)
-                        if step.to_box is not None:
-                            liveness.heard(step.to_box)
-                            await upstream.send(step.to_box)
-                        if step.to_client is not None:
-                            await websocket.send_text(step.to_client)
+                    async def deliver(srq: str, session: str, choice: str) -> None:
+                        """An answer given from outside the conversation (FLOTTA-166):
+                        to the box as the reply to its own request, then the card down."""
+                        reply = {"jsonrpc": "2.0", "id": srq, "result": {"choice": choice}}
+                        await upstream.send(json.dumps(reply))
+                        withdrawn = gate.answered_elsewhere(srq, session)
+                        if withdrawn is not None:
+                            with contextlib.suppress(Exception):
+                                await to_person(withdrawn)
 
-                async def box_to_downstream() -> None:
-                    async for message in upstream:
-                        if isinstance(message, str):
-                            if liveness.take_answer(message):
+                    if turns is not None:
+                        turns.attach(deliver)
+
+                    async def downstream_to_box() -> None:
+                        while True:
+                            message = await websocket.receive()
+                            if message["type"] == "websocket.disconnect":
+                                if turns is not None and turns.awaiting_answer():
+                                    # Their turn waits on someone else's answer, which
+                                    # only this socket can carry to the agent: keep it.
+                                    left.set()
+                                    return
+                                await upstream.close()
+                                return
+                            frame = message.get("text")
+                            if frame is None:
+                                frame = message.get("bytes")
+                            if frame is None:
                                 continue
-                            answer = await gate.from_box(message)
-                            if answer is not None:
-                                await websocket.send_text(answer)
-                            for notice in gate.notices():
-                                await websocket.send_text(notice)
-                        else:
-                            await websocket.send_bytes(message)
+                            step = await gate.from_client(frame)
+                            if step.to_box is not None:
+                                liveness.heard(step.to_box)
+                                await upstream.send(step.to_box)
+                            if step.to_client is not None:
+                                await websocket.send_text(step.to_client)
 
-                # Whichever side hangs up first ends the pair. Without this the
-                # surviving task would wait forever on a socket nobody is on.
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(downstream_to_box()),
-                        asyncio.create_task(box_to_downstream()),
-                        heartbeat,
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in pending:
-                    task.cancel()
-                # Read what ended it. A side that closed, with or without a
-                # close frame (a killed agent sends none), is how a
-                # conversation ends; left unread, asyncio logged each one as a
-                # crash ("Task exception was never retrieved").
-                for task in done:
-                    error = task.exception()
-                    if isinstance(error, websockets.exceptions.ConnectionClosed):
-                        _log.info("ws to %s ended: %s", target.name, error)
-                    elif error is not None:
-                        raise error
-        except Exception as exc:  # pragma: no cover - network faults
-            _log.warning("ws proxy to %s failed: %s", target.name, exc)
-        finally:
-            heartbeat.cancel()
-            with contextlib.suppress(Exception):
-                await websocket.close()
-            if turns is not None:
-                # After the person's socket is closed: it costs them nothing.
-                await turns.close()
+                    async def box_to_downstream() -> None:
+                        async for message in upstream:
+                            if isinstance(message, str):
+                                if liveness.take_answer(message):
+                                    continue
+                                # Heard even with nobody to tell: it is how the turn's
+                                # end, and an answer's arrival, are recorded.
+                                answer = await gate.from_box(message)
+                                if answer is not None:
+                                    await to_person(answer)
+                                for notice in gate.notices():
+                                    await to_person(notice)
+                            elif not left.is_set():
+                                await websocket.send_bytes(message)
+
+                    # Whichever side hangs up first ends the pair. Without this the
+                    # surviving task would wait forever on a socket nobody is on.
+                    person = asyncio.create_task(downstream_to_box())
+                    agent = asyncio.create_task(box_to_downstream())
+                    done, pending = await asyncio.wait(
+                        [person, agent, heartbeat], return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if left.is_set() and turns is not None:
+                        # The person left mid-turn, with an approval of theirs still
+                        # waiting (FLOTTA-204). Keep the agent's socket, the answer
+                        # poll and the keep-awake beat until the turn ends, the agent
+                        # hangs up, or `HELD_AFTER_LEAVING_S`: an answer from Home
+                        # then reaches the agent, and the turn finishes and is
+                        # recorded, for the person to read when they come back.
+                        _log.info(
+                            "%s's person left mid-turn awaiting an answer; holding", target.name
+                        )
+                        over = asyncio.create_task(turns.turns_over())
+                        done, pending = await asyncio.wait(
+                            [agent, heartbeat, over],
+                            timeout=HELD_AFTER_LEAVING_S,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        pending = {*pending, over} - done
+                        _log.info(
+                            "%s's held turn: %s",
+                            target.name,
+                            "ended"
+                            if over in done
+                            else "the agent hung up"
+                            if agent in done
+                            else "stopped holding",
+                        )
+                        with contextlib.suppress(Exception):
+                            await upstream.close()
+                    for task in pending:
+                        task.cancel()
+                    # Read what ended it. A side that closed, with or without a
+                    # close frame (a killed agent sends none), is how a
+                    # conversation ends; left unread, asyncio logged each one as a
+                    # crash ("Task exception was never retrieved").
+                    for task in done:
+                        error = task.exception()
+                        if isinstance(error, websockets.exceptions.ConnectionClosed):
+                            _log.info("ws to %s ended: %s", target.name, error)
+                        elif error is not None:
+                            raise error
+            except Exception as exc:  # pragma: no cover - network faults
+                _log.warning("ws proxy to %s failed: %s", target.name, exc)
+            finally:
+                heartbeat.cancel()
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+                if turns is not None:
+                    # After the person's socket is closed: it costs them nothing.
+                    await turns.close()
+
+        # Its own task, awaited through a shield: a handler cancelled when the
+        # person's socket goes (a test client, a server shutting the request
+        # down) must not take a held turn, and the agent's socket, with it.
+        conversation = asyncio.create_task(converse())
+        _CONVERSATIONS.add(conversation)
+        conversation.add_done_callback(_CONVERSATIONS.discard)
+        await asyncio.shield(conversation)
 
     app.state.plane = plane
     app.state.signing_key = key

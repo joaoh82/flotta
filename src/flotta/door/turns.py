@@ -40,6 +40,13 @@ the question the person saw. Answered here, withdrawn by the box, or the turn
 over, it is settled and nothing more is looked for. Only the request form
 (Hermes v0.22) is recorded; an `approval.request` event is still a step.
 
+**It outlives the person's page (FLOTTA-204).** This socket is the only way an
+answer from outside reaches the agent, so when the person's socket closes while
+a turn of theirs waits on one (`awaiting_answer`), the door keeps the agent's
+socket, this recorder and its poll until the turn ends (`turns_over`), up to
+`door.app.HELD_AFTER_LEAVING_S`. The answer is carried, the turn finishes, and
+its run is recorded, for the person to read when they come back.
+
 ## What is not recorded
 
 - A turn while the agent is doing another run. The control plane answers 409,
@@ -221,6 +228,24 @@ class TurnRecorder:
         self._asked: dict[str, _Asked] = {}
         self._deliver: Deliver | None = None
         self._poller: asyncio.Task[None] | None = None
+        #: Set while no turn is going on: what a socket held for an answer
+        #: after its person left waits for (FLOTTA-204).
+        self._no_turns = asyncio.Event()
+        self._no_turns.set()
+
+    def awaiting_answer(self) -> bool:
+        """Whether a turn still going on here waits on an approval the control
+        plane has, which someone may answer from outside (FLOTTA-204): so the
+        agent's socket is worth keeping after the person's has gone."""
+        open_turns = {id(t) for t in self._turns.values()}
+        return any(
+            a.approval_id and not a.settled and id(a.turn) in open_turns
+            for a in self._asked.values()
+        )
+
+    async def turns_over(self) -> None:
+        """Until no turn is going on here."""
+        await self._no_turns.wait()
 
     def attach(self, deliver: Deliver) -> None:
         """How an answer given from outside reaches the box on this socket."""
@@ -393,6 +418,7 @@ class TurnRecorder:
             self._end(session, None)
         turn = _Turn(prompt=self._prompts.pop(session, ""))
         self._turns[session] = turn
+        self._no_turns.clear()
         if self._queue.qsize() + self._reserved + 2 > QUEUE_LIMIT:
             # Behind: this turn goes unrecorded, and queues nothing, not even
             # its end. Every turn that was opened keeps room for its end, since
@@ -406,6 +432,8 @@ class TurnRecorder:
 
     def _end(self, session: str, payload: dict[str, Any] | None) -> None:
         turn = self._turns.pop(session, None)
+        if not self._turns:
+            self._no_turns.set()
         if turn is None or not turn.admitted:
             return
         turn.steps.unanswered()
