@@ -285,3 +285,162 @@ def test_the_list_is_capped_even_when_everything_is_waiting(tmp_path):
         listed = store.list_requests(org=box.org, limit=3)
         assert [r.title for r in listed] == ["r0", "r1", "r2"]
         assert [r.title for r in store.list_requests(org=box.org, limit=6)][-1] == "done"
+
+
+# -- settling what failed (FLOTTA-201/202) ---------------------------------------
+
+
+def _approved_and_failed(api, fleet, jev, *, status="failed"):
+    """An approved request whose work run ended `status`, as on 2026-11-10."""
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    filed = _file(api, fleet, title="Adjust the columnists' banners").json()["request"]
+    after = api.post(
+        f"/api/requests/{filed['id']}/decision",
+        json={"approve": True},
+        headers=_as(SCOPE_FLEET_WRITE),
+    ).json()["request"]
+    with FleetStore(fleet) as store:
+        store.start_run(after["work_run_id"])
+        store.finish_run(after["work_run_id"], status, error_class="closed")
+    return after
+
+
+def test_a_failed_request_runs_again_as_itself(api, fleet, jev):
+    """FLOTTA-201: the request follows the new run, so its card turns with it,
+    and the attempt it replaces stops asking on Home."""
+    failed = _approved_and_failed(api, fleet, jev)
+    again = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    assert again.status_code == 200, again.text
+    after = again.json()["request"]
+    assert after["work_run_id"] != failed["work_run_id"]
+    assert after["work_status"] == "pending"
+    with FleetStore(fleet) as store:
+        new = store.get_run(after["work_run_id"])
+        old = store.get_run(failed["work_run_id"])
+    assert (new.trigger_kind, new.trigger_id) == ("request", failed["id"])
+    assert "Adjust the columnists' banners" in new.prompt
+    assert old.resolved_at is not None
+    assert old.resolved_note == f"run again as {new.id}"
+
+    twice = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    assert twice.status_code == 409, "not while its new attempt is still going"
+
+
+def test_a_request_done_some_other_way_is_resolved_with_its_run(api, fleet, jev):
+    failed = _approved_and_failed(api, fleet, jev)
+    resolved = api.post(
+        f"/api/requests/{failed['id']}/resolve",
+        json={"note": "Done by hand in #132"},
+        headers=_as(SCOPE_FLEET_WRITE),
+    )
+    assert resolved.status_code == 200, resolved.text
+    after = resolved.json()["request"]
+    assert after["resolved_note"] == "Done by hand in #132"
+    assert after["resolved_by"] == "olivia" and after["resolved_at"]
+    run = api.get(f"/api/runs/{failed['work_run_id']}", headers=_as(SCOPE_FLEET_READ)).json()
+    assert run["resolved_note"] == "Done by hand in #132"
+
+    again = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    assert again.status_code == 409, "a resolved request is settled"
+
+
+def test_resolving_a_requests_failed_run_resolves_the_request(api, fleet, jev):
+    """One resolution, from either side: Home's and the conversation's agree."""
+    failed = _approved_and_failed(api, fleet, jev, status="budget_blocked")
+    done = api.post(
+        f"/api/runs/{failed['work_run_id']}/resolve", json={}, headers=_as(SCOPE_FLEET_WRITE)
+    )
+    assert done.status_code == 200, done.text
+    assert done.json()["resolved_at"]
+    (listed,) = api.get("/api/requests", headers=_as(SCOPE_FLEET_READ)).json()["requests"]
+    assert listed["resolved_at"] and listed["resolved_note"] is None
+
+
+def test_only_what_failed_is_resolved_and_only_by_the_agency(api, fleet, jev):
+    failed = _approved_and_failed(api, fleet, jev, status="done")
+    for path in (
+        f"/api/requests/{failed['id']}/resolve",
+        f"/api/runs/{failed['work_run_id']}/resolve",
+    ):
+        assert api.post(path, json={}, headers=_as(SCOPE_FLEET_WRITE)).status_code == 409
+    retry = f"/api/requests/{failed['id']}/retry"
+    assert api.post(retry, headers=_as(SCOPE_FLEET_WRITE)).status_code == 409
+
+    failed = _approved_and_failed(api, fleet, jev)
+    resolve = f"/api/requests/{failed['id']}/resolve"
+    retry = f"/api/requests/{failed['id']}/retry"
+    run = f"/api/runs/{failed['work_run_id']}/resolve"
+    for path in (resolve, retry, run):
+        assert api.post(path, json={}, headers=_as(SCOPE_FLEET_READ)).status_code == 403
+        assert api.post(path, json={}, headers=_as_box(fleet)).status_code == 403
+        client = _as(SCOPE_FLEET_WRITE, client="default")
+        assert api.post(path, json={}, headers=client).status_code == 403, "a client's"
+        elsewhere = _as(SCOPE_FLEET_WRITE, org="agency-y")
+        assert api.post(path, json={}, headers=elsewhere).status_code == 404
+    long = api.post(resolve, json={"note": "x" * 501}, headers=_as(SCOPE_FLEET_WRITE))
+    assert long.status_code == 409, "a note is at most 500 characters"
+
+
+def test_the_agent_is_told_a_resolved_request_is_settled():
+    from flotta.box.requests import describe
+
+    said = describe(
+        [
+            {
+                "title": "Banners",
+                "status": "approved",
+                "work_status": "failed",
+                "resolved_at": "2026-11-11T10:00:00+00:00",
+                "resolved_note": "Done in #132",
+            }
+        ]
+    )
+    assert "resolved by the agency: Done in #132" in said
+    assert "do not do it again" in said
+    assert "failed" not in said
+
+
+def test_two_clicks_on_run_again_start_the_work_once(api, fleet, jev, monkeypatch):
+    """The review of #228: both used to pass the checks before either wrote,
+    and each started a run. The claim on the old attempt lets one through."""
+    from flotta.store import FleetStore as Store
+
+    failed = _approved_and_failed(api, fleet, jev)
+    real = Store.get_request
+    seen = []
+
+    def stale(self, request_id):
+        # The second click reads the request as the first one did: before it wrote.
+        found = real(self, request_id)
+        if seen:
+            return seen[0]
+        seen.append(found)
+        return found
+
+    monkeypatch.setattr(Store, "get_request", stale)
+    first = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    second = api.post(f"/api/requests/{failed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    monkeypatch.setattr(Store, "get_request", real)
+
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    with FleetStore(fleet) as store:
+        runs = [
+            r
+            for r in store.list_tasks()
+            if store.get_run(r.id) and store.get_run(r.id).trigger_id == failed["id"]
+        ]
+    assert len(runs) == 2, "the failed attempt and exactly one new one"
+
+
+def test_a_request_being_run_again_is_not_resolved_under_it(api, fleet, jev):
+    failed = _approved_and_failed(api, fleet, jev)
+    with FleetStore(fleet) as store:
+        # A Run again has claimed the old attempt and not yet pointed the request at the new one.
+        store._conn.execute(
+            "UPDATE tasks SET resolved_at = ?, resolved_note = 'run again (x)' WHERE id = ?",
+            ("2026-11-11T10:00:00+00:00", failed["work_run_id"]),
+        )
+    resolved = api.post(
+        f"/api/requests/{failed['id']}/resolve", json={}, headers=_as(SCOPE_FLEET_WRITE)
+    )
+    assert resolved.status_code == 409

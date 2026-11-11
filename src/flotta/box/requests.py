@@ -93,7 +93,14 @@ def describe(found: list[dict[str, Any]]) -> str:
         if r.get("note"):
             lines.append(f"    note from the agency: {r['note']}")
         work = r.get("work_status")
-        if work:
+        if r.get("resolved_at"):
+            # Settled by the agency some other way (FLOTTA-201): whatever its
+            # last run said, there is nothing left to do here.
+            said = f": {r['resolved_note']}" if r.get("resolved_note") else ""
+            lines.append(
+                f"    its work: resolved by the agency{said}. It is settled: do not do it again"
+            )
+        elif work:
             lines.append(f"    its work: {_WORK.get(str(work), str(work))}")
     return "\n".join(lines) + "\n"
 

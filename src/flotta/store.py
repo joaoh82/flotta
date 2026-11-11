@@ -515,6 +515,21 @@ class InvalidBoxNameError(StoreError):
 APPROVAL_HELD_S = 30
 
 
+#: How a run ends that someone may have to deal with: what Home asks about.
+RESOLVABLE_RUN_STATUSES = frozenset({"failed", "budget_blocked", "cancelled"})
+#: Characters a resolution's note may be.
+RESOLUTION_NOTE_MAX = 500
+
+
+def _resolution_note(note: str | None) -> str | None:
+    if note is not None and not isinstance(note, str):
+        raise ValueError("a note is text")
+    note = (note or "").strip() or None
+    if note is not None and len(note) > RESOLUTION_NOTE_MAX:
+        raise ValueError(f"a note is at most {RESOLUTION_NOTE_MAX} characters")
+    return note
+
+
 class ApprovalClosedError(StoreError):
     """An approval that was already answered, or that expired, takes no answer."""
 
@@ -831,6 +846,11 @@ class Run:
     steps: dict[str, Any] | None
     approval_count: int
     error_class: str | None
+    #: Someone dealt with a run that failed or was held (FLOTTA-202): who,
+    #: when, and what they said. Home stops asking about a resolved run.
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolved_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1000,6 +1020,10 @@ class WorkRequest:
     note: str | None
     work_run_id: str | None
     created_at: str
+    #: Its work failed and someone settled it another way (FLOTTA-201).
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolved_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5504,6 +5528,113 @@ class FleetStore:
             raise UnknownEntityError(f"no request {request_id!r}")
         return found
 
+    # -- settling what failed (FLOTTA-201/202) ---------------------------------
+
+    def resolve_run(
+        self, run_id: str, *, by: str, note: str | None = None, now: datetime | None = None
+    ) -> Run:
+        """Say a run that failed or was held has been dealt with. Once: the first
+        resolution stands, and a second returns the run as it is.
+
+        A request's work run settles its request with it, so the conversation's
+        card and Home stop asking about the same thing in two places.
+        """
+        note = _resolution_note(note)
+        moment = _instant(now) if now else _utcnow()
+        with self._conn.transaction(guard="tasks"):
+            run = self._get_run_or_raise(run_id)
+            if run.status not in RESOLVABLE_RUN_STATUSES:
+                raise ValueError(f"a run that is {run.status} has nothing to resolve")
+            if run.resolved_at is None:
+                self._conn.execute(
+                    "UPDATE tasks SET resolved_at = ?, resolved_by = ?, resolved_note = ? "
+                    "WHERE id = ?",
+                    (moment, by, note, run_id),
+                )
+        resolved = self._get_run_or_raise(run_id)
+        if resolved.trigger_kind == "request" and resolved.trigger_id:
+            request = self.get_request(resolved.trigger_id)
+            if request is not None and request.work_run_id == run_id:
+                self._mark_request_resolved(request.id, by=by, note=note, moment=moment)
+        return resolved
+
+    def resolve_request(
+        self, request_id: str, *, by: str, note: str | None = None, now: datetime | None = None
+    ) -> WorkRequest:
+        """Say an approved request whose work failed was settled some other way:
+        done by hand, no longer wanted. Its failed work run is resolved too."""
+        note = _resolution_note(note)
+        request = self.get_request(request_id)
+        if request is None:
+            raise UnknownEntityError(f"no request {request_id!r}")
+        work = self.get_run(request.work_run_id) if request.work_run_id else None
+        if request.status != "approved" or work is None:
+            raise ValueError("only an approved request whose work was started can be resolved")
+        if work.status not in RESOLVABLE_RUN_STATUSES:
+            raise ValueError(f"its work is {work.status}: there is nothing to resolve")
+        if request.resolved_at is None and work.resolved_at is not None:
+            # Resolved without its request: a Run again took it, and the new
+            # attempt is the request's work now (or about to be).
+            raise ValueError("it is being run again: resolve the new attempt if it fails")
+        moment = _instant(now) if now else _utcnow()
+        if work.resolved_at is None:
+            self.resolve_run(work.id, by=by, note=note, now=now)
+        self._mark_request_resolved(request.id, by=by, note=note, moment=moment)
+        found = self.get_request(request.id)
+        assert found is not None
+        return found
+
+    def _mark_request_resolved(
+        self, request_id: str, *, by: str, note: str | None, moment: str
+    ) -> None:
+        self._conn.execute(
+            "UPDATE requests SET resolved_at = ?, resolved_by = ?, resolved_note = ? "
+            "WHERE id = ? AND resolved_at IS NULL",
+            (moment, by, note, request_id),
+        )
+
+    def retry_request(self, request_id: str, *, prompt: str, input: Any, by: str) -> WorkRequest:
+        """Run an approved request's work again, as the same request (FLOTTA-201).
+
+        Only once its last attempt has ended without being done, and while it is
+        not resolved: the new run becomes its work, so the request, its card and
+        Home follow the new attempt. The attempt it replaces is resolved, saying
+        so, and asks nobody any more.
+        """
+        request = self.get_request(request_id)
+        if request is None:
+            raise UnknownEntityError(f"no request {request_id!r}")
+        work = self.get_run(request.work_run_id) if request.work_run_id else None
+        if request.status != "approved" or work is None:
+            raise ValueError("only an approved request whose work was started can be run again")
+        if request.resolved_at is not None:
+            raise ValueError("this request was resolved")
+        if work.status not in RESOLVABLE_RUN_STATUSES:
+            raise ValueError(f"its work is {work.status}: wait for it to end")
+        # Claim the attempt being replaced before starting another: one write
+        # that only an unresolved attempt takes, read back by its token. Two
+        # clicks, or two people, would otherwise both pass the checks above and
+        # start the work twice, which is the incident this exists for (#228).
+        claim = f"run again ({uuid.uuid4().hex[:12]})"
+        self._conn.execute(
+            "UPDATE tasks SET resolved_at = ?, resolved_by = ?, resolved_note = ? "
+            "WHERE id = ? AND resolved_at IS NULL",
+            (_utcnow(), by, claim, work.id),
+        )
+        if self._get_run_or_raise(work.id).resolved_note != claim:
+            raise ValueError("it is already being run again, or was resolved")
+        run = self.create_run(
+            request.box_id, prompt, trigger_kind="request", trigger_id=request.id, input=input
+        )
+        self.set_request_work(request.id, run.id)
+        self._conn.execute(
+            "UPDATE tasks SET resolved_note = ? WHERE id = ? AND resolved_note = ?",
+            (f"run again as {run.id}", work.id, claim),
+        )
+        found = self.get_request(request.id)
+        assert found is not None
+        return found
+
     def list_requests(
         self,
         *,
@@ -6788,6 +6919,9 @@ def _run_from_row(row: db.Row) -> Run:
         steps=json.loads(row["steps_json"]) if row["steps_json"] is not None else None,
         approval_count=int(row["approval_count"]),
         error_class=row["error_class"],
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+        resolved_note=row["resolved_note"],
     )
 
 
@@ -6847,6 +6981,9 @@ def _request_from_row(row: db.Row) -> WorkRequest:
         note=row["note"],
         work_run_id=row["work_run_id"],
         created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+        resolved_note=row["resolved_note"],
     )
 
 
