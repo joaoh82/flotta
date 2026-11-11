@@ -238,3 +238,46 @@ def test_doctor_gives_up_rather_than_hanging():
     from flotta.box import doctor
 
     assert doctor._is_listening(1, wait_s=1) is False
+
+
+def test_doctor_reports_the_browser_profile_and_warns_on_a_full_volume(tmp_path, monkeypatch):
+    """FLOTTA-208: a screen's browser profile is on the volume with the agent's
+    memory, so the doctor says how big it is and warns past 80%."""
+    import os
+
+    from flotta.box import doctor
+
+    home = tmp_path / "hermes"
+    profile = home / "bot-desktop" / "browser-profile" / "Default"
+    profile.mkdir(parents=True)
+    (profile / "Cookies").write_bytes(b"x" * 3000)
+
+    class Full:
+        f_frsize = 1024
+        f_blocks = 1000
+        f_bfree = 150
+        f_bavail = 150
+
+    monkeypatch.setattr(os, "statvfs", lambda path: Full())
+    report = doctor.collect(hermes_home=str(home), port=1)
+    assert report["browser_profile"]["exists"] is True
+    assert report["browser_profile"]["bytes"] == 3000
+    assert report["volume"]["used_fraction"] == 0.85
+    assert report["volume"]["warn"] is True
+    text = doctor.render(report)
+    assert "WARN volume" in text and "browser profile" in text
+
+    class Roomy(Full):
+        f_bfree = 500
+        f_bavail = 500
+
+    monkeypatch.setattr(os, "statvfs", lambda path: Roomy())
+    assert doctor.collect(hermes_home=str(home), port=1)["volume"]["warn"] is False
+
+
+def test_doctor_on_an_agent_without_a_screen_reports_no_profile(tmp_path):
+    from flotta.box import doctor
+
+    report = doctor.collect(hermes_home=str(tmp_path), port=1)
+    assert report["browser_profile"]["exists"] is False
+    assert "browser profile" not in doctor.render(report)

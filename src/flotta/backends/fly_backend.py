@@ -530,7 +530,7 @@ class FlyBackend:
         app, machine_id = self._addr(box_id)
         guest_cpus(memory_mb, self._guest(app, machine_id)[1], self.config.vm_size)
 
-    def resize(self, box_id: str, memory_mb: int) -> None:
+    def resize(self, box_id: str, memory_mb: int, *, env: dict[str, str] | None = None) -> None:
         """`flyctl machine update --vm-memory --vm-cpus`, which keeps the volume.
 
         The CPUs are `guest_cpus`, of the kind the machine already has: memory
@@ -543,6 +543,9 @@ class FlyBackend:
         `--skip-start` when the machine is not `started`, for `reimage`'s
         reason: an asleep agent stays asleep and unbilled. `--yes` because
         nobody is there to confirm.
+
+        `env` rides the same `machine update` as `--env`, which keeps every
+        key it does not name (`apply_env`): one restart, not two.
         """
         app, machine_id = self._addr(box_id)
         state, kind = self._guest(app, machine_id)
@@ -557,6 +560,8 @@ class FlyBackend:
             str(cpus),
             "--yes",
         ]
+        for key, value in (env or {}).items():
+            args += ["--env", f"{key}={value}"]
         if state != "started":
             args.append("--skip-start")
         self._flyctl(*args, app=app)

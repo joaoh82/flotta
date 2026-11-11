@@ -111,6 +111,14 @@ fi
 # model is a secret change and a restart.
 "${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.inference "$HERMES_HOME" || true
 
+# Whether this agent has a screen (FLOTTA-208). The image carries the desktop
+# and its tools for every agent; FLOTTA_SCREEN=1, set by the control plane when
+# the screen is chosen, turns Hermes's Bot Desktop on. Without it, the desktop
+# and browser toolsets are disabled, so an agent without a screen is offered
+# neither. Merged into config.yaml, leaving what somebody else chose alone, and
+# `|| true` because a box that cannot tune this must still boot.
+"${HERMES_VENV:-/opt/hermes-venv}/bin/python3" -m flotta.box.screen "$HERMES_HOME" || true
+
 echo "[flotta-box] HERMES_HOME=$HERMES_HOME"
 echo "[flotta-box] workdir=$FLOTTA_WORKDIR"
 echo "[flotta-box] mount:"

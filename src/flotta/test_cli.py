@@ -2063,3 +2063,98 @@ def test_a_resize_off_the_list_is_refused_before_anything_is_asked(tmp_path, mon
     result = CliRunner().invoke(cli.app, ["resize", "eng-a", "--memory", "3000"])
     assert result.exit_code == 2
     assert "1024, 2048, 4096" in result.output
+
+
+# -- `flotta screen` (FLOTTA-208) ---------------------------------------------
+
+
+def test_screen_on_goes_through_the_control_plane_and_says_it_resizes(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k" * 32)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    sent = []
+
+    def fake(method, path, *, scopes, body=None, **kw):
+        if path.endswith("/screen"):
+            sent.append((method, path, body))
+            return {
+                "box_id": "b-1",
+                "screen": True,
+                "memory_mb": 4096,
+                "resized": True,
+                "started": True,
+                "box": {"name": "eng-a"},
+            }
+        return {"id": "b-1", "name": "eng-a"}
+
+    monkeypatch.setattr(cli, "control_request", fake)
+    result = CliRunner().invoke(cli.app, ["screen", "on", "eng-a"])
+    assert result.exit_code == 0, result.output
+    assert sent == [("PUT", "/api/boxes/b-1/screen", {"screen": True})]
+    assert "resized to 4096 MB" in result.output
+
+    as_json = CliRunner().invoke(cli.app, ["screen", "off", "eng-a", "--json"])
+    assert as_json.exit_code == 0, as_json.output
+    assert sent[-1][2] == {"screen": False}
+    assert json.loads(as_json.output)["box_id"] == "b-1"
+
+
+def test_screen_takes_on_or_off_and_nothing_else(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_CONTROL_URL", "https://control.example")
+    monkeypatch.setattr(cli, "control_request", lambda *a, **k: pytest.fail("asked"))
+    result = CliRunner().invoke(cli.app, ["screen", "maybe", "eng-a"])
+    assert result.exit_code == 2
+    assert "on or off" in result.output
+
+
+def test_a_screen_agent_cannot_be_resized_down_from_the_cli_either(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from flotta import cli
+    from flotta.provision import SIZE_SET
+    from flotta.store import FleetStore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
+    db = tmp_path / "fleet.db"
+    with FleetStore(db) as store:
+        box = store.create_box("eng-s")
+        store.update_box_status(box.id, "running", endpoint="fly://flotta-eng-s/m1")
+        store.set_box_screen(box.id, True)
+        store.add_event("box", box.id, SIZE_SET, {"memory_mb": 4096, "reason": "created"})
+    result = CliRunner().invoke(
+        cli.app, ["resize", "eng-s", "--memory", "2048", "--store", str(db)]
+    )
+    assert result.exit_code == 2, result.output
+    assert "needs at least 4096 MB" in result.output
+
+
+def test_create_screen_asks_for_one(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import flotta.provision as provision
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    seen = {}
+
+    def create_box(name, *, store, **kwargs):
+        seen.update(kwargs)
+        box = store.create_box(name)
+        return {"box_id": box.id, "endpoint": "fly://x/m1"}
+
+    monkeypatch.setattr(provision, "create_box", create_box)
+    result = CliRunner().invoke(
+        cli.app, ["create", "eng-s", "--screen", "--store", str(tmp_path / "fleet.db")]
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["screen"] is True

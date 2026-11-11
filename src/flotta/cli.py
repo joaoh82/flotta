@@ -1064,6 +1064,11 @@ def create(
     client: str = typer.Option(
         DEFAULT_CLIENT, "--client", help="Which of the org's clients it belongs to"
     ),
+    screen: bool = typer.Option(
+        False,
+        "--screen",
+        help="Give it a screen: a desktop and browser a person can watch. Makes it 4096 MB",
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -1125,6 +1130,7 @@ def create(
                 description=description,
                 instructions=instructions,
                 model=model,
+                screen=screen,
             )
         except (
             InvalidBoxNameError,
@@ -1603,6 +1609,72 @@ def resize(
             raise typer.Exit(code=2) from exc
         note = "already has" if result.get("already_current") else "now has"
         emit(result, f"{box.name}  {note} {memory} MB", as_json=as_json)
+
+
+@app.command()
+def screen(
+    state: str = typer.Argument(..., help="on or off"),
+    box_id: str = typer.Argument(..., help="Box id or name"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Give an agent a screen, or take it away (FLOTTA-208).
+
+    `on` gives it Hermes's desktop and a browser a person can watch, and makes
+    it at least 4096 MB, resizing it in the same restart if it is smaller.
+    `off` takes the desktop and browser tools away and keeps the size. A running
+    agent restarts; a sleeping one stays asleep and wakes with the change.
+    Through the control plane when `$FLOTTA_CONTROL_URL` is set; otherwise
+    against this machine's store.
+    """
+    wanted = state.strip().lower()
+    if wanted not in ("on", "off"):
+        raise _fail(ValueError(f"say on or off, not {state!r}"), code=2)
+    on = wanted == "on"
+
+    def said(result: dict[str, Any], name: str, *, accepted: bool) -> str:
+        if result.get("already_current"):
+            return f"{name} already has {'a screen' if on else 'no screen'}"
+        size = f", resized to {result.get('memory_mb')} MB" if result.get("resized") else ""
+        if accepted:
+            # Accepted, not done: the restart is the control plane's thread's.
+            return (
+                f"{name} is getting {'a screen' if on else 'no screen'}{size}. A running "
+                "agent restarts; its timeline says how it went."
+            )
+        return f"{name}  {'has a screen' if on else 'has no screen'}{size}"
+
+    if control_url():
+        from flotta.auth import SCOPE_FLEET_WRITE
+
+        try:
+            box = _remote_box(box_id)
+            body = control_request(
+                "PUT",
+                f"/api/boxes/{box['id']}/screen",
+                scopes=(SCOPE_FLEET_WRITE,),
+                body={"screen": on},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        name = (body.get("box") or {}).get("name") or box_id
+        emit(body, said(body, name, accepted=bool(body.get("started"))), as_json=as_json)
+        return
+
+    provision = _provision()
+    with _open_store(store) as fleet:
+        box = _require_box(fleet, box_id)
+        try:
+            result = provision.begin_screen_change(box.id, on, store=fleet)
+            if not result.get("already_current"):
+                result = provision.set_screen(box.id, on, store=fleet)
+        except provision.UpgradeFailed as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        except provision.ProvisionError as exc:
+            typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=2) from exc
+        emit(result, said(result, box.name, accepted=False), as_json=as_json)
 
 
 @app.command()

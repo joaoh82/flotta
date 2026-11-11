@@ -70,6 +70,7 @@ from typing import Any
 from flotta import budgets as budget_rules
 from flotta.auth import DEFAULT_CLIENT, DEFAULT_ORG, box_password
 from flotta.backend import (
+    SCREEN_MIN_MEMORY_MB,
     Backend,
     BackendError,
     BoxSpec,
@@ -999,6 +1000,7 @@ def reserve_box(
     description: str | None = None,
     instructions: str | None = None,
     model: str | None = None,
+    screen: bool = False,
 ) -> Box:
     """Write the row, and nothing else. Returns immediately.
 
@@ -1046,6 +1048,11 @@ def reserve_box(
         # is provisioned later, on a thread, and `create_box` reads it back —
         # the same reason instructions live in `box_meta`.
         store.set_box_model(box.id, model)
+    if screen:
+        # On the row for the same reason: `create_box` on the 202 thread reads
+        # it back to size the machine and tell it so (FLOTTA-208).
+        store.set_box_screen(box.id, True)
+        box = store.get_box(box.id)
     return box
 
 
@@ -1121,8 +1128,13 @@ def create_box(
     description: str | None = None,
     instructions: str | None = None,
     model: str | None = None,
+    screen: bool = False,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
+
+    `screen` gives the agent a screen (FLOTTA-208): a 4096 MB machine unless a
+    size is named, a named size below that refused, and `FLOTTA_SCREEN=1` in
+    its environment. A row reserved with one (`reserve_box`) has it already.
 
     `name` is what the agent is called in `org`'s `client`. From the moment it
     is validated the box is known by its **address** instead — the row's name,
@@ -1167,6 +1179,12 @@ def create_box(
         # And a size, for the same reason: a number nothing has priced costs
         # nothing to refuse now and a machine to refuse later.
         memory_mb = _checked_size(memory_mb)
+    # A screen agent's size, refused on every path that can name one: the
+    # argument, and a caller's own spec, which otherwise wins (FLOTTA-208).
+    screen = bool(screen or (box is not None and box.screen))
+    if screen:
+        check_screen_size(memory_mb)
+        check_screen_size(spec.memory_mb if spec else None)
 
     # A pending org's agent is refused before a substrate is resolved, let alone
     # probed. The store refuses the row too (`FleetStore.create_box`), and that
@@ -1207,6 +1225,7 @@ def create_box(
             description=description,
             instructions=instructions,
             model=model,
+            screen=screen,
         )
 
     # Identity travels with the machine rather than arriving afterwards. The
@@ -1276,6 +1295,12 @@ def create_box(
     # actually means, and the one the Info panel will read back off the
     # machine.
     identity_env = {**identity_env, WORKDIR_ENV: resolve_workdir(store, source)}
+    if screen:
+        # Plain environment, not a secret: it is not one, and it lets turning a
+        # screen on later ride the same `machine update` as its resize. An agent
+        # without a screen gets nothing here, so its spec is today's; the box
+        # reads an absent `FLOTTA_SCREEN` as no screen (`flotta.box.screen`).
+        identity_env[SCREEN_ENV_KEY] = "1"
 
     # What this agent gets, as opposed to what every agent gets. Travels in the
     # spec because that is what the portable fields are for — see
@@ -1283,6 +1308,9 @@ def create_box(
     resolved_volume, resolved_region, resolved_memory = resolve_box_resources(
         store, volume_gb=volume_gb, region=region, memory_mb=memory_mb
     )
+    if screen and resolved_memory is None and base.memory_mb is None:
+        # The screen's minimum rather than the fleet's default, which is 2048.
+        resolved_memory = SCREEN_MIN_MEMORY_MB
 
     # What every box needs, as opposed to what makes this one itself. Missing
     # values are recorded rather than raised: a box with no provider key still
@@ -1319,6 +1347,9 @@ def create_box(
         env={**identity_env, **base.env},
         secrets={**identity_secrets, **fleet, **base.secrets},
     )
+
+    if screen:
+        store.add_event("box", box.id, SCREEN_SET, {"screen": True, "reason": "created"})
 
     if spec.volume_gb is not None or spec.region is not None or spec.memory_mb is not None:
         # What makes this agent different from the fleet default, recorded
@@ -1411,6 +1442,11 @@ def create_box(
             # diagnosis is worse than none — it sends someone to check the one
             # thing that is not broken.
             identity_error = f"apply_secrets failed: {exc}"
+
+    if handle.adopted and screen:
+        # An adopted machine kept its own environment and size, so a screen
+        # reaches it the way turning one on later does: one `machine update`.
+        _screen_onto_adopted(store, impl, box, handle.endpoint, given_memory)
 
     # Recorded as an event rather than a column: the store has no migration
     # path, so a new column would not appear on an existing fleet. An event
@@ -2980,6 +3016,9 @@ def _size_plan(box_id: str, memory_mb: object, store: FleetStore) -> tuple[Box, 
     or the refusal, before anything is touched."""
     wanted = _checked_size(memory_mb)
     box = _require_box(store, box_id)
+    if box.screen:
+        # Here, so the API, the CLI and anything else that resizes meet it.
+        check_screen_size(wanted, name=box.name)
     if is_terminal("box", box.status):
         raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to resize.")
     if box.status == "provisioning" or not box.endpoint:
@@ -3025,6 +3064,11 @@ def begin_resize(
         raise ProvisionError(f"could not check whether {box.name} can be resized: {exc}") from exc
     if size_changes(store, [box.id]).get(box.id):
         raise ProvisionError(f"{box.name} is already being resized; wait for that to finish.")
+    if screen_changes(store, [box.id]).get(box.id):
+        # A screen going on may be resizing it to the minimum already.
+        raise ProvisionError(
+            f"{box.name}'s screen is being changed; wait for that to finish before resizing it."
+        )
     if current == wanted:
         return {**out, "already_current": True}
     store.add_event("box", box.id, SIZE_CHANGE_STARTED, {"memory_mb": wanted, "from": current})
@@ -3064,6 +3108,236 @@ def resize_box(
         "box", box.id, SIZE_SET, {"memory_mb": wanted, "from": current, "reason": "resized"}
     )
     return {"box_id": box.id, "name": box.name, "memory_mb": wanted}
+
+
+#: The env var that tells a box whether it has a screen (`flotta.box.screen`).
+SCREEN_ENV_KEY = "FLOTTA_SCREEN"
+#: An agent's screen recorded (FLOTTA-208): chosen at creation, or a change that
+#: reached the machine. The payload's `screen` is the latest.
+SCREEN_SET = "screen_set"
+#: A screen change accepted and under way on a thread, and one the substrate
+#: refused: the model change's three events, for the same window.
+SCREEN_CHANGE_STARTED = "screen_change_started"
+SCREEN_CHANGE_FAILED = "screen_change_failed"
+SCREEN_CHANGE_STALE_S = MODEL_CHANGE_STALE_S
+
+
+class ScreenTooSmall(InvalidSize):
+    """A size below `SCREEN_MIN_MEMORY_MB` for an agent with a screen."""
+
+
+def check_screen_size(memory_mb: int | None, *, name: str | None = None) -> None:
+    """`ScreenTooSmall` if a screen agent is being given less than the minimum.
+
+    None is "nothing named", which the caller then makes the minimum. One check
+    for creation, a caller's spec and every resize, so no path makes a screen
+    agent smaller than its screen needs.
+    """
+    if memory_mb is not None and memory_mb < SCREEN_MIN_MEMORY_MB:
+        who = name or "an agent with a screen"
+        raise ScreenTooSmall(
+            f"{who} needs at least {SCREEN_MIN_MEMORY_MB} MB: its desktop and browser "
+            f"take about 1 GB on top of the agent's own, so {memory_mb} MB would leave "
+            "it killed for memory. Turn the screen off first to make it smaller."
+        )
+
+
+def screen_change_of(event: Any, *, now: datetime | None = None) -> dict[str, Any] | None:
+    """`{"screen", "memory_mb", "since"}` while a screen change is under way, else None.
+
+    `memory_mb` is the size it is being resized to as part of the change, or
+    None when the size stays.
+    """
+    if event is None or event.type != SCREEN_CHANGE_STARTED:
+        return None
+    started = _instant_of(event.ts)
+    if started is None:
+        return None
+    if ((now or datetime.now(UTC)) - started).total_seconds() > SCREEN_CHANGE_STALE_S:
+        return None
+    payload = event.payload or {}
+    return {
+        "screen": payload.get("screen"),
+        "memory_mb": payload.get("memory_mb"),
+        "since": event.ts,
+    }
+
+
+def screen_changes(store: FleetStore, box_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """`screen_change_of` for each of `box_ids` with a screen change under way."""
+    latest = store.latest_box_events(
+        box_ids, (SCREEN_SET, SCREEN_CHANGE_STARTED, SCREEN_CHANGE_FAILED)
+    )
+    found = {box_id: screen_change_of(event) for box_id, event in latest.items()}
+    return {box_id: change for box_id, change in found.items() if change}
+
+
+def _screen_plan(
+    box_id: str, screen: bool, store: FleetStore, backend: Backend | None
+) -> tuple[Box, int | None, int | None]:
+    """The box, the size the change resizes it to (None: it keeps its size),
+    and the size it has (None: unknown) — or the refusal, before anything is
+    touched.
+
+    **On** resizes an agent below the minimum, or of unknown size, to the
+    minimum, in the same restart. A substrate with no size to change (a local
+    stand-in) gets the screen without a resize: there is no machine for the
+    size to be too small. **Off** keeps the size; the owner can size down
+    afterwards.
+    """
+    if not isinstance(screen, bool):
+        raise ProvisionError(f"screen must be true or false, got {screen!r}")
+    box = _require_box(store, box_id)
+    if is_terminal("box", box.status):
+        raise ProvisionError(f"box {box_id} is {box.status!r}; there is no machine to change.")
+    if box.status == "provisioning" or not box.endpoint:
+        raise ProvisionError(
+            f"box {box_id} is still being created; wait for it to settle before changing its "
+            "screen."
+        )
+    current = box_sizes(store, [box.id]).get(box.id)
+    if not screen or (current is not None and current >= SCREEN_MIN_MEMORY_MB):
+        return box, None, current
+    try:
+        _resolve_backend(box, backend).check_resize(box.endpoint, SCREEN_MIN_MEMORY_MB)
+    except NotSupported:
+        return box, None, current
+    except SizeRefused as exc:
+        raise InvalidSize(
+            f"{box.name} cannot have a screen: it needs {SCREEN_MIN_MEMORY_MB} MB, and {exc}"
+        ) from exc
+    except BackendError as exc:
+        raise ProvisionError(f"could not check whether {box.name} can be resized: {exc}") from exc
+    return box, SCREEN_MIN_MEMORY_MB, current
+
+
+def begin_screen_change(
+    box_id: str,
+    screen: bool,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Accept a screen change that `set_screen` will then make on a thread, or
+    refuse it now (FLOTTA-208).
+
+    `begin_resize`'s shape: the change restarts a running agent, so every
+    refusal comes first. `screen_change_started` says it is under way, and
+    `size_change_started` too when it resizes, so the window shows both. An
+    agent whose screen is already that answers `already_current` and records
+    nothing.
+    """
+    box, resize_to, current = _screen_plan(box_id, screen, store, backend)
+    out: dict[str, Any] = {
+        "box_id": box.id,
+        "name": box.name,
+        "screen": screen,
+        "memory_mb": resize_to or current,
+        "resized": resize_to is not None,
+    }
+    if screen_changes(store, [box.id]).get(box.id):
+        raise ProvisionError(f"{box.name}'s screen is already being changed; wait for that.")
+    if size_changes(store, [box.id]).get(box.id):
+        raise ProvisionError(f"{box.name} is being resized; wait for that to finish.")
+    if box.screen == screen:
+        return {**out, "resized": False, "memory_mb": current, "already_current": True}
+    store.add_event(
+        "box", box.id, SCREEN_CHANGE_STARTED, {"screen": screen, "memory_mb": resize_to}
+    )
+    if resize_to is not None:
+        store.add_event(
+            "box",
+            box.id,
+            SIZE_CHANGE_STARTED,
+            {"memory_mb": resize_to, "from": current, "reason": "screen"},
+        )
+    return out
+
+
+def set_screen(
+    box_id: str,
+    screen: bool,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Give an agent a screen, or take it away (FLOTTA-208).
+
+    Writes `FLOTTA_SCREEN` to the agent's machine as plain environment, and
+    the boot step `flotta.box.screen` turns Hermes's Bot Desktop on or the
+    desktop and browser toolsets off. Turning it on for an agent below
+    `SCREEN_MIN_MEMORY_MB` resizes it in the **same** `machine update`, so it
+    is one restart; a sleeping agent stays asleep and wakes with both.
+
+    **Substrate first, row second**, as `resize_box` is: the row says the agent
+    has a screen only once its machine has been told.
+    """
+    box, resize_to, current = _screen_plan(box_id, screen, store, backend)
+    impl = _resolve_backend(box, backend)
+    env = {SCREEN_ENV_KEY: "1" if screen else "0"}
+    try:
+        if resize_to is not None:
+            impl.resize(box.endpoint, resize_to, env=env)
+        else:
+            impl.apply_env(box.endpoint, env)
+    except BackendError as exc:
+        error = str(exc)[:400]
+        store.add_event("box", box.id, SCREEN_CHANGE_FAILED, {"screen": screen, "error": error})
+        if resize_to is not None:
+            store.add_event(
+                "box", box.id, SIZE_CHANGE_FAILED, {"memory_mb": resize_to, "error": error}
+            )
+        state = "has a screen" if box.screen else "has no screen"
+        raise UpgradeFailed(
+            f"could not change {box.name}'s screen: {exc}. It still {state}."
+        ) from exc
+    store.set_box_screen(box.id, screen)
+    store.add_event("box", box.id, SCREEN_SET, {"screen": screen, "reason": "changed"})
+    if resize_to is not None:
+        store.add_event(
+            "box",
+            box.id,
+            SIZE_SET,
+            {"memory_mb": resize_to, "from": current, "reason": "screen"},
+        )
+    return {
+        "box_id": box.id,
+        "name": box.name,
+        "screen": screen,
+        "memory_mb": resize_to or current,
+        "resized": resize_to is not None,
+    }
+
+
+def _screen_onto_adopted(
+    store: FleetStore, impl: Backend, box: Box, endpoint: str, given_memory: int | None
+) -> None:
+    """A screen onto a machine `create` adopted rather than made, which kept its
+    own environment and size. A failure takes the screen off the row rather
+    than leave it claiming one the machine was never told about."""
+    try:
+        if given_memory is None or given_memory < SCREEN_MIN_MEMORY_MB:
+            try:
+                impl.resize(endpoint, SCREEN_MIN_MEMORY_MB, env={SCREEN_ENV_KEY: "1"})
+            except NotSupported:
+                impl.apply_env(endpoint, {SCREEN_ENV_KEY: "1"})
+            else:
+                store.add_event(
+                    "box",
+                    box.id,
+                    SIZE_SET,
+                    {"memory_mb": SCREEN_MIN_MEMORY_MB, "from": given_memory, "reason": "screen"},
+                )
+        else:
+            impl.apply_env(endpoint, {SCREEN_ENV_KEY: "1"})
+    except BackendError as exc:
+        store.set_box_screen(box.id, False)
+        store.add_event(
+            "box",
+            box.id,
+            SCREEN_CHANGE_FAILED,
+            {"screen": True, "error": f"adopted machine: {str(exc)[:400]}"},
+        )
 
 
 #: How long a resolved release image is fresh. The lookup is a `flyctl`
