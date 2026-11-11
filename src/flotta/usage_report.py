@@ -89,6 +89,11 @@ def report(
     """The answer to `GET /api/orgs/{org}/usage`."""
     window = {"since": since, "until": until, "client": client, "box": box}
     rows = [sum_dict(s) for s in store.usage_summary(org, group=group, **window)]
+    if "client" in group:
+        # What an invoice line names (FLOTTA-188): the client, as its agency called it.
+        clients = store.client_names(org)
+        for row in rows:
+            row["client_name"] = clients.get(row["client"]) if row["client"] else None
     if "box" in group:
         names = store.box_names(org)
         for row in rows:

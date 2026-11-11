@@ -1,7 +1,8 @@
 """`org:govern`: the hosted product's billing credential (FLOTTA-183, M15.1).
 
 The first test is the guard. A governing token may read and set an org's
-limits, and **nothing else**: it is sent to every route the app has, every
+limits, suspend, resume and approve it, and read its usage totals, and
+**nothing else**: it is sent to every route the app has, every
 method, with real ids where a route takes them, and every route but the two
 limits routes must refuse it with nothing changed. A route added later is in
 the sweep without anyone remembering to add it, because the sweep reads the
@@ -52,6 +53,9 @@ GOVERN_ROUTES = frozenset(
         # cap, and lifting that cap once a renewal is paid.
         ("POST", "/api/orgs/{org_id}/approve"),
         ("DELETE", "/api/orgs/{org_id}/starting-cap"),
+        # FLOTTA-188: the usage totals an invoice's model spend is built from.
+        # Sums only (`flotta.usage_report`), never the ledger's rows.
+        ("GET", "/api/orgs/{org_id}/usage"),
     }
 )
 #: What any valid credential may ask about itself: who it is and what it holds.
@@ -141,7 +145,7 @@ def test_the_sweep_finds_the_routes():
         ("GET", "/api/orgs"),
         ("POST", "/api/orgs/{org_id}/decline"),
         ("GET", "/api/orgs/{org_id}/members"),
-        ("GET", "/api/orgs/{org_id}/usage"),
+        ("GET", "/api/orgs/{org_id}/budgets"),
         ("POST", "/api/orgs/{org_id}/clients"),
         ("POST", "/api/orgs/{org_id}/tokens"),
         ("PUT", "/api/settings"),

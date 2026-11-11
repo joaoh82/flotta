@@ -1198,6 +1198,8 @@ USAGE_GROUPS: dict[str, str] = {
     "kind": "kind",
     "model": "model",
     "requested_model": "requested_model",
+    # Whose provider key paid (FLOTTA-102): billing resells only the fleet's.
+    "key_scope": "key_scope",
 }
 
 
@@ -3998,6 +4000,10 @@ class FleetStore:
             )
             for row in rows
         ]
+
+    def client_names(self, org: str) -> dict[str, str]:
+        """`org`'s clients by id, named: what a usage report grouped by client says."""
+        return {c.id: c.name for c in self.list_clients(org)}
 
     def box_names(self, org: str) -> dict[str, tuple[str, str | None]]:
         """`org`'s boxes by id: the name, as it was before any destroying, and the display name."""

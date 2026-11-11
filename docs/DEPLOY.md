@@ -799,7 +799,10 @@ next one. The org's own owner can read its limits and cannot set them.
 
 On the hosted product the web app's billing sets these from each agency's plan
 (M15), holding a token with **`org:govern`**, alone: it may read and set any
-org's limits and do nothing else, and it is never treated as the operator.
+org's limits, approve, suspend and resume an org, lift its starting cap, and
+read any org's usage **totals** (`GET /api/orgs/{id}/usage`, never the
+ledger's rows), which is what an invoice's model spend is built from
+(FLOTTA-188). It does nothing else, and it is never treated as the operator.
 `just govern-token` mints one for a year with this machine's signing key: run it
 with the key of the environment it is for (staging and production each have
 their own) and put the output straight into that web app's environment.
