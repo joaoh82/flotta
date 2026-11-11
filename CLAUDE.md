@@ -387,6 +387,25 @@ conventions, and the sharp edges below.
   hold. "Update agents" passes such an agent by with `upgrade_skipped`, listed
   on its build as `skipped`. Skips, forces and lapses are `NOT_ACTIVITY`: they
   move neither the idle clock nor the cap.
+- **"Needs you on the screen" is a handoff, and a run waits for one parked (FLOTTA-213,
+  migration 36).** Hermes has no pause-for-a-person tool, so an agent with a
+  screen runs `flotta-handoff "<why>" [--url]` (the `flotta-screen` skill, offered
+  only where the `browser` toolset is on, and the command refuses with no
+  `FLOTTA_SCREEN`) and ends its turn. `POST /api/boxes/{id}/handoffs` (`box:peer`,
+  409 without a screen) keeps one open per agent; `GET /api/handoffs` lists them
+  for whoever may drive (a client's people only with `client_screen_control`, a
+  client viewer never); `POST /api/handoffs/{id}/dismiss` is the agency's.
+  **A hand-back counts only from a person**: FLOTTA-211's `LeaseWatch` reports
+  one (`handed_back_at` on `/screen-lease`) when a socket whose ticket may drive
+  the screen sends `display.lease.release` and Hermes's answer to that request
+  gives the lease back to the agent, timed by the door's clock. The box's own
+  lease frames prove nothing: the agent has root and can move its lease. **A run's turn ending with a handoff open parks
+  the run** (`RunLoop._park`): it stays `running`, so its agent stays awake, but
+  holds none of `MAX_CONCURRENT`; each sweep looks at parked runs first, carries
+  a handed-back one on in the same stored session (`through_door(resume=)`),
+  ends a dismissed one `cancelled` and one past `RUN_TIMEOUT_S` `failed`.
+  Emailed after 60 s like approvals, **at most once per agent in 20 minutes**,
+  and again when a reused handoff names a different run (`notice_for`).
 - **The projects folder is on the rootfs and is lost on every image update.**
   `$FLOTTA_WORKDIR` (default `/workspace`) is created by the entrypoint on the
   machine's disk, not on `/data`, because a `node_modules` on the 1 GB memory

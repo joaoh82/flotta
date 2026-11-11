@@ -831,6 +831,55 @@ def _requests() -> tuple[str, ...]:
     )
 
 
+def _handoffs() -> tuple[str, ...]:
+    """An agent saying it needs a person on its screen (FLOTTA-213).
+
+    The agent files one (`flotta-handoff "<why>"`) on a sign-in, a 2FA prompt,
+    a CAPTCHA or a payment. `run_id` is the run it was filed in, when there was
+    one: a run that is not a conversation's turn waits for it rather than
+    ending (`flotta.runner`). `url` is the page it was on, as the agent said.
+
+    `status` is `open`, then `handed_back` (a person handed the screen back to
+    the agent after it was filed), `dismissed` (the agency, by `closed_by`), or
+    `expired` (its run ended first). `notified_at` is the email's claim, as on
+    `run_approvals`, and `notice_for` the run that email was about: a row
+    reused for another run is due an email again.
+
+    A run that waits on it is **parked** (`parked_at`): it holds no delivery
+    slot while it waits, and what it needs to carry on is kept here, the stored
+    session (`run_session`), its steps so far (`run_steps_json`) and its reply
+    (`run_reply`). `resumed_at` is the claim of whichever control plane picks
+    it up again.
+    """
+    return (
+        """
+        CREATE TABLE handoffs (
+            id           TEXT PRIMARY KEY,
+            box_id       TEXT NOT NULL REFERENCES boxes(id),
+            org_id       TEXT NOT NULL,
+            client_id    TEXT NOT NULL,
+            why          TEXT NOT NULL,
+            url          TEXT,
+            run_id       TEXT,
+            status       TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            closed_at    TEXT,
+            closed_by    TEXT,
+            notified_at  TEXT,
+            notice_for   TEXT,
+            parked_at    TEXT,
+            resumed_at   TEXT,
+            run_session  TEXT,
+            run_reply    TEXT,
+            run_steps_json TEXT
+        )
+        """,
+        "CREATE INDEX idx_handoffs_org ON handoffs(org_id, status, created_at)",
+        "CREATE INDEX idx_handoffs_box ON handoffs(box_id, status)",
+        "CREATE INDEX idx_handoffs_parked ON handoffs(parked_at, resumed_at)",
+    )
+
+
 def _triggers() -> tuple[str, ...]:
     """What starts a run on its own (FLOTTA-148): schedules now, webhooks next.
 
@@ -1136,6 +1185,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         # deployed, so any suspension then was made by hand.
         ("ALTER TABLE orgs ADD COLUMN suspended_by TEXT",),
     ),
+    Migration(36, "handoffs: an agent needs a person on its screen", _handoffs()),
 )
 
 
