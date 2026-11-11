@@ -888,9 +888,7 @@ def test_an_end_the_control_plane_refuses_is_not_tried_again(no_backoff, caplog)
         _closed_mid_turn(plane)
 
     assert plane.tries == 1
-    assert [r.levelname for r in caplog.records if "stays running" in r.getMessage()] == [
-        "WARNING"
-    ]
+    assert [r.levelname for r in caplog.records if "stays running" in r.getMessage()] == ["WARNING"]
 
 
 def test_an_end_already_closed_elsewhere_is_not_a_warning(no_backoff, caplog):
@@ -901,3 +899,29 @@ def test_an_end_already_closed_elsewhere_is_not_a_warning(no_backoff, caplog):
 
     assert plane.tries == 1
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_a_bug_of_ours_is_not_tried_again(no_backoff, caplog):
+    plane = Flaky([TypeError("a bug, every time")] * 10)
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(plane)
+
+    assert plane.tries == 1
+    assert [r.levelname for r in caplog.records if "stays running" in r.getMessage()] == ["WARNING"]
+
+
+def test_ends_still_unsent_when_the_drain_runs_out_are_said_at_warning(monkeypatch, caplog):
+    """The worker is cancelled past `DRAIN_S`, and a cancel is no exception the
+    end's own warning would catch: `close` says what it gave up."""
+    monkeypatch.setattr("flotta.door.turns.DRAIN_S", 0.05)
+
+    class Slow(Plane):
+        async def finish_chat_run(self, box_id, run_id, **ending):
+            await asyncio.sleep(10)
+
+    with caplog.at_level("INFO", logger="flotta.door"):
+        _closed_mid_turn(Slow())
+
+    (warning,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "1 turn end(s) unsent" in warning.getMessage()

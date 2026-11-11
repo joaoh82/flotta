@@ -17,7 +17,7 @@ import logging
 import re
 from typing import Any
 
-#: The door's logger (`flotta.door.app`, `flotta.door.turns`).
+#: The logger the door's modules all write on (`door/app.py`, `turns.py`, `conversation.py`).
 DOOR_LOG = "flotta.door"
 
 #: A query parameter's value, after its name: up to the next `&`, space, quote or `#`.

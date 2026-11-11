@@ -144,6 +144,17 @@ def test_flotta_chat_sends_its_token_in_a_header_not_the_url():
     assert seen["headers"] == {"Authorization": f"Bearer {TOKEN}"}
 
 
+@pytest.fixture(autouse=True)
+def door_logger():
+    """The door's logger as it was, after every test here that applies the
+    servers' config (the `server` fixture's uvicorn does too): it sets the
+    logger not to propagate, which would hide its records from later `caplog`s."""
+    logger = logging.getLogger("flotta.door")
+    kept = logger.handlers[:], logger.level, logger.propagate, logger.disabled
+    yield
+    logger.handlers[:], logger.level, logger.propagate, logger.disabled = kept
+
+
 def test_the_doors_own_lines_are_written(capfd):
     """FLOTTA-218: uvicorn's config sets up only its own loggers, so every INFO
     line the door wrote about a conversation (a turn ended disconnected, an

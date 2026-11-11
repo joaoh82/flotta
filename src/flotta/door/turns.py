@@ -77,6 +77,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+import httpx
+
 from flotta.approval_choices import OUTSIDE_CHOICES
 from flotta.steps import Steps
 
@@ -100,6 +102,12 @@ DRAIN_S = 75.0
 #: `provision.reap_runs` closes it, so a fault on the way to the control plane
 #: (a timeout, a refused connection, a 5xx) is worth another go. Safe to repeat:
 #: an end that did land answers the next try 409, which counts as recorded.
+#: Only a fault that may pass is tried again (`_may_pass`), not a 4xx or a bug.
+#:
+#: The tries hold the socket's one worker, up to about 52 s at worst, so the
+#: calls queued behind them wait: a next turn's open (which would be refused
+#: 409 anyway while the agent's run is still `running`) and an approval's. A
+#: stopping door gives a turn its first try only (`cli.DOOR_DRAIN_S`).
 FINISH_TRIES = 4
 
 #: The waits between those tries, in seconds.
@@ -237,6 +245,8 @@ class TurnRecorder:
         self._closed = False
         #: Places kept on the queue for the ends of turns opened and not ended.
         self._reserved = 0
+        #: Ends queued and not yet tried to the last, said if `close` gives up.
+        self._ends_unsent = 0
         #: The approvals asked here, by the box's request id (FLOTTA-166).
         self._asked: dict[str, _Asked] = {}
         self._deliver: Deliver | None = None
@@ -434,6 +444,12 @@ class TurnRecorder:
             async with asyncio.timeout(DRAIN_S):
                 await asyncio.shield(worker)
         except TimeoutError:
+            _log.warning(
+                "%s's last calls ran past %ss; given up, with %d turn end(s) unsent",
+                self._box_id,
+                DRAIN_S,
+                self._ends_unsent,
+            )
             worker.cancel()
 
     # -- turns --------------------------------------------------------------
@@ -470,6 +486,7 @@ class TurnRecorder:
         turn.ending = payload
         turn.ended_at = datetime.now(UTC)
         self._reserved -= 1
+        self._ends_unsent += 1
         self._send("end", session, turn)
 
     def _send(self, what: str, session: str, turn: _Turn, extra: Any = None) -> None:
@@ -507,6 +524,8 @@ class TurnRecorder:
             finally:
                 if what == "open" and not turn.run_id.done():
                     turn.run_id.set_result(None)
+                if what == "end":
+                    self._ends_unsent -= 1
 
     async def _open(self, session: str, turn: _Turn) -> None:
         async with asyncio.timeout(CALL_TIMEOUT_S):
@@ -627,7 +646,7 @@ class TurnRecorder:
                         _log.info("%s's run %s had already ended", self._box_id, run_id)
                     return
                 last = attempt == FINISH_TRIES - 1
-                if last or (code is not None and code < 500):
+                if last or not _may_pass(exc, code):
                     _log.warning(
                         "%s's run %s stays running: its end (%s) went unrecorded: %s",
                         self._box_id,
@@ -649,6 +668,15 @@ class TurnRecorder:
                     "%s's run %s ended %s on try %d", self._box_id, run_id, status, attempt + 1
                 )
             return
+
+
+def _may_pass(exc: BaseException, code: int | None) -> bool:
+    """Whether a failed call is worth another go: a timeout, a fault on the way
+    there (`httpx.TransportError`, a refused connection), or a 5xx. Not a 4xx,
+    and not a bug of ours, which would fail the same way every time."""
+    if code is not None:
+        return code >= 500
+    return isinstance(exc, TimeoutError | OSError | httpx.TransportError)
 
 
 def _status_code(exc: BaseException) -> int | None:
