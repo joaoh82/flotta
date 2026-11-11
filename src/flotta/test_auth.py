@@ -505,3 +505,129 @@ def test_a_box_password_opens_one_box_and_is_not_the_fleets():
     assert mine == box_password("fleet-pw", "b-1"), "the door must derive the same one"
     assert "fleet-pw" not in mine and "fleet-pw" not in theirs
     assert box_password("another-fleet", "b-1") != mine
+
+
+# -- what a ticket may do with a screen (FLOTTA-209) ----------------------------
+
+
+def _screen_ticket(**kwargs):
+    from flotta.auth import mint_ticket
+
+    return mint_ticket(
+        subject="user:u-1", box_id="b-1", org="agency-x", client="acme", key=KEY, **kwargs
+    )
+
+
+@pytest.mark.parametrize("grant", ["watch", "control"])
+def test_a_ticket_carries_its_screen_grant(grant):
+    from flotta.auth import verify_ticket
+
+    assert verify_ticket(_screen_ticket(screen=grant), key=KEY).screen == grant
+
+
+def test_a_ticket_that_says_nothing_may_do_nothing_with_a_screen():
+    """Every ticket minted before screens says nothing; `none` is written as
+    nothing too, so the two read the same."""
+    from flotta.auth import _TICKET_DOMAIN, TICKET_PREFIX, _open, verify_ticket
+
+    for ticket in (_screen_ticket(), _screen_ticket(screen="none")):
+        claims = _open(ticket[len(TICKET_PREFIX) :], KEY, now=None, domain=_TICKET_DOMAIN)
+        assert "screen" not in claims
+        assert verify_ticket(ticket, key=KEY).screen == "none"
+
+
+def test_a_ticket_minted_before_screens_reads_none():
+    """Built by hand the way `mint_ticket` built one before FLOTTA-209: no claim."""
+    import time
+
+    from flotta.auth import _TICKET_DOMAIN, TICKET_PREFIX, _encode, _sign, verify_ticket
+
+    now = int(time.time())
+    payload = _encode(
+        {
+            "v": 1,
+            "sub": "user:u-1",
+            "scopes": [SCOPE_BOX_CHAT],
+            "box": "b-1",
+            "org": "agency-x",
+            "client": "acme",
+            "iat": now,
+            "exp": now + 60,
+            "access": "full",
+        }
+    )
+    old = f"{TICKET_PREFIX}{payload}.{_sign(_TICKET_DOMAIN + payload, KEY)}"
+    token = verify_ticket(old, key=KEY)
+    assert token.full_access
+    assert token.screen == "none"
+
+
+def test_an_unknown_screen_grant_is_refused_at_mint():
+    from flotta.auth import mint_ticket
+
+    with pytest.raises(AuthError, match="screen grant"):
+        mint_ticket(subject="s", box_id="b-1", org="o", client="c", key=KEY, screen="drive")
+
+
+def test_a_token_never_carries_a_screen_grant():
+    token = verify(
+        mint(subject="josh", scopes={SCOPE_BOX_CHAT, SCOPE_FLEET_WRITE}, key=KEY), key=KEY
+    )
+    assert token.screen == "none"
+
+
+def _person(role, client="acme"):
+    from flotta.auth import scopes_for_role
+
+    scopes = scopes_for_role(role, client=None if role == "owner" else client)
+    return verify(
+        mint(
+            subject="josh",
+            scopes=scopes,
+            key=KEY,
+            org="agency-x",
+            client=None if role == "owner" else client,
+        ),
+        key=KEY,
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "client_control", "grant"),
+    [
+        ("owner", False, "control"),
+        ("member", False, "control"),
+        ("client_user", False, "watch"),
+        ("client_user", True, "control"),
+        # Holds no `box:chat`, so the control plane gives it no ticket; and if
+        # anything ever asked, it would not drive.
+        ("client_viewer", False, "watch"),
+        ("client_viewer", True, "watch"),
+    ],
+)
+def test_who_may_watch_a_screen_and_who_may_drive_it(role, client_control, grant):
+    from flotta.auth import screen_grant
+
+    token = _person(role)
+    assert screen_grant(token, has_screen=True, client_control=client_control) == grant
+
+
+@pytest.mark.parametrize("role", ["owner", "member", "client_user", "client_viewer"])
+@pytest.mark.parametrize("client_control", [False, True])
+def test_an_agent_without_a_screen_grants_nobody_anything(role, client_control):
+    from flotta.auth import screen_grant
+
+    token = _person(role)
+    assert screen_grant(token, has_screen=False, client_control=client_control) == "none"
+    assert screen_grant(None, has_screen=False, client_control=client_control) == "none"
+
+
+def test_the_keyless_operator_drives_and_a_box_only_watches():
+    from flotta.auth import box_subject, screen_grant
+
+    assert screen_grant(None, has_screen=True, client_control=False) == "control"
+    box = verify(
+        mint(subject=box_subject("b-1"), scopes={SCOPE_BOX_CHAT}, key=KEY, org="o", client="c"),
+        key=KEY,
+    )
+    assert screen_grant(box, has_screen=True, client_control=True) == "watch"

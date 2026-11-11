@@ -257,3 +257,132 @@ def test_only_the_agency_sets_it_and_only_for_its_own_agents(api, fleet):
     ana = _as(fleet, "ana@example.com")
     assert _set_approvals(api, ana, True, box="b-theirs").status_code == 404
     assert not _client_ticket(api, fleet).answers_approvals
+
+
+# -- the screen: who may watch it, and who may drive it (FLOTTA-209) ----------
+
+
+def _give_screen(fleet, *boxes):
+    with FleetStore(fleet) as store:
+        for box in boxes:
+            store.set_box_screen(box, True)
+
+
+def _set_screen_control(api, headers, allowed, box="b-support"):
+    return api.put(
+        f"/api/boxes/{box}/client-screen-control", json={"allowed": allowed}, headers=headers
+    )
+
+
+def _screen(api, fleet, email, box="b-support"):
+    answer = _ticket(api, box, _as(fleet, email))
+    assert answer.status_code == 200, answer.text
+    grant = verify_ticket(answer.json()["ticket"], key=KEY).screen
+    assert answer.json()["screen"] == grant, "the answer says what the ticket says"
+    return grant
+
+
+def test_an_agent_without_a_screen_grants_no_one_anything(api, fleet):
+    """Every agent that exists today: no screen, so no ticket says a thing about one,
+    whoever asks, and whatever the agency allowed."""
+    ana = _as(fleet, "ana@example.com")
+    assert _set_screen_control(api, ana, True).status_code == 200
+    for email in ("ana@example.com", "mo@example.com", "cu@example.com"):
+        assert _screen(api, fleet, email) == "none", email
+    agent = api.get("/api/boxes/b-support", headers=ana).json()["box"]
+    assert agent["screen"] is False
+
+
+def test_the_agency_drives_its_agents_screen(api, fleet):
+    _give_screen(fleet, "b-support")
+    assert _screen(api, fleet, "ana@example.com") == "control"
+    assert _screen(api, fleet, "mo@example.com") == "control"
+
+
+def test_a_client_user_watches_until_the_agency_lets_them_drive(api, fleet):
+    _give_screen(fleet, "b-support", "b-billing")
+    ana = _as(fleet, "ana@example.com")
+    assert _screen(api, fleet, "cu@example.com") == "watch"
+    agent = api.get("/api/boxes/b-support", headers=ana).json()["box"]
+    assert (agent["screen"], agent["client_screen_control"]) == (True, False)
+
+    answer = _set_screen_control(api, ana, True)
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["box"]["client_screen_control"] is True
+    assert _screen(api, fleet, "cu@example.com") == "control"
+    assert _screen(api, fleet, "cu@example.com", "b-billing") == "watch"
+    listed = api.get("/api/boxes", headers=ana).json()["boxes"]
+    assert {b["id"] for b in listed if b["client_screen_control"]} == {"b-support"}
+
+    assert _set_screen_control(api, ana, False).status_code == 200
+    assert _screen(api, fleet, "cu@example.com") == "watch"
+    with FleetStore(fleet) as store:
+        said = [
+            e.payload["allowed"]
+            for e in store.get_events("box", "b-support")
+            if e.type == "client_screen_control_set"
+        ]
+    assert said == [True, False]
+
+
+def test_a_client_viewer_gets_no_ticket_even_where_clients_may_drive(api, fleet):
+    """No `box:chat`, so no ticket at all, and nothing to watch or drive with.
+    What `screen_grant` would say for one is `test_auth.py`'s."""
+    _give_screen(fleet, "b-support")
+    assert _set_screen_control(api, _as(fleet, "ana@example.com"), True).status_code == 200
+    assert _ticket(api, "b-support", _as(fleet, "vi@example.com")).status_code == 403
+
+
+def test_a_colleague_without_a_screen_gets_none_beside_one_that_has_it(api, fleet):
+    """The grant is decided from the one agent the ticket is for, not from its
+    client or org: a colleague with no screen says `none`. The ticket names its
+    box, so `admits` keeps it off a colleague; that the door holds a grant to
+    that box is FLOTTA-210's guard."""
+    from flotta.auth import admits
+
+    _give_screen(fleet, "b-support")
+    assert _screen(api, fleet, "ana@example.com", "b-billing") == "none"
+    answer = _ticket(api, "b-support", _as(fleet, "ana@example.com"))
+    ticket = verify_ticket(answer.json()["ticket"], key=KEY)
+    assert (ticket.box, ticket.screen) == ("b-support", "control")
+    assert admits(ticket, box_id="b-billing", org="agency-x", client="acme") is not None
+
+
+def test_an_agents_own_token_only_watches_its_own_screen(api, fleet):
+    """Driving is granted, never assumed: a box's token is not the agency."""
+    _give_screen(fleet, "b-support")
+    assert _set_screen_control(api, _as(fleet, "ana@example.com"), True).status_code == 200
+    token = mint(
+        subject=box_subject("b-support"),
+        scopes={SCOPE_BOX_CHAT, SCOPE_GIT_CREDENTIAL},
+        org="agency-x",
+        client="acme",
+        key=KEY,
+    )
+    answer = _ticket(api, "b-support", {"Authorization": f"Bearer {token}"})
+    assert answer.status_code == 200, answer.text
+    assert verify_ticket(answer.json()["ticket"], key=KEY).screen == "watch"
+
+
+@pytest.mark.parametrize("body", [{}, {"allowed": "yes"}, {"allowed": 1}, {"allowed": None}])
+def test_the_screen_setting_is_a_yes_or_a_no(api, fleet, body):
+    _give_screen(fleet, "b-support")
+    answer = api.put(
+        "/api/boxes/b-support/client-screen-control",
+        json=body,
+        headers=_as(fleet, "ana@example.com"),
+    )
+    assert answer.status_code == 422
+    assert _screen(api, fleet, "cu@example.com") == "watch"
+
+
+def test_only_the_agency_lets_a_client_drive_and_only_its_own_agents(api, fleet):
+    _give_screen(fleet, "b-support")
+    for email in ("cu@example.com", "vi@example.com"):
+        assert _set_screen_control(api, _as(fleet, email), True).status_code == 403, email
+    ana = _as(fleet, "ana@example.com")
+    assert _set_screen_control(api, ana, True, box="b-theirs").status_code == 404
+    assert (
+        _set_screen_control(api, _as(fleet, "mo@example.com"), True, "b-sales").status_code == 404
+    )
+    assert _screen(api, fleet, "cu@example.com") == "watch"

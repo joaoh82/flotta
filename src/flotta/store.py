@@ -578,6 +578,9 @@ class Box:
     #: that has to know: every row it reads sets both.
     org: str = DEFAULT_ORG
     client: str = DEFAULT_CLIENT
+    #: Whether this agent has a screen a person can watch and take over
+    #: (FLOTTA-208/209). Off unless chosen: no screen means no ticket grants one.
+    screen: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -3336,6 +3339,47 @@ class FleetStore:
         marks = ", ".join("?" for _ in box_ids)
         rows = self._conn.execute(
             f"SELECT box_id FROM client_approvers WHERE box_id IN ({marks})",
+            tuple(box_ids),
+        ).fetchall()
+        return {str(r["box_id"]) for r in rows}
+
+    def set_box_screen(self, box_id: str, screen: bool) -> None:
+        """Whether this agent has a screen (FLOTTA-208). Only the switch: the
+        machine's image and size are provisioning's to change."""
+        self._get_box_or_raise(box_id)
+        self._conn.execute("UPDATE boxes SET screen = ? WHERE id = ?", (int(screen), box_id))
+
+    def set_clients_control_screen(self, box_id: str, allowed: bool) -> None:
+        """Whether this agent's client's people may drive its screen (FLOTTA-209).
+
+        Watching is theirs anyway; this is taking over, which the agency
+        decides per agent because whatever they sign in to there, the agent
+        keeps. A row means yes, as `client_approvers` does, so an agent nobody
+        has decided about is a no.
+        """
+        self._get_box_or_raise(box_id)
+        if not allowed:
+            self._conn.execute("DELETE FROM client_screen_control WHERE box_id = ?", (box_id,))
+            return
+        self._conn.execute(
+            "INSERT INTO client_screen_control (box_id, updated_at) VALUES (?, ?) "
+            "ON CONFLICT (box_id) DO NOTHING",
+            (box_id, _utcnow()),
+        )
+
+    def clients_control_screen(self, box_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT box_id FROM client_screen_control WHERE box_id = ?", (box_id,)
+        ).fetchone()
+        return row is not None
+
+    def client_screen_controllers(self, box_ids: list[str]) -> set[str]:
+        """Which of these do. One query for the fleet list, not one per row."""
+        if not box_ids:
+            return set()
+        marks = ", ".join("?" for _ in box_ids)
+        rows = self._conn.execute(
+            f"SELECT box_id FROM client_screen_control WHERE box_id IN ({marks})",
             tuple(box_ids),
         ).fetchall()
         return {str(r["box_id"]) for r in rows}
@@ -6682,6 +6726,9 @@ def _box_from_row(row: db.Row) -> Box:
         destroyed_at=row["destroyed_at"],
         org=row["org_id"],
         client=row["client_id"],
+        # `get`: a store read part-way through its migrations, before 34, has
+        # no screens yet, which is no screen.
+        screen=bool(row.get("screen") or 0),
     )
 
 

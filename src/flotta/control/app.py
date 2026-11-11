@@ -76,6 +76,7 @@ from flotta.auth import (
     person_token,
     resolve_signing_key,
     scopes_for_role,
+    screen_grant,
     subject_box,
     verify,
 )
@@ -457,6 +458,7 @@ def _box_dict(
     given: str | None = None,
     model_change: dict[str, Any] | None = None,
     clients_answer_approvals: bool = False,
+    client_screen_control: bool = False,
     memory_mb: int | None = None,
     size_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -493,6 +495,9 @@ def _box_dict(
     # window say "restarting" and an open conversation expect the drop.
     out["model_change"] = model_change
     out["clients_answer_approvals"] = clients_answer_approvals
+    # Whether a client's people may drive the agent's screen, not only watch
+    # it (FLOTTA-209). `screen`, from the row, says whether there is one.
+    out["client_screen_control"] = client_screen_control
     # The machine's memory in MB (FLOTTA-157), from the store rather than the
     # substrate (`provision.box_sizes`); None when nothing has said. And a
     # resize under way, which restarts the agent the way a model change does.
@@ -518,6 +523,7 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         given=store.models_given([box.id]).get(box.id) or model_given_by_default(),
         model_change=model_changes(store, [box.id]).get(box.id),
         clients_answer_approvals=store.clients_answer_approvals(box.id),
+        client_screen_control=store.clients_control_screen(box.id),
         memory_mb=box_sizes(store, [box.id]).get(box.id),
         size_change=size_changes(store, [box.id]).get(box.id),
     )
@@ -3453,6 +3459,7 @@ def create_app(
         default = fleet_model(store)
         default_given = model_given_by_default()
         approvers = store.client_approvers(ids)
+        screen_drivers = store.client_screen_controllers(ids)
         return {
             "boxes": [
                 _for_reader(
@@ -3464,6 +3471,7 @@ def create_app(
                             fleet_model=default,
                             given=given.get(b.id) or default_given,
                             clients_answer_approvals=b.id in approvers,
+                            client_screen_control=b.id in screen_drivers,
                             model_change=changes.get(b.id),
                             memory_mb=sizes.get(b.id),
                             size_change=resizes.get(b.id),
@@ -5052,6 +5060,35 @@ def create_app(
                 "box",
                 box.id,
                 "client_approvals_set",
+                {"allowed": allowed, "by": token.subject if token is not None else "operator"},
+            )
+            return {"box": _with_meta(store, box)}
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/client-screen-control")
+    def set_client_screen_control(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Whether this agent's client's people may drive its screen (FLOTTA-209).
+
+        They may watch it either way; this is taking over, and whatever they sign
+        in to there the agent keeps, so it is off unless the agency turns it on.
+        Like approvals it is signed into the next ticket: a screen already open
+        keeps what it was given until it reconnects. It can be set before the
+        agent has a screen, and grants nothing until it does.
+        """
+        allowed = body.get("allowed")
+        if not isinstance(allowed, bool):
+            raise HTTPException(status_code=422, detail='send {"allowed": true} or false')
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            store.set_clients_control_screen(box.id, allowed)
+            store.add_event(
+                "box",
+                box.id,
+                "client_screen_control_set",
                 {"allowed": allowed, "by": token.subject if token is not None else "operator"},
             )
             return {"box": _with_meta(store, box)}
@@ -7558,6 +7595,11 @@ def create_app(
         Scoped like every box route, and by `admits` as well, so a box's own
         token cannot get a ticket for a colleague. Nothing is woken: the door
         does that when the socket opens, which may be never.
+
+        `screen` is what the ticket may do with the agent's screen
+        (`flotta.auth.screen_grant`): `control` for the agency, `watch` for a
+        client's people unless the agency lets them drive this agent, and `none`
+        for an agent without one.
         """
         if key is None:
             raise HTTPException(
@@ -7574,6 +7616,11 @@ def create_app(
             if is_terminal("box", box.status):
                 raise HTTPException(status_code=409, detail=f"box {box.name!r} is {box.status}")
             answers_approvals = store.clients_answer_approvals(box.id)
+            screen = screen_grant(
+                token,
+                has_screen=box.screen,
+                client_control=box.screen and store.clients_control_screen(box.id),
+            )
         finally:
             store.close()
         ticket = mint_ticket(
@@ -7586,6 +7633,7 @@ def create_app(
             # conversation and no more, which is what a ticket says by default.
             full_access=token is None or token.allows(SCOPE_FLEET_WRITE),
             answers_approvals=answers_approvals,
+            screen=screen,
         )
         from flotta.client import ticket_url
 
@@ -7595,6 +7643,8 @@ def create_app(
             "box": {"id": box.id, "name": box.name},
             "url": ticket_url(box.name),
             "protocols": [CHAT_PROTOCOL, f"{TICKET_PROTOCOL_PREFIX}{ticket}"],
+            # What the ticket says, for the page to offer: the door decides.
+            "screen": screen,
         }
 
     @app.delete("/api/boxes/{box_id}")
