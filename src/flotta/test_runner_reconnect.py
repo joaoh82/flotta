@@ -311,7 +311,9 @@ class _RelayThatBreaksOnce(_Talk):
         self.relays += 1
         if self.relays == 1:
             await asyncio.sleep(0)
-            raise ConnectionResetError("could not send the answer")
+            from flotta.runner import SendFailed
+
+            raise SendFailed("could not send the answer")
         await asyncio.Event().wait()
 
 
@@ -354,3 +356,30 @@ def test_a_resume_hands_its_open_questions_to_the_run():
     talk = _Talk()
     _deliver(door, talk)
     assert talk.resumed_open == asked
+
+
+class _RelayWhoseStoreIsDown(_Talk):
+    async def relay(self, _send):
+        await asyncio.sleep(0)
+        raise RuntimeError("the store is down")
+
+
+def test_a_store_failure_in_the_relay_is_not_mistaken_for_the_socket():
+    """The review of #238: reconnecting would fail the same way, five times."""
+    door = _HangingDoor([CREATED, ACK, HANG], [_resumed(running=True), _complete("x")])
+    with pytest.raises(RuntimeError, match="the store is down"):
+        asyncio.run(
+            asyncio.wait_for(
+                through_door(
+                    BOX,
+                    PROMPT,
+                    token="t",
+                    talk=_RelayWhoseStoreIsDown(),
+                    timeout_s=3600,
+                    connect=door.connect,
+                    sleep=lambda _s: asyncio.sleep(0),
+                ),
+                timeout=5,
+            )
+        )
+    assert len(door.sockets) == 1, "no reconnect"

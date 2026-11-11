@@ -533,7 +533,7 @@ def test_an_answer_that_could_not_be_sent_goes_on_the_next_socket(path):
     async def broken(_frame):
         raise ConnectionResetError("the socket went")
 
-    with pytest.raises(ConnectionResetError):
+    with pytest.raises(runner.SendFailed):
         asyncio.run(talk.relay(broken))
 
     to_box = []
@@ -546,3 +546,35 @@ def test_an_answer_that_could_not_be_sent_goes_on_the_next_socket(path):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(asyncio.wait_for(talk.relay(send), timeout=5))
     assert to_box == ["once"]
+
+
+def test_an_answer_that_went_into_a_dying_socket_is_sent_again_on_the_resume(path):
+    """The review of #238: sent, but the socket died before the agent read
+    it. The resume still lists the question, so the answer goes again."""
+    talk = _talk(path)
+    talk.hear(ASK)
+    talk._sync()
+    with FleetStore(path) as store:
+        (waiting,) = store.waiting_approvals(org="studio-nord")
+        store.answer_approval(waiting.id, "once", by="user:ada")
+    to_box = []
+
+    async def send(frame):
+        to_box.append(json.loads(frame)["result"]["choice"])
+        if len(to_box) == 1:
+            return None
+        raise asyncio.CancelledError
+
+    async def first_relay():
+        relaying = asyncio.create_task(talk.relay(send))
+        while not to_box:
+            await asyncio.sleep(0.01)
+        relaying.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await relaying
+
+    asyncio.run(first_relay())
+    talk.hear_open({"open_requests": [ASK]})
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(asyncio.wait_for(talk.relay(send), timeout=5))
+    assert to_box == ["once", "once"]

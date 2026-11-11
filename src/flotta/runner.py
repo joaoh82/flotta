@@ -156,6 +156,11 @@ def run_token(run: Run, box: Box, *, key: str, ttl_s: int) -> str:
     )
 
 
+class SendFailed(Exception):
+    """An answer could not be sent on the run's socket: the socket going
+    (FLOTTA-199), unlike anything else the relay can fail on, such as the store."""
+
+
 class Talk:
     """One run's conversation as the control plane holds it: the steps it
     hears, and the approvals it carries between the agent and a person."""
@@ -182,6 +187,8 @@ class Talk:
         self._held_at = 0.0
         #: The box's request ids of every question heard, on any socket of the run.
         self._asked: set[str] = set()
+        #: Answers sent, by the box's request id: what a resume can ask for again.
+        self._sent_for: dict[str, tuple[str, Any]] = {}
 
     def hear(self, frame: dict[str, Any]) -> None:
         """One frame of the turn, as `client.send_turn` streams it."""
@@ -205,7 +212,16 @@ class Talk:
             if not isinstance(entry, dict) or entry.get("method") != "approval":
                 continue
             rid = entry.get("id")
-            if not isinstance(rid, str | int) or str(rid) in self._asked:
+            if not isinstance(rid, str | int):
+                continue
+            if str(rid) in self._sent_for:
+                # Answered, and the agent still waits: the answer went into a
+                # socket that died before the agent read it. Sent again; Hermes
+                # takes the first answer to a question and drops the rest.
+                approval_id, rpc_id = self._sent_for.pop(str(rid))
+                self._open[approval_id] = rpc_id
+                continue
+            if str(rid) in self._asked:
                 continue
             params = entry.get("params")
             self.hear(
@@ -224,14 +240,16 @@ class Talk:
                 answer = {"jsonrpc": "2.0", "id": rpc_id, "result": {"choice": choice}}
                 try:
                     await send(json.dumps(answer))
-                except BaseException:
+                except Exception as exc:
                     # Not carried: the next socket sends it (FLOTTA-199). It was
-                    # taken off what is open to be sent, and would be lost.
+                    # taken off what is open to be sent, and would be lost. Not a
+                    # cancel: the run is ending then, and the answer may have gone.
                     self._open[approval_id] = rpc_id
-                    raise
+                    raise SendFailed(str(exc)) from exc
                 # Noted before anything that can be cancelled: the box may finish
                 # its turn on this answer at once, and `close` must know it went.
                 self._sent.add(approval_id)
+                self._sent_for[str(rpc_id)] = (approval_id, rpc_id)
                 self.steps.answered(str(rpc_id), choice, by)
                 await asyncio.to_thread(self._delivered, approval_id)
             await asyncio.sleep(self._poll_s)
@@ -489,6 +507,11 @@ async def _turn_or_relay_lost(turn: Awaitable[Any], relaying: asyncio.Task | Non
     if waiting.done():
         return waiting.result()
     lost = relaying.exception()
+    if lost is not None and not isinstance(lost, SendFailed):
+        # The store, not the socket: reconnecting would fail the same way.
+        waiting.add_done_callback(lambda t: t.cancelled() or t.exception())
+        waiting.cancel()
+        raise lost
     # Not waited for: leaving the socket's context closes it, which ends the read.
     waiting.add_done_callback(lambda t: t.cancelled() or t.exception())
     waiting.cancel()
