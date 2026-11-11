@@ -153,6 +153,7 @@ BOX_ROUTES = [
     ("DELETE", "/api/boxes/{b}/repos/acme/secrets", SCOPE_FLEET_WRITE, None),
     ("PUT", "/api/boxes/{b}/model", SCOPE_FLEET_WRITE, {"model": None}),
     ("PUT", "/api/boxes/{b}/size", SCOPE_FLEET_WRITE, {"memory_mb": 4096}),
+    ("PUT", "/api/boxes/{b}/screen", SCOPE_FLEET_WRITE, {"screen": True}),
     ("PUT", "/api/boxes/{b}/client-approvals", SCOPE_FLEET_WRITE, {"allowed": True}),
     ("PUT", "/api/boxes/{b}/client-screen-control", SCOPE_FLEET_WRITE, {"allowed": True}),
     ("GET", "/api/boxes/{b}/rules", SCOPE_FLEET_WRITE, None),

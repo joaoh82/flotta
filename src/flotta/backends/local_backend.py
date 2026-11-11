@@ -365,7 +365,14 @@ class LocalBackend:
             "a local stand-in is a process on this machine; it has no size to change"
         )
 
-    def resize(self, box_id: str, memory_mb: int) -> None:
+    def resize(
+        self,
+        box_id: str,
+        memory_mb: int,
+        *,
+        env: dict[str, str] | None = None,
+        at_least: bool = False,
+    ) -> int | None:
         # Refused rather than recorded: a process has no VM to size, and saying
         # it now has 4 GB would be a number the window shows and nothing holds.
         raise NotSupported(

@@ -502,3 +502,70 @@ def test_git_honours_a_configured_author_over_the_committer(tmp_path):
     assert git("log", "-1", "--format=%an <%ae>|%cn <%ce>").strip() == (
         "João Henrique <208517+joaoh82@users.noreply.github.com>|eng-a <eng-a@flotta.dev>"
     )
+
+
+def test_the_entrypoint_switches_the_screen_for_real(tmp_path):
+    """FLOTTA-208. The screen line as written, last of the config.yaml writers:
+    unset is no screen (every agent that exists), and `|| true` holds with no venv."""
+    import subprocess
+    import sys
+
+    import yaml
+
+    body = _ENTRYPOINT.read_text(encoding="utf-8")
+    writers = [
+        line
+        for line in body.splitlines()
+        if any(f"flotta.box.{m} " in line for m in ("approvals", "skills", "inference", "screen"))
+        and not line.lstrip().startswith("#")
+    ]
+    assert len(writers) == 4, writers
+    assert "flotta.box.screen" in writers[-1]
+    assert writers[-1].rstrip().endswith("|| true")
+
+    venv = pathlib.Path(sys.executable).parent.parent
+    for value, headed in ((None, False), ("1", True)):
+        home = tmp_path / f"hermes-{value}"
+        home.mkdir()
+        env = {"HERMES_HOME": str(home), "HERMES_VENV": str(venv), "PATH": "/usr/bin:/bin"}
+        if value is not None:
+            env["FLOTTA_SCREEN"] = value
+        subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", writers[-1]],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        written = yaml.safe_load((home / "config.yaml").read_text())
+        assert written["browser"]["headed"] is headed
+        disabled = written.get("agent", {}).get("disabled_toolsets") or []
+        assert ("browser" in disabled) is (not headed)
+
+    bare = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", writers[-1] + "\necho still-booting"],
+        env={"HERMES_HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert bare.returncode == 0 and "still-booting" in bare.stdout, bare.stderr
+
+
+def test_the_screen_has_a_recipe():
+    assert "agent-screen BOX STATE:" in _JUSTFILE.read_text(encoding="utf-8")
+    assert "uv run flotta screen {{STATE}} {{BOX}}" in _JUSTFILE.read_text(encoding="utf-8")
+
+
+def test_the_image_imports_every_boot_module_the_entrypoint_forgives():
+    """Each `python -m flotta.box.<m> … || true` line hides an import failure
+    at boot, so the image build imports them all. For `flotta.box.screen` that
+    failure would be every agent offered the browser and the desktop with no
+    screen behind them."""
+    import re
+
+    called = set(re.findall(r"-m (flotta\.box\.\w+) .*\|\| true", _ENTRYPOINT.read_text()))
+    assert "flotta.box.screen" in called
+    dockerfile = (_ENTRYPOINT.parent / "Dockerfile").read_text(encoding="utf-8")
+    (check,) = [c for c in re.findall(r'-c "(import [^"]+)"', dockerfile) if "flotta" in c]
+    imported = {m.strip() for m in check.removeprefix("import ").split(",")}
+    assert called <= imported, called - imported

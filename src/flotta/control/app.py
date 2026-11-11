@@ -209,6 +209,35 @@ def _record_unfinished_resize(
         _log.warning("could not record %s's unfinished resize: %s", box_id, exc)
 
 
+def _record_unfinished_screen(
+    store_factory: Any, box_id: str, started: dict[str, Any], error: Exception
+) -> None:
+    """`_record_unfinished_resize`, for a screen change, and for the resize it
+    started with it."""
+    from flotta.provision import SCREEN_CHANGE_FAILED, SIZE_CHANGE_FAILED
+
+    try:
+        store = store_factory()
+        try:
+            store.add_event(
+                "box",
+                box_id,
+                SCREEN_CHANGE_FAILED,
+                {"screen": started.get("screen"), "error": str(error)[:400]},
+            )
+            if started.get("resized"):
+                store.add_event(
+                    "box",
+                    box_id,
+                    SIZE_CHANGE_FAILED,
+                    {"memory_mb": started.get("memory_mb"), "error": str(error)[:400]},
+                )
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("could not record %s's unfinished screen change: %s", box_id, exc)
+
+
 def _build() -> str:
     """Which commit is running.
 
@@ -461,6 +490,7 @@ def _box_dict(
     client_screen_control: bool = False,
     memory_mb: int | None = None,
     size_change: dict[str, Any] | None = None,
+    screen_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The row, plus who the agent is when the caller has looked that up.
 
@@ -503,6 +533,13 @@ def _box_dict(
     # resize under way, which restarts the agent the way a model change does.
     out["memory_mb"] = memory_mb
     out["size_change"] = size_change
+    # Whether it has a screen is the row's `screen` (FLOTTA-208). The least a
+    # screen agent may have, so the window says why smaller sizes are not on
+    # offer rather than copying the number; and a change under way.
+    from flotta.backend import SCREEN_MIN_MEMORY_MB
+
+    out["screen_min_memory_mb"] = SCREEN_MIN_MEMORY_MB
+    out["screen_change"] = screen_change
     return out
 
 
@@ -512,6 +549,7 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         fleet_model,
         model_changes,
         model_given_by_default,
+        screen_changes,
         size_changes,
     )
 
@@ -526,6 +564,7 @@ def _with_meta(store: Any, box: Any) -> dict[str, Any]:
         client_screen_control=store.clients_control_screen(box.id),
         memory_mb=box_sizes(store, [box.id]).get(box.id),
         size_change=size_changes(store, [box.id]).get(box.id),
+        screen_change=screen_changes(store, [box.id]).get(box.id),
     )
 
 
@@ -1022,6 +1061,12 @@ def create_app(
             return check_memory_mb(raw)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def _checked_screen(raw: Any) -> bool:
+        """A body's `screen`: true or false, or 422."""
+        if not isinstance(raw, bool):
+            raise HTTPException(status_code=422, detail="screen must be true or false")
+        return raw
 
     def _scoped_box(store: Any, token: Token | None, ref: str) -> Any:
         """A box by id or name that `token` may act on, or 404.
@@ -3441,6 +3486,7 @@ def create_app(
             fleet_model,
             model_changes,
             model_given_by_default,
+            screen_changes,
             size_changes,
         )
 
@@ -3451,6 +3497,7 @@ def create_app(
         changes = model_changes(store, ids)
         sizes = box_sizes(store, ids)
         resizes = size_changes(store, ids)
+        screens = screen_changes(store, ids)
         default = fleet_model(store)
         default_given = model_given_by_default()
         approvers = store.client_approvers(ids)
@@ -3470,6 +3517,7 @@ def create_app(
                             model_change=changes.get(b.id),
                             memory_mb=sizes.get(b.id),
                             size_change=resizes.get(b.id),
+                            screen_change=screens.get(b.id),
                         ),
                         **summaries[b.id],
                     },
@@ -3578,6 +3626,18 @@ def create_app(
         if body.get("memory_mb") is not None:
             memory_mb = _checked_memory(body.get("memory_mb"))
             _require_owner(token, "choose an agent's size")
+        # A screen (FLOTTA-208), which anyone who may create may choose: it
+        # makes the agent the screen's minimum when no size is named, so a
+        # member gets a working screen without naming a size. A named size
+        # below the minimum is refused here, before a name is spent.
+        screen = _checked_screen(body["screen"]) if body.get("screen") is not None else False
+        if screen and memory_mb is not None:
+            from flotta.provision import ScreenTooSmall, check_screen_size
+
+            try:
+                check_screen_size(memory_mb)
+            except ScreenTooSmall as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         # Who the agent is. Validated here for the early exit and again in the
         # store for the guarantee; a description that cannot be stored must
@@ -3609,6 +3669,7 @@ def create_app(
                 description=description,
                 instructions=instructions,
                 model=model,
+                screen=screen,
             )
 
         store = store_factory()
@@ -3626,6 +3687,7 @@ def create_app(
                     description=description,
                     instructions=instructions,
                     model=model,
+                    screen=screen,
                 )
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
@@ -3680,6 +3742,7 @@ def create_app(
         description: str | None = None,
         instructions: str | None = None,
         model: str | None = None,
+        screen: bool = False,
     ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
@@ -3726,6 +3789,7 @@ def create_app(
                     description=description,
                     instructions=instructions,
                     model=model,
+                    screen=screen,
                 )
             except DuplicateBoxError as exc:
                 # A *live* box holds the name — a destroyed one no longer does,
@@ -5296,6 +5360,115 @@ def create_app(
             except Exception as exc:
                 # It will never run: say so, rather than leave "resizing" showing.
                 _record_unfinished_resize(store_factory, box.id, memory_mb, exc)
+                raise
+            finally:
+                if not handed_over:
+                    _resizes_running.discard(box.id)
+        finally:
+            store.close()
+
+    @app.put("/api/boxes/{box_id}/screen")
+    def set_screen_endpoint(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Give an agent a screen, or take it away (FLOTTA-208): `{"screen": true}`.
+
+        **On** for an agent below `SCREEN_MIN_MEMORY_MB` resizes it to that in
+        the same restart, and the answer says so (`resized`, `memory_mb`).
+        **Off** keeps the size; an owner can size it down afterwards. The size
+        route refuses a screen agent anything smaller.
+
+        `fleet:write` for turning it off, or on for an agent already big
+        enough. **Turning it on when that resizes the agent is an owner's**
+        (`_require_owner`, as `PUT /size` is): the size is what the agency pays.
+        Creating one with a screen is a member's too, since naming no size is,
+        and the screen's minimum is then the size it is made at. The size
+        route's shape otherwise: refusals first, then `202` and a thread, with the box's
+        `screen_change` (and `size_change`, when it resizes) saying it is under
+        way and the timeline's `screen_set` or `screen_change_failed` how it
+        ended. Already so is a `200` with `already_current`. Shares the resize
+        guard, since both change the machine.
+        """
+        from fastapi.responses import JSONResponse
+
+        from flotta.provision import (
+            InvalidSize,
+            ProvisionError,
+            ScreenNeedsResize,
+            UpgradeFailed,
+            begin_screen_change,
+            set_screen,
+        )
+
+        if "screen" not in body:
+            raise HTTPException(
+                status_code=422, detail='screen on or off? Send {"screen": true} or false.'
+            )
+        screen = _checked_screen(body.get("screen"))
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            with _resizes_lock:
+                if box.id in _resizes_running:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{box.name} is already being changed; wait for that to finish.",
+                    )
+                owner = token is None or _is_operator(token) or token.allows(SCOPE_ORG_ADMIN)
+                try:
+                    started = begin_screen_change(box.id, screen, store=store, may_resize=owner)
+                except ScreenNeedsResize as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
+                except InvalidSize as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except ProvisionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if started.get("already_current"):
+                    return {**started, "box": _with_meta(store, box)}
+                _resizes_running.add(box.id)
+
+            def change() -> None:
+                # Released whatever happens (see `set_model_endpoint`).
+                try:
+                    inner = store_factory()
+                    try:
+                        set_screen(box.id, screen, store=inner)
+                    except UpgradeFailed as exc:
+                        # `set_screen` recorded it.
+                        _log.warning("changing %s's screen failed: %s", box.name, exc)
+                    finally:
+                        inner.close()
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("changing %s's screen failed: %s", box.name, exc)
+                    _record_unfinished_screen(store_factory, box.id, started, exc)
+                finally:
+                    _resizes_running.discard(box.id)
+
+            handed_over = False
+            try:
+                if not background:
+                    try:
+                        result = set_screen(box.id, screen, store=store)
+                    except UpgradeFailed as exc:
+                        # `set_screen` recorded it.
+                        raise HTTPException(status_code=502, detail=str(exc)) from exc
+                    except ProvisionError as exc:
+                        # Refused after it was begun (the box changed underneath):
+                        # ended on the timeline, or it reads as under way and
+                        # holds back every resize until it goes stale.
+                        _record_unfinished_screen(store_factory, box.id, started, exc)
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
+                answer = {**started, "started": True, "box": _with_meta(store, box)}
+                worker = threading.Thread(target=change, name=f"screen-{box.name}", daemon=True)
+                _provisioning.add(worker)
+                worker.start()
+                handed_over = True
+                return JSONResponse(answer, status_code=202)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                _record_unfinished_screen(store_factory, box.id, started, exc)
                 raise
             finally:
                 if not handed_over:

@@ -352,6 +352,20 @@ conventions, and the sharp edges below.
   exits the shell before `|| true` is ever reached — a missing venv would have
   stopped the agent booting. `test_recipes.py` runs the line under `set -euo
   pipefail` with no venv to prove it (FLOTTA-60).
+- **A screen is per agent, and a screen agent is never below 4096 MB
+  (FLOTTA-208).** `boxes.screen` is the switch; `SCREEN_MIN_MEMORY_MB` in
+  `flotta.backend` is the floor, and every box payload carries it
+  (`screen_min_memory_mb`). Creating with `screen: true` and no size gives the
+  floor (a member may; naming a size is still an owner's), a named size below
+  it is a 422, and `_size_plan` refuses any resize below it, so the API, the
+  CLI and any later caller meet one check. `PUT /api/boxes/{id}/screen`
+  (`flotta screen on|off`) turns it on with the resize in the **same** `machine
+  update`: `FLOTTA_SCREEN` is plain env, not a secret, which is what lets
+  `Backend.resize(..., env=)` carry it. Off keeps the size. **On the box, unset
+  is off**, and off is not a no-op: the image carries Chromium and cua-driver
+  for everyone, so `flotta.box.screen` puts `computer_use` and `browser` in
+  `agent.disabled_toolsets` on every agent without a screen. It records what it
+  wrote in `$HERMES_HOME/.flotta-screen.json` and takes back only that.
 - **The projects folder is on the rootfs and is lost on every image update.**
   `$FLOTTA_WORKDIR` (default `/workspace`) is created by the entrypoint on the
   machine's disk, not on `/data`, because a `node_modules` on the 1 GB memory

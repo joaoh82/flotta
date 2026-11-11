@@ -103,6 +103,13 @@ MEMORY_SIZES_MB: tuple[int, ...] = (1024, 2048, 4096)
 #: 300.
 DEFAULT_MEMORY_MB = 2048
 
+#: The least memory an agent with a screen may have (FLOTTA-208). Hermes's Bot
+#: Desktop and a headed Chromium took about 1 GB on top of the agent's own on a
+#: staging box (Screen.1), and Hermes refuses to start a screen with less than
+#: 1.5 GB free. One constant, read by the control plane's box payload, so the
+#: web app is told the minimum rather than copying it.
+SCREEN_MIN_MEMORY_MB = 4096
+
 
 def check_memory_mb(value: object) -> int:
     """`value` as a size on `MEMORY_SIZES_MB`, or `ValueError` saying which are.
@@ -353,9 +360,28 @@ class Backend(Protocol):
         """
         ...
 
-    def resize(self, box_id: str, memory_mb: int) -> None:
+    def resize(
+        self,
+        box_id: str,
+        memory_mb: int,
+        *,
+        env: dict[str, str] | None = None,
+        at_least: bool = False,
+    ) -> int | None:
         """Give the box's machine `memory_mb` of memory, **keeping its disk**.
         `NotSupported` if it cannot.
+
+        `env` is plain environment to change in the same restart, as
+        `apply_env` would (FLOTTA-208): turning a screen on resizes the agent
+        and sets `FLOTTA_SCREEN`, and two operations would be two restarts.
+
+        `at_least` makes it a floor rather than a size: a machine that already
+        has `memory_mb` or more keeps what it has (and still gets `env`). The
+        substrate knows the machine's real size where the store may not — one
+        resized by hand to 8 GB must not be shrunk to make room for a screen.
+
+        Returns the memory the machine has afterwards, when the substrate
+        knows it; None otherwise.
 
         Memory is the portable field (`MEMORY_SIZES_MB`); whatever CPUs that
         much memory needs on this substrate is the backend's to work out, since

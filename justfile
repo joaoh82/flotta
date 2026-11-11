@@ -305,6 +305,11 @@ agent-direct BOX:
 agent-resize BOX MEMORY:
     uv run flotta resize {{BOX}} --memory {{MEMORY}}
 
+# FLOTTA-208 — give an agent a screen (on) or take it away (off). On makes it at
+# least 4096 MB in the same restart; off keeps the size. Restarts it if running.
+agent-screen BOX STATE:
+    uv run flotta screen {{STATE}} {{BOX}}
+
 # M5 — generate a signing key for scoped tokens (print once, never stored)
 token-key:
     uv run flotta token key
