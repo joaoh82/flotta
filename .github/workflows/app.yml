@@ -1,0 +1,91 @@
+# The retired desktop app's checks (D17), split out of ci.yml.
+#
+# They lived in CI's own job, which ran on every commit and installed Tauri's
+# webview libraries with apt first. On 2026-11-11 that job hung on main for
+# hours more than once. CI's concurrency group keeps main's runs in order, so
+# one stuck `app` job held every later main run in `pending` until a newer
+# push cancelled it — and main lost its verdict on commits that had nothing to
+# do with the app.
+#
+# So the app is checked only when the app changes, in a workflow of its own
+# whose stall cannot queue anything else, and with timeouts: a stuck mirror is
+# a red check after minutes, not a yellow one for six hours. When `app/` leaves
+# the repo, this file leaves with it.
+
+name: App
+
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/app.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/app.yml"
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: app (tsc + vitest + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # Tauri links against the system webview, so the Rust half does not
+      # compile on a bare runner. These are Tauri's own documented Linux
+      # dependencies; without them `cargo clippy` fails to find webkit2gtk and
+      # the failure reads like a broken lockfile rather than a missing library.
+      # This is the step that hung: bounded, with apt's own retries and
+      # timeouts, so a slow mirror fails or recovers instead of waiting forever.
+      - name: Tauri system dependencies
+        timeout-minutes: 10
+        run: |
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $APT update
+          sudo apt-get $APT install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libxdo-dev libssl-dev build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      # Inline rather than `just check-app`: the recipe runs `npm ci` only when
+      # node_modules is absent, which is right on a laptop and wrong here. Keep
+      # these in step with it.
+      - run: npm ci
+        working-directory: app
+
+      - run: npx tsc --noEmit
+        working-directory: app
+
+      - run: npm test
+        working-directory: app
+
+      - run: cargo fmt --check
+        working-directory: app/src-tauri
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: app/src-tauri
+
+      - run: cargo test
+        working-directory: app/src-tauri
