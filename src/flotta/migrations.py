@@ -1107,6 +1107,24 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX idx_pull_requests_run ON pull_requests(run_id)",
         ),
     ),
+    Migration(
+        34,
+        "screens: whether an agent has one, and whether its client's people may drive it",
+        # FLOTTA-209. `boxes.screen` is the per-agent switch (FLOTTA-208 sets
+        # it): 0 on every agent that exists, which is no screen, so no ticket
+        # grants one. `client_screen_control` sits beside `client_approvers`
+        # and means the same thing by a row: the agency lets this agent's
+        # client's people take over its screen, not only watch it.
+        (
+            "ALTER TABLE boxes ADD COLUMN screen INTEGER NOT NULL DEFAULT 0",
+            """
+            CREATE TABLE client_screen_control (
+                box_id      TEXT PRIMARY KEY REFERENCES boxes(id),
+                updated_at  TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 
