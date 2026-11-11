@@ -332,6 +332,7 @@ def test_a_turn_cut_off_by_the_socket_closing_ends_failed():
 
     (finished,) = plane.finished
     assert (finished["status"], finished["error_class"]) == ("failed", "disconnected")
+    json.dumps(finished)  # what the door posts must be JSON
     assert len(finished["steps"]) == 1
 
 
@@ -720,3 +721,29 @@ def test_nothing_is_looked_for_once_nothing_waits(quick):
 
     assert plane.polls == polls
     assert carried == []
+
+
+def test_a_turn_closed_while_its_approval_waits_is_still_ended(quick):
+    """FLOTTA-200's production case: a client's turn asks the agency, the door
+    polls for the answer, and the person's socket closes (they signed out)."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, client=True)
+
+        async def deliver(srq, session, choice):
+            return None
+
+        recorder.attach(deliver)
+        await gate.from_client(_submit("Clean up."))
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await _until(lambda: plane.polls >= 2)
+        await recorder.close()
+        return plane
+
+    plane = asyncio.run(go())
+
+    (finished,) = plane.finished
+    assert (finished["status"], finished["error_class"]) == ("failed", "disconnected")
+    json.dumps(finished)  # what the door posts must be JSON

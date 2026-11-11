@@ -276,6 +276,14 @@ class TurnRecorder:
         if asked is None or asked.settled:
             return
         asked.settled = True
+        # Said once per question, so a turn that stopped waiting can be traced
+        # (FLOTTA-200: one stopped, and nothing said why).
+        _log.info(
+            "%s's approval %s settled on its socket: %s",
+            self._box_id,
+            rpc_id,
+            f"answered {choice}" if choice is not None else "withdrawn by the agent",
+        )
         if self._room(1):
             self._send("settle", asked.session, asked.turn, (rpc_id, choice))
 
@@ -355,6 +363,12 @@ class TurnRecorder:
         can be lost, and a worker that missed one would wait on its queue for
         as long as the door runs, one per closed socket.
         """
+        if self._turns:
+            _log.info(
+                "%s's socket closed mid-turn: %d turn(s) end disconnected",
+                self._box_id,
+                len(self._turns),
+            )
         for session in list(self._turns):
             self._end(session, None)
         self._closed = True

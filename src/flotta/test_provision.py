@@ -1803,6 +1803,86 @@ def test_a_turn_left_running_does_not_keep_its_agent_awake(store):
     assert (ended.status, ended.error_class) == ("failed", "stopped")
 
 
+def _a_turn_asking(store, box, *, held_ago_s=0, expires_in_s=3600):
+    """A turn of `box` waiting on a person's approval, its socket last held `held_ago_s` ago."""
+    now = datetime.now(UTC)
+    turn = store.open_chat_run(box.id, "Clean up.", now=now - timedelta(hours=1))
+    approval = store.ask_approval(
+        turn.id,
+        request_id="srq-1",
+        command="git branch -D feat/x",
+        description="git branch force delete",
+        choices=["once", "deny"],
+        expires_at=now + timedelta(seconds=expires_in_s),
+        now=now - timedelta(minutes=40),
+    )
+    store.hold_approvals(turn.id, now=now - timedelta(seconds=held_ago_s))
+    return turn, approval
+
+
+def test_a_turn_waiting_for_an_answer_keeps_its_agent_awake(store):
+    """FLOTTA-200. On 2026-11-11 a client's agent slept 38 minutes into an
+    hour-long approval its agency had been asked for, and the turn was lost.
+    Waiting on a person is not idle, whoever the person is."""
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    turn, _ = _a_turn_asking(store, box)
+
+    assert sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60) == []
+    assert store.get_box(box.id).status == "running"
+    assert store.get_run(turn.id).status == "running"
+
+
+def test_an_approval_nobody_holds_any_more_does_not_keep_its_agent_awake(store):
+    """Held, as the agency's Home reads it: a turn whose door died must not
+    keep its agent billing for the rest of the approval's hour."""
+    from flotta.provision import sleep_idle_boxes
+    from flotta.store import APPROVAL_HELD_S
+
+    box = _quiet_box(store, ago_s=3600)
+    _a_turn_asking(store, box, held_ago_s=APPROVAL_HELD_S + 5)
+
+    outcomes = sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60)
+    assert [(o["box_id"], o["slept"]) for o in outcomes] == [(box.id, True)]
+
+
+def test_an_expired_approval_does_not_keep_its_agent_awake(store):
+    from flotta.provision import sleep_idle_boxes
+
+    box = _quiet_box(store, ago_s=3600)
+    _a_turn_asking(store, box, expires_in_s=-1)
+
+    outcomes = sleep_idle_boxes(store, backend=FakeBackend(), idle_after_s=60)
+    assert [(o["box_id"], o["slept"]) for o in outcomes] == [(box.id, True)]
+
+
+def test_a_turn_its_agents_sleep_ended_stops_asking(store):
+    """The approval left behind said `waiting` after its turn was over, so the
+    agency was still offered an answer nobody would hear (FLOTTA-200)."""
+    from flotta.provision import stop_box
+
+    box = _quiet_box(store, ago_s=3600)
+    turn, approval = _a_turn_asking(store, box)
+
+    stop_box(box.id, store=store, backend=FakeBackend(), reason="idle")
+
+    assert store.get_run(turn.id).error_class == "stopped"
+    assert store.get_approval(approval.id).status == "expired"
+    assert store.boxes_awaiting_answers() == set()
+
+
+def test_any_ending_of_a_run_closes_what_it_was_asking(store):
+    """In `finish_run`, so every way a run ends says the same: a reap, a
+    teardown and an org's suspension included, not only the door's end."""
+    box = _quiet_box(store, ago_s=0)
+    turn, approval = _a_turn_asking(store, box)
+
+    store.finish_run(turn.id, "failed", error_class="stranded")
+
+    assert store.get_approval(approval.id).status == "expired"
+
+
 def test_a_delivered_run_still_keeps_its_agent_awake_beside_a_turn(store):
     from flotta.provision import sleep_idle_boxes
 

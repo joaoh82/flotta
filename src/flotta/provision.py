@@ -3967,6 +3967,12 @@ def idle_boxes(
         for t in store.list_tasks()
         if not is_terminal("task", t.status) and not _a_turn(store, t.id)
     }
+    # A turn waiting for a person's answer is the exception (FLOTTA-200). The
+    # door holds an agent awake only while Hermes says it is working, and a
+    # client who walked away from the page stops counting as talking: on
+    # 2026-11-11 a client's agent slept under an approval routed to its agency,
+    # 38 minutes into the hour that approval had, and the turn was lost.
+    occupied |= store.boxes_awaiting_answers(now=current)
 
     idle: list[tuple[Box, float]] = []
     for box in store.list_boxes():
