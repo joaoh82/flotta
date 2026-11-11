@@ -499,8 +499,13 @@ class TurnRecorder:
 
     async def _poll(self) -> None:
         """While an approval waits here, look for an answer given from outside
-        the conversation, and carry it to the box (FLOTTA-166)."""
-        while True:
+        the conversation, and carry it to the box (FLOTTA-166).
+
+        Until the socket closes, as well as being cancelled then: a lost cancel
+        must not leave this refreshing `held_at`, which keeps the agent awake
+        (`FleetStore.boxes_awaiting_answers`) for the rest of the approval's hour.
+        """
+        while not self._closed:
             waiting = [
                 (rid, a) for rid, a in self._asked.items() if a.approval_id and not a.settled
             ]
