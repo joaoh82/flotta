@@ -85,8 +85,11 @@ open rather than what a client can learn.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -152,6 +155,8 @@ class Conversations(Protocol):
 
     async def record_client_conversation(self, box_id: str, session_id: str) -> None: ...
 
+    async def working(self, box_id: str) -> dict[str, Any] | None: ...
+
 
 def _error(rid: Any, code: int, message: str) -> str:
     return json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
@@ -187,6 +192,46 @@ def latest_of_the_agency(rows: list[Any], client_sessions: set[str]) -> dict[str
             continue
         return row
     return None
+
+
+#: A message's method, and the block the door puts above one while a run works
+#: (FLOTTA-197). The web app leaves `⟦flotta: …⟧ … ⟦/flotta⟧` blocks out of the
+#: person's own words in a transcript.
+PROMPT_METHOD = "prompt.submit"
+WORKING_OPEN = "⟦flotta: working⟧"
+NOTE_CLOSE = "⟦/flotta⟧"
+#: How long a message waits to learn whether a run is working: then it goes as it was.
+WORKING_TIMEOUT_S = 2.0
+
+
+def inert(text: str) -> str:
+    """Text that can't open or close a note: the person can't speak as Flotta."""
+    return text.replace("⟦", "[").replace("⟧", "]")
+
+
+#: The notes the web app writes above a person's words, and so may arrive here
+#: (FLOTTA-203). Only those: a `working` note is the door's own to write. The
+#: web app has made the person's words inert, so a client can't forge this one;
+#: someone holding a token and a terminal could, and could already say anything.
+_PAGE_NOTE_HEAD = re.compile(r"⟦flotta: requests⟧")
+
+
+def _inert_after_notes(text: str) -> str:
+    """The person's words made inert, past the closed notes already at the start.
+
+    The web app puts its own (`⟦flotta: requests⟧`, FLOTTA-203) above what the
+    person wrote, and has made their words inert already. Inerting that block
+    too would turn it into the person's words: the agent would lose it, and
+    the transcript would show it (the review of #234).
+    """
+    rest, kept = text, []
+    while _PAGE_NOTE_HEAD.match(rest):
+        end = rest.find(NOTE_CLOSE)
+        if end < 0:
+            break
+        kept.append(rest[: end + len(NOTE_CLOSE)])
+        rest = rest[end + len(NOTE_CLOSE) :].lstrip()
+    return "\n\n".join([*kept, inert(rest)]) if kept else inert(rest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,11 +294,59 @@ class ConversationGate:
 
     async def from_client(self, frame: str | bytes) -> Step:
         step = await self._from_client(frame)
+        # A person's conversation only: a run's own delivery (`run:`), an agent's
+        # message to a colleague (`relay`) and a box's own token are runs or
+        # turns themselves, and a run told about itself would stop its own work.
+        if (
+            isinstance(step.to_box, str)
+            and PROMPT_METHOD in step.to_box
+            and not self._subject_of_run()
+        ):
+            step = Step(to_box=await self._told_what_runs(step.to_box), to_client=step.to_client)
         if self._turns is not None and step.to_box is not None:
             # What reaches the agent, after the gate: a refused answer to an
             # approval answered nothing, and is not recorded as answering it.
             self._turns.heard_client(step.to_box)
         return step
+
+    def _subject_of_run(self) -> bool:
+        from flotta.door.turns import NOT_A_CONVERSATION
+
+        return self._subject.startswith(NOT_A_CONVERSATION)
+
+    async def _told_what_runs(self, frame: str) -> str:
+        """A message, with a note above it when a run of the agent's own is
+        working now (FLOTTA-197): on 2026-11-10 a person's turn redid the work
+        a request's run was doing, beside it, and two builds stalled the
+        machine. Best effort and quick: not knowing sends the message as it was.
+        """
+        parsed = _parse(frame)
+        params = parsed.get("params") if parsed is not None else None
+        if parsed is None or parsed.get("method") != PROMPT_METHOD or not isinstance(params, dict):
+            return frame
+        text = params.get("text")
+        if not isinstance(text, str):
+            return frame
+        working = None
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(WORKING_TIMEOUT_S):
+                working = await self._plane.working(self._box_id)
+        if not working:
+            return frame
+        about = inert(str(working.get("about") or "")).strip()
+        what = f"“{about}”" if about else "a piece of work"
+        note = "\n".join(
+            (
+                WORKING_OPEN,
+                "From Flotta, not written by the person: a run of your own is working on this "
+                f"machine right now, on {what}. Don't start that same work here, and don't start a "
+                "second heavy build, install or test run beside it: say so if this asks for one, "
+                "and offer to do it once the run is done.",
+                NOTE_CLOSE,
+            )
+        )
+        told = {**parsed, "params": {**params, "text": f"{note}\n\n{_inert_after_notes(text)}"}}
+        return json.dumps(told)
 
     async def _from_client(self, frame: str | bytes) -> Step:
         if self.conversation_only:

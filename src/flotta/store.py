@@ -5641,6 +5641,14 @@ class FleetStore:
         assert found is not None
         return found
 
+    def box_request(self, box_id: str, request_id: str) -> WorkRequest | None:
+        """`box_id`'s request `request_id`, or None: bounded by the box, so a
+        route that has scoped the box can read it (FLOTTA-197)."""
+        row = self._conn.execute(
+            "SELECT * FROM requests WHERE id = ? AND box_id = ?", (request_id, box_id)
+        ).fetchone()
+        return _request_from_row(row) if row else None
+
     def get_request(self, request_id: str) -> WorkRequest | None:
         row = self._conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         return _request_from_row(row) if row else None

@@ -576,6 +576,12 @@ class ControlPlane:
         )
         return list(response.json().get("conversations") or [])
 
+    async def working(self, box_id: str) -> dict[str, Any] | None:
+        """The run this box is doing now, if not a conversation's (FLOTTA-197)."""
+        response = await self._call("GET", f"/api/boxes/{box_id}/working", name=box_id, verb="read")
+        found = response.json().get("working")
+        return found if isinstance(found, dict) else None
+
     async def record_client_conversation(self, box_id: str, session_id: str) -> None:
         """A session a client just made is the client's from now on."""
         await self._call(
