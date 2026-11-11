@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from flotta.door import conversation
 from flotta.door.conversation import NOTE_CLOSE, WORKING_OPEN, ConversationGate
 
@@ -91,3 +93,18 @@ def test_only_a_message_is_looked_at():
 
     sent, frame = asyncio.run(go())
     assert sent == frame and plane.asked == 0
+
+
+@pytest.mark.parametrize("subject", ["run:t-1", "relay:b-2", "box:b-1"])
+def test_a_run_is_never_told_about_itself(subject):
+    """The review of #234's own question, made a guard: a run's delivery goes
+    through the same gate, and told "a run is working, don't do that work"
+    about itself, it would stop."""
+    plane = Plane({"run_id": "t-1", "trigger_kind": "api", "about": "Morning report"})
+
+    async def go():
+        g = ConversationGate(box_id="b-1", subject=subject, plane=plane, conversation_only=False)
+        return (await g.from_client(_submit("Morning report"))).to_box
+
+    assert json.loads(asyncio.run(go()))["params"]["text"] == "Morning report"
+    assert plane.asked == 0

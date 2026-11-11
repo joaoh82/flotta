@@ -268,13 +268,25 @@ class ConversationGate:
 
     async def from_client(self, frame: str | bytes) -> Step:
         step = await self._from_client(frame)
-        if isinstance(step.to_box, str) and PROMPT_METHOD in step.to_box:
+        # A person's conversation only: a run's own delivery (`run:`), an agent's
+        # message to a colleague (`relay`) and a box's own token are runs or
+        # turns themselves, and a run told about itself would stop its own work.
+        if (
+            isinstance(step.to_box, str)
+            and PROMPT_METHOD in step.to_box
+            and not self._subject_of_run()
+        ):
             step = Step(to_box=await self._told_what_runs(step.to_box), to_client=step.to_client)
         if self._turns is not None and step.to_box is not None:
             # What reaches the agent, after the gate: a refused answer to an
             # approval answered nothing, and is not recorded as answering it.
             self._turns.heard_client(step.to_box)
         return step
+
+    def _subject_of_run(self) -> bool:
+        from flotta.door.turns import NOT_A_CONVERSATION
+
+        return self._subject.startswith(NOT_A_CONVERSATION)
 
     async def _told_what_runs(self, frame: str) -> str:
         """A message, with a note above it when a run of the agent's own is
