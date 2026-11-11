@@ -607,6 +607,9 @@ class Org:
     #: `suspended`; `None` otherwise. See `FleetStore.suspend_org`.
     suspended_at: str | None = None
     suspend_reason: str | None = None
+    #: Who suspended it (FLOTTA-190): `BILLING` for the hosted product's
+    #: billing, `OPERATOR` otherwise. Billing resumes only its own.
+    suspended_by: str | None = None
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -1268,6 +1271,16 @@ class UsageSum:
     tokens_out: int
     tokens_cached: int
     machine_seconds: int
+
+
+#: `Org.suspended_by`: the hosted product's billing made the suspension, or
+#: the operator did (FLOTTA-190). Who exactly is on the agents' timelines.
+BILLING = "billing"
+OPERATOR = "operator"
+
+
+class HeldByOperatorError(InvalidTransitionError):
+    """Billing asked to lift a suspension the operator made, which only the operator lifts."""
 
 
 class BuildInProgressError(RuntimeError):
@@ -1943,7 +1956,12 @@ class FleetStore:
         return decided
 
     def suspend_org(
-        self, org_id: str, *, reason: str | None = None, by: str | None = None
+        self,
+        org_id: str,
+        *,
+        reason: str | None = None,
+        by: str | None = None,
+        as_billing: bool = False,
     ) -> tuple[Org, bool]:
         """Suspend an active org (FLOTTA-184): `(org, changed)`.
 
@@ -1958,18 +1976,30 @@ class FleetStore:
         `active` or `suspended` is `InvalidTransitionError`, and so is the
         default org, which is the operator's own fleet.
         """
-        return self._set_suspended(org_id, True, reason=reason, by=by)
+        return self._set_suspended(org_id, True, reason=reason, by=by, as_billing=as_billing)
 
-    def resume_org(self, org_id: str, *, by: str | None = None) -> tuple[Org, bool]:
+    def resume_org(
+        self, org_id: str, *, by: str | None = None, as_billing: bool = False
+    ) -> tuple[Org, bool]:
         """Resume a suspended org: `(org, changed)`, as `suspend_org`.
 
         Wakes nothing. Its agents wake when they are next addressed, as any
         sleeping agent does.
+
+        `as_billing`: the hosted product's billing, which may lift only a
+        suspension of its own (FLOTTA-190). One the operator made raises
+        `HeldByOperatorError`, and nothing changes.
         """
-        return self._set_suspended(org_id, False, by=by)
+        return self._set_suspended(org_id, False, by=by, as_billing=as_billing)
 
     def _set_suspended(
-        self, org_id: str, suspend: bool, *, reason: str | None = None, by: str | None = None
+        self,
+        org_id: str,
+        suspend: bool,
+        *,
+        reason: str | None = None,
+        by: str | None = None,
+        as_billing: bool = False,
     ) -> tuple[Org, bool]:
         wanted = "suspended" if suspend else "active"
         with self._conn.transaction(guard="orgs"):
@@ -1981,7 +2011,25 @@ class FleetStore:
                     "the default org is the operator's own fleet; it is never suspended"
                 )
             if org.status == wanted:
+                # The operator holding an org billing already suspended makes the
+                # hold theirs, so its next payment doesn't lift it. Nobody is
+                # told twice: it was suspended already (the review of #233).
+                if suspend and not as_billing and org.suspended_by == BILLING:
+                    self._conn.execute(
+                        "UPDATE orgs SET suspended_by = ?, suspend_reason = ? WHERE id = ?",
+                        (OPERATOR, reason or org.suspend_reason, org_id),
+                    )
+                    held = self.get_org(org_id)
+                    assert held is not None
+                    return held, False
                 return org, False
+            # Billing lifts only its own. A suspension with no `suspended_by` is
+            # from before migration 35, when only the operator suspended an org
+            # by hand (billing wasn't deployed): the operator's.
+            if not suspend and as_billing and org.suspended_by != BILLING:
+                raise HeldByOperatorError(
+                    f"org {org_id!r} was suspended by the operator; only the operator can resume it"
+                )
             if org.status != ("active" if suspend else "suspended"):
                 verb = "suspended" if suspend else "resumed"
                 raise InvalidTransitionError(
@@ -1990,11 +2038,14 @@ class FleetStore:
                     + f" org can be {verb}"
                 )
             self._conn.execute(
-                "UPDATE orgs SET status = ?, suspended_at = ?, suspend_reason = ? WHERE id = ?",
+                "UPDATE orgs SET status = ?, suspended_at = ?, suspend_reason = ?, "
+                "suspended_by = ? WHERE id = ?",
                 (
                     wanted,
                     _utcnow() if suspend else None,
                     reason if suspend else None,
+                    # A fixed kind, never the caller's subject, which could be named `billing`.
+                    (BILLING if as_billing else OPERATOR) if suspend else None,
                     org_id,
                 ),
             )
@@ -6720,6 +6771,7 @@ def _org_from_row(row: db.Row) -> Org:
         max_agents=row.get("max_agents"),
         suspended_at=row.get("suspended_at"),
         suspend_reason=row.get("suspend_reason"),
+        suspended_by=row.get("suspended_by"),
     )
 
 

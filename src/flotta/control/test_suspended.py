@@ -98,8 +98,9 @@ def _box(fleet, name=BOX):
 
 
 def _suspend(fleet, reason="the payment failed"):
+    """As billing does when a final payment fails, so billing may lift it (FLOTTA-190)."""
     with FleetStore(fleet) as store:
-        return store.suspend_org("agency-x", reason=reason, by="test")
+        return store.suspend_org("agency-x", reason=reason, by="test", as_billing=True)
 
 
 def _resume(fleet):
@@ -510,3 +511,97 @@ def test_an_unknown_org_is_404_and_a_long_reason_422(api):
     assert api.post("/api/orgs/nope/suspend", headers=GOVERNOR).status_code == 404
     long = api.post("/api/orgs/agency-x/suspend", headers=GOVERNOR, json={"reason": "x" * 501})
     assert long.status_code == 422
+
+
+# -- who suspended it (FLOTTA-190, M15.8) ---------------------------------------------
+#
+# Billing lifts only its own suspension (Josh, 11 Nov 2026): an agency the
+# operator suspended by hand stays suspended when it next pays, and its owners
+# are not told it was resumed.
+
+
+def _suspend_as(api, who, reason="why"):
+    return api.post("/api/orgs/agency-x/suspend", headers=who, json={"reason": reason})
+
+
+def test_a_suspension_says_who_made_it(api, fleet):
+    _suspend_as(api, GOVERNOR)
+    assert api.get("/api/orgs", headers=OPERATOR).json()["orgs"][1]["suspended_by"] == "billing"
+    with FleetStore(fleet) as store:
+        assert store.get_org("agency-x").suspended_by == "billing"
+
+
+def test_billing_never_lifts_the_operators_suspension(api, fleet, outbox):
+    assert _suspend_as(api, OPERATOR, "held by hand").json()["changed"] is True
+    told = len(outbox)
+    answer = api.post("/api/orgs/agency-x/resume", headers=GOVERNOR)
+    assert answer.status_code == 409, answer.text
+    assert "operator" in answer.json()["detail"]
+    with FleetStore(fleet) as store:
+        org = store.get_org("agency-x")
+    assert (org.status, org.suspend_reason, org.suspended_by) == (
+        "suspended",
+        "held by hand",
+        "operator",
+    )
+    assert len(outbox) == told  # nobody is told it was resumed
+
+
+def test_billing_lifts_its_own(api, fleet):
+    _suspend_as(api, GOVERNOR, "the payment failed")
+    answer = api.post("/api/orgs/agency-x/resume", headers=GOVERNOR)
+    assert answer.status_code == 200 and answer.json()["changed"] is True
+    with FleetStore(fleet) as store:
+        org = store.get_org("agency-x")
+    assert (org.status, org.suspended_by) == ("active", None)
+
+
+@pytest.mark.parametrize("by", ["billing", "operator"])
+def test_the_operator_lifts_either(api, fleet, by):
+    _suspend_as(api, GOVERNOR if by == "billing" else OPERATOR)
+    assert api.post("/api/orgs/agency-x/resume", headers=OPERATOR).json()["changed"] is True
+
+
+def test_suspending_again_keeps_who_did_it_first(api, fleet):
+    """A billing webhook after the operator's hold must not turn it into billing's."""
+    _suspend_as(api, OPERATOR, "held by hand")
+    assert _suspend_as(api, GOVERNOR, "the payment failed").json()["changed"] is False
+    with FleetStore(fleet) as store:
+        org = store.get_org("agency-x")
+    assert (org.suspended_by, org.suspend_reason) == ("operator", "held by hand")
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
+
+
+def test_the_operator_holding_billings_suspension_makes_it_theirs(api, fleet, outbox):
+    """Billing suspended it for a failed payment; the operator then holds it by hand."""
+    _suspend_as(api, GOVERNOR, "the payment failed")
+    told = len(outbox)
+    answer = _suspend_as(api, OPERATOR, "held for a dispute")
+    assert answer.json()["changed"] is False
+    with FleetStore(fleet) as store:
+        org = store.get_org("agency-x")
+    assert (org.status, org.suspended_by, org.suspend_reason) == (
+        "suspended",
+        "operator",
+        "held for a dispute",
+    )
+    assert len(outbox) == told  # suspended already: nobody is told again
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
+
+
+def test_a_suspension_from_before_the_column_is_the_operators(api, fleet):
+    """Billing wasn't deployed before migration 35: any suspension then was made by hand."""
+    with FleetStore(fleet) as store:
+        store.suspend_org("agency-x", reason="held by hand", by="cli")
+        store._conn.execute("UPDATE orgs SET suspended_by = NULL WHERE id = 'agency-x'")
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
+    assert api.post("/api/orgs/agency-x/resume", headers=OPERATOR).json()["changed"] is True
+
+
+def test_an_operator_token_named_billing_is_still_the_operator(api, fleet):
+    scopes = {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN}
+    named_billing = {"Authorization": f"Bearer {mint(subject='billing', scopes=scopes, key=KEY)}"}
+    _suspend_as(api, named_billing, "held by hand")
+    with FleetStore(fleet) as store:
+        assert store.get_org("agency-x").suspended_by == "operator"
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
