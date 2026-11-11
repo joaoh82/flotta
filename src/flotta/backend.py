@@ -360,13 +360,28 @@ class Backend(Protocol):
         """
         ...
 
-    def resize(self, box_id: str, memory_mb: int, *, env: dict[str, str] | None = None) -> None:
+    def resize(
+        self,
+        box_id: str,
+        memory_mb: int,
+        *,
+        env: dict[str, str] | None = None,
+        at_least: bool = False,
+    ) -> int | None:
         """Give the box's machine `memory_mb` of memory, **keeping its disk**.
         `NotSupported` if it cannot.
 
         `env` is plain environment to change in the same restart, as
         `apply_env` would (FLOTTA-208): turning a screen on resizes the agent
         and sets `FLOTTA_SCREEN`, and two operations would be two restarts.
+
+        `at_least` makes it a floor rather than a size: a machine that already
+        has `memory_mb` or more keeps what it has (and still gets `env`). The
+        substrate knows the machine's real size where the store may not — one
+        resized by hand to 8 GB must not be shrunk to make room for a screen.
+
+        Returns the memory the machine has afterwards, when the substrate
+        knows it; None otherwise.
 
         Memory is the portable field (`MEMORY_SIZES_MB`); whatever CPUs that
         much memory needs on this substrate is the backend's to work out, since

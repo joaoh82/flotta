@@ -530,7 +530,14 @@ class FlyBackend:
         app, machine_id = self._addr(box_id)
         guest_cpus(memory_mb, self._guest(app, machine_id)[1], self.config.vm_size)
 
-    def resize(self, box_id: str, memory_mb: int, *, env: dict[str, str] | None = None) -> None:
+    def resize(
+        self,
+        box_id: str,
+        memory_mb: int,
+        *,
+        env: dict[str, str] | None = None,
+        at_least: bool = False,
+    ) -> int | None:
         """`flyctl machine update --vm-memory --vm-cpus`, which keeps the volume.
 
         The CPUs are `guest_cpus`, of the kind the machine already has: memory
@@ -546,9 +553,17 @@ class FlyBackend:
 
         `env` rides the same `machine update` as `--env`, which keeps every
         key it does not name (`apply_env`): one restart, not two.
+
+        `at_least` reads the machine's own `guest.memory_mb` from the same
+        listing and leaves a bigger machine its memory and CPUs. With nothing
+        to resize and no `env`, nothing is run.
         """
         app, machine_id = self._addr(box_id)
-        state, kind = self._guest(app, machine_id)
+        state, kind, has = self._guest_of(app, machine_id)
+        if at_least and has is not None and has >= memory_mb:
+            if env:
+                self.apply_env(box_id, env)
+            return has
         cpus = guest_cpus(memory_mb, kind, self.config.vm_size)
         args = [
             "machine",
@@ -565,13 +580,24 @@ class FlyBackend:
         if state != "started":
             args.append("--skip-start")
         self._flyctl(*args, app=app)
+        return memory_mb
 
     def _guest(self, app: str, machine_id: str) -> tuple[str, str | None]:
         """The machine's state and CPU kind, from one lenient listing."""
+        state, kind, _ = self._guest_of(app, machine_id)
+        return state, kind
+
+    def _guest_of(self, app: str, machine_id: str) -> tuple[str, str | None, int | None]:
+        """`_guest`, and the memory the machine has (None when it does not say)."""
         machine = next((m for m in self._machines(app) if m.get("id") == machine_id), None)
         guest = ((machine or {}).get("config") or {}).get("guest") or {}
         kind = guest.get("cpu_kind")
-        return (machine or {}).get("state") or "gone", kind if isinstance(kind, str) else None
+        memory = guest.get("memory_mb")
+        return (
+            (machine or {}).get("state") or "gone",
+            kind if isinstance(kind, str) else None,
+            memory if isinstance(memory, int) and not isinstance(memory, bool) else None,
+        )
 
     def image_of(self, box_id: str) -> str | None:
         """What image this machine is actually running, or None.

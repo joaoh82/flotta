@@ -1645,14 +1645,15 @@ def screen(
         return f"{name}  {'has a screen' if on else 'has no screen'}{size}"
 
     if control_url():
-        from flotta.auth import SCOPE_FLEET_WRITE
+        from flotta.auth import SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN
 
         try:
             box = _remote_box(box_id)
             body = control_request(
                 "PUT",
                 f"/api/boxes/{box['id']}/screen",
-                scopes=(SCOPE_FLEET_WRITE,),
+                # On may resize, which is an owner's (as `resize` is).
+                scopes=(SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN) if on else (SCOPE_FLEET_WRITE,),
                 body={"screen": on},
             )
         except ControlPlaneError as exc:

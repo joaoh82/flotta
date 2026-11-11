@@ -554,3 +554,18 @@ def test_the_entrypoint_switches_the_screen_for_real(tmp_path):
 def test_the_screen_has_a_recipe():
     assert "agent-screen BOX STATE:" in _JUSTFILE.read_text(encoding="utf-8")
     assert "uv run flotta screen {{STATE}} {{BOX}}" in _JUSTFILE.read_text(encoding="utf-8")
+
+
+def test_the_image_imports_every_boot_module_the_entrypoint_forgives():
+    """Each `python -m flotta.box.<m> … || true` line hides an import failure
+    at boot, so the image build imports them all. For `flotta.box.screen` that
+    failure would be every agent offered the browser and the desktop with no
+    screen behind them."""
+    import re
+
+    called = set(re.findall(r"-m (flotta\.box\.\w+) .*\|\| true", _ENTRYPOINT.read_text()))
+    assert "flotta.box.screen" in called
+    dockerfile = (_ENTRYPOINT.parent / "Dockerfile").read_text(encoding="utf-8")
+    (check,) = [c for c in re.findall(r'-c "(import [^"]+)"', dockerfile) if "flotta" in c]
+    imported = {m.strip() for m in check.removeprefix("import ").split(",")}
+    assert called <= imported, called - imported

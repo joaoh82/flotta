@@ -38,8 +38,9 @@ class Machine:
     def check_resize(self, endpoint, memory_mb):
         pass
 
-    def resize(self, endpoint, memory_mb, *, env=None):
+    def resize(self, endpoint, memory_mb, *, env=None, at_least=False):
         self.resized.append((memory_mb, env))
+        return memory_mb
 
     def apply_env(self, endpoint, env):
         self.env.update(env)
@@ -117,14 +118,14 @@ def test_screen_must_be_a_boolean(fleet, machine, bad):  # noqa: F811
 
 def test_turning_a_screen_on_resizes_and_says_so(fleet, machine):  # noqa: F811
     with _api(fleet) as api:
-        response = api.put(f"/api/boxes/{X}/screen", json={"screen": True}, headers=MEMBER)
+        response = api.put(f"/api/boxes/{X}/screen", json={"screen": True}, headers=OWNER)
         assert response.status_code == 202, response.text
         body = response.json()
         assert (body["screen"], body["resized"], body["memory_mb"]) == (True, True, 4096)
         assert body["box"]["screen_change"]["screen"] is True
         assert body["box"]["size_change"]["memory_mb"] == 4096
         _finish()
-        box = api.get(f"/api/boxes/{X}", headers=MEMBER).json()["box"]
+        box = api.get(f"/api/boxes/{X}", headers=OWNER).json()["box"]
     assert machine.resized == [(4096, {"FLOTTA_SCREEN": "1"})]
     assert machine.env == {}
     assert (box["screen"], box["memory_mb"], box["screen_change"], box["size_change"]) == (
@@ -166,3 +167,44 @@ def test_another_orgs_owner_finds_no_agent(fleet, machine):  # noqa: F811
     with _api(fleet) as api:
         response = api.put(f"/api/boxes/{X}/screen", json={"screen": True}, headers=OTHER_OWNER)
     assert response.status_code == 404
+
+
+def test_a_member_may_not_turn_on_a_screen_that_resizes_the_agent(fleet, machine):  # noqa: F811
+    """The size is an owner's (as `PUT /size` is), and a screen on a 2 GB agent
+    makes it 4 GB. Refused before anything says it is under way."""
+    with _api(fleet) as api:
+        response = api.put(f"/api/boxes/{X}/screen", json={"screen": True}, headers=MEMBER)
+        box = api.get(f"/api/boxes/{X}", headers=MEMBER).json()["box"]
+    assert response.status_code == 403
+    assert "only the org's owner" in response.json()["detail"]
+    assert (box["screen"], box["screen_change"], box["size_change"]) == (False, None, None)
+    assert machine.resized == [] and machine.env == {}
+
+
+def test_a_member_may_turn_one_on_for_a_big_agent_and_off_again(fleet, machine):  # noqa: F811
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name(X)
+        store.add_event("box", box.id, SIZE_SET, {"memory_mb": 4096, "reason": "resized"})
+    with _api(fleet, background=False) as api:
+        on = api.put(f"/api/boxes/{X}/screen", json={"screen": True}, headers=MEMBER)
+        assert on.status_code == 200, on.text
+        assert machine.env == {"FLOTTA_SCREEN": "1"} and machine.resized == []
+        off = api.put(f"/api/boxes/{X}/screen", json={"screen": False}, headers=MEMBER)
+        assert off.status_code == 200, off.text
+        assert machine.env == {"FLOTTA_SCREEN": "0"}
+
+
+def test_a_change_refused_after_it_began_is_ended_on_the_timeline(fleet, machine, monkeypatch):  # noqa: F811
+    """`background=False`: a `ProvisionError` that is not `UpgradeFailed` must not
+    leave `screen_change_started` open, holding back every resize for ten minutes."""
+    import flotta.provision as provision
+
+    def refused(*args, **kwargs):
+        raise provision.ProvisionError("the box was destroyed meanwhile")
+
+    monkeypatch.setattr(provision, "set_screen", refused)
+    with _api(fleet, background=False) as api:
+        response = api.put(f"/api/boxes/{X}/screen", json={"screen": True}, headers=OWNER)
+        box = api.get(f"/api/boxes/{X}", headers=OWNER).json()["box"]
+    assert response.status_code == 409
+    assert (box["screen_change"], box["size_change"]) == (None, None)

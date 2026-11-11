@@ -5378,9 +5378,12 @@ def create_app(
         **Off** keeps the size; an owner can size it down afterwards. The size
         route refuses a screen agent anything smaller.
 
-        `fleet:write`, like creating one with a screen: a screen is a choice of
-        what the agent can do, and its size follows from it. The size route's
-        shape otherwise: refusals first, then `202` and a thread, with the box's
+        `fleet:write` for turning it off, or on for an agent already big
+        enough. **Turning it on when that resizes the agent is an owner's**
+        (`_require_owner`, as `PUT /size` is): the size is what the agency pays.
+        Creating one with a screen is a member's too, since naming no size is,
+        and the screen's minimum is then the size it is made at. The size
+        route's shape otherwise: refusals first, then `202` and a thread, with the box's
         `screen_change` (and `size_change`, when it resizes) saying it is under
         way and the timeline's `screen_set` or `screen_change_failed` how it
         ended. Already so is a `200` with `already_current`. Shares the resize
@@ -5391,6 +5394,7 @@ def create_app(
         from flotta.provision import (
             InvalidSize,
             ProvisionError,
+            ScreenNeedsResize,
             UpgradeFailed,
             begin_screen_change,
             set_screen,
@@ -5410,8 +5414,11 @@ def create_app(
                         status_code=409,
                         detail=f"{box.name} is already being changed; wait for that to finish.",
                     )
+                owner = token is None or _is_operator(token) or token.allows(SCOPE_ORG_ADMIN)
                 try:
-                    started = begin_screen_change(box.id, screen, store=store)
+                    started = begin_screen_change(box.id, screen, store=store, may_resize=owner)
+                except ScreenNeedsResize as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
                 except InvalidSize as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
                 except ProvisionError as exc:
@@ -5443,8 +5450,13 @@ def create_app(
                     try:
                         result = set_screen(box.id, screen, store=store)
                     except UpgradeFailed as exc:
+                        # `set_screen` recorded it.
                         raise HTTPException(status_code=502, detail=str(exc)) from exc
                     except ProvisionError as exc:
+                        # Refused after it was begun (the box changed underneath):
+                        # ended on the timeline, or it reads as under way and
+                        # holds back every resize until it goes stale.
+                        _record_unfinished_screen(store_factory, box.id, started, exc)
                         raise HTTPException(status_code=409, detail=str(exc)) from exc
                     return {**result, "box": _with_meta(store, _scoped_box(store, token, box.id))}
                 answer = {**started, "started": True, "box": _with_meta(store, box)}

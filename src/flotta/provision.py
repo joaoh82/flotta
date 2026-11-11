@@ -3126,6 +3126,15 @@ class ScreenTooSmall(InvalidSize):
     """A size below `SCREEN_MIN_MEMORY_MB` for an agent with a screen."""
 
 
+class ScreenNeedsResize(ProvisionError):
+    """Turning a screen on would resize the agent, and the caller may not.
+
+    The size is what the agency pays for the machine, which is an owner's
+    choice (`PUT /size`). A screen on an agent already big enough, or turning
+    one off, changes no size and is anyone's who may change the agent.
+    """
+
+
 def check_screen_size(memory_mb: int | None, *, name: str | None = None) -> None:
     """`ScreenTooSmall` if a screen agent is being given less than the minimum.
 
@@ -3217,9 +3226,13 @@ def begin_screen_change(
     *,
     store: FleetStore,
     backend: Backend | None = None,
+    may_resize: bool = True,
 ) -> dict[str, Any]:
     """Accept a screen change that `set_screen` will then make on a thread, or
     refuse it now (FLOTTA-208).
+
+    `may_resize=False` refuses, with `ScreenNeedsResize` and nothing recorded,
+    a change that would resize the agent: the caller is not its owner.
 
     `begin_resize`'s shape: the change restarts a running agent, so every
     refusal comes first. `screen_change_started` says it is under way, and
@@ -3241,6 +3254,12 @@ def begin_screen_change(
         raise ProvisionError(f"{box.name} is being resized; wait for that to finish.")
     if box.screen == screen:
         return {**out, "resized": False, "memory_mb": current, "already_current": True}
+    if resize_to is not None and not may_resize:
+        has = f"{current} MB" if current else "an unknown size"
+        raise ScreenNeedsResize(
+            f"a screen needs {SCREEN_MIN_MEMORY_MB} MB and {box.name} has {has}, so turning "
+            "it on resizes the agent, and only the org's owner may choose an agent's size."
+        )
     store.add_event(
         "box", box.id, SCREEN_CHANGE_STARTED, {"screen": screen, "memory_mb": resize_to}
     )
@@ -3275,9 +3294,12 @@ def set_screen(
     box, resize_to, current = _screen_plan(box_id, screen, store, backend)
     impl = _resolve_backend(box, backend)
     env = {SCREEN_ENV_KEY: "1" if screen else "0"}
+    given: int | None = None
     try:
         if resize_to is not None:
-            impl.resize(box.endpoint, resize_to, env=env)
+            # A floor, not a size: a machine bigger than the store knew (one
+            # resized by hand) keeps its memory and still gets the switch.
+            given = impl.resize(box.endpoint, resize_to, env=env, at_least=True)
         else:
             impl.apply_env(box.endpoint, env)
     except BackendError as exc:
@@ -3293,19 +3315,20 @@ def set_screen(
         ) from exc
     store.set_box_screen(box.id, screen)
     store.add_event("box", box.id, SCREEN_SET, {"screen": screen, "reason": "changed"})
+    now = given if isinstance(given, int) and not isinstance(given, bool) else resize_to
     if resize_to is not None:
         store.add_event(
             "box",
             box.id,
             SIZE_SET,
-            {"memory_mb": resize_to, "from": current, "reason": "screen"},
+            {"memory_mb": now, "from": current, "reason": "screen"},
         )
     return {
         "box_id": box.id,
         "name": box.name,
         "screen": screen,
-        "memory_mb": resize_to or current,
-        "resized": resize_to is not None,
+        "memory_mb": now or current,
+        "resized": resize_to is not None and now == resize_to and now != current,
     }
 
 
@@ -3318,15 +3341,19 @@ def _screen_onto_adopted(
     try:
         if given_memory is None or given_memory < SCREEN_MIN_MEMORY_MB:
             try:
-                impl.resize(endpoint, SCREEN_MIN_MEMORY_MB, env={SCREEN_ENV_KEY: "1"})
+                now = impl.resize(
+                    endpoint, SCREEN_MIN_MEMORY_MB, env={SCREEN_ENV_KEY: "1"}, at_least=True
+                )
             except NotSupported:
                 impl.apply_env(endpoint, {SCREEN_ENV_KEY: "1"})
             else:
+                if not isinstance(now, int) or isinstance(now, bool):
+                    now = SCREEN_MIN_MEMORY_MB
                 store.add_event(
                     "box",
                     box.id,
                     SIZE_SET,
-                    {"memory_mb": SCREEN_MIN_MEMORY_MB, "from": given_memory, "reason": "screen"},
+                    {"memory_mb": now, "from": given_memory, "reason": "screen"},
                 )
         else:
             impl.apply_env(endpoint, {SCREEN_ENV_KEY: "1"})

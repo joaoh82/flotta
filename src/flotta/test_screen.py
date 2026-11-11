@@ -45,10 +45,13 @@ class Screened(Sized):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.resized_env: list[dict[str, str] | None] = []
+        self.floors: list[bool] = []
 
-    def resize(self, box_id, memory_mb, *, env=None):
+    def resize(self, box_id, memory_mb, *, env=None, at_least=False):
         super().resize(box_id, memory_mb)
         self.resized_env.append(env)
+        self.floors.append(at_least)
+        return memory_mb
 
 
 def _running(store, name="eng-a", memory_mb=DEFAULT_MEMORY_MB, screen=False):
@@ -188,6 +191,7 @@ def test_turning_a_screen_on_resizes_in_the_same_restart(store):
     # One `resize` carrying the switch, and no separate env write: one restart.
     assert impl.resized == [("fake://app/m1", 4096)]
     assert impl.resized_env == [{"FLOTTA_SCREEN": "1"}]
+    assert impl.floors == [True]
     assert "apply_env" not in impl.calls
     assert out == {
         "box_id": box.id,
@@ -206,6 +210,38 @@ def test_an_agent_of_unknown_size_is_resized_to_be_sure(store):
     impl = Screened()
     set_screen(box.id, True, store=store, backend=impl)
     assert impl.resized == [("fake://app/m1", 4096)]
+
+
+def test_a_machine_bigger_than_the_store_knew_keeps_its_size(store):
+    """The store did not know (None); the machine had 8 GB, set by hand. A floor
+    of 4096 leaves it 8 GB, and the timeline says what it really has."""
+
+    class Big(Screened):
+        def resize(self, box_id, memory_mb, *, env=None, at_least=False):
+            self.calls.append("resize")
+            self.resized_env.append(env)
+            assert at_least
+            return 8192
+
+    box = _running(store, memory_mb=None)
+    out = set_screen(box.id, True, store=store, backend=Big())
+    assert out["memory_mb"] == 8192 and out["resized"] is False
+    assert box_sizes(store, [box.id]) == {box.id: 8192}
+
+
+def test_a_caller_who_may_not_resize_is_refused_before_anything_is_recorded(store):
+    from flotta.provision import ScreenNeedsResize
+
+    small = _running(store, memory_mb=2048)
+    with pytest.raises(ScreenNeedsResize, match="only the org's owner"):
+        begin_screen_change(small.id, True, store=store, backend=Screened(), may_resize=False)
+    assert SCREEN_CHANGE_STARTED not in _types(store, small.id)
+
+    # Big enough already, or turning it off: no size changes, so anyone's.
+    big = _running(store, name="eng-b", memory_mb=4096)
+    assert begin_screen_change(big.id, True, store=store, backend=Screened(), may_resize=False)
+    on = _running(store, name="eng-c", memory_mb=4096, screen=True)
+    assert begin_screen_change(on.id, False, store=store, backend=Screened(), may_resize=False)
 
 
 def test_turning_a_screen_on_for_a_big_agent_only_flips_the_switch(store):
@@ -332,3 +368,36 @@ def test_fly_resizes_and_sets_the_switch_in_one_machine_update():
     assert update[update.index("--vm-memory") + 1] == "4096"
     assert update[update.index("--env") + 1] == "FLOTTA_SCREEN=1"
     assert not any(c[1:3] == ["secrets", "import"] for c in issued)
+
+
+@pytest.mark.parametrize(("has", "resizes"), [(8192, False), (4096, False), (2048, True)])
+def test_fly_never_shrinks_a_machine_to_give_it_a_screen(has, resizes):
+    import json
+    import subprocess
+
+    from flotta.backends.fly_backend import FlyBackend
+    from flotta.test_backend import _offline_config
+
+    issued: list[list[str]] = []
+    listing = json.dumps(
+        [
+            {
+                "id": "m1",
+                "state": "started",
+                "config": {"guest": {"cpu_kind": "shared", "memory_mb": has}},
+            }
+        ]
+    )
+
+    def runner(cmd, *, timeout, check, stdin=None):
+        issued.append(cmd)
+        listed = cmd[1:3] in (["machine", "list"], ["machines", "list"])
+        return subprocess.CompletedProcess(cmd, 0, listing if listed else "", "")
+
+    now = FlyBackend(config=_offline_config(), runner=runner).resize(
+        "fly://joaoh82-flotta-eng-s/m1", 4096, env={"FLOTTA_SCREEN": "1"}, at_least=True
+    )
+    (update,) = [c for c in issued if c[1:3] == ["machine", "update"]]
+    assert ("--vm-memory" in update) is resizes
+    assert update[update.index("--env") + 1] == "FLOTTA_SCREEN=1"
+    assert now == max(has, 4096)
