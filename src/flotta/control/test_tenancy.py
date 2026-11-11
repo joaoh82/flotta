@@ -247,6 +247,8 @@ BOX_ROUTES = [
     ("GET", "/api/boxes/{b}/requests", SCOPE_FLEET_READ, None),
     ("GET", "/api/boxes/{b}/request-policy", SCOPE_FLEET_READ, None),
     ("PUT", "/api/boxes/{b}/request-policy", SCOPE_FLEET_WRITE, {"auto_level": 4}),
+    ("POST", "/api/boxes/{b}/handoffs", SCOPE_BOX_PEER, {"why": "Sign in to their bank"}),
+    ("GET", "/api/boxes/{b}/handoffs", SCOPE_FLEET_READ, None),
 ]
 
 

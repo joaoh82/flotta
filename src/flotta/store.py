@@ -883,6 +883,40 @@ class RunApproval:
     answered_at: str | None
 
 
+#: The longest reason an agent may give for needing a person on its screen.
+HANDOFF_WHY_MAX = 500
+#: The longest page address it may name with one.
+HANDOFF_URL_MAX = 2000
+#: How a handoff stands: `open` until a person hands the screen back after it
+#: (`handed_back`), the agency dismisses it, or its run ends first (`expired`).
+HANDOFF_STATUSES = frozenset({"open", "handed_back", "dismissed", "expired"})
+
+
+@dataclass(frozen=True, slots=True)
+class Handoff:
+    """An agent saying it needs a person on its screen, and why (FLOTTA-213)."""
+
+    id: str
+    box_id: str
+    org: str
+    client: str
+    why: str
+    #: The page it was on, as the agent named it. Shown, never followed.
+    url: str | None
+    #: The run it was filed in. One that is not a conversation's turn waits for it.
+    run_id: str | None
+    status: str
+    created_at: str
+    closed_at: str | None
+    closed_by: str | None
+    #: A run waiting on it, parked: what the run needs to carry on (`runner`).
+    parked_at: str | None = None
+    resumed_at: str | None = None
+    run_session: str | None = None
+    run_reply: str | None = None
+    run_steps: dict[str, Any] | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class Trigger:
     """What starts an agent's run on its own: a schedule (FLOTTA-148) or a
@@ -5057,6 +5091,12 @@ class FleetStore:
                 ),
             )
         self.expire_approvals(run_id, now=now)
+        if current.trigger_kind != "chat":
+            # A run waits for its handoff (FLOTTA-213), so one still open when
+            # it ends was never answered and has nothing left to continue. A
+            # conversation's turn ends as the agent hands over: its handoff is
+            # for whoever reads the conversation, and stays.
+            self.expire_handoffs(run_id, now=now)
         return self._get_run_or_raise(run_id)
 
     def open_chat_run(
@@ -6353,6 +6393,266 @@ class FleetStore:
         assert found is not None
         return found
 
+    # -- handoffs: a person on the agent's screen (FLOTTA-213) -------------
+
+    def file_handoff(
+        self, box_id: str, *, why: str, url: str | None = None, now: datetime | None = None
+    ) -> tuple[Handoff, bool]:
+        """`box_id` needs a person on its screen. Whether it was news, with it.
+
+        One open per agent: filed again while one is open, that one takes the
+        newer reason, page and run, and keeps when it was first filed, so a
+        hand-back after the first still clears it. Filed during a run, it names
+        the run; one reused for a different run is due an email again
+        (`notice_for`), so a stale conversation's handoff can't swallow a run's.
+        """
+        why = why.strip()
+        url = url.strip() if isinstance(url, str) and url.strip() else None
+        if not why:
+            raise ValueError("say why: what the person is to do on the screen, in a line")
+        if len(why) > HANDOFF_WHY_MAX:
+            raise ValueError(f"the reason is at most {HANDOFF_WHY_MAX} characters")
+        if url is not None and (
+            len(url) > HANDOFF_URL_MAX
+            or not url.startswith(("https://", "http://"))
+            or any(c.isspace() for c in url)
+        ):
+            raise ValueError(
+                f"the page is an http(s) address of at most {HANDOFF_URL_MAX} characters"
+            )
+        with self._conn.transaction(guard="handoffs"):
+            box = self._get_box_or_raise(box_id)
+            if box.status in BOX_TERMINAL:
+                raise UnknownEntityError(f"box {box_id!r} has been destroyed")
+            live = self.live_run(box.id)
+            row = self._conn.execute(
+                "SELECT id FROM handoffs WHERE box_id = ? AND status = 'open' "
+                "ORDER BY created_at LIMIT 1",
+                (box.id,),
+            ).fetchone()
+            if row is not None:
+                self._conn.execute(
+                    "UPDATE handoffs SET why = ?, url = ?, run_id = COALESCE(?, run_id) "
+                    "WHERE id = ?",
+                    (why, url, live.id if live else None, row["id"]),
+                )
+                handoff_id, new = row["id"], False
+            else:
+                handoff_id, new = f"ho-{uuid.uuid4().hex[:12]}", True
+                self._conn.execute(
+                    "INSERT INTO handoffs (id, box_id, org_id, client_id, why, url, run_id, "
+                    "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                    (
+                        handoff_id,
+                        box.id,
+                        box.org,
+                        box.client,
+                        why,
+                        url,
+                        live.id if live else None,
+                        _instant(now) if now else _utcnow(),
+                    ),
+                )
+        return self._get_handoff_or_raise(handoff_id), new
+
+    def get_handoff(self, handoff_id: str) -> Handoff | None:
+        row = self._conn.execute("SELECT * FROM handoffs WHERE id = ?", (handoff_id,)).fetchone()
+        return _handoff_from_row(row) if row else None
+
+    def list_handoffs(
+        self,
+        *,
+        org: str,
+        client: str | None = None,
+        box: str | None = None,
+        open_only: bool = True,
+        limit: int = 200,
+    ) -> list[Handoff]:
+        """`org`'s handoffs, or one client's or one agent's, oldest first: the
+        open ones, or with `open_only=False` the latest of every kind."""
+        where, args = ["org_id = ?"], [org]
+        if client is not None:
+            where.append("client_id = ?")
+            args.append(client)
+        if box is not None:
+            where.append("box_id = ?")
+            args.append(box)
+        if open_only:
+            where.append("status = 'open'")
+            order = "created_at ASC, id"
+        else:
+            order = "created_at DESC, id"
+        rows = self._conn.execute(
+            f"SELECT * FROM handoffs WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
+            (*args, limit),
+        ).fetchall()
+        return [_handoff_from_row(r) for r in rows]
+
+    def open_handoff_of_run(self, run_id: str) -> Handoff | None:
+        """The handoff `run_id` is waiting on, if it filed one still open."""
+        row = self._conn.execute(
+            "SELECT * FROM handoffs WHERE run_id = ? AND status = 'open' "
+            "ORDER BY created_at LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return _handoff_from_row(row) if row else None
+
+    def hand_back_handoffs(
+        self, box_id: str, *, since: datetime, by: str | None = None, now: datetime | None = None
+    ) -> list[Handoff]:
+        """A person handed `box_id`'s screen back at `since`: what that answered.
+
+        Only handoffs filed before it: a hand-back from before the agent asked
+        did nothing about what it asked. Saying it again changes nothing.
+        """
+        with self._conn.transaction(guard="handoffs"):
+            ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM handoffs WHERE box_id = ? AND status = 'open' "
+                    "AND created_at < ?",
+                    (box_id, _instant(since)),
+                ).fetchall()
+            ]
+            for handoff_id in ids:
+                self._conn.execute(
+                    "UPDATE handoffs SET status = 'handed_back', closed_at = ?, closed_by = ? "
+                    "WHERE id = ?",
+                    (_instant(now) if now else _utcnow(), by, handoff_id),
+                )
+        return [self._get_handoff_or_raise(i) for i in ids]
+
+    def dismiss_handoff(self, handoff_id: str, *, by: str, now: datetime | None = None) -> Handoff:
+        """The agency won't be going on the screen for this. Open ones only."""
+        with self._conn.transaction(guard="handoffs"):
+            current = self._get_handoff_or_raise(handoff_id)
+            if current.status != "open":
+                raise ValueError(f"handoff {handoff_id!r} is {current.status.replace('_', ' ')}")
+            self._conn.execute(
+                "UPDATE handoffs SET status = 'dismissed', closed_at = ?, closed_by = ? "
+                "WHERE id = ?",
+                (_instant(now) if now else _utcnow(), by, handoff_id),
+            )
+        return self._get_handoff_or_raise(handoff_id)
+
+    def expire_handoffs(self, run_id: str, *, now: datetime | None = None) -> list[Handoff]:
+        """`run_id` ended with its handoff still open: nobody is left to continue."""
+        with self._conn.transaction(guard="handoffs"):
+            ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM handoffs WHERE run_id = ? AND status = 'open'", (run_id,)
+                ).fetchall()
+            ]
+            if ids:
+                self._conn.execute(
+                    "UPDATE handoffs SET status = 'expired', closed_at = ? "
+                    "WHERE run_id = ? AND status = 'open'",
+                    (_instant(now) if now else _utcnow(), run_id),
+                )
+        return [self._get_handoff_or_raise(i) for i in ids]
+
+    #: An email is due on a row never emailed, or emailed about another run.
+    _NOTICE_DUE = "(notified_at IS NULL OR COALESCE(notice_for, '') <> COALESCE(run_id, ''))"
+    #: Nothing about this agent was emailed since the cutoff (the rate limit).
+    _NOTICE_QUIET = (
+        "NOT EXISTS (SELECT 1 FROM handoffs AS sent WHERE sent.box_id = handoffs.box_id "
+        "AND sent.notified_at > ?)"
+    )
+
+    def handoffs_to_notify(self, *, older_than: datetime, quiet_since: datetime) -> list[Handoff]:
+        """Open handoffs filed before `older_than` that are due an email, on
+        agents nobody was emailed about since `quiet_since`, oldest first, in
+        every org. An agent's next one waits for the quiet, rather than mailing
+        an agency every time the agent asks."""
+        rows = self._conn.execute(
+            f"SELECT * FROM handoffs WHERE status = 'open' AND {self._NOTICE_DUE} "
+            f"AND created_at <= ? AND {self._NOTICE_QUIET} ORDER BY created_at, id",
+            (_instant(older_than), _instant(quiet_since)),
+        ).fetchall()
+        return [_handoff_from_row(r) for r in rows]
+
+    def claim_handoff_notice(
+        self, handoff_id: str, *, now: datetime, quiet_since: datetime
+    ) -> tuple[str | None, str | None] | None:
+        """Mark `handoff_id` as emailed about its run, if it is due and its agent
+        has been quiet: what it said before, for `release_handoff_notice`, to the
+        one caller who gets to send it; None to anyone else."""
+        with self._conn.transaction(guard="handoffs"):
+            row = self._conn.execute(
+                f"SELECT notified_at, notice_for FROM handoffs WHERE id = ? AND status = 'open' "
+                f"AND {self._NOTICE_DUE} AND {self._NOTICE_QUIET}",
+                (handoff_id, _instant(quiet_since)),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE handoffs SET notified_at = ?, notice_for = COALESCE(run_id, '') "
+                "WHERE id = ?",
+                (_instant(now), handoff_id),
+            )
+        return row["notified_at"], row["notice_for"]
+
+    def release_handoff_notice(
+        self, handoff_id: str, before: tuple[str | None, str | None] = (None, None)
+    ) -> None:
+        """The email could not be sent: put back what the claim replaced."""
+        self._conn.execute(
+            "UPDATE handoffs SET notified_at = ?, notice_for = ? WHERE id = ?",
+            (*before, handoff_id),
+        )
+
+    def park_run(
+        self,
+        handoff_id: str,
+        *,
+        session: str | None,
+        reply: str,
+        steps: dict[str, Any],
+        now: datetime | None = None,
+    ) -> Handoff:
+        """The run `handoff_id` was filed in waits for it, holding no delivery:
+        what it needs to carry on is kept with the handoff (`runner`)."""
+        with self._conn.transaction(guard="handoffs"):
+            self._get_handoff_or_raise(handoff_id)
+            self._conn.execute(
+                "UPDATE handoffs SET parked_at = ?, resumed_at = NULL, run_session = ?, "
+                "run_reply = ?, run_steps_json = ? WHERE id = ?",
+                (
+                    _instant(now) if now else _utcnow(),
+                    session,
+                    reply,
+                    json.dumps(steps),
+                    handoff_id,
+                ),
+            )
+        return self._get_handoff_or_raise(handoff_id)
+
+    def parked_handoffs(self) -> list[Handoff]:
+        """Handoffs a run is parked on and nobody has picked up, oldest first,
+        whose run is still running, in every org."""
+        rows = self._conn.execute(
+            "SELECT handoffs.* FROM handoffs JOIN tasks ON tasks.id = handoffs.run_id "
+            "WHERE handoffs.parked_at IS NOT NULL AND handoffs.resumed_at IS NULL "
+            "AND tasks.status = 'running' ORDER BY handoffs.parked_at, handoffs.id"
+        ).fetchall()
+        return [_handoff_from_row(r) for r in rows]
+
+    def claim_parked(self, handoff_id: str, *, now: datetime | None = None) -> bool:
+        """Pick a parked run up again, if nobody has: True for the one caller who may."""
+        taken = self._conn.execute(
+            "UPDATE handoffs SET resumed_at = ? WHERE id = ? AND parked_at IS NOT NULL "
+            "AND resumed_at IS NULL RETURNING id",
+            (_instant(now) if now else _utcnow(), handoff_id),
+        ).fetchone()
+        return taken is not None
+
+    def _get_handoff_or_raise(self, handoff_id: str) -> Handoff:
+        found = self.get_handoff(handoff_id)
+        if found is None:
+            raise UnknownEntityError(f"no handoff with id {handoff_id!r}")
+        return found
+
     # -- a run's approvals (FLOTTA-147) ------------------------------------
 
     def ask_approval(
@@ -7290,6 +7590,27 @@ def _approval_from_row(row: db.Row) -> RunApproval:
         choice=row["choice"],
         answered_by=row["answered_by"],
         answered_at=row["answered_at"],
+    )
+
+
+def _handoff_from_row(row: db.Row) -> Handoff:
+    return Handoff(
+        id=row["id"],
+        box_id=row["box_id"],
+        org=row["org_id"],
+        client=row["client_id"],
+        why=row["why"],
+        url=row["url"],
+        run_id=row["run_id"],
+        status=row["status"],
+        created_at=row["created_at"],
+        closed_at=row["closed_at"],
+        closed_by=row["closed_by"],
+        parked_at=row["parked_at"],
+        resumed_at=row["resumed_at"],
+        run_session=row["run_session"],
+        run_reply=row["run_reply"],
+        run_steps=json.loads(row["run_steps_json"]) if row["run_steps_json"] else None,
     )
 
 

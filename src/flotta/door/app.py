@@ -134,6 +134,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -504,12 +505,27 @@ def _keep(task: asyncio.Task[None]) -> None:
     task.add_done_callback(_LEASE_TASKS.discard)
 
 
-async def _report_lease(plane: Any, box_id: str, lease: dict[str, Any], by: str | None) -> None:
+async def _report_lease(
+    plane: Any,
+    box_id: str,
+    lease: dict[str, Any],
+    by: str | None,
+    handed_back_at: float | None = None,
+) -> None:
     """Best effort, as a heartbeat is: a lost report costs a refusal or a hold."""
     try:
-        await plane.report_screen_lease(
-            box_id, holder=lease["holder"], since=float(lease["since"]), by=by
-        )
+        if handed_back_at is None:
+            await plane.report_screen_lease(
+                box_id, holder=lease["holder"], since=float(lease["since"]), by=by
+            )
+        else:
+            await plane.report_screen_lease(
+                box_id,
+                holder=lease["holder"],
+                since=float(lease["since"]),
+                by=by,
+                handed_back_at=handed_back_at,
+            )
     except Exception as exc:  # noqa: BLE001
         _log.info("could not report %s's screen lease: %s", box_id, type(exc).__name__)
 
@@ -525,33 +541,59 @@ class LeaseWatch:
     answer to that `display.lease.acquire`, matched by its JSON-RPC id: a
     broadcast names nobody, and a refused acquire names nobody either, so
     someone else's takeover afterwards is never credited to this socket.
+
+    **A hand-back** (FLOTTA-213) is the same, for `display.lease.release`, and
+    only on a socket whose ticket may drive the screen (`drives`): Hermes's
+    answer to that very release, giving the lease back to the agent. It clears
+    what the agent asked a person for (`FleetStore.hand_back_handoffs`), timed
+    by the door's clock (`clock`). The agent has root and can move its own
+    lease, so nothing the box says unasked, a broadcast or a snapshot, is one.
     """
 
-    def __init__(self, *, box_id: str, subject: str | None, plane: Any) -> None:
+    def __init__(
+        self,
+        *,
+        box_id: str,
+        subject: str | None,
+        plane: Any,
+        drives: bool = False,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._box_id = box_id
         self._subject = subject
         self._plane = plane
-        #: The ids of this socket's acquires still unanswered.
+        self._drives = drives
+        self._clock = clock
+        #: The ids of this socket's acquires, and releases, still unanswered.
         self._taking: set[str] = set()
+        self._releasing: set[str] = set()
         self._reported: tuple[str, float, str | None] | None = None
 
     def asked(self, frame: str | bytes) -> None:
         """A frame from the client, on its way to the box."""
-        if isinstance(frame, bytes) or "display.lease.acquire" not in frame:
+        if isinstance(frame, bytes) or "display.lease." not in frame:
             return
         with contextlib.suppress(ValueError):
             parsed = json.loads(frame)
-            if isinstance(parsed, dict) and parsed.get("method") == "display.lease.acquire":
-                rid = parsed.get("id")
-                if rid is not None and len(self._taking) < 16:
-                    self._taking.add(json.dumps(rid))
+            if not isinstance(parsed, dict) or parsed.get("id") is None:
+                return
+            method = parsed.get("method")
+            if method == "display.lease.acquire":
+                into = self._taking
+            elif method == "display.lease.release" and self._drives:
+                into = self._releasing
+            else:
+                return
+            if len(into) < 16:
+                into.add(json.dumps(parsed["id"]))
 
-    def _answers_acquire(self, frame: str) -> bool:
-        """Whether this frame is Hermes's answer to one of this socket's acquires.
+    @staticmethod
+    def _answers(frame: str, ids: set[str]) -> bool:
+        """Whether this frame is Hermes's answer to one of `ids`, this socket's own.
 
         Taken off the list either way: an error ends it as surely as a result.
         """
-        if not self._taking or '"id"' not in frame:
+        if not ids or '"id"' not in frame:
             return False
         try:
             parsed = json.loads(frame)
@@ -560,16 +602,26 @@ class LeaseWatch:
         if not isinstance(parsed, dict) or ("result" not in parsed and "error" not in parsed):
             return False
         rid = json.dumps(parsed.get("id"))
-        if rid not in self._taking:
+        if rid not in ids:
             return False
-        self._taking.discard(rid)
+        ids.discard(rid)
         return "result" in parsed
 
     def heard(self, frame: str) -> None:
         """A frame from the box, on its way to the client."""
-        answered = self._answers_acquire(frame)
+        answered = self._answers(frame, self._taking)
+        released = self._answers(frame, self._releasing)
         lease = read_lease(frame)
         if lease is None:
+            return
+        if released and lease["holder"] == "agent":
+            # A person handed it back, here: said whether or not it is news.
+            self._reported = (str(lease["holder"]), float(lease["since"]), None)
+            _keep(
+                asyncio.get_running_loop().create_task(
+                    _report_lease(self._plane, self._box_id, lease, self._subject, self._clock())
+                )
+            )
             return
         by = self._subject if answered and lease["holder"] == "human" else None
         key = (str(lease["holder"]), float(lease["since"]), by)
@@ -886,12 +938,24 @@ class ControlPlane:
         return found if isinstance(found, dict) else None
 
     async def report_screen_lease(
-        self, box_id: str, *, holder: str, since: float, by: str | None = None
+        self,
+        box_id: str,
+        *,
+        holder: str,
+        since: float,
+        by: str | None = None,
+        handed_back_at: float | None = None,
     ) -> None:
-        """Who holds this agent's screen, as a socket to it just heard (FLOTTA-211)."""
+        """Who holds this agent's screen, as a socket to it just heard (FLOTTA-211).
+
+        `handed_back_at` is the door's own time a person handed the screen back
+        on this socket (FLOTTA-213): what the agent asked a person for is answered.
+        """
         body: dict[str, Any] = {"holder": holder, "since": since}
         if by:
             body["by"] = by
+        if handed_back_at is not None:
+            body["handed_back_at"] = handed_back_at
         await self._door_post(f"/api/boxes/{box_id}/screen-lease", body)
 
     async def record_client_conversation(self, box_id: str, session_id: str) -> None:
@@ -1664,7 +1728,14 @@ def create_door(
             return
 
         liveness = Liveness(target.name)
-        lease = LeaseWatch(box_id=target.box_id, subject=token.subject, plane=plane)
+        # A person handing the screen back clears what the agent asked for
+        # (FLOTTA-213): only from a ticket that may drive it, never the box's word.
+        lease = LeaseWatch(
+            box_id=target.box_id,
+            subject=token.subject,
+            plane=plane,
+            drives=ticketed and token.screen == SCREEN_CONTROL,
+        )
         # Tokens that reach this far aren't a client's: see `authorize`.
         a_clients = ticketed and not token.full_access
         # Each turn of a person's conversation becomes a `chat` run (M14.6).

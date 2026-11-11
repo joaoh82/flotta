@@ -71,6 +71,7 @@ from flotta.auth import (
     admits,
     admits_tenant,
     is_api_key,
+    is_client_person,
     is_governor,
     key_token,
     mint,
@@ -1225,6 +1226,7 @@ def create_app(
         task: asyncio.Task | None = None
         alerts: asyncio.Task | None = None
         notices: asyncio.Task | None = None
+        handoff_notices: asyncio.Task | None = None
         runs: asyncio.Task | None = None
         pulls_task: asyncio.Task | None = None
         if warm_release_cache is not None:
@@ -1255,6 +1257,12 @@ def create_app(
             notices = asyncio.create_task(
                 run_approval_mail_loop(store_factory, mailer=deliver_link, app_url=link_base)
             )
+            # An agent that needs a person on its screen, emailed the same way (FLOTTA-213).
+            from flotta.handoffs import run_handoff_mail_loop
+
+            handoff_notices = asyncio.create_task(
+                run_handoff_mail_loop(store_factory, mailer=deliver_link, app_url=link_base)
+            )
             # Pull requests agents opened, read again from GitHub (FLOTTA-171/172).
             pulls_task = asyncio.create_task(
                 run_pull_request_loop(store_factory, token_for=_sweep_token, fetch=_github_fetch)
@@ -1284,6 +1292,10 @@ def create_app(
                 notices.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await notices
+            if handoff_notices is not None:
+                handoff_notices.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await handoff_notices
             if pulls_task is not None:
                 pulls_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -6068,7 +6080,9 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
         return run
 
-    def _run_view(run: Any, cost: Any = None, approvals: Any = None) -> dict[str, Any]:
+    def _run_view(
+        run: Any, cost: Any = None, approvals: Any = None, handoff: Any = False
+    ) -> dict[str, Any]:
         from dataclasses import asdict
 
         view = asdict(run)
@@ -6077,6 +6091,9 @@ def create_app(
         if approvals is not None:
             view["approvals"] = [asdict(a) for a in approvals]
             view["waiting_approval"] = any(a.status == "waiting" for a in approvals)
+        if handoff is not False:
+            # Waiting for a person on its screen (FLOTTA-213), not failing.
+            view["waiting_handoff"] = asdict(handoff) if handoff is not None else None
         return view
 
     @app.post("/api/boxes/{box_id}/runs", status_code=202)
@@ -6186,7 +6203,12 @@ def create_app(
         try:
             run = _scoped_run(store, token, run_id)
             _run_reader(token)
-            return _run_view(run, store.run_cost(run.id), store.run_approvals(run.id))
+            return _run_view(
+                run,
+                store.run_cost(run.id),
+                store.run_approvals(run.id),
+                store.open_handoff_of_run(run.id) if run.trigger_kind != "chat" else None,
+            )
         finally:
             store.close()
 
@@ -6657,13 +6679,16 @@ def create_app(
 
         assert key is not None
         token = runner.run_token(run, box, key=key, ttl_s=int(RUN_TIMEOUT_S) + 60)
+        # The run's prompt, or after a handoff "carry on" in the same conversation.
+        text, resume = talk.next_message(run)
         return await runner.through_door(
             box,
-            runner.message(run),
+            text,
             token=token,
             talk=talk,
             timeout_s=RUN_TIMEOUT_S,
             title=f"Run {run.id}",
+            resume=resume,
         )
 
     carry_run = deliver_run if deliver_run is not None else (_deliver_run if key else None)
@@ -7262,6 +7287,145 @@ def create_app(
         finally:
             store.close()
 
+    # -- handoffs: a person on the agent's screen (FLOTTA-213) -----------------
+    #
+    # The agent files one (`flotta-handoff`) and ends its turn; the agency sees it
+    # on Home with Open screen, and is emailed (`flotta.handoffs`). Cleared by the
+    # next hand-back of the screen, which the door reports on `/screen-lease`
+    # (`handed_back_at`), or dismissed.
+
+    def _seen_handoffs(store: Any, token: Token | None, found: list[Any]) -> list[Any]:
+        """Of `found`, what `token` may be shown: whoever may drive the screen.
+
+        The agency's people drive every screen. A client's people only an
+        agent whose agency lets them (`client_screen_control`), and only the
+        client's people who talk to agents (`is_client_person`): a client
+        viewer is shown none, whatever the agent allows.
+        """
+        if not _clients_person(token):
+            return found
+        assert token is not None
+        if not is_client_person(token):
+            return []
+        drivers = store.client_screen_controllers(sorted({h.box_id for h in found}))
+        return [h for h in found if h.box_id in drivers]
+
+    def _scoped_handoff(store: Any, token: Token | None, handoff_id: str) -> Any:
+        """A handoff `token` may act on, or 404, as `_scoped_request` is for a request."""
+        found = store.get_handoff(handoff_id)
+        if found is None or (
+            token is not None
+            and (
+                admits_tenant(token, org=found.org, client=found.client) is not None
+                or (token.box is not None and token.box != found.box_id)
+            )
+        ):
+            raise HTTPException(status_code=404, detail=f"no handoff {handoff_id!r}")
+        return found
+
+    @app.post("/api/boxes/{box_id}/handoffs", status_code=201)
+    def file_handoff(box_id: str, body: dict[str, Any], token: Token | None = needs_peer) -> Any:
+        """This agent needs a person on its screen: `{"why": "…", "url": "…"?}`.
+        Its own box files it (`flotta-handoff`), then ends its turn.
+
+        `run_waits` says the run it was filed in is not a conversation's turn,
+        and so waits for a person to hand the screen back (`flotta.runner`).
+        """
+        from flotta import handoffs
+
+        why, url = body.get("why"), body.get("url")
+        if not isinstance(why, str) or (url is not None and not isinstance(url, str)):
+            raise HTTPException(status_code=422, detail="send why, and a url, as text")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "hand over the screen of")
+            if not box.screen:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{box.name} has no screen, so there is nothing for a person to take over"
+                    ),
+                )
+            try:
+                filed, new = store.file_handoff(box.id, why=why, url=url)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            live = store.live_run(box.id)
+            waits = live is not None and live.id == filed.run_id and live.trigger_kind != "chat"
+            store.add_event(
+                "box",
+                box.id,
+                "handoff_filed",
+                {
+                    "handoff": filed.id,
+                    "why": filed.why[:EVENT_TEXT_CHARS],
+                    "run": filed.run_id,
+                    "again": not new,
+                },
+            )
+            return {"handoff": handoffs.view(store, filed), "new": new, "run_waits": waits}
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/handoffs")
+    def box_handoffs(box_id: str, token: Token | None = needs_peer_or_read) -> Any:
+        """This agent's open handoffs, oldest first."""
+        from flotta import handoffs
+
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            confine_to_box(token, box, "read the handoffs of")
+            found = _seen_handoffs(store, token, store.list_handoffs(org=box.org, box=box.id))
+            return {"handoffs": handoffs.views(store, found)}
+        finally:
+            store.close()
+
+    @app.get("/api/handoffs")
+    def list_handoffs(token: Token | None = needs_read) -> Any:
+        """Every open handoff of the caller's agents: the org's for the agency,
+        and for a client's people those on agents they may drive. Oldest first."""
+        from flotta import handoffs
+
+        if token is not None and (token.box is not None or subject_box(token.subject)):
+            raise HTTPException(status_code=403, detail="an agent reads its own, on its own box")
+        org = (token.org if token else None) or DEFAULT_ORG
+        store = store_factory()
+        try:
+            found = store.list_handoffs(org=org, client=token.client if token else None)
+            return {"handoffs": handoffs.views(store, _seen_handoffs(store, token, found))}
+        finally:
+            store.close()
+
+    @app.post("/api/handoffs/{handoff_id}/dismiss")
+    def dismiss_handoff(handoff_id: str, token: Token | None = needs_write) -> Any:
+        """The agency won't be going on the screen for this one. A run waiting
+        on it ends `cancelled`: nobody is coming, and that was decided."""
+        from flotta import handoffs
+
+        store = store_factory()
+        try:
+            found = _scoped_handoff(store, token, handoff_id)
+            who = (_person(store, token.subject) if token is not None else None) or (
+                token.subject if token is not None else "the operator"
+            )
+            try:
+                dismissed = store.dismiss_handoff(found.id, by=who)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event(
+                "box",
+                dismissed.box_id,
+                "handoff_dismissed",
+                {"handoff": dismissed.id, "by": who, "run": dismissed.run_id},
+            )
+            return {"handoff": handoffs.view(store, dismissed)}
+        finally:
+            store.close()
+
     # -- settling what failed (FLOTTA-201/202) ---------------------------------
     #
     # The agency's: a person who can change its agents. Not a client's people
@@ -7577,10 +7741,17 @@ def create_app(
     def report_screen_lease(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{holder, since, by?}`: who holds this agent's screen, as the door just
-        saw it on the agent's socket (FLOTTA-211). `holder` is Hermes's `human`
-        or `agent`, `since` Hermes's own time of the change in epoch seconds,
-        and `by` the subject of the socket that took it, when it was that one.
+        """`{holder, since, by?, handed_back_at?}`: who holds this agent's screen,
+        as the door just saw it on the agent's socket (FLOTTA-211). `holder` is
+        Hermes's `human` or `agent`, `since` Hermes's own time of the change in
+        epoch seconds, and `by` the subject of the socket that took it, when it
+        was that one.
+
+        `handed_back_at` is the door's own time a person handed the screen back
+        (FLOTTA-213): a driving ticket's socket sent `display.lease.release` and
+        Hermes's answer to it gave the lease to the agent. It clears what the
+        agent filed before then (`FleetStore.hand_back_handoffs`), and a run
+        parked on it carries on. Saying it again clears nothing more.
 
         The door's alone, like the turns it records: it reads, and this writes
         (D10). What it decides is in `provision.screen_hold`: a person's hold
@@ -7610,6 +7781,31 @@ def create_app(
             raise HTTPException(status_code=422, detail="since is not a time that has happened")
         if by is not None and (not isinstance(by, str) or not 0 < len(by) <= 200):
             raise HTTPException(status_code=422, detail="by is a subject of 1 to 200 characters")
+        back = body.get("handed_back_at")
+        handed_back: datetime | None = None
+        if back is not None:
+            if holder != "agent":
+                raise HTTPException(
+                    status_code=422, detail="a hand-back gives the screen to the agent"
+                )
+            if (
+                isinstance(back, bool)
+                or not isinstance(back, int | float)
+                or not (math.isfinite(back) and back > 0)
+            ):
+                raise HTTPException(
+                    status_code=422, detail="handed_back_at is a time, in epoch seconds"
+                )
+            try:
+                handed_back = datetime.fromtimestamp(back, UTC)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail="handed_back_at is a time, in epoch seconds"
+                ) from exc
+            if handed_back > datetime.now(UTC) + timedelta(minutes=5):
+                raise HTTPException(
+                    status_code=422, detail="handed_back_at is not a time that has happened"
+                )
         store = store_factory()
         try:
             box = _routable_box(store, token, box_id)
@@ -7617,7 +7813,21 @@ def create_app(
                 recorded = record_screen_lease(store, box.id, holder=holder, since=moment, by=by)
             except ProvisionError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-            return {"box_id": box.id, "recorded": recorded}
+            cleared: list[str] = []
+            if handed_back is not None:
+                who = (_person(store, by) or by) if by else None
+                for handoff in store.hand_back_handoffs(box.id, since=handed_back, by=who):
+                    cleared.append(handoff.id)
+                    store.add_event(
+                        "box",
+                        box.id,
+                        "handoff_handed_back",
+                        {"handoff": handoff.id, "by": who, "run": handoff.run_id},
+                    )
+            answer: dict[str, Any] = {"box_id": box.id, "recorded": recorded}
+            if handed_back is not None:
+                answer["handed_back"] = cleared
+            return answer
         finally:
             store.close()
 

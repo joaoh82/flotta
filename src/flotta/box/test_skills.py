@@ -93,6 +93,7 @@ SHIPPED = {
     "flotta-colleagues": ("flotta-ask", "flotta.box.ask:main"),
     "flotta-projects": ("flotta-workdir", "flotta.box.workdir:main"),
     "flotta-requests": ("flotta-request", "flotta.box.requests:main"),
+    "flotta-screen": ("flotta-handoff", "flotta.box.handoff:main"),
 }
 
 
@@ -197,3 +198,35 @@ def test_the_github_skill_tells_the_agent_about_its_pull_requests():
     assert "flotta-pr report" in body
     assert "You do not need to check for reviews" in body
     assert "gh pr merge" in body
+
+
+def _image_checks() -> str:
+    """The Dockerfile's instructions, without its comments: what the build runs."""
+    dockerfile = Path(__file__).resolve().parents[3] / "fly" / "Dockerfile"
+    if not dockerfile.exists():
+        pytest.skip(f"no Dockerfile at {dockerfile}")
+    lines = dockerfile.read_text(encoding="utf-8").splitlines()
+    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
+
+@pytest.mark.parametrize(("skill", "command"), [(s, c) for s, (c, _) in SHIPPED.items()])
+def test_the_image_build_fails_without_a_skill_or_its_command(skill, command):
+    """The pair check: a skill naming a missing command, or a command no skill
+    mentions, fails quietly on a box, so the build fails instead (FLOTTA-213)."""
+    checks = _image_checks()
+    assert f'test -x "$HERMES_VENV/bin/{command}"' in checks, command
+    assert f"test -f /app/src/flotta/box/hermes_skills/flotta/{skill}/SKILL.md" in checks, skill
+
+
+def test_the_screen_skill_is_offered_only_with_a_screen_and_keeps_secrets_off_the_chat():
+    """An agent without a screen has the browser toolset turned off at boot
+    (`flotta.box.screen`), which is what hides this skill from it."""
+    from flotta.box.screen import SCREEN_TOOLSETS
+
+    front, body = _skill("flotta-screen")
+    required = front["metadata"]["hermes"]["requires_toolsets"]
+    assert required and set(required) <= set(SCREEN_TOOLSETS)
+    assert "Never ask anyone for a password, a one-time code" in body
+    assert "End your turn" in body
+    for reason in ("sign-in", "2FA", "CAPTCHA", "payment", "requires a human"):
+        assert reason in body, reason

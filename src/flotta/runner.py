@@ -50,6 +50,23 @@ socket is the door's, not this loop's, so the door records and carries its
 approvals the same way (`flotta.door.turns`, FLOTTA-166), and one list and one
 route answer both.
 
+## A handoff waits for a person on the screen (FLOTTA-213)
+
+An agent with a screen that meets a sign-in, a 2FA prompt, a CAPTCHA or a
+payment runs `flotta-handoff` and ends its turn. In a conversation that is the
+end of the turn; in a run, which nobody is watching, it would be the end of the
+run with the work not done. So a run whose turn ends with a handoff open is
+**parked** (`FleetStore.park_run`): it stays `running`, which holds its agent
+awake (`provision.idle_boxes`), but its delivery ends, so a run waiting on a
+person holds none of `MAX_CONCURRENT`. What it needs to carry on, the stored
+session and its steps so far, is kept with the handoff. Each sweep looks at
+the parked runs first: one whose screen was handed back (the door reports it)
+is picked up (`claim_parked`, once across control planes) and told to carry on
+in the same conversation (`handoffs.continue_message`), through another
+handoff if it needs one; dismissed by the agency it ends `cancelled`, and past
+its `RUN_TIMEOUT_S` from when it started, `failed`. A parked run outlives a
+control plane's restart: the next one's sweep finds it.
+
 ## When the control plane stops mid-run
 
 Stopped on purpose, as on every deploy, it knows its own deliveries: each run
@@ -161,6 +178,15 @@ class SendFailed(Exception):
     (FLOTTA-199), unlike anything else the relay can fail on, such as the store."""
 
 
+class Parked(Exception):
+    """A run's turn ended with a handoff open: the run waits for it, parked."""
+
+    def __init__(self, handoff: Any, reply: str) -> None:
+        super().__init__(handoff.id)
+        self.handoff = handoff
+        self.reply = reply
+
+
 class Talk:
     """One run's conversation as the control plane holds it: the steps it
     hears, and the approvals it carries between the agent and a person."""
@@ -189,6 +215,23 @@ class Talk:
         self._asked: set[str] = set()
         #: Answers sent, by the box's request id: what a resume can ask for again.
         self._sent_for: dict[str, tuple[str, Any]] = {}
+        #: The conversation's stored session id, once the agent named one.
+        self.session: str | None = None
+        #: What to say next instead of the run's prompt: a handoff's "carry on".
+        self.continuing: str | None = None
+
+    def next_message(self, run: Run) -> tuple[str, str | None]:
+        """What to send the agent now, and the stored session to send it in.
+
+        The run's prompt in a new conversation, or, after a handoff, "carry on"
+        in the same one. An agent that named no stored session can't be
+        resumed, so it is sent the run again with the "carry on" after it.
+        """
+        if self.continuing is None:
+            return message(run), None
+        if self.session:
+            return self.continuing, self.session
+        return f"{message(run)}\n\n{self.continuing}", None
 
     def hear(self, frame: dict[str, Any]) -> None:
         """One frame of the turn, as `client.send_turn` streams it."""
@@ -373,10 +416,14 @@ async def through_door(
     talk: Talk,
     timeout_s: float,
     title: str = "",
+    resume: str | None = None,
     connect: Callable[[Box, str], Any] = door_socket,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> str:
     """Hold one run's turn with its agent through the front door.
+
+    `resume` is a stored session to say `text` in rather than a new one: a run
+    carrying on after its handoff (FLOTTA-213).
 
     The relay's path (`relay.deliver_through_door`), with two differences: it
     hears every frame for the run's steps, and it answers the approvals a
@@ -409,9 +456,19 @@ async def through_door(
                 try:
                     rid: int | None
                     if not submitted:
-                        created = await client.create_session(socket, title=title, timeout_s=120)
-                        live = str(created.get("session_id") or "")
-                        stored = str(created.get("stored_session_id") or "") or None
+                        if resume is None:
+                            created = await client.create_session(
+                                socket, title=title, timeout_s=120
+                            )
+                            live = str(created.get("session_id") or "")
+                            stored = str(created.get("stored_session_id") or "") or None
+                        else:
+                            attached = await client.resume_session(
+                                socket, resume, timeout_s=120, hear=talk.hear
+                            )
+                            live = str(attached.result.get("session_id") or "")
+                            stored = resume
+                        talk.session = stored
                         relaying = asyncio.create_task(talk.relay(socket.send_str))
                         rid = await client.submit_turn(socket, live, text)
                         submitted = True
@@ -596,10 +653,69 @@ class RunLoop:
             await asyncio.to_thread(self._fire)
         except Exception:  # noqa: BLE001 - a schedule must not stop delivery
             _log.exception("firing schedules failed")
+        # Parked runs first (FLOTTA-213): one whose screen came back has waited
+        # already, and it goes ahead of the queue it was part of.
+        for run, box, handoff in await asyncio.to_thread(self._unpark):
+            self._start(run, box, handoff)
         for run, box in await asyncio.to_thread(self._claim):
-            task = asyncio.create_task(self._carry(run, box))
-            self.in_flight[box.id] = task
-            task.add_done_callback(lambda _, box_id=box.id: self.in_flight.pop(box_id, None))
+            self._start(run, box, None)
+
+    def _start(self, run: Run, box: Box, parked: Any) -> None:
+        task = asyncio.create_task(self._carry(run, box, parked))
+        self.in_flight[box.id] = task
+        task.add_done_callback(lambda _, box_id=box.id: self.in_flight.pop(box_id, None))
+
+    def _deadline(self, run: Run) -> datetime:
+        started = datetime.fromisoformat(run.started_at or datetime.now(UTC).isoformat())
+        return started + timedelta(seconds=self._timeout_s)
+
+    def _unpark(self) -> list[tuple[Run, Box, Any]]:
+        """Parked runs to pick up now: each whose screen was handed back, while
+        there is a slot. One dismissed, or out of time, ends here with no slot."""
+        resumed: list[tuple[Run, Box, Any]] = []
+        now = datetime.now(UTC)
+        store = self._store_factory()
+        try:
+            for handoff in store.parked_handoffs():
+                run = store.get_run(handoff.run_id) if handoff.run_id else None
+                box = store.get_box(handoff.box_id)
+                if run is None or box is None or box.id in self.in_flight:
+                    continue
+                if handoff.status == "handed_back":
+                    if len(self.in_flight) + len(resumed) >= self._max:
+                        continue  # the next sweep; it keeps its place first
+                    if store.claim_parked(handoff.id):
+                        resumed.append((run, box, handoff))
+                elif handoff.status != "open" or now >= self._deadline(run):
+                    if store.claim_parked(handoff.id):
+                        self._end_parked(store, run, handoff)
+        finally:
+            store.close()
+        return resumed
+
+    def _end_parked(self, store: FleetStore, run: Run, handoff: Any) -> None:
+        """A parked run nobody is coming back for: dismissed, or out of time."""
+        steps = handoff.run_steps or {}
+        reply = handoff.run_reply or ""
+        if handoff.status == "dismissed":
+            status, error_class = "cancelled", "handoff_dismissed"
+            said = f"It needed a person on its screen to: {handoff.why}. That was dismissed, "
+            said += "so the run ended there."
+        else:
+            status, error_class = "failed", "timeout"
+            said = (
+                f"Nobody handed the agent's screen back within {self._timeout_s:.0f}s. "
+                f"It needed a person to: {handoff.why}"
+            )
+        self._end(
+            store,
+            run.id,
+            status,
+            output=f"{reply}\n\n{said}".strip(),
+            steps=steps.get("steps"),
+            approval_count=steps.get("approvals"),
+            error_class=error_class,
+        )
 
     async def drain(self) -> None:
         """Wait for every delivery in flight to end."""
@@ -677,14 +793,31 @@ class RunLoop:
         )
         return True
 
-    async def _carry(self, run: Run, box: Box) -> None:
-        started = datetime.fromisoformat(run.started_at or datetime.now(UTC).isoformat())
-        talk = Talk(
-            self._store_factory, run, expires_at=started + timedelta(seconds=self._timeout_s)
-        )
+    async def _carry(self, run: Run, box: Box, parked: Any = None) -> None:
+        """Deliver `run`, or carry a parked one on after its handoff, and end it.
+
+        A turn that ends with a handoff open is the agent waiting for a person
+        on its screen, not its work done: the run is parked (`_park`) and this
+        delivery ends, so waiting holds no slot. The sweep picks it up again.
+        """
+        from flotta import handoffs
+
+        deadline = self._deadline(run)
+        talk = Talk(self._store_factory, run, expires_at=deadline)
+        if parked is not None:
+            # Where it stopped: the same conversation, and the steps it had.
+            talk.session = parked.run_session
+            talk.continuing = handoffs.continue_message(parked)
+            kept = parked.run_steps or {}
+            talk.steps.steps = list(kept.get("steps") or [])
+            talk.steps.approvals = int(kept.get("approvals") or 0)
+        left = max((deadline - datetime.now(UTC)).total_seconds(), 0.0)
         status, error_class, stopped = "done", None, False
         try:
-            output = await asyncio.wait_for(self._deliver(run, box, talk), timeout=self._timeout_s)
+            output = await asyncio.wait_for(self._deliver_or_park(run, box, talk), timeout=left)
+        except Parked as exc:
+            await asyncio.to_thread(self._park, run, talk, exc)
+            return
         except TimeoutError:
             status, error_class = "failed", "timeout"
             output = f"the agent did not finish within {self._timeout_s:.0f}s"
@@ -704,6 +837,44 @@ class RunLoop:
         await asyncio.to_thread(self._finish, run, status, output, talk, error_class)
         if stopped:
             raise asyncio.CancelledError
+
+    async def _deliver_or_park(self, run: Run, box: Box, talk: Talk) -> str:
+        """The agent's reply, or `Parked` if its turn ended with a handoff open."""
+        reply = await self._deliver(run, box, talk)
+        handoff = await asyncio.to_thread(self._open_handoff, run.id)
+        if handoff is not None:
+            raise Parked(handoff, reply)
+        return reply
+
+    def _open_handoff(self, run_id: str) -> Any:
+        store = self._store_factory()
+        try:
+            return store.open_handoff_of_run(run_id)
+        finally:
+            store.close()
+
+    def _park(self, run: Run, talk: Talk, parked: Parked) -> None:
+        """Keep what the run needs to carry on with its handoff, and let go.
+
+        The turn is over, so nothing it asked is still open (`talk.close`). The
+        run stays `running`, which keeps its agent awake while it waits.
+        """
+        try:
+            talk.close()
+        except Exception:  # noqa: BLE001 - parking goes on whatever the approvals did
+            _log.exception("closing run %s's approvals failed", run.id)
+        store = self._store_factory()
+        try:
+            store.park_run(
+                parked.handoff.id,
+                session=talk.session,
+                reply=parked.reply,
+                steps={"steps": talk.steps.steps, "approvals": talk.steps.approvals},
+            )
+            store.add_event("task", run.id, "waiting_handoff", {"handoff": parked.handoff.id})
+        finally:
+            store.close()
+        _log.info("run %s waits for a person on its agent's screen", run.id)
 
     def _finish(
         self, run: Run, status: str, output: str, talk: Talk, error_class: str | None
