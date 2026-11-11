@@ -932,11 +932,11 @@ def create_app(
     needs_admin = Depends(require(SCOPE_ORG_ADMIN))
     #: An org's limits (FLOTTA-183): read by its own people, the operator or
     #: the hosted product's billing (`org:govern`); set by the last two.
-    needs_limits_read = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
+    #: What the org's own people read, and the hosted product's billing too:
+    #: an org's limits (FLOTTA-183) and its usage totals (FLOTTA-188). One rule,
+    #: so the two never drift apart. Each route still checks whose org it is.
+    needs_read_or_govern = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
     needs_limits_write = Depends(require(SCOPE_ORG_ADMIN, SCOPE_ORG_GOVERN, any_of=True))
-    #: An org's usage totals: its own people, the operator, or the hosted
-    #: product's billing, which puts model spend on each agency's invoice (FLOTTA-188).
-    needs_usage_read = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
     #: The agency's people, or a client's person who talks to agents: who may
     #: answer a run's approval, before the rules of `answer_run_approval`.
     needs_answer = Depends(require(SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, any_of=True))
@@ -1334,7 +1334,7 @@ def create_app(
         }
 
     @app.get("/api/orgs/{org_id}/limits")
-    def get_org_limits(org_id: str, token: Token | None = needs_limits_read) -> Any:
+    def get_org_limits(org_id: str, token: Token | None = needs_read_or_govern) -> Any:
         """An org's limits and what it holds of each: `{limits, counts, over}`.
 
         For the org's own people (not a client's: a client sees its agents,
@@ -2380,7 +2380,7 @@ def create_app(
         group: str | None = None,
         from_: str | None = Query(default=None, alias="from"),
         to: str | None = None,
-        token: Token | None = needs_usage_read,
+        token: Token | None = needs_read_or_govern,
     ) -> Any:
         """What an org has spent, added up, for whoever may read its budgets.
 
