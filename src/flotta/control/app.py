@@ -932,7 +932,10 @@ def create_app(
     needs_admin = Depends(require(SCOPE_ORG_ADMIN))
     #: An org's limits (FLOTTA-183): read by its own people, the operator or
     #: the hosted product's billing (`org:govern`); set by the last two.
-    needs_limits_read = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
+    #: What the org's own people read, and the hosted product's billing too:
+    #: an org's limits (FLOTTA-183) and its usage totals (FLOTTA-188). One rule,
+    #: so the two never drift apart. Each route still checks whose org it is.
+    needs_read_or_govern = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
     needs_limits_write = Depends(require(SCOPE_ORG_ADMIN, SCOPE_ORG_GOVERN, any_of=True))
     #: The agency's people, or a client's person who talks to agents: who may
     #: answer a run's approval, before the rules of `answer_run_approval`.
@@ -1331,7 +1334,7 @@ def create_app(
         }
 
     @app.get("/api/orgs/{org_id}/limits")
-    def get_org_limits(org_id: str, token: Token | None = needs_limits_read) -> Any:
+    def get_org_limits(org_id: str, token: Token | None = needs_read_or_govern) -> Any:
         """An org's limits and what it holds of each: `{limits, counts, over}`.
 
         For the org's own people (not a client's: a client sees its agents,
@@ -2377,15 +2380,19 @@ def create_app(
         group: str | None = None,
         from_: str | None = Query(default=None, alias="from"),
         to: str | None = None,
-        token: Token | None = needs_read,
+        token: Token | None = needs_read_or_govern,
     ) -> Any:
         """What an org has spent, added up, for whoever may read its budgets.
 
         `?group=day,client,box,kind,model,requested_model`, any of them, and `from` and
         `to` as days or moments, this month so far if not named. Never the ledger's rows:
-        see `flotta.usage_report`.
+        see `flotta.usage_report`. Grouped by `client`, each row names it (`client_name`).
+
+        Also the hosted product's billing (`org:govern`), for any org: the totals
+        an invoice is built from, and nothing more (FLOTTA-188).
         """
-        _budget_reader(token, org_id)
+        if not (token is not None and is_governor(token)):
+            _budget_reader(token, org_id)
         from flotta.usage_report import BadReport, parse_group, parse_window, report
 
         try:

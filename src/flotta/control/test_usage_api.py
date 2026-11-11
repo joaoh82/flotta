@@ -332,3 +332,55 @@ def test_a_listed_budget_at_its_limit_says_so(api, fleet):
     assert found["spent_eur"] == "2"
     assert found["reached"] is True
     assert found["soft_reached"] is True
+
+
+# -- billing reads totals (FLOTTA-188, M15.6) ----------------------------------------
+
+
+def _governor():
+    from flotta.auth import SCOPE_ORG_GOVERN
+
+    token = mint(subject="billing", scopes={SCOPE_ORG_GOVERN}, key=SIGNING_KEY)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_billing_reads_any_orgs_usage_totals(api):
+    """The hosted product's billing puts model spend on each agency's invoice."""
+    for org, total in (("studio-nord", "1.75"), ("other", "7")):
+        answer = api.get(
+            f"/api/orgs/{org}/usage", params={**WINDOW, "group": "client"}, headers=_governor()
+        )
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["total"]["model_eur"] == total
+
+
+def test_billing_reads_totals_and_nothing_beside_them(api):
+    """Sums only, as every reader gets: the ledger's rows never leave."""
+    body = api.get(ROUTE, params={**WINDOW, "group": "client"}, headers=_governor()).json()
+    assert set(body) == {"org", "from", "to", "group", "rows", "total"}
+    for refused in ("budgets", "budget-events", "alerts"):
+        assert api.get(f"/api/orgs/studio-nord/{refused}", headers=_governor()).status_code in (
+            401,
+            403,
+            404,
+        )
+
+
+def test_a_report_by_client_names_each_client(api):
+    """What an invoice line says: a client's name, for whoever may read its usage."""
+    rows = _read(api, group="client")["rows"]
+    assert [(r["client"], r["client_name"]) for r in rows] == [
+        ("acme", "Acme Dental"),
+        ("bolt", "Bolt Bikes"),
+    ]
+
+
+def test_usage_groups_by_whose_provider_key_paid(api, fleet):
+    """Spend on an agency's own key (FLOTTA-102) is shown, and billing never resells it."""
+    with FleetStore(fleet) as store:
+        _call(store, "b-one", 3 * NANO, key="own", key_scope="org")
+    rows = _read(api, group="client,key_scope")["rows"]
+    by = {(r["client"], r["key_scope"]): r["model_eur"] for r in rows}
+    assert by[("acme", "fleet")] == "1.25"
+    assert by[("acme", "org")] == "3"
+    assert by[("bolt", "fleet")] == "0.5"
