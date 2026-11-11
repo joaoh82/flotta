@@ -14,7 +14,10 @@
 # a task the agent has to talk its way around instead of doing.
 #
 # What is NOT here yet, deliberately (§6b): systemd as PID 1, `unminimize` and
-# man pages, headless Chrome, docker. Changing PID 1 is the risky half — the
+# man pages, docker. A browser is: a headed Chromium on the agent's screen
+# (Screen.2, below) does everything headless Chrome would.
+#
+# Changing PID 1 is the risky half — the
 # current entrypoint is what made durable memory work in M2 — so the toolchain
 # lands first, where a failure is a missing binary rather than a box that will
 # not boot.
@@ -105,8 +108,74 @@ ENV HERMES_SRC=/opt/hermes
 RUN git clone --depth 1 --branch "$HERMES_REF" "$HERMES_REPO" "$HERMES_SRC" \
     && cd "$HERMES_SRC" \
     && UV_PROJECT_ENVIRONMENT="$HERMES_VENV" uv sync --frozen --no-dev --no-cache \
+       --extra computer-use \
        --python-preference only-managed \
     && "$HERMES_VENV/bin/python" -c "import hermes_cli.main"
+
+# ## The screen (Screen.2, FLOTTA-207; docs/AGENT_SCREEN.md in flotta_parent)
+#
+# Hermes ships a per-agent screen it calls Bot Desktop: an Xvnc + Xfce desktop
+# the agent drives with `computer_use` and a headed Chromium, which a person can
+# watch and take over. Everything it needs is baked in here, because a box
+# cannot install it at run time in any way worth depending on:
+#
+# - **Not on the volume.** Hermes's PM keeps its tools in `$HERMES_HOME/tools`,
+#   which is /data: Chromium, agent-browser and cua-driver are ~750 MB, and the
+#   volume is 1 GB and holds the agent's memory. So PM installs them under a
+#   home of its own on the rootfs, and the env below points Hermes at them.
+# - **Not at run time.** A Fly restart resets the rootfs, so anything installed
+#   by hand on a running box is gone at the next boot (found in Screen.1).
+# - **Not snap.** Ubuntu 24.04's `chromium` is a snap stub, so the browser is
+#   PM's pinned build, and its shared libraries are apt's (the second group).
+#
+# Nothing starts here, and `bot_desktop.auto_start` stays Hermes's default
+# (false). **With these tools present Hermes offers `computer_use` and the
+# browser tools to every agent**, because both are core tools gated only by
+# whether they are installed. `flotta.box.screen` (Screen.3) is what keeps an
+# agent without a screen as it was: it disables both toolsets there, so such
+# an agent pays disk for this layer and never memory. Do not unset the env
+# below to the same end: without HERMES_CUA_DRIVER_CMD, Hermes installs
+# cua-driver into $HERMES_HOME/tools, which is the volume.
+#
+# Deliberately not the `xfce4` metapackage: it pulls in a screensaver, a power
+# manager and a polkit agent that lock or prompt a headless desktop.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # the desktop Hermes's Bot Desktop launches: Xvnc, Xfce's pieces, and the
+    # X utilities its launcher probes
+    tigervnc-standalone-server xfce4-panel xfwm4 xfdesktop4 xfce4-settings \
+    xfce4-terminal dbus-x11 x11-xserver-utils x11-utils x11-xkb-utils xauth \
+    fonts-dejavu-core at-spi2-core \
+    # what PM's Chromium links against (Playwright's list for Ubuntu 24.04)
+    libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+    libpango-1.0-0 libcairo2 libasound2t64 libatspi2.0-0t64 libxshmfence1 \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# PM's pinned agent-browser (with its Chromium) and cua-driver, in a PM home on
+# the rootfs. Their directories carry versions (`chromium-1208`, ...), so stable
+# links in /opt/screen are what the env names; `hermes pm env` says where each
+# landed, which keeps the version out of this file. The checks fail the build
+# rather than every agent that later turns a screen on.
+ENV FLOTTA_SCREEN_PM_HOME=/opt/hermes-pm
+RUN HERMES_HOME="$FLOTTA_SCREEN_PM_HOME" hermes pm install agent-browser cua-driver
+COPY fly/screen_tools.py /tmp/screen_tools.py
+RUN HERMES_HOME="$FLOTTA_SCREEN_PM_HOME" hermes pm env > /tmp/pm-env.json \
+    && cat /tmp/pm-env.json | "$HERMES_VENV/bin/python" /tmp/screen_tools.py /opt/screen \
+    && rm /tmp/pm-env.json /tmp/screen_tools.py \
+    && /opt/screen/chrome --headless=new --no-sandbox --disable-gpu --dump-dom about:blank >/dev/null
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/screen/chrome
+ENV HERMES_CUA_DRIVER_CMD=/opt/screen/bin/cua-driver
+ENV PATH="/opt/screen/bin:${PATH}"
+# Chromium's launch flags. Hermes sets `--no-sandbox,--disable-dev-shm-usage`
+# itself when it runs as root (a box always does) *unless* this is set, so the
+# two are repeated here. The rest is the volume: the browser profile (sign-ins)
+# lives in $HERMES_HOME/bot-desktop/browser-profile on /data, which is right,
+# but Chromium keeps its cache inside the profile by default and that alone
+# can fill a 1 GB disk that holds the agent's memory. So the cache goes to the
+# rootfs, capped at 256 MB (Hermes's own cap for its dock Browser). A cache is
+# worth losing on a re-image; a sign-in is not.
+ENV AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage,--disk-cache-dir=/var/cache/flotta-chromium,--disk-cache-size=268435456
 
 # Which Hermes this image carries, recorded **in the image**.
 #
