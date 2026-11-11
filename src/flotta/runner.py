@@ -180,19 +180,55 @@ class Talk:
         #: Answers sent to the box.
         self._sent: set[str] = set()
         self._held_at = 0.0
+        #: The box's request ids of every question heard, on any socket of the run.
+        self._asked: set[str] = set()
 
     def hear(self, frame: dict[str, Any]) -> None:
         """One frame of the turn, as `client.send_turn` streams it."""
         self.steps.hear(frame)
-        if frame.get("method") == "approval" and isinstance(frame.get("id"), str | int):
+        rid = frame.get("id")
+        if (
+            frame.get("method") == "approval"
+            and isinstance(rid, str | int)
+            and str(rid) not in self._asked
+        ):
+            self._asked.add(str(rid))
             self._heard.append(frame)
+
+    def hear_open(self, resumed: dict[str, Any]) -> None:
+        """The questions a resumed turn still waits on (FLOTTA-199): one asked
+        while the socket was down never came as a frame, so nobody could have
+        answered it, and the agent would wait on it past the run's deadline.
+        Those already heard are not asked again."""
+        entries = resumed.get("open_requests")
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict) or entry.get("method") != "approval":
+                continue
+            rid = entry.get("id")
+            if not isinstance(rid, str | int) or str(rid) in self._asked:
+                continue
+            params = entry.get("params")
+            self.hear(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "method": "approval",
+                    "params": params if isinstance(params, dict) else {},
+                }
+            )
 
     async def relay(self, send: Send) -> None:
         """Until cancelled: record each question, and send each answer back."""
         while True:
             for approval_id, rpc_id, choice, by in await asyncio.to_thread(self._sync):
                 answer = {"jsonrpc": "2.0", "id": rpc_id, "result": {"choice": choice}}
-                await send(json.dumps(answer))
+                try:
+                    await send(json.dumps(answer))
+                except BaseException:
+                    # Not carried: the next socket sends it (FLOTTA-199). It was
+                    # taken off what is open to be sent, and would be lost.
+                    self._open[approval_id] = rpc_id
+                    raise
                 # Noted before anything that can be cancelled: the box may finish
                 # its turn on this answer at once, and `close` must know it went.
                 self._sent.add(approval_id)
@@ -381,14 +417,19 @@ async def through_door(
                                     "ended with no reply"
                                 )
                             return reply
+                        # What it asked while nobody was listening (FLOTTA-199).
+                        talk.hear_open(resumed)
                         relaying = asyncio.create_task(talk.relay(socket.send_str))
                         rid = None
-                    turn = await client.await_turn(
-                        socket,
-                        live,
-                        rid=rid,
-                        timeout_s=max(deadline - loop.time(), 0.0),
-                        hear=talk.hear,
+                    turn = await _turn_or_relay_lost(
+                        client.await_turn(
+                            socket,
+                            live,
+                            rid=rid,
+                            timeout_s=max(deadline - loop.time(), 0.0),
+                            hear=talk.hear,
+                        ),
+                        relaying,
                     )
                     return turn.response
                 except client.SocketClosed:
@@ -397,8 +438,12 @@ async def through_door(
                 finally:
                     if relaying is not None:
                         relaying.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
+                        try:
                             await relaying
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:  # already acted on: see `_turn_or_relay_lost`
+                            _log.info("run %s's relay ended: %s", talk.run.id, exc)
                     if withdraw:
                         await talk.withdraw(socket.send_str)
         except client.SocketClosed as exc:
@@ -420,6 +465,36 @@ async def through_door(
             len(RECONNECT_DELAYS_S),
         )
         await sleep(wait)
+
+
+async def _turn_or_relay_lost(turn: Awaitable[Any], relaying: asyncio.Task | None) -> Any:
+    """The turn's end, unless the relay can no longer send on this socket first.
+
+    A send that fails after the prompt went is the socket going (FLOTTA-199):
+    on 2026-11-10 only a close seen while reading reconnected, and a failed
+    answer to an approval failed the run. So it is `SocketClosed`, and the run
+    reconnects; the answer is still open and goes on the next socket. Never
+    the prompt's own send: that happens before this, and is never repeated.
+    """
+    from flotta import client
+
+    waiting = asyncio.ensure_future(turn)
+    if relaying is None:
+        return await waiting
+    try:
+        await asyncio.wait({waiting, relaying}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        waiting.cancel()
+        raise
+    if waiting.done():
+        return waiting.result()
+    lost = relaying.exception()
+    # Not waited for: leaving the socket's context closes it, which ends the read.
+    waiting.add_done_callback(lambda t: t.cancelled() or t.exception())
+    waiting.cancel()
+    if lost is None:  # the relay never ends on its own; nothing to say about one that did
+        raise client.SocketClosed("the run's relay stopped")
+    raise client.SocketClosed(f"could not send to the agent: {lost}") from lost
 
 
 def _client_errors() -> type[BaseException]:

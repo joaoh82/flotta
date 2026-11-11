@@ -105,6 +105,9 @@ class _Talk:
     def hear(self, frame):
         self.heard.append(frame)
 
+    def hear_open(self, resumed):
+        self.resumed_open = resumed.get("open_requests")
+
     async def relay(self, _send):
         await asyncio.Event().wait()
 
@@ -271,3 +274,83 @@ def test_a_provider_failure_before_the_resume_result_still_fails_the_run():
     door = _Door([CREATED, ACK, DROP], [failed, _resumed(running=True)])
     with pytest.raises(ChatError, match="could not answer"):
         _deliver(door)
+
+
+# -- a send that fails is the socket going (FLOTTA-199) ------------------------------
+
+HANG = "hang"
+
+
+class _HangingSocket(_Socket):
+    """A socket whose script can stop and wait, as a turn waiting on an answer does."""
+
+    async def receive(self):
+        if self._frames and self._frames[0] == HANG:
+            await asyncio.Event().wait()
+        return await super().receive()
+
+
+class _HangingDoor(_Door):
+    @contextlib.asynccontextmanager
+    async def connect(self, _box, _token):
+        script = self.scripts.pop(0)
+        socket = _HangingSocket(script)
+        self.sockets.append(socket)
+        try:
+            yield socket
+        finally:
+            socket.closed = True
+
+
+class _RelayThatBreaksOnce(_Talk):
+    def __init__(self):
+        super().__init__()
+        self.relays = 0
+
+    async def relay(self, _send):
+        self.relays += 1
+        if self.relays == 1:
+            await asyncio.sleep(0)
+            raise ConnectionResetError("could not send the answer")
+        await asyncio.Event().wait()
+
+
+def test_an_answer_that_cannot_be_sent_reconnects_rather_than_failing_the_run():
+    """On 2026-11-10 only a close seen while reading reconnected: a failed
+    send of an approval's answer failed the run."""
+    door = _HangingDoor(
+        [CREATED, ACK, HANG],
+        [_resumed(running=True), _complete("Done after the answer.")],
+    )
+    talk = _RelayThatBreaksOnce()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    # Bounded: unwatched, the failed relay leaves the turn waiting for ever.
+    reply = asyncio.run(
+        asyncio.wait_for(
+            through_door(
+                BOX, PROMPT, token="t", talk=talk, timeout_s=3600, connect=door.connect, sleep=sleep
+            ),
+            timeout=5,
+        )
+    )
+
+    assert reply == "Done after the answer."
+    assert slept == [RECONNECT_DELAYS_S[0]]
+    assert len(door.sent("prompt.submit")) == 1, "the prompt is never sent twice"
+    assert talk.relays == 2
+
+
+def test_a_resume_hands_its_open_questions_to_the_run():
+    asked = [{"id": "srq-9", "method": "approval", "params": {"command": "rm -rf build/"}}]
+    resumed = {
+        "id": ECHO,
+        "result": {"session_id": "live-2", "running": True, "open_requests": asked},
+    }
+    door = _Door([CREATED, ACK, DROP], [resumed, _complete("ok")])
+    talk = _Talk()
+    _deliver(door, talk)
+    assert talk.resumed_open == asked
