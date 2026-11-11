@@ -15,7 +15,10 @@ hermetic one — see `just fly-up`.
 
 from __future__ import annotations
 
+import json
 import pathlib
+import subprocess
+import sys
 
 import pytest
 
@@ -217,3 +220,149 @@ def test_the_gh_shim_reuses_gits_own_credential_path():
     """Calling the helper directly would let `gh pr create` succeed against a
     repository `git push` had just refused."""
     assert "git credential fill" in _gh_shim()
+
+
+# ## The screen (Screen.2, FLOTTA-207)
+#
+# Hermes's Bot Desktop needs a desktop, a browser and a driver. Each is named
+# here so dropping one is a deliberate edit, not a casualty of a RUN line.
+
+#: What Hermes's Bot Desktop launcher probes for, by package.
+SCREEN_PACKAGES = [
+    "tigervnc-standalone-server",  # Xvnc: the screen itself
+    "xfce4-panel",
+    "xfwm4",
+    "xfdesktop4",
+    "xfce4-settings",
+    "dbus-x11",  # dbus-run-session, which the launcher wraps Xfce in
+    "xauth",
+    "x11-utils",  # xdpyinfo, xprop
+    "x11-xkb-utils",  # setxkbmap
+    "at-spi2-core",  # the accessibility bus `computer_use` reads
+    "libnss3",  # the first library PM's Chromium fails without
+    "libnspr4",
+]
+
+
+@pytest.mark.parametrize("package", SCREEN_PACKAGES)
+def test_the_image_carries_the_screen(package):
+    assert package in _dockerfile(), f"the box image no longer installs {package!r}"
+
+
+def test_the_screen_is_not_the_xfce4_metapackage():
+    """`xfce4` pulls in a screensaver, a power manager and a polkit agent that
+    lock or prompt a desktop nobody is sitting at."""
+    words = _dockerfile().replace("\\\n", " ").split()
+    assert "xfce4" not in words
+
+
+def test_the_screen_tools_are_not_on_the_volume():
+    """PM keeps its tools in `$HERMES_HOME/tools`, which is the agent's 1 GB
+    volume: Chromium, agent-browser and cua-driver are ~750 MB of it. Built
+    under a PM home of their own on the rootfs instead."""
+    text = _dockerfile()
+    assert "ENV FLOTTA_SCREEN_PM_HOME=/opt/hermes-pm" in text
+    assert 'HERMES_HOME="$FLOTTA_SCREEN_PM_HOME" hermes pm install agent-browser cua-driver' in text
+    assert "/data" not in "".join(
+        line for line in text.splitlines() if "SCREEN_PM_HOME=" in line or "/opt/screen" in line
+    )
+
+
+def test_hermes_is_pointed_at_the_baked_tools():
+    """Without these Hermes looks in PM's default store, which is the volume, and
+    reports the browser and `computer_use` as not installed."""
+    text = _dockerfile()
+    assert "ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/screen/chrome" in text
+    assert "ENV HERMES_CUA_DRIVER_CMD=/opt/screen/bin/cua-driver" in text
+    assert 'ENV PATH="/opt/screen/bin:${PATH}"' in text
+
+
+def test_computer_use_has_its_python_half():
+    """`computer_use` talks to cua-driver over MCP, from Hermes's `computer-use`
+    extra. Lazily installed it lands at run time, which a restart undoes."""
+    assert "--extra computer-use" in _dockerfile()
+
+
+def test_nothing_starts_a_screen_at_boot():
+    """An agent without a screen pays disk for this layer and never memory. The
+    switch is `flotta.box.screen`, per agent (Screen.3), not the entrypoint."""
+    entry = _entrypoint()
+    for starts in ("Xvnc", "screen start", "auto_start"):
+        assert starts not in entry
+
+
+def _screen_tools(tmp_path, env: dict) -> subprocess.CompletedProcess[str]:
+    script = _DOCKERFILE.parent / "screen_tools.py"
+    return subprocess.run(
+        [sys.executable, "-I", str(script), str(tmp_path / "screen")],
+        input=json.dumps(env),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _fake_pm_store(tmp_path):
+    """The layout `hermes pm install agent-browser cua-driver` leaves (v0.22.5)."""
+    tools = tmp_path / "tools"
+    browser = tools / "agent-browser-0.26.0-linux-x64" / "bin"
+    driver = tools / "cua-driver-0.21.0-linux-x64"
+    chrome = tools / "chromium-1208" / "chrome-linux64"
+    for directory, name in (
+        (browser, "agent-browser-linux-x64"),
+        (driver, "cua-driver"),
+        (chrome, "chrome"),
+    ):
+        directory.mkdir(parents=True)
+        (directory / name).write_text("#!/bin/sh\n")
+        (directory / name).chmod(0o755)
+    return {
+        "AGENT_BROWSER_EXECUTABLE_PATH": str(chrome / "chrome"),
+        "PATH": f"{tools / 'python-3.14.9-linux-x64' / 'bin'}:{driver}:{browser}",
+    }
+
+
+def test_the_screen_tools_are_linked_where_the_env_says(tmp_path):
+    """PM ships agent-browser as `agent-browser-linux-x64`; Hermes looks for plain
+    `agent-browser` on PATH. A missing link is a box whose browser tools all say
+    "agent-browser CLI not found" (Screen.1)."""
+    done = _screen_tools(tmp_path, _fake_pm_store(tmp_path))
+    assert done.returncode == 0, done.stderr
+    out = tmp_path / "screen"
+    assert (out / "chrome").resolve().name == "chrome"
+    assert (out / "bin" / "agent-browser").resolve().name == "agent-browser-linux-x64"
+    assert (out / "bin" / "cua-driver").resolve().name == "cua-driver"
+
+
+def test_a_missing_screen_tool_fails_the_build(tmp_path):
+    env = _fake_pm_store(tmp_path)
+    env["PATH"] = env["PATH"].rsplit(":", 1)[0]  # no agent-browser
+    done = _screen_tools(tmp_path, env)
+    assert done.returncode == 1 and "agent-browser" in done.stderr
+    assert _screen_tools(tmp_path / "x", {}).returncode == 1
+    assert "no JSON" in _screen_tools_raw(tmp_path, "warning: something\n").stderr
+
+
+def _screen_tools_raw(tmp_path, text: str) -> subprocess.CompletedProcess[str]:
+    script = _DOCKERFILE.parent / "screen_tools.py"
+    return subprocess.run(
+        [sys.executable, "-I", str(script), str(tmp_path / "raw")],
+        input=text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_the_browser_cache_is_not_on_the_volume():
+    """The profile (sign-ins) belongs on /data; its cache does not. Setting
+    AGENT_BROWSER_ARGS replaces Hermes's own root default, so the sandbox
+    flags it would have added must be repeated or Chromium will not start."""
+    line = next(
+        line for line in _dockerfile().splitlines() if line.startswith("ENV AGENT_BROWSER_ARGS=")
+    )
+    flags = line.split("=", 1)[1].split(",")
+    assert "--no-sandbox" in flags and "--disable-dev-shm-usage" in flags
+    cache = next(flag for flag in flags if flag.startswith("--disk-cache-dir="))
+    assert not cache.split("=", 1)[1].startswith("/data")
+    assert any(flag.startswith("--disk-cache-size=") for flag in flags)
