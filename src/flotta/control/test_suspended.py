@@ -539,7 +539,11 @@ def test_billing_never_lifts_the_operators_suspension(api, fleet, outbox):
     assert "operator" in answer.json()["detail"]
     with FleetStore(fleet) as store:
         org = store.get_org("agency-x")
-    assert (org.status, org.suspend_reason, org.suspended_by) == ("suspended", "held by hand", "t")
+    assert (org.status, org.suspend_reason, org.suspended_by) == (
+        "suspended",
+        "held by hand",
+        "operator",
+    )
     assert len(outbox) == told  # nobody is told it was resumed
 
 
@@ -564,5 +568,40 @@ def test_suspending_again_keeps_who_did_it_first(api, fleet):
     assert _suspend_as(api, GOVERNOR, "the payment failed").json()["changed"] is False
     with FleetStore(fleet) as store:
         org = store.get_org("agency-x")
-    assert (org.suspended_by, org.suspend_reason) == ("t", "held by hand")
+    assert (org.suspended_by, org.suspend_reason) == ("operator", "held by hand")
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
+
+
+def test_the_operator_holding_billings_suspension_makes_it_theirs(api, fleet, outbox):
+    """Billing suspended it for a failed payment; the operator then holds it by hand."""
+    _suspend_as(api, GOVERNOR, "the payment failed")
+    told = len(outbox)
+    answer = _suspend_as(api, OPERATOR, "held for a dispute")
+    assert answer.json()["changed"] is False
+    with FleetStore(fleet) as store:
+        org = store.get_org("agency-x")
+    assert (org.status, org.suspended_by, org.suspend_reason) == (
+        "suspended",
+        "operator",
+        "held for a dispute",
+    )
+    assert len(outbox) == told  # suspended already: nobody is told again
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
+
+
+def test_a_suspension_from_before_the_column_is_the_operators(api, fleet):
+    """Billing wasn't deployed before migration 35: any suspension then was made by hand."""
+    with FleetStore(fleet) as store:
+        store.suspend_org("agency-x", reason="held by hand", by="cli")
+        store._conn.execute("UPDATE orgs SET suspended_by = NULL WHERE id = 'agency-x'")
+    assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409
+    assert api.post("/api/orgs/agency-x/resume", headers=OPERATOR).json()["changed"] is True
+
+
+def test_an_operator_token_named_billing_is_still_the_operator(api, fleet):
+    scopes = {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN}
+    named_billing = {"Authorization": f"Bearer {mint(subject='billing', scopes=scopes, key=KEY)}"}
+    _suspend_as(api, named_billing, "held by hand")
+    with FleetStore(fleet) as store:
+        assert store.get_org("agency-x").suspended_by == "operator"
     assert api.post("/api/orgs/agency-x/resume", headers=GOVERNOR).status_code == 409

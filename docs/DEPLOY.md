@@ -834,9 +834,11 @@ suspend or resume changes nothing and emails nobody, so a webhook delivered
 twice is harmless.
 
 **Billing lifts only its own suspension** (FLOTTA-190). An org records who
-suspended it (`suspended_by`: `billing`, or whoever else did). Billing's resume
-of an org you suspended by hand answers 409 and changes nothing, so an agency
-you hold stays held when it next pays. You can resume either kind yourself. The default org is the operator's own and is never suspended.
+suspended it (`suspended_by`: `billing` or `operator`). Billing's resume of an
+org you suspended by hand answers 409 and changes nothing, so an agency you hold
+stays held when it next pays. Suspending an org billing already suspended makes
+the hold yours, without telling its owners again. A suspension from before this
+counts as yours. You can resume either kind yourself. The default org is the operator's own and is never suspended.
 
 ### Self-serve approval and the starting cap (FLOTTA-185)
 

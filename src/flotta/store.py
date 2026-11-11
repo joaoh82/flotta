@@ -608,7 +608,7 @@ class Org:
     suspended_at: str | None = None
     suspend_reason: str | None = None
     #: Who suspended it (FLOTTA-190): `BILLING` for the hosted product's
-    #: billing, otherwise who did. Billing resumes only its own.
+    #: billing, `OPERATOR` otherwise. Billing resumes only its own.
     suspended_by: str | None = None
 
     def limit(self, kind: str) -> int | None:
@@ -1273,8 +1273,10 @@ class UsageSum:
     machine_seconds: int
 
 
-#: `Org.suspended_by` for a suspension the hosted product's billing made (FLOTTA-190).
+#: `Org.suspended_by`: the hosted product's billing made the suspension, or
+#: the operator did (FLOTTA-190). Who exactly is on the agents' timelines.
 BILLING = "billing"
+OPERATOR = "operator"
 
 
 class HeldByOperatorError(InvalidTransitionError):
@@ -2009,8 +2011,22 @@ class FleetStore:
                     "the default org is the operator's own fleet; it is never suspended"
                 )
             if org.status == wanted:
+                # The operator holding an org billing already suspended makes the
+                # hold theirs, so its next payment doesn't lift it. Nobody is
+                # told twice: it was suspended already (the review of #233).
+                if suspend and not as_billing and org.suspended_by == BILLING:
+                    self._conn.execute(
+                        "UPDATE orgs SET suspended_by = ?, suspend_reason = ? WHERE id = ?",
+                        (OPERATOR, reason or org.suspend_reason, org_id),
+                    )
+                    held = self.get_org(org_id)
+                    assert held is not None
+                    return held, False
                 return org, False
-            if not suspend and as_billing and (org.suspended_by or BILLING) != BILLING:
+            # Billing lifts only its own. A suspension with no `suspended_by` is
+            # from before migration 35, when only the operator suspended an org
+            # by hand (billing wasn't deployed): the operator's.
+            if not suspend and as_billing and org.suspended_by != BILLING:
                 raise HeldByOperatorError(
                     f"org {org_id!r} was suspended by the operator; only the operator can resume it"
                 )
@@ -2028,7 +2044,8 @@ class FleetStore:
                     wanted,
                     _utcnow() if suspend else None,
                     reason if suspend else None,
-                    (BILLING if as_billing else (by or "operator")) if suspend else None,
+                    # A fixed kind, never the caller's subject, which could be named `billing`.
+                    (BILLING if as_billing else OPERATOR) if suspend else None,
                     org_id,
                 ),
             )

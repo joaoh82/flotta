@@ -1130,10 +1130,10 @@ MIGRATIONS: tuple[Migration, ...] = (
         "suspended by: who suspended an org, so billing lifts only its own",
         # FLOTTA-190 (M15.8). `billing` when the hosted product's billing
         # (`org:govern`) suspended it, for a failed payment or an ended
-        # subscription; otherwise who did (the operator). Billing may resume
-        # only its own (Josh, 11 Nov 2026). NULL while the org is not
-        # suspended, and for one suspended before this, which is billing's,
-        # since nothing else suspended an org until now.
+        # subscription; `operator` otherwise. Billing may resume only its own
+        # (Josh, 11 Nov 2026). NULL while the org is not suspended, and for one
+        # suspended before this, which counts as the operator's: billing wasn't
+        # deployed, so any suspension then was made by hand.
         ("ALTER TABLE orgs ADD COLUMN suspended_by TEXT",),
     ),
 )
