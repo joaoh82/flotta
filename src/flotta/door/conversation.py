@@ -81,6 +81,34 @@ agency tested.
 span every conversation, so a client asking it in words can still reach them.
 That is for guardrails (FLOTTA-124), and it is why this says what a *ticket* can
 open rather than what a client can learn.
+
+## The agent's screen (FLOTTA-210)
+
+A ticket's screen grant (`Token.screen`, FLOTTA-209) adds Hermes's `display.*`
+methods, and only those in `screen_methods`:
+
+- **`watch`:** `display.status`, `display.thumbnail` and `display.observe`.
+- **`control`:** those, and `display.lease.acquire`, `display.lease.release`
+  (`force` included) and `display.start`.
+- **No ticket, whatever it says:** `display.install`, `display.stop` and
+  `display.switchSandboxImage` (`NEVER_FOR_A_TICKET`). They belong to the image
+  and the operator, not to a viewer. That holds for a full-access ticket too,
+  which is otherwise forwarded unread.
+
+The `display.lease` and `display.status` events reach a ticket's socket only
+when it has a grant, and no other `display.*` event reaches one.
+
+**`watch` can never drive, even with input crafted by hand.** Hermes's
+`rfb_filter.py` drops keyboard, pointer and clipboard input on
+`/api/display/ws` from any viewer that doesn't hold the lease, and the lease is
+taken only with `display.lease.acquire`, which `watch` is refused here. noVNC's
+`viewOnly` is the page's courtesy; that filter is the gate.
+
+**The viewer id is per Hermes connection.** `display.observe` mints it on the
+socket that asked (`_minted_for_this_connection`), and the lease methods refuse
+one minted elsewhere. The door opens one socket to the box for each socket a
+person opens, so the id a person was given works on their own socket and on no
+one else's.
 """
 
 from __future__ import annotations
@@ -94,6 +122,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from flotta.approval_choices import CLIENT_APPROVAL_CHOICES
+from flotta.auth import SCREEN_CONTROL, SCREEN_WATCH
 
 if TYPE_CHECKING:
     from flotta.door.turns import TurnRecorder
@@ -115,6 +144,38 @@ CONVERSATION_METHODS: dict[str, frozenset[str]] = {
     "image.detach": frozenset({"session_id", "path"}),
     "request.answer": frozenset({"id", "result"}),
 }
+
+#: What a `watch` grant adds, and the parameters each may carry. Never `profile`:
+#: a ticket's screen is its own agent's, whatever profile it names.
+SCREEN_WATCH_METHODS: dict[str, frozenset[str]] = {
+    "display.status": frozenset(),
+    "display.thumbnail": frozenset(),
+    "display.observe": frozenset({"viewer_id"}),
+}
+#: What a `control` grant adds to those.
+SCREEN_CONTROL_METHODS: dict[str, frozenset[str]] = {
+    **SCREEN_WATCH_METHODS,
+    "display.start": frozenset(),
+    "display.lease.acquire": frozenset({"viewer_id", "reason"}),
+    "display.lease.release": frozenset({"viewer_id", "force"}),
+}
+#: The image's and the operator's, never a viewer's, whatever a ticket says.
+NEVER_FOR_A_TICKET = frozenset({"display.install", "display.stop", "display.switchSandboxImage"})
+#: The screen's events a socket with a grant hears.
+SCREEN_EVENTS = frozenset({"display.lease", "display.status"})
+SCREEN_PREFIX = "display."
+
+assert not NEVER_FOR_A_TICKET & (SCREEN_CONTROL_METHODS.keys() | CONVERSATION_METHODS.keys())
+
+
+def screen_methods(grant: str | None) -> dict[str, frozenset[str]]:
+    """The `display.*` methods a ticket's screen grant opens, with their parameters."""
+    if grant == SCREEN_CONTROL:
+        return SCREEN_CONTROL_METHODS
+    if grant == SCREEN_WATCH:
+        return SCREEN_WATCH_METHODS
+    return {}
+
 
 #: The extra method of a ticket that may answer approvals.
 APPROVAL_RESPOND = "approval.respond"
@@ -247,6 +308,10 @@ class ConversationGate:
 
     `conversation_only` is the ticket's answer: `False` forwards everything but
     the one question whose answer depends on who is asking.
+
+    `screen` is a ticket's screen grant, and `None` for a socket opened with a
+    token rather than a ticket, whose frames this leaves to Hermes as before:
+    such a token reaches all of Hermes over plain HTTP anyway.
     """
 
     def __init__(
@@ -258,8 +323,11 @@ class ConversationGate:
         conversation_only: bool,
         answers_approvals: bool = False,
         turns: TurnRecorder | None = None,
+        screen: str | None = None,
     ) -> None:
         self._box_id = box_id
+        self.screen = screen
+        self._screen_methods = screen_methods(screen)
         #: Records each turn as a run (M14.6). Told every frame first, before
         #: anything here decides what passes: an approval kept from a client
         #: was still asked.
@@ -351,12 +419,44 @@ class ConversationGate:
     async def _from_client(self, frame: str | bytes) -> Step:
         if self.conversation_only:
             return await self._confined(frame)
+        if self.screen is not None:
+            screened = self._screen_frame(frame)
+            if screened is not None:
+                return screened
         if isinstance(frame, bytes) or "session.most_recent" not in frame:
             return Step(to_box=frame)
         parsed = _parse(frame)
         if parsed is None or parsed.get("method") != "session.most_recent":
             return Step(to_box=frame)
         return await self._agency_latest(parsed.get("id"), frame)
+
+    def _screen_frame(self, frame: str | bytes) -> Step | None:
+        """A full-access ticket's `display.*` call: refused, or rebuilt. `None` for anything else.
+
+        Refused unless its grant opens it, and rebuilt from the method's
+        parameters as a client's is, so `profile` never reaches Hermes's
+        profile-scoped handlers from any ticket. Read only when it could name
+        one: a method's name has `display` in it unless a character of it is a
+        JSON `\\u` escape. Hermes reads text frames alone, one object each, so a
+        binary frame or a batch calls nothing.
+        """
+        if isinstance(frame, bytes) or ("display" not in frame and "\\u" not in frame):
+            return None
+        parsed = _parse(frame)
+        method = parsed.get("method") if parsed is not None else None
+        if parsed is None or not isinstance(method, str) or not method.startswith(SCREEN_PREFIX):
+            return None
+        rid = parsed.get("id")
+        allowed = self._screen_methods.get(method)
+        if allowed is None:
+            self._note(f"the method {method[:80]!r}")
+            return Step(to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket"))
+        raw = parsed.get("params")
+        params = {k: v for k, v in raw.items() if k in allowed} if isinstance(raw, dict) else {}
+        rebuilt: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+        if "id" in parsed:
+            rebuilt["id"] = rid
+        return Step(to_box=json.dumps(rebuilt))
 
     async def _agency_latest(self, rid: Any, frame: str) -> Step:
         try:
@@ -470,6 +570,8 @@ class ConversationGate:
             return None
         if method == APPROVAL_RESPOND and self.answers_approvals:
             return _APPROVAL_RESPOND_PARAMS
+        if method in self._screen_methods:
+            return self._screen_methods[method]
         return CONVERSATION_METHODS.get(method)
 
     async def _client_latest(self, rid: Any) -> Step:
@@ -494,6 +596,8 @@ class ConversationGate:
         """What to send the client for a frame from the box, if anything."""
         if self._turns is not None:
             self._turns.heard_box(frame)
+        if self.screen is not None and self._screen_event_withheld(frame):
+            return None
         if self._withheld and '"message.complete"' in frame:
             self._turn_ended(frame)
         if self.conversation_only:
@@ -518,6 +622,23 @@ class ConversationGate:
             self._resuming.discard(rid)
             self._hear_live(parsed)
         return frame
+
+    def _screen_event_withheld(self, frame: str) -> bool:
+        """Whether a ticket's socket is kept from this `display.*` event.
+
+        Hermes broadcasts them to every socket it has. A socket with a grant
+        hears `SCREEN_EVENTS`; nothing else of the screen's reaches a ticket.
+        """
+        if f'"{SCREEN_PREFIX}' not in frame:
+            return False
+        parsed = _parse(frame)
+        params = parsed.get("params") if parsed is not None else None
+        if parsed is None or parsed.get("method") != "event" or not isinstance(params, dict):
+            return False
+        kind = params.get("type")
+        if not isinstance(kind, str) or not kind.startswith(SCREEN_PREFIX):
+            return False
+        return not (self._screen_methods and kind in SCREEN_EVENTS)
 
     def _without_approvals(self, frame: str) -> str | None:
         """`frame` with any approval taken out, noting what else the box asks here."""
