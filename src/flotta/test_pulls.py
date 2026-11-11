@@ -1,7 +1,8 @@
-"""The pull requests agents open, and the reviews they follow (FLOTTA-171, FLOTTA-172).
+"""The pull requests agents open, the reviews they follow, and their deploys
+(FLOTTA-171, FLOTTA-172, FLOTTA-174).
 
-GitHub is a fake that answers the four reads and the merge as GitHub's REST
-docs say it does. The store is real.
+GitHub is a fake that answers the reads and the merge as GitHub's REST docs say
+it does. The store is real.
 """
 
 from __future__ import annotations
@@ -35,6 +36,10 @@ class FakeGitHub:
         self.merged: list[tuple[int, str]] = []
         self.calls: list[tuple[str, str]] = []
         self.refuse_merge: tuple[int, str] | None = None
+        #: sha -> deployments, and deployment id -> its statuses, newest first.
+        self.deployments: dict[str, list] = {}
+        self.statuses: dict[int, list] = {}
+        self.refuse_deployments: int | None = None
 
     def open(self, number: int, *, author: str = BOT, created: datetime = NOW - timedelta(hours=1)):
         self.pulls[number] = {
@@ -49,8 +54,34 @@ class FakeGitHub:
             "merged_at": None,
             "merged_by": None,
             "closed_at": None,
+            # GitHub's test merge while it is open: not something anyone deploys.
+            "merge_commit_sha": f"test{number}",
         }
         return self
+
+    def merge_on_github(self, number: int, *, at: datetime = NOW, by: str = "ana") -> str:
+        sha = f"sha{number}"
+        self.pulls[number].update(
+            state="closed", merged_at=_gh(at), merged_by={"login": by}, merge_commit_sha=sha
+        )
+        return sha
+
+    def deploy(self, sha, environment, *, production=None, at=NOW, state=None, url=None):
+        """A deployment of `sha`, with one status when `state` is given. Its id."""
+        number = 100 + sum(len(v) for v in self.deployments.values())
+        found = {"id": number, "sha": sha, "environment": environment, "created_at": _gh(at)}
+        if production is not None:
+            found["production_environment"] = production
+        self.deployments.setdefault(sha, []).append(found)
+        if state:
+            self.status(number, state, at=at, url=url)
+        return number
+
+    def status(self, deployment, state, *, at=NOW, url=None, target=None):
+        self.statuses.setdefault(deployment, []).insert(
+            0,
+            {"state": state, "created_at": _gh(at), "environment_url": url, "target_url": target},
+        )
 
     def review(self, number, login, state, body="", *, at, association="MEMBER", kind="User"):
         self.reviews.setdefault(number, []).append(
@@ -91,6 +122,14 @@ class FakeGitHub:
         self.calls.append((method, path))
         assert kwargs["headers"]["Authorization"] == "Bearer tok"
         parts = path.strip("/").split("/")  # repos/acme/app/{pulls|issues}/n[/...]
+        if parts[3] == "deployments":
+            if self.refuse_deployments:
+                return self.refuse_deployments, {
+                    "message": "Resource not accessible by integration"
+                }
+            if len(parts) == 4:
+                return 200, list(self.deployments.get(kwargs["params"]["sha"], []))
+            return 200, self.statuses.get(int(parts[4]), [])[: kwargs["params"]["per_page"]]
         number = int(parts[4])
         if number not in self.pulls:
             return 404, {"message": "Not Found"}
@@ -100,7 +139,10 @@ class FakeGitHub:
                 return self.refuse_merge[0], {"message": self.refuse_merge[1]}
             self.merged.append((number, kwargs["json"]["merge_method"]))
             self.pulls[number].update(
-                state="closed", merged_at=_gh(NOW), merged_by={"login": "olivia"}
+                state="closed",
+                merged_at=_gh(NOW),
+                merged_by={"login": "olivia"},
+                merge_commit_sha=f"sha{number}",
             )
             return 200, {"merged": True}
         if tail is None:
@@ -301,22 +343,172 @@ def test_the_policy_is_off_for_merging_and_on_for_reviews_until_changed(store):
 # -- the sweep -----------------------------------------------------------------
 
 
-def test_the_sweep_keeps_state_and_verdict_and_stops_at_a_merge(store, github):
+def test_the_sweep_keeps_state_and_verdict_and_stops_at_a_deploy(store, github):
     github.open(7)
     pr = _report(store, github, 7)
     github.review(7, "ana", "APPROVED", at=NOW - timedelta(minutes=10))
     _sweep(store, github)
     pr = store.get_pull_request(pr.id)
     assert pr.review_state == "approved" and pr.checked_at == NOW.isoformat()
+    assert pr.merge_sha is None, "an open PR's merge commit is GitHub's test merge"
 
-    github.pulls[7].update(state="closed", merged_at=_gh(NOW), merged_by={"login": "ana"})
+    sha = github.merge_on_github(7, at=NOW + timedelta(minutes=4))
     _sweep(store, github, now=NOW + timedelta(minutes=5))
     pr = store.get_pull_request(pr.id)
-    assert (pr.state, pr.merged_by) == ("merged", "ana")
+    assert (pr.state, pr.merged_by, pr.merge_sha) == ("merged", "ana", sha)
+    assert pr.deploy_state is None, "nothing has deployed it yet"
+
+    github.deploy(
+        sha, "Production", production=True, at=NOW + timedelta(minutes=9), state="success"
+    )
+    _sweep(store, github, now=NOW + timedelta(minutes=10))
+    assert store.get_pull_request(pr.id).deploy_state == "success"
 
     github.calls.clear()
     _sweep(store, github, now=NOW + timedelta(hours=1))
-    assert github.calls == [], "a merged pull request is never read again"
+    assert github.calls == [], "once deployed, a merged pull request is never read again"
+
+
+def test_a_closed_pull_request_is_never_read_again(store, github):
+    github.open(7)
+    _report(store, github, 7)
+    github.pulls[7].update(state="closed", closed_at=_gh(NOW))
+    _sweep(store, github)
+    github.calls.clear()
+    _sweep(store, github, now=NOW + timedelta(hours=1))
+    assert github.calls == []
+
+
+# -- deployed (FLOTTA-174) ---------------------------------------------------
+
+
+def _merged(store, github, number=7):
+    github.open(number)
+    pr = _report(store, github, number)
+    sha = github.merge_on_github(number, at=NOW - timedelta(minutes=1))
+    _sweep(store, github)
+    return store.get_pull_request(pr.id), sha
+
+
+def _events(store, kind):
+    box = _box(store)
+    return [e for e in store.get_events("box", box.id) if e.type == kind]
+
+
+def test_a_merged_pull_request_follows_its_deploy_until_it_succeeds(store, github):
+    pr, sha = _merged(store, github)
+    deployment = github.deploy(sha, "production", at=NOW + timedelta(minutes=1))
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deploy_environment, pr.deployed_at) == (
+        "pending",
+        "production",
+        None,
+    ), "a deployment with no status yet is pending"
+
+    github.status(deployment, "in_progress", at=NOW + timedelta(minutes=5))
+    _sweep(store, github, now=NOW + timedelta(minutes=8))
+    assert store.get_pull_request(pr.id).deploy_state == "in_progress"
+    assert _events(store, "pull_request_deployed") == []
+
+    done = NOW + timedelta(minutes=10)
+    github.status(deployment, "success", at=done, url="https://app.acme.dev")
+    _sweep(store, github, now=NOW + timedelta(minutes=12))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deploy_url, pr.deployed_at) == (
+        "success",
+        "https://app.acme.dev",
+        done.isoformat(),
+    )
+    (event,) = _events(store, "pull_request_deployed")
+    assert event.payload["environment"] == "production"
+
+
+def test_a_failed_deploy_is_said_and_a_later_success_still_counts(store, github):
+    pr, sha = _merged(store, github)
+    deployment = github.deploy(sha, "production", state="failure")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    assert store.get_pull_request(pr.id).deploy_state == "failure"
+    github.status(deployment, "success", at=NOW + timedelta(minutes=6))
+    _sweep(store, github, now=NOW + timedelta(minutes=8))
+    assert store.get_pull_request(pr.id).deploy_state == "success"
+
+
+def test_production_is_preferred_over_a_newer_preview(store, github):
+    pr, sha = _merged(store, github)
+    github.deploy(sha, "Production", at=NOW, state="success")
+    github.deploy(sha, "Preview", production=False, at=NOW + timedelta(minutes=1), state="success")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    assert store.get_pull_request(pr.id).deploy_environment == "Production"
+
+
+def test_with_only_a_preview_it_says_the_preview(store, github):
+    pr, sha = _merged(store, github)
+    github.deploy(sha, "Preview", production=False, state="success")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deploy_environment) == ("success", "Preview")
+
+
+def test_a_link_that_is_not_https_is_not_kept(store, github):
+    pr, sha = _merged(store, github)
+    github.deploy(sha, "production", state="success", url="javascript:alert(1)")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    assert store.get_pull_request(pr.id).deploy_url is None
+
+
+def test_a_token_that_cannot_see_deployments_says_so_and_stays_merged(store, github):
+    pr, sha = _merged(store, github)
+    github.refuse_deployments = 403
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert pr.state == "merged" and pr.deploy_state is None
+    assert "Deployments: read" in (pr.check_error or "")
+    github.refuse_deployments = None
+    github.deploy(sha, "production", state="success")
+    _sweep(store, github, now=NOW + timedelta(minutes=8))
+    pr = store.get_pull_request(pr.id)
+    assert pr.deploy_state == "success" and pr.check_error is None
+
+
+def test_a_merge_with_no_deploy_is_read_less_often_and_then_not_at_all(store, github):
+    pr, _ = _merged(store, github)
+    hour = NOW + timedelta(seconds=pulls.DEPLOY_SOON_S + 60)
+    assert _sweep(store, github, now=hour) == 1
+    assert _sweep(store, github, now=hour + timedelta(seconds=pulls.POLL_S + 1)) == 0
+    later = hour + timedelta(seconds=pulls.DEPLOY_LATER_POLL_S + 1)
+    assert _sweep(store, github, now=later) == 1
+    past = NOW + timedelta(seconds=pulls.DEPLOY_WATCH_S + 60)
+    assert _sweep(store, github, now=past) == 0
+    assert store.get_pull_request(pr.id).deploy_state is None
+
+
+def test_one_merged_before_its_merge_commit_was_kept_is_read_for_it(store, github):
+    github.open(7)
+    pr = _report(store, github, 7)
+    sha = github.merge_on_github(7, at=NOW - timedelta(minutes=1))
+    store.update_pull_request(
+        pr.id, state="merged", merged_at=(NOW - timedelta(minutes=1)).isoformat()
+    )
+    github.deploy(sha, "production", state="success")
+    _sweep(store, github)
+    pr = store.get_pull_request(pr.id)
+    assert (pr.merge_sha, pr.deploy_state) == (sha, "success")
+
+
+def test_a_pull_request_keeps_the_run_its_agent_was_in(store, github):
+    box = _box(store)
+    run = store.create_run(
+        box.id, "do the thing", trigger_kind="request", now=NOW - timedelta(hours=1)
+    )
+    store.start_run(run.id, now=NOW - timedelta(hours=1))
+    github.open(7)
+    pr = _report(store, github, 7, now=NOW - timedelta(minutes=30))
+    assert pr.run_id == run.id
+    assert [p.id for p in store.pull_requests_of_runs([run.id, None])] == [pr.id]
+    github.open(8)
+    store.finish_run(run.id, "done", output="ok", now=NOW - timedelta(minutes=20))
+    assert _report(store, github, 8, now=NOW - timedelta(minutes=10)).run_id is None
 
 
 def test_a_pull_request_is_not_read_more_often_than_the_poll(store, github):
@@ -597,3 +789,47 @@ def test_a_repository_token_is_reused_while_the_grant_stands(store):
     store.revoke_repo(box.id, "acme/app")
     held(store, box, "acme/app")
     assert len(asked) == 3
+
+
+# -- from the review of #230 ---------------------------------------------------
+
+
+def test_a_preview_that_succeeds_first_does_not_end_the_wait_for_production(store, github):
+    pr, sha = _merged(store, github)
+    github.deploy(sha, "Preview", production=False, at=NOW, state="success")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deploy_environment, pr.deploy_production) == (
+        "success",
+        "Preview",
+        False,
+    )
+    assert _events(store, "pull_request_deployed") == [], "a preview is not live"
+    github.deploy(sha, "Production", at=NOW + timedelta(minutes=5), state="success")
+    assert _sweep(store, github, now=NOW + timedelta(minutes=8)) == 1, "still read"
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_environment, pr.deploy_production) == ("Production", True)
+    assert len(_events(store, "pull_request_deployed")) == 1
+    assert _sweep(store, github, now=NOW + timedelta(minutes=12)) == 0, "and then not"
+
+
+def test_a_deploy_made_inactive_by_a_newer_one_was_still_live(store, github):
+    pr, sha = _merged(store, github)
+    deployment = github.deploy(sha, "production", at=NOW, state="success", url="https://a.dev")
+    github.status(deployment, "inactive", at=NOW + timedelta(minutes=2))
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deployed_at, pr.deploy_url) == (
+        "success",
+        NOW.isoformat(),
+        "https://a.dev",
+    )
+
+
+def test_a_build_log_is_not_a_link_to_what_went_live(store, github):
+    pr, sha = _merged(store, github)
+    deployment = github.deploy(sha, "production")
+    github.status(deployment, "success", target="https://vercel.com/acme/app/inspect/123")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert pr.deploy_state == "success" and pr.deploy_url is None

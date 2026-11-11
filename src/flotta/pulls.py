@@ -20,8 +20,24 @@ exist, or for a repository it was never given. A PR opened some other way, with
 
 `sweep` reads every open PR again every `POLL_S`: its state, its reviews and
 its comments. There is no webhook (the App's is off, and turning it on would
-send every PR on a repository, not just the agents'). Merged and closed PRs are
-never read again.
+send every PR on a repository, not just the agents'). Closed PRs are never read
+again.
+
+## Deployed (FLOTTA-174)
+
+A client wants to know when the work they asked for is live, and merged is not
+that. A merged PR goes on being read, for GitHub's deployments of its merge
+commit only (`read_deployment`), until one to production has succeeded (a
+preview's success is shown meanwhile): every `POLL_S` for
+`DEPLOY_SOON_S` after the merge, then every `DEPLOY_LATER_POLL_S` until
+`DEPLOY_WATCH_S`, then never. Vercel, Netlify, Render and GitHub Actions
+environments all record deployments there; a repository whose deploys record
+nothing stays "merged", which is the truth as far as anyone can see. A
+production environment is preferred over a preview of the same commit.
+
+The repository token needs **Deployments: read**. On a GitHub App connection
+made before the App asked for it, GitHub refuses, and the PR says so to the
+agency (`check_error`) and stays merged for its client.
 
 ## Following reviews (FLOTTA-172)
 
@@ -61,6 +77,7 @@ from typing import Any
 
 from flotta.github import API_HEADERS, API_ROOT
 from flotta.runs import MAX_INPUT
+from flotta.store import DEPLOY_STATES as _DEPLOY_STATES
 
 _log = logging.getLogger(__name__)
 
@@ -88,6 +105,21 @@ MAX_FEEDBACK_JSON = MAX_INPUT - 1_000
 TIMEOUT_S = 10.0
 #: How long a repository token is reused by the sweep. GitHub's last an hour.
 TOKEN_REUSE_S = 30 * 60
+#: After a merge, how long it is read for its deploy as often as an open PR.
+DEPLOY_SOON_S = 60 * 60
+#: After that, how often, until `DEPLOY_WATCH_S` after the merge.
+DEPLOY_LATER_POLL_S = 30 * 60
+#: How long after a merge a deploy is looked for at all. A release train slower
+#: than a day is not watched for: the PR says merged, and stays so.
+DEPLOY_WATCH_S = 24 * 60 * 60
+#: Deployments of one commit read, newest first. One per environment is usual.
+MAX_DEPLOYMENTS = 30
+#: Statuses of the chosen deployment read, newest first. GitHub marks a
+#: deployment `inactive` once a newer one to its environment succeeds, so the
+#: success it had may be a few statuses back by the time it is read.
+MAX_STATUSES = 10
+#: Environment names that mean production when GitHub's flag is not set.
+PRODUCTION_NAMES: frozenset[str] = frozenset({"production", "prod", "live"})
 
 #: Who may set an agent to work by commenting (`author_association`).
 SAYS_SO: frozenset[str] = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
@@ -182,6 +214,8 @@ def read_pull(fetch: Fetch, token: str, repo: str, number: int) -> dict[str, Any
     merged_at = _instant(body.get("merged_at"))
     state = "merged" if merged_at else ("open" if body.get("state") == "open" else "closed")
     head, base = body.get("head") or {}, body.get("base") or {}
+    # On an open PR GitHub's `merge_commit_sha` is a test merge nobody deploys.
+    sha = body.get("merge_commit_sha")
     return {
         "url": str(body.get("html_url") or f"https://github.com/{repo}/pull/{number}"),
         "title": str(body.get("title") or f"#{number}")[:300],
@@ -194,6 +228,67 @@ def read_pull(fetch: Fetch, token: str, repo: str, number: int) -> dict[str, Any
         "merged_at": merged_at,
         "merged_by": _login(body.get("merged_by")),
         "closed_at": _instant(body.get("closed_at")),
+        "merge_sha": sha if state == "merged" and isinstance(sha, str) and sha else None,
+    }
+
+
+def read_deployment(fetch: Fetch, token: str, repo: str, sha: str) -> dict[str, Any] | None:
+    """GitHub's deployment of `sha`, as the store keeps it, or None for none yet.
+
+    A production one if there is one (GitHub's `production_environment`, or an
+    environment called production), else the newest; and its state: `success`
+    if any of its statuses was one (a deployment that went live and was later
+    made `inactive` by a newer one was still live), else the latest, which is
+    `pending` while it has none. `deployed_at` is when it succeeded. The link
+    is the status's `environment_url` only: `target_url` is the provider's
+    build log, often behind its sign-in, not the thing that went live.
+    Refused (403, or the 404 GitHub gives for a permission it hides) is
+    PullError, in words that say which permission.
+    """
+    status, body = _ask(
+        fetch,
+        token,
+        "GET",
+        f"/repos/{repo}/deployments",
+        params={"sha": sha, "per_page": MAX_DEPLOYMENTS},
+    )
+    if status in (403, 404):
+        raise PullError(
+            f"GitHub would not show {repo}'s deployments: the token needs Deployments: read"
+        )
+    if status != 200 or not isinstance(body, list):
+        raise PullError(f"GitHub answered {status} for {repo}'s deployments")
+    found = [d for d in body if isinstance(d, dict) and d.get("id") is not None]
+    if not found:
+        return None
+
+    def production(d: dict[str, Any]) -> bool:
+        name = str(d.get("environment") or "").strip().lower()
+        return d.get("production_environment") is True or name in PRODUCTION_NAMES
+
+    found.sort(key=lambda d: (production(d), str(d.get("created_at") or "")), reverse=True)
+    chosen = found[0]
+    status, statuses = _ask(
+        fetch,
+        token,
+        "GET",
+        f"/repos/{repo}/deployments/{chosen['id']}/statuses",
+        params={"per_page": MAX_STATUSES},
+    )
+    if status != 200 or not isinstance(statuses, list):
+        raise PullError(f"GitHub answered {status} for {repo}'s deployment {chosen['id']}")
+    kept = [st for st in statuses if isinstance(st, dict)]
+    succeeded = [st for st in kept if st.get("state") == "success"]
+    # Newest first: the latest success, when there was one, else the latest word.
+    shown = succeeded[0] if succeeded else (kept[0] if kept else {})
+    state = "success" if succeeded else str(shown.get("state") or "pending")
+    url = shown.get("environment_url")
+    return {
+        "deploy_state": state if state in _DEPLOY_STATES else "pending",
+        "deploy_environment": str(chosen.get("environment") or "")[:100] or None,
+        "deploy_url": url if isinstance(url, str) and url.startswith("https://") else None,
+        "deployed_at": _instant(shown.get("created_at")) if succeeded else None,
+        "deploy_production": production(chosen),
     }
 
 
@@ -459,11 +554,22 @@ def following(store: Any, pr: Any) -> str | None:
     return None
 
 
-def view(store: Any, pr: Any) -> dict[str, Any]:
-    """A pull request as the API says it."""
+#: What a client's people are not shown of a pull request (FLOTTA-174): why
+#: the last look at GitHub failed is the agency's to fix, and the rest is how
+#: Flotta follows the PR rather than what happened to it.
+AGENCY_ONLY: frozenset[str] = frozenset(
+    {"check_error", "checked_at", "feedback_seen_at", "followup_run_id", "run_id", "author_login"}
+)
+
+
+def view(store: Any, pr: Any, *, for_client: bool = False) -> dict[str, Any]:
+    """A pull request as the API says it. `for_client` leaves out `AGENCY_ONLY`."""
     out = asdict(pr)
     out["following"] = following(store, pr)
     out["followup_limit"] = MAX_FOLLOWUPS
+    if for_client:
+        for key in AGENCY_ONLY:
+            out.pop(key, None)
     return out
 
 
@@ -477,6 +583,9 @@ def check(store: Any, pr: Any, *, token_for: TokenFor, fetch: Fetch, now: dateti
         return store.update_pull_request(pr.id, checked_at=checked, check_error="its agent is gone")
     try:
         token = token_for(store, box, pr.repo)
+        if pr.state == "merged":
+            # Done on GitHub: only its deploy is still to come (FLOTTA-174).
+            return deployed(store, pr, fetch=fetch, token=token, checked=checked)
         fresh = read_pull(fetch, token, pr.repo, pr.number)
         changes: dict[str, Any] = {
             key: fresh[key]
@@ -489,6 +598,7 @@ def check(store: Any, pr: Any, *, token_for: TokenFor, fetch: Fetch, now: dateti
                 "merged_at",
                 "merged_by",
                 "closed_at",
+                "merge_sha",
             )
         }
         reviews, lines, comments = read_reviews(
@@ -523,12 +633,46 @@ def check(store: Any, pr: Any, *, token_for: TokenFor, fetch: Fetch, now: dateti
             {"repo": pr.repo, "number": pr.number, "by": fresh.get("merged_by")},
         )
     pr = store.update_pull_request(pr.id, **changes)
+    if pr.state == "merged":
+        return deployed(store, pr, fetch=fetch, token=token, checked=checked)
     if pr.state != "open":
         return pr
     feedback = feedback_from(reviews, lines, comments, after=pr.feedback_seen_at, own=own)
     if feedback:
         pr = follow_up(store, pr, feedback, now=now)
     return pr
+
+
+def deployed(store: Any, pr: Any, *, fetch: Fetch, token: str, checked: str) -> Any:
+    """Read a merged PR's deployment, and keep what GitHub says. The PR, as now kept.
+
+    Production's first success is an event on its agent, and the last read:
+    the sweep looks no more (`FleetStore.pulls_to_check`). A preview's success
+    is kept and said, and reading goes on, since production may follow.
+    """
+    try:
+        sha = pr.merge_sha or read_pull(fetch, token, pr.repo, pr.number)["merge_sha"]
+        if sha is None:
+            return store.update_pull_request(pr.id, checked_at=checked, check_error=None)
+        found = read_deployment(fetch, token, pr.repo, sha)
+    except PullError as exc:
+        return store.update_pull_request(pr.id, checked_at=checked, check_error=exc.detail)
+    changes: dict[str, Any] = {"merge_sha": sha, "checked_at": checked, "check_error": None}
+    if found is not None:
+        changes.update(found)
+        live = found["deploy_state"] == "success" and found["deploy_production"]
+        if live and not (pr.deploy_state == "success" and pr.deploy_production):
+            store.add_event(
+                "box",
+                pr.box_id,
+                "pull_request_deployed",
+                {
+                    "repo": pr.repo,
+                    "number": pr.number,
+                    "environment": found["deploy_environment"],
+                },
+            )
+    return store.update_pull_request(pr.id, **changes)
 
 
 def follow_up(store: Any, pr: Any, feedback: list[Feedback], *, now: datetime) -> Any:
@@ -575,9 +719,20 @@ def follow_up(store: Any, pr: Any, feedback: list[Feedback], *, now: datetime) -
 
 
 def sweep(store: Any, *, token_for: TokenFor, fetch: Fetch, now: datetime | None = None) -> int:
-    """Read every open PR that is due. How many were read."""
+    """Read every open PR that is due, and every merged one waiting on its deploy.
+    How many were read."""
     moment = now or datetime.now(UTC)
-    due = store.pulls_to_check(before=moment - timedelta(seconds=POLL_S), limit=PER_SWEEP)
+    due = store.pulls_to_check(
+        before=moment - timedelta(seconds=POLL_S),
+        limit=PER_SWEEP,
+        deploys=(
+            (moment - timedelta(seconds=DEPLOY_SOON_S), moment - timedelta(seconds=POLL_S)),
+            (
+                moment - timedelta(seconds=DEPLOY_WATCH_S),
+                moment - timedelta(seconds=DEPLOY_LATER_POLL_S),
+            ),
+        ),
+    )
     for pr in due:
         try:
             check(store, pr, token_for=token_for, fetch=fetch, now=moment)

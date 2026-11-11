@@ -36,19 +36,123 @@ from flotta.judge import COMPLEXITY_NAMES, KINDS, PRIORITY_NAMES
 MAX_SHOWN = 8_000
 
 
-def view(store: Any, request: Any) -> dict[str, Any]:
-    """A request as the API says it: with its levels named, and how the work went."""
-    out = asdict(request)
-    out["kind_name"] = request.kind if request.kind in KINDS else None
-    out["complexity_name"] = (
-        COMPLEXITY_NAMES[request.complexity] if request.complexity is not None else None
+#: Characters of the work's summary a request carries. The run keeps more.
+MAX_SUMMARY = 4_000
+
+#: What a client's people are not shown of a request (FLOTTA-174): Jev's
+#: verdict and the agency's reasons for holding it were written for the agency,
+#: and who asked is said by name (`whose`) rather than by subject.
+AGENCY_ONLY: frozenset[str] = frozenset(
+    {
+        "kind",
+        "complexity",
+        "priority",
+        "within",
+        "verdict",
+        "judge_error",
+        "why",
+        "kind_name",
+        "complexity_name",
+        "priority_name",
+        "asked_by",
+        "run_id",
+        "work_run_id",
+    }
+)
+
+
+def view(store: Any, request: Any, *, for_client: bool = False) -> dict[str, Any]:
+    """A request as the API says it (see `views`)."""
+    return views(store, [request], for_client=for_client)[0]
+
+
+def views(store: Any, requests: list[Any], *, for_client: bool = False) -> list[dict[str, Any]]:
+    """Requests as the API says them: with their levels named, how the work
+    went and the pull requests it opened. `for_client` leaves out `AGENCY_ONLY`.
+
+    Read together, so a list of hundreds is a handful of queries, not several
+    per request.
+
+    The work is an approved request's run: when it started and finished, and,
+    once it is done, its output, which is the summary the agent was asked to
+    end with (`work_prompt`). Approved within the agent's level there is no run
+    of its own: the agent goes on in the conversation's turn it was asked in,
+    and `turn_status` is that turn's, so a page can tell it is still going.
+
+    Its pull requests are those its agent reported during any attempt at its
+    work (a retry keeps the first attempt's); or, for one that started on its
+    own, during the turn it was filed in, from when it was filed until the next
+    request that turn filed. Never a turn that was some other run (an agent
+    filing a follow-up while it works on an approved request is filing during
+    *that* request's run), and none while it waits or once it was declined.
+    """
+    from flotta import pulls
+
+    attempts = store.request_attempts(
+        [r.id for r in requests if r.status == "approved" and r.work_run_id]
     )
-    out["priority_name"] = (
-        PRIORITY_NAMES[request.priority] if request.priority is not None else None
-    )
-    work = store.get_run(request.work_run_id) if request.work_run_id else None
-    out["work_status"] = work.status if work is not None else None
-    out["whose"] = whose(store, request.asked_by)
+    for r in requests:
+        if r.status == "approved" and r.work_run_id and r.work_run_id not in attempts.get(r.id, []):
+            attempts.setdefault(r.id, []).append(r.work_run_id)
+    turn_ids = [r.run_id for r in requests if r.status == "approved" and r.auto and r.run_id]
+    runs = store.runs_by_id([r.work_run_id for r in requests] + turn_ids)
+    turns = {t for t in turn_ids if t in runs and runs[t].trigger_kind == "chat"}
+    filed_in: dict[str, list[Any]] = {}
+    for sibling in store.requests_of_runs(sorted(turns)):
+        filed_in.setdefault(sibling.run_id, []).append(sibling)
+    by_run: dict[str, list[Any]] = {}
+    for pr in store.pull_requests_of_runs(
+        [run for found in attempts.values() for run in found] + sorted(turns)
+    ):
+        by_run.setdefault(pr.run_id, []).append(pr)
+    names: dict[str | None, str | None] = {}
+
+    def opened(r: Any) -> list[Any]:
+        if r.status != "approved":
+            return []
+        if r.id in attempts:
+            return [pr for run in attempts[r.id] for pr in by_run.get(run, [])]
+        if not (r.auto and r.run_id in turns):
+            return []
+        later = [
+            o.created_at
+            for o in filed_in.get(r.run_id, [])
+            if o.id != r.id and o.created_at > r.created_at
+        ]
+        until = min(later) if later else None
+        return [
+            pr
+            for pr in by_run.get(r.run_id, [])
+            if pr.reported_at >= r.created_at and (until is None or pr.reported_at < until)
+        ]
+
+    out: list[dict[str, Any]] = []
+    for r in requests:
+        item = asdict(r)
+        item["kind_name"] = r.kind if r.kind in KINDS else None
+        item["complexity_name"] = (
+            COMPLEXITY_NAMES[r.complexity] if r.complexity is not None else None
+        )
+        item["priority_name"] = PRIORITY_NAMES[r.priority] if r.priority is not None else None
+        work = runs.get(r.work_run_id) if r.work_run_id else None
+        item["work_status"] = work.status if work is not None else None
+        item["work_started_at"] = work.started_at if work is not None else None
+        item["work_finished_at"] = work.finished_at if work is not None else None
+        item["work_summary"] = (
+            (work.output or "")[:MAX_SUMMARY] or None
+            if work is not None and work.status == "done"
+            else None
+        )
+        turn = runs.get(r.run_id) if r.auto and r.run_id in turns else None
+        item["turn_status"] = turn.status if turn is not None else None
+        if r.asked_by not in names:
+            names[r.asked_by] = whose(store, r.asked_by)
+        item["whose"] = names[r.asked_by]
+        item["pull_requests"] = [pulls.view(store, pr, for_client=for_client) for pr in opened(r)]
+        if for_client:
+            for key in AGENCY_ONLY:
+                item.pop(key, None)
+        out.append(item)
     return out
 
 
