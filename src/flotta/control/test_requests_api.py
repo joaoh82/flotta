@@ -613,3 +613,79 @@ def test_a_request_started_in_a_conversation_has_that_turns_pull_requests(api, f
         )
     (seen,) = api.get("/api/requests", headers=_as_client()).json()["requests"]
     assert [p["number"] for p in seen["pull_requests"]] == [14]
+
+
+# -- from the review of #230 ---------------------------------------------------
+
+
+def _pr(store, box, number):
+    pr, _ = store.record_pull_request(
+        box,
+        repo="acme/app",
+        number=number,
+        url=f"https://github.com/acme/app/pull/{number}",
+        title=f"Change {number}",
+        author_login="flotta[bot]",
+        head_ref=f"b{number}",
+        base_ref="main",
+        state="open",
+        draft=False,
+        opened_at=datetime.now(UTC).isoformat(),
+    )
+    return pr
+
+
+def test_a_member_confined_to_a_client_still_sees_the_agencys_reasons(api, fleet, jev):
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    _file(api, fleet)
+    member = _as(SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, org=DEFAULT_ORG, client=DEFAULT_CLIENT)
+    (seen,) = api.get("/api/requests", headers=member).json()["requests"]
+    assert seen["why"] and seen["complexity_name"] == "large"
+
+
+def test_a_retried_request_keeps_the_pull_requests_of_its_first_attempt(api, fleet, jev):
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    filed = _file(api, fleet).json()["request"]
+    api.post(
+        f"/api/requests/{filed['id']}/decision",
+        json={"approve": True},
+        headers=_as(SCOPE_FLEET_WRITE),
+    )
+    box = _id(fleet)
+    with FleetStore(fleet) as store:
+        first = store.get_request(filed["id"]).work_run_id
+        store.start_run(first)
+        _pr(store, box, 12)
+        store.finish_run(first, "failed")
+    retried = api.post(f"/api/requests/{filed['id']}/retry", headers=_as(SCOPE_FLEET_WRITE))
+    assert retried.status_code == 200, retried.text
+    (seen,) = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    assert [p["number"] for p in seen["pull_requests"]] == [12]
+
+
+def test_in_one_turn_each_request_has_the_changes_made_after_it(api, fleet, jev):
+    box = _id(fleet)
+    with FleetStore(fleet) as store:
+        turn = store.open_chat_run(
+            box,
+            "A few things",
+            input={"session_id": "s-9", "by": "user:u-7", "client": True},
+            started_at=datetime.now(UTC),
+        )
+        _pr(store, box, 20)  # before anything was filed: nobody's request
+    _file(api, fleet, title="CSV export")
+    with FleetStore(fleet) as store:
+        _pr(store, box, 21)
+    _file(api, fleet, title="Dark mode")
+    with FleetStore(fleet) as store:
+        _pr(store, box, 22)
+    seen = {
+        r["title"]: r for r in api.get("/api/requests", headers=_as_client()).json()["requests"]
+    }
+    assert [p["number"] for p in seen["CSV export"]["pull_requests"]] == [21]
+    assert [p["number"] for p in seen["Dark mode"]["pull_requests"]] == [22]
+    assert seen["CSV export"]["turn_status"] == "running", "its turn is still going"
+    with FleetStore(fleet) as store:
+        store.finish_run(turn.id, "done", output="ok")
+    seen = api.get("/api/requests", headers=_as_client()).json()["requests"]
+    assert {r["turn_status"] for r in seen} == {"done"}

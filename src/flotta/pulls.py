@@ -27,7 +27,8 @@ again.
 
 A client wants to know when the work they asked for is live, and merged is not
 that. A merged PR goes on being read, for GitHub's deployments of its merge
-commit only (`read_deployment`), until one has succeeded: every `POLL_S` for
+commit only (`read_deployment`), until one to production has succeeded (a
+preview's success is shown meanwhile): every `POLL_S` for
 `DEPLOY_SOON_S` after the merge, then every `DEPLOY_LATER_POLL_S` until
 `DEPLOY_WATCH_S`, then never. Vercel, Netlify, Render and GitHub Actions
 environments all record deployments there; a repository whose deploys record
@@ -113,6 +114,10 @@ DEPLOY_LATER_POLL_S = 30 * 60
 DEPLOY_WATCH_S = 24 * 60 * 60
 #: Deployments of one commit read, newest first. One per environment is usual.
 MAX_DEPLOYMENTS = 30
+#: Statuses of the chosen deployment read, newest first. GitHub marks a
+#: deployment `inactive` once a newer one to its environment succeeds, so the
+#: success it had may be a few statuses back by the time it is read.
+MAX_STATUSES = 10
 #: Environment names that mean production when GitHub's flag is not set.
 PRODUCTION_NAMES: frozenset[str] = frozenset({"production", "prod", "live"})
 
@@ -231,10 +236,14 @@ def read_deployment(fetch: Fetch, token: str, repo: str, sha: str) -> dict[str, 
     """GitHub's deployment of `sha`, as the store keeps it, or None for none yet.
 
     A production one if there is one (GitHub's `production_environment`, or an
-    environment called production), else the newest; and its latest status,
-    which is `pending` while it has none. `deployed_at` is when that status was
-    a success. Refused (403, or the 404 GitHub gives for a permission it hides)
-    is PullError, in words that say which permission.
+    environment called production), else the newest; and its state: `success`
+    if any of its statuses was one (a deployment that went live and was later
+    made `inactive` by a newer one was still live), else the latest, which is
+    `pending` while it has none. `deployed_at` is when it succeeded. The link
+    is the status's `environment_url` only: `target_url` is the provider's
+    build log, often behind its sign-in, not the thing that went live.
+    Refused (403, or the 404 GitHub gives for a permission it hides) is
+    PullError, in words that say which permission.
     """
     status, body = _ask(
         fetch,
@@ -264,18 +273,22 @@ def read_deployment(fetch: Fetch, token: str, repo: str, sha: str) -> dict[str, 
         token,
         "GET",
         f"/repos/{repo}/deployments/{chosen['id']}/statuses",
-        params={"per_page": 1},
+        params={"per_page": MAX_STATUSES},
     )
     if status != 200 or not isinstance(statuses, list):
         raise PullError(f"GitHub answered {status} for {repo}'s deployment {chosen['id']}")
-    latest = statuses[0] if statuses and isinstance(statuses[0], dict) else {}
-    state = str(latest.get("state") or "pending")
-    url = latest.get("environment_url") or latest.get("target_url")
+    kept = [st for st in statuses if isinstance(st, dict)]
+    succeeded = [st for st in kept if st.get("state") == "success"]
+    # Newest first: the latest success, when there was one, else the latest word.
+    shown = succeeded[0] if succeeded else (kept[0] if kept else {})
+    state = "success" if succeeded else str(shown.get("state") or "pending")
+    url = shown.get("environment_url")
     return {
         "deploy_state": state if state in _DEPLOY_STATES else "pending",
         "deploy_environment": str(chosen.get("environment") or "")[:100] or None,
         "deploy_url": url if isinstance(url, str) and url.startswith("https://") else None,
-        "deployed_at": _instant(latest.get("created_at")) if state == "success" else None,
+        "deployed_at": _instant(shown.get("created_at")) if succeeded else None,
+        "deploy_production": production(chosen),
     }
 
 
@@ -633,8 +646,9 @@ def check(store: Any, pr: Any, *, token_for: TokenFor, fetch: Fetch, now: dateti
 def deployed(store: Any, pr: Any, *, fetch: Fetch, token: str, checked: str) -> Any:
     """Read a merged PR's deployment, and keep what GitHub says. The PR, as now kept.
 
-    The first success is an event on its agent, and the last read: the sweep
-    looks no more (`FleetStore.pulls_to_check`).
+    Production's first success is an event on its agent, and the last read:
+    the sweep looks no more (`FleetStore.pulls_to_check`). A preview's success
+    is kept and said, and reading goes on, since production may follow.
     """
     try:
         sha = pr.merge_sha or read_pull(fetch, token, pr.repo, pr.number)["merge_sha"]
@@ -646,7 +660,8 @@ def deployed(store: Any, pr: Any, *, fetch: Fetch, token: str, checked: str) -> 
     changes: dict[str, Any] = {"merge_sha": sha, "checked_at": checked, "check_error": None}
     if found is not None:
         changes.update(found)
-        if found["deploy_state"] == "success" and pr.deploy_state != "success":
+        live = found["deploy_state"] == "success" and found["deploy_production"]
+        if live and not (pr.deploy_state == "success" and pr.deploy_production):
             store.add_event(
                 "box",
                 pr.box_id,

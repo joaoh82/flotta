@@ -930,6 +930,7 @@ _PULL_FIELDS: frozenset[str] = frozenset(
         "deploy_environment",
         "deploy_url",
         "deployed_at",
+        "deploy_production",
     }
 )
 
@@ -987,6 +988,9 @@ class PullRequest:
     deploy_environment: str | None = None
     deploy_url: str | None = None
     deployed_at: str | None = None
+    #: Whether that deployment is to production. A preview's success is said,
+    #: and the PR goes on being read until production's is, or the watch ends.
+    deploy_production: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -5373,6 +5377,8 @@ class FleetStore:
             raise ValueError(f"a review is {sorted(REVIEW_STATES)} or none, not {review!r}")
         if "draft" in fields:
             fields["draft"] = 1 if fields["draft"] else 0
+        if "deploy_production" in fields:
+            fields["deploy_production"] = 1 if fields["deploy_production"] else 0
         if fields:
             names = sorted(fields)
             assignments = ", ".join(f"{name} = ?" for name in names)
@@ -5429,14 +5435,16 @@ class FleetStore:
 
         A merged one is looked at for its deployment (FLOTTA-174) while one of
         `deploys`, `(merged after, last looked at before)`, covers it and no
-        deployment of it has succeeded: so soon after a merge it is read as
-        often as an open one, and later less often, until it stops.
+        production deployment of it has succeeded (a preview's success does not
+        end it): so soon after a merge it is read as often as an open one, and
+        later less often, until it stops.
         """
         clauses = ["(state = 'open' AND (checked_at IS NULL OR checked_at < ?))"]
         args: list[Any] = [_instant(before)]
         for merged_after, checked_before in deploys:
             clauses.append(
-                "(state = 'merged' AND COALESCE(deploy_state, '') <> 'success' "
+                "(state = 'merged' AND NOT (COALESCE(deploy_state, '') = 'success' "
+                "AND COALESCE(deploy_production, 0) = 1) "
                 "AND merged_at >= ? AND (checked_at IS NULL OR checked_at < ?))"
             )
             args += [_instant(merged_after), _instant(checked_before)]
@@ -5446,6 +5454,45 @@ class FleetStore:
             (*args, limit),
         ).fetchall()
         return [_pull_from_row(r) for r in rows]
+
+    def request_attempts(self, request_ids: list[str]) -> dict[str, list[str]]:
+        """Every run each request's work has had, retries too, oldest first."""
+        wanted = sorted(set(request_ids))
+        if not wanted:
+            return {}
+        marks = ", ".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            f"SELECT id, trigger_id FROM tasks WHERE trigger_kind = 'request' "
+            f"AND trigger_id IN ({marks}) ORDER BY created_at ASC",
+            tuple(wanted),
+        ).fetchall()
+        out: dict[str, list[str]] = {}
+        for row in rows:
+            out.setdefault(row["trigger_id"], []).append(row["id"])
+        return out
+
+    def runs_by_id(self, run_ids: list[str]) -> dict[str, Run]:
+        """The runs named, by id; one that does not exist is left out."""
+        wanted = sorted({r for r in run_ids if r})
+        if not wanted:
+            return {}
+        marks = ", ".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            f"SELECT * FROM tasks WHERE id IN ({marks})", tuple(wanted)
+        ).fetchall()
+        return {run.id: run for run in (_run_from_row(r) for r in rows)}
+
+    def requests_of_runs(self, run_ids: list[str]) -> list[WorkRequest]:
+        """The requests filed during any of `run_ids`, oldest first."""
+        wanted = sorted({r for r in run_ids if r})
+        if not wanted:
+            return []
+        marks = ", ".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            f"SELECT * FROM requests WHERE run_id IN ({marks}) ORDER BY created_at ASC",
+            tuple(wanted),
+        ).fetchall()
+        return [_request_from_row(r) for r in rows]
 
     def pull_requests_of_runs(self, run_ids: list[str]) -> list[PullRequest]:
         """The pull requests reported during any of `run_ids`, oldest first."""
@@ -7086,6 +7133,7 @@ def _pull_from_row(row: db.Row) -> PullRequest:
         deploy_environment=row["deploy_environment"],
         deploy_url=row["deploy_url"],
         deployed_at=row["deployed_at"],
+        deploy_production=bool(row["deploy_production"]),
     )
 
 

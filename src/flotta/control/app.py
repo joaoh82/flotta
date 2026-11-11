@@ -6586,12 +6586,18 @@ def create_app(
     def _clients_person(token: Token | None) -> bool:
         """Whether the caller is one of a client's people or systems, who see a
         request's or PR's outcome and not the agency's notes on it (FLOTTA-174).
-        An agent is not: it reads its own requests, reasons and all."""
+
+        Not an agent: it reads its own requests, reasons and all. And not an
+        agency member confined to one client, who decides that client's
+        requests: confined or not, a member can change agents (`fleet:write`),
+        and no role at a client can.
+        """
         return (
             token is not None
             and token.client is not None
             and token.box is None
             and subject_box(token.subject) is None
+            and SCOPE_FLEET_WRITE not in token.scopes
         )
 
     @app.get("/api/boxes/{box_id}/pull-requests")
@@ -6830,7 +6836,7 @@ def create_app(
             confine_to_box(token, box, "read the requests of")
             found = store.list_requests(org=box.org, box=box.id)
             mine = _clients_person(token)
-            return {"requests": [work_requests.view(store, r, for_client=mine) for r in found]}
+            return {"requests": work_requests.views(store, found, for_client=mine)}
         finally:
             store.close()
 
@@ -6847,7 +6853,7 @@ def create_app(
         try:
             found = store.list_requests(org=org, client=token.client if token else None)
             mine = _clients_person(token)
-            return {"requests": [work_requests.view(store, r, for_client=mine) for r in found]}
+            return {"requests": work_requests.views(store, found, for_client=mine)}
         finally:
             store.close()
 

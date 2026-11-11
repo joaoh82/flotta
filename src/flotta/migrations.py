@@ -1103,6 +1103,7 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE pull_requests ADD COLUMN deploy_environment TEXT",
             "ALTER TABLE pull_requests ADD COLUMN deploy_url TEXT",
             "ALTER TABLE pull_requests ADD COLUMN deployed_at TEXT",
+            "ALTER TABLE pull_requests ADD COLUMN deploy_production INTEGER",
             "CREATE INDEX idx_pull_requests_run ON pull_requests(run_id)",
         ),
     ),

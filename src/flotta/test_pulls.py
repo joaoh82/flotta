@@ -77,9 +77,10 @@ class FakeGitHub:
             self.status(number, state, at=at, url=url)
         return number
 
-    def status(self, deployment, state, *, at=NOW, url=None):
+    def status(self, deployment, state, *, at=NOW, url=None, target=None):
         self.statuses.setdefault(deployment, []).insert(
-            0, {"state": state, "created_at": _gh(at), "environment_url": url}
+            0,
+            {"state": state, "created_at": _gh(at), "environment_url": url, "target_url": target},
         )
 
     def review(self, number, login, state, body="", *, at, association="MEMBER", kind="User"):
@@ -788,3 +789,47 @@ def test_a_repository_token_is_reused_while_the_grant_stands(store):
     store.revoke_repo(box.id, "acme/app")
     held(store, box, "acme/app")
     assert len(asked) == 3
+
+
+# -- from the review of #230 ---------------------------------------------------
+
+
+def test_a_preview_that_succeeds_first_does_not_end_the_wait_for_production(store, github):
+    pr, sha = _merged(store, github)
+    github.deploy(sha, "Preview", production=False, at=NOW, state="success")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deploy_environment, pr.deploy_production) == (
+        "success",
+        "Preview",
+        False,
+    )
+    assert _events(store, "pull_request_deployed") == [], "a preview is not live"
+    github.deploy(sha, "Production", at=NOW + timedelta(minutes=5), state="success")
+    assert _sweep(store, github, now=NOW + timedelta(minutes=8)) == 1, "still read"
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_environment, pr.deploy_production) == ("Production", True)
+    assert len(_events(store, "pull_request_deployed")) == 1
+    assert _sweep(store, github, now=NOW + timedelta(minutes=12)) == 0, "and then not"
+
+
+def test_a_deploy_made_inactive_by_a_newer_one_was_still_live(store, github):
+    pr, sha = _merged(store, github)
+    deployment = github.deploy(sha, "production", at=NOW, state="success", url="https://a.dev")
+    github.status(deployment, "inactive", at=NOW + timedelta(minutes=2))
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert (pr.deploy_state, pr.deployed_at, pr.deploy_url) == (
+        "success",
+        NOW.isoformat(),
+        "https://a.dev",
+    )
+
+
+def test_a_build_log_is_not_a_link_to_what_went_live(store, github):
+    pr, sha = _merged(store, github)
+    deployment = github.deploy(sha, "production")
+    github.status(deployment, "success", target="https://vercel.com/acme/app/inspect/123")
+    _sweep(store, github, now=NOW + timedelta(minutes=4))
+    pr = store.get_pull_request(pr.id)
+    assert pr.deploy_state == "success" and pr.deploy_url is None
