@@ -172,14 +172,15 @@ TOUCH_GAP_S = 60.0
 #: working for another 27 minutes. A stalled agent is not a dead one. The ping is
 #: kept for a box that has truly gone without closing its socket, and five
 #: minutes is longer than any stall but a runaway one.
+BOX_PING_INTERVAL_S = 20.0
+BOX_PING_TIMEOUT_S = 300.0
 #: Longest the door keeps an agent's socket after the person's has gone, while
 #: a turn of theirs waits on an answer someone else may give (FLOTTA-204): the
-#: approval's hour (`flotta.box.approvals`), and a quarter more to finish.
+#: approval's hour (`flotta.box.approvals`), and a quarter more to finish. A
+#: stopping door doesn't wait for it: `cli.door` bounds that (`DOOR_DRAIN_S`).
 HELD_AFTER_LEAVING_S = 3600.0 + 900.0
 #: Conversations going on, kept so a task outliving its handler isn't collected.
 _CONVERSATIONS: set[asyncio.Task[None]] = set()
-BOX_PING_INTERVAL_S = 20.0
-BOX_PING_TIMEOUT_S = 300.0
 #: What a page sends to keep its socket through Cloudflare. Nobody is behind it.
 KEEPALIVE_METHOD = "gateway.ping"
 #: Longest frame read as a keepalive. A ping is short, and an upload needn't be parsed.
@@ -1192,8 +1193,14 @@ def create_door(
                     left = asyncio.Event()
 
                     async def to_person(frame: str) -> None:
-                        if not left.is_set():
+                        if left.is_set():
+                            return
+                        try:
                             await websocket.send_text(frame)
+                        except Exception:
+                            # Gone before its disconnect was read: the agent is
+                            # still heard, and a hold is still decided on the read.
+                            _log.info("%s's person went mid-frame", target.name)
 
                     async def deliver(srq: str, session: str, choice: str) -> None:
                         """An answer given from outside the conversation (FLOTTA-166):
@@ -1244,7 +1251,8 @@ def create_door(
                                 for notice in gate.notices():
                                     await to_person(notice)
                             elif not left.is_set():
-                                await websocket.send_bytes(message)
+                                with contextlib.suppress(Exception):
+                                    await websocket.send_bytes(message)
 
                     # Whichever side hangs up first ends the pair. Without this the
                     # surviving task would wait forever on a socket nobody is on.
@@ -1263,7 +1271,7 @@ def create_door(
                         _log.info(
                             "%s's person left mid-turn awaiting an answer; holding", target.name
                         )
-                        over = asyncio.create_task(turns.turns_over())
+                        over = asyncio.create_task(turns.asked_turns_over())
                         done, pending = await asyncio.wait(
                             [agent, heartbeat, over],
                             timeout=HELD_AFTER_LEAVING_S,

@@ -236,7 +236,10 @@ class TurnRecorder:
     def awaiting_answer(self) -> bool:
         """Whether a turn still going on here waits on an approval the control
         plane has, which someone may answer from outside (FLOTTA-204): so the
-        agent's socket is worth keeping after the person's has gone."""
+        agent's socket is worth keeping after the person's has gone.
+
+        Recorded, so `approval_id`: one the control plane never heard of (its
+        call failed, or hasn't come back) can't be answered from outside."""
         open_turns = {id(t) for t in self._turns.values()}
         return any(
             a.approval_id and not a.settled and id(a.turn) in open_turns
@@ -246,6 +249,16 @@ class TurnRecorder:
     async def turns_over(self) -> None:
         """Until no turn is going on here."""
         await self._no_turns.wait()
+
+    async def asked_turns_over(self, *, every_s: float = 0.5) -> None:
+        """Until no turn that asked for an approval here is still going on: what
+        a socket held after its person left waits for (FLOTTA-204). Not every
+        turn: another session's, waiting on nothing, may never say it ended."""
+        while True:
+            open_turns = {id(t) for t in self._turns.values()}
+            if not any(id(a.turn) in open_turns for a in self._asked.values()):
+                return
+            await asyncio.sleep(every_s)
 
     def attach(self, deliver: Deliver) -> None:
         """How an answer given from outside reaches the box on this socket."""

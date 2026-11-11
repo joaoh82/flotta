@@ -747,3 +747,44 @@ def test_a_turn_closed_while_its_approval_waits_is_still_ended(quick):
     (finished,) = plane.finished
     assert (finished["status"], finished["error_class"]) == ("failed", "disconnected")
     json.dumps(finished)  # what the door posts must be JSON
+
+
+def test_only_an_approval_still_waiting_and_recorded_holds_a_socket(quick):
+    """FLOTTA-204: what decides whether the door keeps the agent's socket."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:ops")
+        await gate.from_box(_event("message.start"))
+        before = recorder.awaiting_answer()
+        await gate.from_box(_ask())
+        await _until(lambda: plane.asked)
+        await _until(lambda: recorder._asked["srq-1"].approval_id is not None)
+        asked = recorder.awaiting_answer()
+        await gate.from_client(
+            json.dumps({"jsonrpc": "2.0", "id": "srq-1", "result": {"choice": "deny"}})
+        )
+        answered = recorder.awaiting_answer()
+        await _settle(recorder)
+        return before, asked, answered
+
+    assert asyncio.run(go()) == (False, True, False)
+
+
+def test_a_held_socket_waits_for_the_turn_that_asked_not_every_turn(quick):
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:ops")
+        await gate.from_box(_event("message.start", session="other"))
+        await gate.from_box(_event("message.start"))
+        await gate.from_box(_ask())
+        await _until(lambda: plane.asked)
+        waiting = asyncio.create_task(recorder.asked_turns_over(every_s=0.01))
+        await asyncio.sleep(0.05)
+        still = not waiting.done()
+        await gate.from_box(_event("message.complete", {"text": "ok"}))
+        await asyncio.wait_for(waiting, 1)
+        await _settle(recorder)
+        return still
+
+    assert asyncio.run(go()) is True

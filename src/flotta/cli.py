@@ -1909,6 +1909,10 @@ def kill(
         emit(result, f"{box.id}  torn_down{note}", as_json=as_json)
 
 
+#: Seconds a stopping door gives its conversations before it lets them go.
+DOOR_DRAIN_S = 10
+
+
 @app.command()
 def door(
     host: str = typer.Option("0.0.0.0", "--host", help="Bind address"),
@@ -1960,7 +1964,15 @@ def door(
     from flotta.server_logs import log_config
 
     typer.secho(f"front door on {host}:{port}", fg=typer.colors.BRIGHT_BLACK, err=True)
-    uvicorn.run(create_door(), host=host, port=port, log_config=log_config())
+    # Bounded: a conversation held for an answer after its person left
+    # (FLOTTA-204) lasts up to 75 minutes, and a deploy must not wait for it.
+    uvicorn.run(
+        create_door(),
+        host=host,
+        port=port,
+        log_config=log_config(),
+        timeout_graceful_shutdown=DOOR_DRAIN_S,
+    )
 
 
 @app.command()
