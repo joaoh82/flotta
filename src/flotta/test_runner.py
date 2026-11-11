@@ -486,3 +486,95 @@ def test_stopping_the_control_plane_ends_its_runs_as_interrupted(path):
     stopped = _run(path, first.id)
     assert (stopped.status, stopped.error_class) == ("failed", "interrupted")
     assert _run(path, second.id).status == "pending", "free for the next control plane"
+
+
+# -- what a reconnect must not lose (FLOTTA-199) -----------------------------------
+
+
+def _talk(path):
+    run = _queue(path)
+    with FleetStore(path) as store:
+        run = store.start_run(run.id)
+    return runner.Talk(
+        lambda: FleetStore(path), run, expires_at=datetime.now(UTC) + timedelta(minutes=5)
+    )
+
+
+def test_a_question_asked_while_the_socket_was_down_is_recorded_on_the_resume(path):
+    """Its frame never came, so nobody could answer it: the resume's open
+    requests name it, and it is recorded like one that was heard."""
+    talk = _talk(path)
+    talk.hear(ASK)
+    later = {"id": "srq-later", "method": "approval", "params": {"command": "git push --force"}}
+    talk.hear_open(
+        {
+            "open_requests": [
+                {**ASK, "params": ASK["params"]},
+                later,
+                {"method": "clarify", "id": "q"},
+            ]
+        }
+    )
+    talk._sync()
+    with FleetStore(path) as store:
+        asked = store.run_approvals(talk.run.id)
+    assert sorted(a.request_id for a in asked) == sorted([str(ASK["id"]), "srq-later"])
+    assert [a.command for a in asked if a.request_id == "srq-later"] == ["git push --force"]
+
+
+def test_an_answer_that_could_not_be_sent_goes_on_the_next_socket(path):
+    talk = _talk(path)
+    talk.hear(ASK)
+    talk._sync()
+    with FleetStore(path) as store:
+        (waiting,) = store.waiting_approvals(org="studio-nord")
+        store.answer_approval(waiting.id, "once", by="user:ada")
+
+    async def broken(_frame):
+        raise ConnectionResetError("the socket went")
+
+    with pytest.raises(runner.SendFailed):
+        asyncio.run(talk.relay(broken))
+
+    to_box = []
+
+    async def send(frame):
+        to_box.append(json.loads(frame)["result"]["choice"])
+        raise asyncio.CancelledError  # stop the relay once it has sent
+
+    # Bounded: lost, the answer is never sent, and the relay would poll for ever.
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(asyncio.wait_for(talk.relay(send), timeout=5))
+    assert to_box == ["once"]
+
+
+def test_an_answer_that_went_into_a_dying_socket_is_sent_again_on_the_resume(path):
+    """The review of #238: sent, but the socket died before the agent read
+    it. The resume still lists the question, so the answer goes again."""
+    talk = _talk(path)
+    talk.hear(ASK)
+    talk._sync()
+    with FleetStore(path) as store:
+        (waiting,) = store.waiting_approvals(org="studio-nord")
+        store.answer_approval(waiting.id, "once", by="user:ada")
+    to_box = []
+
+    async def send(frame):
+        to_box.append(json.loads(frame)["result"]["choice"])
+        if len(to_box) == 1:
+            return None
+        raise asyncio.CancelledError
+
+    async def first_relay():
+        relaying = asyncio.create_task(talk.relay(send))
+        while not to_box:
+            await asyncio.sleep(0.01)
+        relaying.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await relaying
+
+    asyncio.run(first_relay())
+    talk.hear_open({"open_requests": [ASK]})
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(asyncio.wait_for(talk.relay(send), timeout=5))
+    assert to_box == ["once", "once"]
