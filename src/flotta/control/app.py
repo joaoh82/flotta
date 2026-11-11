@@ -6873,6 +6873,102 @@ def create_app(
         finally:
             store.close()
 
+    # -- settling what failed (FLOTTA-201/202) ---------------------------------
+    #
+    # The agency's: a person who can change its agents. Not a client's people
+    # or systems, and not an API key: they can't see runs (D21), so they can't
+    # say one has been dealt with either.
+
+    def _settler(token: Token | None) -> str:
+        """Who is resolving or rerunning, by name, or 403."""
+        if token is not None and (token.client is not None or token.box is not None):
+            raise HTTPException(status_code=403, detail="that is the agency's to settle")
+        return (token.subject if token is not None else None) or "the operator"
+
+    def _note_of(body: dict[str, Any]) -> str | None:
+        note = body.get("note")
+        if note is not None and not isinstance(note, str):
+            raise HTTPException(status_code=422, detail="a note is text")
+        return note
+
+    @app.post("/api/requests/{request_id}/retry")
+    def retry_request(request_id: str, token: Token | None = needs_write) -> Any:
+        """Run an approved request's work again, as the same request: once its
+        last attempt failed, was held or was stopped. The request then follows
+        the new run, in its conversation and on Home."""
+        from flotta import work_requests
+
+        subject = _settler(token)
+        store = store_factory()
+        try:
+            found = _scoped_request(store, token, request_id)
+            who = _person(store, subject) or subject
+            try:
+                retried = store.retry_request(
+                    found.id,
+                    prompt=work_requests.work_prompt(found, note=found.note),
+                    input=work_requests.run_input(found),
+                    by=who,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event(
+                "box",
+                retried.box_id,
+                "request_retried",
+                {"request": retried.id, "by": who, "run": retried.work_run_id},
+            )
+            return {"request": work_requests.view(store, retried)}
+        finally:
+            store.close()
+
+    @app.post("/api/requests/{request_id}/resolve")
+    def resolve_request(
+        request_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """`{"note": "…"}`: an approved request whose work failed was settled
+        some other way. Its card in the conversation says so, with the note."""
+        from flotta import work_requests
+
+        subject = _settler(token)
+        note = _note_of(body)
+        store = store_factory()
+        try:
+            found = _scoped_request(store, token, request_id)
+            who = _person(store, subject) or subject
+            try:
+                resolved = store.resolve_request(found.id, by=who, note=note)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event(
+                "box", resolved.box_id, "request_resolved", {"request": resolved.id, "by": who}
+            )
+            return {"request": work_requests.view(store, resolved)}
+        finally:
+            store.close()
+
+    @app.post("/api/runs/{run_id}/resolve")
+    def resolve_run(run_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """`{"note": "…"}`: a run that failed, was held or was stopped has been
+        dealt with. Home stops asking about it; a request it was the work of is
+        resolved with it."""
+        subject = _settler(token)
+        note = _note_of(body)
+        store = store_factory()
+        try:
+            run = _scoped_run(store, token, run_id)
+            who = _person(store, subject) or subject
+            try:
+                resolved = store.resolve_run(run.id, by=who, note=note)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            store.add_event("task", resolved.id, "resolved", {"by": who})
+            return _run_view(resolved)
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}/request-policy")
     def get_request_policy(box_id: str, token: Token | None = needs_peer_or_read) -> Any:
         """The most complex work this agent may start without the agency's OK."""

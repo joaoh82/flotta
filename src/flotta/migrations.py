@@ -1070,6 +1070,22 @@ MIGRATIONS: tuple[Migration, ...] = (
         # nor remove it. Every budget that exists already is an org's own: 0.
         ("ALTER TABLE budgets ADD COLUMN starting_cap INTEGER NOT NULL DEFAULT 0",),
     ),
+    Migration(
+        32,
+        "resolved: a failed run or request someone has dealt with, and how",
+        # FLOTTA-201/202. A failed run asked for a person on Home for a week
+        # whatever anyone did, and a request whose work failed said so in its
+        # conversation for good. Who settled it, when, and a note; all NULL on
+        # everything that exists, which is unresolved, as it was.
+        (
+            "ALTER TABLE tasks ADD COLUMN resolved_at TEXT",
+            "ALTER TABLE tasks ADD COLUMN resolved_by TEXT",
+            "ALTER TABLE tasks ADD COLUMN resolved_note TEXT",
+            "ALTER TABLE requests ADD COLUMN resolved_at TEXT",
+            "ALTER TABLE requests ADD COLUMN resolved_by TEXT",
+            "ALTER TABLE requests ADD COLUMN resolved_note TEXT",
+        ),
+    ),
 )
 
 
