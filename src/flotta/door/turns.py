@@ -55,7 +55,9 @@ its run is recorded, for the person to read when they come back.
   already a run, and an agent's message to a colleague (`relay`) is the other
   agent's turn. Nor a box's own token.
 - A turn whose socket closes before `message.complete` is ended `failed`,
-  `disconnected`, with the steps heard so far.
+  `disconnected`, with the steps heard so far. Its end, like every turn's, is
+  tried again on a fault (`FINISH_TRIES`), and said at WARNING if it never
+  lands (FLOTTA-218: one didn't, and nothing said so).
 - A new turn while the queue has no room for both its calls.
 - A turn going on when the door itself dies. Its run stays `running` until
   `provision.reap_runs` closes it as `stranded`, as a delivered run's does when
@@ -75,6 +77,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+import httpx
+
 from flotta.approval_choices import OUTSIDE_CHOICES
 from flotta.steps import Steps
 
@@ -89,8 +93,25 @@ QUEUE_LIMIT = 64
 #: The longest one call to the control plane may take before it is given up.
 CALL_TIMEOUT_S = 10.0
 
-#: How long a closed socket's last calls may take, after the person's socket closed.
-DRAIN_S = 15.0
+#: How long a closed socket's last calls may take, after the person's socket
+#: closed: room for a turn's end to be tried `FINISH_TRIES` times.
+DRAIN_S = 75.0
+
+#: How many times a turn's end is tried (FLOTTA-218). An end that is lost leaves
+#: its run `running`, holding the agent's schedules back until idle sleep or
+#: `provision.reap_runs` closes it, so a fault on the way to the control plane
+#: (a timeout, a refused connection, a 5xx) is worth another go. Safe to repeat:
+#: an end that did land answers the next try 409, which counts as recorded.
+#: Only a fault that may pass is tried again (`_may_pass`), not a 4xx or a bug.
+#:
+#: The tries hold the socket's one worker, up to about 52 s at worst, so the
+#: calls queued behind them wait: a next turn's open (which would be refused
+#: 409 anyway while the agent's run is still `running`) and an approval's. A
+#: stopping door gives a turn its first try only (`cli.DOOR_DRAIN_S`).
+FINISH_TRIES = 4
+
+#: The waits between those tries, in seconds.
+FINISH_BACKOFF_S = (1.0, 3.0, 8.0)
 
 #: Sessions one socket keeps the stored id of, and resumes it waits on: a
 #: socket holds one or two conversations, so this only bounds a misbehaving one.
@@ -224,6 +245,8 @@ class TurnRecorder:
         self._closed = False
         #: Places kept on the queue for the ends of turns opened and not ended.
         self._reserved = 0
+        #: Ends queued and not yet tried to the last, said if `close` gives up.
+        self._ends_unsent = 0
         #: The approvals asked here, by the box's request id (FLOTTA-166).
         self._asked: dict[str, _Asked] = {}
         self._deliver: Deliver | None = None
@@ -421,6 +444,12 @@ class TurnRecorder:
             async with asyncio.timeout(DRAIN_S):
                 await asyncio.shield(worker)
         except TimeoutError:
+            _log.warning(
+                "%s's last calls ran past %ss; given up, with %d turn end(s) unsent",
+                self._box_id,
+                DRAIN_S,
+                self._ends_unsent,
+            )
             worker.cancel()
 
     # -- turns --------------------------------------------------------------
@@ -457,6 +486,7 @@ class TurnRecorder:
         turn.ending = payload
         turn.ended_at = datetime.now(UTC)
         self._reserved -= 1
+        self._ends_unsent += 1
         self._send("end", session, turn)
 
     def _send(self, what: str, session: str, turn: _Turn, extra: Any = None) -> None:
@@ -490,10 +520,12 @@ class TurnRecorder:
                 else:
                     await self._finish(turn)
             except Exception as exc:  # best effort: see the module
-                _log.info("a turn on %s went unrecorded: %s", self._box_id, exc)
+                _log.warning("a turn on %s went unrecorded (%s): %s", self._box_id, what, _why(exc))
             finally:
                 if what == "open" and not turn.run_id.done():
                     turn.run_id.set_result(None)
+                if what == "end":
+                    self._ends_unsent -= 1
 
     async def _open(self, session: str, turn: _Turn) -> None:
         async with asyncio.timeout(CALL_TIMEOUT_S):
@@ -591,17 +623,73 @@ class TurnRecorder:
             ended = payload.get("status")
             status = "done" if ended in (None, "complete") else "failed"
             error = None if status == "done" else str(ended)[:80]
-        async with asyncio.timeout(CALL_TIMEOUT_S):
-            await self._plane.finish_chat_run(
-                self._box_id,
-                run_id,
-                steps=turn.steps.steps,
-                status=status,
-                output=output,
-                error_class=error,
-                approvals=turn.steps.approvals,
-                ended_at=(turn.ended_at or datetime.now(UTC)).isoformat(),
-            )
+        ended_at = (turn.ended_at or datetime.now(UTC)).isoformat()
+        for attempt in range(FINISH_TRIES):
+            try:
+                async with asyncio.timeout(CALL_TIMEOUT_S):
+                    await self._plane.finish_chat_run(
+                        self._box_id,
+                        run_id,
+                        steps=turn.steps.steps,
+                        status=status,
+                        output=output,
+                        error_class=error,
+                        approvals=turn.steps.approvals,
+                        ended_at=ended_at,
+                    )
+            except Exception as exc:
+                code = _status_code(exc)
+                if code == 409:
+                    # Not running any more: an earlier try landed after all and
+                    # its answer was lost, or something else ended it first.
+                    if not attempt:
+                        _log.info("%s's run %s had already ended", self._box_id, run_id)
+                    return
+                last = attempt == FINISH_TRIES - 1
+                if last or not _may_pass(exc, code):
+                    _log.warning(
+                        "%s's run %s stays running: its end (%s) went unrecorded: %s",
+                        self._box_id,
+                        run_id,
+                        error or status,
+                        _why(exc),
+                    )
+                    return
+                _log.info(
+                    "ending %s's run %s failed (%s); trying again",
+                    self._box_id,
+                    run_id,
+                    _why(exc),
+                )
+                await asyncio.sleep(FINISH_BACKOFF_S[min(attempt, len(FINISH_BACKOFF_S) - 1)])
+                continue
+            if attempt:
+                _log.info(
+                    "%s's run %s ended %s on try %d", self._box_id, run_id, status, attempt + 1
+                )
+            return
+
+
+def _may_pass(exc: BaseException, code: int | None) -> bool:
+    """Whether a failed call is worth another go: a timeout, a fault on the way
+    there (`httpx.TransportError`, a refused connection), or a 5xx. Not a 4xx,
+    and not a bug of ours, which would fail the same way every time."""
+    if code is not None:
+        return code >= 500
+    return isinstance(exc, TimeoutError | OSError | httpx.TransportError)
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """The HTTP status a call to the control plane was answered with, if it was."""
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _why(exc: BaseException) -> str:
+    """An error, said so a log line reads: a timeout's own text is empty."""
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def _parse(frame: str) -> dict[str, Any] | None:

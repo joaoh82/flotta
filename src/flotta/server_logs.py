@@ -17,6 +17,9 @@ import logging
 import re
 from typing import Any
 
+#: The logger the door's modules all write on (`door/app.py`, `turns.py`, `conversation.py`).
+DOOR_LOG = "flotta.door"
+
 #: A query parameter's value, after its name: up to the next `&`, space, quote or `#`.
 _VALUE = re.compile(r'([?&][^=&\s"#]*=)[^&\s"#]*')
 
@@ -56,9 +59,13 @@ def log_config() -> dict[str, Any]:
     config.setdefault("filters", {})["hide_query_values"] = {"()": HideQueryValues}
     for handler in config["handlers"].values():
         handler.setdefault("filters", []).append("hide_query_values")
-    # How long each ask to GitHub took (FLOTTA-180). Only this logger: turning
-    # on all of `flotta` at INFO would change what the door and gateway write.
+    # How long each ask to GitHub took (FLOTTA-180). Only these loggers: turning
+    # on all of `flotta` at INFO would change what the gateway writes.
     # And how long `/machine` waited on Fly and on the fleet's image (FLOTTA-182).
-    for name in (TIMING_LOG, "flotta.control.machine"):
+    # And the door's own account of a conversation (FLOTTA-218): a turn ended
+    # disconnected, an approval settled, a turn that went unrecorded. Without
+    # it every one of those INFO lines went nowhere, since uvicorn's config sets
+    # up only its own loggers, and an unrecorded turn end left no trace at all.
+    for name in (TIMING_LOG, "flotta.control.machine", DOOR_LOG):
         config["loggers"][name] = {"handlers": ["default"], "level": "INFO", "propagate": False}
     return config
