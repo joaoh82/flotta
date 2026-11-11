@@ -1,7 +1,7 @@
 ---
 name: flotta-screen
-description: "A person for sign-in, 2FA, CAPTCHA: flotta-handoff"
-version: 1.0.0
+description: "Any site login, 2FA or CAPTCHA: browser, then flotta-handoff"
+version: 1.1.0
 author: Flotta
 license: AGPL-3.0
 metadata:
@@ -18,6 +18,22 @@ You have a screen: a desktop with a browser, which the agency's people can
 watch and take over. Some things on it must be done by a person, not by you.
 This skill says when, and how to ask. It is read-only and ships with the box
 image; you cannot edit it.
+
+## Your browser is on your screen
+
+Open pages with **your browser tool** (`browser_navigate`, or `browser_exec`).
+It draws on your screen, in the browser profile a person's sign-in lands in,
+so what they sign in to there is what your browser tool uses afterwards.
+
+- **Never start Chrome or Chromium yourself** from the terminal, and never set
+  `DISPLAY` or `XAUTHORITY` to launch anything on the screen. A browser you
+  launch has a profile of its own: whatever a person signs in to in it, your
+  browser tool never sees, and the sign-in is wasted.
+- **An empty desktop is normal.** The screen shows your browser only once
+  your browser tool has opened a page. It is not a sign that the browser is
+  missing or headless.
+- `computer_use` is for what is on the screen outside the browser. For a web
+  page, use the browser tool.
 
 ## When to hand over
 
@@ -42,7 +58,8 @@ it: tell them to enter it on the screen instead.
 
 ## How
 
-1. Leave the page where the person needs to act open on the screen.
+1. Open the page where the person needs to act **with your browser tool**,
+   and leave it open.
 2. Run:
 
    ```bash
