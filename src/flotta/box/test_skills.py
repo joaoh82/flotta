@@ -230,3 +230,15 @@ def test_the_screen_skill_is_offered_only_with_a_screen_and_keeps_secrets_off_th
     assert "End your turn" in body
     for reason in ("sign-in", "2FA", "CAPTCHA", "payment", "requires a human"):
         assert reason in body, reason
+
+
+def test_the_screen_skill_keeps_the_agent_in_its_own_browser():
+    """Found on staging (FLOTTA-213): an agent that hadn't read this concluded its
+    browser was headless and launched Chrome itself on the display, outside the
+    shared profile, so a person's sign-in there would never reach its browser
+    tool. The skill must say both things, in the index line and the body."""
+    front, body = _skill("flotta-screen")
+    assert "browser" in front["description"] and "login" in front["description"]
+    assert "Never start Chrome or Chromium yourself" in body
+    assert "An empty desktop is normal" in body
+    assert "with your browser tool" in body
