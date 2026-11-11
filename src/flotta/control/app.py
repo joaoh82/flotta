@@ -7224,6 +7224,35 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/boxes/{box_id}/working")
+    def box_working(box_id: str, token: Token | None = needs_fleet_route) -> Any:
+        """The run this agent is doing now, if it isn't a conversation's turn
+        (FLOTTA-197): what the door tells the agent about with each message, so
+        a person's turn doesn't start the same work, or a second heavy build,
+        beside it. The door's alone, like the conversations it records."""
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            run = store.live_run(box.id)
+            if run is None or run.trigger_kind == "chat":
+                return {"working": None}
+            about = ""
+            if run.trigger_kind == "request" and run.trigger_id:
+                request = store.box_request(box.id, run.trigger_id)
+                about = request.title if request is not None else ""
+            if not about:
+                lines = (line.strip() for line in run.prompt.splitlines())
+                about = next((line for line in lines if line), "")
+            return {
+                "working": {
+                    "run_id": run.id,
+                    "trigger_kind": run.trigger_kind,
+                    "about": about[:160],
+                }
+            }
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/client-conversations", status_code=201)
     def add_client_conversation(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route

@@ -172,6 +172,7 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/wake", SCOPE_BOX_CHAT, None),
     ("GET", "/api/boxes/{b}/client-conversations", SCOPE_FLEET_WRITE, None),
     ("POST", "/api/boxes/{b}/client-conversations", SCOPE_FLEET_ROUTE, {"session_id": "s"}),
+    ("GET", "/api/boxes/{b}/working", SCOPE_FLEET_ROUTE, None),
     (
         "POST",
         "/api/boxes/{b}/chat-runs",
