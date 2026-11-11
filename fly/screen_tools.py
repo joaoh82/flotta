@@ -40,8 +40,15 @@ def main(argv: list[str]) -> int:
             if not (tool.is_file() and os.access(tool, os.X_OK)):
                 continue
             # PM ships agent-browser as `agent-browser-<target>` (linux-x64), and
-            # Hermes looks for plain `agent-browser` on PATH.
-            name = "agent-browser" if tool.name.startswith("agent-browser-") else tool.name
+            # Hermes looks for plain `agent-browser` on PATH. Only these two are
+            # linked: /opt/screen/bin is first on PATH, and a helper a package
+            # bundles (a `node`, say) must not shadow the system's.
+            if tool.name.startswith("agent-browser"):
+                name = "agent-browser"
+            elif tool.name == "cua-driver":
+                name = "cua-driver"
+            else:
+                continue
             if not (bins / name).exists():
                 (bins / name).symlink_to(tool)
     missing = [name for name in ("agent-browser", "cua-driver") if not (bins / name).exists()]

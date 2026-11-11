@@ -263,9 +263,10 @@ def test_the_screen_tools_are_not_on_the_volume():
     text = _dockerfile()
     assert "ENV FLOTTA_SCREEN_PM_HOME=/opt/hermes-pm" in text
     assert 'HERMES_HOME="$FLOTTA_SCREEN_PM_HOME" hermes pm install agent-browser cua-driver' in text
-    assert "/data" not in "".join(
-        line for line in text.splitlines() if "SCREEN_PM_HOME=" in line or "/opt/screen" in line
+    pm_home = next(
+        line for line in text.splitlines() if line.startswith("ENV FLOTTA_SCREEN_PM_HOME=")
     )
+    assert not pm_home.split("=", 1)[1].startswith("/data")
 
 
 def test_hermes_is_pointed_at_the_baked_tools():
@@ -310,10 +311,11 @@ def _fake_pm_store(tmp_path):
     chrome = tools / "chromium-1208" / "chrome-linux64"
     for directory, name in (
         (browser, "agent-browser-linux-x64"),
+        (browser, "node"),  # a bundled helper that must not reach PATH
         (driver, "cua-driver"),
         (chrome, "chrome"),
     ):
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, exist_ok=True)
         (directory / name).write_text("#!/bin/sh\n")
         (directory / name).chmod(0o755)
     return {
@@ -332,6 +334,7 @@ def test_the_screen_tools_are_linked_where_the_env_says(tmp_path):
     assert (out / "chrome").resolve().name == "chrome"
     assert (out / "bin" / "agent-browser").resolve().name == "agent-browser-linux-x64"
     assert (out / "bin" / "cua-driver").resolve().name == "cua-driver"
+    assert sorted(p.name for p in (out / "bin").iterdir()) == ["agent-browser", "cua-driver"]
 
 
 def test_a_missing_screen_tool_fails_the_build(tmp_path):

@@ -129,8 +129,13 @@ RUN git clone --depth 1 --branch "$HERMES_REF" "$HERMES_REPO" "$HERMES_SRC" \
 #   PM's pinned build, and its shared libraries are apt's (the second group).
 #
 # Nothing starts here, and `bot_desktop.auto_start` stays Hermes's default
-# (false): an agent without a screen pays only disk for this layer, never
-# memory. `flotta.box.screen` turns it on per agent (Screen.3).
+# (false). **With these tools present Hermes offers `computer_use` and the
+# browser tools to every agent**, because both are core tools gated only by
+# whether they are installed. `flotta.box.screen` (Screen.3) is what keeps an
+# agent without a screen as it was: it disables both toolsets there, so such
+# an agent pays disk for this layer and never memory. Do not unset the env
+# below to the same end: without HERMES_CUA_DRIVER_CMD, Hermes installs
+# cua-driver into $HERMES_HOME/tools, which is the volume.
 #
 # Deliberately not the `xfce4` metapackage: it pulls in a screensaver, a power
 # manager and a polkit agent that lock or prompt a headless desktop.
@@ -156,7 +161,7 @@ ENV FLOTTA_SCREEN_PM_HOME=/opt/hermes-pm
 RUN HERMES_HOME="$FLOTTA_SCREEN_PM_HOME" hermes pm install agent-browser cua-driver
 COPY fly/screen_tools.py /tmp/screen_tools.py
 RUN HERMES_HOME="$FLOTTA_SCREEN_PM_HOME" hermes pm env > /tmp/pm-env.json \
-    ; cat /tmp/pm-env.json | "$HERMES_VENV/bin/python" /tmp/screen_tools.py /opt/screen \
+    && cat /tmp/pm-env.json | "$HERMES_VENV/bin/python" /tmp/screen_tools.py /opt/screen \
     && rm /tmp/pm-env.json /tmp/screen_tools.py \
     && /opt/screen/chrome --headless=new --no-sandbox --disable-gpu --dump-dom about:blank >/dev/null
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/screen/chrome
