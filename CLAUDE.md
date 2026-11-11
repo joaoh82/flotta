@@ -366,6 +366,23 @@ conventions, and the sharp edges below.
   for everyone, so `flotta.box.screen` puts `computer_use` and `browser` in
   `agent.disabled_toolsets` on every agent without a screen. It records what it
   wrote in `$HERMES_HOME/.flotta-screen.json` and takes back only that.
+- **Nothing sleeps, stops, restarts or re-images an agent under a person on its
+  screen (FLOTTA-211).** A takeover runs no turn, so the door holds the agent
+  awake two other ways. An open `/api/display/ws` touches only for a person's
+  RFB input since the last beat (key, pointer, clipboard; `is_presence`), never
+  for noVNC's endless FramebufferUpdateRequests, so a forgotten tab sleeps. And
+  the door reads Hermes's lease off every `/api/ws` it relays (`LeaseWatch`;
+  plus a `display.status` of its own after a page closes its screen, which can
+  hand the lease back with nobody left to hear it) and posts it to
+  `POST /api/boxes/{id}/screen-lease` with `fleet:route`. The control plane
+  writes `screen_lease` only when it is news (each event is activity). A human
+  lease keeps a running agent out of the sweep **until `SCREEN_HOLD_CAP_S` (4 h)
+  of no activity at all**, then it sleeps and `screen_hold_lapsed` is written,
+  which disarms that lease until the screen changes hands again. While held,
+  sleep, upgrade, model, size, screen, connection, gateway and identity answer
+  409 naming who and since when; `?force=true` is the operator's alone and
+  writes `screen_hold_forced`. "Update agents" passes such an agent by with
+  `upgrade_skipped`, listed on its build as `skipped`.
 - **The projects folder is on the rootfs and is lost on every image update.**
   `$FLOTTA_WORKDIR` (default `/workspace`) is created by the entrypoint on the
   machine's disk, not on `/data`, because a `node_modules` on the 1 GB memory

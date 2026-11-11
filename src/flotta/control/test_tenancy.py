@@ -176,6 +176,12 @@ BOX_ROUTES = [
     ("GET", "/api/boxes/{b}/working", SCOPE_FLEET_ROUTE, None),
     (
         "POST",
+        "/api/boxes/{b}/screen-lease",
+        SCOPE_FLEET_ROUTE,
+        {"holder": "human", "since": 1.0, "by": "user:u-1"},
+    ),
+    (
+        "POST",
         "/api/boxes/{b}/chat-runs",
         SCOPE_FLEET_ROUTE,
         {"prompt": "Mine now.", "session_id": "s", "by": "user:u-1"},

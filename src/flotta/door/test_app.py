@@ -349,6 +349,8 @@ def _door_for(
             self.woken_ids = []
             self.touched = []
             self.status = None
+            #: `(box_id, holder, since, by)`, as the door reported each (FLOTTA-211).
+            self.leases = []
 
         async def resolve(self, name):
             self.resolved.append(name)
@@ -358,6 +360,9 @@ def _door_for(
 
         async def touch(self, box):
             self.touched.append(box)
+
+        async def report_screen_lease(self, box_id, *, holder, since, by=None):
+            self.leases.append((box_id, holder, since, by))
 
         async def wake(self, name, *, box_id=None):
             self.woken.append(name)
