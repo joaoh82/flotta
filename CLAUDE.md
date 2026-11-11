@@ -1001,7 +1001,7 @@ Common commands live in the **`justfile`** (`just` alone lists them). Python too
 ```bash
 just check                  # lint + tests — run before committing
 just check-dashboard        # tsc + eslint (the Python `check` does not cover the dashboard)
-just ci                     # check + check-dashboard — exactly what GitHub Actions runs
+just ci                     # check + check-dashboard + check-app — what GitHub Actions checks (app only when app/ changes)
 just test-one <keyword>     # a single test (uv run pytest -k <keyword>)
 just test-postgres          # the store suite against a real Postgres (throwaway container)
 just fmt                    # ruff format + --fix
