@@ -76,6 +76,36 @@ It answers with `flotta.chat.v1` alone: the protocol carrying the ticket is a
 credential and is never echoed. A browser can do none of Hermes's handshake
 (a login form, then Hermes's own ticket), so for a ticket the door does both
 on the server side (`hermes_ticket`), with the credentials it already holds.
+
+## And a second socket, for the agent's screen (FLOTTA-210)
+
+A ticket with a screen grant (`watch` or `control`, FLOTTA-209) opens one more
+path, Hermes's raw RFB stream, the way it opens the conversation:
+
+    new WebSocket("wss://<box>.flotta.dev/api/display/ws?display_ticket=<hermes's>",
+                  ["flotta.screen.v1", "flotta.ticket.<ticket>"])
+
+The `display_ticket` is Hermes's own, from `display.observe` on the page's
+conversation socket: single-use, 30 seconds, and passed through to the box as
+the only query value it gets. The door answers `flotta.screen.v1` alone, and
+refuses before anything is woken a handshake from an `Origin` nobody named, a
+ticket for another box, a ticket without a grant, or one with no
+`display_ticket`. The display route checks no Hermes login, so the door mints no
+Hermes ticket for it.
+
+`relay_screen` then splices binary frames both ways, each send awaited before
+the next read, and passes each side's close code on to the other unchanged:
+Hermes's `4000` control-taken, `4001` desktop gone, `4401` bad ticket and
+`4403` not allowed reach the page as Hermes sent them, and the page's own `1000`
+reaches Hermes, which hands the lease back on a clean close and keeps it on a
+dropped one. What a `watch` grant can't do there is `flotta.door.conversation`'s
+to say.
+
+**What reaches the box.** As for `/api/ws`, the door sends `Host` as the box's
+own address (`websockets` sets it from the URL) and **no `Origin`**: Hermes's
+`_ws_request_is_allowed` lets a socket with no `Origin` through, and checks one
+that has against the address it bound, which the web app's origin is not. The
+browser's `Origin` is the door's to check, and is checked here.
 """
 
 from __future__ import annotations
@@ -101,6 +131,9 @@ from flotta.auth import (
     DEFAULT_CLIENT,
     DEFAULT_ORG,
     SCOPE_BOX_CHAT,
+    SCREEN_CONTROL,
+    SCREEN_PROTOCOL,
+    SCREEN_WATCH,
     TICKET_PROTOCOL_PREFIX,
     AuthError,
     Token,
@@ -139,8 +172,19 @@ ALLOWED_ORIGINS_ENV = "FLOTTA_DOOR_ORIGINS"
 #: (`just local`). Unset everywhere else, so a deployed door routes none.
 LOCAL_BOXES_ENV = "FLOTTA_DOOR_LOCAL"
 
-#: The one path a ticket opens: Hermes's agent socket.
+#: The path a ticket opens: Hermes's agent socket.
 AGENT_SOCKET_PATH = "api/ws"
+#: And the other, for a ticket with a screen grant: Hermes's RFB stream (FLOTTA-210).
+DISPLAY_SOCKET_PATH = "api/display/ws"
+#: Hermes's own ticket for that stream, and the one query value the box is sent.
+DISPLAY_TICKET_PARAM = "display_ticket"
+#: Every path a ticket opens, and the subprotocol it is offered and answered with.
+TICKET_SOCKETS: dict[str, str] = {
+    AGENT_SOCKET_PATH: CHAT_PROTOCOL,
+    DISPLAY_SOCKET_PATH: SCREEN_PROTOCOL,
+}
+#: The grants that open the screen's socket.
+SCREEN_GRANTS_THAT_SEE = frozenset({SCREEN_WATCH, SCREEN_CONTROL})
 #: The largest frame taken from a box. A resume is one frame holding the whole
 #: conversation, and `websockets` would otherwise close the socket at 1 MiB,
 #: which leaves an agent with a long history unreachable. Bounded because a box
@@ -459,24 +503,31 @@ def admit_ticket(
     """The ticket a browser's handshake carries, if the door takes it here.
 
     The origin first, so a page the operator never named learns nothing about
-    the ticket it holds; then the path, then the ticket itself. The box it
-    names is `_target`'s to check, against the hostname's.
+    the ticket it holds; then the path, then the ticket itself, and for the
+    screen its grant. The box it names is `_target`'s to check, against the
+    hostname's.
     """
     if _origin(origin) not in allowed_origins:
         raise BoxUnavailable(
             f"origin {origin or '(none)'!r} may not open a conversation", status=403
         )
-    if path != AGENT_SOCKET_PATH:
-        raise BoxUnavailable("a ticket opens the agent's conversation and nothing else", status=404)
+    public = TICKET_SOCKETS.get(path)
+    if public is None:
+        raise BoxUnavailable(
+            "a ticket opens the agent's conversation and its screen, and nothing else", status=404
+        )
     tickets = [
         p[len(TICKET_PROTOCOL_PREFIX) :] for p in protocols if p.startswith(TICKET_PROTOCOL_PREFIX)
     ]
-    if CHAT_PROTOCOL not in protocols or len(tickets) != 1:
-        raise BoxUnavailable(f"offer {CHAT_PROTOCOL} and exactly one ticket", status=400)
+    if public not in protocols or len(tickets) != 1:
+        raise BoxUnavailable(f"offer {public} and exactly one ticket", status=400)
     try:
-        return verify_ticket(tickets[0], key=key)
+        token = verify_ticket(tickets[0], key=key)
     except AuthError as exc:
         raise BoxUnavailable(str(exc), status=401) from exc
+    if path == DISPLAY_SOCKET_PATH and token.screen not in SCREEN_GRANTS_THAT_SEE:
+        raise BoxUnavailable("this ticket may not see the agent's screen", status=403)
+    return token
 
 
 # -- talking to the control plane ------------------------------------------
@@ -886,6 +937,149 @@ async def hermes_ticket(base_url: str, credentials: tuple[str, str]) -> str:
     return str(ticket)
 
 
+# -- the screen's socket (FLOTTA-210) -----------------------------------------
+
+#: What the page is told when the box's side ends with no code a page may be
+#: sent (a vanished machine's 1006), and when the box could not be reached.
+SCREEN_GONE = 1011
+SCREEN_UNREACHABLE = 4502
+_REASON_BYTES = 123
+
+
+def _sendable(code: int | None) -> bool:
+    """Whether `code` may go in a close frame. 1005 and 1006 are only ever reported."""
+    if code is None:
+        return False
+    from websockets.exceptions import ProtocolError
+    from websockets.frames import Close
+
+    try:
+        Close(code, "").check()
+    except ProtocolError:
+        return False
+    return True
+
+
+def _reason(text: str | None) -> str:
+    return (text or "").encode()[:_REASON_BYTES].decode(errors="ignore")
+
+
+def close_for_box(code: int | None) -> int | None:
+    """The code to close the box's side with when the page's side closed with `code`.
+
+    As sent, so Hermes reads the page's intent: a clean `1000` or `1001` hands
+    the lease back, and anything else is a dropped link that keeps it, because
+    the person may be mid-login. `None` (an empty close frame, which Hermes reads
+    as 1005) for a page that sent no code, and `SCREEN_GONE` for one that went
+    with no close at all (1006): a dropped link, as Hermes would have seen it.
+    """
+    if code is None or code == 1005:
+        return None
+    return code if _sendable(code) else SCREEN_GONE
+
+
+def close_for_page(code: int | None) -> int:
+    """The code to close the page's side with when the box's side closed with `code`.
+
+    Hermes's own (4000, 4001, 4401, 4403) unchanged; `1000` for an empty close;
+    `SCREEN_GONE` for a box that went without one.
+    """
+    if code is None or code == 1005:
+        return 1000
+    return code if _sendable(code) else SCREEN_GONE
+
+
+async def relay_screen(
+    websocket: WebSocket,
+    url: str,
+    *,
+    name: str,
+    headers: dict[str, str],
+    hold: Callable[[], Awaitable[None]],
+) -> None:
+    """Splice an accepted page socket to the box's `/api/display/ws`, both ways.
+
+    Binary frames, as RFB is, and text passed through for Hermes to refuse.
+    **Backpressure by construction:** each side's next frame is read only once
+    the last one is sent, and `websockets` holds at most `max_queue` frames from
+    the box before TCP pushes back. One connection to the box per page socket.
+
+    `hold` keeps the box awake while the screen is open and returns if it went
+    to sleep anyway, which ends the socket: see `create_door`.
+
+    A `watch` page's input reaches Hermes too, and is dropped there: Hermes's
+    `rfb_filter.py` passes input only from the viewer holding the lease, and
+    `watch` is never let take it (`flotta.door.conversation`).
+    """
+    try:
+        upstream = await websockets.connect(
+            url,
+            additional_headers=headers,
+            proxy=None,
+            max_size=BOX_FRAME_LIMIT,
+            # RFB comes encoded already; deflating it again is the door's CPU for nothing.
+            compression=None,
+            ping_interval=BOX_PING_INTERVAL_S,
+            ping_timeout=BOX_PING_TIMEOUT_S,
+        )
+    except websockets.exceptions.InvalidStatus as exc:
+        # Hermes refuses its Host and Origin check before accepting, which arrives
+        # as an HTTP status: `4403` for its 403, the code it means.
+        status = exc.response.status_code
+        _log.info("%s's screen refused the door: HTTP %s", name, status)
+        await websocket.close(code=4000 + min(status, 999), reason="the agent's screen refused")
+        return
+    except Exception as exc:
+        # Not the URL: it carries Hermes's ticket, and this log is the door's own.
+        _log.warning("%s's screen did not answer: %s", name, type(exc).__name__)
+        await websocket.close(code=SCREEN_UNREACHABLE, reason="the agent's screen did not answer")
+        return
+
+    async def page_to_box() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                code = close_for_box(message.get("code"))
+                reason = _reason(message.get("reason")) if code is not None else ""
+                await upstream.close(code, reason)  # type: ignore[arg-type]
+                return
+            data = message.get("bytes")
+            if data is None:
+                data = message.get("text")
+            if data is not None:
+                await upstream.send(data)
+
+    async def box_to_page() -> None:
+        async for frame in upstream:
+            if isinstance(frame, bytes):
+                await websocket.send_bytes(frame)
+            else:
+                await websocket.send_text(frame)
+
+    page = asyncio.create_task(page_to_box())
+    box = asyncio.create_task(box_to_page())
+    awake = asyncio.create_task(hold())
+    try:
+        done, pending = await asyncio.wait([page, box, awake], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            error = task.exception()
+            if error is not None and not isinstance(error, websockets.exceptions.ConnectionClosed):
+                _log.warning("%s's screen ended: %s", name, type(error).__name__)
+        if page not in done:
+            if box in done:
+                code, reason = close_for_page(upstream.close_code), upstream.close_reason
+            else:
+                code, reason = SCREEN_GONE, "the agent went to sleep"
+            with contextlib.suppress(Exception):
+                await websocket.close(code=code, reason=_reason(reason))
+    finally:
+        with contextlib.suppress(Exception):
+            await upstream.close()
+
+
 # -- the app ----------------------------------------------------------------
 
 
@@ -1079,9 +1273,13 @@ def create_door(
         """
         protocols = list(websocket.scope.get("subprotocols") or [])
         ticketed = offers_ticket(protocols)
-        # Only ever the public protocol, and only to a client that offered it:
-        # a browser that offered subprotocols fails a handshake answering none.
-        answer = CHAT_PROTOCOL if CHAT_PROTOCOL in protocols else None
+        screen = path == DISPLAY_SOCKET_PATH
+        # Only ever a public protocol, and only to a client that offered it: a
+        # browser that offered subprotocols fails a handshake answering none.
+        # Never the one carrying the ticket, which is a credential.
+        public = TICKET_SOCKETS.get(path, CHAT_PROTOCOL)
+        answer = next((p for p in (public, *TICKET_SOCKETS.values()) if p in protocols), None)
+        display_ticket = websocket.query_params.get(DISPLAY_TICKET_PARAM) if screen else None
         try:
             if ticketed:
                 token = admit_ticket(
@@ -1098,10 +1296,15 @@ def create_door(
                     key=key,
                     allow_query=True,
                 )
+            if screen and not display_ticket:
+                # Hermes would refuse it, and only after the box was woken for it.
+                raise BoxUnavailable(
+                    f"the screen opens with Hermes's {DISPLAY_TICKET_PARAM}", status=400
+                )
             target = await _target(token, websocket.headers.get("host"))
             upstream_ticket = None
             own = _own(target)
-            if ticketed and own:
+            if ticketed and own and not screen:
                 upstream_ticket = await hermes_ticket(
                     f"http://{authority(target.host, target.port)}", own
                 )
@@ -1114,6 +1317,36 @@ def create_door(
             return
 
         await websocket.accept(subprotocol=answer)
+
+        if screen:
+            from urllib.parse import urlencode
+
+            async def hold_screen() -> None:
+                """An open screen is in use: touch the box each beat (FLOTTA-210).
+
+                Watching or driving says nothing on the conversation, so
+                `Liveness` can't see it, and a screen's own socket is not a
+                conversation's: the conversation's quiet beats stop touching,
+                but close nothing while the box is up, and this keeps it up.
+                FLOTTA-211 is the busy logic proper. Returns if the box went to
+                sleep anyway, because a touch is a wake (FLOTTA-121).
+                """
+                while True:
+                    await asyncio.sleep(HEARTBEAT_S)
+                    if await _is_down(plane, target.box_id):
+                        _log.info("%s is asleep; closing its screen", target.name)
+                        return
+                    await plane.touch(target.box_id)
+
+            query = urlencode([(DISPLAY_TICKET_PARAM, display_ticket)])
+            await relay_screen(
+                websocket,
+                f"ws://{authority(target.host, target.port)}/{DISPLAY_SOCKET_PATH}?{query}",
+                name=target.name,
+                headers={"Authorization": _basic(*own)} if own else {},
+                hold=hold_screen,
+            )
+            return
 
         liveness = Liveness(target.name)
         # Tokens that reach this far aren't a client's: see `authorize`.
@@ -1131,6 +1364,9 @@ def create_door(
             conversation_only=a_clients,
             answers_approvals=token.answers_approvals,
             turns=turns,
+            # A ticket's screen grant decides its `display.*` methods; a token's
+            # socket is left to Hermes, as it is over plain HTTP.
+            screen=token.screen if ticketed else None,
         )
 
         async def keep_awake() -> None:

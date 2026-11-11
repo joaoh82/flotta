@@ -98,6 +98,7 @@ def test_the_access_lines_arguments_keep_their_shape():
     ("text", "hidden"),
     [
         ("/api/ws?ticket=a&access_token=b", "/api/ws?ticket=…&access_token=…"),
+        ("/api/display/ws?display_ticket=d", "/api/display/ws?display_ticket=…"),
         ('"WebSocket /api/ws?access_token=b" 403', '"WebSocket /api/ws?access_token=…" 403'),
         ("/x?flag&k=v#frag", "/x?flag&k=…#frag"),
         ("/api/boxes/b-1/events", "/api/boxes/b-1/events"),

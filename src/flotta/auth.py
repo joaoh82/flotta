@@ -254,6 +254,9 @@ _TICKET_DOMAIN = "flotta-chat-ticket:"
 #: The subprotocol a browser offers beside its ticket, and the only one the
 #: door answers with. Here because the control plane and the door both name it.
 CHAT_PROTOCOL = "flotta.chat.v1"
+#: The same, for the agent's screen (`/api/display/ws`, FLOTTA-210): offered
+#: beside the same ticket, by a ticket with a screen grant.
+SCREEN_PROTOCOL = "flotta.screen.v1"
 #: The subprotocol that carries a ticket: this, then the ticket.
 TICKET_PROTOCOL_PREFIX = "flotta.ticket."
 
