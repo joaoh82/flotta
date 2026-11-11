@@ -18,16 +18,25 @@ on:
   pull_request:
     paths:
       - "app/**"
+      - "justfile"
       - ".github/workflows/app.yml"
   push:
     branches: [main]
     paths:
       - "app/**"
+      - "justfile"
       - ".github/workflows/app.yml"
+  # The toolchain is unpinned (stable Rust and clippy, node 24), so drift would
+  # otherwise surface only on the next app/ change, as someone else's red
+  # check. A weekly run shows it on its own, and keeps the cache warm.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: app-${{ github.ref }}
-  cancel-in-progress: true
+  # As in ci.yml: a superseded PR run is cancelled, a main commit keeps its verdict.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -36,7 +45,8 @@ jobs:
   app:
     name: app (tsc + vitest + clippy)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold cache rebuilds webkit and Tauri crates from scratch.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -57,7 +67,7 @@ jobs:
         run: |
           APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
           sudo apt-get $APT update
-          sudo apt-get $APT install -y --no-install-recommends \
+          sudo apt-get $APT install -y \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
             libxdo-dev libssl-dev build-essential
 

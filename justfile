@@ -704,10 +704,10 @@ check-dashboard:
     npx tsc --noEmit
     npx eslint .
 
-# Exactly what .github/workflows/ci.yml runs, in one command — so "will CI go
-# green?" is answerable before pushing. The workflow's two jobs are separate so
-# a dashboard-only failure is obvious there; here they run in sequence.
-# Everything CI checks (python + dashboard + app) — no Fly, no cost
+# What GitHub Actions checks, in one command — so "will CI go green?" is
+# answerable before pushing. ci.yml runs check and check-dashboard on every
+# commit; app.yml runs check-app only when app/ (or this file) changes, plus
+# weekly. Here all three run in sequence. No Fly, no cost.
 ci: check check-dashboard check-app
 
 # M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
