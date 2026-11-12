@@ -963,10 +963,14 @@ fly-up: fly-whoami
 
     # `fly deploy` updates whichever machine already has this volume, and the
     # volume cannot move. A host that cannot reserve the guest fails the same
-    # way on every retry, including flyctl's own. Fork the disk (a copy — the
-    # source is not destroyed; on a production box it is the agent's memory),
-    # put one machine on the copy, destroy the stuck machine, and deploy once
-    # more so the release completes. Any other deploy error is left alone.
+    # way on every retry, including flyctl's own. The recovery stops that
+    # machine, forks the disk (a copy — the source is not destroyed; on a
+    # production box it is the agent's memory), starts a machine on the copy
+    # only after the original is stopped, and destroys the original once the
+    # copy has booted. If that fails before the destroy, the original is
+    # started again, unless a clone may still be running — then it stays
+    # stopped and the error says so. Then deploy once more so the release
+    # completes. Any other deploy error is left alone.
     deploy() {
       flyctl deploy --config "$TMP/fly.toml" --dockerfile "$TMP/Dockerfile" \
         --app "$APP" --ha=false --yes .
@@ -981,8 +985,9 @@ fly-up: fly-whoami
       # `set -e` is the retry bound. recover exits 0 only after the machine
       # sits on the fork; the deploy below runs once, and a failure there
       # ends the recipe. Exit 2 means this was not a full host. Any other
-      # non-zero means the move failed and the machine on the original volume
-      # is still there. Neither retries, and neither destroys a volume.
+      # non-zero means the move did not finish: a failure before the original
+      # is destroyed restarts it, and a destroy that errors keeps the
+      # replacement. Neither retries, and neither destroys a volume.
       # Two calls rather than an array: macOS ships bash 3.2, and an empty
       # array under `set -u` aborts.
       if [ -n "${FLOTTA_KEEP_MACHINES:-}" ]; then

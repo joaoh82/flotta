@@ -49,8 +49,15 @@ FLY_TOML = """
 """
 
 
+class _Timeout:
+    """A scripted flyctl that was started and did not return."""
+
+
+TIMEOUT = _Timeout()
+
+
 class Script:
-    def __init__(self, steps: list[tuple[int, str, str]]):
+    def __init__(self, steps: list):
         self.steps = list(steps)
         self.calls: list[list[str]] = []
 
@@ -61,7 +68,10 @@ class Script:
         self.calls.append(list(args))
         if not self.steps:
             raise AssertionError(f"unexpected command: {args}")
-        code, out, err = self.steps.pop(0)
+        step = self.steps.pop(0)
+        if step is TIMEOUT:
+            raise subprocess.TimeoutExpired(list(args), 600)
+        code, out, err = step
         return subprocess.CompletedProcess(list(args), code, out, err)
 
 
@@ -109,12 +119,38 @@ def _clone_out(machine: str = NEW) -> str:
     )
 
 
-def _happy() -> list[tuple[int, str, str]]:
+def _machines(*pairs: tuple[str, str]) -> str:
+    return json.dumps([{"id": machine, "state": state} for machine, state in pairs])
+
+
+def _quiesced(machine: str) -> list[tuple[int, str, str]]:
+    return [
+        (0, f"{machine} has been successfully stopped\n", ""),
+        (0, _machines((machine, "stopped")), ""),
+    ]
+
+
+def _restarted(machine: str = MACHINE) -> list[tuple[int, str, str]]:
+    return [
+        (0, f"{machine} has been started\n", ""),
+        (0, _machines((machine, "started")), ""),
+    ]
+
+
+def _already_stopped_error(machine: str) -> str:
+    return (
+        f"Error: could not stop machine {machine}: "
+        f"failed to stop VM {machine}: machine is already stopped"
+    )
+
+
+def _happy() -> list:
     return [
         (0, _volumes(), ""),
+        *_quiesced(MACHINE),
         (0, _fork_json(), ""),
         (0, _clone_out(), ""),
-        (0, "", ""),
+        *_quiesced(NEW),
         (0, "", ""),
     ]
 
@@ -166,12 +202,28 @@ def test_only_the_current_host_phrase_is_a_full_host():
     )
 
 
-def test_a_full_host_forks_the_attached_volume_and_clones_onto_it():
+def test_a_full_host_forks_the_attached_volume_and_clones_onto_it(capsys):
     script = Script(_happy())
     assert _moved(script=script) == NEW
     assert script.steps == []
-    listed, forked, cloned, stopped, destroyed = script.calls
-    assert listed == ["flyctl", "volumes", "list", "--app", APP, "--json"]
+    actions = [_action(call) for call in script.calls]
+    assert actions == [
+        ("volumes", "list"),
+        ("machine", "stop", MACHINE),
+        ("machines", "list"),
+        ("volumes", "fork"),
+        ("machine", "clone", MACHINE),
+        ("machine", "stop", NEW),
+        ("machines", "list"),
+        ("machine", "destroy", MACHINE),
+    ]
+    # The original is confirmed stopped before the clone is started, and the
+    # clone is confirmed stopped before the original is retired.
+    assert actions.index(("machines", "list")) < actions.index(("machine", "clone", MACHINE))
+    assert actions.index(("machine", "clone", MACHINE)) < actions.index(
+        ("machine", "destroy", MACHINE)
+    )
+    forked = next(call for call in script.calls if call[1:3] == ["volumes", "fork"])
     assert forked == [
         "flyctl",
         "volumes",
@@ -188,7 +240,7 @@ def test_a_full_host_forks_the_attached_volume_and_clones_onto_it():
         "2048",
         "--json",
     ]
-    assert "--name" not in forked
+    cloned = next(call for call in script.calls if call[1:3] == ["machine", "clone"])
     assert cloned == [
         "flyctl",
         "machine",
@@ -205,8 +257,23 @@ def test_a_full_host_forks_the_attached_volume_and_clones_onto_it():
         "--vm-memory",
         "2048",
     ]
-    assert stopped == ["flyctl", "machine", "stop", NEW, "--app", APP]
+    assert "--detach" not in cloned
+    stops = [call for call in script.calls if call[1:3] == ["machine", "stop"]]
+    assert [call[3] for call in stops] == [MACHINE, NEW]
+    assert all(call[call.index("--wait-timeout") + 1] == "2m" for call in stops)
+    destroyed = next(call for call in script.calls if "destroy" in call)
     assert destroyed == ["flyctl", "machine", "destroy", MACHINE, "--app", APP, "--force"]
+    warning = capsys.readouterr().err
+    assert "warning: volume vol_old is unattached and was not destroyed" in warning
+    assert "pre-fork copy" in warning
+
+
+def _action(call: list[str]) -> tuple[str, ...]:
+    if call[1] == "volumes":
+        return ("volumes", call[2])
+    if call[1] == "machines":
+        return ("machines", call[2])
+    return ("machine", call[2], call[3])
 
 
 def test_the_fork_is_placed_for_the_guest_the_deploy_will_request():
@@ -214,8 +281,8 @@ def test_the_fork_is_placed_for_the_guest_the_deploy_will_request():
     toml = FLY_TOML.replace('memory = "2gb"', 'memory = "1gb"')
     script = Script(_happy())
     _moved(script=script, fly_toml=toml)
-    forked = script.calls[1]
-    cloned = script.calls[2]
+    forked = next(call for call in script.calls if call[1:3] == ["volumes", "fork"])
+    cloned = next(call for call in script.calls if call[1:3] == ["machine", "clone"])
     assert forked[forked.index("--vm-memory") + 1] == "1024"
     assert cloned[cloned.index("--vm-memory") + 1] == "1024"
     assert forked[forked.index("--vm-size") + 1] == "shared-cpu-1x"
@@ -238,65 +305,148 @@ def test_an_ordinary_failure_does_not_touch_fly():
     assert script.calls == []
 
 
-def test_a_fork_that_fails_leaves_the_machine_where_it_is():
-    script = Script([(0, _volumes(), ""), (1, "", "failed to fork volume: no capacity")])
-    with pytest.raises(RecoveryError, match="fork vol_old"):
-        _moved(script=script)
-    assert [call[1] for call in script.calls] == ["volumes", "volumes"]
-    assert "destroy" not in {word for call in script.calls for word in call}
+def test_stopping_the_original_is_required_before_a_fork():
+    """A stop that fails while the machine is still running forks nothing.
 
-
-def test_a_clone_that_fails_before_it_exists_destroys_nothing():
+    It is not restarted either: the stop did not take, so it is still the
+    live machine.
+    """
     script = Script(
         [
             (0, _volumes(), ""),
-            (0, _fork_json(), ""),
-            (1, "Cloning failed\n", "the machine is on an unreachable host"),
+            (1, "", "could not stop machine: the host is not running"),
+            (0, _machines((MACHINE, "started")), ""),
         ]
     )
-    with pytest.raises(RecoveryError, match="clone"):
+    with pytest.raises(RecoveryError, match="not forked and not restarted"):
         _moved(script=script)
-    assert "destroy" not in {word for call in script.calls for word in call}
+    assert script.steps == []
+    assert not any(call[1:3] == ["volumes", "fork"] for call in script.calls)
+    assert not any(call[1:3] == ["machine", "start"] for call in script.calls)
+    assert not any(call[1:3] == ["machine", "clone"] for call in script.calls)
 
 
-def test_a_clone_that_is_created_but_does_not_start_is_removed():
+def test_not_running_is_not_flyctl_already_stopped():
+    """'not running' occurs in unrelated stop errors. Only the flaps sentence counts."""
+    from flotta.fly_host import _is_already_stopped
+
+    assert _is_already_stopped(MACHINE, _already_stopped_error(MACHINE))
+    assert not _is_already_stopped(MACHINE, "could not stop machine: the host is not running")
+    assert not _is_already_stopped(MACHINE, "machine is not running")
+    assert not _is_already_stopped(OTHER, _already_stopped_error(MACHINE))
+
+
+def test_an_already_stopped_original_is_still_forked():
     script = Script(
         [
             (0, _volumes(), ""),
+            (1, "", _already_stopped_error(MACHINE)),
+            (0, _machines((MACHINE, "stopped")), ""),
+            (1, "", "failed to fork volume: no capacity"),
+            *_restarted(),
+        ]
+    )
+    with pytest.raises(RecoveryError, match="was restarted"):
+        _moved(script=script)
+    assert any(call[1:3] == ["volumes", "fork"] for call in script.calls)
+    assert any(call[1:4] == ["machine", "start", MACHINE] for call in script.calls)
+
+
+def test_a_failure_after_the_original_is_stopped_restarts_it():
+    script = Script(
+        [
+            (0, _volumes(), ""),
+            *_quiesced(MACHINE),
+            (1, "", "failed to fork volume: no capacity"),
+            *_restarted(),
+        ]
+    )
+    with pytest.raises(RecoveryError, match=f"machine {MACHINE} was restarted"):
+        _moved(script=script)
+    assert script.steps == []
+    assert any(call[1:3] == ["volumes", "fork"] for call in script.calls)
+    assert not any(call[1:3] == ["machine", "clone"] for call in script.calls)
+    assert not any("destroy" in call for call in script.calls)
+    assert any(call[1:4] == ["machine", "start", MACHINE] for call in script.calls)
+
+
+def test_a_restart_that_fails_reports_the_original_still_stopped():
+    script = Script(
+        [
+            (0, _volumes(), ""),
+            *_quiesced(MACHINE),
+            (1, "", "failed to fork volume: no capacity"),
+            (1, "", "could not start machine: no capacity"),
+        ]
+    )
+    with pytest.raises(RecoveryError, match=f"machine {MACHINE} is stopped and was not restarted"):
+        _moved(script=script)
+    assert not any("destroy" in call for call in script.calls)
+
+
+def test_a_clone_that_fails_before_it_exists_restarts_the_original():
+    script = Script(
+        [
+            (0, _volumes(), ""),
+            *_quiesced(MACHINE),
+            (0, _fork_json(), ""),
+            (1, "Cloning failed\n", "the machine is on an unreachable host"),
+            *_restarted(),
+        ]
+    )
+    with pytest.raises(RecoveryError, match="was restarted"):
+        _moved(script=script)
+    assert not any("destroy" in call for call in script.calls)
+    assert any(call[1:4] == ["machine", "start", MACHINE] for call in script.calls)
+
+
+def test_a_clone_that_is_created_but_does_not_start_is_removed_and_the_original_restarts():
+    script = Script(
+        [
+            (0, _volumes(), ""),
+            *_quiesced(MACHINE),
             (0, _fork_json(), ""),
             (1, _clone_out(), "timed out waiting for start"),
             (0, "", ""),
+            *_restarted(),
         ]
     )
-    with pytest.raises(RecoveryError, match="clone"):
+    with pytest.raises(RecoveryError, match="was restarted"):
         _moved(script=script)
     destroys = [call for call in script.calls if "destroy" in call]
     assert destroys == [["flyctl", "machine", "destroy", NEW, "--app", APP, "--force"]]
+    assert any(call[1:4] == ["machine", "start", MACHINE] for call in script.calls)
 
 
-def test_a_replacement_that_will_not_stop_is_removed_and_the_original_stays():
+def test_a_replacement_that_will_not_stop_is_removed_and_the_original_restarts():
     script = Script(
         [
             (0, _volumes(), ""),
+            *_quiesced(MACHINE),
             (0, _fork_json(), ""),
             (0, _clone_out(), ""),
-            (1, "", "could not stop machine"),
+            (1, "", "could not stop machine: the volume is not running"),
+            (0, _machines((NEW, "started")), ""),
             (0, "", ""),
+            *_restarted(),
         ]
     )
-    with pytest.raises(RecoveryError, match="stop replacement"):
+    with pytest.raises(RecoveryError, match="was restarted"):
         _moved(script=script)
     destroys = [call for call in script.calls if "destroy" in call]
     assert destroys == [["flyctl", "machine", "destroy", NEW, "--app", APP, "--force"]]
+    assert not any(call[1:4] == ["machine", "destroy", MACHINE] for call in script.calls)
 
 
 def test_an_already_stopped_replacement_still_replaces_the_original():
     script = Script(
         [
             (0, _volumes(), ""),
+            *_quiesced(MACHINE),
             (0, _fork_json(), ""),
             (0, _clone_out(), ""),
-            (1, "", "machine is not running"),
+            (1, "", _already_stopped_error(NEW)),
+            (0, _machines((NEW, "stopped")), ""),
             (0, "", ""),
         ]
     )
@@ -304,21 +454,39 @@ def test_an_already_stopped_replacement_still_replaces_the_original():
     assert script.calls[-1] == ["flyctl", "machine", "destroy", MACHINE, "--app", APP, "--force"]
 
 
-def test_if_the_original_cannot_be_destroyed_the_replacement_is_removed():
+def test_a_failed_destroy_of_the_original_keeps_the_replacement():
     script = Script(
         [
-            (0, _volumes(), ""),
-            (0, _fork_json(), ""),
-            (0, _clone_out(), ""),
-            (0, "", ""),
+            *_happy()[:-1],
             (1, "", "lease held"),
-            (0, "", ""),
+            (0, _machines((MACHINE, "stopped"), (NEW, "stopped")), ""),
         ]
     )
-    with pytest.raises(RecoveryError, match="remove stuck machine"):
+    with pytest.raises(RecoveryError, match="was kept") as raised:
         _moved(script=script)
+    assert "not restarted" in str(raised.value)
+    assert script.steps == []
     destroys = [call for call in script.calls if "destroy" in call]
-    assert [call[3] for call in destroys] == [MACHINE, NEW]
+    assert destroys == [["flyctl", "machine", "destroy", MACHINE, "--app", APP, "--force"]]
+    assert not any(call[1:3] == ["machine", "start"] for call in script.calls)
+
+
+def test_a_destroy_timeout_keeps_the_replacement():
+    script = Script(
+        [
+            *_happy()[:-1],
+            TIMEOUT,
+            (0, _machines((MACHINE, "stopped"), (NEW, "stopped")), ""),
+        ]
+    )
+    with pytest.raises(RecoveryError, match="was kept") as raised:
+        _moved(script=script)
+    assert "timed out" in str(raised.value)
+    assert "not restarted" in str(raised.value)
+    assert script.steps == []
+    destroys = [call for call in script.calls if "destroy" in call]
+    assert destroys == [["flyctl", "machine", "destroy", MACHINE, "--app", APP, "--force"]]
+    assert not any(call[1:3] == ["machine", "start"] for call in script.calls)
 
 
 def test_the_wrong_volume_is_not_forked():
@@ -440,7 +608,13 @@ def test_a_failed_move_does_not_record_a_machine_to_keep(tmp_path):
     keep = tmp_path / "keep"
     toml.write_text(FLY_TOML, encoding="utf-8")
     log.write_text(LOG, encoding="utf-8")
-    script = Script([(0, _volumes(), ""), (1, "", "no capacity anywhere")])
+    script = Script(
+        [
+            (0, _volumes(), ""),
+            (1, "", "could not stop machine: the host is not running"),
+            (0, _machines((MACHINE, "started")), ""),
+        ]
+    )
     assert (
         main(
             [
