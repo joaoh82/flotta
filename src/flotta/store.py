@@ -3554,12 +3554,32 @@ class FleetStore:
         return cursor.fetchone() is not None
 
     def break_mcp_connection(
-        self, org_id: str, server: str, detail: str, *, client: str | None = None
+        self,
+        org_id: str,
+        server: str,
+        detail: str,
+        *,
+        client: str | None = None,
+        credential: str | None = None,
     ) -> None:
+        """Mark a connection broken. `detail` is what a person reads.
+
+        `credential`, when given, replaces the sealed value in the same write.
+        The gateway uses that to record `failure` inside an OAuth credential
+        that can no longer be refreshed, which is structured and not `detail`.
+        """
+        now = _utcnow()
+        if credential is None:
+            self._conn.execute(
+                "UPDATE mcp_connections SET status = 'broken', detail = ?, updated_at = ? "
+                "WHERE org_id = ? AND client_id = ? AND server = ?",
+                (detail[:500], now, org_id, client or "", server),
+            )
+            return
         self._conn.execute(
-            "UPDATE mcp_connections SET status = 'broken', detail = ?, updated_at = ? "
-            "WHERE org_id = ? AND client_id = ? AND server = ?",
-            (detail[:500], _utcnow(), org_id, client or "", server),
+            "UPDATE mcp_connections SET status = 'broken', detail = ?, credential = ?, "
+            "updated_at = ? WHERE org_id = ? AND client_id = ? AND server = ?",
+            (detail[:500], credential, now, org_id, client or "", server),
         )
 
     def delete_mcp_connection(

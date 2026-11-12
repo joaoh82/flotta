@@ -63,6 +63,7 @@ import ipaddress
 import json
 import os
 import re
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -409,6 +410,75 @@ def parse_client_secret(body: Any, server: Server) -> str:
     if len(value) > 4096 or any(ch in value for ch in "\r\n\0"):
         raise McpError("that isn't a client secret")
     return value
+
+
+#: Written into a sealed OAuth credential when its access token is spent and
+#: there is no refresh token. Readers use this, never the human `detail`.
+CREDENTIAL_FAILURE_EXPIRED = "expired"
+
+
+def connection_status(
+    connection: Any, server: Server | None, *, env: Mapping[str, str] | None = None
+) -> str:
+    """`not_connected`, `connected`, `error` or `expired` for an org's MCP list.
+
+    No row is `not_connected`. One the gateway would use (`connection_usable`
+    is silent) is `connected`. A broken OAuth credential that says
+    `failure` is `expired`, or that has no refresh token and an `expires_at`
+    already past, is `expired`. Every other refusal is `error`. The human
+    `detail` is not read.
+    """
+    if connection is None:
+        return "not_connected"
+    if connection_usable(connection, server, env) is None:
+        return "connected"
+    if connection.status == "broken" and _expired_unrefreshable(connection, env):
+        return "expired"
+    return "error"
+
+
+def _expired_unrefreshable(connection: Any, env: Mapping[str, str] | None) -> bool:
+    """Whether this broken OAuth credential can no longer be renewed.
+
+    The flag the gateway writes, or the credential's own `expires_at` and
+    `refresh_token`. A bearer key, a seal that will not open, and a token that
+    still has a refresh token are not this.
+    """
+    if connection.kind != "oauth":
+        return False
+    from flotta.sealed import SealError, unseal
+
+    client = connection.client_id or None
+    try:
+        raw = unseal(
+            connection.credential,
+            context=connection_context(connection.org_id, connection.server, client),
+            env=env,
+        )
+        body = json.loads(raw)
+    except (SealError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+    if body.get("failure") == CREDENTIAL_FAILURE_EXPIRED:
+        return True
+    refresh = body.get("refresh_token")
+    if isinstance(refresh, str) and refresh:
+        return False
+    expires_at = body.get("expires_at")
+    return isinstance(expires_at, int | float) and float(expires_at) <= time.time()
+
+
+def library_fields(server: Server) -> dict[str, Any]:
+    """The explicit library marker, and its manifest id.
+
+    Only `library: true`, which `catalogue_entry` writes. The same name and
+    host, and a spec that merely matches, are a hand-written server: `library`
+    false and no `library_id`.
+    """
+    if not server.library:
+        return {"library": False}
+    return {"library": True, "library_id": server.name}
 
 
 def connection_usable(

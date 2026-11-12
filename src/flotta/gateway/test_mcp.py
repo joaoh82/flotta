@@ -19,9 +19,9 @@ from fastapi.testclient import TestClient
 from flotta.auth import SCOPE_MCP_CALL, SCOPE_MODEL_CALL, box_subject, mint
 from flotta.gateway.app import create_gateway
 from flotta.gateway.fake_mcp import MCP_URL, FakeMcp, catalogue
-from flotta.mcp import connection_context
+from flotta.mcp import CREDENTIAL_FAILURE_EXPIRED, connection_context
 from flotta.mcp_oauth import Client, Endpoints, Tokens, oauth_credential
-from flotta.sealed import fresh, seal
+from flotta.sealed import fresh, seal, unseal
 from flotta.store import FleetStore
 
 SIGNING_KEY = "a-signing-key-for-these-tests"
@@ -385,6 +385,30 @@ def test_an_expired_token_is_refreshed_before_the_call(path):
     assert "result" in answer.json(), answer.text
     assert server.refreshes == 1
     assert server.requests[-1].headers["authorization"] == "Bearer at-2"
+
+
+def test_an_expired_token_with_nothing_to_refresh_is_flagged(path):
+    """The break is a field on the credential, and the sentence a person reads stays."""
+    server = FakeMcp(keys=set())
+    credential = oauth_credential(
+        ENDPOINTS,
+        Client("dyn-1", "dyn-secret"),
+        Tokens("at-old", None, time.time() - 10),
+    )
+    _connect(path, credential, kind="oauth")
+    _grant(path)
+    with _client(path, server, env=OAUTH_ENV) as client:
+        answer = client.post("/mcp/tracker", json=_call("read_issue"), headers=_auth())
+    assert answer.status_code == 503
+    with FleetStore(path) as fleet:
+        found = fleet.mcp_connection("studio-nord", "tracker")
+    assert found is not None and found.status == "broken"
+    assert found.detail == "expired, with no way to refresh"
+    opened = json.loads(
+        unseal(found.credential, context=connection_context("studio-nord", "tracker"), env=ENV)
+    )
+    assert opened["failure"] == CREDENTIAL_FAILURE_EXPIRED
+    assert opened.get("refresh_token") in (None, "")
 
 
 def test_a_refused_upstream_token_is_refreshed_once_and_the_call_tried_again(path):

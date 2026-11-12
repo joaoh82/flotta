@@ -1146,6 +1146,13 @@ already has.
    no other agent can. `GET /api/boxes/<agent>/mcp` says, per granted server, whose
    account its calls use.
 
+`GET /api/orgs/<org>/mcp` is that list for the console. Each server keeps
+`name`, `title`, `url`, `auth`, `ask_first`, `tools` and `connection` (`status`
+`ok` or `broken`, plus `detail`). It also says `library` (true only for an
+entry the connector library wrote, with `library_id`) and `status`
+(`not_connected`, `connected`, `error` or `expired`). `expired` is read from
+the sealed credential, not from the detail text. See `docs/MCP_SERVERS.md`.
+
 A grant is in force at the gateway the moment it is saved. If the agent's machine can't
 be written, the answer says `written: false`: the agent then can't find a new server, and
 a removed one is refused anyway. A running agent is then asked to reload its MCP servers

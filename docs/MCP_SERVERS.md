@@ -5,6 +5,29 @@ top of it (`src/flotta/mcp_library.json`): eleven vendor connectors an operator
 adds with `POST /api/mcp/library/{id}`. A custom catalogue entry stays possible.
 The console that lists these is a separate change.
 
+## What an agency's list shows
+
+`GET /api/orgs/{org}/mcp` adds two things to each server, and changes nothing
+that was already there (`name`, `title`, `url`, `auth`, `ask_first`, `tools`,
+and `connection`, whose `status` is still `ok` or `broken`).
+
+`library` is true only when the catalogue entry carries `"library": true`, the
+marker `catalogue_entry` writes. `library_id` is that entry's manifest id, and
+it is present only then. A hand-written server is `library: false` with no
+`library_id`, including one that reuses a library name and host. This list does
+not use the spec-match fallback that grants do.
+
+`status` is the connection, as an enum:
+
+| `status` | When |
+| --- | --- |
+| `not_connected` | No connection row |
+| `connected` | The gateway would use it (`connection.status` is `ok`) |
+| `expired` | The row is broken, and the sealed credential says so: `failure` is `expired`, or there is no refresh token and `expires_at` is already past |
+| `error` | Any other broken connection, including a bearer key whose detail happens to mention expiry |
+
+The OpenAPI document for this route carries one example of that object.
+
 ## What "added from the library" means
 
 `catalogue_entry` writes a normal catalogue object and sets `"library": true`.

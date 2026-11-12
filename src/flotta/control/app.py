@@ -4124,7 +4124,13 @@ def create_app(
     # owners, at `/api/orgs/{org}/clients/{client}/mcp/...`. That client's agents
     # use it ahead of the org's; no other agent can.
 
-    from flotta.mcp import McpError, catalogue_of, connection_usable
+    from flotta.mcp import (
+        McpError,
+        catalogue_of,
+        connection_status,
+        connection_usable,
+        library_fields,
+    )
 
     def _mcp_catalogue(store: Any) -> dict[str, Any]:
         """The servers on offer now. A list that can't be read is served empty (`catalogue_of`)."""
@@ -4378,9 +4384,61 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"{server} has no client secret set")
         return {"server": server, "has_client_secret": False}
 
-    @app.get("/api/orgs/{org_id}/mcp")
+    def _mcp_listed(store: Any, server: Any, connection: Any) -> dict[str, Any]:
+        """One catalogue server on an org's MCP list.
+
+        Additive on `Server.public()`: `library` (and `library_id` only when the
+        entry carries the library marker), and `status` for the connection
+        (`not_connected`, `connected`, `error`, `expired`). `connection.status`
+        stays `ok` or `broken`, and `connection.detail` is unchanged.
+        """
+        return {
+            **server.public(),
+            **library_fields(server),
+            "status": connection_status(connection, server),
+            "connection": _mcp_connection(store, connection, server),
+        }
+
+    @app.get(
+        "/api/orgs/{org_id}/mcp",
+        responses={
+            200: {
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "servers": [
+                                {
+                                    "name": "linear",
+                                    "title": "Linear",
+                                    "url": "https://mcp.linear.app/mcp",
+                                    "auth": "oauth",
+                                    "ask_first": True,
+                                    "tools": None,
+                                    "library": True,
+                                    "library_id": "linear",
+                                    "status": "not_connected",
+                                    "connection": None,
+                                    "clients": {},
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+    )
     def org_mcp(org_id: str, token: Token | None = needs_write) -> Any:
-        """Every catalogue server, and whether this org has connected it."""
+        """Every catalogue server, and whether this org has connected it.
+
+        Each server is `name`, `title`, `url`, `auth`, `ask_first`, `tools`,
+        then `library` (`true` only when the catalogue entry has the marker
+        `catalogue_entry` writes, with `library_id` the manifest id; a
+        hand-written entry is `library: false` and has no `library_id`), and
+        `status`: `not_connected`, `connected`, `error` or `expired`.
+        `connection` is unchanged: `null`, or `kind`, `status` (`ok` or
+        `broken`), `detail`, and who connected it. `clients` is that same
+        connection object per client.
+        """
         _agency_of(token, org_id)
         store = store_factory()
         try:
@@ -4395,8 +4453,7 @@ def create_app(
             return {
                 "servers": [
                     {
-                        **s.public(),
-                        "connection": _mcp_connection(store, connected.get(s.name), s),
+                        **_mcp_listed(store, s, connected.get(s.name)),
                         "clients": by_client.get(s.name, {}),
                     }
                     for s in servers.values()
@@ -4420,8 +4477,7 @@ def create_app(
                 "client": client_id,
                 "servers": [
                     {
-                        **s.public(),
-                        "connection": _mcp_connection(store, own.get(s.name), s),
+                        **_mcp_listed(store, s, own.get(s.name)),
                         "agency": _mcp_connection(store, agency.get(s.name), s),
                     }
                     for s in servers.values()
