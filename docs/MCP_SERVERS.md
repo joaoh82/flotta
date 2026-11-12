@@ -5,6 +5,59 @@ top of it (`src/flotta/mcp_library.json`): eleven vendor connectors an operator
 adds with `POST /api/mcp/library/{id}`. A custom catalogue entry stays possible.
 The console that lists these is a separate change.
 
+## What an agency's list shows
+
+`GET /api/orgs/{org}/mcp` adds two things to each server, and changes nothing
+that was already there (`name`, `title`, `url`, `auth`, `ask_first`, `tools`,
+and `connection`, whose `status` is still `ok` or `broken`).
+
+`library` is true only when the catalogue entry carries `"library": true`, the
+marker `catalogue_entry` writes. `library_id` is that entry's manifest id, and
+it is present only then. A hand-written server is `library: false` with no
+`library_id`, including one that reuses a library name and host. This list does
+not use the spec-match fallback that grants do.
+
+`status` is the connection, as an enum:
+
+| `status` | When |
+| --- | --- |
+| `not_connected` | No connection row |
+| `connected` | The gateway would use it (`connection.status` is `ok`) |
+| `expired` | The row is broken, and the sealed credential says so: `failure` is `expired`, or there is no refresh token and `expires_at` is already past |
+| `error` | Any other broken connection, including a bearer key whose detail happens to mention expiry |
+
+The OpenAPI document for this route carries one example of that object.
+
+## The tools a connected server lists
+
+`GET /api/orgs/{org}/mcp/{server}/tools` (`fleet:read`) runs `tools/list` with
+the org's sealed credential, so the console can offer the tools Linear and Make
+do not name in the catalogue. Each tool is `name`, `description`, `read_only`
+(the server's `annotations.readOnlyHint`, or null) and, when the server sent
+an annotations object, `annotations`. The schema is not copied.
+
+Not connected is `409` with `{"code": "not_connected"}`. A sign-in that has
+expired and cannot be refreshed is `424` with `{"code": "expired"}`. Any other
+connection the gateway would not use is `424` with `{"code": "error"}`. The
+server answering badly is `502` `upstream`; not answering within 20 seconds is
+`504` `timeout`. A templated host is pinned the way the gateway pins it, and a
+redirect is not followed. A token inside its refresh window is renewed first,
+through the same OAuth refresh the gateway uses.
+
+```json
+{
+  "server": "linear",
+  "tools": [
+    {
+      "name": "list_issues",
+      "description": "List issues",
+      "read_only": true,
+      "annotations": {"readOnlyHint": true}
+    }
+  ]
+}
+```
+
 ## What "added from the library" means
 
 `catalogue_entry` writes a normal catalogue object and sets `"library": true`.

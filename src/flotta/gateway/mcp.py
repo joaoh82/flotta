@@ -88,6 +88,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from flotta import mcp_oauth
 from flotta.mcp import (
+    CREDENTIAL_FAILURE_EXPIRED,
     Grant,
     Server,
     auth_headers,
@@ -475,8 +476,19 @@ class Proxy:
         account = "client" if client else "org"
         token = credential.get("refresh_token")
         if not token:
+            # The flag lives in the credential. The org list reads it; the
+            # sentence below stays what a person sees.
+            marked = json.dumps({**credential, "failure": CREDENTIAL_FAILURE_EXPIRED})
+            try:
+                sealed = seal(marked, context=context, env=self._env)
+            except SealError:
+                sealed = None
             store.break_mcp_connection(
-                box.org, server.name, "expired, with no way to refresh", client=client
+                box.org,
+                server.name,
+                "expired, with no way to refresh",
+                client=client,
+                credential=sealed,
             )
             raise McpRefused(
                 503, f"{server.title}'s sign-in has expired: connect it again", account=account
