@@ -362,6 +362,7 @@ OPERATOR_ROUTES = [
     ("GET", "/api/hermes", SCOPE_FLEET_READ, None),
     ("GET", "/api/hermes/builds", SCOPE_FLEET_READ, None),
     ("POST", "/api/hermes/update", SCOPE_FLEET_WRITE, {"hermes_ref": "v0.22.5"}),
+    ("POST", "/api/mcp/library/notion", SCOPE_FLEET_WRITE, {"params": {}}),
 ]
 
 

@@ -92,6 +92,10 @@ class Endpoints:
     token: str
     registration: str | None = None
     revocation: str | None = None
+    #: Space-separated `token_endpoint_auth_methods_supported`. A string, not a
+    #: tuple, because this object is sealed as JSON. Empty means the server
+    #: didn't say, and registration keeps today's `client_secret_post`.
+    token_auth_methods: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +241,51 @@ def _get_metadata(http: httpx.Client, server: Server, url: str) -> dict[str, Any
     return _json(response, url)
 
 
+def _authorization_metadata_urls(issuer: str) -> list[str]:
+    """Where an issuer publishes its metadata (RFC 8414).
+
+    A path-bearing issuer is read at `{origin}/.well-known/oauth-authorization-server{path}`,
+    not at `{issuer}/.well-known/...`. Airtable, monday.com, Stripe and Make
+    answer only the first form. Atlassian's issuer answers the second, and the
+    inserted URL can 404, so both are tried, insertion first.
+    """
+    parts = urlsplit(issuer)
+    path = parts.path.rstrip("/")
+    origin = f"{parts.scheme}://{parts.netloc}"
+    inserted = (
+        [
+            f"{origin}/.well-known/oauth-authorization-server{path}",
+            f"{origin}/.well-known/openid-configuration{path}",
+        ]
+        if path
+        else []
+    )
+    suffix = [
+        f"{issuer}/.well-known/oauth-authorization-server",
+        f"{issuer}/.well-known/openid-configuration",
+    ]
+    return inserted + suffix
+
+
+def registration_auth_method(methods: str) -> str:
+    """How Flotta authenticates at the token endpoint after dynamic registration.
+
+    `client_secret_post` when the server says nothing (what registration has
+    always sent) or lists it. `none` when that is the public-client method and
+    `client_secret_post` is not offered (Calendly, Stripe, Airtable). Anything
+    else is refused rather than sent as a method the server did not advertise.
+    """
+    chosen = set(methods.split())
+    if not chosen or "client_secret_post" in chosen:
+        return "client_secret_post"
+    if "none" in chosen:
+        return "none"
+    raise OAuthError(
+        "dynamic registration here accepts client_secret_post or none, "
+        "and this server offers neither"
+    )
+
+
 def discover(http: httpx.Client, server: Server) -> Endpoints:
     """The server's OAuth endpoints: the operator's, else what the server publishes.
 
@@ -261,10 +310,7 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         issuers = (resource or {}).get("authorization_servers") or [origin]
         issuer = str(issuers[0]).rstrip("/")
         checked(server, issuer, "authorization server")
-        for candidate in (
-            f"{issuer}/.well-known/oauth-authorization-server",
-            f"{issuer}/.well-known/openid-configuration",
-        ):
+        for candidate in _authorization_metadata_urls(issuer):
             metadata = _get_metadata(http, server, candidate)
             if metadata is not None:
                 found = metadata
@@ -277,6 +323,11 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         raise OAuthError(f"{server.name}'s OAuth metadata names no authorization or token endpoint")
     registration = settings.registration_endpoint or found.get("registration_endpoint")
     revocation = settings.revocation_endpoint or found.get("revocation_endpoint")
+    raw_methods = found.get("token_endpoint_auth_methods_supported") or []
+    if not isinstance(raw_methods, list):
+        methods = ""
+    else:
+        methods = " ".join(m for m in raw_methods if isinstance(m, str))
     return Endpoints(
         authorization=checked(server, str(authorization), "authorization endpoint"),
         token=checked(server, str(token), "token endpoint"),
@@ -284,6 +335,7 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         if registration
         else None,
         revocation=checked(server, str(revocation), "revocation endpoint") if revocation else None,
+        token_auth_methods=methods,
     )
 
 
@@ -305,6 +357,7 @@ def client_for(
             f"{server.name} offers no client registration, so the operator must register "
             "Flotta with it and set client_id"
         )
+    auth_method = registration_auth_method(endpoints.token_auth_methods)
     response = _send(
         http,
         server,
@@ -316,7 +369,7 @@ def client_for(
             "redirect_uris": [redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
-            "token_endpoint_auth_method": "client_secret_post",
+            "token_endpoint_auth_method": auth_method,
         },
     )
     if response.status_code not in (200, 201):

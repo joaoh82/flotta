@@ -4268,6 +4268,77 @@ def create_app(
             "error": error,
         }
 
+    @app.get("/api/mcp/library")
+    def list_mcp_library(token: Token | None = needs_read) -> Any:
+        """The connectors HQ can add in one click. The same list for every reader."""
+        from flotta.mcp_library import public_entries
+
+        return {"connectors": public_entries()}
+
+    @app.post("/api/mcp/library/{entry_id}")
+    def add_mcp_from_library(
+        entry_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Add one library connector to the catalogue, through the same write as settings.
+
+        The stored list replaces the environment's, so this writes the catalogue
+        as it is now plus the new entry. An entry already there with the same
+        spec is left alone. A different one is refused, so a custom server
+        (Marvin, a hand-written URL) is not overwritten.
+        """
+        _require_operator(token, "add a connector from the library")
+        import json
+
+        from flotta.mcp import catalogue_of as mcp_catalogue_of
+        from flotta.mcp import parse_server
+        from flotta.mcp_library import LibraryError, catalogue_entry, entry
+        from flotta.settings import describe, validate
+
+        found = entry(entry_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail=f"no library connector {entry_id!r}")
+        if not isinstance(body, dict) or set(body) - {"params"}:
+            raise HTTPException(status_code=422, detail='expected {"params": {...}}')
+        params = body.get("params") or {}
+        if not isinstance(params, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in params.items()
+        ):
+            raise HTTPException(status_code=422, detail="params is an object of strings")
+        try:
+            built = catalogue_entry(found, params)
+        except LibraryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        store = store_factory()
+        try:
+            current, error = mcp_catalogue_of(store)
+            if error:
+                raise HTTPException(status_code=422, detail="the MCP catalogue could not be read")
+            proposed = parse_server(built)
+            existing = current.get(proposed.name)
+            if existing is not None and existing.spec() != proposed.spec():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{proposed.name} is already in the catalogue with a different entry",
+                )
+            if existing is None:
+                try:
+                    cleaned = validate(
+                        "FLOTTA_MCP_SERVERS",
+                        json.dumps([*(s.spec() for s in current.values()), built]),
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                store.set_settings({"FLOTTA_MCP_SERVERS": cleaned})
+                _mcp_catalogue_changed(store, current)
+            return {
+                "added": existing is None,
+                "server": proposed.for_operator() if existing is None else existing.for_operator(),
+                "settings": describe(store),
+            }
+        finally:
+            store.close()
+
     @app.put("/api/mcp/servers/{server}/client-secret")
     def set_mcp_client_secret(
         server: str, body: dict[str, Any], token: Token | None = needs_write

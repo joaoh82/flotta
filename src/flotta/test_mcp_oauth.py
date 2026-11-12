@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import time
 
 import httpx
@@ -259,3 +260,92 @@ def test_an_endpoint_the_metadata_names_elsewhere_is_held_to_the_rule():
         pytest.raises(mcp_oauth.OAuthError, match="https"),
     ):
         mcp_oauth.discover(http, SERVER)
+
+
+def test_registration_uses_client_secret_post_unless_the_server_only_offers_none():
+    assert mcp_oauth.registration_auth_method("") == "client_secret_post"
+    assert mcp_oauth.registration_auth_method("none client_secret_post") == "client_secret_post"
+    assert mcp_oauth.registration_auth_method("none") == "none"
+    with pytest.raises(mcp_oauth.OAuthError, match="neither"):
+        mcp_oauth.registration_auth_method("client_secret_basic")
+
+
+def test_a_path_bearing_issuer_is_discovered_where_rfc_8414_puts_it():
+    seen = []
+
+    def answer(request):
+        seen.append(request.url.path)
+        if request.url.path == "/.well-known/oauth-protected-resource/mcp":
+            return httpx.Response(
+                200,
+                json={"authorization_servers": ["https://auth.example.test/oauth2/v1"]},
+            )
+        if request.url.path == "/.well-known/oauth-authorization-server/oauth2/v1":
+            return httpx.Response(
+                200,
+                json={
+                    "authorization_endpoint": "https://auth.example.test/oauth2/v1/authorize",
+                    "token_endpoint": "https://auth.example.test/oauth2/v1/token",
+                    "registration_endpoint": "https://auth.example.test/oauth2/v1/register",
+                    "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
+                },
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        endpoints = mcp_oauth.discover(http, SERVER)
+    assert endpoints.registration == "https://auth.example.test/oauth2/v1/register"
+    assert endpoints.token_auth_methods == "none client_secret_basic"
+    assert "/oauth2/v1/.well-known/oauth-authorization-server" not in seen
+
+
+def test_a_suffix_metadata_url_still_answers_when_insertion_does_not():
+    """Atlassian's issuer answers `{issuer}/.well-known/...`, and insertion can 404."""
+
+    def answer(request):
+        path = request.url.path
+        if path.startswith("/.well-known/oauth-protected-resource"):
+            return httpx.Response(
+                200, json={"authorization_servers": ["https://auth.example.test/oauth/v1"]}
+            )
+        if path == "/oauth/v1/.well-known/oauth-authorization-server":
+            return httpx.Response(
+                200,
+                json={
+                    "authorization_endpoint": "https://auth.example.test/oauth/v1/authorize",
+                    "token_endpoint": "https://auth.example.test/oauth/v1/token",
+                },
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        endpoints = mcp_oauth.discover(http, SERVER)
+    assert endpoints.token == "https://auth.example.test/oauth/v1/token"
+
+
+def test_a_server_that_only_offers_none_registers_a_public_client():
+    posted = {}
+
+    def answer(request):
+        if request.url.path.startswith("/.well-known/oauth-protected-resource"):
+            return httpx.Response(200, json={"authorization_servers": [AUTH_URL]})
+        if request.url.path.endswith("oauth-authorization-server"):
+            return httpx.Response(
+                200,
+                json={
+                    "authorization_endpoint": f"{AUTH_URL}/authorize",
+                    "token_endpoint": f"{AUTH_URL}/token",
+                    "registration_endpoint": f"{AUTH_URL}/register",
+                    "token_endpoint_auth_methods_supported": ["none"],
+                },
+            )
+        if request.url.path == "/register":
+            posted["body"] = json.loads(request.content)
+            return httpx.Response(201, json={"client_id": "pub-1"})
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        endpoints = mcp_oauth.discover(http, SERVER)
+        client = mcp_oauth.client_for(http, SERVER, endpoints, REDIRECT)
+    assert posted["body"]["token_endpoint_auth_method"] == "none"
+    assert client == mcp_oauth.Client("pub-1", None)

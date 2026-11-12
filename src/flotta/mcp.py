@@ -464,6 +464,11 @@ def parse_grants(body: Any, servers: Mapping[str, Server]) -> tuple[Grant, ...]:
             outside = [t for t in tools if t not in server.tools]
             if outside:
                 raise McpError(f"{name} doesn't offer {', '.join(outside)}")
+        # A library connector's omitted tool list is its read tools, not every
+        # tool the catalogue names. A hand-written entry is left as it was.
+        from flotta.mcp_library import default_grant_tools
+
+        tools = default_grant_tools(server, tools)
         ask_first = item.get("ask_first", server.ask_first)
         if not isinstance(ask_first, bool):
             raise McpError(f"{name}: ask_first is true or false")
