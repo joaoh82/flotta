@@ -60,6 +60,16 @@ It is one small read beside the grant's, on a path that already reads the
 store. A connection made for another address than the entry now has, of
 another kind, or sealed under a key this process doesn't hold, is never used
 (`flotta.mcp.connection_usable`); the agent is told to have it connected again.
+
+## A templated connector is pinned
+
+n8n and Intercom (and any later library entry with a URL template) take a host
+from the operator. At connect time the gateway checks that host the way the
+library did at add time, then `alerts.check_addresses`: every address it
+resolves to has to be public. The request then goes to that address via
+`alerts.pinned_request`, with the Host header and httpcore's `sni_hostname`
+extension still the hostname. A redirect is not followed. A hand-written server
+without the library marker is not on this path.
 """
 
 from __future__ import annotations
@@ -86,6 +96,7 @@ from flotta.mcp import (
     connection_usable,
     grant_from_row,
 )
+from flotta.mcp_library import LibraryError, assert_template_target, templated
 from flotta.sealed import SealError, seal, unseal
 from flotta.store import Box, FleetStore
 
@@ -127,6 +138,7 @@ METHOD_REFUSED = -32601
 #: here. Answers to the server's own requests (an elicitation, say) carry no
 #: method and pass.
 PASSED = frozenset({"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"})
+
 
 _EVENT_END = b"\n\n"
 
@@ -297,8 +309,15 @@ class Proxy:
     # -- lifetime --------------------------------------------------------------
 
     def open(self) -> None:
+        # No keepalive: a templated connector is dialled by IP, and the pool
+        # keys on that IP. Reusing the connection would carry one hostname's
+        # TLS session to another host on the same address.
         self.upstream = httpx.AsyncClient(
-            transport=self._transport, timeout=_TIMEOUT, trust_env=False
+            transport=self._transport,
+            timeout=_TIMEOUT,
+            trust_env=False,
+            follow_redirects=False,
+            limits=httpx.Limits(max_keepalive_connections=0),
         )
 
     async def close(self) -> None:
@@ -629,13 +648,35 @@ class Proxy:
         self, request: Request, server: Server, raw: bytes, credential: Mapping[str, Any]
     ) -> httpx.Response:
         assert self.upstream is not None
+        url = server.url
+        headers = self._headers(request, server, credential)
+        extensions: dict[str, Any] | None = None
+        item = templated(server)
+        if item is not None:
+            # Add-time rules again (literal IPs, private suffixes, port 443),
+            # then the webhook DNS check. The connection is pinned to that
+            # address; httpcore's `sni_hostname` keeps TLS on the hostname.
+            try:
+                assert_template_target(item, server.url)
+                url, host_header, sni = await mcp_oauth.connect_pinned(server.url)
+            except LibraryError as exc:
+                raise McpRefused(502, str(exc)) from exc
+            except mcp_oauth.OAuthError as exc:
+                raise McpRefused(502, str(exc)) from exc
+            headers = {**headers, "Host": host_header}
+            extensions = {"sni_hostname": sni}
         upstream = self.upstream.build_request(
             request.method,
-            server.url,
+            url,
             content=raw if request.method == "POST" else None,
-            headers=self._headers(request, server, credential),
+            headers=headers,
+            extensions=extensions,
         )
-        return await self.upstream.send(upstream, stream=True)
+        response = await self.upstream.send(upstream, stream=True, follow_redirects=False)
+        if item is not None and 300 <= response.status_code < 400:
+            await response.aclose()
+            raise McpRefused(502, f"{server.title} answered with a redirect, which is not followed")
+        return response
 
     async def _answer(
         self,

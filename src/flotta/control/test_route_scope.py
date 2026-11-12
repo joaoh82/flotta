@@ -104,6 +104,8 @@ OPERATOR_ROUTES = frozenset(
         "view_as",
         "list_users",
         "list_fleet_boxes",
+        # The connector library writes the fleet catalogue (FLOTTA-225).
+        "add_mcp_from_library",
     }
 )
 
@@ -111,7 +113,7 @@ OPERATOR_ROUTES = frozenset(
 #: read the fleet: their answer is the same whoever asks, so they need not read
 #: their token. They still take one, so an unauthenticated caller is refused,
 #: and they may not reach a box any more than any other route.
-CONFIG_READS = frozenset({"list_models", "list_mcp_servers"})
+CONFIG_READS = frozenset({"list_models", "list_mcp_servers", "list_mcp_library"})
 
 #: Routes with no principal at all, on purpose. They may not reach a box.
 #: The sign-in and sign-up routes are how a person without a credential gets one.

@@ -127,6 +127,21 @@ def test_a_grant_becomes_an_entry_pointing_at_the_gateway_with_the_boxs_own_toke
     assert config["model"] == {"default": "x"}
 
 
+def test_an_empty_grant_on_a_dynamic_connector_exposes_zero_tools(tmp_path):
+    """`()` is a filter of nothing. Omitting `tools` would be no filter at all."""
+    from flotta.mcp_library import catalogue_entry, entry
+
+    linear = parse_catalogue(json.dumps([catalogue_entry(entry("linear"), {})]))
+    grants = parse_grants({"servers": [{"server": "linear"}]}, linear)
+    assert grants[0].tools == ()
+    config = _written(
+        {},
+        config_changes(list(grants), linear, base="https://gw.example", token="t"),
+        tmp_path,
+    )
+    assert config["mcp_servers"]["flotta-linear"]["tools"] == {"include": []}
+
+
 def test_a_grant_taken_away_leaves_no_entry_and_the_agents_own_stay(tmp_path):
     before = {
         "mcp_servers": {
