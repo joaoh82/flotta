@@ -275,25 +275,38 @@ def webhook_body(event: BudgetEvent) -> bytes:
 Poster = Callable[[str, str, bytes, dict[str, str]], Awaitable[int]]
 
 
+def pinned_request(url: str, address: str) -> tuple[str, str, str]:
+    """`(url, host_header, sni_hostname)` for a connection to `address` as `url`.
+
+    TCP dials `address`, which `check_addresses` already vetted. The Host header
+    and TLS stay on the original hostname: httpcore's `AsyncHTTPConnection._connect`
+    reads the `sni_hostname` request extension and passes it to `start_tls` as
+    `server_hostname`, so the certificate is checked against the name. One
+    implementation, shared with `mcp_oauth._send` and the gateway's templated
+    MCP connections. Redirects are not followed by the callers.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    bare = address.split("%", 1)[0]
+    bracketed = f"[{bare}]" if ":" in bare else bare
+    netloc = f"{bracketed}:{parts.port}" if parts.port else bracketed
+    pinned = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+    return pinned, parts.netloc.rsplit("@", 1)[-1], host
+
+
 async def post_pinned(url: str, address: str, body: bytes, headers: dict[str, str]) -> int:
     """POST to `address`, as `url`. The status is all that is read of the answer."""
     import httpx
 
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    bracketed = f"[{address.split('%', 1)[0]}]" if ":" in address else address
-    netloc = f"{bracketed}:{parts.port}" if parts.port else bracketed
-    pinned = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
-    # The certificate is still checked against the name: `sni_hostname` is what it is
-    # compared with, whatever address the connection went to.
+    pinned, host_header, sni = pinned_request(url, address)
     async with (
         httpx.AsyncClient(trust_env=False, follow_redirects=False) as client,
         client.stream(
             "POST",
             pinned,
             content=body,
-            headers={**headers, "Host": parts.netloc.rsplit("@", 1)[-1]},
-            extensions={"sni_hostname": host},
+            headers={**headers, "Host": host_header},
+            extensions={"sni_hostname": sni},
         ) as response,
     ):
         return response.status_code

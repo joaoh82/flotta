@@ -14,7 +14,13 @@ Read tools are the default grant. Write tools are in the catalogue so an
 agency can opt into them, and off until it does. A tool this file does not
 classify is write: it is not in the default grant. Where the vendor publishes
 no stable names (Linear's docs, Make's per-account scenario tools), the entry
-is `dynamic_tools`: nothing is on by default, and naming a tool opts into it.
+is `dynamic_tools`: nothing is on by default (`tools_enabled` is false, and
+`read_tools` is empty). The agency names tools after it has seen a `tools/list`.
+
+A catalogue entry is one of these only when it carries `"library": true`,
+which `catalogue_entry` writes. A hand-written server with the same name and
+host, the `linear` example in `flotta.mcp` included, does not, and an omitted
+grant on it still means every tool.
 """
 
 from __future__ import annotations
@@ -33,7 +39,16 @@ _PATH = Path(__file__).with_name("mcp_library.json")
 _NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOST = re.compile(rf"^(?:{_LABEL}\.)+[a-z]{{2,63}}$")
-_BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".localdomain")
+_BLOCKED_SUFFIXES = (
+    ".localhost",
+    ".local",
+    ".localdomain",
+    ".internal",
+    ".lan",
+    ".home.arpa",
+    ".svc",
+    ".corp",
+)
 _TEMPLATE = re.compile(r"^https://\{host\}/[A-Za-z0-9._~/-]+$")
 _TOOL = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
 _FIELDS = frozenset(
@@ -111,6 +126,9 @@ class LibraryEntry:
             "oauth_scopes": list(self.oauth_scopes),
             "docs_url": self.docs_url,
             "dynamic_tools": self.dynamic_tools,
+            # False for Linear and Make: the console can say no tools are enabled yet
+            # without guessing from an empty list. The agency opts in after tools/list.
+            "tools_enabled": bool(self.read_tools),
         }
 
 
@@ -167,6 +185,9 @@ def catalogue_entry(item: LibraryEntry, params: dict[str, str]) -> dict[str, Any
         "url": url,
         "auth": "oauth" if item.auth == "oauth" else "bearer",
         "ask_first": True,
+        # The marker `for_server` requires. Without it, a hand-written entry of
+        # the same name is not this connector.
+        "library": True,
     }
     if tools:
         built["tools"] = tools
@@ -208,19 +229,80 @@ def resolve_url(item: LibraryEntry, params: dict[str, str]) -> str:
     return _checked(item, item.url_template.replace("{host}", host, 1))
 
 
-def for_server(server: Server) -> LibraryEntry | None:
-    """The library entry a catalogue server was added from, matched by name and host.
+def _same_spec(server: Server, item: LibraryEntry) -> bool:
+    """Whether `server` is exactly what `catalogue_entry` writes, marker aside.
 
-    A hand-written server that merely reuses a name, or points somewhere else,
-    is not one of these.
+    An entry added before the marker existed has the same spec and is still
+    this connector. A hand-written entry that only shares the name and host
+    does not.
+    """
+    params: dict[str, str] = {}
+    if item.url_template is not None:
+        host = (urlsplit(server.url).hostname or "").lower().rstrip(".")
+        if not host:
+            return False
+        params = {"host": host}
+    try:
+        expected = catalogue_entry(item, params)
+    except LibraryError:
+        return False
+    got = {key: value for key, value in server.spec().items() if key != "library"}
+    want = {key: value for key, value in expected.items() if key != "library"}
+    return got == want
+
+
+def for_server(server: Server) -> LibraryEntry | None:
+    """The library entry a catalogue server was added from.
+
+    The marker `catalogue_entry` writes (`library: true`) is how a server is
+    recognised. Failing that, the spec has to be exactly what `catalogue_entry`
+    would write. The same name and host, on their own, are a hand-written server.
     """
     item = _BY_ID.get(server.name)
     if item is None:
         return None
-    host = (urlsplit(server.url).hostname or "").lower().rstrip(".")
-    if not _host_allowed(host, item.allowed_hosts):
+    if server.library or _same_spec(server, item):
+        return item
+    return None
+
+
+def templated(server: Server) -> LibraryEntry | None:
+    """A library connector whose URL came from a template (n8n, Intercom, and the next one)."""
+    item = for_server(server)
+    if item is None or item.url_template is None:
         return None
     return item
+
+
+def assert_template_target(item: LibraryEntry, url: str) -> None:
+    """The stored URL of a templated connector is still one this entry allows.
+
+    https, port 443, a public DNS name in the entry's host pattern, no literal
+    address. DNS is separate (`alerts.check_addresses`), so a name such as
+    `127.0.0.1.nip.io` passes here and fails when it resolves.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower().rstrip(".")
+    if (
+        parts.scheme != "https"
+        or parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+        or parts.port not in (None, 443)
+        or not host
+    ):
+        raise LibraryError("the address is not allowed for this connector")
+    try:
+        host = _public_host(host)
+    except LibraryError:
+        raise LibraryError("the address is not allowed for this connector") from None
+    if not _host_allowed(host, item.allowed_hosts):
+        raise LibraryError("the address is not allowed for this connector")
+    try:
+        check_webhook_url(url)
+    except WebhookRefused:
+        raise LibraryError("the address is not allowed for this connector") from None
 
 
 def default_grant_tools(

@@ -126,6 +126,70 @@ def test_a_hand_written_entry_keeps_every_tool_it_already_allowed():
     assert grants == (Grant("notion", None, True), Grant("marvin", None, True))
 
 
+def test_linear_and_make_say_no_tools_are_enabled_yet():
+    by_id = {item.id: item.public() for item in entries()}
+    assert by_id["linear"]["tools_enabled"] is False
+    assert by_id["linear"]["read_tools"] == []
+    assert by_id["linear"]["dynamic_tools"] is True
+    assert by_id["make"]["tools_enabled"] is False
+    assert by_id["notion"]["tools_enabled"] is True
+    n8n = entry("n8n")
+    assert n8n is not None
+    for name in ("list_credentials", "get_workflow_execution", "explore_node_resources"):
+        assert name in n8n.write_tools
+        assert name not in n8n.read_tools
+
+
+def test_a_name_like_nip_io_is_left_to_the_resolver():
+    item = entry("n8n")
+    assert item is not None
+    assert resolve_url(item, {"host": "127.0.0.1.nip.io"}) == (
+        "https://127.0.0.1.nip.io/mcp-server/http"
+    )
+
+
+def test_a_spec_that_matches_the_library_is_one_even_without_the_marker():
+    """An entry added before `library: true` existed is still that connector."""
+    linear = entry("linear")
+    assert linear is not None
+    built = catalogue_entry(linear, {})
+    built.pop("library")
+    server = parse_server(built)
+    assert server.library is False
+    grants = parse_grants({"servers": [{"server": "linear"}]}, {"linear": server})
+    assert grants == (Grant("linear", (), True),)
+
+
+def test_a_hand_written_linear_and_n8n_still_grant_every_tool_when_tools_are_omitted():
+    """The example in `mcp.py`, and any n8n entry written by hand: no library marker."""
+    linear = parse_server(
+        {
+            "name": "linear",
+            "title": "Linear",
+            "url": "https://mcp.linear.app/mcp",
+            "auth": "oauth",
+            "tools": ["list_issues", "create_issue"],
+            "oauth": {"scopes": ["read", "write"]},
+        }
+    )
+    n8n = parse_server(
+        {
+            "name": "n8n",
+            "title": "n8n",
+            "url": "https://automation.example.com/mcp-server/http",
+            "auth": "bearer",
+        }
+    )
+    assert not linear.library and not n8n.library
+    grants = parse_grants(
+        {"servers": [{"server": "linear"}, {"server": "n8n"}]},
+        {"linear": linear, "n8n": n8n},
+    )
+    assert grants == (Grant("linear", None, True), Grant("n8n", None, True))
+    assert grants[0].allows(linear, "create_issue")
+    assert grants[1].allows(n8n, "list_credentials")
+
+
 def test_a_dynamic_connector_grants_nothing_until_a_tool_is_named():
     linear = entry("linear")
     assert linear is not None and linear.dynamic_tools
@@ -162,6 +226,11 @@ def test_a_same_name_pointing_somewhere_else_is_not_the_library_connector():
         "metadata.google.internal",
         "printer.local",
         "n8n.localhost",
+        "printer.lan",
+        "nas.home.arpa",
+        "n8n.default.svc",
+        "files.corp",
+        "box.internal",
         "user:secret@automation.example.com",
         "automation.example.com/?token=sk_live_supersecretvalue",
         "https://automation.example.com",

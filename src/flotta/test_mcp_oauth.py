@@ -265,7 +265,11 @@ def test_an_endpoint_the_metadata_names_elsewhere_is_held_to_the_rule():
 def test_registration_uses_client_secret_post_unless_the_server_only_offers_none():
     assert mcp_oauth.registration_auth_method("") == "client_secret_post"
     assert mcp_oauth.registration_auth_method("none client_secret_post") == "client_secret_post"
-    assert mcp_oauth.registration_auth_method("none") == "none"
+    assert mcp_oauth.registration_auth_method("none", "S256") == "none"
+    with pytest.raises(mcp_oauth.OAuthError, match="S256"):
+        mcp_oauth.registration_auth_method("none")
+    with pytest.raises(mcp_oauth.OAuthError, match="S256"):
+        mcp_oauth.registration_auth_method("none", "plain")
     with pytest.raises(mcp_oauth.OAuthError, match="neither"):
         mcp_oauth.registration_auth_method("client_secret_basic")
 
@@ -337,6 +341,7 @@ def test_a_server_that_only_offers_none_registers_a_public_client():
                     "token_endpoint": f"{AUTH_URL}/token",
                     "registration_endpoint": f"{AUTH_URL}/register",
                     "token_endpoint_auth_methods_supported": ["none"],
+                    "code_challenge_methods_supported": ["S256"],
                 },
             )
         if request.url.path == "/register":
@@ -349,3 +354,73 @@ def test_a_server_that_only_offers_none_registers_a_public_client():
         client = mcp_oauth.client_for(http, SERVER, endpoints, REDIRECT)
     assert posted["body"]["token_endpoint_auth_method"] == "none"
     assert client == mcp_oauth.Client("pub-1", None)
+
+
+def _metadata_issuer(issuer: str | None):
+    def answer(request):
+        if request.url.path.startswith("/.well-known/oauth-protected-resource"):
+            return httpx.Response(
+                200, json={"authorization_servers": ["https://auth.example.test"]}
+            )
+        if request.url.path.endswith("oauth-authorization-server"):
+            body = {
+                "authorization_endpoint": "https://auth.example.test/authorize",
+                "token_endpoint": "https://auth.example.test/token",
+            }
+            if issuer is not None:
+                body["issuer"] = issuer
+            return httpx.Response(200, json=body)
+        return httpx.Response(404)
+
+    return httpx.MockTransport(answer)
+
+
+def test_a_metadata_issuer_matches_including_one_trailing_slash():
+    with httpx.Client(transport=_metadata_issuer("https://auth.example.test")) as http:
+        exact = mcp_oauth.discover(http, SERVER)
+    assert exact.token == "https://auth.example.test/token"
+    with httpx.Client(transport=_metadata_issuer("https://auth.example.test/")) as http:
+        slashed = mcp_oauth.discover(http, SERVER)
+    assert slashed.token == "https://auth.example.test/token"
+
+
+def test_a_metadata_issuer_that_is_someone_elses_is_not_used():
+    with (
+        httpx.Client(transport=_metadata_issuer("https://evil.example/")) as http,
+        pytest.raises(mcp_oauth.OAuthError, match="no OAuth metadata"),
+    ):
+        mcp_oauth.discover(http, SERVER)
+
+
+def test_sealed_endpoints_round_trip_the_old_shape_and_the_new_one():
+    """A seal written now is the old shape, and a seal that already has the new key still opens."""
+    live = mcp_oauth.Endpoints(
+        authorization="https://auth.example.test/authorize",
+        token="https://auth.example.test/token",
+        token_auth_methods="none",
+        code_challenge_methods="S256",
+    )
+    sealed = mcp_oauth.oauth_credential(
+        live, mcp_oauth.Client("c"), mcp_oauth.Tokens("at", "rt", None)
+    )
+    assert set(sealed["endpoints"]) == {
+        "authorization",
+        "token",
+        "registration",
+        "revocation",
+    }
+    assert mcp_oauth.endpoints_of(sealed).token == live.token
+    assert mcp_oauth.endpoints_of(sealed).token_auth_methods == ""
+    newer = {
+        "endpoints": {
+            **sealed["endpoints"],
+            "token_auth_methods": "none",
+            "code_challenge_methods": "S256",
+            "not_a_field": True,
+        }
+    }
+    opened = mcp_oauth.endpoints_of(newer)
+    assert opened.token_auth_methods == "none"
+    assert opened.code_challenge_methods == "S256"
+    older = {"endpoints": {"authorization": live.authorization, "token": live.token}}
+    assert mcp_oauth.endpoints_of(older).registration is None

@@ -33,6 +33,10 @@ so whatever is on its machine is its to read, and to keep after the grant goes.
  "oauth": {"scopes": ["read", "write"]}}
 ```
 
+This example is hand-written. It carries no `"library": true`, so an omitted
+grant still means every tool it lists. Only an entry the connector library
+wrote has that marker (`flotta.mcp_library`).
+
 `auth` is `bearer` (sent as `Authorization: Bearer`), `api_key` (sent in the
 `header` the entry names) or `oauth` (see `flotta.mcp_oauth`; endpoints are
 discovered unless given, and a client registers itself unless `client_id` is
@@ -130,6 +134,9 @@ class Server:
     #: The header an `api_key` goes in.
     header: str | None = None
     oauth: OAuthSettings | None = None
+    #: Set by the connector library. A hand-written entry leaves it false, and an
+    #: omitted grant then still means every tool (`flotta.mcp_library`).
+    library: bool = False
 
     @property
     def entry(self) -> str:
@@ -150,6 +157,8 @@ class Server:
             out["header"] = self.header
         if self.oauth is not None:
             out["oauth"] = self.oauth.spec()
+        if self.library:
+            out["library"] = True
         return out
 
     def for_operator(self) -> dict[str, Any]:
@@ -277,7 +286,7 @@ def parse_server(raw: Any) -> Server:
     assert name is not None
     if not _NAME.match(name):
         raise McpError(f"{name!r}: a name is lowercase letters, digits and -, at most 40")
-    known = {"name", "title", "url", "auth", "ask_first", "tools", "header", "oauth"}
+    known = {"name", "title", "url", "auth", "ask_first", "tools", "header", "oauth", "library"}
     unknown = set(raw) - known
     if unknown:
         raise McpError(f"{name}: unknown fields: {', '.join(sorted(unknown))}")
@@ -299,6 +308,9 @@ def parse_server(raw: Any) -> Server:
     if not isinstance(ask_first, bool):
         raise McpError(f"{name}: ask_first is true or false")
     tools = raw.get("tools")
+    library = raw.get("library", False)
+    if not isinstance(library, bool):
+        raise McpError(f"{name}: library is true or false")
     return Server(
         name=name,
         title=_str(raw.get("title"), f"{name}: title", required=False) or name,
@@ -308,6 +320,7 @@ def parse_server(raw: Any) -> Server:
         tools=_tool_names(tools, f"{name}: tools") if tools is not None else None,
         header=header,
         oauth=_oauth(raw.get("oauth"), name) if auth == "oauth" else None,
+        library=library,
     )
 
 
@@ -494,6 +507,8 @@ def config_entry(grant: Grant, server: Server, *, base: str, token: str) -> dict
         "url": f"{base}/mcp/{server.name}",
         "headers": {"Authorization": f"Bearer {token}"},
     }
+    # An empty grant is a filter of nothing. Omitting `tools` is "no filter",
+    # which would show Hermes every tool the server lists.
     tools = grant.tools if grant.tools is not None else server.tools
     if tools is not None:
         entry["tools"] = {"include": list(tools)}

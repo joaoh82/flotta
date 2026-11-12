@@ -45,6 +45,11 @@ def test_the_library_is_readable_and_only_the_operator_can_add(api, fleet):  # n
         "n8n",
         "intercom",
     ]
+    by_id = {item["id"]: item for item in listed.json()["connectors"]}
+    assert by_id["linear"]["tools_enabled"] is False
+    assert by_id["linear"]["read_tools"] == []
+    assert by_id["make"]["tools_enabled"] is False
+    assert by_id["notion"]["tools_enabled"] is True
     refused = api.post("/api/mcp/library/notion", json={"params": {}}, headers=_member())
     assert refused.status_code == 403
     missing = api.post("/api/mcp/library/no-such", json={"params": {}}, headers=_operator())

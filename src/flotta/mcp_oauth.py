@@ -48,6 +48,7 @@ catalogue's rule, which lets a laptop use `http://127.0.0.1`.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -57,13 +58,13 @@ import secrets
 import socket
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
-from flotta.alerts import WebhookRefused, check_webhook_url
+from flotta.alerts import WebhookRefused, check_addresses, check_webhook_url, pinned_request
 from flotta.alerts import _is_public as is_public
 from flotta.mcp import McpError, Server, check_url
 
@@ -92,10 +93,14 @@ class Endpoints:
     token: str
     registration: str | None = None
     revocation: str | None = None
-    #: Space-separated `token_endpoint_auth_methods_supported`. A string, not a
-    #: tuple, because this object is sealed as JSON. Empty means the server
-    #: didn't say, and registration keeps today's `client_secret_post`.
+    #: Space-separated `token_endpoint_auth_methods_supported`. Empty means the
+    #: server didn't say, and registration keeps `client_secret_post`. Not sealed:
+    #: a rolled-back release's `Endpoints` has no such field, and refresh does
+    #: not need it (`sealed_endpoints`).
     token_auth_methods: str = ""
+    #: Space-separated `code_challenge_methods_supported`. A public client
+    #: (`none`) is refused unless this advertises `S256`. Not sealed, same reason.
+    code_challenge_methods: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +206,27 @@ def checked(server: Server, url: str, what: str) -> str:
         raise OAuthError(f"{server.name}: {what}: {exc}") from exc
 
 
+async def _resolve_for_pin(host: str, port: int) -> list[str]:
+    return await asyncio.to_thread(resolve_host, host, port)
+
+
+async def connect_pinned(url: str) -> tuple[str, str, str]:
+    """Resolve `url`, require every address to be public, and pin the request to it.
+
+    What the gateway uses for a templated MCP connector. The check is
+    `alerts.check_addresses` and the rewrite is `pinned_request`, the same pair
+    `_send` and `alerts.post_pinned` use. Raises `OAuthError` with the check's
+    own wording, so the gateway does not import `flotta.alerts`.
+    """
+    try:
+        address = await check_addresses(url, resolve=_resolve_for_pin)
+    except WebhookRefused as exc:
+        raise OAuthError(str(exc)) from exc
+    except ConnectionError as exc:
+        raise OAuthError("the host could not be resolved") from exc
+    return pinned_request(url, address)
+
+
 def _send(
     http: httpx.Client, server: Server, method: str, url: str, what: str, **kwargs: Any
 ) -> httpx.Response:
@@ -219,13 +245,9 @@ def _send(
             raise OAuthError(
                 f"{server.name}: {what}: {host} resolves to an address that isn't public"
             )
-        address = addresses[0].split("%", 1)[0]
-        bracketed = f"[{address}]" if ":" in address else address
-        netloc = f"{bracketed}:{parts.port}" if parts.port else bracketed
-        url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
-        headers["Host"] = parts.netloc
-        # The certificate is still checked against the name, whatever address was dialled.
-        extensions["sni_hostname"] = host
+        url, host_header, sni = pinned_request(url, addresses[0])
+        headers["Host"] = host_header
+        extensions["sni_hostname"] = sni
     try:
         return http.request(
             method, url, headers=headers, extensions=extensions, timeout=_TIMEOUT, **kwargs
@@ -267,18 +289,32 @@ def _authorization_metadata_urls(issuer: str) -> list[str]:
     return inserted + suffix
 
 
-def registration_auth_method(methods: str) -> str:
+def _issuer_matches(published: str, expected: str) -> bool:
+    """Whether two issuer identifiers are the same, apart from one trailing slash.
+
+    Calendly publishes `https://calendly.com/` for an issuer we read as
+    `https://calendly.com`.
+    """
+    return published.rstrip("/") == expected.rstrip("/")
+
+
+def registration_auth_method(methods: str, code_challenge_methods: str = "") -> str:
     """How Flotta authenticates at the token endpoint after dynamic registration.
 
     `client_secret_post` when the server says nothing (what registration has
     always sent) or lists it. `none` when that is the public-client method and
-    `client_secret_post` is not offered (Calendly, Stripe, Airtable). Anything
-    else is refused rather than sent as a method the server did not advertise.
+    `client_secret_post` is not offered (Calendly, Stripe, Airtable), and only
+    when the server advertises S256 PKCE. Anything else is refused rather than
+    sent as a method the server did not advertise.
     """
     chosen = set(methods.split())
     if not chosen or "client_secret_post" in chosen:
         return "client_secret_post"
     if "none" in chosen:
+        if "S256" not in set(code_challenge_methods.split()):
+            raise OAuthError(
+                "a public client needs S256 PKCE, and this server does not advertise it"
+            )
         return "none"
     raise OAuthError(
         "dynamic registration here accepts client_secret_post or none, "
@@ -312,9 +348,15 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         checked(server, issuer, "authorization server")
         for candidate in _authorization_metadata_urls(issuer):
             metadata = _get_metadata(http, server, candidate)
-            if metadata is not None:
-                found = metadata
-                break
+            if metadata is None:
+                continue
+            published = metadata.get("issuer")
+            # A document that names an issuer has to name this one. One that
+            # omits it is still the document this server answered with.
+            if isinstance(published, str) and not _issuer_matches(published, issuer):
+                continue
+            found = metadata
+            break
         else:
             raise OAuthError(f"{server.name} publishes no OAuth metadata, and none is configured")
     authorization = settings.authorization_endpoint or found.get("authorization_endpoint")
@@ -328,6 +370,11 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         methods = ""
     else:
         methods = " ".join(m for m in raw_methods if isinstance(m, str))
+    raw_challenges = found.get("code_challenge_methods_supported") or []
+    if not isinstance(raw_challenges, list):
+        challenges = ""
+    else:
+        challenges = " ".join(m for m in raw_challenges if isinstance(m, str))
     return Endpoints(
         authorization=checked(server, str(authorization), "authorization endpoint"),
         token=checked(server, str(token), "token endpoint"),
@@ -336,6 +383,7 @@ def discover(http: httpx.Client, server: Server) -> Endpoints:
         else None,
         revocation=checked(server, str(revocation), "revocation endpoint") if revocation else None,
         token_auth_methods=methods,
+        code_challenge_methods=challenges,
     )
 
 
@@ -357,7 +405,9 @@ def client_for(
             f"{server.name} offers no client registration, so the operator must register "
             "Flotta with it and set client_id"
         )
-    auth_method = registration_auth_method(endpoints.token_auth_methods)
+    auth_method = registration_auth_method(
+        endpoints.token_auth_methods, endpoints.code_challenge_methods
+    )
     response = _send(
         http,
         server,
@@ -573,11 +623,35 @@ def needs_refresh(credential: Mapping[str, Any], *, now: float | None = None) ->
 # -- what is kept, sealed --------------------------------------------------------
 
 
+#: What a sealed credential's `endpoints` may hold. A field added after this
+#: (`token_auth_methods`, `code_challenge_methods`) stays off the seal: refresh
+#: does not need it, and a rolled-back release builds `Endpoints(**this)` and
+#: raises TypeError on a key it does not have.
+_SEALED_ENDPOINT_FIELDS = ("authorization", "token", "registration", "revocation")
+
+
+def sealed_endpoints(endpoints: Endpoints) -> dict[str, Any]:
+    """The endpoint object as it is sealed, which is the shape from before the extra fields."""
+    raw = asdict(endpoints)
+    return {name: raw[name] for name in _SEALED_ENDPOINT_FIELDS}
+
+
+def endpoints_from(raw: Mapping[str, Any]) -> Endpoints:
+    """`Endpoints` from a sealed object, old or new.
+
+    An old seal has no `token_auth_methods`. A seal written while that field
+    was included has the key. Either loads. A key this process does not know
+    is ignored, the same way a rolled-back release must not be handed one.
+    """
+    known = {field.name for field in fields(Endpoints)}
+    return Endpoints(**{key: value for key, value in raw.items() if key in known})
+
+
 def oauth_credential(endpoints: Endpoints, client: Client, tokens: Tokens) -> dict[str, Any]:
     """Everything a refresh needs, in one sealed value: no other table to keep in step."""
     return {
         "kind": "oauth",
-        "endpoints": asdict(endpoints),
+        "endpoints": sealed_endpoints(endpoints),
         "client": asdict(client),
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
@@ -597,7 +671,7 @@ def refreshed(credential: Mapping[str, Any], tokens: Tokens) -> dict[str, Any]:
 
 
 def endpoints_of(credential: Mapping[str, Any]) -> Endpoints:
-    return Endpoints(**credential["endpoints"])
+    return endpoints_from(credential["endpoints"])
 
 
 def client_of(credential: Mapping[str, Any]) -> Client:
@@ -607,7 +681,7 @@ def client_of(credential: Mapping[str, Any]) -> Client:
 def flow_payload(endpoints: Endpoints, client: Client, verifier: str, redirect_uri: str) -> str:
     return json.dumps(
         {
-            "endpoints": asdict(endpoints),
+            "endpoints": sealed_endpoints(endpoints),
             "client": asdict(client),
             "verifier": verifier,
             "redirect_uri": redirect_uri,

@@ -4674,7 +4674,7 @@ def create_app(
                     detail=f"{server.title} moved to another address during the sign-in; "
                     "start again",
                 )
-            endpoints = mcp_oauth.Endpoints(**payload["endpoints"])
+            endpoints = mcp_oauth.endpoints_from(payload["endpoints"])
             client = mcp_oauth.Client(**payload["client"])
             try:
                 with _oauth_http() as http:
