@@ -69,6 +69,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 CATALOGUE_ENV = "FLOTTA_MCP_SERVERS"
 ENTRY_PREFIX = "flotta-"
 AUTH_KINDS = ("bearer", "api_key", "oauth")
@@ -639,6 +641,149 @@ def parse_key(body: Any, server: Server) -> str:
     if len(key) > 4096 or any(ch in key for ch in "\r\n\0"):
         raise McpError("that isn't a key that fits in a header")
     return key
+
+
+#: How long a console `tools/list` may take. A stream the gateway relays may
+#: stay quiet; this one is one answer, so the read is bounded too.
+TOOLS_LIST_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+
+
+class ToolsListError(Exception):
+    """`tools/list` did not come back. `code` is `upstream` or `timeout`."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+def tool_public(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One tool as the console lists it: name, description, and whether it only reads.
+
+    `read_only` is the server's `annotations.readOnlyHint` when that is a
+    boolean, otherwise null. `annotations` is present only when the server sent
+    an object. Nothing else from the tool (its schema, above all) is copied.
+    """
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    description = raw.get("description")
+    annotations = raw.get("annotations")
+    read_only = None
+    if isinstance(annotations, dict) and isinstance(annotations.get("readOnlyHint"), bool):
+        read_only = annotations["readOnlyHint"]
+    out: dict[str, Any] = {
+        "name": name,
+        "description": description if isinstance(description, str) else None,
+        "read_only": read_only,
+    }
+    if isinstance(annotations, dict):
+        out["annotations"] = annotations
+    return out
+
+
+def _message_tools(message: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """The tools in one JSON-RPC result, and a cursor for the next page."""
+    if not isinstance(message, dict):
+        raise ToolsListError("upstream", "tools/list did not answer one JSON-RPC message")
+    if message.get("error"):
+        raise ToolsListError("upstream", "tools/list was refused")
+    result = message.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+        raise ToolsListError("upstream", "tools/list named no tools")
+    tools = []
+    for item in result["tools"]:
+        if isinstance(item, dict):
+            public = tool_public(item)
+            if public is not None:
+                tools.append(public)
+    cursor = result.get("nextCursor")
+    return tools, cursor if isinstance(cursor, str) and cursor else None
+
+
+def _tools_from_response(response: httpx.Response) -> tuple[list[dict[str, Any]], str | None]:
+    kind = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    if kind == "text/event-stream":
+        message = None
+        for line in response.text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and ("result" in event or "error" in event):
+                message = event
+        if message is None:
+            raise ToolsListError("upstream", "tools/list did not answer one JSON-RPC message")
+        return _message_tools(message)
+    try:
+        message = response.json()
+    except ValueError as exc:
+        raise ToolsListError("upstream", "tools/list did not answer JSON") from exc
+    return _message_tools(message)
+
+
+def fetch_tools(
+    http: httpx.Client, server: Server, credential: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Every tool `server` lists, using `credential` and the gateway's pin.
+
+    One `tools/list`, then the next page while the server sends `nextCursor`,
+    at most twenty pages. A templated host is pinned by `mcp_request_target`.
+    A redirect is not followed. Raises `ToolsListError`.
+    """
+    from flotta.mcp_library import templated
+    from flotta.mcp_oauth import OAuthError, mcp_request_target
+
+    try:
+        url, pin_headers, extensions = mcp_request_target(server)
+    except OAuthError as exc:
+        raise ToolsListError("upstream", str(exc)) from exc
+    pinned = templated(server) is not None
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **auth_headers(server, credential),
+        **pin_headers,
+    }
+    found: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(20):
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        if cursor:
+            message["params"] = {"cursor": cursor}
+        try:
+            response = http.post(
+                url,
+                content=json.dumps(message),
+                headers=headers,
+                extensions=extensions or None,
+                timeout=TOOLS_LIST_TIMEOUT,
+                follow_redirects=False,
+            )
+        except httpx.TimeoutException as exc:
+            raise ToolsListError("timeout", f"{server.title} did not answer in time") from exc
+        except httpx.HTTPError as exc:
+            raise ToolsListError("upstream", f"{server.title} could not be reached") from exc
+        if pinned and 300 <= response.status_code < 400:
+            raise ToolsListError(
+                "upstream", f"{server.title} answered with a redirect, which is not followed"
+            )
+        if response.status_code == 401:
+            raise ToolsListError(
+                "error", f"{server.title} refused the credential; connect it again"
+            )
+        if response.status_code >= 400:
+            raise ToolsListError("upstream", f"{server.title} answered {response.status_code}")
+        page, cursor = _tools_from_response(response)
+        found.extend(page)
+        if not cursor:
+            break
+    return found
 
 
 def auth_headers(server: Server, credential: Mapping[str, Any]) -> dict[str, str]:

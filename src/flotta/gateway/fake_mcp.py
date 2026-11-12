@@ -25,8 +25,15 @@ AUTH_URL = "https://auth.example.test"
 TOOLS = ("read_issue", "create_issue", "delete_everything")
 
 
-def _tool(name: str) -> dict[str, Any]:
-    return {"name": name, "description": f"{name}, for tests", "inputSchema": {"type": "object"}}
+def _tool(name: str, annotations: dict[str, Any] | None = None) -> dict[str, Any]:
+    tool: dict[str, Any] = {
+        "name": name,
+        "description": f"{name}, for tests",
+        "inputSchema": {"type": "object"},
+    }
+    if annotations:
+        tool["annotations"] = annotations
+    return tool
 
 
 class FakeMcp:
@@ -52,6 +59,13 @@ class FakeMcp:
         self.forbidden: set[str] = set()
         #: Seconds a refresh takes, so concurrent ones overlap.
         self.refresh_delay = 0.0
+        #: Annotations added to a named tool's `tools/list` entry. Absent, the
+        #: tool is what it always was.
+        self.tool_annotations: dict[str, dict[str, Any]] = {}
+        #: A status `tools/list` answers with, instead of its tools.
+        self.list_status: int | None = None
+        #: Raised from `tools/list`, so a timeout is the client's and not a body.
+        self.list_error: Exception | None = None
         self._issued = 0
         self._lock = threading.Lock()
 
@@ -133,7 +147,7 @@ class FakeMcp:
         if method == "initialize":
             result: dict[str, Any] = {"protocolVersion": "2025-06-18", "capabilities": {}}
         elif method == "tools/list":
-            result = {"tools": [_tool(t) for t in TOOLS]}
+            result = {"tools": [_tool(t, self.tool_annotations.get(t)) for t in TOOLS]}
         elif method == "tools/call":
             name = message["params"]["name"]
             self.calls.append(name)
@@ -164,6 +178,10 @@ class FakeMcp:
         if request.method == "DELETE":
             return httpx.Response(200)
         message = json.loads(request.content)
+        if message.get("method") == "tools/list" and self.list_error is not None:
+            raise self.list_error
+        if message.get("method") == "tools/list" and self.list_status is not None:
+            return httpx.Response(self.list_status, json={"error": "unavailable"})
         params = message.get("params") or {}
         if message.get("method") == "tools/call" and params.get("name") in self.forbidden:
             return httpx.Response(403, json={"error": "insufficient_scope"})

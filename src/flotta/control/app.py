@@ -4126,9 +4126,11 @@ def create_app(
 
     from flotta.mcp import (
         McpError,
+        ToolsListError,
         catalogue_of,
         connection_status,
         connection_usable,
+        fetch_tools,
         library_fields,
     )
 
@@ -4459,6 +4461,190 @@ def create_app(
                     for s in servers.values()
                 ]
             }
+        finally:
+            store.close()
+
+    _TOOL_HTTP = {
+        "not_connected": 409,
+        "expired": 424,
+        "error": 424,
+        "upstream": 502,
+        "timeout": 504,
+    }
+
+    def _tools_problem(code: str, detail: str) -> Any:
+        """A tools/list that did not run.
+
+        `code` is the connection status, or why the call failed.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"code": code, "detail": detail}, status_code=_TOOL_HTTP[code])
+
+    def _renew_org_oauth(
+        store: Any, org_id: str, server: Any, connection: Any, credential: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Refresh an org OAuth credential the way the gateway does, or say why it can't."""
+        import json
+
+        from flotta import mcp_oauth
+        from flotta.mcp import CREDENTIAL_FAILURE_EXPIRED, connection_context
+        from flotta.sealed import SealError, seal
+
+        context = connection_context(org_id, server.name)
+        token_value = credential.get("refresh_token")
+        if not isinstance(token_value, str) or not token_value:
+            marked = json.dumps({**credential, "failure": CREDENTIAL_FAILURE_EXPIRED})
+            try:
+                sealed = seal(marked, context=context)
+            except SealError:
+                sealed = None
+            store.break_mcp_connection(
+                org_id,
+                server.name,
+                "expired, with no way to refresh",
+                credential=sealed,
+            )
+            raise ToolsListError(
+                "expired", f"{server.title}'s sign-in has expired: connect it again"
+            )
+        try:
+            with _oauth_http() as http:
+                tokens = mcp_oauth.refresh(
+                    http,
+                    server,
+                    mcp_oauth.endpoints_of(credential),
+                    mcp_oauth.client_of(credential),
+                    token_value,
+                )
+        except mcp_oauth.Refused as exc:
+            store.break_mcp_connection(org_id, server.name, str(exc))
+            raise ToolsListError(
+                "error", f"{server.title} refused to renew the sign-in: connect it again"
+            ) from exc
+        except mcp_oauth.OAuthError as exc:
+            raise ToolsListError(
+                "upstream", f"{server.title} couldn't be reached to renew the sign-in"
+            ) from exc
+        fresh = mcp_oauth.refreshed(credential, tokens)
+        try:
+            sealed = seal(json.dumps(fresh), context=context)
+        except SealError as exc:
+            raise ToolsListError("error", f"{server.title}'s credential won't seal") from exc
+        store.refresh_mcp_connection(
+            org_id, server.name, credential=sealed, was=connection.updated_at
+        )
+        return fresh
+
+    @app.get(
+        "/api/orgs/{org_id}/mcp/{server}/tools",
+        responses={
+            200: {
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "server": "linear",
+                            "tools": [
+                                {
+                                    "name": "list_issues",
+                                    "description": "List issues",
+                                    "read_only": True,
+                                    "annotations": {"readOnlyHint": True},
+                                },
+                                {
+                                    "name": "create_issue",
+                                    "description": "Create an issue",
+                                    "read_only": False,
+                                    "annotations": {"readOnlyHint": False},
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+            409: {
+                "content": {
+                    "application/json": {
+                        "example": {"code": "not_connected", "detail": "Linear is not connected"}
+                    }
+                }
+            },
+            424: {
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "code": "expired",
+                            "detail": "Linear's sign-in has expired: connect it again",
+                        }
+                    }
+                }
+            },
+        },
+    )
+    def org_mcp_tools(org_id: str, server: str, token: Token | None = needs_read) -> Any:
+        """The tools a connected server lists, so an agency can choose which an agent gets.
+
+        `fleet:read`. Uses the org's sealed credential and `tools/list`, pinned
+        the way the gateway pins a templated host. Each tool is `name`,
+        `description`, `read_only` (the server's `readOnlyHint`, or null) and,
+        when the server sent them, `annotations`.
+
+        Not connected is 409 `not_connected`. An expired sign-in that cannot be
+        refreshed is 424 `expired`. Any other unusable connection is 424
+        `error`. The server answering badly is 502 `upstream`; not answering
+        in time is 504 `timeout`. `connection.status` on the org list is
+        unchanged.
+        """
+        import json
+
+        from flotta import mcp_oauth
+        from flotta.mcp import connection_context
+        from flotta.sealed import SealError, unseal
+
+        _agency_of(token, org_id)
+        found = _mcp_server_or_404(server)
+        store = store_factory()
+        try:
+            connection = store.mcp_connection(org_id, server)
+            status = connection_status(connection, found)
+            if status != "connected":
+                if status == "not_connected":
+                    detail = f"{found.title} is not connected"
+                elif status == "expired":
+                    detail = f"{found.title}'s sign-in has expired: connect it again"
+                else:
+                    detail = (
+                        connection.detail
+                        if connection is not None and connection.detail
+                        else f"{found.title}'s connection isn't usable"
+                    )
+                return _tools_problem(status, detail)
+            try:
+                credential = json.loads(
+                    unseal(
+                        connection.credential,
+                        context=connection_context(org_id, server),
+                    )
+                )
+            except (SealError, ValueError):
+                return _tools_problem(
+                    "error", f"{found.title}'s credential won't open: connect it again"
+                )
+            if not isinstance(credential, dict):
+                return _tools_problem(
+                    "error", f"{found.title}'s credential won't open: connect it again"
+                )
+            if found.auth == "oauth" and mcp_oauth.needs_refresh(credential):
+                try:
+                    credential = _renew_org_oauth(store, org_id, found, connection, credential)
+                except ToolsListError as exc:
+                    return _tools_problem(exc.code, exc.detail)
+            try:
+                with _oauth_http() as http:
+                    tools = fetch_tools(http, found, credential)
+            except ToolsListError as exc:
+                return _tools_problem(exc.code, exc.detail)
+            return {"server": found.name, "tools": tools}
         finally:
             store.close()
 

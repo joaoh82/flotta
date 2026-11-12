@@ -227,6 +227,36 @@ async def connect_pinned(url: str) -> tuple[str, str, str]:
     return pinned_request(url, address)
 
 
+def mcp_request_target(server: Server) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Where an MCP request to `server` goes, and the pin a templated host needs.
+
+    A hand-written server, and a library server with a fixed URL, is requested
+    at the catalogue URL, as the gateway does. A templated connector (n8n,
+    Intercom) is checked with `assert_template_target` and then pinned the way
+    `connect_pinned` pins it: every address public, TCP to that address, Host
+    and `sni_hostname` still the hostname. Redirects are the caller's to refuse.
+    """
+    from flotta.mcp_library import LibraryError, assert_template_target, templated
+
+    item = templated(server)
+    if item is None:
+        return server.url, {}, {}
+    try:
+        assert_template_target(item, server.url)
+    except LibraryError as exc:
+        raise OAuthError(str(exc)) from exc
+    parts = urlsplit(server.url)
+    host = parts.hostname or ""
+    try:
+        addresses = resolve_host(host, parts.port or 443)
+    except OSError as exc:
+        raise OAuthError("the host could not be resolved") from exc
+    if not addresses or not all(is_public(a) for a in addresses):
+        raise OAuthError(f"{host} resolves to an address that isn't public")
+    url, host_header, sni = pinned_request(server.url, addresses[0])
+    return url, {"Host": host_header}, {"sni_hostname": sni}
+
+
 def _send(
     http: httpx.Client, server: Server, method: str, url: str, what: str, **kwargs: Any
 ) -> httpx.Response:

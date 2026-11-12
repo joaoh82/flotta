@@ -28,6 +28,36 @@ not use the spec-match fallback that grants do.
 
 The OpenAPI document for this route carries one example of that object.
 
+## The tools a connected server lists
+
+`GET /api/orgs/{org}/mcp/{server}/tools` (`fleet:read`) runs `tools/list` with
+the org's sealed credential, so the console can offer the tools Linear and Make
+do not name in the catalogue. Each tool is `name`, `description`, `read_only`
+(the server's `annotations.readOnlyHint`, or null) and, when the server sent
+an annotations object, `annotations`. The schema is not copied.
+
+Not connected is `409` with `{"code": "not_connected"}`. A sign-in that has
+expired and cannot be refreshed is `424` with `{"code": "expired"}`. Any other
+connection the gateway would not use is `424` with `{"code": "error"}`. The
+server answering badly is `502` `upstream`; not answering within 20 seconds is
+`504` `timeout`. A templated host is pinned the way the gateway pins it, and a
+redirect is not followed. A token inside its refresh window is renewed first,
+through the same OAuth refresh the gateway uses.
+
+```json
+{
+  "server": "linear",
+  "tools": [
+    {
+      "name": "list_issues",
+      "description": "List issues",
+      "read_only": true,
+      "annotations": {"readOnlyHint": true}
+    }
+  ]
+}
+```
+
 ## What "added from the library" means
 
 `catalogue_entry` writes a normal catalogue object and sets `"library": true`.
