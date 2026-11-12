@@ -223,3 +223,42 @@ def test_a_token_inside_its_refresh_window_is_renewed_first(
         "create_issue",
         "delete_everything",
     ]
+
+
+def test_another_orgs_tools_are_not_listed_or_unsealed(api, fleet, provider):  # noqa: F811
+    """Org A's fleet:read reaches neither org B's path nor org B's credential.
+
+    The catalogue name is shared. What is not is the sealed connection. Asking
+    on A's own path for the server B connected must not open B's credential or
+    call the server with it. The refusal is the same 404 the org list gives.
+    """
+    secret = "agency-y-secret"
+    with FleetStore(fleet) as store:
+        user = store.create_user("yo@example.com")
+        store.add_membership(user.id, "agency-y", "owner")
+    yo = _as(fleet, "yo@example.com", org="agency-y")
+    connected = api.put("/api/orgs/agency-y/mcp/notes", json={"key": secret}, headers=yo)
+    assert connected.status_code == 200, connected.text
+    with FleetStore(fleet) as store:
+        stored = store.mcp_connection("agency-y", "notes")
+    assert stored is not None
+    sealed, updated = stored.credential, stored.updated_at
+    before = len(provider.requests)
+
+    ana = _headers(fleet)
+    other_list = api.get("/api/orgs/agency-y/mcp", headers=ana)
+    other_tools = api.get("/api/orgs/agency-y/mcp/notes/tools", headers=ana)
+    assert other_tools.status_code == other_list.status_code == 404
+    assert secret not in other_tools.text
+
+    own = api.get("/api/orgs/agency-x/mcp/notes/tools", headers=ana)
+    assert own.status_code == 409
+    assert own.json() == {"code": "not_connected", "detail": "notes is not connected"}
+    assert secret not in own.text
+    assert len(provider.requests) == before
+
+    with FleetStore(fleet) as store:
+        again = store.mcp_connection("agency-y", "notes")
+    assert again is not None
+    assert again.credential == sealed and again.updated_at == updated
+    assert again.status == "ok"
