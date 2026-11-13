@@ -146,12 +146,7 @@ def test_the_build_recipe_only_destroys_machines_it_created():
     orphan" and "destroy the agent", and it is three lines of shell that no
     test would otherwise see.
     """
-    if not _JUSTFILE.is_file():  # pragma: no cover - only outside the repo
-        pytest.skip(f"no justfile at {_JUSTFILE}")
-    body = _JUSTFILE.read_text(encoding="utf-8")
-    recipe = body.split("\nfly-build: fly-whoami\n", 1)
-    assert len(recipe) == 2, "fly-build is gone or renamed"
-    recipe = recipe[1].split("\n\n# ", 1)[0]
+    recipe = _recipe("fly-build")
 
     assert "machine destroy" in recipe, "fly-build no longer cleans up"
     assert "BEFORE" in recipe and "existed before this build" in recipe, (
@@ -182,6 +177,123 @@ def test_the_build_recipe_only_destroys_machines_it_created():
         "the post-build listing is fail-closed, so a flyctl blip aborts after a "
         "successful release for the sake of a tidying step"
     )
+
+    # A full host is handled inside fly-up, which replaces a machine that was
+    # in BEFORE. That replacement must survive this loop: destroying it leaves
+    # the next deploy to choose between two unattached volumes of the same
+    # name, one of them still on the full host. A machine that is in BEFORE is
+    # still never destroyed here — the replacement is an id this loop did not
+    # see beforehand, named in a file fly-up writes.
+    assert recipe.index("export FLOTTA_KEEP_MACHINES") < recipe.index("just fly-up")
+    kept = recipe.index("existed before this build")
+    replaced = recipe.index("replaced a machine pinned to a full host")
+    destroyed = recipe.index("machine destroy")
+    assert kept < destroyed and replaced < destroyed
+    assert "volumes destroy" not in recipe
+    assert "apps destroy" not in recipe
+
+
+def test_fly_up_moves_a_full_host_without_destroying_a_volume():
+    """The deploy recipe recovers a pinned host, and it cannot delete a disk.
+
+    `fly-up` provisions production boxes as well as the image app. The
+    recovery may fork and recreate; it must not learn `volumes destroy` or
+    `apps destroy`, and it retries the deploy once rather than looping.
+    """
+    recipe = _recipe("fly-up")
+    assert recipe.count("python -m flotta.fly_host") == 2
+    assert recipe.index("python -m flotta.fly_host") < recipe.index(
+        "retrying deploy once on the forked volume"
+    )
+    assert "volumes destroy" not in recipe
+    assert "apps destroy" not in recipe
+    # The guest the fork is placed for is the fly.toml this deploy uses, not
+    # a size remembered somewhere else. fly-up rewrites that file and does
+    # not rewrite [[vm]].
+    assert '--fly-toml "$TMP/fly.toml"' in recipe
+
+
+def test_a_full_host_retries_the_deploy_once(tmp_path):
+    """Run the deploy tail of `fly-up` against stubs.
+
+    `set -e` is what stops a second recovery. Exit 0 retries once; exit 2 (not
+    a full host) and any other failure do not. Checked by executing the lines,
+    because reading them cannot see that a failing command in an `if` body
+    never reaches the retry.
+    """
+    import os
+    import subprocess
+
+    body = _recipe("fly-up")
+    snippet = body[body.index("deploy() {") :]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    deploys = tmp_path / "deploys"
+    deploys.write_text("0", encoding="utf-8")
+    (bindir / "flyctl").write_text(
+        "#!/bin/sh\n"
+        f'echo "flyctl $*" >> "{calls}"\n'
+        'if [ "$1" = deploy ]; then\n'
+        f'  n=$(cat "{deploys}")\n'
+        f'  echo $((n + 1)) > "{deploys}"\n'
+        '  echo "deploy output"\n'
+        '  [ "$n" = 0 ] && exit 1\n'
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (bindir / "uv").write_text(
+        "#!/bin/sh\n"
+        f'echo "uv $*" >> "{calls}"\n'
+        'case "$*" in\n'
+        "  *flotta.fly_host*) exit \"${RECOVER_CODE}\" ;;\n"
+        "esac\n"
+        "echo unexpected >&2\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    os.chmod(bindir / "flyctl", 0o755)
+    os.chmod(bindir / "uv", 0o755)
+
+    def run(recover_code: str, keep: str | None):
+        calls.write_text("", encoding="utf-8")
+        deploys.write_text("0", encoding="utf-8")
+        env = {
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "TMP": str(tmp_path),
+            "APP": "flotta-staging-images",
+            "REF": "v0.22.5",
+            "REGION": "ams",
+            "RECOVER_CODE": recover_code,
+        }
+        if keep is not None:
+            env["FLOTTA_KEEP_MACHINES"] = keep
+        return subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", snippet],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    moved = run("0", str(tmp_path / "keep"))
+    assert moved.returncode == 0, moved.stderr
+    log = calls.read_text(encoding="utf-8")
+    assert log.count("flyctl deploy") == 2
+    assert log.count("flotta.fly_host") == 1
+    assert "--keep-file" in log
+    assert "retrying deploy once" in moved.stdout
+
+    untouched = run("2", None)
+    assert untouched.returncode == 2
+    assert calls.read_text(encoding="utf-8").count("flyctl deploy") == 1
+    assert "retrying deploy once" not in untouched.stdout
+
+    failed = run("1", None)
+    assert failed.returncode == 1
+    assert calls.read_text(encoding="utf-8").count("flyctl deploy") == 1
+    assert "--keep-file" not in calls.read_text(encoding="utf-8")
+
 
 
 # -- the entrypoint seeds the persona, and only once ---------------------------

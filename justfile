@@ -788,6 +788,19 @@ fly-whoami:
 # in `fly-up` is by name), it costs cents, and deleting a disk on a recipe
 # whose job is building images is the wrong instinct to encode.
 #
+# ## A host with no memory left
+#
+# The volume pins its machine to one host, so a deploy that fails with
+# "insufficient memory available to fulfill request on the current host"
+# fails the same way on every retry. `fly-up` forks that volume onto a host
+# that can hold the guest, clones the machine onto the fork, and destroys the
+# stuck machine — the machine, never the volume. The replacement did not exist
+# before this run, but destroying it would leave the next deploy choosing
+# between two unattached volumes of the same name, one of them still on the
+# full host. `fly-up` records its id in `$FLOTTA_KEEP_MACHINES` and the loop
+# below keeps it. A build that replaced nothing still destroys only what it
+# created.
+#
 # COSTS MONEY: build and release the fleet image, leaving nothing running
 fly-build: fly-whoami
     #!/usr/bin/env bash
@@ -826,13 +839,31 @@ fly-build: fly-whoami
     fi
     echo "machines before:${BEFORE% }"
 
+    # See "A host with no memory left" above. The file is empty when nothing
+    # was replaced, and the loop then behaves exactly as it did before.
+    KEEPFILE=$(mktemp)
+    export FLOTTA_KEEP_MACHINES="$KEEPFILE"
+    trap 'rm -f "$KEEPFILE"' EXIT
+
     just fly-up
+
+    KEEP_EXTRA=" "
+    if [ -s "$KEEPFILE" ]; then
+      KEEP_EXTRA=" $(tr '\n' ' ' < "$KEEPFILE") "
+    fi
 
     KEPT=0
     for id in $(ids_after); do
       case "$BEFORE" in
         *" $id "*)
           echo "keeping $id — it existed before this build"
+          KEPT=$((KEPT+1))
+          continue
+          ;;
+      esac
+      case "$KEEP_EXTRA" in
+        *" $id "*)
+          echo "keeping $id — it replaced a machine pinned to a full host"
           KEPT=$((KEPT+1))
           continue
           ;;
@@ -930,9 +961,48 @@ fly-up: fly-whoami
     path.write_text(text)
     PY
 
+    # `fly deploy` updates whichever machine already has this volume, and the
+    # volume cannot move. A host that cannot reserve the guest fails the same
+    # way on every retry, including flyctl's own. The recovery stops that
+    # machine, forks the disk (a copy — the source is not destroyed; on a
+    # production box it is the agent's memory), starts a machine on the copy
+    # only after the original is stopped, and destroys the original once the
+    # copy has booted. If that fails before the destroy, the original is
+    # started again, unless a clone may still be running — then it stays
+    # stopped and the error says so. Then deploy once more so the release
+    # completes. Any other deploy error is left alone.
+    deploy() {
+      flyctl deploy --config "$TMP/fly.toml" --dockerfile "$TMP/Dockerfile" \
+        --app "$APP" --ha=false --yes .
+    }
+
     echo "deploying (Hermes pinned at $REF)"
-    flyctl deploy --config "$TMP/fly.toml" --dockerfile "$TMP/Dockerfile" \
-      --app "$APP" --ha=false --yes .
+    set +e
+    deploy 2>&1 | tee "$TMP/deploy.log"
+    code=${PIPESTATUS[0]}
+    set -e
+    if [ "$code" -ne 0 ]; then
+      # `set -e` is the retry bound. recover exits 0 only after the machine
+      # sits on the fork; the deploy below runs once, and a failure there
+      # ends the recipe. Exit 2 means this was not a full host. Any other
+      # non-zero means the move did not finish: a failure before the original
+      # is destroyed restarts it, and a destroy that errors keeps the
+      # replacement. Neither retries, and neither destroys a volume.
+      # Two calls rather than an array: macOS ships bash 3.2, and an empty
+      # array under `set -u` aborts.
+      if [ -n "${FLOTTA_KEEP_MACHINES:-}" ]; then
+        uv run python -m flotta.fly_host recover \
+          --app "$APP" --region "$REGION" \
+          --fly-toml "$TMP/fly.toml" --log "$TMP/deploy.log" \
+          --keep-file "$FLOTTA_KEEP_MACHINES"
+      else
+        uv run python -m flotta.fly_host recover \
+          --app "$APP" --region "$REGION" \
+          --fly-toml "$TMP/fly.toml" --log "$TMP/deploy.log"
+      fi
+      echo "retrying deploy once on the forked volume"
+      deploy
+    fi
 
 # M2: prove HERMES_HOME survives a stop/start (REAL infra + one model call)
 fly-proof *ARGS: fly-whoami
