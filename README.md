@@ -23,6 +23,8 @@ each request, and Flotta rates it from trivial to a whole project. Small request
 and usually end as a pull request. Larger ones wait until you approve them. You set that line
 per agent, and you set a monthly budget per client so a busy month cannot become a surprise bill.
 
+![How approval works: the client asks, the request is sized, small work runs and larger work waits for you](docs/images/approval.png)
+
 The same runtime hosts other agents you would otherwise run by hand for a client: a support
 agent, a report on a schedule, an agent that reacts to a webhook from the client's systems.
 
@@ -124,6 +126,10 @@ It does not include the screens people click through. The managed platform at
 - a portal where a client sees its own requests and what was done;
 - sign-up, plans and billing;
 - running and upgrading the infrastructure for you.
+
+![The managed web app's clients page, with illustrative data: each client's agents, whether they are awake, model spend against the monthly budget, and the last run](docs/images/managed-clients.png)
+
+*The managed web app's clients page, from flotta.dev. The data is illustrative.*
 
 The web app talks to this runtime only through its HTTP API, so anything it does, you can do
 with the API. When the hosted product needs something new from the runtime, it is added here
