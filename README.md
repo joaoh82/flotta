@@ -193,6 +193,7 @@ own org, and it talks to the local door when `FLOTTA_DOOR_URL` says where it is:
 ```bash
 uv run flotta create qa --org studio --client acme --description "QA"
 uv run flotta run qa--acme--studio "Check the contact form" --wait
+uv run flotta ps --org studio          # plain `ps` lists the default org's agents
 
 export FLOTTA_DOOR_URL=ws://localhost:8081
 FLOTTA_TOKEN=$OWNER uv run flotta chat dev--acme--studio "hello"

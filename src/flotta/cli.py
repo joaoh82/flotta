@@ -768,19 +768,34 @@ def ps(
     ),
     tasks: bool = typer.Option(False, "--tasks", help="List tasks instead of boxes"),
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum rows"),
+    org: str | None = typer.Option(
+        None, "--org", help="An org's agents instead of the default org's"
+    ),
+    client: str | None = typer.Option(
+        None, "--client", help="Only this client's agents (in --org, else the default org)"
+    ),
 ) -> None:
     """List the fleet: boxes by default, tasks with --tasks."""
+    if tasks and (org or client):
+        raise _fail(Exception("--org and --client list agents, not --tasks"))
     # Through the fleet API when there is one, like `repo`: a laptop that only
     # talks to a deployed control plane has no fleet.db, and `ps` said so as
     # "no fleet-state store" on the first command anyone ran. `--store` still
     # wins, so a local store stays reachable on purpose. Tasks have no list
     # endpoint yet, so `--tasks` stays local.
     if control_url() and store is None and not tasks:
-        _ps_remote(as_json=as_json, status=status, all_=all_, limit=limit)
+        _ps_remote(as_json=as_json, status=status, all_=all_, limit=limit, org=org, client=client)
         return
     with _open_store(store) as fleet:
         try:
-            rows = fleet.list_tasks(status=status) if tasks else fleet.list_boxes(status)
+            if tasks:
+                rows = fleet.list_tasks(status=status)
+            elif org or client:
+                rows = fleet.list_boxes_in(org or DEFAULT_ORG, client)
+                if status is not None:
+                    rows = [r for r in rows if r.status == status]
+            else:
+                rows = fleet.list_boxes(status)
         except Exception as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
@@ -822,7 +837,22 @@ def ps(
             )
 
 
-def _ps_remote(*, as_json: bool, status: str | None, all_: bool, limit: int) -> None:
+def _ps_remote(
+    *,
+    as_json: bool,
+    status: str | None,
+    all_: bool,
+    limit: int,
+    org: str | None = None,
+    client: str | None = None,
+) -> None:
+    """The fleet API's list, which is one org's: the token's.
+
+    A token this CLI mints is in `--org` (the default org without it), the
+    way `_in_box_org` reaches one agent. A supplied token lists its own org,
+    so the rows are filtered too, and an org it cannot see lists nothing
+    rather than some other org's agents.
+    """
     from flotta.auth import SCOPE_FLEET_READ
 
     show_all = all_ or status is not None
@@ -831,10 +861,15 @@ def _ps_remote(*, as_json: bool, status: str | None, all_: bool, limit: int) -> 
             "GET",
             "/api/boxes?all_=true" if show_all else "/api/boxes",
             scopes=(SCOPE_FLEET_READ,),
+            org=org,
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     rows = body.get("boxes", []) if isinstance(body, dict) else []
+    if org is not None:
+        rows = [r for r in rows if (r.get("org") or DEFAULT_ORG) == org]
+    if client is not None:
+        rows = [r for r in rows if r.get("client") == client]
     if status is not None:
         rows = [r for r in rows if r.get("status") == status]
     rows = rows[:limit]
@@ -860,6 +895,31 @@ def _ps_remote(*, as_json: bool, status: str | None, all_: bool, limit: int) -> 
     )
     if not rows:
         typer.secho(f"(fleet: {control_url()})", fg=typer.colors.BRIGHT_BLACK)
+    if org is None and _minting():
+        _other_orgs_hint()
+
+
+def _other_orgs_hint() -> None:
+    """Say so when the default org's list is not the whole fleet (FLOTTA-18).
+
+    A minted token sees the default org, and an agency's agents were simply
+    absent from `flotta ps`, with nothing saying the list was partial. One
+    more request, made only when this CLI holds the signing key.
+    """
+    from flotta.auth import SCOPE_FLEET_READ
+
+    try:
+        orgs = control_request("GET", "/api/orgs", scopes=(SCOPE_FLEET_READ,)).get("orgs", [])
+    except (ControlPlaneError, AttributeError):
+        return
+    others = [o["id"] for o in orgs if o.get("id") and o["id"] != DEFAULT_ORG]
+    if not others:
+        return
+    named = ", ".join(others[:5]) + (f" and {len(others) - 5} more" if len(others) > 5 else "")
+    typer.secho(
+        f"(the default org's agents; other orgs: {named}. `flotta ps --org <org>` lists one)",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
 
 
 async def _chat_via_door(
