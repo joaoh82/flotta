@@ -587,3 +587,25 @@ def test_an_operator_route_that_refuses_first_may_read_the_fleet():
         )
         == {}
     )
+
+
+def test_no_helper_in_the_app_is_defined_twice():
+    """A second `def` of a name inside `create_app` silently replaces the first
+    for every route after it. M16.4's `_client_or_404` did exactly that, and
+    the MCP routes answered "no client None" until it was renamed."""
+    import ast
+    from collections import Counter
+    from pathlib import Path
+
+    import flotta.control.app as app_module
+
+    tree = ast.parse(Path(app_module.__file__).read_text())
+    factory = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "create_app"
+    )
+    names = Counter(
+        n.name for n in factory.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    )
+    helpers = {name: n for name, n in names.items() if n > 1 and name.startswith("_")}
+
+    assert helpers == {}, f"defined more than once in create_app: {sorted(helpers)}"

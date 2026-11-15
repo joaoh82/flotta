@@ -39,7 +39,7 @@ class BadWindow(ValueError):
 
 def month_window(period: str) -> tuple[datetime, datetime]:
     """`YYYY-MM` as `[its first moment, the next month's)`, in UTC."""
-    if not re.fullmatch(r"\d{4}-\d{2}", period or ""):
+    if not re.fullmatch(r"(19|20)\d{2}-\d{2}", period or ""):
         raise BadWindow(f"a period is a month as YYYY-MM, got {period!r}")
     try:
         start = datetime.strptime(period, "%Y-%m").replace(tzinfo=UTC)
