@@ -61,6 +61,7 @@ from flotta.auth import (
     SCOPE_GIT_CREDENTIAL,
     SCOPE_ORG_ADMIN,
     SCOPE_ORG_GOVERN,
+    SCOPE_PORTAL_READ,
     SCOPE_RUN_CREATE,
     SIGNING_KEY_ENV,
     TICKET_PROTOCOL_PREFIX,
@@ -646,6 +647,33 @@ def _epoch(iso: str | None) -> float | None:
         return None
 
 
+#: How a client's viewer may group its usage (D27): by day and by agent. Never
+#: by client, which is the agency's view, or by model, which is how it runs it.
+VIEWER_USAGE_GROUPS = frozenset({"day", "box"})
+
+#: The runs a client's viewer never sees (D27): conversations, which are the
+#: people's who had them. A viewer has none of its own.
+VIEWER_HIDDEN_KINDS = ("chat",)
+
+#: What a client's viewer never reads of a run (D27): the agency's words to the
+#: agent, what a trigger fed it, and the agency's note on settling a failure.
+RUN_FIELDS_WITHHELD = ("prompt", "input", "resolved_by", "resolved_note")
+
+
+def _portal_reader(token: Token | None) -> bool:
+    """A client's viewer (M16.1, D27): `portal:read`, one client, changes nothing.
+
+    A client's systems hold `fleet:write` (an integration's token) and read as
+    the agency's API does; a client user holds `box:chat` and no `portal:read`.
+    """
+    return (
+        token is not None
+        and token.client is not None
+        and token.allows(SCOPE_PORTAL_READ)
+        and not token.allows(SCOPE_FLEET_WRITE)
+    )
+
+
 def create_app(
     *,
     store_factory: Any = _store_factory,
@@ -985,9 +1013,12 @@ def create_app(
     #: so the two never drift apart. Each route still checks whose org it is.
     needs_read_or_govern = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
     needs_limits_write = Depends(require(SCOPE_ORG_ADMIN, SCOPE_ORG_GOVERN, any_of=True))
-    #: The agency's people, or a client's person who talks to agents: who may
-    #: answer a run's approval, before the rules of `answer_run_approval`.
-    needs_answer = Depends(require(SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, any_of=True))
+    #: The agency's people, or a client's people (one who talks to agents, or
+    #: a viewer, D27): who may answer a run's approval, before the rules of
+    #: `answer_run_approval`.
+    needs_answer = Depends(
+        require(SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_PORTAL_READ, any_of=True)
+    )
     needs_chat = Depends(require(SCOPE_BOX_CHAT))
     # Any valid credential at all: for the routes about the caller themselves.
     needs_anyone = Depends(require())
@@ -2425,7 +2456,38 @@ def create_app(
             clients = store.list_clients(org_id)
             if token is not None and token.client is not None:
                 clients = [c for c in clients if c.id == token.client]
-            return {"org": org_id, "clients": [asdict(c) for c in clients]}
+            return {
+                "org": org_id,
+                "clients": [
+                    {**asdict(c), "spend_shown": store.client_spend_shown(org_id, c.id)}
+                    for c in clients
+                ],
+            }
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/clients/{client_id}/spend-shown")
+    def set_client_spend_shown(
+        org_id: str, client_id: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Whether this client's viewers see what its agents cost (M16.1, D27).
+
+        Off unless an owner turns it on: Flotta's numbers are the agency's cost,
+        and whether a client sees them is the agency's to decide.
+        """
+        shown = body.get("shown")
+        if not isinstance(shown, bool):
+            raise HTTPException(status_code=422, detail='send {"shown": true} or false')
+        if token is not None and not _is_operator(token) and (token.org or DEFAULT_ORG) != org_id:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            try:
+                store.set_client_spend_shown(org_id, client_id, shown)
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=f"no client {client_id!r}") from exc
+            return {"org": org_id, "client": client_id, "spend_shown": shown}
         finally:
             store.close()
 
@@ -2453,18 +2515,29 @@ def create_app(
             store.close()
         return {"client": asdict(client)}
 
-    def _budget_reader(token: Token | None, org_id: str) -> None:
-        """The org's own, or the operator: not a client's viewer, or an agent.
+    def _budget_reader(token: Token | None, org_id: str, *, portal: bool = False) -> bool:
+        """The org's own, or the operator: not an agent, and not a client's people.
 
-        What an agency allows a client's agents is the agency's business.
+        What an agency allows a client's agents is the agency's business, but
+        for one case (D27): with `portal`, a client's viewer reads its own
+        client's, once the agency shows it what its agents cost. True when the
+        caller is that viewer, so the route answers for its client only.
         """
         if _is_operator(token):
-            return
+            return False
         assert token is not None
         if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
             raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
-        if token.client is not None:
-            raise HTTPException(status_code=403, detail="budgets are the agency's to see")
+        if token.client is None:
+            return False
+        if portal and _portal_reader(token):
+            store = store_factory()
+            try:
+                if store.client_spend_shown(org_id, token.client):
+                    return True
+            finally:
+                store.close()
+        raise HTTPException(status_code=403, detail="budgets are the agency's to see")
 
     @app.get("/api/orgs/{org_id}/budgets")
     def list_budgets(org_id: str, token: Token | None = needs_read) -> Any:
@@ -2472,26 +2545,33 @@ def create_app(
 
         Owners and members read. Each sums the ledger, as a budget check does.
         """
-        _budget_reader(token, org_id)
+        viewer = _budget_reader(token, org_id, portal=True)
         from flotta.budgets import standing
 
         now = datetime.now(UTC)
         store = store_factory()
         try:
             _org_or_404(store, org_id)
-            standings = [standing(store, b, now) for b in store.budgets_for_org(org_id)]
-            return {
-                "org": org_id,
-                "budgets": [
-                    {
-                        **s.details(),
-                        "unpriced": s.unpriced,
-                        "reached": s.reached,
-                        "soft_reached": s.soft_reached,
-                    }
-                    for s in standings
-                ],
-            }
+            budgets = store.budgets_for_org(org_id)
+            if viewer:
+                # Its own client's limits; never the agency's own, or what an
+                # agent falls back to, which is how the agency runs it.
+                assert token is not None
+                budgets = [b for b in budgets if b.client == token.client]
+            standings = [standing(store, b, now) for b in budgets]
+            views = [
+                {
+                    **s.details(),
+                    "unpriced": s.unpriced,
+                    "reached": s.reached,
+                    "soft_reached": s.soft_reached,
+                }
+                for s in standings
+            ]
+            if viewer:
+                for view in views:
+                    view.pop("fallback_model", None)
+            return {"org": org_id, "budgets": views}
         finally:
             store.close()
 
@@ -2514,12 +2594,24 @@ def create_app(
         Also the hosted product's billing (`org:govern`), for any org: the totals
         an invoice is built from, and nothing more (FLOTTA-188).
         """
+        viewer = False
         if not (token is not None and is_governor(token)):
-            _budget_reader(token, org_id)
+            viewer = _budget_reader(token, org_id, portal=True)
         from flotta.usage_report import BadReport, parse_group, parse_window, report
 
         try:
             groups = parse_group(group)
+            if viewer:
+                assert token is not None
+                if client != token.client:
+                    raise HTTPException(
+                        status_code=403, detail=f"name your own client: ?client={token.client}"
+                    )
+                if set(groups) - VIEWER_USAGE_GROUPS:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"usage is grouped by {', '.join(sorted(VIEWER_USAGE_GROUPS))}",
+                    )
             since, until = parse_window(from_, to, datetime.now(UTC))
         except BadReport as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2536,12 +2628,23 @@ def create_app(
     def list_budget_events(
         org_id: str, client: str | None = None, token: Token | None = needs_read
     ) -> Any:
-        """What an org's budgets did, or one client's: its own and the org-wide ones."""
-        _budget_reader(token, org_id)
+        """What an org's budgets did, or one client's: its own and the org-wide ones.
+
+        A client's viewer, its own client's only, and never the org-wide ones.
+        """
+        viewer = _budget_reader(token, org_id, portal=True)
         from dataclasses import asdict
 
         store = store_factory()
         try:
+            if viewer:
+                assert token is not None
+                events = [
+                    e
+                    for e in store.budget_events(org_id, client=token.client)
+                    if e.client == token.client
+                ]
+                return {"events": [asdict(e) for e in events]}
             return {"events": [asdict(e) for e in store.budget_events(org_id, client=client)]}
         finally:
             store.close()
@@ -6369,16 +6472,21 @@ def create_app(
     # agency's, and a client's own systems' (a token for that client with
     # `fleet:write`). A client's people see none of it (D21).
 
-    def _run_reader(token: Token | None) -> None:
+    def _run_reader(token: Token | None, *, portal: bool = False) -> bool:
         """Not a client's people: a token confined to a client that can't change it.
 
         An API key is a client's systems, not its people, and reads its own
-        agent's runs only (`_scoped_box`, `_scoped_run`).
+        agent's runs only (`_scoped_box`, `_scoped_run`). With `portal`, a
+        client's viewer reads its own client's (D27), without the agency's
+        words (`_run_view`); a client user still reads none. True for that viewer.
         """
         if token is not None and token.allows(SCOPE_RUN_CREATE) and token.box is not None:
-            return
+            return False
+        if portal and _portal_reader(token):
+            return True
         if token is not None and token.client is not None and not token.allows(SCOPE_FLEET_WRITE):
             raise HTTPException(status_code=403, detail="runs are the agency's to see")
+        return False
 
     def _scoped_run(store: Any, token: Token | None, run_id: str) -> Any:
         """A run `token` may read, or 404, as `_scoped_box` is for a box."""
@@ -6394,11 +6502,24 @@ def create_app(
         return run
 
     def _run_view(
-        run: Any, cost: Any = None, approvals: Any = None, handoff: Any = False
+        run: Any,
+        cost: Any = None,
+        approvals: Any = None,
+        handoff: Any = False,
+        *,
+        viewer: bool = False,
+        spend_shown: bool = False,
     ) -> dict[str, Any]:
+        """A run as JSON. For a client's `viewer` (D27), without the agency's
+        words, and with its cost only where the agency shows the client that."""
         from dataclasses import asdict
 
         view = asdict(run)
+        if viewer:
+            for field in RUN_FIELDS_WITHHELD:
+                view.pop(field, None)
+            if not spend_shown:
+                cost = None
         if cost is not None:
             view["cost"] = asdict(cost)
         if approvals is not None:
@@ -6473,12 +6594,20 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            _run_reader(token)
+            viewer = _run_reader(token, portal=True)
             runs = store.list_runs(
-                org=box.org, box=box.id, since=after, statuses=statuses, limit=min(limit, 200)
+                org=box.org,
+                box=box.id,
+                since=after,
+                statuses=statuses,
+                limit=min(limit, 200),
+                exclude_kinds=VIEWER_HIDDEN_KINDS if viewer else (),
             )
             costs = store.run_costs(runs)
-            return {"runs": [_run_view(r, costs[r.id]) for r in runs]}
+            shown = viewer and store.client_spend_shown(box.org, box.client)
+            return {
+                "runs": [_run_view(r, costs[r.id], viewer=viewer, spend_shown=shown) for r in runs]
+            }
         finally:
             store.close()
 
@@ -6496,16 +6625,24 @@ def create_app(
         org = (token.org if token else None) or DEFAULT_ORG
         if token is not None and token.client is not None and token.client != client_id:
             raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
-        _run_reader(token)
+        viewer = _run_reader(token, portal=True)
         after = _runs_since(since)
         statuses = _runs_status(status)
         store = store_factory()
         try:
             runs = store.list_runs(
-                org=org, client=client_id, since=after, statuses=statuses, limit=min(limit, 200)
+                org=org,
+                client=client_id,
+                since=after,
+                statuses=statuses,
+                limit=min(limit, 200),
+                exclude_kinds=VIEWER_HIDDEN_KINDS if viewer else (),
             )
             costs = store.run_costs(runs)
-            return {"runs": [_run_view(r, costs[r.id]) for r in runs]}
+            shown = viewer and store.client_spend_shown(org, client_id)
+            return {
+                "runs": [_run_view(r, costs[r.id], viewer=viewer, spend_shown=shown) for r in runs]
+            }
         finally:
             store.close()
 
@@ -6515,12 +6652,17 @@ def create_app(
         store = store_factory()
         try:
             run = _scoped_run(store, token, run_id)
-            _run_reader(token)
+            viewer = _run_reader(token, portal=True)
+            if viewer and run.trigger_kind in VIEWER_HIDDEN_KINDS:
+                # Someone's conversation: not a viewer's to read, nor to know of.
+                raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
             return _run_view(
                 run,
                 store.run_cost(run.id),
                 store.run_approvals(run.id),
                 store.open_handoff_of_run(run.id) if run.trigger_kind != "chat" else None,
+                viewer=viewer,
+                spend_shown=viewer and store.client_spend_shown(run.org, run.client),
             )
         finally:
             store.close()
@@ -6562,6 +6704,13 @@ def create_app(
                         raise HTTPException(
                             status_code=403,
                             detail="the agency answers this agent's approvals",
+                        )
+                    if run.trigger_kind == "chat" and _portal_reader(token):
+                        # A viewer's are a run's (D27); a conversation's
+                        # belong to the person in it.
+                        raise HTTPException(
+                            status_code=403,
+                            detail="a conversation's approvals are answered in it",
                         )
                     allowed = CLIENT_APPROVAL_CHOICES
                 elif not token.allows(SCOPE_FLEET_WRITE):
@@ -6626,7 +6775,11 @@ def create_app(
                     if store.clients_answer_approvals(b.id)
                 ]
                 found = store.waiting_approvals(org=org, client=token.client, boxes=boxes)
-            return {"approvals": [_approval_view(store, a) for a in found]}
+            views = [_approval_view(store, a) for a in found]
+            if _portal_reader(token):
+                # A viewer answers a run's, never a conversation's (D27).
+                views = [v for v in views if v["kind"] == "run"]
+            return {"approvals": views}
         finally:
             store.close()
 

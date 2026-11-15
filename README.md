@@ -54,7 +54,8 @@ Each item names where it lives in this repository.
   reads the route table and fails the build if a route is not scoped.
   (`src/flotta/auth.py`, `src/flotta/door/`, `src/flotta/control/test_tenancy.py`)
 - **People and sign-in.** Users, memberships and sign-in by emailed link. Roles are `owner`,
-  `member`, `client_user` (talks to the client's agents) and `client_viewer` (reads only).
+  `member`, `client_user` (talks to the client's agents) and `client_viewer` (reads the work done for the client, and answers
+  the approvals the agency lets it).
   A new sign-up is a `pending` org that cannot create an agent until the operator approves it.
   (`src/flotta/control/app.py`, `src/flotta/test_accounts.py`)
 - **One machine and one memory per agent.** A Fly Machine with a volume at `/data/hermes`, so

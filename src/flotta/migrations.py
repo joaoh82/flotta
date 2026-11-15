@@ -1186,6 +1186,24 @@ MIGRATIONS: tuple[Migration, ...] = (
         ("ALTER TABLE orgs ADD COLUMN suspended_by TEXT",),
     ),
     Migration(36, "handoffs: an agent needs a person on its screen", _handoffs()),
+    Migration(
+        37,
+        "spend shown: whether a client's viewers see what its agents cost",
+        # M16.1 (D27). A row means yes, as in `client_approvers`, so every
+        # client that exists sees nothing about money until its agency says so:
+        # Flotta's numbers are the agency's cost, not its price.
+        (
+            """
+            CREATE TABLE client_spend_shown (
+                org_id      TEXT NOT NULL,
+                client_id   TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY (org_id, client_id),
+                FOREIGN KEY (org_id, client_id) REFERENCES clients(org_id, id)
+            )
+            """,
+        ),
+    ),
 )
 
 

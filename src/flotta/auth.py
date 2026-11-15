@@ -182,6 +182,11 @@ SCOPE_RUN_CREATE = "run:create"
 #: or change a single agent. Not the operator either, though its token is the
 #: default org's and unconfined: see `is_governor`.
 SCOPE_ORG_GOVERN = "org:govern"
+#: A client's view of the work done for it (M16.1, D27): its own client's runs,
+#: its usage when the agency shows it, and the approvals the agency lets it
+#: answer. Held by a client viewer and nothing else, and only with a client
+#: (`mint`). Never the agency's words: a run's prompt and input are withheld.
+SCOPE_PORTAL_READ = "portal:read"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -197,6 +202,7 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_MCP_CALL,
         SCOPE_RUN_CREATE,
         SCOPE_ORG_GOVERN,
+        SCOPE_PORTAL_READ,
     }
 )
 
@@ -210,8 +216,9 @@ ROLES: dict[str, frozenset[str]] = {
         {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY, SCOPE_ORG_ADMIN}
     ),
     "member": frozenset({SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY}),
-    # A client's own view of its agents: one client, read-only.
-    "client_viewer": frozenset({SCOPE_FLEET_READ}),
+    # A client's own view of its agents and the work they did: one client,
+    # read-only but for answering the approvals the agency lets it (D27).
+    "client_viewer": frozenset({SCOPE_FLEET_READ, SCOPE_PORTAL_READ}),
     # Someone at a client who uses its agents: one client, talks to them, and
     # creates, changes and destroys nothing.
     "client_user": frozenset({SCOPE_FLEET_READ, SCOPE_BOX_CHAT}),
@@ -722,6 +729,8 @@ def mint(
         raise AuthError(
             f"{SCOPE_ORG_ADMIN} is the whole org's; a token confined to one client cannot hold it"
         )
+    if SCOPE_PORTAL_READ in wanted and client is None:
+        raise AuthError(f"{SCOPE_PORTAL_READ} is one client's view of its work; name the client")
     if SCOPE_ORG_GOVERN in wanted:
         if wanted != {SCOPE_ORG_GOVERN}:
             raise AuthError(

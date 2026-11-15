@@ -518,7 +518,7 @@ def test_an_owner_changes_someones_role_and_it_holds_at_once(api, fleet, outbox)
         "client": "acme",
     }
     me = api.get("/api/me", headers=bo).json()
-    assert (me["client"], me["scopes"]) == ("acme", ["fleet:read"])
+    assert (me["client"], me["scopes"]) == ("acme", ["fleet:read", "portal:read"])
     members = api.get("/api/orgs/agency-x/members", headers=ana).json()["members"]
     assert [(m["role"], m["client"]) for m in members] == [
         ("owner", None),
