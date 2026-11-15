@@ -787,6 +787,13 @@ conventions, and the sharp edges below.
   PNG, JPEG, WebP, at most 256 KB), never SVG, which is a document that can
   carry script. An org or client name is one line with no control characters
   (`_tenant_name`), because a name becomes a report email's sender.
+- **A client's history is one read, by window (M16.3).** `FleetStore.client_window`
+  reads what touched a client in `[since, until)` (its runs, approvals answered,
+  requests, pull requests, its agents' own events), and `flotta.client_audit`
+  turns it into the trail (`GET /api/clients/{client}/audit`, at most 92 days,
+  the agency's and a client viewer's: without payloads, prompts or
+  conversations) and the monthly report's numbers (`/report-data?period=YYYY-MM`,
+  the agency's only; the hosted product decides what a client is shown).
 - **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
   real control plane and the real door in one process — the door's
   `ControlPlane` takes an `httpx.ASGITransport` as its `transport` — over a
