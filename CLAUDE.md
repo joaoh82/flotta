@@ -806,6 +806,13 @@ conventions, and the sharp edges below.
   within 15 minutes. An email address has no comma, semicolon, bracket or
   quote (`_EMAIL`): a To line is built of them. All of it is the
   agency's; a client's people read none of it here.
+- **The hosted product's report schedule holds `report:send`, alone (M16.8).**
+  Like `org:govern`: never beside another scope, never one org's, never the
+  operator (`is_report_sender`, checked in `_is_operator`). It reaches
+  `GET /api/report-runs?period=` (every agency with clients: owners' emails,
+  each client's report and where it goes), `report-data?org=`, branding and
+  logo, a report's `GET` and `/sent`, and the owners' `/notice`, and no other
+  route. `just report-token` mints it for the web app's `FLOTTA_REPORT_TOKEN`.
 - **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
   real control plane and the real door in one process — the door's
   `ControlPlane` takes an `httpx.ASGITransport` as its `transport` — over a

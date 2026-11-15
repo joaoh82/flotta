@@ -815,7 +815,8 @@ ScopeOpt = typer.Option(
     "--scope",
     "-s",
     help="Repeatable. fleet:read | fleet:write | box:destroy | ... | "
-    "org:govern (the hosted product's billing: held alone)",
+    "org:govern (the hosted product's billing: held alone) | "
+    "report:send (the hosted product's report schedule: held alone)",
 )
 
 

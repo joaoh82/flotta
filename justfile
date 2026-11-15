@@ -334,6 +334,14 @@ token-role SUBJECT ROLE ORG CLIENT="":
 govern-token:
     uv run flotta token mint billing --scope org:govern --days 365
 
+# M16.8 — the hosted product's report schedule: `report:send`, alone, for a year.
+# It lists the reports due, reads their numbers and the agencies' branding, and
+# records a send and the owners' notice, and nothing else. Mint it with the
+# signing key of the environment it is for, and put the output straight into
+# that web app's FLOTTA_REPORT_TOKEN; never paste it anywhere else.
+report-token:
+    uv run flotta token mint reports --scope report:send --days 365
+
 # The operator's; through the control plane when $FLOTTA_CONTROL_URL is set,
 # else the local store — as every org and client recipe below.
 # M11.7 — add an org (an agency), e.g. `just org-create agency-x "Agency X"`

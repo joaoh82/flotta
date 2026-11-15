@@ -62,6 +62,7 @@ from flotta.auth import (
     SCOPE_ORG_ADMIN,
     SCOPE_ORG_GOVERN,
     SCOPE_PORTAL_READ,
+    SCOPE_REPORT_SEND,
     SCOPE_RUN_CREATE,
     SIGNING_KEY_ENV,
     TICKET_PROTOCOL_PREFIX,
@@ -74,6 +75,7 @@ from flotta.auth import (
     is_api_key,
     is_client_person,
     is_governor,
+    is_report_sender,
     key_token,
     mint,
     mint_ticket,
@@ -1013,6 +1015,11 @@ def create_app(
     #: so the two never drift apart. Each route still checks whose org it is.
     needs_read_or_govern = Depends(require(SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, any_of=True))
     needs_limits_write = Depends(require(SCOPE_ORG_ADMIN, SCOPE_ORG_GOVERN, any_of=True))
+    #: A client's report: the agency's people, or the hosted product's report
+    #: schedule (`report:send`, M16.8), for these routes and no others.
+    needs_report_read = Depends(require(SCOPE_FLEET_READ, SCOPE_REPORT_SEND, any_of=True))
+    needs_report_write = Depends(require(SCOPE_FLEET_WRITE, SCOPE_REPORT_SEND, any_of=True))
+    needs_report_notice = Depends(require(SCOPE_ORG_ADMIN, SCOPE_REPORT_SEND, any_of=True))
     #: The agency's people, or a client's people (one who talks to agents, or
     #: a viewer, D27): who may answer a run's approval, before the rules of
     #: `answer_run_approval`.
@@ -1050,11 +1057,12 @@ def create_app(
         """
         if token is None:
             return True
-        if is_governor(token):
+        if is_governor(token) or is_report_sender(token):
             # The hosted product's billing credential is the default org's and
             # unconfined, so it looks like the operator's. It is not one: it
             # may read and set orgs' limits (FLOTTA-183) and suspend and resume
-            # them (FLOTTA-184), and nothing else.
+            # them (FLOTTA-184), and nothing else. Nor is its report schedule
+            # (`report:send`, M16.8): it sends reports, and nothing else.
             return False
         return (
             (token.org or DEFAULT_ORG) == DEFAULT_ORG
@@ -2657,10 +2665,16 @@ def create_app(
     # set by an owner. `flotta.branding` says what a logo may be.
 
     def _org_reader(token: Token | None, org_id: str) -> None:
-        """404 unless `token` is someone in `org_id`, or the operator. Not an agent."""
+        """404 unless `token` is someone in `org_id`, or the operator. Not an agent.
+
+        Also the hosted product's report schedule (`report:send`, M16.8): a
+        report wears its agency's branding.
+        """
         if _is_operator(token):
             return
         assert token is not None
+        if is_report_sender(token):
+            return
         if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
             raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
 
@@ -2677,7 +2691,7 @@ def create_app(
         }
 
     @app.get("/api/orgs/{org_id}/branding")
-    def get_branding(org_id: str, token: Token | None = needs_read) -> Any:
+    def get_branding(org_id: str, token: Token | None = needs_report_read) -> Any:
         """An org's name, accent and whether it has a logo (not the logo's bytes)."""
         _org_reader(token, org_id)
         store = store_factory()
@@ -2688,7 +2702,7 @@ def create_app(
             store.close()
 
     @app.get("/api/orgs/{org_id}/branding/logo")
-    def get_logo(org_id: str, token: Token | None = needs_read) -> Any:
+    def get_logo(org_id: str, token: Token | None = needs_report_read) -> Any:
         """The logo itself, as the image type its bytes are, and nothing else."""
         from fastapi.responses import Response
 
@@ -6839,14 +6853,26 @@ def create_app(
             store.close()
 
     @app.get("/api/clients/{client_id}/report-data")
-    def client_report_data(client_id: str, period: str, token: Token | None = needs_read) -> Any:
+    def client_report_data(
+        client_id: str,
+        period: str,
+        org: str | None = None,
+        token: Token | None = needs_report_read,
+    ) -> Any:
         """The numbers a client's monthly report is made from, for `period`
         (`YYYY-MM`): runs by outcome per agent, conversations, approvals
         answered, requests, pull requests, failures, spend and its limit. The
         agency's; the hosted product decides what of it a client is shown."""
         from flotta.client_audit import BadWindow, report_data
 
-        org, _ = _client_reader(token, client_id, people=False)
+        if token is not None and is_report_sender(token):
+            # The report schedule (M16.8) names the org: it is every org's.
+            if not org:
+                raise HTTPException(status_code=422, detail="name the org: ?org=")
+            org_id = org
+        else:
+            org_id, _ = _client_reader(token, client_id, people=False)
+        org = org_id
         store = store_factory()
         try:
             if store.get_client(org, client_id) is None:
@@ -6864,11 +6890,17 @@ def create_app(
     # it; this keeps what has to outlive a request. A send is recorded before
     # the email goes, once (409 after), so two senders never both send it.
 
-    def _report_keeper(token: Token | None, org_id: str) -> None:
-        """404 unless the operator or the org's own agency; a client's people are refused."""
+    def _report_keeper(token: Token | None, org_id: str, *, sender: bool = False) -> None:
+        """404 unless the operator or the org's own agency; a client's people are refused.
+
+        With `sender`, the hosted product's report schedule too (`report:send`,
+        M16.8), for any org; on any other route it is refused like a stranger.
+        """
         if _is_operator(token):
             return
         assert token is not None
+        if sender and is_report_sender(token):
+            return
         if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
             raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
         if token.client is not None:
@@ -6905,6 +6937,55 @@ def create_app(
         if client is None:
             raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
         return client
+
+    @app.get("/api/report-runs")
+    def report_runs(period: str, token: Token | None = needs_report_read) -> Any:
+        """Every report due for `period`, for the hosted product's schedule (M16.8).
+
+        Each active org with clients: its name, its owners' emails (who are told
+        the reports are ready, and who a report's replies go to), and each
+        client's report as kept (status, version) with where it goes. Only
+        `report:send`, or the operator: nothing in it is any one agency's to read.
+        """
+        if not (_is_operator(token) or (token is not None and is_report_sender(token))):
+            raise HTTPException(status_code=403, detail="the report schedule's alone")
+        period = _period(period)
+        store = store_factory()
+        try:
+            runs = []
+            for org in store.list_orgs(status="active"):
+                # The operator's own fleet has no clients to report to.
+                clients = [] if org.id == DEFAULT_ORG else store.list_clients(org.id)
+                if not clients:
+                    continue
+                owners = []
+                for m in store.members_of(org.id):
+                    if m.role != "owner":
+                        continue
+                    user = store.get_user(m.user_id)
+                    if user is not None:
+                        owners.append(user.email)
+                runs.append(
+                    {
+                        "org": org.id,
+                        "name": org.name,
+                        "owners": owners,
+                        "clients": [
+                            {
+                                "id": c.id,
+                                "name": c.name,
+                                "spend_shown": store.client_spend_shown(org.id, c.id),
+                                "report": _report_view(
+                                    store, store.client_report(org.id, c.id, period)
+                                ),
+                            }
+                            for c in clients
+                        ],
+                    }
+                )
+            return {"period": period, "orgs": runs}
+        finally:
+            store.close()
 
     @app.get("/api/orgs/{org_id}/clients/{client_id}/report-settings")
     def get_report_settings(org_id: str, client_id: str, token: Token | None = needs_read) -> Any:
@@ -6966,10 +7047,10 @@ def create_app(
 
     @app.get("/api/orgs/{org_id}/clients/{client_id}/reports/{period}")
     def get_report(
-        org_id: str, client_id: str, period: str, token: Token | None = needs_read
+        org_id: str, client_id: str, period: str, token: Token | None = needs_report_read
     ) -> Any:
         """One client's report for one month: its note, version and send."""
-        _report_keeper(token, org_id)
+        _report_keeper(token, org_id, sender=True)
         period = _period(period)
         store = store_factory()
         try:
@@ -7018,7 +7099,7 @@ def create_app(
         client_id: str,
         period: str,
         body: dict[str, Any],
-        token: Token | None = needs_write,
+        token: Token | None = needs_report_write,
     ) -> Any:
         """`{version}`: record the report's send, before it goes. Once: a 409 after.
 
@@ -7030,7 +7111,7 @@ def create_app(
         """
         from flotta.store import InvalidAccountError, ReportConflictError
 
-        _report_keeper(token, org_id)
+        _report_keeper(token, org_id, sender=True)
         period = _period(period)
         store = store_factory()
         try:
@@ -7070,12 +7151,13 @@ def create_app(
         org_id: str,
         period: str,
         body: dict[str, Any] | None = None,
-        token: Token | None = needs_admin,
+        token: Token | None = needs_report_notice,
     ) -> Any:
         """Record that `org`'s owners were told `period`'s reports are ready.
         `{"first": true}` the first time, false after: the telling happens once.
         `{"undo": true}` takes it back, for a telling whose email did not go."""
-        _admin_of(token, org_id)
+        if not (token is not None and is_report_sender(token)):
+            _admin_of(token, org_id)
         period = _period(period)
         store = store_factory()
         try:

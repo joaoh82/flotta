@@ -217,7 +217,10 @@ def test_the_known_scopes_are_exactly_these():
     well; it is held alone, and is never the operator — and for M16.1's
     `portal:read` (D27), because a client's viewer reads the work done for its
     client, and `fleet:write`, the only scope that reads runs, would let it
-    change that work too.
+    change that work too — and for M16.8's `report:send`, because the hosted
+    product's schedule sends every agency's reports with no one signed in, and
+    any other scope would let it read or change their agents as well; it is
+    held alone, like `org:govern`, and is never the operator.
     """
     assert {
         "fleet:read",
@@ -234,6 +237,7 @@ def test_the_known_scopes_are_exactly_these():
         "run:create",
         "org:govern",
         "portal:read",
+        "report:send",
     } == SCOPES
 
 
