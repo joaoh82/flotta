@@ -469,7 +469,7 @@ def test_org_with_a_supplied_token_says_why_it_is_a_404(ids, monkeypatch):
     result = CliRunner().invoke(app, ["key", "rm", "key-1", "--org", "nowhere"])
 
     assert result.exit_code == 1
-    assert "acts in its own org, whatever --org says" in result.output
+    assert "decides the org, not --org" in result.output
 
 
 def test_trigger_rm_and_key_rm_answer_json(ids):
@@ -480,3 +480,13 @@ def test_trigger_rm_and_key_rm_answer_json(ids):
 
     assert json.loads(removed.output) == {"removed": "tr-0"}
     assert json.loads(revoked.output) == {"revoked": "key-1"}
+
+
+def test_an_org_given_that_lacks_the_id_says_the_search_would_look(ids):
+    _, calls = ids
+
+    result = CliRunner().invoke(app, ["trigger", "rm", "tr-1", "--org", "other-co"])
+
+    assert result.exit_code == 1
+    assert "without --org every org is looked in" in result.output
+    assert calls == [("DELETE", "/api/triggers/tr-1", "other-co")]

@@ -590,15 +590,26 @@ def _in_any_org(
             return call(org)
         except ControlPlaneError as exc:
             if exc.status == 404 and org is not None:
+                # Whose the token is cannot be read without the key, so this
+                # says what --org does not do rather than guess.
                 typer.secho(
-                    f"($FLOTTA_CONTROL_TOKEN acts in its own org, whatever --org says; "
-                    f"{org}'s need a token for that org, or $FLOTTA_SIGNING_KEY in its place)",
+                    "($FLOTTA_CONTROL_TOKEN decides the org, not --org: if it is not "
+                    f"{org}'s, ask with a token for {org}, or with $FLOTTA_SIGNING_KEY instead)",
                     fg=typer.colors.BRIGHT_BLACK,
                     err=True,
                 )
             raise
     if org is not None:
-        return call(org)
+        try:
+            return call(org)
+        except ControlPlaneError as exc:
+            if exc.status == 404:
+                typer.secho(
+                    f"(not in {org}; without --org every org is looked in)",
+                    fg=typer.colors.BRIGHT_BLACK,
+                    err=True,
+                )
+            raise
     try:
         return call(None)
     except ControlPlaneError as exc:
