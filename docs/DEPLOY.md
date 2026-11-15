@@ -947,7 +947,10 @@ The ticket tells the page where to connect: `wss://<box>.$FLOTTA_DOMAIN/api/ws`,
 or, with `$FLOTTA_DOOR_URL` set on the control plane, that door's scheme, host
 and port instead (`ws://localhost:8081` for `just local`). A self-hosted door
 on a port of its own needs it. The web app reads the same variable for the
-page's content security policy, so set it on both or neither.
+page's content security policy, so set it on both or neither. `flotta chat`
+reads it too, dialling `http://<box>.localhost:8081` for `ws://localhost:8081`,
+and with neither it nor `$FLOTTA_DOMAIN` set it refuses to send a token to
+`flotta.dev` when `$FLOTTA_CONTROL_URL` is on this machine.
 
 ---
 

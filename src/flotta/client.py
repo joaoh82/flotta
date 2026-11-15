@@ -295,21 +295,70 @@ def ticket_url(box_name: str, env: Mapping[str, str] | None = None) -> str:
     return f"{scheme}://{box_name}.{where}/api/ws"
 
 
-def door_url(box_name: str, *, domain: str | None = None) -> str:
-    """`https://<box>.<domain>` — the public address of a box.
+#: Where the CLI finds the fleet API; read here only to tell a local fleet.
+CONTROL_URL_ENV = "FLOTTA_CONTROL_URL"
+
+
+def _is_loopback(url: str) -> bool:
+    """Whether `url` names this machine: `localhost`, `*.localhost` or a loopback IP."""
+    import ipaddress
+
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def door_url(
+    box_name: str, *, domain: str | None = None, env: Mapping[str, str] | None = None
+) -> str:
+    """`https://<box>.<domain>` — the address of a box, as the CLI dials it.
 
     The whole point of the front door: reaching an agent stops requiring
     `flyctl`, a WireGuard tunnel, and membership of the Fly org that happens to
     host it. A stranger with a scoped token and a hostname can talk to an
     agent, which is what makes the app (M8) shippable to anyone.
+
+    **`$FLOTTA_DOOR_URL` first**, the same setting that tells a browser where
+    the door is (`browser_door`): `ws://localhost:8081` under `just local`
+    becomes `http://<box>.localhost:8081`, without TLS. Before FLOTTA-16 only
+    browser tickets read it, so the CLI beside a local fleet dialled
+    `https://<box>.flotta.dev`, which is production.
+
+    **Never the default domain for a local fleet.** With no door URL and no
+    `$FLOTTA_DOMAIN`, a loopback `$FLOTTA_CONTROL_URL` means the token in hand
+    was minted for this machine; sending it to `flotta.dev` hands a stranger's
+    door a credential, so this refuses and says what to set instead.
     """
     from flotta.dotenv import read_dotenv_value
 
-    resolved = (
-        (domain or os.environ.get(DOMAIN_ENV) or read_dotenv_value(DOMAIN_ENV) or DEFAULT_DOMAIN)
-        .strip()
-        .strip(".")
-    )
+    env = os.environ if env is None else env
+
+    def setting(name: str) -> str:
+        return ((env.get(name) or "").strip() or read_dotenv_value(name) or "").strip()
+
+    if not domain:
+        raw_door = setting(DOOR_URL_ENV)
+        if raw_door:
+            try:
+                scheme, where = browser_door({DOOR_URL_ENV: raw_door})
+            except ValueError as exc:
+                raise ChatError(str(exc)) from exc
+            return f"{'https' if scheme == 'wss' else 'http'}://{box_name}.{where}"
+    resolved = (domain or setting(DOMAIN_ENV)).strip(".")
+    if not resolved:
+        control = setting(CONTROL_URL_ENV)
+        if control and _is_loopback(control):
+            raise ChatError(
+                f"${CONTROL_URL_ENV} is {control}, a fleet on this machine, but neither "
+                f"${DOOR_URL_ENV} nor ${DOMAIN_ENV} says where its door is, and the "
+                f"default is {DEFAULT_DOMAIN}, which is not this fleet's. Set "
+                f"{DOOR_URL_ENV}=ws://localhost:8081 for `just local`."
+            )
+        resolved = DEFAULT_DOMAIN
     return f"https://{box_name}.{resolved}"
 
 
@@ -369,10 +418,51 @@ def new_session(*, unsafe_cookies: bool = True):
     it the login returns 200, no cookie is retained, and the very next request
     is anonymous — which surfaces as a bare 401 from `/api/auth/ws-ticket` and
     looks like a credentials problem rather than a cookie-jar policy.
+
+    **`<box>.localhost` is this machine** (RFC 6761), which is how a local door
+    is addressed (`just local`). Browsers know that; the system resolver does
+    not everywhere — macOS answers nothing for a subdomain of `localhost` — so
+    the session resolves those names itself and leaves every other to aiohttp.
     """
     import aiohttp
 
-    return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=unsafe_cookies))
+    return aiohttp.ClientSession(
+        cookie_jar=aiohttp.CookieJar(unsafe=unsafe_cookies),
+        connector=aiohttp.TCPConnector(resolver=_LocalhostResolver()),
+    )
+
+
+class _LocalhostResolver:
+    """aiohttp's resolver, except that `localhost` and `*.localhost` are loopback."""
+
+    def __init__(self) -> None:
+        import aiohttp
+
+        self._inner = aiohttp.ThreadedResolver()
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[dict]:
+        name = host.lower().rstrip(".")
+        if name != "localhost" and not name.endswith(".localhost"):
+            return await self._inner.resolve(host, port, family)
+        found = []
+        for fam, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            if family in (socket.AF_UNSPEC, fam):
+                found.append(
+                    {
+                        "hostname": host,
+                        "host": address,
+                        "port": port,
+                        "family": fam,
+                        "proto": 0,
+                        "flags": socket.AI_NUMERICHOST,
+                    }
+                )
+        return found
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 async def login(

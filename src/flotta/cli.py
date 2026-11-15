@@ -52,6 +52,7 @@ import contextlib
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -414,7 +415,14 @@ CONTROL_TOKEN_ENV = "FLOTTA_CONTROL_TOKEN"
 
 
 class ControlPlaneError(Exception):
-    """The control plane refused, or could not be reached."""
+    """The control plane refused, or could not be reached.
+
+    `status` is the HTTP status of a refusal, and None when nothing answered.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def control_url(env: dict[str, str] | None = None) -> str | None:
@@ -423,7 +431,7 @@ def control_url(env: dict[str, str] | None = None) -> str | None:
     return (env.get(CONTROL_URL_ENV) or "").strip() or None
 
 
-def control_token(*scopes: str, env: dict[str, str] | None = None) -> str:
+def control_token(*scopes: str, env: dict[str, str] | None = None, org: str | None = None) -> str:
     """A token for the fleet API — supplied, or minted from the signing key.
 
     Minting rather than requiring a pasted `$FLOTTA_CONTROL_TOKEN` is the same
@@ -434,6 +442,12 @@ def control_token(*scopes: str, env: dict[str, str] | None = None) -> str:
     It also means `just box-identity` works with the `.env` an operator already
     has. Requiring one more secret to do a thing the signing key can already
     authorise is a step that exists only to be forgotten.
+
+    `org` mints it in that org rather than the default (FLOTTA-16): the fleet
+    API keeps the operator's token to the default org's agents, so acting on
+    an agency's agent takes a token of that agency, which the signing key can
+    already mint (`flotta token mint --org`). A supplied token is used as it
+    is, whatever `org` says: it already decides where it acts.
     """
     env = os.environ if env is None else env
     supplied = (env.get(CONTROL_TOKEN_ENV) or "").strip()
@@ -445,7 +459,13 @@ def control_token(*scopes: str, env: dict[str, str] | None = None) -> str:
     try:
         # Minutes, not days. This is minted per invocation for one request; a
         # long life would only widen the window if it leaked from a shell.
-        return mint(subject="cli", scopes=set(scopes), ttl_s=300, env=env)
+        return mint(
+            subject="cli",
+            scopes=set(scopes),
+            ttl_s=300,
+            env=env,
+            org=None if org in (None, DEFAULT_ORG) else org,
+        )
     except AuthError as exc:
         raise ControlPlaneError(
             f"cannot authenticate to {control_url(env)}: {exc}\n"
@@ -461,8 +481,12 @@ def control_request(
     body: dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     timeout_s: float = 30.0,
+    org: str | None = None,
 ) -> Any:
     """One call to the fleet API. Returns the decoded body.
+
+    `org`: the org a minted token acts in (`control_token`); `_in_box_org`
+    finds an agent's.
 
     stdlib rather than httpx: the CLI is installed with `uv tool install .` and
     httpx is not a runtime dependency of it. Reaching for one here would make
@@ -480,7 +504,7 @@ def control_request(
         url,
         data=json.dumps(body).encode() if body is not None else None,
         headers={
-            "Authorization": f"Bearer {control_token(*scopes, env=env)}",
+            "Authorization": f"Bearer {control_token(*scopes, env=env, org=org)}",
             "Content-Type": "application/json",
         },
         method=method,
@@ -493,16 +517,82 @@ def control_request(
         detail = ""
         with contextlib.suppress(Exception):
             detail = json.loads(exc.read().decode()).get("detail", "")
-        raise ControlPlaneError(f"{method} {path} -> {exc.code}: {detail or exc.reason}") from exc
+        raise ControlPlaneError(
+            f"{method} {path} -> {exc.code}: {detail or exc.reason}", status=exc.code
+        ) from exc
     except urllib.error.URLError as exc:
         raise ControlPlaneError(f"cannot reach the control plane at {base}: {exc.reason}") from exc
 
 
+def _minting(env: dict[str, str] | None = None) -> bool:
+    """Whether this CLI mints its own token, rather than using a supplied one."""
+    env = os.environ if env is None else env
+    return not (env.get(CONTROL_TOKEN_ENV) or "").strip()
+
+
+def _in_box_org(ref: str, call: Callable[[str | None], Any]) -> tuple[Any, str | None]:
+    """`call(org)`, its token minted in the org of the agent `ref` names; and that org.
+
+    The fleet API keeps the operator's own token to the default org's agents,
+    so before FLOTTA-16 `flotta run dev--acme--studio` and `flotta run <its
+    id>` both answered 404 from the operator's CLI. The signing key it mints
+    with can mint in any org (`flotta token mint --org`), so it does, for the
+    agent's: an address says its org (`flotta.address`), and an id or a bare
+    name that 404s is asked of `/api/boxes/{ref}/address` — which box, whose,
+    and nothing more — and the call made once more in that org. A default-org
+    agent, the operator's own, costs no extra round trip.
+
+    A supplied `$FLOTTA_CONTROL_TOKEN` is used as it is: it decides where it
+    acts, and a 404 from it is the answer.
+    """
+    from flotta import address
+
+    org = None
+    if _minting() and address.SEPARATOR in ref:
+        # A bare word parses too, as the default org's, but it may be an id
+        # of any org's agent; only a whole address answers without asking.
+        with contextlib.suppress(ValueError):
+            org = address.parse(ref)[2]
+    try:
+        return call(org), org
+    except ControlPlaneError as exc:
+        if exc.status != 404 or org is not None or not _minting():
+            raise
+        found = _lookup_org(ref)
+        if found in (None, DEFAULT_ORG):
+            raise
+        return call(found), found
+
+
+def _lookup_org(ref: str) -> str | None:
+    """The org of the agent `ref` names, from the fleet API, or None if it does not say.
+
+    Asked with the door's scope, `fleet:route`, which alone finds any org's
+    agent by name or id; the signing key in hand mints it, as `just local`
+    does for its door.
+    """
+    from flotta.auth import SCOPE_FLEET_ROUTE
+
+    try:
+        found = control_request(
+            "GET", f"/api/boxes/{_quoted(ref)}/address", scopes=(SCOPE_FLEET_ROUTE,)
+        )
+    except ControlPlaneError:
+        return None
+    box = (found or {}).get("box") if isinstance(found, dict) else None
+    return (box or {}).get("org") or None
+
+
 def _remote_box(box_id: str) -> dict[str, Any]:
-    """A box's row from the fleet API. `{id, name, ...}`."""
+    """A box's row from the fleet API. `{id, name, org, ...}`, found in its own org."""
     from flotta.auth import SCOPE_FLEET_READ
 
-    box = control_request("GET", f"/api/boxes/{box_id}", scopes=(SCOPE_FLEET_READ,))
+    box, _org = _in_box_org(
+        box_id,
+        lambda org: control_request(
+            "GET", f"/api/boxes/{_quoted(box_id)}", scopes=(SCOPE_FLEET_READ,), org=org
+        ),
+    )
     # The endpoint answers with the box itself or wraps it; accept both rather
     # than coupling the CLI to a response shape it does not own.
     if isinstance(box, dict) and "box" in box:
@@ -1016,7 +1106,15 @@ def logs(
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
-    """Show a box's timeline — its own events plus its tasks' and workspaces'."""
+    """Show a box's timeline — its own events plus its tasks' and workspaces'.
+
+    Through the fleet API when `$FLOTTA_CONTROL_URL` is set and `--store` is
+    not (FLOTTA-16), as `ps` is: before, it read `./fleet.db` beside a fleet
+    whose rows were somewhere else entirely.
+    """
+    if control_url() and store is None:
+        _logs_remote(box_id, as_json=as_json)
+        return
     with _open_store(store) as fleet:
         box = _require_box(fleet, box_id)
         events = fleet.get_box_timeline(box.id)
@@ -1037,6 +1135,34 @@ def logs(
             typer.echo(f"endpoint: {box.endpoint}")
         typer.echo("")
         typer.echo(render_events(events))
+
+
+def _logs_remote(ref: str, *, as_json: bool) -> None:
+    """`flotta logs` from `GET /api/boxes/{id}` and its `/events`, in the agent's org."""
+    from flotta.auth import SCOPE_FLEET_READ
+
+    try:
+        found, org = _in_box_org(
+            ref,
+            lambda org: control_request(
+                "GET", f"/api/boxes/{_quoted(ref)}", scopes=(SCOPE_FLEET_READ,), org=org
+            ),
+        )
+        box = found.get("box") or {}
+        timeline = control_request(
+            "GET", f"/api/boxes/{_quoted(box['id'])}/events", scopes=(SCOPE_FLEET_READ,), org=org
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    events = timeline.get("events") or []
+    if as_json:
+        emit({"box": box, "tasks": found.get("tasks") or [], "events": events}, "", as_json=True)
+        return
+    typer.echo(f"{box['id']}  {box.get('name')}  {box.get('status')}")
+    if box.get("endpoint"):
+        typer.echo(f"endpoint: {box['endpoint']}")
+    typer.echo("")
+    typer.echo(render_events([Event(**e) for e in events]))
 
 
 @app.command()
@@ -1081,8 +1207,37 @@ def create(
 
     The machine it lands on keeps `/data/hermes` on a volume, so what the agent
     learns survives a stop/start.
+
+    **With `$FLOTTA_CONTROL_URL` set, the control plane creates it**
+    (`POST /api/boxes`), as `ps`, `org create` and `client create` already go
+    there; `--store` still means this store. Before FLOTTA-16 this wrote
+    `./fleet.db` beside a deployed fleet, which knows none of its orgs.
     """
     from flotta.inference import InvalidModel
+
+    if instructions_file is not None:
+        if instructions is not None:
+            raise typer.BadParameter("give --instructions or --instructions-file, not both")
+        instructions = instructions_file.read_text(encoding="utf-8")
+
+    if control_url() and store is None:
+        _create_remote(
+            name,
+            image=image,
+            org=org,
+            client=client,
+            as_json=as_json,
+            body={
+                "volume_gb": volume_gb,
+                "display_name": display_name,
+                "description": description,
+                "instructions": instructions,
+                "region": region,
+                "model": model,
+                "screen": screen or None,
+            },
+        )
+        return
 
     provision = _provision()
 
@@ -1114,10 +1269,6 @@ def create(
             # machine while doing it. Without this flag a fresh app cannot be
             # created into at all — which is how the adopt path came to be the
             # only one anybody ever took.
-            if instructions_file is not None:
-                if instructions is not None:
-                    raise typer.BadParameter("give --instructions or --instructions-file, not both")
-                instructions = instructions_file.read_text(encoding="utf-8")
             result = provision.create_box(
                 name,
                 store=fleet,
@@ -1162,6 +1313,53 @@ def create(
         )
 
 
+def _create_remote(
+    name: str,
+    *,
+    image: str | None,
+    org: str,
+    client: str,
+    body: dict[str, Any],
+    as_json: bool,
+) -> None:
+    """`flotta create` through the fleet API: `POST /api/boxes`, in `org`'s `client`.
+
+    The token is minted in `org` (`control_token`), since the operator's own
+    may create only in the default org. The answer is a `202`: the row is
+    reserved and the machine is provisioned on the control plane's thread, so
+    this says so rather than waiting, as the web app does.
+    """
+    from flotta.auth import SCOPE_FLEET_WRITE
+
+    if image is not None:
+        raise _fail(
+            Exception(
+                "--image boots a machine from this store, and the control plane creates "
+                "from its own; pass --store to create here, or leave --image out"
+            ),
+            code=2,
+        )
+    request = {"name": name, "org": org, "client": client}
+    request.update({k: v for k, v in body.items() if v is not None})
+    try:
+        found = control_request(
+            "POST", "/api/boxes", scopes=(SCOPE_FLEET_WRITE,), body=request, org=org
+        )
+    except ControlPlaneError as exc:
+        raise _fail(exc) from exc
+    box = found.get("box") or {}
+    address = box.get("name") or name
+    box_id = box.get("id") or found.get("box_id")
+    status = box.get("status") or found.get("status")
+    emit(
+        found,
+        f"{box_id}  {address}  {status}\n\n"
+        f"It is being provisioned; `flotta logs {address}` says when it is running. "
+        f"Talk to it with `flotta chat {address}`.",
+        as_json=as_json,
+    )
+
+
 #: How often `run --wait` asks how the run is going.
 RUN_POLL_S = 2.0
 
@@ -1201,15 +1399,26 @@ def run(
     if not control_url():
         raise _fail(ControlPlaneError(f"runs go through the control plane: set ${CONTROL_URL_ENV}"))
     try:
-        found = control_request(
-            "POST", f"/api/boxes/{_quoted(box)}/runs", scopes=(SCOPE_FLEET_WRITE,), body=body
+        # The agent's own org, so the operator's CLI reaches an agency's agent
+        # (FLOTTA-16); its run is in the same org, so the poll uses it too.
+        found, org = _in_box_org(
+            box,
+            lambda org: control_request(
+                "POST",
+                f"/api/boxes/{_quoted(box)}/runs",
+                scopes=(SCOPE_FLEET_WRITE,),
+                body=body,
+                org=org,
+            ),
         )
         deadline = time.monotonic() + timeout_s
         while wait and found.get("status") not in TASK_TERMINAL:
             if time.monotonic() > deadline:
                 raise ControlPlaneError(f"run {found.get('id')} is still {found.get('status')}")
             time.sleep(RUN_POLL_S)
-            found = control_request("GET", f"/api/runs/{found['id']}", scopes=(SCOPE_FLEET_READ,))
+            found = control_request(
+                "GET", f"/api/runs/{found['id']}", scopes=(SCOPE_FLEET_READ,), org=org
+            )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     if not wait:
@@ -1224,6 +1433,9 @@ def run(
 def runs(
     box: str | None = typer.Argument(None, help="The agent, by name or id"),
     client: str | None = typer.Option(None, "--client", help="A client's runs instead"),
+    org: str | None = typer.Option(
+        None, "--org", help="The client's org, with --client [default org]"
+    ),
     limit: int = typer.Option(20, "--limit", help="How many, newest first"),
     as_json: bool = JsonOpt,
 ) -> None:
@@ -1234,9 +1446,21 @@ def runs(
         raise _fail(Exception("name an agent, or a client with --client"))
     if not control_url():
         raise _fail(ControlPlaneError(f"runs go through the control plane: set ${CONTROL_URL_ENV}"))
+    if box and org:
+        raise _fail(Exception("--org goes with --client; an agent's own org is found for it"))
     path = f"/api/boxes/{_quoted(box)}/runs" if box else f"/api/clients/{_quoted(client)}/runs"
     try:
-        found = control_request("GET", f"{path}?limit={limit}", scopes=(SCOPE_FLEET_READ,))
+        if box:
+            found, _org = _in_box_org(
+                box,
+                lambda org: control_request(
+                    "GET", f"{path}?limit={limit}", scopes=(SCOPE_FLEET_READ,), org=org
+                ),
+            )
+        else:
+            found = control_request(
+                "GET", f"{path}?limit={limit}", scopes=(SCOPE_FLEET_READ,), org=org
+            )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     lines = [_run_line(r) for r in found["runs"]] or ["no runs"]
@@ -1270,13 +1494,22 @@ def _trigger_line(trigger: dict[str, Any]) -> str:
     )
 
 
-def _through_control(method: str, path: str, scope: str, body: dict | None = None) -> Any:
+def _through_control(
+    method: str, path: str, scope: str, body: dict | None = None, *, box: str | None = None
+) -> Any:
+    """One call to the fleet API, or exit saying why not; `box` is the agent it
+    is about, whose org a minted token acts in (`_in_box_org`)."""
     if not control_url():
         raise _fail(
             ControlPlaneError(f"this goes through the control plane: set ${CONTROL_URL_ENV}")
         )
     try:
-        return control_request(method, path, scopes=(scope,), body=body)
+        if box is None:
+            return control_request(method, path, scopes=(scope,), body=body)
+        return _in_box_org(
+            box,
+            lambda org: control_request(method, path, scopes=(scope,), body=body, org=org),
+        )[0]
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
 
@@ -1304,7 +1537,9 @@ def trigger_add(
         if webhook
         else {"cron": cron, "tz": tz, "prompt": prompt}
     )
-    found = _through_control("POST", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_WRITE, body)
+    found = _through_control(
+        "POST", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_WRITE, body, box=box
+    )
     text = _trigger_line(found)
     if webhook:
         text += (
@@ -1338,7 +1573,9 @@ def trigger_ls(
     """An agent's triggers: schedules with when each fires next, and webhooks."""
     from flotta.auth import SCOPE_FLEET_READ
 
-    found = _through_control("GET", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_READ)
+    found = _through_control(
+        "GET", f"/api/boxes/{_quoted(box)}/triggers", SCOPE_FLEET_READ, box=box
+    )
     lines = [_trigger_line(t) for t in found["triggers"]] or ["no triggers"]
     emit(found, "\n".join(lines), as_json=as_json)
 
@@ -1382,7 +1619,7 @@ def key_add(
     from flotta.auth import SCOPE_FLEET_WRITE
 
     found = _through_control(
-        "POST", f"/api/boxes/{_quoted(box)}/keys", SCOPE_FLEET_WRITE, {"name": name}
+        "POST", f"/api/boxes/{_quoted(box)}/keys", SCOPE_FLEET_WRITE, {"name": name}, box=box
     )
     text = (
         f"{_key_line(found)}\n\nkey  {found.get('key')}\n\n"
@@ -1401,7 +1638,7 @@ def key_ls(
     """An agent's keys, newest first, revoked ones too. Never the keys themselves."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
-    found = _through_control("GET", f"/api/boxes/{_quoted(box)}/keys", SCOPE_FLEET_WRITE)
+    found = _through_control("GET", f"/api/boxes/{_quoted(box)}/keys", SCOPE_FLEET_WRITE, box=box)
     lines = [_key_line(k) for k in found["keys"]] or ["no keys"]
     emit(found, "\n".join(lines), as_json=as_json)
 
@@ -1579,6 +1816,7 @@ def resize(
                 f"/api/boxes/{box['id']}/size",
                 scopes=(SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN),
                 body={"memory_mb": memory},
+                org=box.get("org"),
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
@@ -1655,6 +1893,7 @@ def screen(
                 # On may resize, which is an owner's (as `resize` is).
                 scopes=(SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN) if on else (SCOPE_FLEET_WRITE,),
                 body={"screen": on},
+                org=box.get("org"),
             )
         except ControlPlaneError as exc:
             raise _fail(exc) from exc
@@ -2987,6 +3226,7 @@ def peer_block(
             f"/api/boxes/{box['id']}/peer-blocks",
             scopes=(SCOPE_FLEET_WRITE,),
             body={"peer": peer},
+            org=box.get("org"),
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
@@ -3006,7 +3246,10 @@ def peer_allow(
     try:
         box = _remote_box(box_id)
         body = control_request(
-            "DELETE", f"/api/boxes/{box['id']}/peer-blocks/{peer}", scopes=(SCOPE_FLEET_WRITE,)
+            "DELETE",
+            f"/api/boxes/{box['id']}/peer-blocks/{peer}",
+            scopes=(SCOPE_FLEET_WRITE,),
+            org=box.get("org"),
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
@@ -3024,7 +3267,9 @@ def peer_list(
     _needs_control_plane()
     try:
         box = _remote_box(box_id)
-        body = control_request("GET", f"/api/boxes/{box['id']}/peers", scopes=(SCOPE_FLEET_READ,))
+        body = control_request(
+            "GET", f"/api/boxes/{box['id']}/peers", scopes=(SCOPE_FLEET_READ,), org=box.get("org")
+        )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
     emit(body, _colleagues_text(body), as_json=as_json)
@@ -3060,6 +3305,7 @@ def _set_model(box_id: str, model: str | None, as_json: bool) -> None:
             body={"model": model},
             # A control plane from before FLOTTA-99 answers after the restart.
             timeout_s=180.0,
+            org=box.get("org"),
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
@@ -3417,6 +3663,7 @@ def token_rotate(
             scopes=(SCOPE_FLEET_WRITE,),
             # A running agent restarts before this answers.
             timeout_s=180.0,
+            org=box.get("org"),
         )
     except ControlPlaneError as exc:
         raise _fail(exc) from exc
