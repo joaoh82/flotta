@@ -1223,6 +1223,16 @@ ALERT_THRESHOLDS = ("budget_soft_limit", "budget_limit")
 
 
 @dataclass(frozen=True, slots=True)
+class OrgBranding:
+    """How an agency looks to its clients (M16.2). See `flotta.branding`."""
+
+    org: str
+    accent: str | None
+    logo_type: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class OrgAlerts:
     """Where an org's alerts go, besides its owners. See `flotta.alerts`."""
 
@@ -4505,6 +4515,78 @@ class FleetStore:
             ),
         )
 
+    def org_branding(self, org: str) -> OrgBranding | None:
+        """An org's accent and whether it has a logo; never the logo itself."""
+        row = self._conn.execute(
+            "SELECT org_id, accent, logo_type, updated_at FROM org_branding WHERE org_id = ?",
+            (org,),
+        ).fetchone()
+        if row is None:
+            return None
+        return OrgBranding(
+            org=row["org_id"],
+            accent=row["accent"],
+            logo_type=row["logo_type"],
+            updated_at=row["updated_at"],
+        )
+
+    def org_logo(self, org: str) -> tuple[bytes, str] | None:
+        """An org's logo and its type, or None."""
+        import base64
+
+        row = self._conn.execute(
+            "SELECT logo_type, logo_b64 FROM org_branding WHERE org_id = ?", (org,)
+        ).fetchone()
+        if row is None or not row["logo_b64"] or not row["logo_type"]:
+            return None
+        return base64.b64decode(row["logo_b64"]), str(row["logo_type"])
+
+    def set_org_branding(
+        self,
+        org: str,
+        *,
+        accent: str | None,
+        logo: tuple[bytes, str] | None,
+        keep_logo: bool = False,
+    ) -> OrgBranding:
+        """Replace an org's accent, and its logo unless `keep_logo`.
+
+        Checked already (`flotta.branding`): this keeps what it is given.
+        """
+        import base64
+
+        now = _utcnow()
+        if keep_logo:
+            self._conn.execute(
+                "INSERT INTO org_branding (org_id, accent, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (org_id) DO UPDATE SET accent = excluded.accent, "
+                "updated_at = excluded.updated_at",
+                (org, accent, now),
+            )
+        else:
+            data, kind = logo if logo is not None else (None, None)
+            encoded = base64.b64encode(data).decode("ascii") if data is not None else None
+            self._conn.execute(
+                "INSERT INTO org_branding (org_id, accent, logo_type, logo_b64, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id) DO UPDATE SET "
+                "accent = excluded.accent, logo_type = excluded.logo_type, "
+                "logo_b64 = excluded.logo_b64, updated_at = excluded.updated_at",
+                (org, accent, kind, encoded, now),
+            )
+        found = self.org_branding(org)
+        assert found is not None
+        return found
+
+    def rename_org(self, org_id: str, name: str) -> Org:
+        """An org's name, as its people and its clients read it. Its id never changes."""
+        name = _tenant_name(name, kind="org")
+        if self.get_org(org_id) is None:
+            raise UnknownEntityError(f"no org {org_id!r}")
+        self._conn.execute("UPDATE orgs SET name = ? WHERE id = ?", (name, org_id))
+        org = self.get_org(org_id)
+        assert org is not None
+        return org
+
     def org_alerts(self, org: str) -> OrgAlerts | None:
         row = self._conn.execute("SELECT * FROM org_alerts WHERE org_id = ?", (org,)).fetchone()
         return _org_alerts_from_row(row) if row is not None else None
@@ -7310,6 +7392,12 @@ def _tenant_name(value: str, *, kind: Literal["org", "client"]) -> str:
         raise InvalidTenantError(f"{a_kind} needs a name")
     if len(v) > TENANT_NAME_MAX:
         raise InvalidTenantError(f"{a_kind} name has at most {TENANT_NAME_MAX} characters")
+    import unicodedata
+
+    # A name is put in front of people: a page's header, a report email's
+    # sender (M16.8). A line break there could start a header of its own.
+    if any(unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") for ch in v):
+        raise InvalidTenantError(f"{a_kind} name is one line of text, with no control characters")
     return v
 
 
