@@ -779,6 +779,14 @@ conventions, and the sharp edges below.
   Flotta's numbers are the agency's cost); and a run's approvals where the agent
   lets its client answer. A client user, who talks to the agents, still reads
   no runs and no spend (D21). Triggers and alerts stay the agency's.
+- **An agency's branding is kept here and worn by the hosted product (M16.2).**
+  `GET /api/orgs/{org}/branding` (anyone in the org, a client's people
+  included: it is what they are shown) and `/branding/logo` (the bytes, with
+  `nosniff` and `default-src 'none'`); `PUT` changes name, accent and logo,
+  owner only. **A logo is an image by its first bytes** (`flotta.branding`:
+  PNG, JPEG, WebP, at most 256 KB), never SVG, which is a document that can
+  carry script. An org or client name is one line with no control characters
+  (`_tenant_name`), because a name becomes a report email's sender.
 - **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
   real control plane and the real door in one process — the door's
   `ControlPlane` takes an `httpx.ASGITransport` as its `transport` — over a

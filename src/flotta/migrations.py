@@ -1204,6 +1204,25 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        38,
+        "org branding: an agency's accent colour and logo, for its clients",
+        # M16.2. One row per org that has set either; no row is Flotta's own
+        # look. The logo is kept as base64 text rather than bytes, so the one
+        # statement reads the same on SQLite and Postgres; it is at most
+        # 256 KB (`flotta.branding`), and read only when a portal asks for it.
+        (
+            """
+            CREATE TABLE org_branding (
+                org_id      TEXT PRIMARY KEY REFERENCES orgs(id),
+                accent      TEXT,
+                logo_type   TEXT,
+                logo_b64    TEXT,
+                updated_at  TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 

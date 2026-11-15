@@ -2649,6 +2649,111 @@ def create_app(
         finally:
             store.close()
 
+    # -- branding (M16.2) ----------------------------------------------------
+    #
+    # How an agency looks to its clients: its name, an accent colour and a
+    # logo, which the hosted product's portal and report wear. Read by anyone
+    # in the org, a client's people included, since it is what they are shown;
+    # set by an owner. `flotta.branding` says what a logo may be.
+
+    def _org_reader(token: Token | None, org_id: str) -> None:
+        """404 unless `token` is someone in `org_id`, or the operator. Not an agent."""
+        if _is_operator(token):
+            return
+        assert token is not None
+        if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+
+    def _branding_view(org: Any, branding: Any) -> dict[str, Any]:
+        return {
+            "org": org.id,
+            "name": org.name,
+            "accent": branding.accent if branding else None,
+            "logo": (
+                {"type": branding.logo_type, "updated_at": branding.updated_at}
+                if branding is not None and branding.logo_type
+                else None
+            ),
+        }
+
+    @app.get("/api/orgs/{org_id}/branding")
+    def get_branding(org_id: str, token: Token | None = needs_read) -> Any:
+        """An org's name, accent and whether it has a logo (not the logo's bytes)."""
+        _org_reader(token, org_id)
+        store = store_factory()
+        try:
+            org = _org_or_404(store, org_id)
+            return _branding_view(org, store.org_branding(org_id))
+        finally:
+            store.close()
+
+    @app.get("/api/orgs/{org_id}/branding/logo")
+    def get_logo(org_id: str, token: Token | None = needs_read) -> Any:
+        """The logo itself, as the image type its bytes are, and nothing else."""
+        from fastapi.responses import Response
+
+        _org_reader(token, org_id)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            found = store.org_logo(org_id)
+        finally:
+            store.close()
+        if found is None:
+            raise HTTPException(status_code=404, detail=f"org {org_id!r} has no logo")
+        data, kind = found
+        return Response(
+            content=data,
+            media_type=kind,
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'",
+            },
+        )
+
+    @app.put("/api/orgs/{org_id}/branding")
+    def put_branding(org_id: str, body: dict[str, Any], token: Token | None = needs_admin) -> Any:
+        """Change what the body names: `{name?, accent?, logo?}`.
+
+        `accent` is `#rrggbb`; `logo` is a PNG, JPEG or WebP as base64 (a data
+        URL is fine), at most 256 KB. `null` removes either. An owner's, or the
+        operator's.
+        """
+        from flotta.branding import BrandingRefused, check_accent, decode_logo
+        from flotta.store import InvalidTenantError
+
+        _admin_of(token, org_id)
+        unknown = sorted(set(body) - {"name", "accent", "logo"})
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"no branding field {unknown[0]!r}")
+        store = store_factory()
+        try:
+            org = _org_or_404(store, org_id)
+            current = store.org_branding(org_id)
+            accent = current.accent if current else None
+            logo = None
+            try:
+                if "accent" in body:
+                    accent = check_accent(body["accent"]) if body["accent"] is not None else None
+                if body.get("logo") is not None:
+                    logo = decode_logo(body["logo"])
+            except BrandingRefused as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if "name" in body:
+                try:
+                    org = store.rename_org(org_id, str(body["name"] or ""))
+                except InvalidTenantError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+            branding = current
+            if "accent" in body or "logo" in body:
+                branding = store.set_org_branding(
+                    org_id, accent=accent, logo=logo, keep_logo="logo" not in body
+                )
+            return _branding_view(org, branding)
+        finally:
+            store.close()
+
     @app.get("/api/orgs/{org_id}/alerts")
     def get_alerts(org_id: str, token: Token | None = needs_read) -> Any:
         """Where an org's alerts go, and how the latest went. Never the webhook's secret."""
