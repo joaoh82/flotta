@@ -7333,6 +7333,19 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/triggers/{trigger_id}")
+    def get_trigger(trigger_id: str, token: Token | None = needs_read) -> Any:
+        """One trigger, as the agent's list shows it, or the same 404 for anyone
+        else's. What a caller holding only its id asks to learn whether this
+        token's org has it, before acting on it (FLOTTA-17)."""
+        store = store_factory()
+        try:
+            trigger = _scoped_trigger(store, token, trigger_id)
+            _run_reader(token)
+            return {"trigger": _trigger_view(trigger)}
+        finally:
+            store.close()
+
     @app.patch("/api/triggers/{trigger_id}")
     def update_trigger(
         trigger_id: str, body: dict[str, Any], token: Token | None = needs_write
@@ -7427,6 +7440,16 @@ def create_app(
         try:
             box = _scoped_box(store, token, box_id)
             return {"keys": [_key_view(k) for k in store.list_api_keys(box.id)]}
+        finally:
+            store.close()
+
+    @app.get("/api/keys/{key_id}")
+    def get_api_key(key_id: str, token: Token | None = needs_write) -> Any:
+        """One key, as the agent's list shows it (never the key itself), or the
+        same 404 for anyone else's. `fleet:write`, as that list is (FLOTTA-17)."""
+        store = store_factory()
+        try:
+            return {"key": _key_view(_scoped_key(store, token, key_id))}
         finally:
             store.close()
 
