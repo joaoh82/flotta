@@ -18,7 +18,7 @@ curl -X POST "$FLOTTA_CONTROL_URL/api/boxes/eng-a/triggers" \
   -d '{"kind": "webhook", "prompt": "Qualify the lead {{body.title}}."}'
 ```
 
-**The answer carries `url` and `secret`, and the secret only that once.** It isn't stored: it's derived from the control plane's signing key and a value on the trigger, so it can't be read back. `flotta trigger secret <id>`, or `POST /api/triggers/<id>/secret`, makes a new one, and the old one stops working at once. (From the operator's CLI, holding the signing key, it finds a webhook in any org; `--org` says which.) Rotating the signing key changes every webhook's secret.
+**The answer carries `url` and `secret`, and the secret only that once.** It isn't stored: it's derived from the control plane's signing key and a value on the trigger, so it can't be read back. `flotta trigger secret <id>`, or `POST /api/triggers/<id>/secret`, makes a new one, and the old one stops working at once. (From the operator's CLI, holding the signing key, it finds a webhook in any org with `GET /api/triggers/<id>`; `--org` says which.) Rotating the signing key changes every webhook's secret.
 
 The URL is `<control plane>/hooks/<trigger id>`. It doesn't name the org or the client. A URL ends up in a CRM's settings, in tickets and in logs, and the trigger's id already says whose agent it is.
 

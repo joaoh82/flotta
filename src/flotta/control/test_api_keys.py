@@ -350,3 +350,21 @@ def test_without_a_signing_key_a_key_is_still_its_one_agent(fleet):
     assert mine.status_code == 202, mine.text
     assert theirs.status_code == 404
     assert listed.status_code == 403
+
+
+def test_one_key_is_read_by_its_id_by_the_agency_alone(api):
+    """FLOTTA-17: what the CLI asks to learn which org has a key id. Never the
+    key itself, and `fleet:write`, as the agent's list of keys is."""
+    made = _key(api)
+    path = f"/api/keys/{made['id']}"
+
+    own = api.get(path, headers=AGENCY_X)
+    assert own.status_code == 200
+    assert own.json()["key"]["id"] == made["id"]
+    assert made["key"] not in own.text
+
+    assert api.get(path, headers=AGENCY_Y).status_code == 404
+    assert api.get("/api/keys/key-nope", headers=AGENCY_X).status_code == 404
+    viewer = _bearer(SCOPE_FLEET_READ, org="agency-x", client="acme")
+    assert api.get(path, headers=viewer).status_code == 403
+    assert api.get(path, headers=_with(made["key"])).status_code == 403, "a key reads no key"

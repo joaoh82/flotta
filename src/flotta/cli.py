@@ -564,21 +564,40 @@ def _in_box_org(ref: str, call: Callable[[str | None], Any]) -> tuple[Any, str |
         return call(found), found
 
 
-def _in_any_org(call: Callable[[str | None], Any], *, org: str | None = None) -> Any:
+def _in_any_org(
+    call: Callable[[str | None], Any],
+    *,
+    find: tuple[str, str],
+    org: str | None = None,
+) -> Any:
     """`call(org)` for what an id names without saying whose: a trigger, a key (FLOTTA-17).
 
     `_in_box_org` reads the org off an agent; a trigger's or a key's id says
     nothing of it, so the operator's CLI answered 404 for every one outside the
-    default org. With `org` given, the token is minted there. Otherwise the
-    default org is asked first, and on its 404, while this CLI mints, each other
-    org that can hold agents in turn, until one answers.
+    default org. With `org` given, the token is minted there. Otherwise `call`
+    is made in the default org, the operator's own, and on its 404, while this
+    CLI mints, `find` (a read of the same id, and the scope it needs) is asked
+    of each other org that can hold agents until one has it; `call` is then
+    made there, once. The act itself never goes to an org that lacks the id.
 
-    Asking the wrong org is no act: the fleet API scopes the id before it does
-    anything (`_scoped_trigger`, `_scoped_key`), so a wrong org's answer is a
-    404 and nothing else. An id no org has gets the default org's 404, as it
-    did before. A supplied `$FLOTTA_CONTROL_TOKEN` is used as it is.
+    An id no org has gets the default org's 404, as it did before. A failure
+    other than a 404, the org list's included, ends the search as itself. A
+    supplied `$FLOTTA_CONTROL_TOKEN` is used as it is, and `--org` cannot move
+    it, which a 404 then says.
     """
-    if org is not None or not _minting():
+    if not _minting():
+        try:
+            return call(org)
+        except ControlPlaneError as exc:
+            if exc.status == 404 and org is not None:
+                typer.secho(
+                    f"($FLOTTA_CONTROL_TOKEN acts in its own org, whatever --org says; "
+                    f"{org}'s need a token for that org, or $FLOTTA_SIGNING_KEY in its place)",
+                    fg=typer.colors.BRIGHT_BLACK,
+                    err=True,
+                )
+            raise
+    if org is not None:
         return call(org)
     try:
         return call(None)
@@ -586,12 +605,15 @@ def _in_any_org(call: Callable[[str | None], Any], *, org: str | None = None) ->
         if exc.status != 404:
             raise
         first = exc
-    for other in _other_orgs():
+    path, scope = find
+    for other in _other_orgs(strict=True):
         try:
-            return call(other)
+            control_request("GET", path, scopes=(scope,), org=other)
         except ControlPlaneError as exc:
-            if exc.status != 404:
-                raise
+            if exc.status == 404:
+                continue
+            raise
+        return call(other)
     raise first
 
 
@@ -947,11 +969,14 @@ def _ps_remote(
 _LISTED = ("active", "suspended")
 
 
-def _other_orgs() -> list[str]:
+def _other_orgs(*, strict: bool = False) -> list[str]:
     """The orgs besides the default one that can hold agents, as the operator's
-    `/api/orgs` lists them; none when it cannot say.
+    `/api/orgs` lists them. A pending or declined sign-up has no agents, so it
+    is left out.
 
-    A pending or declined sign-up has no agents, so it is left out.
+    For a hint, an answer it cannot get or read is no orgs. With `strict`,
+    for a search whose result is the answer, it is the failure it was: a 503
+    must not read as "no such trigger".
     """
     from flotta.auth import SCOPE_FLEET_READ
 
@@ -962,7 +987,15 @@ def _other_orgs() -> list[str]:
             for o in orgs
             if o.get("id") and o["id"] != DEFAULT_ORG and o.get("status", "active") in _LISTED
         ]
-    except (ControlPlaneError, AttributeError, KeyError, TypeError):
+    except ControlPlaneError:
+        if strict:
+            raise
+        return []
+    except (AttributeError, KeyError, TypeError) as exc:
+        if strict:
+            raise ControlPlaneError(
+                f"GET /api/orgs: an answer this CLI cannot read ({exc})"
+            ) from exc
         return []
 
 
@@ -1623,21 +1656,22 @@ def _through_control(
     body: dict | None = None,
     *,
     box: str | None = None,
-    any_org: bool = False,
+    find: tuple[str, str] | None = None,
     org: str | None = None,
 ) -> Any:
     """One call to the fleet API, or exit saying why not; `box` is the agent it
-    is about, whose org a minted token acts in (`_in_box_org`). With `any_org`
-    the path names something by an id alone, found in `org` or else searched
-    for (`_in_any_org`)."""
+    is about, whose org a minted token acts in (`_in_box_org`). With `find`
+    the path names something by an id alone, which is in `org` or is looked
+    for with that read (`_in_any_org`)."""
     if not control_url():
         raise _fail(
             ControlPlaneError(f"this goes through the control plane: set ${CONTROL_URL_ENV}")
         )
     try:
-        if any_org:
+        if find is not None:
             return _in_any_org(
                 lambda o: control_request(method, path, scopes=(scope,), body=body, org=o),
+                find=find,
                 org=(org or "").strip() or None,
             )
         if box is None:
@@ -1696,13 +1730,13 @@ def trigger_secret_cmd(
     as_json: bool = JsonOpt,
 ) -> None:
     """A webhook's new secret, printed this once. The old one stops at once."""
-    from flotta.auth import SCOPE_FLEET_WRITE
+    from flotta.auth import SCOPE_FLEET_READ, SCOPE_FLEET_WRITE
 
     found = _through_control(
         "POST",
         f"/api/triggers/{_quoted(trigger_id)}/secret",
         SCOPE_FLEET_WRITE,
-        any_org=True,
+        find=(f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_READ),
         org=org,
     )
     emit(found, f"secret  {found.get('secret')}", as_json=as_json)
@@ -1729,14 +1763,14 @@ def trigger_rm(
     org: str | None = typer.Option(
         None, "--org", help="The org of its agent [looked for when not given]"
     ),
+    as_json: bool = JsonOpt,
 ) -> None:
     """Remove a trigger. The runs it made stay."""
-    from flotta.auth import SCOPE_FLEET_WRITE
+    from flotta.auth import SCOPE_FLEET_READ, SCOPE_FLEET_WRITE
 
-    _through_control(
-        "DELETE", f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_WRITE, any_org=True, org=org
-    )
-    typer.echo(f"removed {trigger_id}")
+    path = f"/api/triggers/{_quoted(trigger_id)}"
+    _through_control("DELETE", path, SCOPE_FLEET_WRITE, find=(path, SCOPE_FLEET_READ), org=org)
+    emit({"removed": trigger_id}, f"removed {trigger_id}", as_json=as_json)
 
 
 # -- API keys (M14.5) ------------------------------------------------------------
@@ -1799,14 +1833,15 @@ def key_rm(
     org: str | None = typer.Option(
         None, "--org", help="The org of its agent [looked for when not given]"
     ),
+    as_json: bool = JsonOpt,
 ) -> None:
     """Revoke a key. Its next request is refused; the runs it started stay."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
-    _through_control(
-        "DELETE", f"/api/keys/{_quoted(key_id)}", SCOPE_FLEET_WRITE, any_org=True, org=org
-    )
-    typer.echo(f"revoked {key_id}")
+    path = f"/api/keys/{_quoted(key_id)}"
+    # Reading a key is `fleet:write`, as its agent's list of keys is.
+    _through_control("DELETE", path, SCOPE_FLEET_WRITE, find=(path, SCOPE_FLEET_WRITE), org=org)
+    emit({"revoked": key_id}, f"revoked {key_id}", as_json=as_json)
 
 
 hook_app = typer.Typer(

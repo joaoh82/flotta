@@ -138,3 +138,28 @@ def test_a_clients_people_neither_see_nor_change_schedules(api, scopes):
 
     assert _add(api, headers=person).status_code == 403
     assert api.get(f"/api/boxes/{X}/triggers", headers=person).status_code == 403
+
+
+def test_one_trigger_is_read_by_its_id_and_by_no_one_elses_org(api, fleet):
+    """FLOTTA-17: the CLI asks this in each org to learn which has the id, so
+    that the act itself goes only to that one."""
+    from flotta.store import FleetStore
+
+    trigger = _add(api).json()
+    path = f"/api/triggers/{trigger['id']}"
+    with FleetStore(fleet) as store:
+        store.create_client("agency-x", "globex", "Globex")
+
+    own = api.get(path, headers=WRITER)
+    assert own.status_code == 200
+    assert own.json()["trigger"]["id"] == trigger["id"]
+    assert own.json()["trigger"]["next"], "as the agent's list shows it"
+
+    stranger = _bearer(SCOPE_FLEET_READ, org="agency-y")
+    sibling = _bearer(SCOPE_FLEET_READ, org="agency-x", client="globex")
+    assert api.get(path, headers=stranger).status_code == 404
+    assert api.get(path, headers=sibling).status_code == 404
+    assert api.get("/api/triggers/tr-nope", headers=WRITER).status_code == 404
+
+    viewer = _bearer(SCOPE_FLEET_READ, org="agency-x", client="acme")
+    assert api.get(path, headers=viewer).status_code == 403, "a client's people see none"

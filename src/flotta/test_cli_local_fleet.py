@@ -298,14 +298,20 @@ def ids(monkeypatch, tmp_path):
     """A fleet API with a schedule `tr-1`, a webhook `tr-2` and a key `key-1`
     on `dev--acme--studio`, and orgs to search: `other-co` before `studio`, and
     a pending sign-up. Like the real one, each id answers 404 for any org but
-    its own, before it does anything."""
+    its own, and `GET` of it says which org has it without doing anything."""
     monkeypatch.setenv("FLOTTA_SIGNING_KEY", KEY)
     monkeypatch.setenv("FLOTTA_CONTROL_URL", "http://127.0.0.1:8080")
-    state = {"owner": {"tr-1": "studio", "tr-2": "studio", "key-1": "studio", "tr-0": "default"}}
+    state = {
+        "owner": {"tr-1": "studio", "tr-2": "studio", "key-1": "studio", "tr-0": "default"},
+        "fail": {},
+    }
     calls: list[tuple] = []
 
     def fake(method, path, *, scopes, body=None, org=None, **kwargs):
         calls.append((method, path, org))
+        failing = state["fail"].get((method, path, org))
+        if failing:
+            raise ControlPlaneError(f"{method} {path} -> {failing}: busy", status=failing)
         if path == "/api/orgs":
             return {
                 "orgs": [
@@ -316,18 +322,23 @@ def ids(monkeypatch, tmp_path):
                 ]
             }
         ref = path.split("/")[3]
-        if state.get("fail"):
-            raise ControlPlaneError(f"{method} {path} -> 503: busy", status=503)
         owner = state["owner"].get(ref)
         if owner is None or (org or "default") != owner:
             what = "API key" if path.startswith("/api/keys") else "trigger"
             raise ControlPlaneError(f"{method} {path} -> 404: no {what} {ref!r}", status=404)
+        if method == "GET":
+            return {"trigger": {"id": ref}} if "triggers" in path else {"key": {"id": ref}}
         if path.endswith("/secret"):
             return {"id": ref, "secret": "whsec_new"}
         return None
 
     monkeypatch.setattr(cli, "control_request", fake)
     return state, calls
+
+
+def _acts(calls):
+    """The calls that do something: neither the org list nor a lookup."""
+    return [c for c in calls if c[0] != "GET"]
 
 
 def test_trigger_rm_finds_another_orgs_trigger_by_id(ids):
@@ -340,16 +351,24 @@ def test_trigger_rm_finds_another_orgs_trigger_by_id(ids):
     assert calls == [
         ("DELETE", "/api/triggers/tr-1", None),
         ("GET", "/api/orgs", None),
-        ("DELETE", "/api/triggers/tr-1", "other-co"),  # a 404, and nothing done
+        ("GET", "/api/triggers/tr-1", "other-co"),  # not there; nothing sent to act
+        ("GET", "/api/triggers/tr-1", "studio"),
         ("DELETE", "/api/triggers/tr-1", "studio"),
     ]
 
 
 def test_trigger_secret_finds_another_orgs_webhook_by_id(ids):
+    _, calls = ids
+
     result = CliRunner().invoke(app, ["trigger", "secret", "tr-2"])
 
     assert result.exit_code == 0, result.output
     assert "whsec_new" in result.output
+    assert _acts(calls) == [
+        ("POST", "/api/triggers/tr-2/secret", None),
+        ("POST", "/api/triggers/tr-2/secret", "studio"),
+    ]
+    assert ("GET", "/api/triggers/tr-2", "studio") in calls
 
 
 def test_key_rm_finds_another_orgs_key_by_id(ids):
@@ -359,7 +378,10 @@ def test_key_rm_finds_another_orgs_key_by_id(ids):
 
     assert result.exit_code == 0, result.output
     assert "revoked key-1" in result.output
-    assert calls[-1] == ("DELETE", "/api/keys/key-1", "studio")
+    assert _acts(calls) == [
+        ("DELETE", "/api/keys/key-1", None),
+        ("DELETE", "/api/keys/key-1", "studio"),
+    ]
 
 
 def test_the_org_given_is_asked_directly(ids):
@@ -380,25 +402,54 @@ def test_the_default_orgs_own_trigger_costs_no_search(ids):
     assert calls == [("DELETE", "/api/triggers/tr-0", None)]
 
 
-def test_an_id_no_org_has_is_the_same_404(ids):
+def test_an_id_no_org_has_is_the_same_404_and_acts_nowhere_else(ids):
     _, calls = ids
 
     result = CliRunner().invoke(app, ["key", "rm", "key-nope"])
 
     assert result.exit_code == 1
     assert "404: no API key 'key-nope'" in result.output
-    assert [org for _, path, org in calls if path != "/api/orgs"] == [None, "other-co", "studio"]
+    assert _acts(calls) == [("DELETE", "/api/keys/key-nope", None)]
+    assert [org for method, path, org in calls if path == "/api/keys/key-nope"] == [
+        None,
+        "other-co",
+        "studio",
+    ]
 
 
-def test_a_failure_that_is_not_a_404_stops_the_search(ids):
+def test_a_failure_in_the_default_org_is_not_searched_past(ids):
     state, calls = ids
-    state["fail"] = True
+    state["fail"][("DELETE", "/api/triggers/tr-1", None)] = 503
 
     result = CliRunner().invoke(app, ["trigger", "rm", "tr-1"])
 
     assert result.exit_code == 1
     assert "503" in result.output
     assert calls == [("DELETE", "/api/triggers/tr-1", None)]
+
+
+def test_a_failure_in_another_org_ends_the_search_as_itself(ids):
+    state, calls = ids
+    state["fail"][("GET", "/api/triggers/tr-1", "other-co")] = 503
+
+    result = CliRunner().invoke(app, ["trigger", "rm", "tr-1"])
+
+    assert result.exit_code == 1
+    assert "503" in result.output
+    assert _acts(calls) == [("DELETE", "/api/triggers/tr-1", None)]
+
+
+def test_an_org_list_that_fails_is_that_failure_not_a_404(ids):
+    """For `ps`'s hint an unreadable org list is no orgs; here it would turn a
+    trigger that exists into `no trigger`."""
+    state, _ = ids
+    state["fail"][("GET", "/api/orgs", None)] = 503
+
+    result = CliRunner().invoke(app, ["trigger", "rm", "tr-1"])
+
+    assert result.exit_code == 1
+    assert "GET /api/orgs -> 503" in result.output
+    assert "no trigger" not in result.output
 
 
 def test_a_supplied_token_is_not_searched_with(ids, monkeypatch):
@@ -409,3 +460,23 @@ def test_a_supplied_token_is_not_searched_with(ids, monkeypatch):
 
     assert result.exit_code == 1
     assert calls == [("DELETE", "/api/triggers/tr-1", None)]
+    assert "FLOTTA_SIGNING_KEY" not in result.output
+
+
+def test_org_with_a_supplied_token_says_why_it_is_a_404(ids, monkeypatch):
+    monkeypatch.setenv("FLOTTA_CONTROL_TOKEN", "another-orgs-token")
+
+    result = CliRunner().invoke(app, ["key", "rm", "key-1", "--org", "nowhere"])
+
+    assert result.exit_code == 1
+    assert "acts in its own org, whatever --org says" in result.output
+
+
+def test_trigger_rm_and_key_rm_answer_json(ids):
+    import json
+
+    removed = CliRunner().invoke(app, ["trigger", "rm", "tr-0", "--json"])
+    revoked = CliRunner().invoke(app, ["key", "rm", "key-1", "--org", "studio", "--json"])
+
+    assert json.loads(removed.output) == {"removed": "tr-0"}
+    assert json.loads(revoked.output) == {"revoked": "key-1"}
