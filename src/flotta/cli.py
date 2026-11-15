@@ -776,8 +776,10 @@ def ps(
     ),
 ) -> None:
     """List the fleet: boxes by default, tasks with --tasks."""
+    org = (org or "").strip() or None
+    client = (client or "").strip() or None
     if tasks and (org or client):
-        raise _fail(Exception("--org and --client list agents, not --tasks"))
+        raise _fail(Exception("--org and --client list agents, not --tasks"), code=2)
     # Through the fleet API when there is one, like `repo`: a laptop that only
     # talks to a deployed control plane has no fleet.db, and `ps` said so as
     # "no fleet-state store" on the first command anyone ran. `--store` still
@@ -793,6 +795,9 @@ def ps(
             elif org or client:
                 rows = fleet.list_boxes_in(org or DEFAULT_ORG, client)
                 if status is not None:
+                    from flotta.store import _check_status
+
+                    _check_status("box", status)
                     rows = [r for r in rows if r.status == status]
             else:
                 rows = fleet.list_boxes(status)
@@ -895,8 +900,20 @@ def _ps_remote(
     )
     if not rows:
         typer.secho(f"(fleet: {control_url()})", fg=typer.colors.BRIGHT_BLACK)
+        if org is not None and not _minting():
+            # The supplied token lists its own org, and this CLI cannot mint
+            # another: an empty list here is not "that org has no agents".
+            typer.secho(
+                f"($FLOTTA_CONTROL_TOKEN lists its own org's agents; {org}'s need a token "
+                "for that org, or $FLOTTA_SIGNING_KEY in place of the token)",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
     if org is None and _minting():
         _other_orgs_hint()
+
+
+#: The org statuses that can hold agents: `suspended` keeps them, stopped.
+_LISTED = ("active", "suspended")
 
 
 def _other_orgs_hint() -> None:
@@ -910,9 +927,14 @@ def _other_orgs_hint() -> None:
 
     try:
         orgs = control_request("GET", "/api/orgs", scopes=(SCOPE_FLEET_READ,)).get("orgs", [])
-    except (ControlPlaneError, AttributeError):
-        return
-    others = [o["id"] for o in orgs if o.get("id") and o["id"] != DEFAULT_ORG]
+        # A pending or declined sign-up has no agents to list.
+        others = [
+            o["id"]
+            for o in orgs
+            if o.get("id") and o["id"] != DEFAULT_ORG and o.get("status", "active") in _LISTED
+        ]
+    except (ControlPlaneError, AttributeError, KeyError, TypeError):
+        return  # a hint is never worth failing `ps` over, its table already printed
     if not others:
         return
     named = ", ".join(others[:5]) + (f" and {len(others) - 5} more" if len(others) > 5 else "")
