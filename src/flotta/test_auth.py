@@ -214,7 +214,10 @@ def test_the_known_scopes_are_exactly_these():
     may create from its plan, suspend it when it does not pay (FLOTTA-184), and
     approve it, always capped, when it does (FLOTTA-185),
     and `org:admin` would have let it read and change every agency's agents as
-    well; it is held alone, and is never the operator.
+    well; it is held alone, and is never the operator — and for M16.1's
+    `portal:read` (D27), because a client's viewer reads the work done for its
+    client, and `fleet:write`, the only scope that reads runs, would let it
+    change that work too.
     """
     assert {
         "fleet:read",
@@ -230,6 +233,7 @@ def test_the_known_scopes_are_exactly_these():
         "mcp:call",
         "run:create",
         "org:govern",
+        "portal:read",
     } == SCOPES
 
 
@@ -442,7 +446,7 @@ def test_a_box_subject_may_name_its_box_by_name():
 
 def test_role_maps_to_scopes_at_mint():
     """A token is still a flat list of scopes; the role is gone once minted."""
-    from flotta.auth import SCOPE_ORG_ADMIN, scopes_for_role
+    from flotta.auth import SCOPE_ORG_ADMIN, SCOPE_PORTAL_READ, scopes_for_role
 
     owner = scopes_for_role("owner")
     member = scopes_for_role("member", client="acme")
@@ -450,7 +454,7 @@ def test_role_maps_to_scopes_at_mint():
 
     assert owner == member | {SCOPE_ORG_ADMIN}
     assert {SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY} == member
-    assert viewer == {SCOPE_FLEET_READ}
+    assert viewer == {SCOPE_FLEET_READ, SCOPE_PORTAL_READ}
     assert scopes_for_role("client_user", client="acme") == {SCOPE_FLEET_READ, SCOPE_BOX_CHAT}
     token = verify(mint(subject="alice", scopes=owner, key=KEY, org="agency-x"), key=KEY)
     assert token.scopes == owner

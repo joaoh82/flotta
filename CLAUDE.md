@@ -761,8 +761,8 @@ conventions, and the sharp edges below.
   `org:admin` on that org — the operator, or the org's own owner — and
   another org is the 404 of no org. **People get tokens by role** (`ROLES`
   in `auth.py`: `owner` = `member` + `org:admin`, `member` = read, write,
-  chat, destroy, `client_viewer` = `fleet:read` in one client, `client_user` =
-  `fleet:read` and `box:chat` in one client), mapped at
+  chat, destroy, `client_viewer` = `fleet:read` and `portal:read` in one
+  client, `client_user` = `fleet:read` and `box:chat` in one client), mapped at
   mint time so a token is still a flat scope list. No role holds a machine's
   scope (`git:credential`, `box:peer`, `fleet:route`), and `mint` refuses
   `org:admin` on a client-confined token. `flotta token mint --role` goes
@@ -770,6 +770,15 @@ conventions, and the sharp edges below.
   owner without the signing key mints for its people — while `--scope` always
   mints locally, which `just door-secrets` relies on. The default org's
   tokens still carry no `org` claim.
+- **A client viewer reads the work done for its client (M16.1, D27).**
+  `portal:read` lets it read its own client's runs (`_run_reader(portal=True)`),
+  never a conversation (`VIEWER_HIDDEN_KINDS`) and never the agency's words
+  (`RUN_FIELDS_WITHHELD`: prompt, input, the note on a settled failure); its
+  usage and limits only while an owner shows that client its spend
+  (`PUT /api/orgs/{org}/clients/{client}/spend-shown`, off by default, because
+  Flotta's numbers are the agency's cost); and a run's approvals where the agent
+  lets its client answer. A client user, who talks to the agents, still reads
+  no runs and no spend (D21). Triggers and alerts stay the agency's.
 - **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
   real control plane and the real door in one process — the door's
   `ControlPlane` takes an `httpx.ASGITransport` as its `transport` — over a

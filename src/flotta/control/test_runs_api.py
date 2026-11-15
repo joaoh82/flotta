@@ -190,9 +190,10 @@ def test_a_clients_system_asks_for_and_reads_its_own_runs(api):
 @pytest.mark.parametrize(
     "scopes",
     [{SCOPE_FLEET_READ, SCOPE_BOX_CHAT}, {SCOPE_FLEET_READ}],
-    ids=["client_user", "client_viewer"],
+    ids=["client_user", "client_reader"],
 )
 def test_a_clients_people_neither_ask_for_runs_nor_see_them(api, scopes):
+    """But a client viewer, who reads its own (D27): `test_portal_api.py`."""
     run = _ask(api).json()
     person = _bearer(*scopes, org="agency-x", client="acme")
 
@@ -322,7 +323,8 @@ def test_a_clients_person_answers_only_where_the_agency_allows_it(api, fleet):
     assert once.status_code == 200
 
 
-def test_a_client_viewer_answers_nothing(api, fleet):
+def test_a_client_reader_without_portal_read_answers_nothing(api, fleet):
+    """A client viewer answers where the agency allows it (D27): `test_portal_api.py`."""
     run, _ = _waiting(fleet)
     _allow_clients(fleet)
 

@@ -3395,6 +3395,32 @@ class FleetStore:
         ).fetchone()
         return row is not None
 
+    def set_client_spend_shown(self, org_id: str, client_id: str, shown: bool) -> None:
+        """Whether this client's viewers see what its agents cost (M16.1, D27).
+
+        A row means yes, so a client nobody has decided about sees nothing.
+        """
+        if self.get_client(org_id, client_id) is None:
+            raise UnknownEntityError(f"no client {client_id!r} in org {org_id!r}")
+        if not shown:
+            self._conn.execute(
+                "DELETE FROM client_spend_shown WHERE org_id = ? AND client_id = ?",
+                (org_id, client_id),
+            )
+            return
+        self._conn.execute(
+            "INSERT INTO client_spend_shown (org_id, client_id, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (org_id, client_id) DO NOTHING",
+            (org_id, client_id, _utcnow()),
+        )
+
+    def client_spend_shown(self, org_id: str, client_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT client_id FROM client_spend_shown WHERE org_id = ? AND client_id = ?",
+            (org_id, client_id),
+        ).fetchone()
+        return row is not None
+
     def client_approvers(self, box_ids: list[str]) -> set[str]:
         """Which of these do. One query for the fleet list, not one per row."""
         if not box_ids:
@@ -5258,6 +5284,7 @@ class FleetStore:
         since: datetime | None = None,
         statuses: Sequence[str] | None = None,
         limit: int = 50,
+        exclude_kinds: Sequence[str] = (),
     ) -> list[Run]:
         """`org`'s runs, newest first. `org` is always required, as in `spend`:
         a client's id is only unique within its org, and a box filter must not
@@ -5265,6 +5292,10 @@ class FleetStore:
         reader counting failures is not capped by the runs that went well."""
         where = ["org_id = ?", "trigger_kind IS NOT NULL"]
         params: list[Any] = [org]
+        if exclude_kinds:
+            # `exclude_kinds`: a client's viewer reads no one's conversations (D27).
+            where.append(f"trigger_kind NOT IN ({','.join('?' * len(exclude_kinds))})")
+            params.extend(exclude_kinds)
         if statuses is not None:
             unknown = sorted(set(statuses) - TASK_STATUSES)
             if unknown:
