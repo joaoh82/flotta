@@ -794,6 +794,14 @@ conventions, and the sharp edges below.
   the agency's and a client viewer's: without payloads, prompts or
   conversations) and the monthly report's numbers (`/report-data?period=YYYY-MM`,
   the agency's only; the hosted product decides what a client is shown).
+- **A report is sent once, and the send is recorded before the email goes
+  (M16.4).** `client_report_settings` (where it goes, at most five people, and
+  whether it sends itself N days after its month, owner only),
+  `client_reports` (one client's month: the agency's note, written against the
+  `version` read, 409 if stale or sent) and `report_notices` (owners told once a
+  month). `POST …/reports/{period}/sent` is the lock: a second is 409, and only
+  its sender takes a failed send back, within 15 minutes. All of it is the
+  agency's; a client's people read none of it here.
 - **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
   real control plane and the real door in one process — the door's
   `ControlPlane` takes an `httpx.ASGITransport` as its `transport` — over a

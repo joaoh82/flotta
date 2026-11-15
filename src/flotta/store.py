@@ -1245,6 +1245,50 @@ class ClientWindow:
     capped: bool = False
 
 
+#: The most people one client's report goes to (M16.4).
+REPORT_RECIPIENTS_MAX = 5
+#: The longest "what we changed this month" note.
+REPORT_NOTE_MAX = 2000
+#: How long the sender of a report has to take back a send whose email failed.
+REPORT_UNDO_S = 15 * 60
+#: The latest a report may send itself after its month ends, in days.
+REPORT_AUTO_SEND_MAX_DAYS = 28
+
+
+class ReportConflictError(StoreError):
+    """A report was changed since it was read, or was sent already."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReportSettings:
+    """Where one client's monthly report goes (M16.4)."""
+
+    org: str
+    client: str
+    recipients: list[str]
+    #: Send it this many days after the month ends unless someone has; None never.
+    auto_send_after_days: int | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClientReport:
+    """One client's report for one month: the agency's note and its send (M16.4)."""
+
+    org: str
+    client: str
+    period: str
+    note: str
+    #: 0 for a report nobody has written to; each change adds one.
+    version: int
+    #: `draft` or `sent`.
+    status: str
+    sent_at: str | None
+    sent_by: str | None
+    recipients_sent: list[str] | None
+    updated_at: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class OrgBranding:
     """How an agency looks to its clients (M16.2). See `flotta.branding`."""
@@ -4538,6 +4582,189 @@ class FleetStore:
             ),
         )
 
+    # -- client reports (M16.4) ---------------------------------------------
+
+    def report_settings(self, org: str, client: str) -> ReportSettings | None:
+        row = self._conn.execute(
+            "SELECT * FROM client_report_settings WHERE org_id = ? AND client_id = ?",
+            (org, client),
+        ).fetchone()
+        if row is None:
+            return None
+        return ReportSettings(
+            org=row["org_id"],
+            client=row["client_id"],
+            recipients=list(json.loads(row["recipients_json"])),
+            auto_send_after_days=row["auto_send_after_days"],
+            updated_at=row["updated_at"],
+        )
+
+    def set_report_settings(
+        self,
+        org: str,
+        client: str,
+        *,
+        recipients: Sequence[str],
+        auto_send_after_days: int | None,
+    ) -> ReportSettings:
+        """Replace where a client's report goes. Each address is checked here."""
+        if self.get_client(org, client) is None:
+            raise UnknownEntityError(f"no client {client!r} in org {org!r}")
+        cleaned: list[str] = []
+        for raw in recipients:
+            email = normalize_email(str(raw))
+            if email not in cleaned:
+                cleaned.append(email)
+        if len(cleaned) > REPORT_RECIPIENTS_MAX:
+            raise ValueError(f"a report goes to at most {REPORT_RECIPIENTS_MAX} people")
+        if auto_send_after_days is not None and not (
+            isinstance(auto_send_after_days, int)
+            and not isinstance(auto_send_after_days, bool)
+            and 0 <= auto_send_after_days <= REPORT_AUTO_SEND_MAX_DAYS
+        ):
+            raise ValueError(
+                f"a report sends itself 0 to {REPORT_AUTO_SEND_MAX_DAYS} days after its month, "
+                "or never (null)"
+            )
+        self._conn.execute(
+            "INSERT INTO client_report_settings "
+            "(org_id, client_id, recipients_json, auto_send_after_days, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id, client_id) DO UPDATE SET "
+            "recipients_json = excluded.recipients_json, "
+            "auto_send_after_days = excluded.auto_send_after_days, "
+            "updated_at = excluded.updated_at",
+            (org, client, json.dumps(cleaned), auto_send_after_days, _utcnow()),
+        )
+        found = self.report_settings(org, client)
+        assert found is not None
+        return found
+
+    def client_report(self, org: str, client: str, period: str) -> ClientReport:
+        """A client's report for `period`; a blank draft, version 0, if none is kept."""
+        row = self._conn.execute(
+            "SELECT * FROM client_reports WHERE org_id = ? AND client_id = ? AND period = ?",
+            (org, client, period),
+        ).fetchone()
+        if row is None:
+            return ClientReport(org, client, period, "", 0, "draft", None, None, None, None)
+        return _client_report_from_row(row)
+
+    def client_reports(self, org: str, period: str) -> list[ClientReport]:
+        """Every client's report for `period` in `org`, blank drafts included."""
+        return [self.client_report(org, c.id, period) for c in self.list_clients(org)]
+
+    def write_report_note(
+        self, org: str, client: str, period: str, *, note: str, version: int
+    ) -> ClientReport:
+        """Keep the agency's note, if nobody changed the report since `version`."""
+        if self.get_client(org, client) is None:
+            raise UnknownEntityError(f"no client {client!r} in org {org!r}")
+        note = note.strip()
+        if len(note) > REPORT_NOTE_MAX:
+            raise ValueError(f"a note is at most {REPORT_NOTE_MAX} characters")
+        if "\x00" in note:
+            raise ValueError("a note contains a NUL byte")
+        with self._conn.transaction(guard="client_reports"):
+            current = self.client_report(org, client, period)
+            if current.status == "sent":
+                raise ReportConflictError(f"the {period} report was sent already")
+            if current.version != version:
+                raise ReportConflictError(
+                    f"the {period} report changed since version {version}: "
+                    f"it is at {current.version}"
+                )
+            now = _utcnow()
+            self._conn.execute(
+                "INSERT INTO client_reports "
+                "(org_id, client_id, period, note, version, status, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'draft', ?) "
+                "ON CONFLICT (org_id, client_id, period) DO UPDATE SET "
+                "note = excluded.note, version = excluded.version, "
+                "updated_at = excluded.updated_at",
+                (org, client, period, note, version + 1, now),
+            )
+        return self.client_report(org, client, period)
+
+    def mark_report_sent(
+        self, org: str, client: str, period: str, *, by: str, recipients: Sequence[str]
+    ) -> ClientReport:
+        """Record a report's send, once: a second is a `ReportConflictError`.
+
+        Recorded before the email goes, so two senders can't both send it.
+        """
+        if self.get_client(org, client) is None:
+            raise UnknownEntityError(f"no client {client!r} in org {org!r}")
+        sent_to = [normalize_email(str(r)) for r in recipients]
+        if not sent_to:
+            raise ValueError("a report goes to someone: name its recipients")
+        with self._conn.transaction(guard="client_reports"):
+            current = self.client_report(org, client, period)
+            if current.status == "sent":
+                raise ReportConflictError(f"the {period} report was sent already")
+            now = _utcnow()
+            self._conn.execute(
+                "INSERT INTO client_reports "
+                "(org_id, client_id, period, note, version, status, sent_at, sent_by, "
+                "recipients_sent_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?) "
+                "ON CONFLICT (org_id, client_id, period) DO UPDATE SET "
+                "status = 'sent', sent_at = excluded.sent_at, sent_by = excluded.sent_by, "
+                "recipients_sent_json = excluded.recipients_sent_json, "
+                "updated_at = excluded.updated_at",
+                (
+                    org,
+                    client,
+                    period,
+                    current.note,
+                    current.version,
+                    now,
+                    by,
+                    json.dumps(sent_to),
+                    now,
+                ),
+            )
+        return self.client_report(org, client, period)
+
+    def unmark_report_sent(
+        self, org: str, client: str, period: str, *, by: str, now: datetime | None = None
+    ) -> ClientReport:
+        """Back to a draft: the email a send recorded could not be handed over.
+
+        Only by whoever recorded it, and only within `REPORT_UNDO_S` of that:
+        the sender undoing its own failed attempt, never anyone reopening a
+        report that went.
+        """
+        with self._conn.transaction(guard="client_reports"):
+            current = self.client_report(org, client, period)
+            if current.status != "sent" or current.sent_at is None:
+                raise ReportConflictError(f"the {period} report was not sent")
+            moment = now or datetime.now(UTC)
+            age = (moment - datetime.fromisoformat(current.sent_at)).total_seconds()
+            if current.sent_by != by or age > REPORT_UNDO_S:
+                raise ReportConflictError(
+                    f"the {period} report went: only its sender takes a failed send back, "
+                    "within minutes"
+                )
+            self._conn.execute(
+                "UPDATE client_reports SET status = 'draft', sent_at = NULL, sent_by = NULL, "
+                "recipients_sent_json = NULL, updated_at = ? "
+                "WHERE org_id = ? AND client_id = ? AND period = ?",
+                (_utcnow(), org, client, period),
+            )
+        return self.client_report(org, client, period)
+
+    def note_reports_ready(self, org: str, period: str) -> bool:
+        """Record that `org`'s owners were told `period`'s reports are ready.
+        True the first time, False after: the telling happens once."""
+        try:
+            self._conn.execute(
+                "INSERT INTO report_notices (org_id, period, sent_at) VALUES (?, ?, ?)",
+                (org, period, _utcnow()),
+            )
+        except db.UniqueViolation:
+            return False
+        return True
+
     def org_branding(self, org: str) -> OrgBranding | None:
         """An org's accent and whether it has a logo; never the logo itself."""
         row = self._conn.execute(
@@ -7432,6 +7659,22 @@ def _budget_event_from_row(row: db.Row) -> BudgetEvent:
         period_start=row["period_start"],
         payload=json.loads(row["payload"]),
         ts=row["ts"],
+    )
+
+
+def _client_report_from_row(row: db.Row) -> ClientReport:
+    sent = row["recipients_sent_json"]
+    return ClientReport(
+        org=row["org_id"],
+        client=row["client_id"],
+        period=row["period"],
+        note=row["note"],
+        version=row["version"],
+        status=row["status"],
+        sent_at=row["sent_at"],
+        sent_by=row["sent_by"],
+        recipients_sent=list(json.loads(sent)) if sent else None,
+        updated_at=row["updated_at"],
     )
 
 

@@ -4375,11 +4375,16 @@ def create_app(
         if client_id is not None and store.get_client(org_id, client_id) is None:
             raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
 
-    def _person(store: Any, subject: str | None) -> str | None:
-        """Who a subject is, as a page names them: a person's name, else their email."""
+    def _person(store: Any, subject: Any) -> str | None:
+        """Who a subject is, as a page names them: a person's name, else their
+        email; "the operator" for the operator; None for anything else.
+
+        The one definition: a second, for approvals, once replaced this for
+        every route, MCP's included (`test_no_helper_in_the_app_is_defined_twice`).
+        """
         from flotta.auth import USER_SUBJECT_PREFIX
 
-        if not subject:
+        if not isinstance(subject, str) or not subject:
             return None
         if subject == "operator":
             return "the operator"
@@ -6850,6 +6855,227 @@ def create_app(
         finally:
             store.close()
 
+    # -- a client's monthly report: where it goes, its note, its send (M16.4) --
+    #
+    # The agency's, all of it: the hosted product writes the report and sends
+    # it; this keeps what has to outlive a request. A send is recorded before
+    # the email goes, once (409 after), so two senders never both send it.
+
+    def _report_keeper(token: Token | None, org_id: str) -> None:
+        """404 unless the operator or the org's own agency; a client's people are refused."""
+        if _is_operator(token):
+            return
+        assert token is not None
+        if (token.org or DEFAULT_ORG) != org_id or subject_box(token.subject) is not None:
+            raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+        if token.client is not None:
+            raise HTTPException(status_code=403, detail="a client's report is the agency's")
+
+    def _period(raw: str) -> str:
+        from flotta.client_audit import BadWindow, month_window
+
+        try:
+            month_window(raw)
+        except BadWindow as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return raw
+
+    def _settings_view(settings: Any) -> dict[str, Any]:
+        """Where a client's report goes; nobody, and never by itself, if unset."""
+        if settings is None:
+            return {"recipients": [], "auto_send_after_days": None}
+        return {
+            "recipients": settings.recipients,
+            "auto_send_after_days": settings.auto_send_after_days,
+        }
+
+    def _report_view(store: Any, report: Any) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        return {
+            **asdict(report),
+            "settings": _settings_view(store.report_settings(report.org, report.client)),
+        }
+
+    def _report_client(store: Any, org_id: str, client_id: str) -> Any:
+        client = store.get_client(org_id, client_id)
+        if client is None:
+            raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
+        return client
+
+    @app.get("/api/orgs/{org_id}/clients/{client_id}/report-settings")
+    def get_report_settings(org_id: str, client_id: str, token: Token | None = needs_read) -> Any:
+        """Who a client's report goes to, and whether it sends itself."""
+        _report_keeper(token, org_id)
+        store = store_factory()
+        try:
+            _report_client(store, org_id, client_id)
+            return _settings_view(store.report_settings(org_id, client_id))
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/clients/{client_id}/report-settings")
+    def put_report_settings(
+        org_id: str, client_id: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """`{recipients: [email, ...], auto_send_after_days: n | null}`, owner only.
+
+        At most five people. `auto_send_after_days` sends a draft that many days
+        after its month ends, if nobody has; null (the default) never does.
+        """
+        from flotta.store import InvalidAccountError
+
+        _admin_of(token, org_id)
+        recipients = body.get("recipients", [])
+        if not isinstance(recipients, list):
+            raise HTTPException(status_code=422, detail="recipients is a list of emails")
+        store = store_factory()
+        try:
+            _report_client(store, org_id, client_id)
+            try:
+                settings = store.set_report_settings(
+                    org_id,
+                    client_id,
+                    recipients=recipients,
+                    auto_send_after_days=body.get("auto_send_after_days"),
+                )
+            except (InvalidAccountError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _settings_view(settings)
+        finally:
+            store.close()
+
+    @app.get("/api/orgs/{org_id}/reports")
+    def list_reports(org_id: str, period: str, token: Token | None = needs_read) -> Any:
+        """Every client's report for `period` (`YYYY-MM`), drafts nobody wrote included."""
+        _report_keeper(token, org_id)
+        period = _period(period)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            return {
+                "org": org_id,
+                "period": period,
+                "reports": [_report_view(store, r) for r in store.client_reports(org_id, period)],
+            }
+        finally:
+            store.close()
+
+    @app.get("/api/orgs/{org_id}/clients/{client_id}/reports/{period}")
+    def get_report(
+        org_id: str, client_id: str, period: str, token: Token | None = needs_read
+    ) -> Any:
+        """One client's report for one month: its note, version and send."""
+        _report_keeper(token, org_id)
+        period = _period(period)
+        store = store_factory()
+        try:
+            _report_client(store, org_id, client_id)
+            return _report_view(store, store.client_report(org_id, client_id, period))
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/clients/{client_id}/reports/{period}")
+    def put_report(
+        org_id: str,
+        client_id: str,
+        period: str,
+        body: dict[str, Any],
+        token: Token | None = needs_write,
+    ) -> Any:
+        """`{note, version}`: the agency's "what we changed this month".
+
+        `version` is the one read; a report changed since, or sent, is a 409.
+        """
+        from flotta.store import ReportConflictError
+
+        _report_keeper(token, org_id)
+        period = _period(period)
+        note, version = body.get("note"), body.get("version")
+        if not isinstance(note, str) or not isinstance(version, int) or isinstance(version, bool):
+            raise HTTPException(status_code=422, detail='send {"note": "...", "version": n}')
+        store = store_factory()
+        try:
+            _report_client(store, org_id, client_id)
+            try:
+                report = store.write_report_note(
+                    org_id, client_id, period, note=note, version=version
+                )
+            except ReportConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _report_view(store, report)
+        finally:
+            store.close()
+
+    @app.post("/api/orgs/{org_id}/clients/{client_id}/reports/{period}/sent")
+    def mark_report_sent(
+        org_id: str,
+        client_id: str,
+        period: str,
+        body: dict[str, Any],
+        token: Token | None = needs_write,
+    ) -> Any:
+        """`{recipients}`: record the report's send, before it goes. Once: a 409 after.
+
+        `{"undo": true}` puts a recorded send back to a draft, for an email that
+        could not be handed over: by its sender, within 15 minutes.
+        """
+        from flotta.store import InvalidAccountError, ReportConflictError
+
+        _report_keeper(token, org_id)
+        period = _period(period)
+        store = store_factory()
+        try:
+            _report_client(store, org_id, client_id)
+            if body.get("undo") is True:
+                try:
+                    undone = store.unmark_report_sent(
+                        org_id,
+                        client_id,
+                        period,
+                        by=token.subject if token is not None else "operator",
+                    )
+                except ReportConflictError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                return _report_view(store, undone)
+            recipients = body.get("recipients")
+            if not isinstance(recipients, list):
+                raise HTTPException(status_code=422, detail="recipients is a list of emails")
+            try:
+                report = store.mark_report_sent(
+                    org_id,
+                    client_id,
+                    period,
+                    by=token.subject if token is not None else "operator",
+                    recipients=recipients,
+                )
+            except ReportConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except (InvalidAccountError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _report_view(store, report)
+        finally:
+            store.close()
+
+    @app.post("/api/orgs/{org_id}/reports/{period}/notice")
+    def note_reports_ready(org_id: str, period: str, token: Token | None = needs_write) -> Any:
+        """Record that `org`'s owners were told `period`'s reports are ready.
+        `{"first": true}` the first time, false after: the telling happens once."""
+        _report_keeper(token, org_id)
+        period = _period(period)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            return {
+                "org": org_id,
+                "period": period,
+                "first": store.note_reports_ready(org_id, period),
+            }
+        finally:
+            store.close()
+
     # A run's agent asked permission and waits for a person (`flotta.runner`).
     # FLOTTA-124's rules, as the door keeps them for a conversation: the
     # agency answers with any choice the box offered; a client's people only
@@ -6978,19 +7204,9 @@ def create_app(
             view["kind"] = "chat"
             view["session_id"] = chat_conversation(given)
             by = given.get("by")
-            view["whose"] = _person(store, by)
+            # A person in a conversation, by name; never the operator or a machine.
+            view["whose"] = _person(store, by) if by != "operator" else None
         return view
-
-    def _person(store: FleetStore, subject: Any) -> str | None:
-        """A token's subject as a person's name or email, when it is a user's."""
-        from flotta.auth import USER_SUBJECT_PREFIX
-
-        if not isinstance(subject, str) or not subject.startswith(USER_SUBJECT_PREFIX):
-            return None
-        user = store.get_user(subject.removeprefix(USER_SUBJECT_PREFIX))
-        if user is None:
-            return None
-        return user.name or user.email
 
     # -- triggers (M14.3) ------------------------------------------------------
     #

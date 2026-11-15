@@ -1223,6 +1223,52 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        39,
+        "client reports: who a client's monthly report goes to, its note, and its send",
+        # M16.4. Settings are per client: where its report goes and whether it
+        # sends itself. A report is one client's one month: the agency's note
+        # ("what we changed"), a version so two editors don't overwrite each
+        # other, and its send, recorded once. A notice is the owner told, once
+        # per org and month, that the month's reports are ready (M16.8).
+        (
+            """
+            CREATE TABLE client_report_settings (
+                org_id                TEXT NOT NULL,
+                client_id             TEXT NOT NULL,
+                recipients_json       TEXT NOT NULL,
+                auto_send_after_days  INTEGER,
+                updated_at            TEXT NOT NULL,
+                PRIMARY KEY (org_id, client_id),
+                FOREIGN KEY (org_id, client_id) REFERENCES clients(org_id, id)
+            )
+            """,
+            """
+            CREATE TABLE client_reports (
+                org_id                TEXT NOT NULL,
+                client_id             TEXT NOT NULL,
+                period                TEXT NOT NULL,
+                note                  TEXT NOT NULL,
+                version               INTEGER NOT NULL,
+                status                TEXT NOT NULL,
+                sent_at               TEXT,
+                sent_by               TEXT,
+                recipients_sent_json  TEXT,
+                updated_at            TEXT NOT NULL,
+                PRIMARY KEY (org_id, client_id, period),
+                FOREIGN KEY (org_id, client_id) REFERENCES clients(org_id, id)
+            )
+            """,
+            """
+            CREATE TABLE report_notices (
+                org_id      TEXT NOT NULL REFERENCES orgs(id),
+                period      TEXT NOT NULL,
+                sent_at     TEXT NOT NULL,
+                PRIMARY KEY (org_id, period)
+            )
+            """,
+        ),
+    ),
 )
 
 
