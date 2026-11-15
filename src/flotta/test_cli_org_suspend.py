@@ -20,6 +20,9 @@ remote = test_cli_runs.remote
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
+    # From a directory with no `.env`: the CLI loads one at run time, which undoes
+    # the delenv and sends these to the control plane it names (see conftest).
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
     path = tmp_path / "fleet.db"
     with FleetStore(path) as fleet:

@@ -183,8 +183,19 @@ curl -s -X PUT $FLOTTA_CONTROL_URL/api/orgs/studio/budgets \
 curl -s $FLOTTA_CONTROL_URL/api/boxes/$AGENT/request-policy -H "Authorization: Bearer $OWNER"
 # {"auto_level": 1, "auto_level_name": "small", ...}
 
-FLOTTA_STORE=~/.flotta/local/fleet.db uv run flotta logs $AGENT
+uv run flotta logs $AGENT
 # the agent's timeline: provisioning, running, then the run's created, started, done
+```
+
+The CLI does the same through the control plane. Holding the signing key, it acts in the agent's
+own org, and it talks to the local door when `FLOTTA_DOOR_URL` says where it is:
+
+```bash
+uv run flotta create qa --org studio --client acme --description "QA"
+uv run flotta run qa--acme--studio "Check the contact form" --wait
+
+export FLOTTA_DOOR_URL=ws://localhost:8081
+FLOTTA_TOKEN=$OWNER uv run flotta chat dev--acme--studio "hello"
 ```
 
 The same API serves a deployed fleet.
@@ -237,10 +248,6 @@ Any OpenAI-compatible model endpoint works, set with `FLOTTA_MODEL`, `FLOTTA_MOD
 - **Tokens minted from the signing key cannot be revoked one by one.** They last until they
   expire, unless the key is rotated, which ends every token at once. Sign-in sessions can be
   ended individually.
-- **The CLI is behind the API in places.** `flotta create` writes to a local store rather than
-  the control plane, `flotta chat` always dials `https://<agent>.$FLOTTA_DOMAIN` and cannot reach
-  a local door, and the CLI's operator token finds agents by name in the default org only. Use
-  the API, as the quickstart does.
 - **`app/` is a retired desktop app** and will be removed. `dashboard/` still says "worker" in
   places.
 
