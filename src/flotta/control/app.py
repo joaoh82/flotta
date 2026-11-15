@@ -4377,7 +4377,8 @@ def create_app(
 
     def _person(store: Any, subject: Any) -> str | None:
         """Who a subject is, as a page names them: a person's name, else their
-        email; "the operator" for the operator; None for anything else.
+        email; None for anything else, the operator included (MCP's connection
+        says "the operator" itself).
 
         The one definition: a second, for approvals, once replaced this for
         every route, MCP's included (`test_no_helper_in_the_app_is_defined_twice`).
@@ -4386,8 +4387,6 @@ def create_app(
 
         if not isinstance(subject, str) or not subject:
             return None
-        if subject == "operator":
-            return "the operator"
         if not subject.startswith(USER_SUBJECT_PREFIX):
             return None
         user = store.get_user(subject[len(USER_SUBJECT_PREFIX) :])
@@ -4408,7 +4407,11 @@ def create_app(
             "status": "ok" if why is None else "broken",
             "detail": why,
             "connected_by": found.connected_by,
-            "connected_by_name": _person(store, found.connected_by),
+            "connected_by_name": (
+                "the operator"
+                if found.connected_by == "operator"
+                else _person(store, found.connected_by)
+            ),
             "connected_at": _epoch(found.created_at),
             "updated_at": _epoch(found.updated_at),
         }
@@ -7017,7 +7020,10 @@ def create_app(
         body: dict[str, Any],
         token: Token | None = needs_write,
     ) -> Any:
-        """`{recipients}`: record the report's send, before it goes. Once: a 409 after.
+        """`{version}`: record the report's send, before it goes. Once: a 409 after.
+
+        It goes to the people the client's report settings name (an owner's to
+        set), and only as the `version` read: a report changed since is a 409.
 
         `{"undo": true}` puts a recorded send back to a draft, for an email that
         could not be handed over: by its sender, within 15 minutes.
@@ -7040,16 +7046,16 @@ def create_app(
                 except ReportConflictError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 return _report_view(store, undone)
-            recipients = body.get("recipients")
-            if not isinstance(recipients, list):
-                raise HTTPException(status_code=422, detail="recipients is a list of emails")
+            version = body.get("version")
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise HTTPException(status_code=422, detail='send {"version": n}, the one read')
             try:
                 report = store.mark_report_sent(
                     org_id,
                     client_id,
                     period,
                     by=token.subject if token is not None else "operator",
-                    recipients=recipients,
+                    version=version,
                 )
             except ReportConflictError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -7060,14 +7066,23 @@ def create_app(
             store.close()
 
     @app.post("/api/orgs/{org_id}/reports/{period}/notice")
-    def note_reports_ready(org_id: str, period: str, token: Token | None = needs_write) -> Any:
+    def note_reports_ready(
+        org_id: str,
+        period: str,
+        body: dict[str, Any] | None = None,
+        token: Token | None = needs_admin,
+    ) -> Any:
         """Record that `org`'s owners were told `period`'s reports are ready.
-        `{"first": true}` the first time, false after: the telling happens once."""
-        _report_keeper(token, org_id)
+        `{"first": true}` the first time, false after: the telling happens once.
+        `{"undo": true}` takes it back, for a telling whose email did not go."""
+        _admin_of(token, org_id)
         period = _period(period)
         store = store_factory()
         try:
             _org_or_404(store, org_id)
+            if body and body.get("undo") is True:
+                store.forget_reports_ready(org_id, period)
+                return {"org": org_id, "period": period, "first": None}
             return {
                 "org": org_id,
                 "period": period,
@@ -7204,8 +7219,7 @@ def create_app(
             view["kind"] = "chat"
             view["session_id"] = chat_conversation(given)
             by = given.get("by")
-            # A person in a conversation, by name; never the operator or a machine.
-            view["whose"] = _person(store, by) if by != "operator" else None
+            view["whose"] = _person(store, by)
         return view
 
     # -- triggers (M14.3) ------------------------------------------------------

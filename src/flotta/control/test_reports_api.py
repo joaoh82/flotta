@@ -31,15 +31,27 @@ def _note(api, note, version, headers=MEMBER):
     return api.put(REPORT, json={"note": note, "version": version}, headers=headers)
 
 
-def _send(api, headers=MEMBER, recipients=("ceo@acme.example",)):
-    return api.post(f"{REPORT}/sent", json={"recipients": list(recipients)}, headers=headers)
+def _send(api, headers=MEMBER, version=None, fleet=None):
+    if version is None:
+        version = api.get(REPORT, headers=MEMBER).json()["version"]
+    return api.post(f"{REPORT}/sent", json={"version": version}, headers=headers)
+
+
+@pytest.fixture(autouse=True)
+def recipients(api):
+    """Every report here goes somewhere: an owner said where."""
+    api.put(SETTINGS, json={"recipients": ["ceo@acme.example"]}, headers=OWNER)
 
 
 # -- settings -------------------------------------------------------------------
 
 
-def test_a_client_with_no_settings_goes_to_nobody_and_never_by_itself(api):
-    assert api.get(SETTINGS, headers=MEMBER).json() == {
+def test_a_client_with_no_settings_goes_to_nobody_and_never_by_itself(api, fleet):
+    with FleetStore(fleet) as store:
+        store.create_client("agency-x", "globex", "Globex")
+    unset = "/api/orgs/agency-x/clients/globex/report-settings"
+
+    assert api.get(unset, headers=MEMBER).json() == {
         "recipients": [],
         "auto_send_after_days": None,
     }
@@ -108,7 +120,7 @@ def test_a_note_has_a_limit(api):
     assert _note(api, "x" * 2001, 0).status_code == 422
 
 
-@pytest.mark.parametrize("period", ["2026-13", "october", "2026-1"])
+@pytest.mark.parametrize("period", ["2026-13", "october", "2026-1", "9999-12"])
 def test_a_period_is_a_month(api, period):
     path = f"/api/orgs/agency-x/clients/acme/reports/{period}"
 
@@ -144,9 +156,43 @@ def test_a_send_that_could_not_go_is_put_back(api):
     assert again.status_code == 200
 
 
-def test_a_send_names_who_it_went_to(api):
-    assert _send(api, recipients=()).status_code == 422
-    assert _send(api, recipients=("nobody",)).status_code == 422
+def test_a_send_goes_to_the_owners_list_and_nobody_else(api):
+    forged = api.post(
+        f"{REPORT}/sent",
+        json={"version": 0, "recipients": ["someone@elsewhere.example"]},
+        headers=MEMBER,
+    )
+
+    assert forged.status_code == 200
+    assert forged.json()["recipients_sent"] == ["ceo@acme.example"], "never the sender's list"
+
+
+def test_a_client_nobody_named_is_sent_to_nobody(api):
+    api.put(SETTINGS, json={"recipients": []}, headers=OWNER)
+
+    assert _send(api).status_code == 422
+
+
+def test_a_send_is_of_the_version_read(api):
+    _note(api, "First", 0)
+    _note(api, "Second", 1)
+
+    stale = _send(api, version=1)
+    current = _send(api, version=2)
+
+    assert stale.status_code == 409, "the email rendered version 1; version 2 is what is there"
+    assert current.json()["note"] == "Second"
+
+
+def test_an_address_that_is_two_is_refused(api):
+    for address in (
+        "ceo@acme.example,x@evil.example",
+        "a@b.c;d@e.f",
+        '"x"@acme.example',
+        "<a@b.c>",
+    ):
+        answer = api.put(SETTINGS, json={"recipients": [address]}, headers=OWNER)
+        assert answer.status_code == 422, address
 
 
 def test_every_clients_report_is_listed_for_a_month(api, fleet):
@@ -165,10 +211,23 @@ def test_every_clients_report_is_listed_for_a_month(api, fleet):
 def test_the_owners_are_told_once_a_month(api):
     path = "/api/orgs/agency-x/reports/2026-10/notice"
 
-    assert api.post(path, headers=MEMBER).json()["first"] is True
-    assert api.post(path, headers=MEMBER).json()["first"] is False
-    other = api.post("/api/orgs/agency-x/reports/2026-11/notice", headers=MEMBER)
+    assert api.post(path, headers=OWNER).json()["first"] is True
+    assert api.post(path, headers=OWNER).json()["first"] is False
+    other = api.post("/api/orgs/agency-x/reports/2026-11/notice", headers=OWNER)
     assert other.json()["first"] is True
+
+
+def test_a_telling_that_did_not_go_is_taken_back(api):
+    path = "/api/orgs/agency-x/reports/2026-10/notice"
+    api.post(path, headers=OWNER)
+
+    api.post(path, json={"undo": True}, headers=OWNER)
+
+    assert api.post(path, headers=OWNER).json()["first"] is True
+
+
+def test_a_member_does_not_spend_the_months_notice(api):
+    assert api.post("/api/orgs/agency-x/reports/2026-10/notice", headers=MEMBER).status_code == 403
 
 
 # -- whose it is ----------------------------------------------------------------

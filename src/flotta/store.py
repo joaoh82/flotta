@@ -794,8 +794,10 @@ EMAIL_MAX = 254
 USER_NAME_MAX = 100
 
 #: Something, an @, and a domain with a dot. Deliverability is the email's
-#: problem; this only refuses what could not be an address at all.
-_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+#: problem; this only refuses what could not be an address at all, and what
+#: would be more than one in a header: no comma, semicolon, angle bracket,
+#: quote, parenthesis or backslash (M16.4: a report's To line is built of these).
+_EMAIL = re.compile(r'^[^@\s,;<>"()\[\]\\]+@[^@\s,;<>"()\[\]\\]+\.[^@\s,;<>"()\[\]\\]+$')
 
 
 @dataclass(frozen=True, slots=True)
@@ -4686,21 +4688,30 @@ class FleetStore:
         return self.client_report(org, client, period)
 
     def mark_report_sent(
-        self, org: str, client: str, period: str, *, by: str, recipients: Sequence[str]
+        self, org: str, client: str, period: str, *, by: str, version: int
     ) -> ClientReport:
         """Record a report's send, once: a second is a `ReportConflictError`.
 
-        Recorded before the email goes, so two senders can't both send it.
+        Recorded before the email goes, so two senders can't both send it. It
+        goes to the people the client's settings name, which an owner set, and
+        never to a list the sender brings; and only the `version` the sender
+        read, so what is recorded as sent is what was rendered.
         """
         if self.get_client(org, client) is None:
             raise UnknownEntityError(f"no client {client!r} in org {org!r}")
-        sent_to = [normalize_email(str(r)) for r in recipients]
+        settings = self.report_settings(org, client)
+        sent_to = list(settings.recipients) if settings is not None else []
         if not sent_to:
-            raise ValueError("a report goes to someone: name its recipients")
+            raise ValueError("this client's report goes to nobody yet: an owner names who")
         with self._conn.transaction(guard="client_reports"):
             current = self.client_report(org, client, period)
             if current.status == "sent":
                 raise ReportConflictError(f"the {period} report was sent already")
+            if current.version != version:
+                raise ReportConflictError(
+                    f"the {period} report changed since version {version}: "
+                    f"it is at {current.version}; read it again before sending"
+                )
             now = _utcnow()
             self._conn.execute(
                 "INSERT INTO client_reports "
@@ -4752,6 +4763,12 @@ class FleetStore:
                 (_utcnow(), org, client, period),
             )
         return self.client_report(org, client, period)
+
+    def forget_reports_ready(self, org: str, period: str) -> None:
+        """Take back `note_reports_ready`: the telling it recorded did not go."""
+        self._conn.execute(
+            "DELETE FROM report_notices WHERE org_id = ? AND period = ?", (org, period)
+        )
 
     def note_reports_ready(self, org: str, period: str) -> bool:
         """Record that `org`'s owners were told `period`'s reports are ready.

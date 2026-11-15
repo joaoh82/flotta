@@ -799,8 +799,12 @@ conventions, and the sharp edges below.
   whether it sends itself N days after its month, owner only),
   `client_reports` (one client's month: the agency's note, written against the
   `version` read, 409 if stale or sent) and `report_notices` (owners told once a
-  month). `POST …/reports/{period}/sent` is the lock: a second is 409, and only
-  its sender takes a failed send back, within 15 minutes. All of it is the
+  month, owner only, and taken back when its email failed). `POST
+  …/reports/{period}/sent {version}` is the lock: it goes to the settings'
+  recipients, never a list the sender brings, only as the version read (409 if
+  it changed), a second is 409, and only its sender takes a failed send back,
+  within 15 minutes. An email address has no comma, semicolon, bracket or
+  quote (`_EMAIL`): a To line is built of them. All of it is the
   agency's; a client's people read none of it here.
 - **`door/test_two_orgs.py` is M11's proof, and the place to extend it.** The
   real control plane and the real door in one process — the door's
