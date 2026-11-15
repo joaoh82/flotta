@@ -250,11 +250,14 @@ def test_an_owner_cannot_approve_its_own_org(api, fleet):
     assert _status(fleet) == "pending"
 
 
-def test_the_cli_approves_with_or_without_it(fleet, monkeypatch):
+def test_the_cli_approves_with_or_without_it(fleet, monkeypatch, tmp_path):
     from typer.testing import CliRunner
 
     from flotta.cli import app
 
+    # From a directory with no `.env`: the CLI loads one at run time, which undoes
+    # the delenv and sends these to the control plane it names (see conftest).
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FLOTTA_CONTROL_URL", raising=False)
     monkeypatch.setenv("FLOTTA_STORE", str(fleet))
     with FleetStore(fleet) as store:
