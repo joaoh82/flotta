@@ -1222,6 +1222,27 @@ class BudgetEvent:
 ALERT_THRESHOLDS = ("budget_soft_limit", "budget_limit")
 
 
+#: The most rows of each kind `client_window` reads (M16.3).
+WINDOW_ROWS = 5000
+
+
+@dataclass(frozen=True, slots=True)
+class ClientWindow:
+    """What touched one client in a window: see `FleetStore.client_window`."""
+
+    org: str
+    client: str
+    #: The window's bounds, as the store writes a moment.
+    since: str
+    until: str
+    boxes: list[Box]
+    runs: list[Run]
+    approvals: list[RunApproval]
+    requests: list[WorkRequest]
+    pulls: list[PullRequest]
+    events: list[Event]
+
+
 @dataclass(frozen=True, slots=True)
 class OrgBranding:
     """How an agency looks to its clients (M16.2). See `flotta.branding`."""
@@ -6967,6 +6988,103 @@ class FleetStore:
             "SELECT * FROM run_approvals WHERE id = ?", (approval_id,)
         ).fetchone()
         return _approval_from_row(row) if row else None
+
+    def client_window(
+        self,
+        org: str,
+        client: str,
+        since: datetime,
+        until: datetime,
+        *,
+        exclude_kinds: Sequence[str] = (),
+    ) -> ClientWindow:
+        """What touched one client in `[since, until)` (M16.3, `flotta.client_audit`).
+
+        Each kind of row is read once, by when it started or ended inside the
+        window, so a run made before it and finished in it is there. Capped at
+        `WINDOW_ROWS` a kind: a window is at most a quarter (`MAX_WINDOW`).
+        """
+        lo, hi = _instant(since), _instant(until)
+        boxes = self.list_boxes_in(org, client)
+        cap = WINDOW_ROWS
+        where = (
+            "org_id = ? AND client_id = ? AND trigger_kind IS NOT NULL AND "
+            "((created_at >= ? AND created_at < ?) OR (finished_at >= ? AND finished_at < ?))"
+        )
+        params: list[Any] = [org, client, lo, hi, lo, hi]
+        if exclude_kinds:
+            where += f" AND trigger_kind NOT IN ({','.join('?' * len(exclude_kinds))})"
+            params.extend(exclude_kinds)
+        runs = [
+            _run_from_row(r)
+            for r in self._conn.execute(
+                f"SELECT * FROM tasks WHERE {where} ORDER BY created_at LIMIT ?", (*params, cap)
+            ).fetchall()
+        ]
+        hidden = set()
+        if exclude_kinds:
+            # An approval or a request asked in a conversation goes with it.
+            hidden = {
+                str(r["id"])
+                for r in self._conn.execute(
+                    f"SELECT id FROM tasks WHERE org_id = ? AND client_id = ? "
+                    f"AND trigger_kind IN ({','.join('?' * len(exclude_kinds))})",
+                    (org, client, *exclude_kinds),
+                ).fetchall()
+            }
+        approvals = [
+            a
+            for a in (
+                _approval_from_row(r)
+                for r in self._conn.execute(
+                    "SELECT * FROM run_approvals WHERE org_id = ? AND client_id = ? "
+                    "AND answered_at >= ? AND answered_at < ? ORDER BY answered_at LIMIT ?",
+                    (org, client, lo, hi, cap),
+                ).fetchall()
+            )
+            if a.run_id not in hidden
+        ]
+        requests = [
+            _request_from_row(r)
+            for r in self._conn.execute(
+                "SELECT * FROM requests WHERE org_id = ? AND client_id = ? AND "
+                "((created_at >= ? AND created_at < ?) OR (decided_at >= ? AND decided_at < ?)) "
+                "ORDER BY created_at LIMIT ?",
+                (org, client, lo, hi, lo, hi, cap),
+            ).fetchall()
+        ]
+        pulls = [
+            _pull_from_row(r)
+            for r in self._conn.execute(
+                "SELECT * FROM pull_requests WHERE org_id = ? AND client_id = ? AND "
+                "((opened_at >= ? AND opened_at < ?) OR (merged_at >= ? AND merged_at < ?)) "
+                "ORDER BY opened_at LIMIT ?",
+                (org, client, lo, hi, lo, hi, cap),
+            ).fetchall()
+        ]
+        events: list[Event] = []
+        if boxes:
+            marks = ",".join("?" * len(boxes))
+            events = [
+                _event_from_row(r)
+                for r in self._conn.execute(
+                    f"SELECT * FROM events WHERE entity_kind = 'box' AND entity_id IN ({marks}) "
+                    "AND ts >= ? AND ts < ? ORDER BY ts, id LIMIT ?",
+                    (*[b.id for b in boxes], lo, hi, cap),
+                ).fetchall()
+            ]
+        return ClientWindow(
+            org=org,
+            client=client,
+            since=lo,
+            until=hi,
+            boxes=boxes,
+            runs=runs,
+            approvals=approvals,
+            requests=requests,
+            pulls=pulls,
+            events=events,
+        )
 
     def run_approvals(self, run_id: str) -> list[RunApproval]:
         """`run_id`'s approvals, in the order they were asked."""

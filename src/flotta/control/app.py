@@ -6772,6 +6772,84 @@ def create_app(
         finally:
             store.close()
 
+    # -- a client's trail and its report's numbers (M16.3) --------------------
+
+    def _client_reader(token: Token | None, client_id: str, *, people: bool) -> tuple[str, bool]:
+        """`(org, viewer)` for a read of one client's history, or a refusal.
+
+        The agency's, or a client's own systems' (`fleet:write` on it). With
+        `people`, a client's viewer too (D27); a client user never.
+        """
+        org = (token.org if token else None) or DEFAULT_ORG
+        if token is not None and (token.box is not None or subject_box(token.subject)):
+            raise HTTPException(status_code=403, detail="an agent reads no client's history")
+        if token is not None and token.client is not None and token.client != client_id:
+            raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
+        if people and _portal_reader(token):
+            return org, True
+        if token is not None and token.client is not None and not token.allows(SCOPE_FLEET_WRITE):
+            raise HTTPException(
+                status_code=403, detail="a client's history is the agency's to read"
+            )
+        return org, False
+
+    @app.get("/api/clients/{client_id}/audit")
+    def client_audit_trail(
+        client_id: str,
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        token: Token | None = needs_read,
+    ) -> Any:
+        """What happened for a client, oldest first: runs, approvals answered,
+        requests, pull requests and its agents' own events. `from` and `to` as
+        days or moments, at most 92 days apart; the last 30 days if not named.
+
+        A client's viewer reads its own, without the agency's words and
+        without conversations (D27). `flotta.client_audit`.
+        """
+        from flotta.client_audit import BadWindow, audit
+        from flotta.usage_report import BadReport, parse_instant
+
+        org, viewer = _client_reader(token, client_id, people=True)
+        now = datetime.now(UTC)
+        try:
+            until = parse_instant(to, "to") if to else now
+            since = parse_instant(from_, "from") if from_ else until - timedelta(days=30)
+        except BadReport as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            if store.get_client(org, client_id) is None:
+                raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
+            try:
+                return audit(
+                    store, org=org, client=client_id, since=since, until=until, viewer=viewer
+                )
+            except BadWindow as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            store.close()
+
+    @app.get("/api/clients/{client_id}/report-data")
+    def client_report_data(client_id: str, period: str, token: Token | None = needs_read) -> Any:
+        """The numbers a client's monthly report is made from, for `period`
+        (`YYYY-MM`): runs by outcome per agent, conversations, approvals
+        answered, requests, pull requests, failures, spend and its limit. The
+        agency's; the hosted product decides what of it a client is shown."""
+        from flotta.client_audit import BadWindow, report_data
+
+        org, _ = _client_reader(token, client_id, people=False)
+        store = store_factory()
+        try:
+            if store.get_client(org, client_id) is None:
+                raise HTTPException(status_code=404, detail=f"no client {client_id!r}")
+            try:
+                return report_data(store, org=org, client=client_id, period=period)
+            except BadWindow as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            store.close()
+
     # A run's agent asked permission and waits for a person (`flotta.runner`).
     # FLOTTA-124's rules, as the door keeps them for a conversation: the
     # agency answers with any choice the box offered; a client's people only
