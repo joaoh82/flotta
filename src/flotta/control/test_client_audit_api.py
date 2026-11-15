@@ -111,6 +111,9 @@ def test_a_viewer_reads_its_trail_without_the_agencys_words(api, history):
     assert "Close stale tickets" not in text, "a run's prompt is the agency's"
     assert "Bo's private notes" not in text
     assert all("payload" not in e for e in entries)
+    actors = {e["actor"] for e in entries if not e["kind"].startswith("run.")}
+    assert actors <= {None}, f"who did it is the agency's: {actors}"
+    assert "flotta-bot" not in text and "user:ana" not in text
 
 
 def test_a_client_user_reads_no_trail(api, history):
@@ -196,3 +199,27 @@ def test_a_month_is_its_first_moment_to_the_next_months():
     )
     with pytest.raises(BadWindow):
         month_window("2026-00")
+
+
+def test_a_busy_month_is_counted_not_capped(api, fleet, monkeypatch):
+    """The report's numbers come from counts, so a month past the row cap is
+    still its own; the trail says it was cut short."""
+    import flotta.store as store_module
+
+    monkeypatch.setattr(store_module, "WINDOW_ROWS", 2)
+    box = _ids(fleet)[X]
+    with FleetStore(fleet) as store:
+        for _ in range(5):
+            run = store.create_run(box, "Sync", trigger_kind="webhook")
+            store.start_run(run.id)
+            store.finish_run(run.id, "done")
+    period = datetime.now(UTC).strftime("%Y-%m")
+
+    data = api.get(
+        "/api/clients/acme/report-data", headers=AGENCY, params={"period": period}
+    ).json()
+    trail = api.get(TRAIL, headers=AGENCY).json()
+
+    assert data["runs"] == {"total": 5, "done": 5}
+    assert data["truncated"] is True
+    assert trail["truncated"] is True

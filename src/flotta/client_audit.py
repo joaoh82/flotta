@@ -80,6 +80,11 @@ def audit(
     def add(at: str | None, box_id: str, kind: str, actor: str | None, summary: str, **extra: Any):
         if at is None or not (window.since <= at < window.until):
             return
+        if viewer and not kind.startswith("run."):
+            # Who did it is the agency's to know (`work_requests.AGENCY_ONLY`,
+            # `pulls.AGENCY_ONLY`): a subject, a GitHub login, a person in a
+            # conversation. A run's "actor" is what started it, which is not.
+            actor = None
         entries.append(
             {
                 "at": at,
@@ -169,7 +174,7 @@ def audit(
         )
 
     entries.sort(key=lambda e: (e["at"], e["kind"]))
-    truncated = len(entries) > MAX_ENTRIES
+    truncated = len(entries) > MAX_ENTRIES or window.capped
     return {
         "org": org,
         "client": client,
@@ -181,8 +186,14 @@ def audit(
 
 
 def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dict[str, Any]:
-    """What a client's monthly report adds up, for `period` (`YYYY-MM`)."""
+    """What a client's monthly report adds up, for `period` (`YYYY-MM`).
+
+    The numbers are counted by the store, never added up from capped rows, so
+    a busy month's are its own; the lists (failures, pull requests opened) are
+    the window's, and `truncated` says when there were more than were read.
+    """
     since, until = month_window(period)
+    counts = store.client_month_counts(org, client, since, until)
     window = store.client_window(org, client, since, until)
     names = {b.id: b.name for b in window.boxes}
     metas = store.meta_for_boxes([b.id for b in window.boxes])
@@ -191,12 +202,18 @@ def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dic
         for b in window.boxes
     }
 
-    in_window = [r for r in window.runs if window.since <= r.created_at < window.until]
-    work = [r for r in in_window if r.trigger_kind != "chat"]
     per_agent: dict[str, Counter[str]] = {}
-    for run in work:
-        per_agent.setdefault(run.box_id, Counter())[run.status] += 1
-    conversations = Counter(r.box_id for r in in_window if r.trigger_kind == "chat")
+    conversations: Counter[str] = Counter()
+    for row in counts["runs"]:
+        if row["kind"] == "chat":
+            conversations[row["box"]] += row["n"]
+        else:
+            per_agent.setdefault(row["box"], Counter())[row["status"]] += row["n"]
+    totals: Counter[str] = Counter()
+    for c in per_agent.values():
+        totals.update(c)
+
+    in_window = [r for r in window.runs if window.since <= r.created_at < window.until]
     failures = [
         {
             "run": r.id,
@@ -206,11 +223,11 @@ def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dic
             "error_class": r.error_class,
             "resolved": r.resolved_at is not None,
         }
-        for r in work
-        if r.status in FAILED
+        for r in in_window
+        if r.trigger_kind != "chat" and r.status in FAILED
     ]
     spend = store.spend(org=org, since=since, client=client)
-    until_spend = store.spend(org=org, since=until, client=client)
+    after = store.spend(org=org, since=until, client=client)
     return {
         "org": org,
         "client": client,
@@ -227,29 +244,13 @@ def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dic
             }
             for b in window.boxes
         ],
-        "runs": {"total": len(work), **dict(sum(per_agent.values(), Counter()))},
+        "runs": {"total": sum(totals.values()), **dict(totals)},
         "conversations": sum(conversations.values()),
-        "approvals_answered": sum(
-            1
-            for a in window.approvals
-            if a.answered_at and window.since <= a.answered_at < window.until
-        ),
+        "approvals_answered": counts["approvals_answered"],
         "requests": {
-            "made": sum(1 for q in window.requests if window.since <= q.created_at < window.until),
-            "approved": sum(
-                1
-                for q in window.requests
-                if q.status == "approved"
-                and q.decided_at
-                and window.since <= q.decided_at < window.until
-            ),
-            "declined": sum(
-                1
-                for q in window.requests
-                if q.status == "declined"
-                and q.decided_at
-                and window.since <= q.decided_at < window.until
-            ),
+            "made": counts["requests_made"],
+            "approved": counts["requests_approved"],
+            "declined": counts["requests_declined"],
         },
         "pull_requests": {
             "opened": [
@@ -263,14 +264,11 @@ def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dic
                 for p in window.pulls
                 if window.since <= p.opened_at < window.until
             ],
-            "merged": sum(
-                1
-                for p in window.pulls
-                if p.merged_at and window.since <= p.merged_at < window.until
-            ),
+            "merged": counts["pulls_merged"],
         },
         "failures": failures,
-        "spend_eur_nano": spend.eur_nano - until_spend.eur_nano,
+        "truncated": window.capped,
+        "spend_eur_nano": spend.eur_nano - after.eur_nano,
         "limit_eur_nano": _monthly_limit(store, org, client),
     }
 

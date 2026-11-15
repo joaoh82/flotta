@@ -1241,6 +1241,8 @@ class ClientWindow:
     requests: list[WorkRequest]
     pulls: list[PullRequest]
     events: list[Event]
+    #: A kind of row reached `WINDOW_ROWS`: there was more than was read.
+    capped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -7023,7 +7025,9 @@ class FleetStore:
         ]
         hidden = set()
         if exclude_kinds:
-            # An approval or a request asked in a conversation goes with it.
+            # An approval asked in a conversation goes with it. A request does
+            # not: its client's people see their requests (FLOTTA-174), with
+            # who asked left out by the reader (`flotta.client_audit`).
             hidden = {
                 str(r["id"])
                 for r in self._conn.execute(
@@ -7084,7 +7088,72 @@ class FleetStore:
             requests=requests,
             pulls=pulls,
             events=events,
+            capped=any(len(rows) >= cap for rows in (runs, approvals, requests, pulls, events)),
         )
+
+    def client_month_counts(
+        self, org: str, client: str, since: datetime, until: datetime
+    ) -> dict[str, Any]:
+        """What a client's report adds up for `[since, until)`, counted here, not
+        from capped rows: a busy month's numbers are its own (M16.3).
+
+        Runs by agent, kind and status, made in the window; approvals answered,
+        requests made and decided, pull requests merged in it.
+        """
+        lo, hi = _instant(since), _instant(until)
+        runs = [
+            {
+                "box": str(r["box_id"]),
+                "kind": str(r["trigger_kind"]),
+                "status": str(r["status"]),
+                "n": int(r["n"]),
+            }
+            for r in self._conn.execute(
+                "SELECT box_id, trigger_kind, status, COUNT(*) AS n FROM tasks "
+                "WHERE org_id = ? AND client_id = ? AND trigger_kind IS NOT NULL "
+                "AND created_at >= ? AND created_at < ? "
+                "GROUP BY box_id, trigger_kind, status",
+                (org, client, lo, hi),
+            ).fetchall()
+        ]
+
+        def count(sql: str, *args: Any) -> int:
+            row = self._conn.execute(sql, (org, client, *args)).fetchone()
+            return int(row["n"]) if row is not None else 0
+
+        return {
+            "runs": runs,
+            "approvals_answered": count(
+                "SELECT COUNT(*) AS n FROM run_approvals WHERE org_id = ? AND client_id = ? "
+                "AND answered_at >= ? AND answered_at < ?",
+                lo,
+                hi,
+            ),
+            "requests_made": count(
+                "SELECT COUNT(*) AS n FROM requests WHERE org_id = ? AND client_id = ? "
+                "AND created_at >= ? AND created_at < ?",
+                lo,
+                hi,
+            ),
+            "requests_approved": count(
+                "SELECT COUNT(*) AS n FROM requests WHERE org_id = ? AND client_id = ? "
+                "AND status = 'approved' AND decided_at >= ? AND decided_at < ?",
+                lo,
+                hi,
+            ),
+            "requests_declined": count(
+                "SELECT COUNT(*) AS n FROM requests WHERE org_id = ? AND client_id = ? "
+                "AND status = 'declined' AND decided_at >= ? AND decided_at < ?",
+                lo,
+                hi,
+            ),
+            "pulls_merged": count(
+                "SELECT COUNT(*) AS n FROM pull_requests WHERE org_id = ? AND client_id = ? "
+                "AND merged_at >= ? AND merged_at < ?",
+                lo,
+                hi,
+            ),
+        }
 
     def run_approvals(self, run_id: str) -> list[RunApproval]:
         """`run_id`'s approvals, in the order they were asked."""
