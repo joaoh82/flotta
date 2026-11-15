@@ -6865,8 +6865,10 @@ def create_app(
         agency's; the hosted product decides what of it a client is shown."""
         from flotta.client_audit import BadWindow, report_data
 
-        if token is not None and is_report_sender(token):
-            # The report schedule (M16.8) names the org: it is every org's.
+        if (token is not None and is_report_sender(token)) or (_is_operator(token) and org):
+            # The report schedule (M16.8) names the org: it is every org's. So
+            # may the operator, whose schedule runs against a keyless local
+            # control plane under `just dev`.
             if not org:
                 raise HTTPException(status_code=422, detail="name the org: ?org=")
             org_id = org

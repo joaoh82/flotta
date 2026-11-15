@@ -140,3 +140,20 @@ def test_it_reaches_nothing_else(api, method, path, body):
 def test_the_agency_does_not_read_the_schedule(api):
     assert api.get("/api/report-runs?period=2026-10", headers=OWNER).status_code == 403
     assert api.get("/api/report-runs?period=2026-10", headers=MEMBER).status_code == 403
+
+
+def test_the_operator_names_the_org_too(api):
+    """The schedule against a local control plane runs as the operator."""
+    operator = _bearer(SCOPE_FLEET_READ)
+
+    data = api.get("/api/clients/acme/report-data?period=2026-10&org=agency-y", headers=operator)
+
+    assert data.status_code == 200 and data.json()["org"] == "agency-y"
+
+
+def test_an_agency_cannot_name_another_org(api):
+    member = _bearer(*ROLES["member"], org="agency-x")
+
+    data = api.get("/api/clients/acme/report-data?period=2026-10&org=agency-y", headers=member)
+
+    assert data.json()["org"] == "agency-x", "?org= is the schedule's and the operator's alone"
