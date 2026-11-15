@@ -564,6 +564,37 @@ def _in_box_org(ref: str, call: Callable[[str | None], Any]) -> tuple[Any, str |
         return call(found), found
 
 
+def _in_any_org(call: Callable[[str | None], Any], *, org: str | None = None) -> Any:
+    """`call(org)` for what an id names without saying whose: a trigger, a key (FLOTTA-17).
+
+    `_in_box_org` reads the org off an agent; a trigger's or a key's id says
+    nothing of it, so the operator's CLI answered 404 for every one outside the
+    default org. With `org` given, the token is minted there. Otherwise the
+    default org is asked first, and on its 404, while this CLI mints, each other
+    org that can hold agents in turn, until one answers.
+
+    Asking the wrong org is no act: the fleet API scopes the id before it does
+    anything (`_scoped_trigger`, `_scoped_key`), so a wrong org's answer is a
+    404 and nothing else. An id no org has gets the default org's 404, as it
+    did before. A supplied `$FLOTTA_CONTROL_TOKEN` is used as it is.
+    """
+    if org is not None or not _minting():
+        return call(org)
+    try:
+        return call(None)
+    except ControlPlaneError as exc:
+        if exc.status != 404:
+            raise
+        first = exc
+    for other in _other_orgs():
+        try:
+            return call(other)
+        except ControlPlaneError as exc:
+            if exc.status != 404:
+                raise
+    raise first
+
+
 def _lookup_org(ref: str) -> str | None:
     """The org of the agent `ref` names, from the fleet API, or None if it does not say.
 
@@ -916,25 +947,34 @@ def _ps_remote(
 _LISTED = ("active", "suspended")
 
 
-def _other_orgs_hint() -> None:
-    """Say so when the default org's list is not the whole fleet (FLOTTA-18).
+def _other_orgs() -> list[str]:
+    """The orgs besides the default one that can hold agents, as the operator's
+    `/api/orgs` lists them; none when it cannot say.
 
-    A minted token sees the default org, and an agency's agents were simply
-    absent from `flotta ps`, with nothing saying the list was partial. One
-    more request, made only when this CLI holds the signing key.
+    A pending or declined sign-up has no agents, so it is left out.
     """
     from flotta.auth import SCOPE_FLEET_READ
 
     try:
         orgs = control_request("GET", "/api/orgs", scopes=(SCOPE_FLEET_READ,)).get("orgs", [])
-        # A pending or declined sign-up has no agents to list.
-        others = [
+        return [
             o["id"]
             for o in orgs
             if o.get("id") and o["id"] != DEFAULT_ORG and o.get("status", "active") in _LISTED
         ]
     except (ControlPlaneError, AttributeError, KeyError, TypeError):
-        return  # a hint is never worth failing `ps` over, its table already printed
+        return []
+
+
+def _other_orgs_hint() -> None:
+    """Say so when the default org's list is not the whole fleet (FLOTTA-18).
+
+    A minted token sees the default org, and an agency's agents were simply
+    absent from `flotta ps`, with nothing saying the list was partial. One
+    more request, made only when this CLI holds the signing key; a reply it
+    cannot read is no hint, never a failed `ps`, whose table already printed.
+    """
+    others = _other_orgs()
     if not others:
         return
     named = ", ".join(others[:5]) + (f" and {len(others) - 5} more" if len(others) > 5 else "")
@@ -1577,15 +1617,29 @@ def _trigger_line(trigger: dict[str, Any]) -> str:
 
 
 def _through_control(
-    method: str, path: str, scope: str, body: dict | None = None, *, box: str | None = None
+    method: str,
+    path: str,
+    scope: str,
+    body: dict | None = None,
+    *,
+    box: str | None = None,
+    any_org: bool = False,
+    org: str | None = None,
 ) -> Any:
     """One call to the fleet API, or exit saying why not; `box` is the agent it
-    is about, whose org a minted token acts in (`_in_box_org`)."""
+    is about, whose org a minted token acts in (`_in_box_org`). With `any_org`
+    the path names something by an id alone, found in `org` or else searched
+    for (`_in_any_org`)."""
     if not control_url():
         raise _fail(
             ControlPlaneError(f"this goes through the control plane: set ${CONTROL_URL_ENV}")
         )
     try:
+        if any_org:
+            return _in_any_org(
+                lambda o: control_request(method, path, scopes=(scope,), body=body, org=o),
+                org=(org or "").strip() or None,
+            )
         if box is None:
             return control_request(method, path, scopes=(scope,), body=body)
         return _in_box_org(
@@ -1636,13 +1690,20 @@ def trigger_add(
 @trigger_app.command("secret")
 def trigger_secret_cmd(
     trigger_id: str = typer.Argument(..., help="The webhook's id"),
+    org: str | None = typer.Option(
+        None, "--org", help="The org of its agent [looked for when not given]"
+    ),
     as_json: bool = JsonOpt,
 ) -> None:
     """A webhook's new secret, printed this once. The old one stops at once."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
     found = _through_control(
-        "POST", f"/api/triggers/{_quoted(trigger_id)}/secret", SCOPE_FLEET_WRITE
+        "POST",
+        f"/api/triggers/{_quoted(trigger_id)}/secret",
+        SCOPE_FLEET_WRITE,
+        any_org=True,
+        org=org,
     )
     emit(found, f"secret  {found.get('secret')}", as_json=as_json)
 
@@ -1663,11 +1724,18 @@ def trigger_ls(
 
 
 @trigger_app.command("rm")
-def trigger_rm(trigger_id: str = typer.Argument(..., help="The trigger's id")) -> None:
+def trigger_rm(
+    trigger_id: str = typer.Argument(..., help="The trigger's id"),
+    org: str | None = typer.Option(
+        None, "--org", help="The org of its agent [looked for when not given]"
+    ),
+) -> None:
     """Remove a trigger. The runs it made stay."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
-    _through_control("DELETE", f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_WRITE)
+    _through_control(
+        "DELETE", f"/api/triggers/{_quoted(trigger_id)}", SCOPE_FLEET_WRITE, any_org=True, org=org
+    )
     typer.echo(f"removed {trigger_id}")
 
 
@@ -1726,11 +1794,18 @@ def key_ls(
 
 
 @key_app.command("rm")
-def key_rm(key_id: str = typer.Argument(..., help="The key's id, key-…")) -> None:
+def key_rm(
+    key_id: str = typer.Argument(..., help="The key's id, key-…"),
+    org: str | None = typer.Option(
+        None, "--org", help="The org of its agent [looked for when not given]"
+    ),
+) -> None:
     """Revoke a key. Its next request is refused; the runs it started stay."""
     from flotta.auth import SCOPE_FLEET_WRITE
 
-    _through_control("DELETE", f"/api/keys/{_quoted(key_id)}", SCOPE_FLEET_WRITE)
+    _through_control(
+        "DELETE", f"/api/keys/{_quoted(key_id)}", SCOPE_FLEET_WRITE, any_org=True, org=org
+    )
     typer.echo(f"revoked {key_id}")
 
 

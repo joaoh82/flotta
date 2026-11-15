@@ -20,7 +20,7 @@ curl -X POST "$FLOTTA_CONTROL_URL/api/boxes/eng-a/keys" \
 
 **The answer's `key` is shown that once.** The store keeps only a hash of it, so it can't be read back. A key that was lost is revoked and replaced. `prefix` is its first few characters, kept so that a list of keys can tell them apart.
 
-`flotta key ls eng-a` (`GET /api/boxes/<agent>/keys`) lists an agent's keys, newest first, with when each was last used (to the minute). Revoked keys stay on the list. `flotta key rm <key id>` (`DELETE /api/keys/<id>`) revokes one: its next request is refused, and the runs it started stay.
+`flotta key ls eng-a` (`GET /api/boxes/<agent>/keys`) lists an agent's keys, newest first, with when each was last used (to the minute). Revoked keys stay on the list. `flotta key rm <key id>` (`DELETE /api/keys/<id>`) revokes one: its next request is refused, and the runs it started stay. The operator's CLI, holding the signing key, finds a key in any org; `--org` says which.
 
 ## Using one
 
