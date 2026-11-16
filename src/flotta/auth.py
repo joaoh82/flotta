@@ -187,6 +187,15 @@ SCOPE_ORG_GOVERN = "org:govern"
 #: answer. Held by a client viewer and nothing else, and only with a client
 #: (`mint`). Never the agency's words: a run's prompt and input are withheld.
 SCOPE_PORTAL_READ = "portal:read"
+#: Sending clients' monthly reports on the hosted product's behalf (M16.8):
+#: listing the reports due and who they go to, reading a report's numbers and
+#: an agency's branding, and recording a send and the owners' notice; nothing
+#: else. Held by the web app's report schedule, never by a person, never
+#: beside another scope and never for one org (`mint`), like `org:govern`. A
+#: leaked one can read every agency's report numbers and send each report once,
+#: to the people its owners named; it reads no agent, run, conversation or
+#: setting, and changes nothing about any. Not the operator: see `is_report_sender`.
+SCOPE_REPORT_SEND = "report:send"
 SCOPES: frozenset[str] = frozenset(
     {
         SCOPE_FLEET_READ,
@@ -203,6 +212,7 @@ SCOPES: frozenset[str] = frozenset(
         SCOPE_RUN_CREATE,
         SCOPE_ORG_GOVERN,
         SCOPE_PORTAL_READ,
+        SCOPE_REPORT_SEND,
     }
 )
 
@@ -417,6 +427,15 @@ def is_governor(token: Token) -> bool:
     limits would read as one that may do anything to the fleet.
     """
     return SCOPE_ORG_GOVERN in token.scopes
+
+
+def is_report_sender(token: Token) -> bool:
+    """Whether `token` is the hosted product's report schedule (`report:send`).
+
+    Like `is_governor`: the default org's and unconfined, so it looks like the
+    operator's, and must be asked about first.
+    """
+    return SCOPE_REPORT_SEND in token.scopes
 
 
 def screen_grant(token: Token | None, *, has_screen: bool, client_control: bool) -> str:
@@ -731,6 +750,17 @@ def mint(
         )
     if SCOPE_PORTAL_READ in wanted and client is None:
         raise AuthError(f"{SCOPE_PORTAL_READ} is one client's view of its work; name the client")
+    if SCOPE_REPORT_SEND in wanted:
+        if wanted != {SCOPE_REPORT_SEND}:
+            raise AuthError(
+                f"{SCOPE_REPORT_SEND} is held alone: a token that sends reports does nothing else"
+            )
+        elsewhere = org is not None and org.strip() != DEFAULT_ORG
+        if client is not None or box is not None or elsewhere:
+            raise AuthError(
+                f"{SCOPE_REPORT_SEND} sends every org's reports, for the hosted product; "
+                "it names no org, client or box"
+            )
     if SCOPE_ORG_GOVERN in wanted:
         if wanted != {SCOPE_ORG_GOVERN}:
             raise AuthError(
