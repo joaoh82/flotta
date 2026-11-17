@@ -2917,6 +2917,79 @@ def org_lift_cap(
     emit(view, line, as_json=as_json)
 
 
+@org_app.command("ceiling")
+def org_ceiling(
+    org_id: str = typer.Argument(..., help="The org whose spend ceiling to read or set"),
+    eur: str | None = typer.Option(
+        None, "--eur", help="Set it: euros of model spend per billing period"
+    ),
+    none: bool = typer.Option(False, "--none", help="Set no ceiling: unlimited"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Read or set an org's spend ceiling (FLOTTA-241).
+
+    What it may owe in model spend on the fleet's keys between invoices; at it,
+    its agents pause until the billing period renews or the ceiling is raised.
+    """
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.budgets import billing_window, eur_text, parse_limit, standing
+    from flotta.store import InvalidBudgetError, UnknownEntityError, ceiling_budget
+
+    if eur is not None and none:
+        raise _fail(ValueError("--eur and --none are two different ceilings; give one"))
+    setting = eur is not None or none
+    if control_url():
+        try:
+            path = f"/api/orgs/{org_id}/spend-ceiling"
+            view = (
+                control_request(
+                    "PUT",
+                    path,
+                    scopes=(SCOPE_ORG_ADMIN,),
+                    body={"limit_eur": None if none else eur},
+                )
+                if setting
+                else control_request("GET", path, scopes=(SCOPE_ORG_ADMIN,))
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            org = fleet.get_org(org_id)
+            if org is None:
+                raise _fail(UnknownEntityError(f"no org with id {org_id!r}"))
+            if setting:
+                try:
+                    nano = None if none else parse_limit(eur)
+                    org = fleet.set_spend_ceiling(org_id, nano, by="cli")
+                except InvalidBudgetError as exc:
+                    raise _fail(exc) from exc
+            now = datetime.now(UTC)
+            since, resets = billing_window(org, now)
+            ceiling = ceiling_budget(org)
+            spent = (
+                standing(fleet, ceiling, now).spent_nano
+                if ceiling is not None
+                else fleet.spend(org=org_id, since=since, key_scope="fleet").eur_nano
+            )
+            view = {
+                "org": org_id,
+                "limit_eur": eur_text(ceiling.limit_eur_nano) if ceiling else None,
+                "decided": org.spend_ceiling_set_at is not None,
+                "spent_eur": eur_text(spent),
+                "since": since.isoformat(),
+                "resets_at": resets.isoformat(),
+            }
+    limit = view["limit_eur"]
+    line = (
+        f"{org_id}: EUR {view['spent_eur']} of a EUR {limit} ceiling this billing period"
+        if limit is not None
+        else f"{org_id}: no spend ceiling; EUR {view['spent_eur']} this billing period"
+    )
+    emit(view, line, as_json=as_json)
+
+
 @org_app.command("decline")
 def org_decline(
     org_id: str = typer.Argument(..., help="A pending org: `flotta org list --pending`"),

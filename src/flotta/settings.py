@@ -90,6 +90,11 @@ class Setting:
 #: back to: a billing approval is never uncapped.
 STARTING_CAP_EUR_DEFAULT = "50"
 
+#: What a self-serve org may owe in model spend between invoices when nothing
+#: says otherwise (FLOTTA-241), in euros. Also what a value that is not more
+#: than zero falls back to: the default is never "no ceiling".
+SPEND_CEILING_EUR_DEFAULT = "500"
+
 #: Every setting the fleet exposes. Adding one here is what makes it settable —
 #: there is deliberately no way to write a key that is not in this list.
 SETTINGS: tuple[Setting, ...] = (
@@ -207,6 +212,19 @@ SETTINGS: tuple[Setting, ...] = (
         ),
         kind="money",
         default=STARTING_CAP_EUR_DEFAULT,
+    ),
+    Setting(
+        key="FLOTTA_SPEND_CEILING_EUR",
+        label="Spend ceiling",
+        help=(
+            "Euros of model spend on the fleet's own keys a self-serve agency may "
+            "run up in one billing period, before its agents pause until the "
+            "period renews. It bounds what an invoice that is never paid costs. "
+            "Given once to each paying agency that has none; raise or remove it "
+            "per agency in HQ."
+        ),
+        kind="money",
+        default=SPEND_CEILING_EUR_DEFAULT,
     ),
     Setting(
         key="FLOTTA_FLY_VOLUME_GB",
@@ -466,6 +484,35 @@ def describe(store: Any, env: Mapping[str, str] | None = None) -> list[dict[str,
             }
         )
     return out
+
+
+def spend_ceiling_eur_nano(store: Any, env: Mapping[str, str] | None = None) -> int:
+    """The spend ceiling billing gives a self-serve org, in euro nanos (FLOTTA-241).
+
+    Never zero and never missing, like the starting cap: a value that is unset,
+    unreadable or not more than zero is the default, with a warning.
+    """
+    return _positive_eur_nano(
+        layered(store, env).get("FLOTTA_SPEND_CEILING_EUR"),
+        "FLOTTA_SPEND_CEILING_EUR",
+        SPEND_CEILING_EUR_DEFAULT,
+    )
+
+
+def _positive_eur_nano(raw: Any, key: str, default: str) -> int:
+    import logging
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        euros = Decimal(str(raw or default).strip())
+    except InvalidOperation:
+        euros = Decimal(0)
+    if not euros.is_finite() or euros <= 0:
+        logging.getLogger("flotta.settings").warning(
+            "%s is %r, which is no limit; using €%s", key, raw, default
+        )
+        euros = Decimal(default)
+    return int(euros * 10**9)
 
 
 def starting_cap_eur_nano(store: Any, env: Mapping[str, str] | None = None) -> int:

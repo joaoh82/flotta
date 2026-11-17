@@ -75,6 +75,10 @@ def test_every_catalogued_setting_actually_changes_something():
         # approval by billing (`POST /api/orgs/{id}/approve` with `org:govern`)
         # and on `flotta org approve --starting-cap` (FLOTTA-185).
         "FLOTTA_STARTING_CAP_EUR",
+        # Read by `settings.spend_ceiling_eur_nano`, through `layered`, when
+        # billing gives a paying self-serve org its ceiling
+        # (`POST /api/orgs/{id}/spend-ceiling/default`, FLOTTA-241).
+        "FLOTTA_SPEND_CEILING_EUR",
         # Both read by `provision.resolve_box_resources` and carried to the
         # machine in `BoxSpec`. The volume one was *not* wired when this test
         # was written — `FlyConfig.volume_gb` was read by nothing but the

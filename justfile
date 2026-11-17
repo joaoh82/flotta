@@ -370,6 +370,11 @@ org-resume ORG:
 org-lift-cap ORG:
     uv run flotta org lift-cap {{ORG}}
 
+# FLOTTA-241 — read or set an org's spend ceiling: what it may owe in model
+# spend between invoices. `just org-ceiling <org> --eur 1000`, or `--none`
+org-ceiling ORG *ARGS:
+    uv run flotta org ceiling {{ORG}} {{ARGS}}
+
 # M12.4 — sign-ups waiting for an answer, and the answer
 org-pending:
     uv run flotta org list --pending

@@ -53,6 +53,11 @@ GOVERN_ROUTES = frozenset(
         # cap, and lifting that cap once a renewal is paid.
         ("POST", "/api/orgs/{org_id}/approve"),
         ("DELETE", "/api/orgs/{org_id}/starting-cap"),
+        # FLOTTA-241: the spend ceiling and the billing period it counts in.
+        ("GET", "/api/orgs/{org_id}/spend-ceiling"),
+        ("PUT", "/api/orgs/{org_id}/spend-ceiling"),
+        ("POST", "/api/orgs/{org_id}/spend-ceiling/default"),
+        ("PUT", "/api/orgs/{org_id}/billing-period"),
         # FLOTTA-188: the usage totals an invoice's model spend is built from.
         # Sums only (`flotta.usage_report`), never the ledger's rows.
         ("GET", "/api/orgs/{org_id}/usage"),

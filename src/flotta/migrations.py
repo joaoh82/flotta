@@ -1269,6 +1269,21 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        40,
+        "spend ceilings: what an org may owe in model spend between invoices",
+        # FLOTTA-241. The ceiling is NULL for none, and `spend_ceiling_set_at`
+        # NULL is "never decided", which is what lets billing apply the fleet's
+        # default once and never over the operator's choice. The window starts
+        # at `billing_period_from`, which billing sets from the subscription;
+        # NULL is the calendar month. Every org that exists gets no ceiling
+        # until billing or the operator decides one.
+        (
+            "ALTER TABLE orgs ADD COLUMN spend_ceiling_eur_nano BIGINT",
+            "ALTER TABLE orgs ADD COLUMN spend_ceiling_set_at TEXT",
+            "ALTER TABLE orgs ADD COLUMN billing_period_from TEXT",
+        ),
+    ),
 )
 
 

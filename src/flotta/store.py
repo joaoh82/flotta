@@ -610,6 +610,16 @@ class Org:
     #: Who suspended it (FLOTTA-190): `BILLING` for the hosted product's
     #: billing, `OPERATOR` otherwise. Billing resumes only its own.
     suspended_by: str | None = None
+    #: What it may owe in model spend on Flotta's keys between invoices
+    #: (FLOTTA-241), in euro nanos: `None` is no ceiling. `spend_ceiling_set_at`
+    #: is when billing or the operator decided it, `None` if nobody has, which
+    #: is what lets billing apply the fleet's default once and never over the
+    #: operator's choice. See `flotta.budgets.ceiling_of`.
+    spend_ceiling_eur_nano: int | None = None
+    spend_ceiling_set_at: str | None = None
+    #: When its current billing period began, as billing last said (FLOTTA-241):
+    #: the ceiling's window. `None` is the calendar month.
+    billing_period_from: str | None = None
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -1347,6 +1357,9 @@ class Budget:
     #: row, which its owners cannot change, until billing or the operator lifts
     #: it. See `FleetStore.decide_org` and `lift_starting_cap`.
     starting_cap: bool = False
+    #: The org's spend ceiling (FLOTTA-241), made from its row by
+    #: `flotta.budgets.ceiling_of` and never stored here: period `billing`.
+    ceiling: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1985,6 +1998,81 @@ class FleetStore:
         org = self.get_org(org_id)
         assert org is not None
         return org
+
+    # -- spend ceilings (FLOTTA-241) -------------------------------------------
+
+    def set_spend_ceiling(
+        self, org_id: str, limit_eur_nano: int | None, *, by: str | None = None
+    ) -> Org:
+        """Decide the org's spend ceiling: an amount in euro nanos, or `None` for none.
+
+        The operator's, or billing's. Deciding is final for the default: once
+        set, `default_spend_ceiling` leaves it alone, whatever it is.
+        """
+        if limit_eur_nano is not None and limit_eur_nano <= 0:
+            raise InvalidBudgetError("a spend ceiling must be more than zero, or none")
+        with self._conn.transaction(guard="orgs"):
+            org = self._ceiling_write(org_id, limit_eur_nano, by=by)
+        return org
+
+    def default_spend_ceiling(self, org_id: str, limit_eur_nano: int, *, by: str | None) -> bool:
+        """Give the org `limit_eur_nano` as its ceiling if nobody has decided one.
+
+        Returns whether it did. Billing calls this on every event for a paying
+        self-serve org, so it must never change a ceiling already decided.
+        """
+        if limit_eur_nano <= 0:
+            raise InvalidBudgetError("a spend ceiling must be more than zero")
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.spend_ceiling_set_at is not None:
+                return False
+            self._ceiling_write(org_id, limit_eur_nano, by=by, default=True)
+        return True
+
+    def _ceiling_write(
+        self, org_id: str, limit_eur_nano: int | None, *, by: str | None, default: bool = False
+    ) -> Org:
+        """The write and its event. The caller holds the transaction."""
+        if self.get_org(org_id) is None:
+            raise UnknownEntityError(f"no org with id {org_id!r}")
+        self._conn.execute(
+            "UPDATE orgs SET spend_ceiling_eur_nano = ?, spend_ceiling_set_at = ? WHERE id = ?",
+            (limit_eur_nano, _utcnow(), org_id),
+        )
+        org = self.get_org(org_id)
+        assert org is not None
+        # On the budget timeline, beside the starting cap's events. `None` is
+        # no ceiling, which has no budget to describe: the event says so.
+        self.record_budget_event(
+            ceiling_budget(org) or _no_ceiling(org_id),
+            "spend_ceiling_set",
+            period_start=datetime.now(UTC),
+            payload={"limit_eur_nano": limit_eur_nano, "by": by, "default": default},
+        )
+        return org
+
+    def set_billing_period(self, org_id: str, start: datetime) -> Org:
+        """Record when the org's current billing period began (the ceiling's window)."""
+        moment = _instant(start)
+        with self._conn.transaction(guard="orgs"):
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            self._conn.execute(
+                "UPDATE orgs SET billing_period_from = ? WHERE id = ?", (moment, org_id)
+            )
+        org = self.get_org(org_id)
+        assert org is not None
+        return org
+
+    def orgs_with_ceiling(self) -> list[Org]:
+        """Every org with a spend ceiling, for the budget sweep."""
+        rows = self._conn.execute(
+            "SELECT * FROM orgs WHERE spend_ceiling_eur_nano IS NOT NULL ORDER BY id"
+        ).fetchall()
+        return [_org_from_row(r) for r in rows]
 
     def require_room(self, org_id: str, kind: str) -> None:
         """`LimitReachedError` unless `org_id` may have one more of `kind`.
@@ -4234,15 +4322,20 @@ class FleetStore:
         since: datetime,
         client: str | None = None,
         box: str | None = None,
+        key_scope: str | None = None,
     ) -> Spend:
         """What an org, or a client or box within it, has spent since `since`.
 
         One indexed sum, because a budget check runs it before every model call.
         `org` is always required: a client's id is only unique within its org,
-        and asking for a box must not reach another org's.
+        and asking for a box must not reach another org's. `key_scope` counts
+        only the calls whose key was that level's (`fleet` is what is billed).
         """
         where = ["org_id = ?"]
         params: list[Any] = [org]
+        if key_scope is not None:
+            where.append("key_scope = ?")
+            params.append(key_scope)
         if client is not None:
             where.append("client_id = ?")
             params.append(client)
@@ -7648,7 +7741,64 @@ def _org_from_row(row: db.Row) -> Org:
         suspended_at=row.get("suspended_at"),
         suspend_reason=row.get("suspend_reason"),
         suspended_by=row.get("suspended_by"),
+        spend_ceiling_eur_nano=_maybe_int(row.get("spend_ceiling_eur_nano")),
+        spend_ceiling_set_at=row.get("spend_ceiling_set_at"),
+        billing_period_from=row.get("billing_period_from"),
     )
+
+
+#: The soft threshold of a spend ceiling: the owner is told at 80%, as for a budget.
+CEILING_SOFT_PCT = 0.8
+
+
+def ceiling_id(org_id: str) -> str:
+    """The id a spend ceiling's events and refusals go by. No budget row has it."""
+    return f"ceiling:{org_id}"
+
+
+def ceiling_budget(org: Org) -> Budget | None:
+    """The org's spend ceiling as an org-wide budget that pauses, or `None` for none.
+
+    Never stored in `budgets`, so no owner's budget route can reach it: it is
+    the org row's, set by billing or the operator (FLOTTA-241).
+    """
+    if org.spend_ceiling_eur_nano is None:
+        return None
+    return Budget(
+        id=ceiling_id(org.id),
+        org=org.id,
+        client=None,
+        box=None,
+        period="billing",
+        limit_eur_nano=org.spend_ceiling_eur_nano,
+        soft_pct=CEILING_SOFT_PCT,
+        action="pause",
+        fallback_model=None,
+        updated_at=org.spend_ceiling_set_at or "",
+        ceiling=True,
+    )
+
+
+def _no_ceiling(org_id: str) -> Budget:
+    """What the event for a ceiling removed is recorded against."""
+    return Budget(
+        id=ceiling_id(org_id),
+        org=org_id,
+        client=None,
+        box=None,
+        period="billing",
+        limit_eur_nano=0,
+        soft_pct=CEILING_SOFT_PCT,
+        action="pause",
+        fallback_model=None,
+        updated_at="",
+        ceiling=True,
+    )
+
+
+def _maybe_int(value: Any) -> int | None:
+    """A BIGINT that Postgres may hand back as a Decimal."""
+    return None if value is None else int(value)
 
 
 def _client_from_row(row: db.Row) -> Client:

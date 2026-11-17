@@ -71,6 +71,20 @@ limit instead. It comes back asleep, and wakes the usual way.
 
 Every threshold writes an event on each box covered and one on the client, once a
 period (`store.budget_events`).
+
+## The spend ceiling (FLOTTA-241)
+
+What an org may owe in model spend between invoices: an org-wide budget that
+pauses, warns at 80%, and is made from the org row (`store.ceiling_budget`)
+rather than stored with the org's own budgets, so no owner's route can change
+it. The operator and billing decide it; billing gives a paying self-serve org
+the fleet's default (`FLOTTA_SPEND_CEILING_EUR`) once, and never over a decision.
+
+It differs from a budget in two ways. It counts only calls on the fleet's keys,
+since only those are billed. And its period is the **billing period**, which
+billing records on the org from the subscription (`billing_period_from`) on
+every event, so a renewal resets it without the gateway reading Stripe; a
+renewal whose event never arrived still rolls the window a month on.
 """
 
 from __future__ import annotations
@@ -82,7 +96,15 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from flotta.pricing import NANO, to_eur_nano
-from flotta.store import Box, Budget, FleetStore, InvalidBudgetError, suspended_refusal
+from flotta.store import (
+    Box,
+    Budget,
+    FleetStore,
+    InvalidBudgetError,
+    Org,
+    ceiling_budget,
+    suspended_refusal,
+)
 
 #: The actions that stop calls at the limit, and so pause the boxes they cover.
 STOPPING_ACTIONS = frozenset({"pause", "kill"})
@@ -108,6 +130,54 @@ def resets_at(period: str, now: datetime) -> datetime:
         return start + timedelta(days=1)
     # The 28th plus four days is always in the next month.
     return (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def _plus_months(anchor: datetime, months: int) -> datetime:
+    """`anchor` moved by whole months, its day clamped to the month's last, as
+    Stripe moves a billing period: a period anchored on the 31st renews on the
+    30th in April and the 31st again in May."""
+    total = anchor.year * 12 + anchor.month - 1 + months
+    year, month = divmod(total, 12)
+    month += 1
+    after = (datetime(year + (month == 12), month % 12 + 1, 1, tzinfo=UTC) - timedelta(days=1)).day
+    return anchor.replace(year=year, month=month, day=min(anchor.day, after))
+
+
+def billing_window(org: Org | None, now: datetime) -> tuple[datetime, datetime]:
+    """The billing period holding `now`, as billing last told the store (FLOTTA-241).
+
+    From `billing_period_from`, a month at a time: a renewal whose event never
+    arrived still starts a new window when the month is up, so a missed webhook
+    cannot leave an org counting from months ago. With no period recorded, it is
+    the calendar month, which is what a budget's `month` is.
+    """
+    moment = now.astimezone(UTC)
+    if org is None or not org.billing_period_from:
+        return period_start("month", moment), resets_at("month", moment)
+    anchor = datetime.fromisoformat(org.billing_period_from).astimezone(UTC)
+    months = (moment.year - anchor.year) * 12 + (moment.month - anchor.month)
+    # One either side of the plain count, for the day of the month and a start
+    # recorded in the future (a clock ahead of ours): the window holding `now`.
+    for n in (months + 1, months, months - 1, months - 2):
+        start = _plus_months(anchor, n)
+        if start <= moment:
+            return start, _plus_months(anchor, n + 1)
+    return moment, _plus_months(anchor, months + 1)  # pragma: no cover - unreachable
+
+
+def window(store: FleetStore, budget: Budget, now: datetime) -> tuple[datetime, datetime]:
+    """When `budget`'s period holding `now` began and when it ends."""
+    if budget.ceiling:
+        return billing_window(store.get_org(budget.org), now)
+    return period_start(budget.period, now), resets_at(budget.period, now)
+
+
+def covering(store: FleetStore, box: Box, org: Org | None = None) -> list[Budget]:
+    """Every budget a call by `box` counts against, the org's spend ceiling included."""
+    found = store.budgets_covering(box)
+    owner = org if org is not None else store.get_org(box.org)
+    ceiling = ceiling_budget(owner) if owner is not None else None
+    return [*found, ceiling] if ceiling is not None else found
 
 
 def parse_limit(value: Any) -> int:
@@ -149,7 +219,16 @@ def budget_dict(budget: Budget) -> dict[str, Any]:
         "action": budget.action,
         "fallback_model": budget.fallback_model,
         "starting_cap": budget.starting_cap,
+        "ceiling": budget.ceiling,
     }
+
+
+def _what(budget: Budget) -> str:
+    return "spending ceiling" if budget.ceiling else "budget"
+
+
+def _period_word(budget: Budget) -> str:
+    return "billing period" if budget.ceiling else budget.period
 
 
 def _whose(budget: Budget) -> str:
@@ -232,6 +311,13 @@ class Standing:
 
     def sentence(self) -> str:
         details = self.details()
+        if self.budget.ceiling:
+            return (
+                f"Org {self.budget.org} has reached its spending ceiling of EUR "
+                f"{details['limit_eur']} for this billing period: EUR {details['spent_eur']} "
+                f"spent. It resets at {details['resets_at']}. Ask Flotta for a higher "
+                "ceiling to carry on sooner."
+            )
         return (
             f"{_whose(self.budget)} budget of EUR {details['limit_eur']} a {self.budget.period} "
             f"is used up: EUR {details['spent_eur']} spent. It resets at {details['resets_at']}."
@@ -239,14 +325,22 @@ class Standing:
 
 
 def standing(store: FleetStore, budget: Budget, now: datetime) -> Standing:
-    since = period_start(budget.period, now)
-    spent = store.spend(org=budget.org, client=budget.client, box=budget.box, since=since)
-    return Standing(budget, spent.eur_nano, spent.unpriced, since, resets_at(budget.period, now))
+    since, resets = window(store, budget, now)
+    # A ceiling is what the agency owes: calls on its or its client's own
+    # provider key are never billed, so they never count (FLOTTA-241).
+    spent = store.spend(
+        org=budget.org,
+        client=budget.client,
+        box=budget.box,
+        since=since,
+        key_scope="fleet" if budget.ceiling else None,
+    )
+    return Standing(budget, spent.eur_nano, spent.unpriced, since, resets)
 
 
 def holding(store: FleetStore, box: Box, now: datetime) -> list[Standing]:
     """The budgets that keep `box` paused now, most severe first."""
-    found = [standing(store, b, now) for b in store.budgets_covering(box)]
+    found = [standing(store, b, now) for b in covering(store, box)]
     stopping = [s for s in found if s.stops]
     return sorted(stopping, key=lambda s: s.budget.action != "kill")
 
@@ -294,27 +388,28 @@ def check_budgets(
             suspended_refusal(org, "call a model"),
             key=("org_suspended", org.id, org.suspended_at or ""),
         )
-    covering = store.budgets_covering(box)
-    if not covering:
+    limits = covering(store, box, org)
+    if not limits:
         return None
 
     missing = list(unsettled)
-    for budget in covering:
+    for budget in limits:
         if any(counts_against(budget, other) for other in missing):
             return Refusal(
                 "budget_unchecked",
                 "The budget could not be checked, because the cost of an earlier call has not "
                 "been recorded yet, so this call was refused.",
                 budget_dict(budget),
-                key=("budget_unsettled", budget.id, period_start(budget.period, now).isoformat()),
+                key=("budget_unsettled", budget.id, window(store, budget, now)[0].isoformat()),
             )
 
-    standings = [standing(store, budget, now) for budget in covering]
+    standings = [standing(store, budget, now) for budget in limits]
     for found in standings:
         if found.unpriced:
             return Refusal(
                 "budget_unpriced",
-                f"{_whose(found.budget)} budget cannot be trusted this {found.budget.period}: "
+                f"{_whose(found.budget)} {_what(found.budget)} cannot be trusted this "
+                f"{_period_word(found.budget)}: "
                 f"{found.unpriced} call(s) in it have no known cost. It clears at "
                 f"{found.resets.isoformat()}.",
                 found.details(),
@@ -336,7 +431,7 @@ def check_budgets(
     fallback = downgrades[0].budget.fallback_model if downgrades else None
     calling = fallback or model
 
-    first = covering[0]
+    first = limits[0]
     price = store.price_of(calling, at=now)
     if price is None:
         return Refusal(
