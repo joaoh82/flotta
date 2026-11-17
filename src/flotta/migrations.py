@@ -1189,7 +1189,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         37,
         "spend shown: whether a client's viewers see what its agents cost",
-        # M16.1 (D27). A row means yes, as in `client_approvers`, so every
+        # M16.1 (D29). A row means yes, as in `client_approvers`, so every
         # client that exists sees nothing about money until its agency says so:
         # Flotta's numbers are the agency's cost, not its price.
         (

@@ -1,6 +1,6 @@
 """A client's history (M16.3): its audit trail, and its report's numbers.
 
-The trail is the agency's and a client viewer's (D27), the viewer's without
+The trail is the agency's and a client viewer's (D29), the viewer's without
 the agency's words and without conversations; a client user reads neither.
 The report's numbers are the agency's alone: the hosted product decides
 what of them a client is shown.
@@ -223,3 +223,45 @@ def test_a_busy_month_is_counted_not_capped(api, fleet, monkeypatch):
     assert data["runs"] == {"total": 5, "done": 5}
     assert data["truncated"] is True
     assert trail["truncated"] is True
+
+
+# -- what a client calls an agent (M16.9) --------------------------------------------
+
+
+def _report(api):
+    period = datetime.now(UTC).strftime("%Y-%m")
+    answer = api.get("/api/clients/acme/report-data", headers=AGENCY, params={"period": period})
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def test_an_agent_without_a_display_name_is_called_by_its_own_name(api, history, fleet):
+    """Not by its address, which names the agency's org: found on staging, where
+    a client's export and report said `spike--acme--agency-test`."""
+    with FleetStore(fleet) as store:
+        store.set_box_meta(_ids(fleet)[X], display_name=None)
+
+    assert {e["agent_label"] for e in _entries(api, VIEWER)} == {"support"}
+    assert [a["label"] for a in _report(api)["agents"]] == ["support"]
+    assert {f["agent_label"] for f in _report(api)["failures"]} == {"support"}
+
+
+def test_a_removed_agent_says_so_and_never_shows_its_tombstone(api, history, fleet):
+    """Its replacement often has the same name: staging's report listed two
+    `Probe`s, and its export `probe--acme--agency-test@b-c09db73d7f8c`."""
+    box = _ids(fleet)[X]
+    with FleetStore(fleet) as store:
+        store.update_box_status(box, "torn_down")
+        store.release_name(box)
+
+    labels = {e["agent_label"] for e in _entries(api, VIEWER)}
+    report = _report(api)
+
+    assert labels == {"Support (no longer here)"}
+    assert [a["label"] for a in report["agents"]] == ["Support (no longer here)"]
+    shown = [
+        *labels,
+        *(a["label"] for a in report["agents"]),
+        *(f["agent_label"] for f in report["failures"]),
+    ]
+    assert not [s for s in shown if "--" in s or "@" in s or "agency-x" in s]
