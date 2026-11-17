@@ -182,7 +182,7 @@ SCOPE_RUN_CREATE = "run:create"
 #: or change a single agent. Not the operator either, though its token is the
 #: default org's and unconfined: see `is_governor`.
 SCOPE_ORG_GOVERN = "org:govern"
-#: A client's view of the work done for it (M16.1, D27): its own client's runs,
+#: A client's view of the work done for it (M16.1, D29): its own client's runs,
 #: its usage when the agency shows it, and the approvals the agency lets it
 #: answer. Held by a client viewer and nothing else, and only with a client
 #: (`mint`). Never the agency's words: a run's prompt and input are withheld.
@@ -227,7 +227,7 @@ ROLES: dict[str, frozenset[str]] = {
     ),
     "member": frozenset({SCOPE_FLEET_READ, SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_BOX_DESTROY}),
     # A client's own view of its agents and the work they did: one client,
-    # read-only but for answering the approvals the agency lets it (D27).
+    # read-only but for answering the approvals the agency lets it (D29).
     "client_viewer": frozenset({SCOPE_FLEET_READ, SCOPE_PORTAL_READ}),
     # Someone at a client who uses its agents: one client, talks to them, and
     # creates, changes and destroys nothing.

@@ -3475,7 +3475,7 @@ class FleetStore:
         return row is not None
 
     def set_client_spend_shown(self, org_id: str, client_id: str, shown: bool) -> None:
-        """Whether this client's viewers see what its agents cost (M16.1, D27).
+        """Whether this client's viewers see what its agents cost (M16.1, D29).
 
         A row means yes, so a client nobody has decided about sees nothing.
         """
@@ -5642,7 +5642,7 @@ class FleetStore:
         where = ["org_id = ?", "trigger_kind IS NOT NULL"]
         params: list[Any] = [org]
         if exclude_kinds:
-            # `exclude_kinds`: a client's viewer reads no one's conversations (D27).
+            # `exclude_kinds`: a client's viewer reads no one's conversations (D29).
             where.append(f"trigger_kind NOT IN ({','.join('?' * len(exclude_kinds))})")
             params.extend(exclude_kinds)
         if statuses is not None:

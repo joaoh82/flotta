@@ -6,7 +6,7 @@ approvals answered in them, its requests, the pull requests its agents opened
 or saw merged, and what happened to its agents themselves. The audit trail
 lists them as entries; the report data adds them up. Neither writes anything.
 
-**A client's viewer reads its own trail, without the agency's words** (D27):
+**A client's viewer reads its own trail, without the agency's words** (D29):
 no run's prompt or input, no request's details beyond its title, and an
 agent's own events by what happened, never with what was set (an agent's
 instructions are among them). Conversations are left out for a viewer, as
@@ -20,7 +20,7 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from flotta.store import FleetStore
+from flotta.store import Box, FleetStore
 
 #: The longest window one call reads: a quarter, so an export of a year is
 #: four calls and none of them reads the whole ledger.
@@ -31,6 +31,29 @@ MAX_ENTRIES = 5000
 
 #: Run statuses that are a failure a report names as an incident.
 FAILED = frozenset({"failed", "budget_blocked", "timed_out"})
+
+
+#: Said after a removed agent's name, so a client can tell it from one there now.
+GONE = " (no longer here)"
+
+
+def client_label(box: Box, display_name: str | None) -> str:
+    """What a client calls an agent: its display name, else its own name.
+
+    Never the address it is stored under (`probe--acme--agency-x`, and once
+    removed `probe--acme--agency-x@b-…`): that names the agency's org and the
+    fleet's ids, which are not the client's words. A removed agent says so,
+    because the one that replaced it often has the same name.
+    """
+    label = display_name or box.name.split("@", 1)[0].split("--", 1)[0]
+    return label + GONE if box.status == "torn_down" else label
+
+
+def _labels(store: FleetStore, boxes: list[Box]) -> dict[str, str]:
+    metas = store.meta_for_boxes([b.id for b in boxes])
+    return {
+        b.id: client_label(b, metas[b.id].display_name if b.id in metas else None) for b in boxes
+    }
 
 
 class BadWindow(ValueError):
@@ -75,6 +98,7 @@ def audit(
         org, client, since, until, exclude_kinds=("chat",) if viewer else ()
     )
     names = {b.id: b.name for b in window.boxes}
+    labels = _labels(store, window.boxes)
     entries: list[dict[str, Any]] = []
 
     def add(at: str | None, box_id: str, kind: str, actor: str | None, summary: str, **extra: Any):
@@ -89,6 +113,8 @@ def audit(
             {
                 "at": at,
                 "agent": names.get(box_id, box_id),
+                # What a client calls it: the export a viewer downloads says this.
+                "agent_label": labels.get(box_id, "An agent"),
                 "kind": kind,
                 "actor": actor,
                 "summary": summary,
@@ -196,11 +222,7 @@ def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dic
     counts = store.client_month_counts(org, client, since, until)
     window = store.client_window(org, client, since, until)
     names = {b.id: b.name for b in window.boxes}
-    metas = store.meta_for_boxes([b.id for b in window.boxes])
-    labels = {
-        b.id: (metas[b.id].display_name if b.id in metas and metas[b.id].display_name else b.name)
-        for b in window.boxes
-    }
+    labels = _labels(store, window.boxes)
 
     per_agent: dict[str, Counter[str]] = {}
     conversations: Counter[str] = Counter()
@@ -218,6 +240,7 @@ def report_data(store: FleetStore, *, org: str, client: str, period: str) -> dic
         {
             "run": r.id,
             "agent": names.get(r.box_id, r.box_id),
+            "agent_label": labels.get(r.box_id, "An agent"),
             "at": r.finished_at or r.created_at,
             "status": r.status,
             "error_class": r.error_class,

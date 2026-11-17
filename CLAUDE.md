@@ -770,7 +770,7 @@ conventions, and the sharp edges below.
   owner without the signing key mints for its people — while `--scope` always
   mints locally, which `just door-secrets` relies on. The default org's
   tokens still carry no `org` claim.
-- **A client viewer reads the work done for its client (M16.1, D27).**
+- **A client viewer reads the work done for its client (M16.1, D29).**
   `portal:read` lets it read its own client's runs (`_run_reader(portal=True)`),
   never a conversation (`VIEWER_HIDDEN_KINDS`) and never the agency's words
   (`RUN_FIELDS_WITHHELD`: prompt, input, the note on a settled failure); its

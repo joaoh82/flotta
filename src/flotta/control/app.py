@@ -649,21 +649,21 @@ def _epoch(iso: str | None) -> float | None:
         return None
 
 
-#: How a client's viewer may group its usage (D27): by day and by agent. Never
+#: How a client's viewer may group its usage (D29): by day and by agent. Never
 #: by client, which is the agency's view, or by model, which is how it runs it.
 VIEWER_USAGE_GROUPS = frozenset({"day", "box"})
 
-#: The runs a client's viewer never sees (D27): conversations, which are the
+#: The runs a client's viewer never sees (D29): conversations, which are the
 #: people's who had them. A viewer has none of its own.
 VIEWER_HIDDEN_KINDS = ("chat",)
 
-#: What a client's viewer never reads of a run (D27): the agency's words to the
+#: What a client's viewer never reads of a run (D29): the agency's words to the
 #: agent, what a trigger fed it, and the agency's note on settling a failure.
 RUN_FIELDS_WITHHELD = ("prompt", "input", "resolved_by", "resolved_note")
 
 
 def _portal_reader(token: Token | None) -> bool:
-    """A client's viewer (M16.1, D27): `portal:read`, one client, changes nothing.
+    """A client's viewer (M16.1, D29): `portal:read`, one client, changes nothing.
 
     A client's systems hold `fleet:write` (an integration's token) and read as
     the agency's API does; a client user holds `box:chat` and no `portal:read`.
@@ -1021,7 +1021,7 @@ def create_app(
     needs_report_write = Depends(require(SCOPE_FLEET_WRITE, SCOPE_REPORT_SEND, any_of=True))
     needs_report_notice = Depends(require(SCOPE_ORG_ADMIN, SCOPE_REPORT_SEND, any_of=True))
     #: The agency's people, or a client's people (one who talks to agents, or
-    #: a viewer, D27): who may answer a run's approval, before the rules of
+    #: a viewer, D29): who may answer a run's approval, before the rules of
     #: `answer_run_approval`.
     needs_answer = Depends(
         require(SCOPE_FLEET_WRITE, SCOPE_BOX_CHAT, SCOPE_PORTAL_READ, any_of=True)
@@ -2478,7 +2478,7 @@ def create_app(
     def set_client_spend_shown(
         org_id: str, client_id: str, body: dict[str, Any], token: Token | None = needs_admin
     ) -> Any:
-        """Whether this client's viewers see what its agents cost (M16.1, D27).
+        """Whether this client's viewers see what its agents cost (M16.1, D29).
 
         Off unless an owner turns it on: Flotta's numbers are the agency's cost,
         and whether a client sees them is the agency's to decide.
@@ -2527,7 +2527,7 @@ def create_app(
         """The org's own, or the operator: not an agent, and not a client's people.
 
         What an agency allows a client's agents is the agency's business, but
-        for one case (D27): with `portal`, a client's viewer reads its own
+        for one case (D29): with `portal`, a client's viewer reads its own
         client's, once the agency shows it what its agents cost. True when the
         caller is that viewer, so the route answers for its client only.
         """
@@ -6604,7 +6604,7 @@ def create_app(
 
         An API key is a client's systems, not its people, and reads its own
         agent's runs only (`_scoped_box`, `_scoped_run`). With `portal`, a
-        client's viewer reads its own client's (D27), without the agency's
+        client's viewer reads its own client's (D29), without the agency's
         words (`_run_view`); a client user still reads none. True for that viewer.
         """
         if token is not None and token.allows(SCOPE_RUN_CREATE) and token.box is not None:
@@ -6637,7 +6637,7 @@ def create_app(
         viewer: bool = False,
         spend_shown: bool = False,
     ) -> dict[str, Any]:
-        """A run as JSON. For a client's `viewer` (D27), without the agency's
+        """A run as JSON. For a client's `viewer` (D29), without the agency's
         words, and with its cost only where the agency shows the client that."""
         from dataclasses import asdict
 
@@ -6800,7 +6800,7 @@ def create_app(
         """`(org, viewer)` for a read of one client's history, or a refusal.
 
         The agency's, or a client's own systems' (`fleet:write` on it). With
-        `people`, a client's viewer too (D27); a client user never.
+        `people`, a client's viewer too (D29); a client user never.
         """
         org = (token.org if token else None) or DEFAULT_ORG
         if token is not None and (token.box is not None or subject_box(token.subject)):
@@ -6827,7 +6827,7 @@ def create_app(
         days or moments, at most 92 days apart; the last 30 days if not named.
 
         A client's viewer reads its own, without the agency's words and
-        without conversations (D27). `flotta.client_audit`.
+        without conversations (D29). `flotta.client_audit`.
         """
         from flotta.client_audit import BadWindow, audit
         from flotta.usage_report import BadReport, parse_instant
@@ -7214,7 +7214,7 @@ def create_app(
                             detail="the agency answers this agent's approvals",
                         )
                     if run.trigger_kind == "chat" and _portal_reader(token):
-                        # A viewer's are a run's (D27); a conversation's
+                        # A viewer's are a run's (D29); a conversation's
                         # belong to the person in it.
                         raise HTTPException(
                             status_code=403,
@@ -7285,7 +7285,7 @@ def create_app(
                 found = store.waiting_approvals(org=org, client=token.client, boxes=boxes)
             views = [_approval_view(store, a) for a in found]
             if _portal_reader(token):
-                # A viewer answers a run's, never a conversation's (D27).
+                # A viewer answers a run's, never a conversation's (D29).
                 views = [v for v in views if v["kind"] == "run"]
             return {"approvals": views}
         finally:

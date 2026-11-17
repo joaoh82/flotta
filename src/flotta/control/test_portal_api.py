@@ -1,4 +1,4 @@
-"""A client's viewer and the work done for it (M16.1, D27).
+"""A client's viewer and the work done for it (M16.1, D29).
 
 `portal:read` is a client viewer's, and only theirs: its own client's runs,
 without the agency's words; its usage and limits, once the agency shows the
