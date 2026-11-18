@@ -614,7 +614,7 @@ class Org:
     #: (FLOTTA-241), in euro nanos: `None` is no ceiling. `spend_ceiling_set_at`
     #: is when billing or the operator decided it, `None` if nobody has, which
     #: is what lets billing apply the fleet's default once and never over the
-    #: operator's choice. See `flotta.budgets.ceiling_of`.
+    #: operator's choice. See `ceiling_budget`.
     spend_ceiling_eur_nano: int | None = None
     spend_ceiling_set_at: str | None = None
     #: When its current billing period began, as billing last said (FLOTTA-241):
@@ -1358,7 +1358,7 @@ class Budget:
     #: it. See `FleetStore.decide_org` and `lift_starting_cap`.
     starting_cap: bool = False
     #: The org's spend ceiling (FLOTTA-241), made from its row by
-    #: `flotta.budgets.ceiling_of` and never stored here: period `billing`.
+    #: `ceiling_budget` and never stored here: period `billing`.
     ceiling: bool = False
 
 
