@@ -1541,6 +1541,140 @@ def create_app(
         finally:
             store.close()
 
+    # -- spend ceilings (FLOTTA-241) --------------------------------------------
+    #
+    # What an org may owe in model spend on the fleet's keys between invoices.
+    # An org-wide budget that pauses, made from the org row (`flotta.budgets`),
+    # so the gateway refuses and the sweep pauses as for any budget. Decided by
+    # the operator or billing, never by the org's own owner, like its limits.
+
+    def _ceiling_view(store: Any, org: Any) -> dict[str, Any]:
+        from flotta.budgets import billing_window, eur_text, standing
+        from flotta.store import ceiling_budget
+
+        now = datetime.now(UTC)
+        since, resets = billing_window(org, now)
+        view: dict[str, Any] = {
+            "org": org.id,
+            "limit_eur": None,
+            "decided": org.spend_ceiling_set_at is not None,
+            "since": since.isoformat(),
+            "resets_at": resets.isoformat(),
+            "billing_period_from": org.billing_period_from,
+            "spent_eur": eur_text(store.spend(org=org.id, since=since, key_scope="fleet").eur_nano),
+            "reached": False,
+            "soft_reached": False,
+        }
+        ceiling = ceiling_budget(org)
+        if ceiling is not None:
+            found = standing(store, ceiling, now)
+            view.update(
+                limit_eur=eur_text(ceiling.limit_eur_nano),
+                spent_eur=eur_text(found.spent_nano),
+                reached=found.reached,
+                soft_reached=found.soft_reached,
+            )
+        return view
+
+    def _ceiling_writer(token: Token | None) -> str:
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            raise HTTPException(
+                status_code=403,
+                detail="only the fleet's operator, or its billing, may set an org's spend ceiling",
+            )
+        return token.subject if token is not None else "operator"
+
+    @app.get("/api/orgs/{org_id}/spend-ceiling")
+    def get_spend_ceiling(org_id: str, token: Token | None = needs_read_or_govern) -> Any:
+        """The org's spend ceiling and this billing period's spend against it.
+
+        `{limit_eur, decided, spent_eur, since, resets_at, reached, soft_reached}`;
+        `limit_eur` is `null` for none. For the org's own people (not a
+        client's), the operator and `org:govern`, as its limits are.
+        """
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            assert token is not None
+            if token.client is not None or (token.org or DEFAULT_ORG) != org_id:
+                raise HTTPException(status_code=404, detail=f"no org with id {org_id!r}")
+        store = store_factory()
+        try:
+            return _ceiling_view(store, _org_or_404(store, org_id))
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/spend-ceiling")
+    def put_spend_ceiling(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_limits_write
+    ) -> Any:
+        """Decide the org's ceiling: `{"limit_eur": "750"}`, or `{"limit_eur": null}` for none.
+
+        Raising or removing it lets the next model call through, since the
+        gateway checks on every call; the sweep releases paused agents.
+        """
+        from flotta.budgets import parse_limit
+        from flotta.store import InvalidBudgetError
+
+        by = _ceiling_writer(token)
+        if "limit_eur" not in (body or {}):
+            raise HTTPException(status_code=422, detail="limit_eur is an amount in euros, or null")
+        raw = body["limit_eur"]
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            try:
+                nano = None if raw is None else parse_limit(raw)
+                org = store.set_spend_ceiling(org_id, nano, by=by)
+            except InvalidBudgetError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            _log.info("the spend ceiling of %s was set to %s by %s", org_id, raw, by)
+            return _ceiling_view(store, org)
+        finally:
+            store.close()
+
+    @app.post("/api/orgs/{org_id}/spend-ceiling/default")
+    def default_spend_ceiling(org_id: str, token: Token | None = needs_limits_write) -> Any:
+        """Give the org the fleet's default ceiling, if nobody has decided one.
+
+        Billing's, on every event for a paying self-serve org: `{"set": true}`
+        the first time, `false` after, whatever the ceiling was decided to be.
+        """
+        from flotta.settings import spend_ceiling_eur_nano
+
+        by = _ceiling_writer(token)
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            done = store.default_spend_ceiling(org_id, spend_ceiling_eur_nano(store), by=by)
+            if done:
+                _log.info("%s was given the default spend ceiling by %s", org_id, by)
+            return {"set": done, **_ceiling_view(store, _org_or_404(store, org_id))}
+        finally:
+            store.close()
+
+    @app.put("/api/orgs/{org_id}/billing-period")
+    def put_billing_period(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_limits_write
+    ) -> Any:
+        """When the org's current billing period began: `{"from": "2026-11-01T00:00:00Z"}`.
+
+        Billing's, from the subscription, on every event: the ceiling's window
+        starts here, so a renewal resets what the org has spent against it.
+        """
+        _ceiling_writer(token)
+        raw = (body or {}).get("from")
+        try:
+            start = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            start = None
+        if not isinstance(raw, str) or start is None or start.tzinfo is None:
+            raise HTTPException(status_code=422, detail="from is an ISO moment with a timezone")
+        store = store_factory()
+        try:
+            _org_or_404(store, org_id)
+            return _ceiling_view(store, store.set_billing_period(org_id, start))
+        finally:
+            store.close()
+
     @app.post("/api/orgs/{org_id}/approve")
     def approve_org(
         org_id: str,

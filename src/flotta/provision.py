@@ -94,6 +94,7 @@ from flotta.store import (
     Task,
     UnknownEntityError,
     box_label,
+    ceiling_budget,
     is_terminal,
     reaches_fleet_github,
     validate_box_meta,
@@ -4566,7 +4567,12 @@ def enforce_budgets(
     """
     current = now or datetime.now(UTC)
     idle_after = resolve_idle_after(idle_after_s, _settings_env(store))
-    standings = [budget_rules.standing(store, b, current) for b in store.all_budgets()]
+    # The orgs' spend ceilings too (FLOTTA-241): an org-wide budget that pauses,
+    # made from the org row, so it pauses, releases and warns like any other.
+    ceilings = [c for c in map(ceiling_budget, store.orgs_with_ceiling()) if c is not None]
+    standings = [
+        budget_rules.standing(store, b, current) for b in [*store.all_budgets(), *ceilings]
+    ]
     boxes = [b for b in store.list_boxes() if b.status in ("running", "stopped", "paused")]
     for found in standings:
         _tell_thresholds(store, found, boxes)
