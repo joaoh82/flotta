@@ -25,7 +25,7 @@ from flotta.auth import (
 )
 from flotta.control.test_sign_in import KEY, Outbox, _app
 from flotta.pricing import NANO
-from flotta.provision import purge_closed_orgs
+from flotta.provision import close_org_agents, purge_closed_orgs
 from flotta.store import (
     PURGED_BY,
     FleetStore,
@@ -260,8 +260,9 @@ def test_the_operator_reopens_it_suspended_with_its_agents_gone(api, fleet):
 
 def test_only_the_operator_reopens_it(api, fleet):
     _close(api)
-    for who in (OWNER, GOVERNOR):
-        assert api.post(f"/api/orgs/{ORG}/reopen", headers=who).status_code == 403
+    # Its owner's token is refused outright now (401): it is a closed org's.
+    assert api.post(f"/api/orgs/{ORG}/reopen", headers=OWNER).status_code == 401
+    assert api.post(f"/api/orgs/{ORG}/reopen", headers=GOVERNOR).status_code == 403
     assert _org(fleet).status == "closed"
 
 
@@ -420,3 +421,94 @@ def test_the_default_org_is_never_purged_even_marked_closed(fleet):
         assert "default" not in [o.id for o in store.orgs_to_purge(days=30)]
         with pytest.raises(InvalidTransitionError, match="never purged"):
             store.purge_org("default")
+
+
+# -- the review of #258 ---------------------------------------------------------------
+
+
+def test_a_destroy_that_fails_keeps_the_agent_and_is_tried_again(fleet, machine, monkeypatch):
+    """Its row is the only record of a machine still holding the agent's memory."""
+    from flotta.backend import BackendError
+
+    real = machine.destroy
+    tries: list[str] = []
+
+    def flaky(endpoint):
+        tries.append(endpoint)
+        if len(tries) == 1:
+            raise BackendError("fly 503")
+        return real(endpoint)
+
+    monkeypatch.setattr(machine, "destroy", flaky)
+    with FleetStore(fleet) as store:
+        store.close_org(ORG, by="operator")
+        first = close_org_agents(store, org_id=ORG)
+        assert "error" in first[0]
+        assert [b.status for b in store.list_boxes_in(ORG)] != ["torn_down"]
+        with pytest.raises(InvalidTransitionError, match="torn down"):
+            store.purge_org(ORG)
+        # The next sweep destroys it, and only then deletes the org.
+        outcomes = purge_closed_orgs(store, days=0)
+    # Tried again (then once more by `teardown_box`, which is idempotent).
+    assert len(tries) >= 2 and machine.machine_state == "gone"
+    assert any(o.get("org") == ORG and o.get("purged") for o in outcomes), outcomes
+
+
+def test_an_agent_still_being_created_is_waited_for(fleet, machine):
+    with FleetStore(fleet) as store:
+        store.create_box("late", org=ORG, client="acme")  # provisioning, no machine yet
+        store.close_org(ORG, by="operator")
+        outcomes = close_org_agents(store, org_id=ORG)
+        late = store.get_box_by_name("late--acme--agency-x")
+        assert {"box_id": late.id, "waiting": "provisioning"} in outcomes
+        with pytest.raises(InvalidTransitionError):
+            store.purge_org(ORG)
+
+
+def test_the_purge_keeps_another_orgs_invite_to_someone_leaving(fleet, machine):
+    with FleetStore(fleet) as store:
+        store.create_login_link("ana@example.com", purpose="invite", org_id="other", role="member")
+        store.create_login_link("ana@example.com")  # her own sign-in link, which goes
+        store.close_org(ORG, by="operator")
+        purge_closed_orgs(store, days=0)
+        assert [i.email for i in store.open_invites("other")] == ["ana@example.com"]
+        left = store._conn.execute(
+            "SELECT purpose FROM login_links WHERE email = 'ana@example.com'"
+        ).fetchall()
+    assert [r["purpose"] for r in left] == ["invite"]
+
+
+def test_an_expired_invite_is_kept_to_be_sent_again(fleet):
+    now = datetime.now(UTC)
+    with FleetStore(fleet) as store:
+        store.create_login_link(
+            "dee@example.com",
+            purpose="invite",
+            org_id=ORG,
+            role="member",
+            now=now - timedelta(days=30),
+        )
+        store.purge_expired_access(now=now)
+        assert "dee@example.com" in [i.email for i in store.open_invites(ORG)]
+
+
+def test_a_token_minted_for_a_closed_org_is_refused(api, fleet):
+    """Signed out includes tokens an owner minted: a signature can't be revoked."""
+    assert api.get("/api/boxes", headers=MEMBER).status_code == 200
+    _close(api)
+    assert api.get("/api/boxes", headers=MEMBER).status_code == 401
+    assert api.get("/api/boxes", headers=OTHER_OWNER).status_code == 200
+
+
+def test_billing_still_reads_a_closed_orgs_usage_for_the_last_invoice(api, fleet):
+    _close(api)
+    assert api.get(f"/api/orgs/{ORG}/usage", headers=GOVERNOR).status_code == 200
+
+
+def test_neither_billing_nor_the_operator_resumes_a_closed_org(api, fleet):
+    with FleetStore(fleet) as store:
+        store.suspend_org(ORG, by="test")  # the operator's hold, then closed
+    _close(api)
+    for who in (GOVERNOR, OPERATOR):
+        answer = api.post(f"/api/orgs/{ORG}/resume", headers=who)
+        assert answer.status_code == 409 and "closed" in answer.json()["detail"]

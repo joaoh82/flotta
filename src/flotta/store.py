@@ -2462,22 +2462,34 @@ class FleetStore:
                         "SELECT email FROM users WHERE id = ?", (user_id,)
                     ).fetchone()
                     gone("sessions", "user_id = ?", (user_id,))
+                    # Their sign-in links only: an invite from another org, or a
+                    # sign-up for a new one, is that org's or their own next step,
+                    # not this org's to delete (the review of #258).
                     if row is not None:
-                        gone("login_links", "email = ?", (row["email"],))
+                        gone(
+                            "login_links",
+                            "email = ? AND purpose = 'sign_in'",
+                            (row["email"],),
+                        )
                     gone("users", "id = ?", (user_id,))
             gone("orgs", "id = ?", o)
         return {table: n for table, n in counts.items() if n}
 
     def purge_expired_access(self, *, now: datetime | None = None) -> dict[str, int]:
-        """Delete expired sessions and sign-in and invite links: `{table: count}`.
+        """Delete expired sessions and sign-in and sign-up links: `{table: count}`.
 
         Nothing reads them once they expire (`session` and `redeem` refuse
-        them), so keeping them only keeps who signed in, and when.
+        them), so keeping them only keeps who signed in, and when. **Not
+        invites**: an org's people list its expired ones to send again
+        (`open_invites`, the resend route), and they go with the org.
         """
         moment = now or datetime.now(UTC)
         counts: dict[str, int] = {}
-        for table, key in (("sessions", "id_hash"), ("login_links", "token_hash")):
-            rows = self._conn.execute(f"SELECT {key}, expires_at FROM {table}").fetchall()
+        for table, key, where in (
+            ("sessions", "id_hash", ""),
+            ("login_links", "token_hash", " WHERE purpose IN ('sign_in', 'sign_up')"),
+        ):
+            rows = self._conn.execute(f"SELECT {key}, expires_at FROM {table}{where}").fetchall()
             expired = [r[key] for r in rows if datetime.fromisoformat(r["expires_at"]) <= moment]
             # Guarded like every other write here: two sweeps (two control
             # planes during a deploy) deleting the same rows serialise.
@@ -2505,6 +2517,12 @@ class FleetStore:
             if org.id == DEFAULT_ORG:
                 raise InvalidTransitionError(
                     "the default org is the operator's own fleet; it is never suspended"
+                )
+            if org.status == "closed":
+                # FLOTTA-224: neither billing nor the operator suspends or resumes
+                # a closed org; the operator reopens it.
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is closed; it is neither suspended nor resumed"
                 )
             if org.status == wanted:
                 # The operator holding an org billing already suspended makes the
@@ -2926,6 +2944,11 @@ class FleetStore:
         ).fetchone()
         if kept is None:
             raise InvalidAccountError("this invite was withdrawn")
+        # Closing deletes an org's invites under this same guard, so this holds
+        # already; said here too, where every join meets it (FLOTTA-224).
+        org = self.get_org(link.org)
+        if org is not None and org.status == "closed":
+            raise InvalidAccountError(f"org {link.org!r} is closed")
         user = self.get_user_by_email(link.email)
         if user is not None and user.disabled_at is not None:
             raise InvalidAccountError(f"the account for {link.email} is disabled")

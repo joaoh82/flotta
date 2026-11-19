@@ -4690,8 +4690,26 @@ def close_org_agents(
         for box in store.list_boxes_in(org.id):
             if box.status == "torn_down":
                 continue
+            if box.status == "provisioning":
+                # No machine to name yet. It either gets one, destroyed next
+                # sweep, or the stranded-provision sweep finds it by name and
+                # destroys it; the purge waits either way.
+                outcomes.append({"box_id": box.id, "waiting": "provisioning"})
+                continue
             try:
+                # The machine first, and only then the row. `teardown_box` is
+                # best effort about the machine and closes the row whatever
+                # happens, which here would let the purge delete the only
+                # record of a machine still holding the agent's memory (the
+                # review of #258). `destroy` is idempotent: one already gone
+                # answers at once.
+                if box.endpoint:
+                    _resolve_backend(box, backend).destroy(box.endpoint)
                 teardown_box(box.id, store=store, reason="org_closed", backend=backend)
+                outcomes.append({"box_id": box.id, "destroyed": True})
+            except InvalidTransitionError:
+                # The close route's teardown and the loop's reached it together;
+                # the other one closed the row, after the same idempotent destroy.
                 outcomes.append({"box_id": box.id, "destroyed": True})
             except (ProvisionError, BackendError) as exc:
                 _log.warning("could not destroy %s of closed %s: %s", box.name, org.id, exc)

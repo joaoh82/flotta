@@ -867,6 +867,16 @@ def create_app(
                         headers={"WWW-Authenticate": "Bearer"},
                     ) from exc
 
+            # A closed org's people are signed out, and that includes tokens an
+            # owner minted (FLOTTA-224): a signature can't be revoked, so it is
+            # refused here. Billing's and the operator's carry no org claim.
+            if token.org is not None and token.org != DEFAULT_ORG and _org_closed(token.org):
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"org {token.org!r} is closed",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
             missing = [s for s in scopes if not token.allows(s)]
             if any_of and len(missing) < len(scopes):
                 missing = []
@@ -880,6 +890,22 @@ def create_app(
             return token
 
         return dependency
+
+    def _org_closed(org_id: str) -> bool:
+        """Whether `org_id` is closed (FLOTTA-224). A store that can't answer is
+        not a reason to refuse: the routes still check tenancy as before."""
+        try:
+            store = store_factory()
+        except Exception:  # noqa: BLE001 - a store that can't open refuses nothing
+            return False
+        try:
+            org = store.get_org(org_id)
+            return org is not None and org.status == "closed"
+        except Exception:  # noqa: BLE001 - a read that failed refuses nothing
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                store.close()
 
     def _session_token(secret: str, request: Request) -> Token:
         """The token a live session's membership would mint, or 401.
