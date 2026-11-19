@@ -209,6 +209,7 @@ class _Machine:
         #: Whether a wait for Hermes hears it, and what happens meanwhile (FLOTTA-252).
         self.hermes_starts = hermes_starts
         self.while_booting = lambda: None
+        self.while_reloading = lambda: None
 
     def exec(self, endpoint, command):
         from flotta.backend import ExecResult
@@ -222,6 +223,7 @@ class _Machine:
                 return ExecResult(0, "Hermes is listening", "")
             return ExecResult(1, "", "Hermes was not listening after 120s")
         if MCP_RELOAD_MARK in command:
+            self.while_reloading()
             if self.fail_reload:
                 raise RuntimeError("machine went away")
             return ExecResult(self.reload_code, "", "refused" if self.reload_code else "")
@@ -625,6 +627,26 @@ def test_a_conversation_opened_while_a_new_agent_boots_writes_nothing(granted):
     _create(granted, machine)
     assert seen == {"status": "running", "sent": []}
     assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
+
+
+def test_once_hermes_listens_a_save_is_written_at_once_again(granted):
+    """Its boot is over, so nothing waits for creation any more: creation has already
+    looked, and a save marked as waiting for it now would wait for a wake instead."""
+    from flotta.provision import set_mcp_grants
+
+    machine = _Creating()
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
+    seen = {}
+
+    def a_save_as_creation_finishes():
+        machine.while_reloading = lambda: None
+        seen["answer"] = set_mcp_grants("b-one", (), store=granted, backend=machine)
+
+    machine.while_reloading = a_save_as_creation_finishes
+    _create(granted, machine)
+    answer = seen["answer"]
+    assert (answer["written"], answer["pending"], answer["waits_for"]) == (True, False, None)
+    assert len(machine.configs()) == 2 and not granted.mcp_config_pending("b-one")
 
 
 def test_a_creation_that_fails_to_write_the_config_still_made_the_agent(granted, monkeypatch):
