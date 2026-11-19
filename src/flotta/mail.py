@@ -25,6 +25,7 @@ import logging
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import resources
 from typing import Any
 
@@ -262,21 +263,30 @@ def sign_in_message(to: str, url: str) -> Message:
     )
 
 
-def sign_up_message(to: str, url: str) -> Message:
+def sign_up_message(to: str, url: str, *, trial: bool = False) -> Message:
     """The link that creates the agency `to` signed up, when followed.
 
     The agency's name is not in it, on purpose: whoever signs up chooses it,
     and an email that carried it would let anyone send text of their choosing
     from our domain to any address. The web app shows the name once the link
-    has proved the address is theirs.
+    has proved the address is theirs. `trial` is a Founding Studio sign-up,
+    which starts from Billing rather than waiting on the operator.
     """
+    if trial:
+        follow = (
+            "Your agency can invite its team straight away. Start the trial from "
+            "Billing, and you can create agents once it is running."
+        )
+    else:
+        follow = (
+            "Your agency can invite its team straight away, and create agents once we approve it."
+        )
     return Message(
         to=to,
         subject="Finish signing up for Flotta",
         text=(
             f"Finish signing up for Flotta:\n\n{url}\n\n"
-            "The link works once, for 15 minutes. Your agency can invite its team "
-            "straight away, and create agents once we approve it. If you did not "
+            f"The link works once, for 15 minutes. {follow} If you did not "
             "ask for this, ignore this email."
         ),
         html=layout(
@@ -285,10 +295,7 @@ def sign_up_message(to: str, url: str) -> Message:
             heading="Finish signing up",
             body=[
                 paragraph("Confirm this address to create your agency on Flotta."),
-                paragraph(
-                    "Your agency can invite its team straight away, and create agents "
-                    "once we approve it."
-                ),
+                paragraph(follow),
             ],
             action=("Finish signing up", url),
             note="The link works once, for 15 minutes.",
@@ -297,6 +304,46 @@ def sign_up_message(to: str, url: str) -> Message:
             "ignore this email.",
         ),
         link=url,
+    )
+
+
+def founding_price_message(to: str, *, until: str, now: datetime) -> Message:
+    """The note that a Founding Studio price ends, 14 days before it does.
+
+    `until` is the store's timestamp. Nothing in it is typed by a stranger.
+    """
+    day = until[:10]
+    parsed = datetime.fromisoformat(until)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    ended = now.astimezone(UTC) >= parsed.astimezone(UTC)
+    if ended:
+        subject = "Your Founding Studio price has ended"
+        text = (
+            f"Your Founding Studio price of EUR 149 a month ended on {day}. "
+            "The agency is now on the regular Studio price. Nothing else about "
+            "the agency changes."
+        )
+    else:
+        subject = "Your Founding Studio price ends soon"
+        text = (
+            f"Your Founding Studio price of EUR 149 a month ends on {day}. "
+            "After that the agency moves to the regular Studio price. Nothing else "
+            "about the agency changes."
+        )
+    return Message(
+        to=to,
+        subject=subject,
+        text=text + "\n",
+        link="",
+        kind="plan note",
+        html=layout(
+            title=subject,
+            preheader=text,
+            heading=subject,
+            body=[paragraph(esc(text))],
+            footer="This note is about your agency's plan on Flotta.",
+        ),
     )
 
 

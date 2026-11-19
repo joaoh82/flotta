@@ -85,9 +85,20 @@ def report(
     group: tuple[str, ...],
     client: str | None = None,
     box: str | None = None,
+    billed_only: bool = False,
 ) -> dict[str, Any]:
-    """The answer to `GET /api/orgs/{org}/usage`."""
-    window = {"since": since, "until": until, "client": client, "box": box}
+    """The answer to `GET /api/orgs/{org}/usage`.
+
+    `billed_only` is the hosted product's invoice: a founding trial's model
+    use is metered and shown to the agency, and left off that read.
+    """
+    window = {
+        "since": since,
+        "until": until,
+        "client": client,
+        "box": box,
+        "billed_only": billed_only,
+    }
     rows = [sum_dict(s) for s in store.usage_summary(org, group=group, **window)]
     if "client" in group:
         # What an invoice line names (FLOTTA-188): the client, as its agency called it.

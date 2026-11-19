@@ -61,6 +61,8 @@ GOVERN_ROUTES = frozenset(
         # FLOTTA-188: the usage totals an invoice's model spend is built from.
         # Sums only (`flotta.usage_report`), never the ledger's rows.
         ("GET", "/api/orgs/{org_id}/usage"),
+        # Checkout and the first paid invoice, so the funnel joins the sign-up.
+        ("POST", "/api/orgs/{org_id}/funnel"),
     }
 )
 #: What any valid credential may ask about itself: who it is and what it holds.

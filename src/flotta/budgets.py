@@ -167,6 +167,12 @@ def billing_window(org: Org | None, now: datetime) -> tuple[datetime, datetime]:
 
 def window(store: FleetStore, budget: Budget, now: datetime) -> tuple[datetime, datetime]:
     """When `budget`'s period holding `now` began and when it ends."""
+    if budget.trial_cap:
+        from flotta.founding import parse_instant
+
+        org = store.get_org(budget.org)
+        if org is not None and org.trial_from and org.trial_until:
+            return parse_instant(org.trial_from), parse_instant(org.trial_until)
     if budget.ceiling:
         return billing_window(store.get_org(budget.org), now)
     return period_start(budget.period, now), resets_at(budget.period, now)
@@ -220,6 +226,7 @@ def budget_dict(budget: Budget) -> dict[str, Any]:
         "fallback_model": budget.fallback_model,
         "starting_cap": budget.starting_cap,
         "ceiling": budget.ceiling,
+        "trial_cap": budget.trial_cap,
     }
 
 
@@ -311,6 +318,12 @@ class Standing:
 
     def sentence(self) -> str:
         details = self.details()
+        if self.budget.trial_cap:
+            return (
+                f"Org {self.budget.org}'s trial includes EUR {details['limit_eur']} of model "
+                f"use, and that is used up: EUR {details['spent_eur']} spent. "
+                f"The trial ends at {details['resets_at']}."
+            )
         if self.budget.ceiling:
             return (
                 f"Org {self.budget.org} has reached its spending ceiling of EUR "
@@ -326,14 +339,25 @@ class Standing:
 
 def standing(store: FleetStore, budget: Budget, now: datetime) -> Standing:
     since, resets = window(store, budget, now)
+    # The trial is over. Reporting it as empty keeps it from pausing the agency
+    # for the rest of the month: the cap applied while the trial ran, and the
+    # usage page still shows what was spent.
+    if budget.trial_cap and now.astimezone(UTC) >= resets:
+        return Standing(budget, 0, 0, since, resets)
     # A ceiling is what the agency owes: calls on its or its client's own
-    # provider key are never billed, so they never count (FLOTTA-241).
+    # provider key are never billed, so they never count (FLOTTA-241). A
+    # founding trial's model use is not owed either, so a ceiling and a
+    # starting cap skip rows that were left off the invoice. The trial cap
+    # itself counts those rows, and only model calls.
+    owed = budget.ceiling or budget.starting_cap
     spent = store.spend(
         org=budget.org,
         client=budget.client,
         box=budget.box,
         since=since,
-        key_scope="fleet" if budget.ceiling else None,
+        key_scope="fleet" if budget.ceiling or budget.trial_cap else None,
+        billed_only=owed,
+        kind="model" if budget.trial_cap else None,
     )
     return Standing(budget, spent.eur_nano, spent.unpriced, since, resets)
 
