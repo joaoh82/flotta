@@ -50,6 +50,9 @@ class Agent:
         self.unauthorized = 0
         self.script: list[dict] = [{"type": "done", "reply": "hello"}]
         self.threads: dict[str, list[dict]] = {}
+        #: Every answer as it arrived: (run id, approval id, choice).
+        self.answered: list[tuple[str, str, str]] = []
+        self.hang_threads = False
         self._answered: dict[str, asyncio.Event] = {}
 
     def _ok(self, request: Request) -> bool:
@@ -67,6 +70,8 @@ class Agent:
         async def threads(request):
             if not self._ok(request):
                 return JSONResponse({}, status_code=401)
+            if self.hang_threads:
+                await asyncio.sleep(30)
             rows = [{"id": t, "title": f"thread {t}", "updated_at": 1} for t in self.threads]
             return JSONResponse({"threads": list(reversed(rows))})
 
@@ -89,8 +94,12 @@ class Agent:
 
             async def stream():
                 for event in script:
+                    if "sleep" in event:
+                        await asyncio.sleep(event["sleep"])
+                        continue
                     if "wait" in event:
-                        gate = self._answered.setdefault(event["wait"], asyncio.Event())
+                        key = f"{body['run_id']}/{event['wait']}"
+                        gate = self._answered.setdefault(key, asyncio.Event())
                         await gate.wait()
                         continue
                     if event.get("die"):
@@ -107,7 +116,10 @@ class Agent:
                 return JSONResponse({}, status_code=401)
             body = await request.json()
             self.answers[body["id"]] = body["choice"]
-            self._answered.setdefault(body["id"], asyncio.Event()).set()
+            self.answered.append((request.path_params["rid"], body["id"], body["choice"]))
+            self._answered.setdefault(
+                f"{request.path_params['rid']}/{body['id']}", asyncio.Event()
+            ).set()
             return JSONResponse({"ok": True})
 
         return Starlette(
@@ -354,6 +366,8 @@ def test_an_answer_to_an_approval_this_socket_was_not_asked_never_reaches_the_ag
                 json.dumps({"jsonrpc": "2.0", "id": asked["id"], "result": {"choice": "once"}})
             )
             _rpc(other, 9, "request.answer", id=asked["id"], result={"choice": "once"})
+            # Told so, rather than told it was settled.
+            assert "error" in _until(other, lambda f: f.get("id") == 9)[0]
             _rpc(
                 other,
                 10,
@@ -586,3 +600,171 @@ def test_a_persons_conversation_is_recorded_as_a_chat_run_with_its_steps(agent):
     assert [s["kind"] for s in finished["steps"]] == ["tool", "approval"]
     assert plane.asked and plane.asked[0][1]["request_id"] == "a1"
     assert agent.answers == {"a1": "once"}
+
+
+# -- what review found (M17.2) -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [
+        (None, "deny"),
+        ("", "deny"),
+        ("yes please", "deny"),
+        ("deny", "deny"),
+        ("once", "once"),
+        ("session", "once"),
+        ("always", "once"),
+    ],
+)
+def test_only_a_yes_approves(given, sent):
+    from flotta.door.contract import contract_choice
+
+    assert contract_choice(given) == sent
+
+
+def test_an_answer_with_no_choice_reaches_the_agent_as_deny(agent):
+    from fastapi.testclient import TestClient
+
+    agent.script = [
+        {"type": "approval.request", "id": "a1", "description": "Refund"},
+        {"wait": "a1"},
+        {"type": "done", "reply": "ok"},
+    ]
+    with TestClient(_door(Plane(agent.port))) as client, _socket(client) as ws:
+        ws.receive_text()
+        _rpc(ws, 1, "session.create")
+        session = _until(ws, lambda f: f.get("id") == 1)[0]["result"]["session_id"]
+        _rpc(ws, 2, "prompt.submit", session_id=session, text="go")
+        asked, _ = _until(ws, lambda f: f.get("method") == "approval")
+        ws.send_text(json.dumps({"jsonrpc": "2.0", "id": asked["id"], "result": {}}))
+        _until(ws, lambda f: _kind(f) == "message.complete")
+    assert agent.answers == {"a1": "deny"}
+
+
+def test_a_hung_agent_does_not_freeze_the_conversation(agent, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import flotta.door.contract as contract
+
+    monkeypatch.setattr(contract, "REQUEST_TIMEOUT_S", 0.3)
+    agent.hang_threads = True
+    started = time.monotonic()
+    with TestClient(_door(Plane(agent.port))) as client, _socket(client, "relay") as ws:
+        ws.receive_text()
+        _rpc(ws, 1, "session.list")
+        listed = _until(ws, lambda f: f.get("id") == 1)[0]
+        # And the socket still answers what comes after.
+        _rpc(ws, 2, "session.create")
+        assert "result" in _until(ws, lambda f: f.get("id") == 2)[0]
+    assert listed["error"]["code"] == contract.UNAVAILABLE
+    assert time.monotonic() - started < 10
+
+
+def test_closing_the_tab_mid_turn_lets_the_agent_finish(agent):
+    from fastapi.testclient import TestClient
+
+    agent.script = [
+        {"type": "message.delta", "text": "Working"},
+        {"sleep": 0.6},
+        {"type": "done", "reply": "finished"},
+    ]
+    with TestClient(_door(Plane(agent.port))) as client:
+        with _socket(client, "relay") as ws:
+            ws.receive_text()
+            _rpc(ws, 1, "session.create")
+            session = _until(ws, lambda f: f.get("id") == 1)[0]["result"]["session_id"]
+            _rpc(ws, 2, "prompt.submit", session_id=session, text="a long task")
+            _until(ws, lambda f: _kind(f) == "message.delta")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(agent.threads.get(session, [])) < 2:
+            time.sleep(0.05)
+    assert agent.threads[session][-1] == {"role": "assistant", "text": "finished"}
+
+
+def test_two_runs_with_the_same_approval_id_are_answered_apart(agent):
+    from fastapi.testclient import TestClient
+
+    agent.script = [
+        {"type": "approval.request", "id": "1", "description": "x"},
+        {"wait": "1"},
+        {"type": "done", "reply": "ok"},
+    ]
+    with TestClient(_door(Plane(agent.port))) as client, _socket(client, "relay") as ws:
+        ws.receive_text()
+        sessions = []
+        for rid in (1, 2):
+            _rpc(ws, rid, "session.create")
+            sessions.append(
+                _until(ws, lambda f, r=rid: f.get("id") == r)[0]["result"]["session_id"]
+            )
+        first, second = sessions
+        _rpc(ws, 3, "prompt.submit", session_id=first, text="a")
+        _until(ws, lambda f: f.get("method") == "approval")
+        _rpc(ws, 4, "prompt.submit", session_id=second, text="b")
+        _until(ws, lambda f: f.get("method") == "approval")
+        _rpc(ws, 5, "approval.respond", session_id=first, request_id="1", choice="once")
+        _until(ws, lambda f: _kind(f) == "message.complete")
+        _rpc(ws, 6, "approval.respond", session_id=second, request_id="1", choice="deny")
+        _until(ws, lambda f: _kind(f) == "message.complete")
+    by_thread = {r["thread_id"]: r["run_id"] for r in agent.runs}
+    assert sorted(agent.answered) == sorted(
+        [(by_thread[first], "1", "once"), (by_thread[second], "1", "deny")]
+    )
+
+
+def test_the_run_loops_socket_delivers_one_run_at_a_time(agent):
+    from fastapi.testclient import TestClient
+
+    agent.script = [{"sleep": 0.5}, {"type": "done", "reply": "ok"}]
+    with TestClient(_door(Plane(agent.port))) as client, _socket(client) as ws:
+        ws.receive_text()
+        sessions = []
+        for rid in (1, 2):
+            _rpc(ws, rid, "session.create")
+            sessions.append(
+                _until(ws, lambda f, r=rid: f.get("id") == r)[0]["result"]["session_id"]
+            )
+        _rpc(ws, 3, "prompt.submit", session_id=sessions[0], text="a")
+        _rpc(ws, 4, "prompt.submit", session_id=sessions[1], text="b")
+        refused = _until(ws, lambda f: f.get("id") == 4)[0]
+        _until(ws, lambda f: _kind(f) == "message.complete")
+    assert "error" in refused
+    assert [r["run_id"] for r in agent.runs] == ["r-1"]
+
+
+def test_a_new_conversation_reopens_before_its_first_turn(agent):
+    from fastapi.testclient import TestClient
+
+    with TestClient(_door(Plane(agent.port))) as client:
+        with _socket(client, "relay") as ws:
+            ws.receive_text()
+            _rpc(ws, 1, "session.create")
+            session = _until(ws, lambda f: f.get("id") == 1)[0]["result"]["session_id"]
+        with _socket(client, "relay") as ws:
+            ws.receive_text()
+            _rpc(ws, 2, "session.resume", session_id=session)
+            resumed = _until(ws, lambda f: f.get("id") == 2)[0]
+    assert resumed["result"]["messages"] == []
+    assert resumed["result"]["status"] == "idle"
+
+
+def test_a_session_id_never_reaches_another_endpoint(agent):
+    from fastapi.testclient import TestClient
+
+    with TestClient(_door(Plane(agent.port))) as client, _socket(client, "relay") as ws:
+        ws.receive_text()
+        _rpc(ws, 1, "session.resume", session_id="x/../../healthz")
+        answer = _until(ws, lambda f: f.get("id") == 1)[0]
+    assert answer["error"]["code"] == 4007
+
+
+def test_a_bad_limit_lists_anyway(agent):
+    from fastapi.testclient import TestClient
+
+    agent.threads = {"t-a": [], "t-b": []}
+    with TestClient(_door(Plane(agent.port))) as client, _socket(client, "relay") as ws:
+        ws.receive_text()
+        _rpc(ws, 1, "session.list", limit="all")
+        listed = _until(ws, lambda f: f.get("id") == 1)[0]
+    assert len(listed["result"]["sessions"]) == 2

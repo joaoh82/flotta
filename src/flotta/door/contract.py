@@ -40,9 +40,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -63,6 +65,18 @@ SESSION_NOT_FOUND = 4007
 #: How long one contract request may take to begin answering. A run's stream
 #: may then take as long as the turn does: the caller's own deadline bounds it.
 CONNECT_TIMEOUT_S = 30.0
+#: How long a request that is not a run's stream may take to answer at all:
+#: listing threads, reading one, carrying an answer. A hung agent must not
+#: freeze the conversation behind it.
+REQUEST_TIMEOUT_S = 30.0
+#: The yes answers Hermes's callers give. Anything else, a missing choice
+#: included, is a no: an approval is never granted by a malformed answer.
+YES_CHOICES = frozenset({"once", "session", "always"})
+#: The thread ids this door mints in `session.create`. The agent has never
+#: heard of one until its first run, so a 404 for it is a new, empty thread.
+_MINTED = re.compile(r"t-[0-9a-f]{16}")
+#: How many threads `session.list` gives when the caller says nothing usable.
+DEFAULT_LIST_LIMIT = 200
 
 #: The methods a custom agent answers. Everything else is refused, by name.
 ANSWERED = frozenset(
@@ -82,8 +96,21 @@ ANSWERED = frozenset(
 
 
 def contract_choice(choice: Any) -> str:
-    """A person's answer as the contract takes it: `deny`, or `once` for any yes."""
-    return "deny" if choice == "deny" else "once"
+    """A person's answer as the contract takes it: `once` for a yes, else `deny`."""
+    return "once" if choice in YES_CHOICES else "deny"
+
+
+def _segment(value: str) -> str:
+    """One id as one URL path segment: never a way to another endpoint."""
+    return quote(value, safe="")
+
+
+def _limit(value: Any) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_LIST_LIMIT
+    return limit if limit > 0 else DEFAULT_LIST_LIMIT
 
 
 def _event(kind: str, session: str, payload: dict[str, Any]) -> str:
@@ -131,10 +158,11 @@ class ContractSocket:
         self._closed = False
         #: Live runs by contract run id: the thread each is in, and its task.
         self._runs: dict[str, tuple[str, asyncio.Task[None]]] = {}
-        #: The box's approval requests this socket asked: srq -> (run id, approval id).
-        self._asked: dict[str, tuple[str, str]] = {}
-        #: Approval ids -> srq, for `approval.respond`, which names the approval.
-        self._by_approval: dict[str, str] = {}
+        #: The box's approval requests this socket asked: srq -> (run, approval, thread).
+        self._asked: dict[str, tuple[str, str, str]] = {}
+        #: (thread, approval id) -> srq, for `approval.respond`, which names the
+        #: approval and its session. Two runs may each use the same approval id.
+        self._by_approval: dict[tuple[str, str], str] = {}
 
     # -- the websockets surface -------------------------------------------------
 
@@ -155,13 +183,22 @@ class ContractSocket:
             return
         self._closed = True
         for _, task in list(self._runs.values()):
-            task.cancel()
+            task.cancel()  # Held by the relay first, while any is running.
         for _, task in list(self._runs.values()):
             with contextlib.suppress(BaseException):
                 await task
         self._out.put_nowait(None)
         if self._own_client and self._client is not None:
             await self._client.aclose()
+
+    def running(self) -> bool:
+        """Whether a run is still going on: the relay holds the socket for it."""
+        return any(not task.done() for _, task in self._runs.values())
+
+    async def runs_over(self, *, every_s: float = 0.5) -> None:
+        """Until no run is going on here: what a held socket waits for."""
+        while self.running():
+            await asyncio.sleep(every_s)
 
     def __aiter__(self) -> AsyncIterator[str]:
         return self._frames()
@@ -229,22 +266,38 @@ class ContractSocket:
             if method == "session.most_recent":
                 newest = threads[0] if threads else None
                 return {"session_id": newest["id"] if newest else None, **(newest or {})}
-            return {"sessions": threads[: int(params.get("limit") or 200)]}
+            return {"sessions": threads[: _limit(params.get("limit"))]}
         if method == "session.resume":
             return await self._resume(params.get("session_id"))
         if method == "prompt.submit":
             return self._submit(params.get("session_id"), params.get("text"))
         if method == "request.answer":
             result = params.get("result") if isinstance(params.get("result"), dict) else {}
-            await self._answer(params.get("id"), result.get("choice"))
+            await self._answer_or_refuse(params.get("id"), result.get("choice"))
             return {}
         if method == "approval.respond":
-            srq = self._by_approval.get(str(params.get("request_id") or ""))
+            srq = self._approval_srq(params.get("request_id"), params.get("session_id"))
             if srq is None:
                 raise _Refused(METHOD_REFUSED, "no such approval is waiting here")
-            await self._answer(srq, params.get("choice"))
+            await self._answer_or_refuse(srq, params.get("choice"))
             return {}
         raise _Refused(METHOD_REFUSED, f"this agent does not offer {method}")  # pragma: no cover
+
+    def _approval_srq(self, approval: Any, thread: Any) -> str | None:
+        """The request an `approval.respond` answers: by its session when it names
+        one, else only when exactly one waiting approval has that id."""
+        approval = str(approval or "")
+        if isinstance(thread, str) and thread:
+            return self._by_approval.get((thread, approval))
+        matches = [srq for (_, a), srq in self._by_approval.items() if a == approval]
+        return matches[0] if len(matches) == 1 else None
+
+    async def _answer_or_refuse(self, srq: Any, choice: Any) -> None:
+        carried = await self._answer(srq, choice)
+        if carried == "unknown":
+            raise _Refused(METHOD_REFUSED, "no such approval is waiting here")
+        if carried == "refused":
+            raise _Refused(UNAVAILABLE, "the agent did not take the answer")
 
     async def _threads(self) -> list[dict[str, Any]]:
         response = await self._get("/threads")
@@ -265,12 +318,15 @@ class ContractSocket:
     async def _resume(self, thread: Any) -> dict[str, Any]:
         if not isinstance(thread, str) or not thread:
             raise _Refused(SESSION_NOT_FOUND, "session not found")
-        response = await self._get(f"/threads/{thread}")
+        response = await self._get(f"/threads/{_segment(thread)}")
         if response.status_code == 404:
-            raise _Refused(SESSION_NOT_FOUND, "session not found")
-        if response.status_code != 200:
+            if not _MINTED.fullmatch(thread):
+                raise _Refused(SESSION_NOT_FOUND, "session not found")
+            # Made here and not yet run: the agent has not heard of it.
+            response = None
+        if response is not None and response.status_code != 200:
             raise _Refused(UNAVAILABLE, f"the agent answered {response.status_code}")
-        body = response.json()
+        body = response.json() if response is not None else {}
         messages = [
             {"role": m.get("role"), "text": str(m.get("text") or "")}
             for m in body.get("messages") or []
@@ -291,6 +347,10 @@ class ContractSocket:
             raise _Refused(SESSION_NOT_FOUND, "session not found")
         if any(t == thread and not task.done() for t, task in self._runs.values()):
             raise _Refused(UNAVAILABLE, "the agent is still answering in this conversation")
+        if self._flotta_run is not None and self.running():
+            # The run loop's socket delivers one Flotta run, under its own id:
+            # a second at once would share it, and the agent could not tell them apart.
+            raise _Refused(UNAVAILABLE, "this run is already being delivered")
         run = self._flotta_run or f"turn-{uuid.uuid4().hex[:16]}"
         task = asyncio.create_task(self._stream(run, thread, str(text or "")))
         self._runs[run] = (thread, task)
@@ -372,8 +432,8 @@ class ContractSocket:
         elif kind == "approval.request":
             approval = str(event.get("id") or uuid.uuid4().hex[:8])
             srq = f"srq-{run}-{approval}"
-            self._asked[srq] = (run, approval)
-            self._by_approval[approval] = srq
+            self._asked[srq] = (run, approval, thread)
+            self._by_approval[(thread, approval)] = srq
             self._say(
                 json.dumps(
                     {
@@ -400,31 +460,34 @@ class ContractSocket:
             return {"status": "error", "text": str(event.get("message") or "the agent failed")}
         return None
 
-    async def _answer(self, srq: Any, choice: Any) -> None:
-        """A person's answer to one of the agent's approvals, carried to the agent."""
+    async def _answer(self, srq: Any, choice: Any) -> str:
+        """A person's answer to one of the agent's approvals, carried to the agent.
+        `carried`, `unknown` (not one of this socket's: never carried) or `refused`."""
         asked = self._asked.pop(srq, None) if isinstance(srq, str) else None
         if asked is None:
-            return  # Not one of this socket's: never carried.
-        run, approval = asked
-        self._by_approval.pop(approval, None)
+            return "unknown"
+        run, approval, thread = asked
+        self._by_approval.pop((thread, approval), None)
         try:
             response = await self._post(
-                f"/run/{run}/approval", {"id": approval, "choice": contract_choice(choice)}
+                f"/run/{_segment(run)}/approval",
+                {"id": approval, "choice": contract_choice(choice)},
             )
-            if response.status_code >= 400:
-                _log.warning(
-                    "the agent refused the answer to %s: %s", approval, response.status_code
-                )
         except Exception as exc:  # noqa: BLE001 - the run's stream says what came of it
             _log.warning("the answer to %s did not reach the agent: %s", approval, exc)
+            return "refused"
+        if response.status_code >= 400:
+            _log.warning("the agent refused the answer to %s: %s", approval, response.status_code)
+            return "refused"
+        return "carried"
 
     def _withdraw(self, run: str) -> None:
         """A run ended with approvals open: each is taken down, as Hermes does."""
-        for srq, (asked_run, approval) in list(self._asked.items()):
+        for srq, (asked_run, approval, thread) in list(self._asked.items()):
             if asked_run != run:
                 continue
             del self._asked[srq]
-            self._by_approval.pop(approval, None)
+            self._by_approval.pop((thread, approval), None)
             self._say(
                 json.dumps(
                     {
@@ -443,11 +506,15 @@ class ContractSocket:
 
     async def _get(self, path: str) -> httpx.Response:
         assert self._client is not None
-        return await self._client.get(f"{self._base}{path}", headers=self._headers)
+        return await self._client.get(
+            f"{self._base}{path}", headers=self._headers, timeout=REQUEST_TIMEOUT_S
+        )
 
     async def _post(self, path: str, body: dict[str, Any]) -> httpx.Response:
         assert self._client is not None
-        return await self._client.post(f"{self._base}{path}", json=body, headers=self._headers)
+        return await self._client.post(
+            f"{self._base}{path}", json=body, headers=self._headers, timeout=REQUEST_TIMEOUT_S
+        )
 
 
 class _Refused(Exception):

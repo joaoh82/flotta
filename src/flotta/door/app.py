@@ -1899,6 +1899,11 @@ def create_door(
                                     # only this socket can carry to the agent: keep it.
                                     left.set()
                                     return
+                                if custom and upstream.running():
+                                    # A custom agent's turn lasts as long as its
+                                    # request: closing would end it halfway (M17.2).
+                                    left.set()
+                                    return
                                 await upstream.close()
                                 return
                             frame = message.get("text")
@@ -1938,7 +1943,7 @@ def create_door(
                     done, pending = await asyncio.wait(
                         [person, agent, heartbeat], return_when=asyncio.FIRST_COMPLETED
                     )
-                    if left.is_set() and turns is not None:
+                    if left.is_set():
                         # The person left mid-turn, with an approval of theirs still
                         # waiting (FLOTTA-204). Keep the agent's socket, the answer
                         # poll and the keep-awake beat until the turn ends, the agent
@@ -1948,7 +1953,9 @@ def create_door(
                         _log.info(
                             "%s's person left mid-turn awaiting an answer; holding", target.name
                         )
-                        over = asyncio.create_task(turns.asked_turns_over())
+                        over = asyncio.create_task(
+                            upstream.runs_over() if custom else turns.asked_turns_over()  # type: ignore[union-attr]
+                        )
                         done, pending = await asyncio.wait(
                             [agent, heartbeat, over],
                             timeout=HELD_AFTER_LEAVING_S,
