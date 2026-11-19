@@ -463,8 +463,13 @@ class OrgNotActiveError(StoreError):
 SUSPENDED_HINT = "an owner can settle its payment in billing to resume it"
 
 
+CLOSED_HINT = "its account was closed"
+
+
 def suspended_refusal(org: Org, doing: str) -> str:
-    """Why a suspended org may not do `doing`, in words a person can act on."""
+    """Why a suspended or closed org may not do `doing`, in words a person can act on."""
+    if org.status == "closed":
+        return f"org {org.id!r} is closed, so it cannot {doing}; {CLOSED_HINT}"
     return f"org {org.id!r} is suspended, so it cannot {doing}; {SUSPENDED_HINT}"
 
 
@@ -620,6 +625,16 @@ class Org:
     #: When its current billing period began, as billing last said (FLOTTA-241):
     #: the ceiling's window. `None` is the calendar month.
     billing_period_from: str | None = None
+    #: When it was closed and by whom (FLOTTA-224), while `status` is `closed`:
+    #: `closed_by` is one of `CLOSED_BY`. Its rows are deleted
+    #: `FLOTTA_CLOSED_RETENTION_DAYS` after `closed_at`. See `FleetStore.close_org`.
+    closed_at: str | None = None
+    closed_by: str | None = None
+
+    @property
+    def held(self) -> bool:
+        """Whether nothing of it may run or be created: suspended, or closed."""
+        return self.status in ("suspended", "closed")
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -773,7 +788,84 @@ LINK_PURPOSES = frozenset({"sign_in", "invite", "sign_up"})
 #: An org's lifecycle (M12.4). `pending` is a sign-up waiting for the operator,
 #: who makes it `active` or `declined`; both are final. An org made by the
 #: operator starts `active`.
-ORG_STATUSES = ("pending", "active", "declined", "suspended")
+ORG_STATUSES = ("pending", "active", "declined", "suspended", "closed")
+
+#: Who closed an org (FLOTTA-224): the operator, or the org's own owner.
+CLOSED_BY = ("operator", "owner")
+
+#: The tables whose rows belong to an org only through one of its boxes, which
+#: `purge_org` deletes by box (FLOTTA-224).
+PURGED_BY_BOX = (
+    "box_mcp_config_pending",
+    "box_mcp_grants",
+    "box_meta",
+    "box_models",
+    "box_peer_blocks",
+    "box_pr_policy",
+    "box_repos",
+    "box_request_policy",
+    "box_rules",
+    "client_approvers",
+    "client_conversations",
+    "client_screen_control",
+    "machine_meter_marks",
+)
+
+#: Every table, and how `purge_org` reaches its rows (FLOTTA-224): `org` by the
+#: org's id, `box` through its boxes, `entity` through its boxes, tasks and
+#: workspaces, `user` for people left in no org, and `global` for the fleet's
+#: own (no org's data). A test fails for a table not listed here, so a new
+#: table is purged on purpose, never by accident.
+PURGED_BY: dict[str, str] = {
+    **{table: "box" for table in PURGED_BY_BOX},
+    "events": "entity",
+    "trigger_fires": "trigger",
+    "tasks": "org",
+    "workspaces": "box",
+    **{
+        table: "org"
+        for table in (
+            "alert_deliveries",
+            "api_keys",
+            "boxes",
+            "budget_events",
+            "budgets",
+            "client_report_settings",
+            "client_reports",
+            "client_spend_shown",
+            "clients",
+            "github_installations",
+            "handoffs",
+            "login_links",
+            "mcp_calls",
+            "mcp_connections",
+            "mcp_oauth_flows",
+            "memberships",
+            "org_alerts",
+            "org_branding",
+            "orgs",
+            "pull_requests",
+            "report_notices",
+            "requests",
+            "run_approvals",
+            "sessions",
+            "triggers",
+            "usage",
+        )
+    },
+    "users": "user",
+    **{
+        table: "global"
+        for table in (
+            "builds",
+            "eur_rates",
+            "mcp_server_secrets",
+            "model_prices",
+            "schema_migrations",
+            "settings",
+        )
+    },
+}
 
 #: Which level's key paid for a model call (D19).
 KEY_SCOPES = frozenset({"fleet", "org", "client"})
@@ -1774,8 +1866,9 @@ class FleetStore:
         tenancy is written in the same statement as the name — there is no
         moment at which a box exists without an owner.
 
-        No transaction around the client check: clients are never deleted, and
-        the insert cannot make one disappear.
+        No transaction around the client check: a client is deleted only with
+        its org, by `purge_org`, long after the org closed, and a closed org
+        creates nothing (FLOTTA-224); the insert cannot make one disappear.
         """
         org = validate_tenant_id(org, kind="org")
         client = validate_tenant_id(client, kind="client")
@@ -1940,6 +2033,8 @@ class FleetStore:
                     if org.status == "pending"
                     else f"it cannot create agents; {SUSPENDED_HINT}"
                     if org.status == "suspended"
+                    else f"it cannot create agents; {CLOSED_HINT}"
+                    if org.status == "closed"
                     else "it cannot create agents"
                 )
             )
@@ -1950,7 +2045,7 @@ class FleetStore:
     def org_counts(self, org_id: str) -> dict[str, int]:
         """What `org_id` holds of each of `LIMIT_KINDS`, as its limits count it.
 
-        Clients are every client it has (clients are never deleted), seats its
+        Clients are every client it has (deleted only with the org), seats its
         owners and members, agents its boxes that are not torn down.
         """
         clients = self._conn.execute(
@@ -2193,6 +2288,206 @@ class FleetStore:
         """
         return self._set_suspended(org_id, False, by=by, as_billing=as_billing)
 
+    # -- closing an org (FLOTTA-224) -----------------------------------------
+
+    def close_org(self, org_id: str, *, by: str) -> tuple[Org, bool]:
+        """Close an org: `(org, changed)`. Its data is deleted later, by `purge_org`.
+
+        In one transaction: the status becomes `closed`, every session of the
+        org ends, its sign-in and invite links are deleted, and its triggers stop
+        firing. Destroying its agents' machines is the caller's next step
+        (`provision.close_org_agents`), outside the transaction, because it
+        reaches the substrate; the purge sweep retries any that failed.
+
+        `by` is one of `CLOSED_BY`. Closing a closed org changes nothing and
+        answers `changed=False`. The default org is the operator's own fleet
+        and is never closed.
+        """
+        if by not in CLOSED_BY:
+            raise ValueError(f"an org is closed by one of {CLOSED_BY}, not {by!r}")
+        # `users` too: `create_session` checks the org under it, so a sign-in
+        # either lands before this and its session is deleted here, or after
+        # and is refused.
+        with self._conn.transaction(guard=("orgs", "users")):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.id == DEFAULT_ORG:
+                raise InvalidTransitionError(
+                    "the default org is the operator's own fleet; it is never closed"
+                )
+            if org.status == "closed":
+                return org, False
+            self._conn.execute(
+                "UPDATE orgs SET status = 'closed', closed_at = ?, closed_by = ? WHERE id = ?",
+                (_utcnow(), by, org_id),
+            )
+            self._conn.execute("DELETE FROM sessions WHERE org_id = ?", (org_id,))
+            self._conn.execute("DELETE FROM login_links WHERE org_id = ?", (org_id,))
+            self._conn.execute("UPDATE triggers SET enabled = 0 WHERE org_id = ?", (org_id,))
+            for box in self.list_boxes_in(org_id):
+                if box.status not in BOX_TERMINAL:
+                    self.add_event("box", box.id, "org_closed", {"by": by})
+        closed = self.get_org(org_id)
+        assert closed is not None
+        return closed, True
+
+    def reopen_org(self, org_id: str) -> Org:
+        """Undo a close before the purge: the org is suspended by the operator.
+
+        Its agents are gone, destroyed when it closed; its people, clients and
+        records are back. An owner signs in and chooses a plan, or the operator
+        resumes it. Anything but a closed org is `InvalidTransitionError`.
+        """
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.status != "closed":
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is {org.status}; only a closed org can be reopened"
+                )
+            self._conn.execute(
+                "UPDATE orgs SET status = 'suspended', suspended_at = ?, suspend_reason = ?, "
+                "suspended_by = ?, closed_at = NULL, closed_by = NULL WHERE id = ?",
+                (_utcnow(), "reopened after it was closed", OPERATOR, org_id),
+            )
+        reopened = self.get_org(org_id)
+        assert reopened is not None
+        return reopened
+
+    def orgs_to_purge(self, *, days: float, now: datetime | None = None) -> list[Org]:
+        """The closed orgs whose `closed_at` is at least `days` ago."""
+        moment = now or datetime.now(UTC)
+        due = moment - timedelta(days=days)
+        return [
+            org
+            for org in self.list_orgs(status="closed")
+            if org.id != DEFAULT_ORG
+            and org.closed_at is not None
+            and datetime.fromisoformat(org.closed_at) <= due
+        ]
+
+    def purge_org(self, org_id: str) -> dict[str, int]:
+        """Delete every row of a closed org, and the people who belong to nothing else.
+
+        What closing promised: nothing of it is kept. Its invoices are Stripe's,
+        not ours. Refuses an org that isn't closed, the default org, and one
+        with an agent that isn't torn down, since a row is the only handle on a
+        machine that may still be billing. Returns how many rows went from
+        each table, which is what the caller logs: counts, never names.
+
+        Every table is in `PURGED_BY` (a test fails for one that isn't), and
+        foreign keys don't cascade, so children go before their parents.
+        """
+        counts: dict[str, int] = {}
+
+        def gone(table: str, where: str, args: tuple[Any, ...]) -> None:
+            # Counted first: `execute` returns rows, not a row count, on both engines.
+            n = self._conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE {where}", args
+            ).fetchone()["n"]
+            if n:
+                self._conn.execute(f"DELETE FROM {table} WHERE {where}", args)
+                counts[table] = counts.get(table, 0) + int(n)
+
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.id == DEFAULT_ORG:
+                raise InvalidTransitionError("the default org is never purged")
+            if org.status != "closed":
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is {org.status}; only a closed org is purged"
+                )
+            live = [b.id for b in self.list_boxes_in(org_id) if b.status != "torn_down"]
+            if live:
+                raise InvalidTransitionError(
+                    f"org {org_id!r} still has {len(live)} agent(s) not torn down; "
+                    "they are destroyed before anything of it is deleted"
+                )
+            boxes = "SELECT id FROM boxes WHERE org_id = ?"
+            tasks = f"SELECT id FROM tasks WHERE org_id = ? OR box_id IN ({boxes})"
+            workspaces = f"SELECT id FROM workspaces WHERE box_id IN ({boxes})"
+            o: tuple[Any, ...] = (org_id,)
+            for table in PURGED_BY_BOX:
+                if table == "box_peer_blocks":
+                    gone(table, f"box_id IN ({boxes}) OR peer_id IN ({boxes})", o + o)
+                else:
+                    gone(table, f"box_id IN ({boxes})", o)
+            gone("events", f"entity_kind = 'box' AND entity_id IN ({boxes})", o)
+            gone("events", f"entity_kind = 'task' AND entity_id IN ({tasks})", o + o)
+            gone("events", f"entity_kind = 'workspace' AND entity_id IN ({workspaces})", o)
+            gone("alert_deliveries", "org_id = ?", o)
+            gone("budget_events", "org_id = ?", o)
+            gone("trigger_fires", "trigger_id IN (SELECT id FROM triggers WHERE org_id = ?)", o)
+            for table in ("run_approvals", "requests", "handoffs", "pull_requests", "mcp_calls"):
+                gone(table, "org_id = ?", o)
+            gone("usage", "org_id = ?", o)
+            gone("api_keys", "org_id = ?", o)
+            gone("triggers", "org_id = ?", o)
+            gone("budgets", "org_id = ?", o)
+            gone("tasks", f"org_id = ? OR box_id IN ({boxes})", o + o)
+            gone("workspaces", f"box_id IN ({boxes})", o)
+            for table in (
+                "mcp_oauth_flows",
+                "mcp_connections",
+                "client_spend_shown",
+                "client_report_settings",
+                "client_reports",
+                "report_notices",
+                "org_alerts",
+                "org_branding",
+                "login_links",
+                "sessions",
+            ):
+                gone(table, "org_id = ?", o)
+            gone("github_installations", "org = ?", o)
+            members = [
+                r["user_id"]
+                for r in self._conn.execute(
+                    "SELECT user_id FROM memberships WHERE org_id = ?", o
+                ).fetchall()
+            ]
+            gone("memberships", "org_id = ?", o)
+            gone("boxes", "org_id = ?", o)
+            gone("clients", "org_id = ?", o)
+            for user_id in members:
+                left = self._conn.execute(
+                    "SELECT 1 FROM memberships WHERE user_id = ?", (user_id,)
+                ).fetchone()
+                if left is None:
+                    row = self._conn.execute(
+                        "SELECT email FROM users WHERE id = ?", (user_id,)
+                    ).fetchone()
+                    gone("sessions", "user_id = ?", (user_id,))
+                    if row is not None:
+                        gone("login_links", "email = ?", (row["email"],))
+                    gone("users", "id = ?", (user_id,))
+            gone("orgs", "id = ?", o)
+        return {table: n for table, n in counts.items() if n}
+
+    def purge_expired_access(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Delete expired sessions and sign-in and invite links: `{table: count}`.
+
+        Nothing reads them once they expire (`session` and `redeem` refuse
+        them), so keeping them only keeps who signed in, and when.
+        """
+        moment = now or datetime.now(UTC)
+        counts: dict[str, int] = {}
+        for table, key in (("sessions", "id_hash"), ("login_links", "token_hash")):
+            rows = self._conn.execute(f"SELECT {key}, expires_at FROM {table}").fetchall()
+            expired = [r[key] for r in rows if datetime.fromisoformat(r["expires_at"]) <= moment]
+            # Guarded like every other write here: two sweeps (two control
+            # planes during a deploy) deleting the same rows serialise.
+            with self._conn.transaction(guard=table):
+                for value in expired:
+                    self._conn.execute(f"DELETE FROM {table} WHERE {key} = ?", (value,))
+            if expired:
+                counts[table] = len(expired)
+        return counts
+
     def _set_suspended(
         self,
         org_id: str,
@@ -2265,21 +2560,21 @@ class FleetStore:
         return changed, True
 
     def _refuse_suspended(self, org_id: str, doing: str) -> None:
-        """`OrgNotActiveError` if `org_id` is suspended. For the creates that a
-        pending org may still do (clients, invites, seats), which a suspended
+        """`OrgNotActiveError` if `org_id` is suspended or closed. For the creates
+        that a pending org may still do (clients, invites, seats), which a held
         one may not."""
         org = self.get_org(org_id)
-        if org is not None and org.status == "suspended":
+        if org is not None and org.held:
             raise OrgNotActiveError(suspended_refusal(org, doing))
 
     def create_client(self, org_id: str, client_id: str, name: str) -> Client:
         """Insert a client of `org_id`. Its id is unique within the org only.
 
         Under the clients guard, for the org's limit on clients (FLOTTA-183):
-        two adds racing for the last one cannot both see it free. Orgs are
-        never deleted, so the org cannot disappear between the read and the
-        insert, and the foreign key refuses the insert on both engines if it
-        somehow did.
+        two adds racing for the last one cannot both see it free. An org is
+        deleted only by `purge_org`, after it closed, and a closed org adds no
+        client (FLOTTA-224), so it cannot disappear between the read and the
+        insert; the foreign key refuses the insert on both engines if it did.
         """
         client_id = validate_tenant_id(client_id, kind="client")
         name = _tenant_name(name, kind="client")
@@ -2819,7 +3114,7 @@ class FleetStore:
                 raise UnknownEntityError(f"no org with id {org_id!r}")
             if org.status == "declined":
                 raise OrgNotActiveError(f"org {org_id!r} was declined; it cannot invite anyone")
-            if org.status == "suspended":
+            if org.held:
                 raise OrgNotActiveError(suspended_refusal(org, "invite anyone"))
             if client_id is not None and self.get_client(org_id, client_id) is None:
                 raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
@@ -2934,6 +3229,11 @@ class FleetStore:
                 raise InvalidAccountError(f"user {user_id!r} is disabled")
             if self.membership(user_id, org_id) is None:
                 raise UnknownEntityError(f"user {user_id!r} is not a member of org {org_id!r}")
+            # Closed (FLOTTA-224): nobody signs in to it again. Under the same
+            # guard `close_org` takes, so a session can't slip in as it closes.
+            org = self.get_org(org_id)
+            if org is not None and org.status == "closed":
+                raise InvalidAccountError(f"org {org_id!r} is closed")
             self._conn.execute(
                 "INSERT INTO sessions (id_hash, user_id, org_id, created_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -7744,6 +8044,8 @@ def _org_from_row(row: db.Row) -> Org:
         spend_ceiling_eur_nano=_maybe_int(row.get("spend_ceiling_eur_nano")),
         spend_ceiling_set_at=row.get("spend_ceiling_set_at"),
         billing_period_from=row.get("billing_period_from"),
+        closed_at=row.get("closed_at"),
+        closed_by=row.get("closed_by"),
     )
 
 

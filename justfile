@@ -375,6 +375,15 @@ org-lift-cap ORG:
 org-ceiling ORG *ARGS:
     uv run flotta org ceiling {{ORG}} {{ARGS}}
 
+# FLOTTA-224 — close an org: its people signed out, its agents destroyed, and
+# everything else deleted 30 days later. `just org-close <org> --confirm <org>`
+org-close ORG *ARGS:
+    uv run flotta org close {{ORG}} {{ARGS}}
+
+# FLOTTA-224 — undo a close before its data is deleted; it comes back suspended
+org-reopen ORG:
+    uv run flotta org reopen {{ORG}}
+
 # M12.4 — sign-ups waiting for an answer, and the answer
 org-pending:
     uv run flotta org list --pending

@@ -1284,6 +1284,18 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE orgs ADD COLUMN billing_period_from TEXT",
         ),
     ),
+    Migration(
+        41,
+        "closing an org: when it was closed and by whom",
+        # FLOTTA-224. A closed org's agents are destroyed at once and its rows
+        # deleted `FLOTTA_CLOSED_RETENTION_DAYS` after `closed_at`, by the
+        # purge sweep. `closed_by` is a kind (`operator` or `owner`), never a
+        # person. The status is `orgs.status`, which has no CHECK to widen.
+        (
+            "ALTER TABLE orgs ADD COLUMN closed_at TEXT",
+            "ALTER TABLE orgs ADD COLUMN closed_by TEXT",
+        ),
+    ),
 )
 
 

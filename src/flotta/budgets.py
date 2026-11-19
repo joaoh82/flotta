@@ -382,7 +382,7 @@ def check_budgets(
     suspended, before the sweep puts its machine to sleep.
     """
     org = store.get_org(box.org)
-    if org is not None and org.status == "suspended":
+    if org is not None and org.held:
         return Refusal(
             "org_suspended",
             suspended_refusal(org, "call a model"),

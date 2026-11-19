@@ -227,6 +227,17 @@ SETTINGS: tuple[Setting, ...] = (
         default=SPEND_CEILING_EUR_DEFAULT,
     ),
     Setting(
+        key="FLOTTA_CLOSED_RETENTION_DAYS",
+        label="Keep closed accounts for",
+        help=(
+            "Days a closed agency's records are kept before they are deleted for "
+            "good: its people, clients, usage, runs and events. Its agents are "
+            "destroyed when it closes. Until then the operator can reopen it."
+        ),
+        kind="int",
+        default="30",
+    ),
+    Setting(
         key="FLOTTA_FLY_VOLUME_GB",
         label="Disk per agent",
         help=(

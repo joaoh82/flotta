@@ -64,7 +64,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from flotta import budgets as budget_rules
@@ -86,11 +86,13 @@ from flotta.github import GITHUB_TOKEN_ENV
 from flotta.rules import Rules, config_changes, rules_from_json
 from flotta.runs import RUN_DEADLINE_S
 from flotta.store import (
+    CLOSED_HINT,
     INSTRUCTIONS_CHANGED,
     SUSPENDED_HINT,
     Box,
     FleetStore,
     InvalidTransitionError,
+    Org,
     Task,
     UnknownEntityError,
     box_label,
@@ -3713,13 +3715,15 @@ def _refuse_held(store: FleetStore, box: Box) -> None:
     if box.status == "paused":
         raise BoxPaused(f"{box.name} is paused by budget, so it was not woken.")
     org = store.get_org(box.org)
-    if org is not None and org.status == "suspended":
-        raise OrgSuspended(suspended_wake_message(box, org.id))
+    if org is not None and org.held:
+        raise OrgSuspended(suspended_wake_message(box, org))
 
 
-def suspended_wake_message(box: Box, org_id: str) -> str:
-    """What the door says when it closes a suspended org's conversation."""
-    return f"{box.name} was not woken: org {org_id!r} is suspended. {SUSPENDED_HINT.capitalize()}."
+def suspended_wake_message(box: Box, org: Org) -> str:
+    """What the door says when it closes a suspended or closed org's conversation."""
+    if org.status == "closed":
+        return f"{box.name} was not woken: org {org.id!r} is closed. {CLOSED_HINT.capitalize()}."
+    return f"{box.name} was not woken: org {org.id!r} is suspended. {SUSPENDED_HINT.capitalize()}."
 
 
 def wake_box(
@@ -4660,6 +4664,94 @@ def sleep_suspended_orgs(
             except (ProvisionError, BackendError) as exc:
                 _log.warning("could not put %s of suspended %s to sleep: %s", box.name, org.id, exc)
                 outcomes.append({"box_id": box.id, "error": str(exc)})
+    return outcomes
+
+
+def close_org_agents(
+    store: FleetStore,
+    *,
+    org_id: str | None = None,
+    backend: Backend | None = None,
+) -> list[dict[str, Any]]:
+    """Destroy every agent of a closed org, machine and volume (FLOTTA-224).
+
+    `org_id` for the org just closed (the close route runs it after
+    answering); without it, every closed org, from the reconcile loop, which is
+    how a teardown the substrate refused comes round again. Closing promised
+    the agents go at once: their memory is the agency's data too.
+    """
+    if org_id is not None:
+        org = store.get_org(org_id)
+        orgs = [org] if org is not None and org.status == "closed" else []
+    else:
+        orgs = store.list_orgs(status="closed")
+    outcomes: list[dict[str, Any]] = []
+    for org in orgs:
+        for box in store.list_boxes_in(org.id):
+            if box.status == "torn_down":
+                continue
+            try:
+                teardown_box(box.id, store=store, reason="org_closed", backend=backend)
+                outcomes.append({"box_id": box.id, "destroyed": True})
+            except (ProvisionError, BackendError) as exc:
+                _log.warning("could not destroy %s of closed %s: %s", box.name, org.id, exc)
+                outcomes.append({"box_id": box.id, "error": str(exc)})
+    return outcomes
+
+
+#: How long a closed org's rows are kept before `purge_closed_orgs` deletes them
+#: (FLOTTA-224), unless the fleet setting says otherwise.
+DEFAULT_CLOSED_RETENTION_DAYS = 30.0
+
+
+def resolve_closed_retention_days(env: Mapping[str, str] | None) -> float:
+    """`FLOTTA_CLOSED_RETENTION_DAYS`, or 30. Never negative: a typo deletes nothing early."""
+    raw = ((env or {}).get("FLOTTA_CLOSED_RETENTION_DAYS") or "").strip()
+    try:
+        days = float(raw) if raw else DEFAULT_CLOSED_RETENTION_DAYS
+    except ValueError:
+        return DEFAULT_CLOSED_RETENTION_DAYS
+    return days if math.isfinite(days) and days >= 0 else DEFAULT_CLOSED_RETENTION_DAYS
+
+
+def purge_after(store: FleetStore, org: Org) -> str | None:
+    """When a closed org's rows are deleted, as an ISO time; `None` if it isn't closed."""
+    if org.status != "closed" or org.closed_at is None:
+        return None
+    days = resolve_closed_retention_days(_settings_env(store))
+    return (datetime.fromisoformat(org.closed_at) + timedelta(days=days)).isoformat()
+
+
+def purge_closed_orgs(
+    store: FleetStore,
+    *,
+    backend: Backend | None = None,
+    now: datetime | None = None,
+    days: float | None = None,
+) -> list[dict[str, Any]]:
+    """The reconcile loop's deletions (FLOTTA-224).
+
+    Every sweep: expired sessions and sign-in links go, and a closed org's
+    agents are destroyed if an earlier attempt failed. A closed org past its
+    retention period then has every row deleted (`FleetStore.purge_org`), once
+    none of its agents is left; until then it waits for the next sweep. What is
+    logged is the org's id and row counts, never a name or an address.
+    """
+    retention = days if days is not None else resolve_closed_retention_days(_settings_env(store))
+    outcomes: list[dict[str, Any]] = []
+    expired = store.purge_expired_access(now=now)
+    if expired:
+        outcomes.append({"expired": expired})
+    outcomes.extend(close_org_agents(store, backend=backend))
+    for org in store.orgs_to_purge(days=retention, now=now):
+        try:
+            counts = store.purge_org(org.id)
+        except InvalidTransitionError as exc:
+            _log.warning("not purging closed %s yet: %s", org.id, exc)
+            outcomes.append({"org": org.id, "waiting": str(exc)})
+            continue
+        _log.info("purged closed org %s: %s", org.id, counts)
+        outcomes.append({"org": org.id, "purged": counts})
     return outcomes
 
 
