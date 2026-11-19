@@ -1509,6 +1509,7 @@ def create_box(
         store.add_event(
             "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
         )
+        _note_agent_created(store, box)
         return {
             "box_id": box.id,
             "endpoint": handle.endpoint,
@@ -1527,12 +1528,23 @@ def create_box(
         "stopped",
         {"endpoint": handle.endpoint, "machine_id": handle.id, "reason": detail},
     )
+    _note_agent_created(store, box)
     raise BoxNotRunning(
         f"box {box.id} was created ({handle.endpoint}) but is not running: {detail}. "
         f"It is recorded as stopped; `flotta start {box.id}` will retry.",
         box_id=box.id,
         endpoint=handle.endpoint,
     )
+
+
+def _note_agent_created(store: FleetStore, box: Box) -> None:
+    """`agent_created` for the funnel. Never fails the provision."""
+    try:
+        from flotta.analytics import agent_created
+
+        agent_created(store, box)
+    except Exception:
+        _log.exception("could not record agent_created for %s", box.id)
 
 
 def _peek_endpoint(impl: Backend, box_name: str | None = None) -> str | None:

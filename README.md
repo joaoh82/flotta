@@ -56,7 +56,7 @@ Each item names where it lives in this repository.
 - **People and sign-in.** Users, memberships and sign-in by emailed link. Roles are `owner`,
   `member`, `client_user` (talks to the client's agents) and `client_viewer` (reads the work done for the client, and answers
   the approvals the agency lets it).
-  A new sign-up is a `pending` org that cannot create an agent until the operator approves it.
+  A new sign-up is a `pending` org that cannot create an agent until it is approved: on a self-hosted fleet the operator approves it, and the managed product approves it through billing once the agency starts a plan.
   (`src/flotta/control/app.py`, `src/flotta/test_accounts.py`)
 - **One machine and one memory per agent.** A Fly Machine with a volume at `/data/hermes`, so
   memory survives sleep, restarts and image updates. Idle agents are suspended and the next

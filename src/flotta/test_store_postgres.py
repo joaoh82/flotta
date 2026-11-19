@@ -503,3 +503,38 @@ def test_a_grants_source_keeps_the_operators_word_on_postgres(pg_store):
 
     assert pg_store.may_spend_fleet_token(box.id, "same/repo")
     assert not pg_store.may_spend_fleet_token(box.id, "same/other")
+
+
+def test_two_founding_sign_ups_cannot_both_take_the_last_place(pg_store):
+    """The fifth place is one row. Two redeems at once, one org, and the
+    refused link is still good."""
+    from flotta.founding import FOUNDING_CAP, Attribution
+
+    for index in range(FOUNDING_CAP - 1):
+        pg_store.sign_up(
+            f"owner{index}@example.com",
+            f"org-{index}",
+            f"Org {index}",
+            attribution=Attribution(plan="founding", interval="month"),
+        )
+    secrets = [
+        pg_store.create_login_link(
+            f"last{index}@example.com",
+            purpose="sign_up",
+            org_id=f"last-{index}",
+            org_name=f"Last {index}",
+            attribution=Attribution(plan="founding", interval="month"),
+        )
+        for index in range(2)
+    ]
+
+    def redeem(fleet, index):
+        if fleet.sign_up_from_link(secrets[index]) is None:
+            raise LookupError("not redeemed")
+
+    outcomes = _race(pg_store, redeem)
+
+    assert sorted(outcomes) == ["FoundingClosedError", "created"], outcomes
+    assert pg_store._founding_count() == FOUNDING_CAP
+    live = [secret for secret in secrets if pg_store.login_link(secret) is not None]
+    assert len(live) == 1, "the refused link was spent"

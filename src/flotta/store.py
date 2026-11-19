@@ -432,6 +432,14 @@ class DuplicateTenantError(StoreError):
     """Raised when creating an org or client whose id is already taken."""
 
 
+class FoundingClosedError(StoreError):
+    """Raised when a Founding Studio sign-up would be the sixth.
+
+    Five founding orgs, ever. The link is not spent: the person can sign up
+    on another plan.
+    """
+
+
 class InvalidTenantError(StoreError):
     """Raised when an org or client id could not be part of an address, or a
     name is missing."""
@@ -620,6 +628,24 @@ class Org:
     #: When its current billing period began, as billing last said (FLOTTA-241):
     #: the ceiling's window. `None` is the calendar month.
     billing_period_from: str | None = None
+    #: The plan the sign-up asked for (`founding`, `studio`, `agency`), and the
+    #: campaign the website passed with it. `None` is a sign-up that named none.
+    #: Founding Studio sets the Studio limits here; the other two wait for
+    #: billing. See `flotta.founding`.
+    plan: str | None = None
+    plan_interval: str | None = None
+    utm_source: str | None = None
+    utm_medium: str | None = None
+    utm_campaign: str | None = None
+    visitor_id: str | None = None
+    #: The founding trial, if this org has started one: model use on Flotta's
+    #: keys in `[trial_from, trial_until)` is capped and left off the invoice.
+    trial_from: str | None = None
+    trial_until: str | None = None
+    #: When the founding price ends, 12 months after the first paid invoice,
+    #: and when the owner was told it was ending. Both `None` until then.
+    price_until: str | None = None
+    price_notice_at: str | None = None
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -729,6 +755,14 @@ class LoginLink:
     org_name: str | None = None
     #: The row's key, the hash of the secret: how an invite is found again.
     token_hash: str = ""
+    #: What the sign-up page asked for, copied onto the org when the link is
+    #: redeemed. Empty on a sign-in or an invite.
+    plan: str | None = None
+    plan_interval: str | None = None
+    utm_source: str | None = None
+    utm_medium: str | None = None
+    utm_campaign: str | None = None
+    visitor_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,9 +804,10 @@ class Session:
 #: plus creating one.
 LINK_PURPOSES = frozenset({"sign_in", "invite", "sign_up"})
 
-#: An org's lifecycle (M12.4). `pending` is a sign-up waiting for the operator,
-#: who makes it `active` or `declined`; both are final. An org made by the
-#: operator starts `active`.
+#: An org's lifecycle (M12.4). `pending` is a sign-up waiting to be approved.
+#: On a self-hosted fleet the operator approves it. The managed product's
+#: billing does, once the agency starts a plan. `active` and `declined` are
+#: final. An org made by the operator starts `active`.
 ORG_STATUSES = ("pending", "active", "declined", "suspended")
 
 #: Which level's key paid for a model call (D19).
@@ -1360,6 +1395,11 @@ class Budget:
     #: The org's spend ceiling (FLOTTA-241), made from its row by
     #: `ceiling_budget` and never stored here: period `billing`.
     ceiling: bool = False
+    #: The founding trial's model cap (see `flotta.founding`). Its own row,
+    #: which owners cannot change. `period` stays `month` so the table's check
+    #: still holds; the window is the trial, and it stops nothing once the
+    #: trial has ended.
+    trial_cap: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2122,6 +2162,7 @@ class FleetStore:
         reason: str | None = None,
         starting_cap_eur_nano: int | None = None,
         by: str | None = None,
+        now: datetime | None = None,
     ) -> Org:
         """Approve or decline a pending org. Once: both answers are final.
 
@@ -2137,7 +2178,11 @@ class FleetStore:
         Under the org table's guard, so an approve and a decline arriving
         together cannot both succeed and leave the answer to whichever wrote
         last.
+
+        Approving a founding org opens its trial in the same transaction: 30
+        days, and a pause at EUR 20 of model use. It does not open one twice.
         """
+        moment = now or datetime.now(UTC)
         with self._conn.transaction(guard="orgs"):
             org = self.get_org(org_id)
             if org is None:
@@ -2152,9 +2197,35 @@ class FleetStore:
             )
             if approve and starting_cap_eur_nano is not None:
                 self._set_starting_cap(org_id, starting_cap_eur_nano, by=by)
+            if approve:
+                self._open_founding_trial(org_id, moment)
         decided = self.get_org(org_id)
         assert decided is not None
         return decided
+
+    def _open_founding_trial(self, org_id: str, moment: datetime) -> None:
+        """Start `org_id`'s founding trial, if it is a founding org and has none.
+
+        The caller holds the orgs guard, inside the approval. The budget is a
+        month row with `trial_cap` set: the period check only allows day and
+        month, and the window the gateway uses is the trial itself.
+        """
+        from flotta.founding import FOUNDING_PLAN, TRIAL_DAYS, TRIAL_LIMIT_EUR_NANO, trial_id
+
+        org = self.get_org(org_id)
+        if org is None or org.plan != FOUNDING_PLAN or org.trial_from:
+            return
+        end = moment + timedelta(days=TRIAL_DAYS)
+        self._conn.execute(
+            "UPDATE orgs SET trial_from = ?, trial_until = ? WHERE id = ? AND trial_from IS NULL",
+            (_stamp(moment), _stamp(end), org_id),
+        )
+        self._conn.execute(
+            "INSERT INTO budgets (id, org_id, client_id, box_id, period, limit_eur_nano, "
+            "soft_pct, action, fallback_model, updated_at, starting_cap, trial_cap) "
+            "VALUES (?, ?, NULL, NULL, 'month', ?, 0.8, 'pause', NULL, ?, 0, 1)",
+            (trial_id(org_id), org_id, TRIAL_LIMIT_EUR_NANO, _stamp(moment)),
+        )
 
     def suspend_org(
         self,
@@ -2560,25 +2631,209 @@ class FleetStore:
                 )
         return membership
 
-    def sign_up(self, email: str, org_id: str, org_name: str) -> tuple[User, Org, Membership]:
+    def sign_up(
+        self,
+        email: str,
+        org_id: str,
+        org_name: str,
+        *,
+        attribution: Any = None,
+    ) -> tuple[User, Org, Membership]:
         """A `pending` org with `email` as its owner, and the account if need be.
 
         For a redeemed sign-up link, which proved the address. All or nothing,
-        under `users`' guard: a taken org id or a disabled account leaves no
-        account, org or membership behind.
+        under the users and orgs guards: a taken org id, a disabled account or
+        a Founding Studio that is already full leaves no account, org or
+        membership behind. `attribution` is the plan and campaign the sign-up
+        page passed; a founding one also takes a place and the Studio limits.
         """
         email = normalize_email(email)
-        with self._conn.transaction(guard="users"):
-            user = self.get_user_by_email(email)
-            if user is not None and user.disabled_at is not None:
-                raise InvalidAccountError(f"the account for {email} is disabled")
-            if self.get_org(validate_tenant_id(org_id, kind="org")) is not None:
-                raise DuplicateTenantError(f"an org {org_id!r} already exists")
-            if user is None:
-                user = self.create_user(email)
-            org = self.create_org(org_id, org_name, status="pending")
-            membership = self.add_membership(user.id, org.id, "owner")
-        return user, org, membership
+        with self._conn.transaction(guard=("users", "orgs")):
+            created = self._sign_up_body(email, org_id, org_name, attribution)
+        self._emit_signup(created)
+        return created
+
+    def sign_up_from_link(
+        self, secret: str, *, now: datetime | None = None
+    ) -> tuple[User, Org, Membership] | None:
+        """Redeem the sign-up `secret` opens and create its org, as one write.
+
+        `None` as `redeem_login_link`: unknown, used, expired, or not a
+        sign-up. A founding place that is already taken, or an org id taken
+        since the link was sent, raises and leaves the link unused, so the
+        person can be sent another. The cap and the insert share the orgs
+        lock, so two redeems cannot both take the last place.
+        """
+        if not secret:
+            return None
+        moment = now or datetime.now(UTC)
+        created: tuple[User, Org, Membership] | None = None
+        with self._conn.transaction(guard=("users", "login_links", "orgs")):
+            row = self._live_link_row(secret, moment)
+            if row is None or row["purpose"] != "sign_up":
+                return None
+            link = _link_from_row(row)
+            self._conn.execute(
+                "UPDATE login_links SET used_at = ? WHERE token_hash = ?",
+                (_stamp(moment), row["token_hash"]),
+            )
+            created = self._sign_up_body(
+                link.email,
+                link.org or "",
+                link.org_name or "",
+                _attribution_from_link(link),
+            )
+        assert created is not None
+        self._emit_signup(created)
+        return created
+
+    def _sign_up_body(
+        self, email: str, org_id: str, org_name: str, attribution: Any
+    ) -> tuple[User, Org, Membership]:
+        """The sign-up writes. The caller holds the users and orgs guards."""
+        user = self.get_user_by_email(email)
+        if user is not None and user.disabled_at is not None:
+            raise InvalidAccountError(f"the account for {email} is disabled")
+        if self.get_org(validate_tenant_id(org_id, kind="org")) is not None:
+            raise DuplicateTenantError(f"an org {org_id!r} already exists")
+        if user is None:
+            user = self.create_user(email)
+        org = self.create_org(org_id, org_name, status="pending")
+        self._apply_sign_up_plan(org.id, attribution)
+        membership = self.add_membership(user.id, org.id, "owner")
+        stored = self.get_org(org.id)
+        assert stored is not None
+        return user, stored, membership
+
+    def _apply_sign_up_plan(self, org_id: str, attribution: Any) -> None:
+        """Copy `attribution` onto the org, and claim a founding place if it is one.
+
+        The count is of founding orgs already stored. This org is not one yet,
+        and the caller holds the orgs lock, so two sign-ups cannot both read
+        four and both become the fifth.
+        """
+        if attribution is None:
+            return
+        from flotta.founding import FOUNDING_CAP, FOUNDING_LIMITS, FOUNDING_PLAN
+
+        if attribution.plan == FOUNDING_PLAN and self._founding_count() >= FOUNDING_CAP:
+            raise FoundingClosedError("Founding Studio is full")
+        limits = FOUNDING_LIMITS if attribution.plan == FOUNDING_PLAN else {}
+        self._conn.execute(
+            "UPDATE orgs SET plan = ?, plan_interval = ?, utm_source = ?, utm_medium = ?, "
+            "utm_campaign = ?, visitor_id = ?, max_clients = ?, max_seats = ?, max_agents = ? "
+            "WHERE id = ?",
+            (
+                attribution.plan,
+                attribution.interval,
+                attribution.utm_source,
+                attribution.utm_medium,
+                attribution.utm_campaign,
+                attribution.visitor_id,
+                limits.get("clients"),
+                limits.get("seats"),
+                limits.get("agents"),
+                org_id,
+            ),
+        )
+
+    def _founding_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM orgs WHERE plan = ?", ("founding",)
+        ).fetchone()
+        return int(row["n"])
+
+    def founding_available(self) -> bool:
+        """Whether another Founding Studio sign-up would still be one of five.
+
+        The redeem checks again under the orgs lock. This is the early answer
+        the sign-up route gives, before it emails a link that cannot be used.
+        """
+        from flotta.founding import FOUNDING_CAP
+
+        return self._founding_count() < FOUNDING_CAP
+
+    def _emit_signup(self, created: tuple[User, Org, Membership]) -> None:
+        """`signup_completed`, after the org is committed. Never fails the sign-up."""
+        user, org, _membership = created
+        try:
+            from flotta.analytics import signup_completed
+
+            signup_completed(org, user.email)
+        except Exception:
+            _log.exception("could not record signup_completed for %s", org.id)
+
+    def owner_email(self, org_id: str) -> str | None:
+        """The oldest owner's address, which is who a funnel event is attributed to."""
+        for membership in self.members_of(org_id):
+            if membership.role != "owner":
+                continue
+            user = self.get_user(membership.user_id)
+            if user is not None:
+                return user.email
+        return None
+
+    def note_founding_paid(self, org_id: str, *, now: datetime | None = None) -> tuple[Org, bool]:
+        """The first paid founding invoice landed: the EUR 149 price lasts 12 months.
+
+        Returns the org and whether this call was the one that started those
+        12 months. A webhook delivered twice does not move the date, and the
+        second answer is False so the funnel is recorded once. Any other plan
+        is left as it is and answers False; the caller still records its event.
+        """
+        from flotta.budgets import _plus_months
+        from flotta.founding import FOUNDING_PLAN, LOCK_MONTHS
+
+        moment = now or datetime.now(UTC)
+        started = False
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.plan == FOUNDING_PLAN and not org.price_until:
+                until = _plus_months(moment, LOCK_MONTHS)
+                self._conn.execute(
+                    "UPDATE orgs SET price_until = ? WHERE id = ? AND price_until IS NULL",
+                    (_stamp(until), org_id),
+                )
+                started = True
+        stored = self.get_org(org_id)
+        assert stored is not None
+        return stored, started
+
+    def founding_notices_due(self, now: datetime) -> list[Org]:
+        """Founding orgs whose price ends within 14 days and whose owner has not been told.
+
+        Also those whose date has passed untold: a sweep that was down still
+        sends the note.
+        """
+        from flotta.founding import NOTICE_DAYS, parse_instant
+
+        rows = self._conn.execute(
+            "SELECT * FROM orgs WHERE plan = 'founding' AND price_until IS NOT NULL "
+            "AND price_notice_at IS NULL"
+        ).fetchall()
+        moment = now.astimezone(UTC)
+        due = []
+        for row in rows:
+            org = _org_from_row(row)
+            if org.price_until and moment >= parse_instant(org.price_until) - timedelta(
+                days=NOTICE_DAYS
+            ):
+                due.append(org)
+        return due
+
+    def mark_price_notice(self, org_id: str, now: datetime) -> bool:
+        """Record that `org_id`'s owner was told. False if they already were."""
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None or org.price_notice_at is not None:
+                return False
+            self._conn.execute(
+                "UPDATE orgs SET price_notice_at = ? WHERE id = ?",
+                (_stamp(now), org_id),
+            )
+        return True
 
     def accept_invite(self, link: LoginLink) -> tuple[User, Membership]:
         """The membership a redeemed invite grants, and the account if need be.
@@ -2788,6 +3043,7 @@ class FleetStore:
         ttl_s: int = LINK_TTL_S,
         now: datetime | None = None,
         new_seat: bool = True,
+        attribution: Any = None,
     ) -> str:
         """A new link for `email`. Returns its secret, which is not stored.
 
@@ -2844,9 +3100,13 @@ class FleetStore:
             raise InvalidAccountError("a link must be valid for some time")
         moment = now or datetime.now(UTC)
         secret = _new_secret()
+        # Only a sign-up carries a plan. A sign-in or an invite stores none,
+        # whatever a caller passed.
+        carried = attribution if purpose == "sign_up" and attribution is not None else None
         self._conn.execute(
             "INSERT INTO login_links (token_hash, email, purpose, org_id, client_id, role, "
-            "org_name, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "org_name, created_at, expires_at, plan, plan_interval, utm_source, utm_medium, "
+            "utm_campaign, visitor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 secret_hash(secret),
                 email,
@@ -2857,6 +3117,12 @@ class FleetStore:
                 org_name,
                 _stamp(moment),
                 _stamp(moment + timedelta(seconds=ttl_s)),
+                None if carried is None else carried.plan,
+                None if carried is None else carried.interval,
+                None if carried is None else carried.utm_source,
+                None if carried is None else carried.utm_medium,
+                None if carried is None else carried.utm_campaign,
+                None if carried is None else carried.visitor_id,
             ),
         )
         return secret
@@ -4142,12 +4408,18 @@ class FleetStore:
             if upstream_cost and cost_eur is not None and currency == "USD"
             else None
         )
+        # A founding trial's model use is metered and capped, and left off the
+        # invoice. `billed = 0` is how the invoice's read skips it. The row is
+        # never updated later: the trial window at this moment is the answer.
+        from flotta.founding import in_trial
+
+        billed = 0 if in_trial(self.get_org(box.org), moment) else 1
         self._conn.execute(
             "INSERT INTO usage (id, org_id, client_id, box_id, kind, model, upstream, key_scope, "
             "tokens_in, tokens_out, tokens_cached, latency_ms, currency, upstream_cost_nano, "
             "eur_per_usd, cost_eur_nano, run_id, at, idempotency_key, status, estimated, "
-            "cost_reported, requested_model) "
-            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "cost_reported, requested_model, billed) "
+            "VALUES (?, ?, ?, ?, 'model', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (box_id, idempotency_key) DO NOTHING",
             (
                 f"u-{uuid.uuid4().hex}",
@@ -4172,6 +4444,7 @@ class FleetStore:
                 1 if estimated else 0,
                 1 if reported_cost_nano else 0,
                 requested_model,
+                billed,
             ),
         )
         row = self._conn.execute(
@@ -4323,6 +4596,8 @@ class FleetStore:
         client: str | None = None,
         box: str | None = None,
         key_scope: str | None = None,
+        billed_only: bool = False,
+        kind: str | None = None,
     ) -> Spend:
         """What an org, or a client or box within it, has spent since `since`.
 
@@ -4330,12 +4605,19 @@ class FleetStore:
         `org` is always required: a client's id is only unique within its org,
         and asking for a box must not reach another org's. `key_scope` counts
         only the calls whose key was that level's (`fleet` is what is billed).
+        `billed_only` leaves out a founding trial's model use, which is capped
+        and not invoiced. `kind` is `model` for that cap, which is not machine time.
         """
         where = ["org_id = ?"]
         params: list[Any] = [org]
         if key_scope is not None:
             where.append("key_scope = ?")
             params.append(key_scope)
+        if billed_only:
+            where.append("billed = 1")
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
         if client is not None:
             where.append("client_id = ?")
             params.append(client)
@@ -4361,16 +4643,21 @@ class FleetStore:
         group: Sequence[str] = (),
         client: str | None = None,
         box: str | None = None,
+        billed_only: bool = False,
     ) -> list[UsageSum]:
         """`org`'s usage from `since` up to `until`, summed by `group`.
 
         One row with zeroes for no group and nothing spent, and no row for a group
         with nothing in it. Machine seconds leave out a volume's, whose row is for
         the same hours as the machine's. `org` is always required, as in `spend`.
+        `billed_only` is the invoice's read: a founding trial's model use is not
+        on it.
         """
         columns = [f"{USAGE_GROUPS[name]} AS {name}" for name in group]
         where = ["org_id = ?", "at >= ?", "at < ?"]
         params: list[Any] = [org, _instant(since), _instant(until)]
+        if billed_only:
+            where.append("billed = 1")
         if client is not None:
             where.append("client_id = ?")
             params.append(client)
@@ -4444,6 +4731,8 @@ class FleetStore:
             updated_at=row["updated_at"],
             # `get`: a store part-way through its migrations, before 31, has none.
             starting_cap=bool(row.get("starting_cap") or 0),
+            # Before 41, no founding trial.
+            trial_cap=bool(row.get("trial_cap") or 0),
         )
 
     def _budget_scope(
@@ -7744,6 +8033,18 @@ def _org_from_row(row: db.Row) -> Org:
         spend_ceiling_eur_nano=_maybe_int(row.get("spend_ceiling_eur_nano")),
         spend_ceiling_set_at=row.get("spend_ceiling_set_at"),
         billing_period_from=row.get("billing_period_from"),
+        # `get`: a store read part-way through its migrations, before 41, has
+        # no plan yet, which is no plan.
+        plan=row.get("plan"),
+        plan_interval=row.get("plan_interval"),
+        utm_source=row.get("utm_source"),
+        utm_medium=row.get("utm_medium"),
+        utm_campaign=row.get("utm_campaign"),
+        visitor_id=row.get("visitor_id"),
+        trial_from=row.get("trial_from"),
+        trial_until=row.get("trial_until"),
+        price_until=row.get("price_until"),
+        price_notice_at=row.get("price_notice_at"),
     )
 
 
@@ -7892,6 +8193,37 @@ def _link_from_row(row: db.Row) -> LoginLink:
         expires_at=row["expires_at"],
         org_name=row["org_name"],
         token_hash=row["token_hash"],
+        plan=row.get("plan"),
+        plan_interval=row.get("plan_interval"),
+        utm_source=row.get("utm_source"),
+        utm_medium=row.get("utm_medium"),
+        utm_campaign=row.get("utm_campaign"),
+        visitor_id=row.get("visitor_id"),
+    )
+
+
+def _attribution_from_link(link: LoginLink) -> Any:
+    """The plan and campaign a sign-up link carried, if it carried any."""
+    from flotta.founding import Attribution
+
+    if not any(
+        (
+            link.plan,
+            link.plan_interval,
+            link.utm_source,
+            link.utm_medium,
+            link.utm_campaign,
+            link.visitor_id,
+        )
+    ):
+        return None
+    return Attribution(
+        plan=link.plan,
+        interval=link.plan_interval,
+        utm_source=link.utm_source,
+        utm_medium=link.utm_medium,
+        utm_campaign=link.utm_campaign,
+        visitor_id=link.visitor_id,
     )
 
 
