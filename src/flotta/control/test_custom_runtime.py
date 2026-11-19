@@ -110,10 +110,26 @@ def test_an_org_cannot_run_its_own_image_until_the_operator_says_so(fleet, machi
 def test_the_store_refuses_it_too_whoever_reserves_the_row(fleet):  # noqa: F811
     """The API's check is the early answer; this is the guarantee."""
     with FleetStore(fleet) as store:
-        box = store.create_box("own", org="agency-x", client="acme")
         with pytest.raises(CustomImagesOffError):
-            store.set_box_runtime(box.id, "custom", IMAGE)
-        assert store.get_box(box.id).runtime == "hermes"
+            store.create_box("own", org="agency-x", client="acme", runtime="custom", image=IMAGE)
+        # No row holds the name: the refusal came before the insert.
+        assert store.get_box_by_name("own--acme--agency-x") is None
+
+
+def test_a_switch_turned_off_mid_create_spends_no_name(fleet, machine, monkeypatch):  # noqa: F811
+    """The API's early check passed; the operator turns it off before the row."""
+    _switch(fleet)
+    real = provision.check_custom_request
+
+    def then_off(*args, **kwargs):
+        cleaned = real(*args, **kwargs)
+        _switch(fleet, on=False)
+        return cleaned
+
+    monkeypatch.setattr(provision, "check_custom_request", then_off)
+    with _api(fleet) as api:
+        assert _create(api, MEMBER).status_code == 403
+    assert _own(fleet) is None and machine.specs == []
 
 
 def test_only_the_operator_turns_it_on(fleet):  # noqa: F811
@@ -244,8 +260,23 @@ def test_a_hermes_agent_names_no_image(fleet, machine):  # noqa: F811
         )
     assert response.status_code == 422
     with pytest.raises(InvalidImageError), FleetStore(fleet) as store:
-        box = store.create_box("other", org="agency-x", client="acme")
-        store.set_box_runtime(box.id, "hermes", IMAGE)
+        store.create_box("other", org="agency-x", client="acme", image=IMAGE)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "registry.fly.io/flotta-images:deployment-01J",
+        "flotta-images.fly.dev/agent:1",
+        "my-registry.internal:5000/agent:1",
+        "localhost:5000/agent:1",
+        "10.0.0.1:5000/agent:1",
+    ],
+)
+def test_the_fleets_own_registries_are_not_public(image):
+    """Fly pulls these with the fleet's credentials: the fleet's Hermes, or another app's."""
+    with pytest.raises(InvalidImageError):
+        validate_image_ref(image)
 
 
 def test_creating_a_hermes_agent_is_exactly_as_before(fleet, machine):  # noqa: F811
@@ -337,8 +368,90 @@ def test_the_fleets_hermes_update_passes_it_by(fleet, machine, own, monkeypatch)
         hermes = [b.id for b in store.list_boxes() if b.runtime == "hermes"]
     # Not vacuous: the roll ran, and moved every Hermes agent but this one.
     assert hermes and set(hermes) <= set(moved)
+    with _api(fleet) as api:
+        (build,) = api.get("/api/hermes/builds", headers=OPERATOR).json()["builds"]
+    assert {"box_id": own.id, "reason": "own_image"}.items() <= next(
+        s for s in build["skipped"] if s["box_id"] == own.id
+    ).items()
     assert own.id not in moved
     assert machine.images[own.endpoint] == IMAGE
+
+
+def test_a_move_that_timed_out_after_landing_keeps_the_new_image(fleet, machine, own):  # noqa: F811
+    from flotta.backend import BackendError
+
+    def landed_then_timed_out(endpoint, image):
+        machine.images[endpoint] = image
+        raise BackendError("timed out waiting for the machine")
+
+    machine.reimage = landed_then_timed_out
+    with _api(fleet) as api:
+        response = api.put(
+            f"/api/boxes/{own.id}/image",
+            json={"image": "ghcr.io/agency-x/support-agent:2.0"},
+            headers=OWNER,
+        )
+    assert response.status_code == 502
+    assert _own(fleet).image == "ghcr.io/agency-x/support-agent:2.0"
+
+
+def test_its_image_does_not_move_once_the_switch_is_off(fleet, machine, own):  # noqa: F811
+    _switch(fleet, on=False)
+    with FleetStore(fleet) as store, pytest.raises(CustomImagesOffError):
+        provision.set_custom_image(own.id, "ghcr.io/agency-x/support-agent:2.0", store=store)
+    assert machine.images[own.endpoint] == IMAGE
+
+
+def test_an_adopted_machine_is_moved_onto_the_agencys_image(fleet, machine):  # noqa: F811
+    _switch(fleet)
+    machine.images["fly://flotta-new/m9"] = "registry.fly.io/hermes:v1"
+    real = machine.create
+
+    def adopting(spec):
+        handle = real(spec)
+        machine.images[handle.endpoint] = "registry.fly.io/hermes:v1"
+        return BoxHandle(id=handle.id, endpoint=handle.endpoint, adopted=True)
+
+    machine.create = adopting
+    with _api(fleet, background=False) as api:
+        assert _create(api, MEMBER).status_code in (200, 201)
+    assert machine.images["fly://flotta-new/m9"] == IMAGE
+
+
+def test_an_adopted_machine_that_will_not_move_is_stopped_not_left_on_hermes(fleet, machine):  # noqa: F811
+    from flotta.backend import BackendError
+
+    _switch(fleet)
+    real = machine.create
+    stopped = []
+
+    def adopting(spec):
+        handle = real(spec)
+        machine.images[handle.endpoint] = "registry.fly.io/hermes:v1"
+        return BoxHandle(id=handle.id, endpoint=handle.endpoint, adopted=True)
+
+    def refuse(endpoint, image):
+        raise BackendError("no")
+
+    machine.create, machine.reimage = adopting, refuse
+    machine.stop = stopped.append
+    with _api(fleet, background=False) as api:
+        response = _create(api, MEMBER)
+    assert response.status_code == 201 and "warning" in response.json(), response.text
+    assert _own(fleet).status == "stopped" and stopped == ["fly://flotta-new/m9"]
+
+
+def test_a_rotated_custom_agent_is_said_to_hold_its_own_secret(fleet, machine, own):  # noqa: F811
+    with FleetStore(fleet) as store:
+        result = provision.rotate_identity(own.id, store=store)
+    assert result["own_password"] is True
+    assert "FLOTTA_BOX_SECRET" in machine.secrets
+    assert not [k for k in machine.secrets if k.startswith("HERMES_")]
+
+
+def test_a_custom_agents_mcp_config_is_never_written(fleet, machine, own):  # noqa: F811
+    with FleetStore(fleet) as store:
+        assert provision.rewrite_mcp_config(own.id, store=store, reason="catalogue") is None
 
 
 def test_a_hermes_agents_image_is_not_the_agencys_to_set(fleet, machine):  # noqa: F811
@@ -408,20 +521,48 @@ def test_every_hermes_only_verb_refuses_a_custom_agent_first(name):
     assert getattr(first.value.func, "id", None) == "hermes_only", name
 
 
-#: Public provision functions that exec on a box yet are safe for any runtime.
-#: None today: every exec rewrites Hermes's files.
-EXEC_ALLOWED: frozenset[str] = frozenset()
+def _reaches_exec_unguarded() -> list[str]:
+    """Public provision functions that reach a box `exec`, through any private
+    helper, without a custom-runtime refusal on the way."""
+    tree = ast.parse(inspect.getsource(provision))
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def guarded(node: ast.FunctionDef) -> bool:
+        if node.name in HERMES_ONLY:
+            return True
+        src = ast.unparse(node)
+        return "hermes_only(" in src or "refuse_custom(" in src or "runtime == 'custom'" in src
+
+    memo: dict[str, bool] = {}
+
+    def reaches(name: str, seen: frozenset[str] = frozenset()) -> bool:
+        if name in memo:
+            return memo[name]
+        node = funcs[name]
+        if guarded(node):
+            memo[name] = False
+            return False
+        hit = False
+        for n in ast.walk(node):
+            if isinstance(n, ast.Attribute) and n.attr == "exec":
+                hit = True
+                break
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id in funcs
+                and n.func.id not in seen | {name}
+                and reaches(n.func.id, seen | {name})
+            ):
+                hit = True
+                break
+        memo[name] = hit
+        return hit
+
+    return sorted(name for name in funcs if not name.startswith("_") and reaches(name))
 
 
-def test_exec_on_the_box_is_only_in_hermes_only_verbs():
-    """Any provision function that runs a `flotta.box` script over exec rewrites
-    Hermes; each must be one of the guarded verbs or be reached only through one."""
-    source = inspect.getsource(provision)
-    tree = ast.parse(source)
-    guarded = set(HERMES_ONLY)
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
-            continue
-        calls_exec = any(isinstance(n, ast.Attribute) and n.attr == "exec" for n in ast.walk(node))
-        if calls_exec:
-            assert node.name in guarded or node.name in EXEC_ALLOWED, node.name
+def test_nothing_execs_into_a_custom_agent_unguarded():
+    """The ratchet: any public verb that runs a script on the box, directly or
+    through a helper, refuses a custom agent first: every exec rewrites Hermes."""
+    assert _reaches_exec_unguarded() == []

@@ -1108,17 +1108,13 @@ def reserve_box(
     # refuses without spending the name — the same reason the name itself is
     # checked at the top of `store.create_box`.
     validate_box_meta(display_name, description, instructions)
-    check_custom_request(
-        runtime, image, store=store, org=org, screen=screen, instructions=instructions, model=model
-    )
     if model is not None:
         model = allowed_model(model, store)
-    box = store.create_box(name, org=org, client=client)
-    if runtime != "hermes":
-        # Before anything else is written about it: what runs in it decides
-        # what the rest of the row may say. The store checks the org's switch
-        # again, which is the guarantee.
-        box = store.set_box_runtime(box.id, runtime, image)
+    # What runs in it is written with the row, and the org's switch checked
+    # under the same guard (`store.create_box`): a refusal leaves no row, so
+    # no name is spent. Callers ran `check_custom_request` first, which is the
+    # early answer for what only Hermes has.
+    box = store.create_box(name, org=org, client=client, runtime=runtime, image=image)
     store.add_event("box", box.id, "provisioning", {"name": box.name, "backend": backend.scheme})
     if display_name or description or instructions:
         store.set_box_meta(
@@ -1144,6 +1140,14 @@ class CustomRuntimeRefused(ProvisionError):
     """A custom agent asked for something only a Hermes agent has (M17.1)."""
 
 
+def refuse_custom(box: Box, what: str) -> None:
+    """Refuse `what` for a custom agent: the one wording, for every caller."""
+    if box.runtime == "custom":
+        raise CustomRuntimeRefused(
+            f"{box.name} runs its own image; {what} is for Hermes agents only"
+        )
+
+
 def hermes_only(store: FleetStore, box_id: str, what: str) -> None:
     """Refuse `what` for a custom agent: it works by rewriting Hermes on the box.
 
@@ -1155,10 +1159,8 @@ def hermes_only(store: FleetStore, box_id: str, what: str) -> None:
     the agency's code.
     """
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
-    if box is not None and box.runtime == "custom":
-        raise CustomRuntimeRefused(
-            f"{box.name} runs its own image; {what} is for Hermes agents only"
-        )
+    if box is not None:
+        refuse_custom(box, what)
 
 
 def check_custom_request(
@@ -1174,13 +1176,12 @@ def check_custom_request(
     """Refuse a custom agent before its name is spent. Returns the cleaned image.
 
     The early answer, for the API and the CLI alike; the store refuses the
-    row's runtime too (`set_box_runtime`), which is the guarantee. A custom
+    row's runtime too (`store.create_box`), which is the guarantee. A custom
     agent has no screen, no `SOUL.md` and no model of Flotta's choosing: its
     image decides all three, so asking for them is asking for nothing.
     """
     from flotta.store import (
         RUNTIMES,
-        CustomImagesOffError,
         InvalidBoxMetaError,
         InvalidImageError,
         validate_image_ref,
@@ -1201,11 +1202,8 @@ def check_custom_request(
                 f"an agent from your own image has no {what.removeprefix('a ')} of Flotta's; "
                 "its image decides that"
             )
-    found = store.get_org(org)
-    if found is not None and not found.custom_images:
-        raise CustomImagesOffError(
-            f"{org} cannot run its own images yet; the operator turns that on"
-        )
+    if store.get_org(org) is not None:
+        store.require_custom_images(org)
     return cleaned
 
 
@@ -1625,6 +1623,13 @@ def create_box(
             # thing that is not broken.
             identity_error = f"apply_secrets failed: {exc}"
 
+    if handle.adopted and runtime == "custom":
+        # An adopted machine kept its own image, which on Fly is whatever the
+        # app last released: Hermes, or another agent's. Moved onto the
+        # agency's, or stopped and said so, never left running a different
+        # image than the row names.
+        _custom_onto_adopted(store, impl, box, handle.endpoint, image)
+
     if handle.adopted and screen:
         # An adopted machine kept its own environment and size, so a screen
         # reaches it the way turning one on later does: one `machine update`.
@@ -1714,6 +1719,30 @@ def create_box(
         box_id=box.id,
         endpoint=handle.endpoint,
     )
+
+
+def _custom_onto_adopted(
+    store: FleetStore, impl: Backend, box: Box, endpoint: str, image: str | None
+) -> None:
+    """Put an adopted machine on the custom agent's image, or stop it (M17.1)."""
+    running = _peek_image(impl, endpoint)
+    if image and running and _same_image(running, image):
+        return
+    try:
+        impl.reimage(endpoint, image)
+    except Exception as exc:  # noqa: BLE001 - any failure means the wrong image is there
+        detail = f"the machine it adopted runs {running or 'an unknown image'}: {exc}"
+        store.add_event("box", box.id, "image_not_applied", {"to": image, "error": detail[:400]})
+        with contextlib.suppress(Exception):
+            impl.stop(endpoint)
+        store.update_box_status(box.id, "stopped", endpoint=endpoint)
+        raise BoxNotRunning(
+            f"box {box.id} adopted a machine that is not on {image}, and moving it failed: "
+            f"{detail}. It is stopped; change its image to retry.",
+            box_id=box.id,
+            endpoint=endpoint,
+        ) from exc
+    store.add_event("box", box.id, "reimaged", {"reason": "adopted", "from": running, "to": image})
 
 
 def _peek_endpoint(impl: Backend, box_name: str | None = None) -> str | None:
@@ -2264,7 +2293,9 @@ def rewrite_mcp_config(
     so the reload waits for it to listen instead of recording a failure.
     """
     box = store.get_box(box_id)
-    if box is None or is_terminal("box", box.status):
+    if box is None or is_terminal("box", box.status) or box.runtime == "custom":
+        # A custom agent has no Hermes config to write (M17.1), and is never
+        # granted MCP servers; nothing to do, now or on wake.
         return None
     try:
         base, token = _mcp_token(box, store)
@@ -2342,16 +2373,34 @@ def set_custom_image(
         raise CustomRuntimeRefused(
             f"{box.name} runs Hermes on the fleet's image; its image moves with the fleet's"
         )
+    store.require_custom_images(box.org)
     new = validate_image_ref(image)
-    previous = box.image
-    store.set_box_image(box.id, new)
-    try:
-        result = upgrade_box(box.id, store=store, image=new, backend=backend, reason="image")
-    except Exception:
-        if previous:
-            store.set_box_image(box.id, previous)
-        raise
-    return result
+    # One move at a time per agent: two overlapping would each roll the row
+    # back over the other's image.
+    with _image_lock(box.id):
+        previous = _require_box(store, box.id).image
+        store.set_box_image(box.id, new)
+        try:
+            return upgrade_box(box.id, store=store, image=new, backend=backend, reason="image")
+        except Exception:
+            # Back only if the machine is not on the new image after all: a
+            # timeout can follow a move the substrate did make.
+            impl = _resolve_backend(box, backend)
+            running = None
+            with contextlib.suppress(Exception):
+                running = _peek_image(impl, box.endpoint or box.id)
+            if previous and not (running and _same_image(running, new)):
+                store.set_box_image(box.id, previous)
+            raise
+
+
+_IMAGE_LOCKS: dict[str, threading.Lock] = {}
+_IMAGE_LOCKS_GUARD = threading.Lock()
+
+
+def _image_lock(box_id: str) -> threading.Lock:
+    with _IMAGE_LOCKS_GUARD:
+        return _IMAGE_LOCKS.setdefault(box_id, threading.Lock())
 
 
 def upgrade_box(
@@ -2580,7 +2629,9 @@ def rotate_identity(
         "scopes": sorted(claims.scopes),
         # Whether the box now holds its own password rather than the fleet's:
         # the timeline is how to tell which agents a FLOTTA-96 rollout reached.
-        "own_password": "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" in rewritten,
+        "own_password": bool(
+            {"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", BOX_SECRET_ENV} & set(rewritten)
+        ),
     }
     store.add_event(
         "box",

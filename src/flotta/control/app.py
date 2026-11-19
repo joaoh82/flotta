@@ -1405,6 +1405,7 @@ def create_app(
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
     from flotta.provision import CustomRuntimeRefused
+    from flotta.provision import refuse_custom as _refuse_custom
 
     @app.exception_handler(CustomRuntimeRefused)
     def _custom_refused(_request: Request, exc: CustomRuntimeRefused) -> Any:
@@ -1417,13 +1418,6 @@ def create_app(
         from fastapi.responses import JSONResponse
 
         return JSONResponse(status_code=409, content={"detail": str(exc), "code": "custom_runtime"})
-
-    def _refuse_custom(box: Any, what: str) -> None:
-        """The route-level `hermes_only`, for the verbs with no provision function."""
-        if getattr(box, "runtime", "hermes") == "custom":
-            raise CustomRuntimeRefused(
-                f"{box.name} runs its own image; {what} is for Hermes agents only"
-            )
 
     @app.exception_handler(OrgNotActiveError)
     def _org_not_active(_request: Request, exc: OrgNotActiveError) -> Any:
@@ -4068,6 +4062,13 @@ def create_app(
                     if box.runtime != "hermes":
                         # The agency's own image (M17.1): there is no Hermes in
                         # it to update, and the fleet's image would replace it.
+                        # Said on its timeline and the build's, as a held screen is.
+                        inner.add_event(
+                            "box",
+                            box.id,
+                            UPGRADE_SKIPPED_EVENT,
+                            {"build_id": build.id, "to": image, "reason": "own_image"},
+                        )
                         continue
                     # A person on its screen (FLOTTA-211): passed by, not stopped
                     # at. Nothing is wrong with the image, and one sign-in must
@@ -4491,8 +4492,8 @@ def create_app(
                 # A *live* box holds the name — a destroyed one no longer does,
                 # because teardown releases it.
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except LimitReachedError:
-                raise  # 402, from its handler: not a conflict over the name
+            except (LimitReachedError, CustomImagesOffError):
+                raise  # 402 or 403, from their handlers: not a conflict over the name
             except Exception as exc:
                 raise HTTPException(
                     status_code=409,
@@ -6750,10 +6751,6 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
-            if store.get_org(box.org) is not None and not store.get_org(box.org).custom_images:
-                raise CustomImagesOffError(
-                    f"{box.org} cannot run its own images yet; the operator turns that on"
-                )
             try:
                 result = set_custom_image(
                     box.id, image if isinstance(image, str) else "", store=store

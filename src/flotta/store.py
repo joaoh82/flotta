@@ -555,7 +555,29 @@ def validate_image_ref(image: object) -> str:
         raise InvalidImageError(
             f"{ref!r} is not an image reference; it looks like ghcr.io/your-org/your-agent:1.0"
         )
+    host = ref.split("/", 1)[0] if "/" in ref else ""
+    if _private_registry(host.split(":", 1)[0]):
+        # Fly pulls its own registry with the fleet's credentials, so an image
+        # there is not public: it is the fleet's Hermes, or another app's.
+        raise InvalidImageError(
+            f"{host} is not a public registry; push the image to ghcr.io or Docker Hub"
+        )
     return ref
+
+
+#: Registries an agency's image may not come from (M17.1): pulled with the
+#: fleet's own credentials, or on the fleet's own network.
+_PRIVATE_REGISTRIES = ("registry.fly.io", "localhost")
+_PRIVATE_SUFFIXES = (".fly.io", ".fly.dev", ".internal", ".flycast", ".localhost")
+
+
+def _private_registry(host: str) -> bool:
+    host = host.lower()
+    if host in _PRIVATE_REGISTRIES or host.endswith(_PRIVATE_SUFFIXES):
+        return True
+    # An address rather than a name: nobody publishes a public image at one,
+    # and it is the shape of reaching the fleet's own network.
+    return bool(re.fullmatch(r"[0-9.]+|\[[0-9a-f:]+\]", host))
 
 
 class InvalidBoxNameError(StoreError):
@@ -1900,8 +1922,16 @@ class FleetStore:
         org: str = DEFAULT_ORG,
         client: str = DEFAULT_CLIENT,
         box_id: str | None = None,
+        runtime: str = "hermes",
+        image: str | None = None,
     ) -> Box:
         """Insert a new box in status ``provisioning`` and return it.
+
+        **What runs in it is written with it** (M17.1): `runtime="custom"`
+        needs an `image` and an org whose operator turned custom images on,
+        checked before the insert and under the same guard, so a refusal
+        leaves no row holding the name and no box is ever re-labelled after
+        it exists.
 
         **Capped by the org's agents limit** (FLOTTA-183): the count and the
         insert share `boxes`' guard, so two creates cannot both take the last
@@ -1934,6 +1964,13 @@ class FleetStore:
         org = validate_tenant_id(org, kind="org")
         client = validate_tenant_id(client, kind="client")
         label = box_label(name, org=org, client=client)
+        if runtime not in RUNTIMES:
+            raise InvalidBoxMetaError(f"runtime is one of {', '.join(RUNTIMES)}, not {runtime!r}")
+        if runtime == "hermes":
+            if image is not None:
+                raise InvalidImageError("a Hermes agent runs the fleet's image; name none")
+        else:
+            image = validate_image_ref(image)
         if self.get_client(org, client) is None:
             raise UnknownEntityError(f"org {org!r} has no client {client!r}")
         bid = box_id or f"b-{uuid.uuid4().hex[:12]}"
@@ -1948,11 +1985,23 @@ class FleetStore:
                 # agents is held the same way, for the same reason.
                 self.require_active_org(org)
                 self._check_room(org, "agents")
-                self._conn.execute(
-                    "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (bid, label, "provisioning", _utcnow(), org, client),
-                )
+                if runtime == "custom":
+                    self.require_custom_images(org)
+                # A Hermes row names no runtime: the column's default is
+                # Hermes, and a store part-way through its migrations, before
+                # 42, has no such column (the migration tests write one).
+                if runtime == "hermes":
+                    self._conn.execute(
+                        "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (bid, label, "provisioning", _utcnow(), org, client),
+                    )
+                else:
+                    self._conn.execute(
+                        "INSERT INTO boxes (id, name, status, created_at, org_id, client_id, "
+                        "runtime, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (bid, label, "provisioning", _utcnow(), org, client, runtime, image),
+                    )
         except db.UniqueViolation as exc:
             # Two different collisions land here. Reporting a duplicate *id* as
             # a duplicate *name* sends the caller looking for the wrong thing —
@@ -3983,30 +4032,16 @@ class FleetStore:
         ).fetchall()
         return {str(r["box_id"]) for r in rows}
 
-    def set_box_runtime(self, box_id: str, runtime: str, image: str | None) -> Box:
-        """What runs in this agent (M17.1): set once, while it is reserved.
+    def require_custom_images(self, org_id: str) -> None:
+        """Refuse unless `org_id`'s operator turned custom images on (M17.1).
 
-        `custom` needs an image and an org whose operator has turned custom
-        images on, checked here so no path that reserves an agent can skip it;
-        `hermes` takes none, because its image is the fleet's.
+        The one place the refusal is worded, for every caller that meets it.
         """
-        if runtime not in RUNTIMES:
-            raise InvalidBoxMetaError(f"runtime is one of {', '.join(RUNTIMES)}, not {runtime!r}")
-        box = self._get_box_or_raise(box_id)
-        if runtime == "hermes":
-            if image is not None:
-                raise InvalidImageError("a Hermes agent runs the fleet's image; name none")
-        else:
-            image = validate_image_ref(image)
-            org = self.get_org(box.org)
-            if org is None or not org.custom_images:
-                raise CustomImagesOffError(
-                    f"{box.org} cannot run its own images yet; the operator turns that on"
-                )
-        self._conn.execute(
-            "UPDATE boxes SET runtime = ?, image = ? WHERE id = ?", (runtime, image, box_id)
-        )
-        return self._get_box_or_raise(box_id)
+        org = self.get_org(org_id)
+        if org is None or not org.custom_images:
+            raise CustomImagesOffError(
+                f"{org_id} cannot run its own images yet; the operator turns that on"
+            )
 
     def set_box_image(self, box_id: str, image: str) -> Box:
         """A custom agent's new image, once its machine runs it (M17.1).
