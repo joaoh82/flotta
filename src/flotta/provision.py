@@ -480,6 +480,7 @@ def fleet_secrets(
     box_id: str,
     org: str | None = None,
     client: str | None = None,
+    runtime: str = "hermes",
 ) -> tuple[dict[str, str], list[str]]:
     """What every box in this fleet needs to boot, and what is missing.
 
@@ -505,6 +506,8 @@ def fleet_secrets(
     because nothing else needs to know it.
     """
     source = os.environ if env is None else env
+    if runtime == "custom":
+        return custom_secrets(source, box_id=box_id, org=org, client=client)
     secrets: dict[str, str] = {}
     missing: list[str] = []
 
@@ -551,6 +554,74 @@ def fleet_secrets(
         missing.append("FLOTTA_MODEL / FLOTTA_MODEL_BASE_URL / FLOTTA_API_KEY")
 
     return secrets, missing
+
+
+#: The per-agent secret a custom agent checks on every request (M17): the
+#: door sends it as a Bearer, because anything on Fly's private network can
+#: reach the agent's port. Derived like a Hermes agent's password, so the door
+#: works it out and it opens one agent.
+BOX_SECRET_ENV = "FLOTTA_BOX_SECRET"
+#: What a custom agent is told it is, so an adapter can tell.
+RUNTIME_ENV = "FLOTTA_RUNTIME"
+
+
+def custom_secrets(
+    source: Mapping[str, str],
+    *,
+    box_id: str,
+    org: str | None = None,
+    client: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """What a custom agent needs (M17.1), and what is missing.
+
+    **Its model calls go through the gateway or nowhere.** A Hermes agent off
+    the gateway is given the fleet's provider key, which is Flotta's own image
+    holding it; a custom image is the agency's code, and the fleet's key in it
+    would be the agency's to read. So off the gateway a custom agent is given
+    no key at all and the gap is reported.
+
+    The model values come under the names an OpenAI SDK reads as well as
+    Flotta's, so a LangGraph agent's `ChatOpenAI()` works with no
+    configuration. No Hermes dashboard login: there is no Hermes to log into.
+    """
+    secrets: dict[str, str] = {}
+    missing: list[str] = []
+    password = (source.get("FLOTTA_BOX_PASSWORD") or "").strip()
+    if password:
+        secrets[BOX_SECRET_ENV] = box_password(password, box_id)
+    else:
+        missing.append("FLOTTA_BOX_PASSWORD (the door's secret for this agent is derived from it)")
+    model = (source.get("FLOTTA_MODEL") or "").strip()
+    if not gateway_url(source):
+        missing.append("FLOTTA_GATEWAY_URL (a custom agent calls models only through the gateway)")
+    elif not model:
+        missing.append("FLOTTA_MODEL")
+    else:
+        from flotta.auth import AuthError
+
+        try:
+            given = gateway_secrets(box_id, model, env=source, org=org, client=client)
+        except AuthError:
+            missing.append("FLOTTA_SIGNING_KEY (the gateway needs a token for this agent)")
+        else:
+            given.pop("OPENROUTER_API_KEY", None)
+            given.pop("FLOTTA_GATEWAY_UPSTREAM", None)
+            secrets.update(given)
+            secrets.update(openai_aliases(given))
+    return secrets, missing
+
+
+def openai_aliases(model_secrets: Mapping[str, str]) -> dict[str, str]:
+    """The gateway's values under the names OpenAI's SDKs read (M17.1)."""
+    out: dict[str, str] = {}
+    for flotta_name, openai_name in (
+        ("FLOTTA_MODEL_BASE_URL", "OPENAI_BASE_URL"),
+        ("FLOTTA_API_KEY", "OPENAI_API_KEY"),
+        ("FLOTTA_MODEL", "OPENAI_MODEL"),
+    ):
+        if model_secrets.get(flotta_name):
+            out[openai_name] = model_secrets[flotta_name]
+    return out
 
 
 def build_identity(
@@ -1004,6 +1075,8 @@ def reserve_box(
     instructions: str | None = None,
     model: str | None = None,
     screen: bool = False,
+    runtime: str = "hermes",
+    image: str | None = None,
 ) -> Box:
     """Write the row, and nothing else. Returns immediately.
 
@@ -1035,9 +1108,17 @@ def reserve_box(
     # refuses without spending the name — the same reason the name itself is
     # checked at the top of `store.create_box`.
     validate_box_meta(display_name, description, instructions)
+    check_custom_request(
+        runtime, image, store=store, org=org, screen=screen, instructions=instructions, model=model
+    )
     if model is not None:
         model = allowed_model(model, store)
     box = store.create_box(name, org=org, client=client)
+    if runtime != "hermes":
+        # Before anything else is written about it: what runs in it decides
+        # what the rest of the row may say. The store checks the org's switch
+        # again, which is the guarantee.
+        box = store.set_box_runtime(box.id, runtime, image)
     store.add_event("box", box.id, "provisioning", {"name": box.name, "backend": backend.scheme})
     if display_name or description or instructions:
         store.set_box_meta(
@@ -1057,6 +1138,75 @@ def reserve_box(
         store.set_box_screen(box.id, True)
         box = store.get_box(box.id)
     return box
+
+
+class CustomRuntimeRefused(ProvisionError):
+    """A custom agent asked for something only a Hermes agent has (M17.1)."""
+
+
+def hermes_only(store: FleetStore, box_id: str, what: str) -> None:
+    """Refuse `what` for a custom agent: it works by rewriting Hermes on the box.
+
+    At the top of every provision verb that does (rules, MCP, model, screen,
+    instructions, the gateway move), held there by a ratchet that reads this
+    file, so a route added later cannot reach one for a custom agent. The
+    gateway move is in the list for a sharper reason than Hermes: off the
+    gateway, an agent is given the fleet's provider key, and a custom image is
+    the agency's code.
+    """
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is not None and box.runtime == "custom":
+        raise CustomRuntimeRefused(
+            f"{box.name} runs its own image; {what} is for Hermes agents only"
+        )
+
+
+def check_custom_request(
+    runtime: str,
+    image: str | None,
+    *,
+    store: FleetStore,
+    org: str,
+    screen: bool = False,
+    instructions: str | None = None,
+    model: str | None = None,
+) -> str | None:
+    """Refuse a custom agent before its name is spent. Returns the cleaned image.
+
+    The early answer, for the API and the CLI alike; the store refuses the
+    row's runtime too (`set_box_runtime`), which is the guarantee. A custom
+    agent has no screen, no `SOUL.md` and no model of Flotta's choosing: its
+    image decides all three, so asking for them is asking for nothing.
+    """
+    from flotta.store import (
+        RUNTIMES,
+        CustomImagesOffError,
+        InvalidBoxMetaError,
+        InvalidImageError,
+        validate_image_ref,
+    )
+
+    if runtime not in RUNTIMES:
+        raise InvalidBoxMetaError(f"runtime is one of {', '.join(RUNTIMES)}, not {runtime!r}")
+    if runtime == "hermes":
+        if image:
+            raise InvalidImageError(
+                "a Hermes agent runs the fleet's image; say runtime custom to run your own"
+            )
+        return None
+    cleaned = validate_image_ref(image)
+    for asked, what in ((screen, "a screen"), (instructions, "instructions"), (model, "a model")):
+        if asked:
+            raise CustomRuntimeRefused(
+                f"an agent from your own image has no {what.removeprefix('a ')} of Flotta's; "
+                "its image decides that"
+            )
+    found = store.get_org(org)
+    if found is not None and not found.custom_images:
+        raise CustomImagesOffError(
+            f"{org} cannot run its own images yet; the operator turns that on"
+        )
+    return cleaned
 
 
 def resolve_box_resources(
@@ -1132,8 +1282,14 @@ def create_box(
     instructions: str | None = None,
     model: str | None = None,
     screen: bool = False,
+    runtime: str = "hermes",
+    image: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
+
+    `runtime="custom"` with an `image` runs the agency's own image (M17.1): no
+    Hermes, its model calls through the gateway only, and the door's secret
+    for it in `FLOTTA_BOX_SECRET`. A row reserved as one has both already.
 
     `screen` gives the agent a screen (FLOTTA-208): a 4096 MB machine unless a
     size is named, a named size below that refused, and `FLOTTA_SCREEN=1` in
@@ -1188,6 +1344,18 @@ def create_box(
     if screen:
         check_screen_size(memory_mb)
         check_screen_size(spec.memory_mb if spec else None)
+    if box is not None:
+        runtime, image = box.runtime, box.image
+    else:
+        image = check_custom_request(
+            runtime,
+            image,
+            store=store,
+            org=org,
+            screen=screen,
+            instructions=instructions,
+            model=model,
+        )
 
     # A pending org's agent is refused before a substrate is resolved, let alone
     # probed. The store refuses the row too (`FleetStore.create_box`), and that
@@ -1229,6 +1397,8 @@ def create_box(
             instructions=instructions,
             model=model,
             screen=screen,
+            runtime=runtime,
+            image=image,
         )
 
     # Identity travels with the machine rather than arriving afterwards. The
@@ -1241,6 +1411,11 @@ def create_box(
     # after it, and a tenant box's spec carrying its short name would put it
     # in another org's app.
     base = replace(spec, name=name) if spec else BoxSpec(name=name)
+    if runtime == "custom":
+        # Its own image, always: the fleet's is Hermes, and a custom agent on
+        # it would be a Hermes agent the rest of Flotta thinks speaks the box
+        # contract. Not a caller's spec either, for the same reason.
+        base = replace(base, image=image)
 
     # The image every agent is born on, resolved the same way an upgrade
     # resolves it — `$FLOTTA_FLY_IMAGE`, else the newest release on the build
@@ -1319,7 +1494,11 @@ def create_box(
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
-    fleet, missing_fleet = fleet_secrets(source, box_id=box.id, org=box.org, client=box.client)
+    fleet, missing_fleet = fleet_secrets(
+        source, box_id=box.id, org=box.org, client=box.client, runtime=runtime
+    )
+    if runtime == "custom":
+        identity_env[RUNTIME_ENV] = "custom"
     # This agent's own model, if it has one — from the store for the reason
     # `meta` is. Only the model is overridden: the endpoint and key stay the
     # fleet's (see the `box_models` table).
@@ -1706,6 +1885,7 @@ def set_instructions(
     one: Hermes seeds its own default when `SOUL.md` is absent, and an empty
     file would leave an agent with no identity at all.
     """
+    hermes_only(store, box_id, "Flotta's instructions")
     import base64
 
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
@@ -1830,6 +2010,7 @@ def set_rules(
     enforced, the next conversation for the rest. As with instructions, nothing
     restarts. Asleep is fine, since `exec` starts the machine; paused is not.
     """
+    hermes_only(store, box_id, "tool rules")
     import json
 
     box = _writable_box(box_id, store)
@@ -2016,6 +2197,7 @@ def set_mcp_grants(
     A running agent is then asked to reload (`reload.mcp`), so a server taken
     away leaves its open conversations too; see `_reload_mcp`.
     """
+    hermes_only(store, box_id, "MCP grants")
     import json
 
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
@@ -2139,6 +2321,39 @@ def mcp_grants_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:
     }
 
 
+def set_custom_image(
+    box_id: str,
+    image: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Move a custom agent onto another image of the agency's, keeping its disk (M17.1).
+
+    The row first, then the machine, because `upgrade_box` refuses any image
+    the row does not name; if the machine cannot be moved the row goes back,
+    so it never names an image nothing runs. The timeline's `reimaged` event
+    says what it ran before, which is the history and the way back.
+    """
+    from flotta.store import validate_image_ref
+
+    box = _require_box(store, box_id)
+    if box.runtime != "custom":
+        raise CustomRuntimeRefused(
+            f"{box.name} runs Hermes on the fleet's image; its image moves with the fleet's"
+        )
+    new = validate_image_ref(image)
+    previous = box.image
+    store.set_box_image(box.id, new)
+    try:
+        result = upgrade_box(box.id, store=store, image=new, backend=backend, reason="image")
+    except Exception:
+        if previous:
+            store.set_box_image(box.id, previous)
+        raise
+    return result
+
+
 def upgrade_box(
     box_id: str,
     *,
@@ -2181,7 +2396,21 @@ def upgrade_box(
             "thread building it; wait for it to settle."
         )
 
-    target_image = (image or "").strip() or _fleet_image()
+    if box.runtime == "custom":
+        # **Never onto the fleet's image** (M17.1). That is Hermes, and every
+        # path that re-images (an upgrade with no image named, the fleet's
+        # Hermes update) would otherwise turn the agency's own agent into one
+        # the rest of Flotta still treats as speaking the box contract. Its
+        # image changes only through `set_custom_image`, which writes the row
+        # first; here the target must be what the row says.
+        target_image = (image or "").strip() or (box.image or "")
+        if not box.image or not _same_image(target_image, box.image):
+            raise CustomRuntimeRefused(
+                f"{box.name} runs its own image ({box.image}); change it with "
+                "PUT /api/boxes/{id}/image, never by an upgrade"
+            )
+    else:
+        target_image = (image or "").strip() or _fleet_image()
     if not target_image:
         raise ProvisionError(
             "no image to upgrade to. Pass one explicitly or set $FLOTTA_FLY_IMAGE — "
@@ -2324,7 +2553,11 @@ def rotate_identity(
     rewritten = {"FLOTTA_BOX_TOKEN": token}
     fleet_password = (layered(store).get("FLOTTA_BOX_PASSWORD") or "").strip()
     if fleet_password:
-        rewritten["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = box_password(fleet_password, box.id)
+        # The door's secret for this agent, under the name its runtime reads.
+        secret_name = (
+            BOX_SECRET_ENV if box.runtime == "custom" else "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"
+        )
+        rewritten[secret_name] = box_password(fleet_password, box.id)
 
     impl = _resolve_backend(box, backend)
     try:
@@ -2626,6 +2859,7 @@ def join_gateway(
     rest. `leave_gateway` is the way back. Synchronous: the control plane runs it on
     a thread, as `set_model`.
     """
+    hermes_only(store, box_id, "moving it on or off the gateway")
     from flotta.auth import AuthError
     from flotta.settings import layered
 
@@ -2673,6 +2907,7 @@ def leave_gateway(
     Needs the control plane to still hold the key, so it has to outlive the last
     agent's move.
     """
+    hermes_only(store, box_id, "moving it on or off the gateway")
     from flotta.inference import provider_secrets
     from flotta.settings import layered
 
@@ -2896,6 +3131,7 @@ def set_model(
 
     Synchronous: the control plane runs it on a thread (FLOTTA-99).
     """
+    hermes_only(store, box_id, "choosing its model")
     box, wanted, effective = _model_plan(box_id, model, store)
     default = fleet_model(store)
 
@@ -3294,6 +3530,7 @@ def set_screen(
     **Substrate first, row second**, as `resize_box` is: the row says the agent
     has a screen only once its machine has been told.
     """
+    hermes_only(store, box_id, "a screen")
     box, resize_to, current = _screen_plan(box_id, screen, store, backend)
     impl = _resolve_backend(box, backend)
     env = {SCREEN_ENV_KEY: "1" if screen else "0"}

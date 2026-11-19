@@ -115,10 +115,12 @@ from flotta.store import (
     SEAT_ROLES,
     TASK_STATUSES,
     BoxBusyError,
+    CustomImagesOffError,
     DuplicateMembershipError,
     DuplicateTenantError,
     FleetStore,
     InvalidAccountError,
+    InvalidImageError,
     InvalidTenantError,
     InvalidTransitionError,
     LastOwnerError,
@@ -1386,6 +1388,43 @@ def create_app(
             content={"detail": str(exc), "limit": {"kind": exc.kind, "limit": exc.limit}},
         )
 
+    @app.exception_handler(CustomImagesOffError)
+    def _custom_images_off(_request: Request, exc: CustomImagesOffError) -> Any:
+        """403 wherever an org without the operator's switch asks for its own image (M17.1)."""
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=403, content={"detail": str(exc), "code": "custom_images_off"}
+        )
+
+    @app.exception_handler(InvalidImageError)
+    def _invalid_image(_request: Request, exc: InvalidImageError) -> Any:
+        """422 for an image reference that could not be pulled, or carries a credential."""
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    from flotta.provision import CustomRuntimeRefused
+
+    @app.exception_handler(CustomRuntimeRefused)
+    def _custom_refused(_request: Request, exc: CustomRuntimeRefused) -> Any:
+        """409 wherever a custom agent is asked for what only Hermes has (M17.1).
+
+        One handler, because the refusal is raised in `provision` (`hermes_only`),
+        where every route meets it; a route that catches `ProvisionError` itself
+        answers 409 for it already.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=409, content={"detail": str(exc), "code": "custom_runtime"})
+
+    def _refuse_custom(box: Any, what: str) -> None:
+        """The route-level `hermes_only`, for the verbs with no provision function."""
+        if getattr(box, "runtime", "hermes") == "custom":
+            raise CustomRuntimeRefused(
+                f"{box.name} runs its own image; {what} is for Hermes agents only"
+            )
+
     @app.exception_handler(OrgNotActiveError)
     def _org_not_active(_request: Request, exc: OrgNotActiveError) -> Any:
         """403 wherever an org that is not active is refused a create.
@@ -2011,6 +2050,32 @@ def create_app(
             _log.info("%s closed by its %s (%s)", org_id, by, subject)
             tasks.add_task(_destroy_closed, org_id)
         return {"org": view, "changed": changed}
+
+    @app.put("/api/orgs/{org_id}/custom-images")
+    def put_custom_images(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Let an agency run agents from its own images, or stop: `{"on": true}` (M17.1).
+
+        The operator's alone: the image is the agency's code, on the fleet's
+        substrate beside every other agency's agents. Off creates nothing and
+        destroys nothing; it refuses the next one.
+        """
+        _require_operator(token, "let an org run its own images")
+        on = (body or {}).get("on")
+        if not isinstance(on, bool):
+            raise HTTPException(status_code=422, detail="on is true or false")
+        store = store_factory()
+        try:
+            try:
+                org = store.set_org_custom_images(org_id, on)
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            view = _org_view(store, org)
+        finally:
+            store.close()
+        _log.info("custom images for %s turned %s by the operator", org_id, "on" if on else "off")
+        return {"org": view}
 
     @app.post("/api/orgs/{org_id}/reopen")
     def reopen_org(org_id: str, token: Token | None = needs_admin) -> Any:
@@ -4000,6 +4065,10 @@ def create_app(
                 for box in inner.list_boxes():
                     if is_terminal("box", box.status) or box.status == "provisioning":
                         continue
+                    if box.runtime != "hermes":
+                        # The agency's own image (M17.1): there is no Hermes in
+                        # it to update, and the fleet's image would replace it.
+                        continue
                     # A person on its screen (FLOTTA-211): passed by, not stopped
                     # at. Nothing is wrong with the image, and one sign-in must
                     # not hold back the fleet. Said on its timeline and the build's.
@@ -4159,6 +4228,13 @@ def create_app(
         name = str(body.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=422, detail="a box needs a name")
+        # What runs in it (M17.1): Hermes unless the agency names its own image.
+        runtime = str(body.get("runtime") or "hermes").strip()
+        image = body.get("image")
+        if image is not None and not isinstance(image, str):
+            raise HTTPException(
+                status_code=422, detail="image is a reference, like ghcr.io/org/agent:1.0"
+            )
 
         # Here as well as in the store, and deliberately: the store is the
         # guarantee — it is what makes this true for the CLI too — while this
@@ -4195,6 +4271,23 @@ def create_app(
             # The same early answer for an org at its limit on agents: the
             # store refuses the row as well, under its guard (FLOTTA-183).
             tenant_store.require_room(org, "agents")
+            # And for an image the org may not run, or a custom agent asked for
+            # what only Hermes has: before a name or a probe is spent.
+            from flotta.provision import check_custom_request
+            from flotta.store import InvalidBoxMetaError as _BadMeta
+
+            try:
+                image = check_custom_request(
+                    runtime,
+                    image,
+                    store=tenant_store,
+                    org=org,
+                    screen=bool(body.get("screen")),
+                    instructions=(str(body.get("instructions") or "").strip() or None),
+                    model=(str(body.get("model") or "").strip() or None),
+                )
+            except _BadMeta as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             tenant_store.close()
 
@@ -4265,6 +4358,8 @@ def create_app(
                 instructions=instructions,
                 model=model,
                 screen=screen,
+                runtime=runtime,
+                image=image,
             )
 
         store = store_factory()
@@ -4283,6 +4378,8 @@ def create_app(
                     instructions=instructions,
                     model=model,
                     screen=screen,
+                    runtime=runtime,
+                    image=image,
                 )
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
@@ -4338,6 +4435,8 @@ def create_app(
         instructions: str | None = None,
         model: str | None = None,
         screen: bool = False,
+        runtime: str = "hermes",
+        image: str | None = None,
     ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
@@ -4385,6 +4484,8 @@ def create_app(
                     instructions=instructions,
                     model=model,
                     screen=screen,
+                    runtime=runtime,
+                    image=image,
                 )
             except DuplicateBoxError as exc:
                 # A *live* box holds the name — a destroyed one no longer does,
@@ -6059,6 +6160,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "a screen")
             store.set_clients_control_screen(box.id, allowed)
             store.add_event(
                 "box",
@@ -6104,6 +6206,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "choosing its model")
             went_ahead = _refuse_screen_held(
                 store, box, token, force=force, verb="change the model of"
             )
@@ -6332,6 +6435,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "a screen")
             went_ahead = _refuse_screen_held(
                 store, box, token, force=force, verb="change the screen of"
             )
@@ -6500,6 +6604,7 @@ def create_app(
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
+            _refuse_custom(box, "moving it on or off the gateway")
             if not _is_operator(token):
                 raise HTTPException(
                     status_code=403, detail="only the fleet's operator may move an agent"
@@ -6628,6 +6733,41 @@ def create_app(
         finally:
             store.close()
 
+    @app.put("/api/boxes/{box_id}/image")
+    def set_image_endpoint(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Move a custom agent onto another of the agency's images: `{"image": "..."}` (M17.1).
+
+        Its disk is kept; the timeline's `reimaged` says what it ran before,
+        which is the way back. A Hermes agent is 409: its image is the fleet's.
+        Synchronous, like an upgrade, and for the same reason it is a known
+        limit: a running agent restarts.
+        """
+        from flotta.provision import ProvisionError, UpgradeFailed, set_custom_image
+
+        image = (body or {}).get("image")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            if store.get_org(box.org) is not None and not store.get_org(box.org).custom_images:
+                raise CustomImagesOffError(
+                    f"{box.org} cannot run its own images yet; the operator turns that on"
+                )
+            try:
+                result = set_custom_image(
+                    box.id, image if isinstance(image, str) else "", store=store
+                )
+            except UpgradeFailed as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except CustomRuntimeRefused:
+                raise
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"box": _with_meta(store, _scoped_box(store, token, box.id)), **result}
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/upgrade")
     def upgrade_box_endpoint(
         box_id: str,
@@ -6685,6 +6825,7 @@ def create_app(
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
+            _refuse_custom(box, "an upgrade onto the fleet's image (change its image instead)")
             went_ahead = _refuse_screen_held(store, box, token, force=force, verb="re-image")
             if background:
                 started = _upgrade_in_background(box, image)
@@ -8579,6 +8720,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "a handoff on its screen")
             confine_to_box(token, box, "hand over the screen of")
             if not box.screen:
                 raise HTTPException(

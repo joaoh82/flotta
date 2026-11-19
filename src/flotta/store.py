@@ -506,6 +506,58 @@ class LastOwnerError(StoreError):
     """Raised when removing an org's last owner would leave nobody to run it."""
 
 
+class CustomImagesOffError(StoreError):
+    """Raised when an org whose operator has not turned custom images on asks for one."""
+
+
+class InvalidImageError(StoreError):
+    """Raised when an image reference is not one Fly can pull without credentials."""
+
+
+#: What may run in an agent (M17): Hermes on the fleet's image, or the agency's own.
+RUNTIMES = ("hermes", "custom")
+#: The longest image reference taken, which is far past any real one.
+IMAGE_REF_MAX = 255
+# `[registry[:port]/]path[:tag][@sha256:digest]`, lower case as registries
+# require, with no scheme and no `user:password@`: only a public image is
+# taken in M17, and a credential in a reference would be logged everywhere
+# the reference is.
+_IMAGE_REF = re.compile(
+    r"^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?/)?"
+    r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@sha256:[a-f0-9]{64})?$"
+)
+
+
+def validate_image_ref(image: object) -> str:
+    """A custom agent's image reference, cleaned, or `InvalidImageError`.
+
+    In the store, where every caller meets it, for the reason a box name is:
+    a reference Fly cannot pull is an agent that never boots, and one carrying
+    a credential is a secret in every event and log line that names it.
+    """
+    if not isinstance(image, str) or not image.strip():
+        raise InvalidImageError("name the image, like ghcr.io/your-org/your-agent:1.0")
+    ref = image.strip()
+    if len(ref) > IMAGE_REF_MAX:
+        raise InvalidImageError(f"an image reference is at most {IMAGE_REF_MAX} characters")
+    if "://" in ref:
+        raise InvalidImageError(
+            "an image reference has no scheme: ghcr.io/org/agent:tag, not https://"
+        )
+    if "@" in ref.split("/", 1)[0] or ref.count("@") > 1 or ("@" in ref and "@sha256:" not in ref):
+        raise InvalidImageError(
+            "an image reference carries no credentials; only public images can be used for now"
+        )
+    if not _IMAGE_REF.match(ref):
+        raise InvalidImageError(
+            f"{ref!r} is not an image reference; it looks like ghcr.io/your-org/your-agent:1.0"
+        )
+    return ref
+
+
 class InvalidBoxNameError(StoreError):
     """Raised when a box name could not be an address.
 
@@ -586,6 +638,12 @@ class Box:
     #: Whether this agent has a screen a person can watch and take over
     #: (FLOTTA-208/209). Off unless chosen: no screen means no ticket grants one.
     screen: bool = False
+    #: What runs in it (M17): `hermes`, the fleet's own image, or `custom`, the
+    #: agency's own image speaking the box contract. One of `RUNTIMES`.
+    runtime: str = "hermes"
+    #: A custom agent's image, as the agency named it. `None` for Hermes, whose
+    #: image is the fleet's and moves with its upgrades.
+    image: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,6 +688,9 @@ class Org:
     #: `FLOTTA_CLOSED_RETENTION_DAYS` after `closed_at`. See `FleetStore.close_org`.
     closed_at: str | None = None
     closed_by: str | None = None
+    #: Whether its people may create agents from their own image (M17.1): the
+    #: operator's switch, off unless they turn it on.
+    custom_images: bool = False
 
     @property
     def held(self) -> bool:
@@ -3921,6 +3982,61 @@ class FleetStore:
             tuple(box_ids),
         ).fetchall()
         return {str(r["box_id"]) for r in rows}
+
+    def set_box_runtime(self, box_id: str, runtime: str, image: str | None) -> Box:
+        """What runs in this agent (M17.1): set once, while it is reserved.
+
+        `custom` needs an image and an org whose operator has turned custom
+        images on, checked here so no path that reserves an agent can skip it;
+        `hermes` takes none, because its image is the fleet's.
+        """
+        if runtime not in RUNTIMES:
+            raise InvalidBoxMetaError(f"runtime is one of {', '.join(RUNTIMES)}, not {runtime!r}")
+        box = self._get_box_or_raise(box_id)
+        if runtime == "hermes":
+            if image is not None:
+                raise InvalidImageError("a Hermes agent runs the fleet's image; name none")
+        else:
+            image = validate_image_ref(image)
+            org = self.get_org(box.org)
+            if org is None or not org.custom_images:
+                raise CustomImagesOffError(
+                    f"{box.org} cannot run its own images yet; the operator turns that on"
+                )
+        self._conn.execute(
+            "UPDATE boxes SET runtime = ?, image = ? WHERE id = ?", (runtime, image, box_id)
+        )
+        return self._get_box_or_raise(box_id)
+
+    def set_box_image(self, box_id: str, image: str) -> Box:
+        """A custom agent's new image, once its machine runs it (M17.1).
+
+        Only a custom agent's: a Hermes agent's image is the fleet's, and is
+        never written here.
+        """
+        box = self._get_box_or_raise(box_id)
+        if box.runtime != "custom":
+            raise InvalidImageError(f"{box.name} runs Hermes on the fleet's image")
+        self._conn.execute(
+            "UPDATE boxes SET image = ? WHERE id = ?", (validate_image_ref(image), box_id)
+        )
+        return self._get_box_or_raise(box_id)
+
+    def set_org_custom_images(self, org_id: str, on: bool) -> Org:
+        """Whether `org_id`'s people may create agents from their own image (M17.1).
+
+        Turning it off creates nothing and destroys nothing: agents it already
+        has keep running their images, and the next one is refused.
+        """
+        with self._conn.transaction(guard="orgs"):
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            self._conn.execute(
+                "UPDATE orgs SET custom_images = ? WHERE id = ?", (int(bool(on)), org_id)
+            )
+        org = self.get_org(org_id)
+        assert org is not None
+        return org
 
     def set_box_screen(self, box_id: str, screen: bool) -> None:
         """Whether this agent has a screen (FLOTTA-208). Only the switch: the
@@ -8046,6 +8162,9 @@ def _box_from_row(row: db.Row) -> Box:
         # `get`: a store read part-way through its migrations, before 34, has
         # no screens yet, which is no screen.
         screen=bool(row.get("screen") or 0),
+        # Before 42, every agent is Hermes on the fleet's image.
+        runtime=row.get("runtime") or "hermes",
+        image=row.get("image"),
     )
 
 
@@ -8069,6 +8188,7 @@ def _org_from_row(row: db.Row) -> Org:
         billing_period_from=row.get("billing_period_from"),
         closed_at=row.get("closed_at"),
         closed_by=row.get("closed_by"),
+        custom_images=bool(row.get("custom_images") or 0),
     )
 
 
