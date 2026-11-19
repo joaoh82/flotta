@@ -2990,6 +2990,83 @@ def org_ceiling(
     emit(view, line, as_json=as_json)
 
 
+@org_app.command("close")
+def org_close(
+    org_id: str = typer.Argument(..., help="The org to close"),
+    confirm: str = typer.Option(
+        ..., "--confirm", help="The org's id again: closing destroys its agents at once"
+    ),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Close an org (FLOTTA-224): its people signed out, its agents destroyed.
+
+    Everything else of it is deleted FLOTTA_CLOSED_RETENTION_DAYS later (30 by
+    default) by the control plane's sweep; until then `flotta org reopen` undoes
+    it. On the hosted product, cancel its subscription first, or close it from HQ.
+    """
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN
+    from flotta.store import InvalidTransitionError, UnknownEntityError
+
+    if confirm != org_id:
+        raise _fail(ValueError(f"--confirm must be the org's id, {org_id!r}"))
+    if control_url():
+        try:
+            answer = control_request(
+                "POST",
+                f"/api/orgs/{org_id}/close",
+                scopes=(SCOPE_ORG_ADMIN, SCOPE_FLEET_WRITE),
+                body={"confirm": confirm},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        view = answer["org"]
+    else:
+        from flotta.provision import close_org_agents, purge_after
+
+        with _open_store(store) as fleet:
+            try:
+                org, _changed = fleet.close_org(org_id, by="operator")
+            except (UnknownEntityError, InvalidTransitionError) as exc:
+                raise _fail(exc) from exc
+            close_org_agents(fleet, org_id=org_id)
+            view = {**asdict(org), "purge_after": purge_after(fleet, org)}
+    emit(
+        view, f"{org_id}: closed; its data is deleted after {view['purge_after']}", as_json=as_json
+    )
+
+
+@org_app.command("reopen")
+def org_reopen(
+    org_id: str = typer.Argument(..., help="A closed org whose data isn't deleted yet"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Undo a close before the purge (FLOTTA-224): the org comes back suspended,
+    with its agents gone. Resume it, or let its owner choose a plan."""
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import InvalidTransitionError, UnknownEntityError
+
+    if control_url():
+        try:
+            view = control_request("POST", f"/api/orgs/{org_id}/reopen", scopes=(SCOPE_ORG_ADMIN,))[
+                "org"
+            ]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                view = asdict(fleet.reopen_org(org_id))
+            except (UnknownEntityError, InvalidTransitionError) as exc:
+                raise _fail(exc) from exc
+    emit(view, f"{org_id}: reopened, suspended until resumed", as_json=as_json)
+
+
 @org_app.command("decline")
 def org_decline(
     org_id: str = typer.Argument(..., help="A pending org: `flotta org list --pending`"),

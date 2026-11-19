@@ -766,10 +766,11 @@ class RunLoop:
         """End `run` as `budget_blocked` if its agent may not be woken now."""
         now = datetime.now(UTC)
         org = store.get_org(box.org)
-        if org is not None and org.status == "suspended":
-            # FLOTTA-184: delivering would wake it. `budget_blocked`, not a status
-            # of its own: it is a run that was never delivered because of what
-            # the agency owes, which is what the status already means.
+        if org is not None and org.held:
+            # FLOTTA-184, and a closed org (FLOTTA-224): delivering would wake
+            # it. `budget_blocked`, not a status of its own: it is a run that was
+            # never delivered because of what the agency owes, which is what the
+            # status already means.
             self._end(
                 store,
                 run.id,

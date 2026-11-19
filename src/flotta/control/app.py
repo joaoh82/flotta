@@ -867,6 +867,16 @@ def create_app(
                         headers={"WWW-Authenticate": "Bearer"},
                     ) from exc
 
+            # A closed org's people are signed out, and that includes tokens an
+            # owner minted (FLOTTA-224): a signature can't be revoked, so it is
+            # refused here. Billing's and the operator's carry no org claim.
+            if token.org is not None and token.org != DEFAULT_ORG and _org_closed(token.org):
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"org {token.org!r} is closed",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
             missing = [s for s in scopes if not token.allows(s)]
             if any_of and len(missing) < len(scopes):
                 missing = []
@@ -880,6 +890,22 @@ def create_app(
             return token
 
         return dependency
+
+    def _org_closed(org_id: str) -> bool:
+        """Whether `org_id` is closed (FLOTTA-224). A store that can't answer is
+        not a reason to refuse: the routes still check tenancy as before."""
+        try:
+            store = store_factory()
+        except Exception:  # noqa: BLE001 - a store that can't open refuses nothing
+            return False
+        try:
+            org = store.get_org(org_id)
+            return org is not None and org.status == "closed"
+        except Exception:  # noqa: BLE001 - a read that failed refuses nothing
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                store.close()
 
     def _session_token(secret: str, request: Request) -> Token:
         """The token a live session's membership would mint, or 401.
@@ -1431,8 +1457,6 @@ def create_app(
 
         `?status=pending` is the operator's queue of sign-ups to decide.
         """
-        from dataclasses import asdict
-
         store = store_factory()
         try:
             if _is_operator(token):
@@ -1441,9 +1465,17 @@ def create_app(
                 assert token is not None
                 own = store.get_org(token.org or DEFAULT_ORG)
                 orgs = [own] if own is not None else []
-            return {"orgs": [asdict(o) for o in orgs]}
+            return {"orgs": [_org_view(store, o) for o in orgs]}
         finally:
             store.close()
+
+    def _org_view(store: Any, org: Any) -> dict[str, Any]:
+        """An org as the API shows it: its row, and when a closed one is deleted."""
+        from dataclasses import asdict
+
+        from flotta.provision import purge_after
+
+        return {**asdict(org), "purge_after": purge_after(store, org)}
 
     @app.post("/api/orgs", status_code=201)
     def create_org(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
@@ -1927,6 +1959,89 @@ def create_app(
                 ],
             )
         return {"org": asdict(org), "changed": changed, "told": told}
+
+    @app.post("/api/orgs/{org_id}/close")
+    def close_org(
+        org_id: str,
+        tasks: BackgroundTasks,
+        body: dict[str, Any] | None = None,
+        token: Token | None = needs_admin,
+    ) -> Any:
+        """Close an org (FLOTTA-224): `{"confirm": "<org id>"}`.
+
+        Its people are signed out and can't sign in to it again, its links and
+        triggers stop, and its agents are destroyed, machine and volume, after
+        the response. Everything else is deleted `FLOTTA_CLOSED_RETENTION_DAYS`
+        later by the purge sweep; until then the operator can reopen it.
+
+        The operator's, or the org's own owner's: `org:admin` in that org with
+        `fleet:write`, which the operator viewing an agency as its owner doesn't
+        hold. Not billing's (`org:govern`), which cancels plans, not accounts.
+        The hosted product cancels the org's subscription before calling this.
+        """
+        if not _is_operator(token):
+            assert token is not None
+            if (
+                token.org != org_id
+                or token.client is not None
+                or not (token.allows(SCOPE_ORG_ADMIN) and token.allows(SCOPE_FLEET_WRITE))
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="only the org's owner, or the fleet's operator, may close it",
+                )
+        if str((body or {}).get("confirm") or "") != org_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f'to close it, confirm with the org\'s id: {{"confirm": "{org_id}"}}',
+            )
+        by = "operator" if _is_operator(token) else "owner"
+        store = store_factory()
+        try:
+            org, changed = store.close_org(org_id, by=by)
+            view = _org_view(store, org)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        if changed:
+            subject = token.subject if token is not None else "operator"
+            _log.info("%s closed by its %s (%s)", org_id, by, subject)
+            tasks.add_task(_destroy_closed, org_id)
+        return {"org": view, "changed": changed}
+
+    @app.post("/api/orgs/{org_id}/reopen")
+    def reopen_org(org_id: str, token: Token | None = needs_admin) -> Any:
+        """Undo a close before its data is deleted: the org is suspended by the
+        operator, with its agents gone. The operator's alone."""
+        _require_operator(token, "reopen an org")
+        store = store_factory()
+        try:
+            org = store.reopen_org(org_id)
+            view = _org_view(store, org)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        _log.info("%s reopened by the operator", org_id)
+        return {"org": view}
+
+    def _destroy_closed(org_id: str) -> None:
+        """After a close's response: its agents destroyed now. The reconcile loop
+        does the same each sweep, for any the substrate refused."""
+        from flotta.provision import close_org_agents
+
+        store = store_factory()
+        try:
+            close_org_agents(store, org_id=org_id)
+        except Exception:  # noqa: BLE001 - the loop tries again next sweep
+            _log.exception("could not destroy %s's agents after closing it", org_id)
+        finally:
+            store.close()
 
     def _sleep_suspended(org_id: str) -> None:
         """After a suspend's response: its running agents to sleep now. The
@@ -3395,7 +3510,12 @@ def create_app(
             user = store.get_user_by_email(link.email)
             if user is None or user.disabled_at is not None:
                 raise refused
-            orgs = [m.org for m in store.memberships_for(user.id)]
+            # Not a closed org (FLOTTA-224): one closed is as if it were gone.
+            orgs = [
+                m.org
+                for m in store.memberships_for(user.id)
+                if (o := store.get_org(m.org)) is None or o.status != "closed"
+            ]
             if not orgs:
                 raise refused
             org = str(wanted) if wanted is not None else orgs[0]
@@ -3423,8 +3543,8 @@ def create_app(
         if user is not None and user.disabled_at is not None:
             raise refused
         org = store.get_org(link.org)
-        # Declined since it was sent: the decline is the later word.
-        if org is None or org.status == "declined":
+        # Declined or closed since it was sent: the later word wins.
+        if org is None or org.status in ("declined", "closed"):
             raise refused
         # An org whose seats filled since the invite was sent answers 402 here,
         # before the link is touched. This is only the early answer: the check
@@ -9230,8 +9350,8 @@ def create_app(
             # closes with as 4402 and the control plane's words; the web app tells
             # them apart by the org's status on `/api/me`.
             owner = store.get_org(box.org)
-            if owner is not None and owner.status == "suspended":
-                raise HTTPException(status_code=402, detail=suspended_wake_message(box, owner.id))
+            if owner is not None and owner.held:
+                raise HTTPException(status_code=402, detail=suspended_wake_message(box, owner))
             if box.status == "paused":
                 raise HTTPException(
                     status_code=402, detail=paused_message(store, box, datetime.now(UTC))

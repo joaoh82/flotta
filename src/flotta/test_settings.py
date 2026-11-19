@@ -79,6 +79,10 @@ def test_every_catalogued_setting_actually_changes_something():
         # billing gives a paying self-serve org its ceiling
         # (`POST /api/orgs/{id}/spend-ceiling/default`, FLOTTA-241).
         "FLOTTA_SPEND_CEILING_EUR",
+        # Read by `provision.resolve_closed_retention_days`, through `layered`,
+        # in every loop sweep (`purge_closed_orgs`) and in `/api/orgs`'s
+        # `purge_after` (FLOTTA-224): how long a closed org's rows are kept.
+        "FLOTTA_CLOSED_RETENTION_DAYS",
         # Both read by `provision.resolve_box_resources` and carried to the
         # machine in `BoxSpec`. The volume one was *not* wired when this test
         # was written — `FlyConfig.volume_gb` was read by nothing but the
