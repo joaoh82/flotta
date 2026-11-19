@@ -100,7 +100,7 @@ def apply(home: Path, env: dict[str, str] | None = None) -> str:
     whatever Hermes already had, which is a wrong model rather than no agent.
     The line says so, and never contains the key.
     """
-    import yaml
+    from flotta.box import config_file
 
     source = os.environ if env is None else env
     model = (source.get("FLOTTA_MODEL") or "").strip()
@@ -110,6 +110,16 @@ def apply(home: Path, env: dict[str, str] | None = None) -> str:
         return "model left alone: FLOTTA_MODEL / FLOTTA_MODEL_BASE_URL / FLOTTA_API_KEY not all set"
 
     wanted = hermes_model_config(model, base_url, api_key)
+    # Under the lock the control plane's writer takes (`config_file`).
+    with config_file.locked(home):
+        return _settle_file(home, source, model, base_url, wanted)
+
+
+def _settle_file(home: Path, source: Any, model: str, base_url: str, wanted: dict[str, Any]) -> str:
+    import yaml
+
+    from flotta.box import config_file
+
     path = home / "config.yaml"
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -127,7 +137,7 @@ def apply(home: Path, env: dict[str, str] | None = None) -> str:
     if not changed:
         return f"model: already {described}"
     try:
-        path.write_text(yaml.safe_dump(settled, sort_keys=False), encoding="utf-8")
+        config_file.save(path, settled)
         if "api_key" in wanted:
             # The file now holds a credential. Hermes runs as the same user,
             # so this does not hide it from the agent — it keeps it out of

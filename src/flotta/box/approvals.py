@@ -97,7 +97,18 @@ def apply(home: Path) -> str:
     approval timeout must still boot, because the alternative is an agent that
     is unreachable over a five-minute wait it could have lived with.
     """
+    from flotta.box import config_file
+
+    # Read, changed and saved under the lock the control plane's writer takes,
+    # so neither saves over the other (`config_file`).
+    with config_file.locked(home):
+        return _apply(home)
+
+
+def _apply(home: Path) -> str:
     import yaml
+
+    from flotta.box import config_file
 
     path = home / "config.yaml"
     try:
@@ -114,7 +125,7 @@ def apply(home: Path) -> str:
         return f"approvals.timeout left alone: already {existing!r}"
 
     try:
-        path.write_text(yaml.safe_dump(settled, sort_keys=False), encoding="utf-8")
+        config_file.save(path, settled)
     except OSError as exc:
         return f"approvals.timeout left alone: could not write {path}: {exc}"
     return f"approvals.timeout set to {FLOTTA_APPROVAL_TIMEOUT_S}s in {path}"

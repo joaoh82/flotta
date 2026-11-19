@@ -28,10 +28,12 @@ prompt cache, which is the price of not showing a tool that is gone.
 waiting up to `WAIT_S` for it, and reload nothing. `provision.create_box` asks this
 before it writes a new agent's first MCP config. Hermes listening means
 `box_entrypoint.sh` has finished: its steps that also edit `config.yaml`
-(approvals, skills, the model, the screen) each read the file and save it with no
-lock, and on a first boot every one of them saves, so a config written before then
-can be put back without its servers, or read half-written and saved over the boot
-step's own.
+(approvals, skills, the model, the screen) each read the file and save it, and on
+a first boot every one of them saves. On an image from before FLOTTA-253 they did
+that with no lock, so a config written before then could be put back without its
+servers, or read half-written and saved over the boot step's own; since then they
+take the writer's lock (`flotta.box.config_file`). Either way Hermes has to be
+listening before it can be asked to reload, so creation still waits for it.
 
 Imports nothing of Flotta's: only the standard library, and `websockets`, which
 Hermes's venv has because Hermes does.
