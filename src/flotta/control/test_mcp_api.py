@@ -579,6 +579,23 @@ def test_a_grant_is_in_force_even_when_the_machine_cant_be_written(api, fleet, m
         assert store.box_mcp_grant("b-support", "notes") is None
 
 
+def test_tools_saved_for_an_agent_still_being_created_say_they_wait_for_it(api, fleet):  # noqa: F811
+    """No machine yet (FLOTTA-252): accepted, in force, and written when creation ends."""
+    mo = _as(fleet, "mo@example.com")
+    with FleetStore(fleet) as store:
+        assert (store.get_box("b-support").status, store.get_box("b-support").endpoint) == (
+            "provisioning",
+            None,
+        )
+    answer = api.put("/api/boxes/b-support/mcp", json=GRANTS, headers=mo)
+    assert answer.status_code == 200
+    said = answer.json()
+    assert (said["written"], said["pending"], said["waits_for"]) == (False, True, "created")
+    with FleetStore(fleet) as store:
+        assert store.box_mcp_grant("b-support", "notes") is not None
+        assert store.mcp_config_pending("b-support")
+
+
 @pytest.mark.parametrize(
     "body",
     [
