@@ -1989,19 +1989,15 @@ class FleetStore:
                     self.require_custom_images(org)
                 # A Hermes row names no runtime: the column's default is
                 # Hermes, and a store part-way through its migrations, before
-                # 42, has no such column (the migration tests write one).
-                if runtime == "hermes":
-                    self._conn.execute(
-                        "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (bid, label, "provisioning", _utcnow(), org, client),
-                    )
-                else:
-                    self._conn.execute(
-                        "INSERT INTO boxes (id, name, status, created_at, org_id, client_id, "
-                        "runtime, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (bid, label, "provisioning", _utcnow(), org, client, runtime, image),
-                    )
+                # 42, has no such column (the migration tests write one). One
+                # statement either way, which the pending-org ratchet counts.
+                extra = "" if runtime == "hermes" else ", runtime, image"
+                values = () if runtime == "hermes" else (runtime, image)
+                self._conn.execute(
+                    f"INSERT INTO boxes (id, name, status, created_at, org_id, client_id{extra}) "
+                    f"VALUES ({', '.join('?' for _ in range(6 + len(values)))})",
+                    (bid, label, "provisioning", _utcnow(), org, client, *values),
+                )
         except db.UniqueViolation as exc:
             # Two different collisions land here. Reporting a duplicate *id* as
             # a duplicate *name* sends the caller looking for the wrong thing —
