@@ -41,6 +41,9 @@ DATA_ENV = "FLOTTA_DATA"
 HOST_ENV = "FLOTTA_HOST"
 PORT_ENV = "FLOTTA_PORT"
 RUN_HEADER = "X-Flotta-Run"
+#: What a thread records when a run ends without a reply.
+INTERRUPTED = "[the run was interrupted]"
+FAILED = "[the run failed]"
 DEFAULT_DATA = "/data"
 #: Flotta's private network is IPv6, so a Flotta machine is reached on `::`.
 DEFAULT_HOST = "::"
@@ -257,6 +260,8 @@ class Agent:
             body = await request.json()
         except ValueError:
             return JSONResponse({"error": "not JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "a JSON object"}, status_code=400)
         run_id, thread_id = body.get("run_id"), body.get("thread_id")
         text = body.get("input")
         if not all(isinstance(v, str) and v for v in (run_id, thread_id)) or not isinstance(
@@ -275,7 +280,7 @@ class Agent:
         ctx = Context(run_id=run_id, thread_id=thread_id, input=text, history=history, _run=run)
         self._runs[run_id] = run
         run.task = asyncio.create_task(self._execute(run, ctx))
-        return StreamingResponse(self._events(run), media_type="application/x-ndjson")
+        return _RunResponse(self._events(run), lambda: self._end(run))
 
     async def _answer(self, request: Request) -> Response:
         if refused := self._refused(request):
@@ -285,6 +290,8 @@ class Agent:
             body = await request.json()
         except ValueError:
             return JSONResponse({"error": "not JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "a JSON object"}, status_code=400)
         waiting = run.waiting.get(str(body.get("id"))) if run else None
         if waiting is None:
             return JSONResponse({"error": "no such approval is waiting"}, status_code=404)
@@ -309,10 +316,15 @@ class Agent:
                     ctx.say(str(returned))
                 reply = str(returned) if returned is not None else "".join(run.said)
         except asyncio.CancelledError:
+            # Never a question left without an answer in the thread: the next
+            # run's history would hold two user turns in a row.
+            self.threads.append(run.thread_id, "assistant", INTERRUPTED)
             raise
         except Exception as exc:  # noqa: BLE001 - the agent's own failure, said to Flotta
             _log.exception("run %s failed", run.run_id)
-            run.emit({"type": "error", "message": str(exc) or type(exc).__name__})
+            message = str(exc) or type(exc).__name__
+            self.threads.append(run.thread_id, "assistant", f"{FAILED} {message}")
+            run.emit({"type": "error", "message": message})
             return
         self.threads.append(run.thread_id, "assistant", reply)
         run.emit({"type": "done", "reply": reply})
@@ -325,12 +337,29 @@ class Agent:
                 if event["type"] in ("done", "error"):
                     return
         finally:
-            # Flotta hung up, or the run ended: either way it is over here.
-            if run.task is not None and not run.task.done():
-                run.task.cancel()
-                with contextlib.suppress(BaseException):
-                    await run.task
-            self._runs.pop(run.run_id, None)
+            await self._end(run)
+
+    async def _end(self, run: _Run) -> None:
+        """Flotta hung up, or the run ended: either way it is over here. Run by
+        the response whether or not its stream ever started, so a request
+        dropped before the first byte cannot leave its thread busy for good."""
+        if run.task is not None and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(BaseException):
+                await run.task
+        self._runs.pop(run.run_id, None)
+
+
+class _RunResponse(StreamingResponse):
+    def __init__(self, events: AsyncIterator[bytes], end: Callable[[], Awaitable[None]]) -> None:
+        super().__init__(events, media_type="application/x-ndjson")
+        self._end = end
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._end()
 
 
 def agent(handler: Handler) -> Agent:

@@ -147,3 +147,39 @@ def test_a_hermes_agent_is_a_stand_in_whatever_image_it_names(backend, tmp_path)
     assert backend._custom("eng") is None
     with pytest.raises(NotSupported):
         backend.reimage("eng", "local:/anywhere")
+
+
+def test_a_rotated_secret_reaches_a_running_custom_agent(backend, tmp_path):
+    """The door derives the agent's Bearer from the fleet's password: a new one
+    applied and then dropped would leave it refusing the door for good."""
+    code = _code(tmp_path / "agent", "x")
+    handle = backend.create(_spec("own", f"local:{code}"))
+    backend.start("own")
+    backend.apply_secrets("own", {BOX_SECRET_ENV: "rotated", "OPENAI_API_KEY": "new-token"})
+    assert _ask(handle.endpoint, "/healthz", secret="rotated") == 200
+    assert _ask(handle.endpoint, "/healthz") == 401
+    assert backend._read("own", "secrets.json")["OPENAI_API_KEY"] == "new-token"
+
+
+def test_installing_gives_uv_no_secret_and_keeps_the_lockfile(tmp_path, monkeypatch):
+    from flotta.backends import local_backend
+
+    code = _code(tmp_path / "agent", "x")
+    (code / "uv.lock").write_text("")
+    impl = LocalBackend(tmp_path / "boxes")
+    impl.create(_spec("own", f"local:{code}"))
+    ran = {}
+
+    def run(argv, *, env, **kwargs):
+        ran.update(argv=argv, env=env)
+
+        class Done:
+            returncode = 0
+
+        return Done()
+
+    monkeypatch.setattr(local_backend.subprocess, "run", run)
+    monkeypatch.setattr(local_backend.shutil, "which", lambda _: "/usr/bin/uv")
+    impl._install("own", code, {BOX_SECRET_ENV: SECRET, "OPENAI_API_KEY": "box-token"})
+    assert "--frozen" in ran["argv"]
+    assert SECRET not in ran["env"].values() and "box-token" not in ran["env"].values()

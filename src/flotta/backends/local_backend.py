@@ -66,7 +66,12 @@ _NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _KEPT_SECRETS = (standin.USERNAME_ENV, standin.PASSWORD_ENV, standin.MODEL_ENV)
 #: What a stand-in inherits from whoever started it: enough to run Python.
 _INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
+#: What `uv sync` runs with: enough to find Python and its cache, and no secret.
+_UV_ENV = (*_INHERITED_ENV, "UV_CACHE_DIR", "UV_PYTHON", "XDG_CACHE_HOME", "XDG_DATA_HOME")
 START_TIMEOUT_S = 15.0
+#: A custom agent imports its own libraries before it answers (LangGraph and
+#: LangChain take a while from a cold cache), so it is given longer.
+CUSTOM_START_TIMEOUT_S = 90.0
 #: A custom agent's first start installs its dependencies, LangGraph and all.
 INSTALL_TIMEOUT_S = 600.0
 #: What a custom agent is: where its code is. Beside its endpoint.
@@ -327,7 +332,9 @@ class LocalBackend:
             )
         self._children[name] = child
         (directory / PID_FILE).write_text(str(child.pid))
-        deadline = time.monotonic() + START_TIMEOUT_S
+        deadline = time.monotonic() + (
+            CUSTOM_START_TIMEOUT_S if custom is not None else START_TIMEOUT_S
+        )
         while time.monotonic() < deadline:
             if self._probe(name) is not None:
                 return
@@ -341,7 +348,9 @@ class LocalBackend:
 
     def _install(self, name: str, code: Path, env: dict[str, str]) -> list[str]:
         """A custom agent's dependencies, into the box's own directory, and the
-        command that runs it. The agent's directory is left as it was found."""
+        command that runs it. The agent's directory is left as it was found: a
+        committed lockfile is used as it is (`--frozen`), and uv is given none of
+        the box's secrets, which a dependency's build could otherwise read."""
         uv = shutil.which("uv")
         if uv is None:
             raise BackendError(
@@ -352,9 +361,11 @@ class LocalBackend:
         venv = self._dir(name) / "venv"
         with open(self._dir(name) / "agent.log", "ab") as log:
             try:
+                frozen = ["--frozen"] if (code / "uv.lock").is_file() else []
+                inherited = {k: os.environ[k] for k in _UV_ENV if k in os.environ}
                 installed = subprocess.run(
-                    [uv, "sync", "--project", str(code), "--no-dev", "--quiet"],
-                    env={**env, "UV_PROJECT_ENVIRONMENT": str(venv)},
+                    [uv, "sync", "--project", str(code), "--no-dev", "--quiet", *frozen],
+                    env={**inherited, "UV_PROJECT_ENVIRONMENT": str(venv)},
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -428,18 +439,25 @@ class LocalBackend:
 
     def apply_secrets(self, box_id: str, secrets: dict[str, str]) -> None:
         name = self._name(box_id)
-        kept = {**self._read(name, "secrets.json"), **_kept(secrets)}
+        # A custom agent keeps every one, as `create` gave it: a rotated door
+        # secret or gateway token dropped here would leave it on the old ones.
+        given = dict(secrets) if self._custom(name) is not None else _kept(secrets)
+        kept = {**self._read(name, "secrets.json"), **given}
+        # Asked before the write: a custom agent is probed with its own secret,
+        # and the one it is still running on is the old one.
+        running = self._probe(name) is not None
         self._write(name, "secrets.json", kept, private=True)
         # A box reads its environment once, at boot, here as on Fly.
-        if self._probe(name) is not None:
+        if running:
             self.stop(name)
             self.start(name)
 
     def remove_secrets(self, box_id: str, names: list[str]) -> None:
         name = self._name(box_id)
         kept = {k: v for k, v in self._read(name, "secrets.json").items() if k not in names}
+        running = self._probe(name) is not None
         self._write(name, "secrets.json", kept, private=True)
-        if self._probe(name) is not None:
+        if running:
             self.stop(name)
             self.start(name)
 

@@ -271,7 +271,7 @@ requires-dist = [
     { name = "flotta-agent", editable = "../flotta-python" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=0.3" },
-    { name = "langgraph", specifier = ">=0.4" },
+    { name = "langgraph", specifier = ">=0.6" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=2.0" },
 ]
 provides-extras = ["openai"]

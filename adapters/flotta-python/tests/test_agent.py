@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import threading
@@ -238,3 +239,55 @@ def test_model_calls_carry_the_run(serve, monkeypatch):
     base, _ = serve(calls)
     _events(base, {"run_id": "r-77", "thread_id": "t1", "input": "x"})
     assert seen["X-Flotta-Run"] == "r-77"
+
+
+@pytest.mark.parametrize("body", [[], "yes", 3])
+def test_a_body_that_is_not_an_object_is_400(serve, body):
+    base, _ = serve(echo)
+    for path in ("/run", "/run/r1/approval"):
+        response = httpx.post(f"{base}{path}", json=body, headers=AUTH)
+        assert response.status_code == 400, path
+
+
+def test_a_failed_run_still_answers_the_question_in_its_thread(serve):
+    async def broken(message, ctx):
+        raise RuntimeError("no stock data")
+        yield ""
+
+    base, _ = serve(broken)
+    _events(base, {"run_id": "r1", "thread_id": "t1", "input": "q"})
+    messages = httpx.get(f"{base}/threads/t1", headers=AUTH).json()["messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[1]["text"] == "[the run failed] no stock data"
+
+
+def test_a_request_dropped_before_its_stream_leaves_the_thread_free(serve):
+    """The cleanup belongs to the response, not to the stream inside it."""
+    import asyncio as _asyncio
+
+    from flotta_agent.server import _RunResponse
+
+    ended = []
+
+    async def never():
+        await _asyncio.sleep(10)
+        yield b""
+
+    async def end():
+        ended.append(True)
+
+    async def send(message):
+        raise OSError("the door went away")
+
+    async def receive():
+        await _asyncio.sleep(10)
+
+    async def call():
+        # Starlette may raise it inside an exception group.
+        with contextlib.suppress(Exception):
+            await _RunResponse(never(), end)(
+                {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+            )
+
+    _asyncio.run(call())
+    assert ended == [True]

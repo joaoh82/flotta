@@ -42,6 +42,9 @@ __version__ = "0.1.0"
 #: The Flotta run the current graph invocation belongs to.
 RUN: ContextVar[str | None] = ContextVar("flotta_run", default=None)
 CHECKPOINTS = "langgraph.sqlite"
+#: How many rounds of an earlier run's open approvals are declined before a new
+#: run gives up on the thread: a graph that asks again after every no.
+MAX_DECLINES = 5
 
 
 def run_headers() -> dict[str, str]:
@@ -134,41 +137,97 @@ async def _drive(graph: Any, payload: Any, ctx: Context) -> str:
     from langgraph.types import Command
 
     config = {"configurable": {"thread_id": ctx.thread_id, "flotta_run_id": ctx.run_id}}
+    # An earlier run that ended while a person was being asked (they closed the
+    # conversation, the door hung up) left the thread waiting on that answer,
+    # with a tool call nobody replied to: as new input it would be history the
+    # model refuses. Nobody approved it, so it is declined, and then this run
+    # starts on a thread that is whole again.
+    await _decline_what_was_left(graph, config)
+    before = len(await _messages(graph, config))
     steps: dict[str, tuple[Any, float]] = {}
-    while True:
-        interrupts: list[Any] = []
-        async for mode, chunk in graph.astream(
-            payload, config, stream_mode=["messages", "updates"]
-        ):
-            if mode == "messages":
-                said = _ai_text(chunk[0])
-                if said:
-                    ctx.say(said)
-            elif mode == "updates" and isinstance(chunk, dict):
-                for node, update in chunk.items():
-                    if node == "__interrupt__":
-                        interrupts.extend(update or ())
-                        continue
-                    for found in _messages_of(update):
-                        await _step(found, ctx, steps)
-        if not interrupts:
-            break
-        answers = {}
-        for asked in interrupts:
-            description, command = _describe(getattr(asked, "value", asked))
-            answers[getattr(asked, "id", None)] = await ctx.approval(description, command=command)
-        if len(answers) == 1:
-            payload = Command(resume=next(iter(answers.values())))
-        else:
-            payload = Command(resume=answers)
+    try:
+        while True:
+            interrupts: list[Any] = []
+            async for mode, chunk in graph.astream(
+                payload, config, stream_mode=["messages", "updates"]
+            ):
+                if mode == "messages":
+                    said = _ai_text(chunk[0])
+                    if said:
+                        ctx.say(said)
+                elif mode == "updates" and isinstance(chunk, dict):
+                    for node, update in chunk.items():
+                        if node == "__interrupt__":
+                            interrupts.extend(update or ())
+                            continue
+                        for found in _messages_of(update):
+                            await _step(found, ctx, steps)
+            if not interrupts:
+                break
+            answers = []
+            for asked in interrupts:
+                description, command = _describe(getattr(asked, "value", asked))
+                answers.append((asked, await ctx.approval(description, command=command)))
+            payload = Command(resume=_resume(answers))
+    except BaseException as exc:
+        # A step a failure cut short ends failed, not open for good.
+        for step, _ in steps.values():
+            await step.__aexit__(type(exc), exc, None)
+        raise
     # Steps a tool never ended (a graph that drops its ToolMessage) end with the run.
     for step, _ in steps.values():
         await step.__aexit__(None, None, None)
-    state = await graph.aget_state(config)
-    for found in reversed((state.values or {}).get("messages") or []):
+    # This run's answer, never an earlier run's on the same thread.
+    for found in reversed((await _messages(graph, config))[before:]):
         if getattr(found, "type", None) == "ai" and not getattr(found, "tool_calls", None):
             return _ai_text(found) or ""
     return ""
+
+
+async def _messages(graph: Any, config: dict[str, Any]) -> list[Any]:
+    state = await graph.aget_state(config)
+    return list((state.values or {}).get("messages") or [])
+
+
+def _interrupt_id(asked: Any) -> str | None:
+    """`Interrupt.id`, which LangGraph before 0.6 called `interrupt_id`."""
+    return getattr(asked, "id", None) or getattr(asked, "interrupt_id", None)
+
+
+def _resume(answers: list[tuple[Any, bool]]) -> Any:
+    """One answer as itself; several by interrupt id, as LangGraph resumes them."""
+    if len(answers) == 1:
+        return answers[0][1]
+    by_id = {_interrupt_id(asked): answer for asked, answer in answers}
+    if None in by_id or len(by_id) != len(answers):
+        # Never one answer for several questions: each was asked on its own.
+        raise RuntimeError("several approvals at once need a LangGraph that names each one")
+    return by_id
+
+
+async def _pending(graph: Any, config: dict[str, Any]) -> list[Any]:
+    state = await graph.aget_state(config)
+    found = list(getattr(state, "interrupts", None) or ())
+    if not found:
+        for task in getattr(state, "tasks", None) or ():
+            found.extend(getattr(task, "interrupts", None) or ())
+    return found
+
+
+async def _decline_what_was_left(graph: Any, config: dict[str, Any]) -> None:
+    from langgraph.types import Command
+
+    for _ in range(MAX_DECLINES):
+        waiting = await _pending(graph, config)
+        if not waiting:
+            return
+        async for _chunk in graph.astream(
+            Command(resume=_resume([(asked, False) for asked in waiting])),
+            config,
+            stream_mode="updates",
+        ):
+            pass
+    raise RuntimeError("the thread keeps asking for approvals nobody is here to give")
 
 
 async def _step(found: Any, ctx: Context, steps: dict[str, tuple[Any, float]]) -> None:
