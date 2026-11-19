@@ -1741,12 +1741,15 @@ def _write_mcp_config_that_waited(box_id: str, *, store: FleetStore, backend: Ba
 
     **Nothing is written until Hermes listens** (`_wait_for_hermes`). The image's
     boot steps edit the same `config.yaml` (`box_entrypoint.sh`: approvals,
-    skills, the model, the screen), each a read and a save with no lock, and on
-    a first boot every one of them saves. A config written meanwhile can be put
-    back without its servers by a step that read the file first, or read while a
-    step has it half-written and saved over that step's own. Hermes is started
-    after them, so its listening means they are done. It has read the file by
-    then, so it is asked to reload.
+    skills, the model, the screen), and on a first boot every one of them
+    saves. On an image from before FLOTTA-253 each was a read and a save with
+    no lock: a config written meanwhile could be put back without its servers
+    by a step that read the file first, or read while a step had it
+    half-written and saved over that step's own. Those steps now take the
+    writer's lock (`flotta.box.config_file`), but the control plane cannot tell
+    which image a machine booted, and Hermes has to be listening to be asked to
+    reload anyway. It is started after the steps, so its listening means they
+    are done, and it has read the file by then.
 
     Best effort, like the same step in `wake_box`, which writes the config if
     this does not: the grants are in force at the gateway either way, and a

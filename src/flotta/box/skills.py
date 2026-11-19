@@ -90,10 +90,19 @@ def apply(home: Path, directory: Path = SKILLS_DIR) -> str:
     A box that cannot register a skill must still boot: the cost is an agent
     that has to find `flotta-repos` the long way, not one nobody can reach.
     """
-    import yaml
+    from flotta.box import config_file
 
     if not directory.is_dir():
         return f"skills left alone: {directory} is not in this image"
+    # Under the lock the control plane's writer takes (`config_file`).
+    with config_file.locked(home):
+        return _apply(home, directory)
+
+
+def _apply(home: Path, directory: Path) -> str:
+    import yaml
+
+    from flotta.box import config_file
 
     path = home / "config.yaml"
     try:
@@ -107,7 +116,7 @@ def apply(home: Path, directory: Path = SKILLS_DIR) -> str:
     if not changed:
         return f"skills: {directory} already registered"
     try:
-        path.write_text(yaml.safe_dump(settled, sort_keys=False), encoding="utf-8")
+        config_file.save(path, settled)
     except OSError as exc:
         return f"skills left alone: could not write {path}: {exc}"
     return f"skills: registered {directory} in {path}"

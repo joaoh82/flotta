@@ -1178,9 +1178,13 @@ that is asleep, paused by a budget or in a suspended org, written at its next wa
 still answers `written: false` with nothing pending is an agent that is gone, and a write
 to a running agent that failed, which waits for the next save. **A new agent's config is
 not written until Hermes listens**, up to 120 s after its machine starts: the image's boot
-steps (approvals, skills, the model, the screen) edit the same `config.yaml` with no lock,
-and on a first boot every one of them saves, so a write meanwhile can be put back without
-its servers. Creation waits for them, writes, and asks Hermes to reload
+steps (approvals, skills, the model, the screen) edit the same `config.yaml`, and on a
+first boot every one of them saves. Since FLOTTA-253 they take the lock the control
+plane's writer takes and save by rename (`flotta.box.config_file`), so the two take turns;
+on an image from before it they did neither, and a write meanwhile could be put back
+without its servers, or save over a boot step's own. An agent has the lock once it is on
+an image built since, which for one already running means `flotta upgrade`. Creation
+waits for the steps either way, writes, and asks Hermes to reload
 (`mcp_config_rewritten` with the reason `created`); a save or a conversation in that time
 waits with it. If Hermes never listens the config stays pending for a wake. **A catalogue change
 reaches every agent granted the server:** its config is written again (the entry gone, or
