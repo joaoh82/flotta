@@ -24,6 +24,15 @@ carried a pending grant recorded `mcp_reload_failed` for a reload that had
 simply come too early (seen live on `eng-r`, 2026-11-07). A reload costs the next turn its
 prompt cache, which is the price of not showing a tool that is gone.
 
+**Or only wait** (`--only-wait`, FLOTTA-252): answer whether Hermes is listening,
+waiting up to `WAIT_S` for it, and reload nothing. `provision.create_box` asks this
+before it writes a new agent's first MCP config. Hermes listening means
+`box_entrypoint.sh` has finished: its steps that also edit `config.yaml`
+(approvals, skills, the model, the screen) each read the file and save it with no
+lock, and on a first boot every one of them saves, so a config written before then
+can be put back without its servers, or read half-written and saved over the boot
+step's own.
+
 Imports nothing of Flotta's: only the standard library, and `websockets`, which
 Hermes's venv has because Hermes does.
 """
@@ -33,6 +42,7 @@ from __future__ import annotations
 import http.cookiejar
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -47,6 +57,9 @@ WAIT_S = 120.0
 
 #: The flag that says the machine was just started, so Hermes may not be up yet.
 WAIT_FLAG = "--wait"
+
+#: The flag that asks only whether Hermes is listening, waiting for it: no reload.
+ONLY_WAIT_FLAG = "--only-wait"
 
 
 def _environment() -> dict[str, str]:
@@ -80,6 +93,27 @@ def _not_listening(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.URLError):
         exc = exc.reason if isinstance(exc.reason, BaseException) else exc
     return isinstance(exc, ConnectionRefusedError)
+
+
+def listening(
+    env: dict[str, str],
+    *,
+    wait_s: float,
+    sleep=time.sleep,
+    clock=time.monotonic,
+    connect=socket.create_connection,
+) -> bool:
+    """Whether Hermes accepts a connection on its port, waiting up to `wait_s` for it."""
+    port = int(env.get("FLOTTA_SERVE_PORT") or "9119")
+    deadline = clock() + wait_s
+    while True:
+        try:
+            connect(("::1", port), timeout=5).close()
+            return True
+        except OSError:
+            if clock() >= deadline:
+                return False
+            sleep(1.0)
 
 
 def reload(
@@ -127,6 +161,12 @@ def reload(
 
 
 def main(argv: list[str]) -> int:
+    if ONLY_WAIT_FLAG in argv:
+        if listening(_environment(), wait_s=WAIT_S):
+            print("Hermes is listening")
+            return 0
+        print(f"Hermes was not listening after {WAIT_S:.0f}s", file=sys.stderr)
+        return 1
     try:
         result = reload(_environment(), wait_s=WAIT_S if WAIT_FLAG in argv else 0.0)
     except Exception as exc:  # noqa: BLE001 - the caller records it, whatever it was

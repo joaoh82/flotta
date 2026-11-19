@@ -1691,10 +1691,17 @@ def create_box(
         impl, handle.endpoint, assume="stopped" if started_error else "started"
     )
     if observed == "started":
-        store.update_box_status(box.id, "running", endpoint=handle.endpoint)
-        store.add_event(
-            "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
-        )
+        # Booting from before the row says `running`, so nothing that sees it
+        # running writes its config while its first boot may be editing it.
+        _BOOTING.add(box.id)
+        try:
+            store.update_box_status(box.id, "running", endpoint=handle.endpoint)
+            store.add_event(
+                "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
+            )
+            _write_mcp_config_that_waited(box.id, store=store, backend=impl)
+        finally:
+            _BOOTING.discard(box.id)
         return {
             "box_id": box.id,
             "endpoint": handle.endpoint,
@@ -1719,6 +1726,55 @@ def create_box(
         box_id=box.id,
         endpoint=handle.endpoint,
     )
+
+
+def _write_mcp_config_that_waited(box_id: str, *, store: FleetStore, backend: Backend) -> None:
+    """Tools chosen for an agent while it was being created, written once it is up (FLOTTA-252).
+
+    `set_mcp_grants` marks an agent still being created as pending, and this is
+    what comes back for it. Called with the box in `_BOOTING`.
+
+    **The mark is read under the lock a save holds** from looking at the box to
+    leaving its mark, and a box with nothing waiting leaves `_BOOTING` under
+    that lock too. So a save either left its mark before this looked, or comes
+    after and finds an agent it may write to.
+
+    **Nothing is written until Hermes listens** (`_wait_for_hermes`). The image's
+    boot steps edit the same `config.yaml` (`box_entrypoint.sh`: approvals,
+    skills, the model, the screen), each a read and a save with no lock, and on
+    a first boot every one of them saves. A config written meanwhile can be put
+    back without its servers by a step that read the file first, or read while a
+    step has it half-written and saved over that step's own. Hermes is started
+    after them, so its listening means they are done. It has read the file by
+    then, so it is asked to reload.
+
+    Best effort, like the same step in `wake_box`, which writes the config if
+    this does not: the grants are in force at the gateway either way, and a
+    failure leaves the mark.
+    """
+    try:
+        with _rules_lock(box_id):
+            waited = store.mcp_config_pending(box_id)
+            if not waited:
+                _BOOTING.discard(box_id)
+        if not waited:
+            return
+        box = store.get_box(box_id)
+        if box is None or not box.endpoint:
+            return
+        up, why = _wait_for_hermes(box, backend)
+        _BOOTING.discard(box_id)
+        if up is False:
+            store.add_event(
+                "box",
+                box_id,
+                "mcp_grants_write_failed",
+                {"detail": f"not written yet, because Hermes did not start: {why}"[:500]},
+            )
+            return
+        rewrite_mcp_config(box_id, store=store, backend=backend, reason="created")
+    except Exception as exc:  # noqa: BLE001 - never fail a creation over discovery
+        _log.warning("the pending MCP config of %s was not written: %s", box_id, exc)
 
 
 def _custom_onto_adopted(
@@ -2084,11 +2140,12 @@ MCP_GRANTS_CHANGED = "mcp_grants_changed"
 MCP_RELOAD_MARK = "--flotta-mcp-reload"
 
 
-def _mcp_reload_command(*, wait: bool = False) -> str:
+def _mcp_reload_command(*, wait: bool = False, only_wait: bool = False) -> str:
     """Run `flotta.box.mcp_reload` on the box: the script travels with the command.
 
     `wait` when the machine was just started: the script then waits for Hermes
-    to listen rather than failing because it is still booting.
+    to listen rather than failing because it is still booting. `only_wait` to
+    wait for Hermes to listen and reload nothing (`_wait_for_hermes`).
     """
     import base64
     from pathlib import Path
@@ -2097,7 +2154,36 @@ def _mcp_reload_command(*, wait: bool = False) -> str:
 
     script = base64.b64encode(Path(mcp_reload.__file__).read_bytes()).decode("ascii")
     flag = f" {mcp_reload.WAIT_FLAG}" if wait else ""
+    if only_wait:
+        flag = f" {mcp_reload.ONLY_WAIT_FLAG}"
     return f"printf %s {script} | base64 -d | {BOX_PYTHON} - {MCP_RELOAD_MARK}{flag}"
+
+
+#: Agents whose first boot isn't known to be over: `create_box` has started the
+#: machine and is still to hear Hermes listen (FLOTTA-252). Nothing writes such
+#: an agent's MCP config, since its boot is editing the same file. Per process,
+#: as `_RULES_LOCKS` is.
+_BOOTING: set[str] = set()
+
+
+def _wait_for_hermes(box: Box, backend: Backend | None) -> tuple[bool | None, str | None]:
+    """Wait for a just-created agent's Hermes to listen: `(is it, why not)`.
+
+    `None` on a substrate with no shell, like `just local`'s stand-in, which
+    has no boot steps to wait out. Up to `mcp_reload.WAIT_S` on the box.
+    """
+    assert box.endpoint is not None
+    try:
+        result = _resolve_backend(box, backend).exec(
+            box.endpoint, _mcp_reload_command(only_wait=True)
+        )
+    except NotSupported:
+        return None, None
+    except Exception as exc:  # noqa: BLE001 - best effort; the config stays pending
+        return False, str(exc) or type(exc).__name__
+    if result.exit_code != 0:
+        return False, (result.stderr or result.stdout or "").strip() or "no output"
+    return True, None
 
 
 def _reload_mcp(
@@ -2194,6 +2280,28 @@ def _write_mcp_config(
     return None
 
 
+def _mcp_config_waits(box: Box, store: FleetStore) -> tuple[str, str] | None:
+    """Why `box`'s MCP config is written later rather than now, or `None` to write it now.
+
+    For a box that isn't terminal. `(waits_for, detail)`: `"created"` for an
+    agent with no machine yet, or one whose first boot `create_box` is still
+    waiting out (`_BOOTING`), which `create_box` writes once Hermes listens;
+    and `"woken"` for one that is asleep, paused or in a suspended org, which
+    `wake_box` writes when it is next addressed. None of them is touched now:
+    there is nothing to write to, its boot is editing the same file, or
+    writing would start a machine that is meant to be down.
+    """
+    if not box.endpoint or box.id in _BOOTING:
+        return "created", f"{box.name} is still being created: its config is written when it is up"
+    try:
+        _refuse_held(store, box)
+    except ProvisionError as exc:
+        return "woken", f"{exc} Its config is written when it next wakes."
+    if box.status != "running":
+        return "woken", f"{box.name} is asleep: its config is written when it next wakes"
+    return None
+
+
 def set_mcp_grants(
     box_id: str,
     grants: tuple[Any, ...],
@@ -2223,6 +2331,20 @@ def set_mcp_grants(
     once, waking it if need be: a rule held back would be a rule not followed,
     while a grant held back is still enforced.
 
+    **Nor is anything lost for an agent that can't be written yet** (FLOTTA-252).
+    One still being created has no machine, or a machine in its first boot,
+    and one that is paused or in a suspended org must not be started: each is
+    `pending` too, and `waits_for` says for what (`_mcp_config_waits`). These
+    were once recorded and never written, by anything, until somebody saved
+    the same grants a second time. What still answers `written: false` with
+    nothing pending is a box that is gone, and a write to a running agent that
+    failed: that one is not tried again until the grants are next saved.
+
+    **Decided under the lock, from the box as it is then.** `create_box` looks
+    for the pending mark under the same lock, so a save that saw an agent still
+    being created has left its mark by the time creation looks, and one that
+    comes after creation has finished finds the machine and writes to it.
+
     A running agent is then asked to reload (`reload.mcp`), so a server taken
     away leaves its open conversations too; see `_reload_mcp`.
     """
@@ -2233,12 +2355,8 @@ def set_mcp_grants(
     if box is None:
         raise ProvisionError(f"no box {box_id!r}")
     base, token = _mcp_token(box, store)
-    detail = None
-    try:
-        _writable_box(box.id, store)
-    except ProvisionError as exc:
-        detail = str(exc)
-    pending = False
+    detail: str | None = None
+    waits_for: str | None = None
     with _rules_lock(box.id):
         previous = [g.server for g in store.box_mcp_grants(box.id)]
         store.set_box_mcp_grants(
@@ -2252,23 +2370,25 @@ def set_mcp_grants(
             "box", box.id, MCP_GRANTS_CHANGED, {"servers": [g.to_json() for g in grants], "by": by}
         )
         now = store.get_box(box.id) or box
-        if detail is None and now.status != "running":
+        waits = None if is_terminal("box", now.status) else _mcp_config_waits(now, store)
+        if waits is not None:
             store.mark_mcp_config_pending(box.id)
-            pending = True
-            detail = f"{box.name} is asleep: its config is written when it next wakes"
-        elif detail is None:
-            detail = _write_mcp_config(
-                now, store, backend, base=base, token=token, previous=previous
-            )
+            waits_for, detail = waits
+        else:
+            if is_terminal("box", now.status):
+                detail = f"box {now.name} is {now.status}, so there is no volume to write to"
+            else:
+                detail = _write_mcp_config(
+                    now, store, backend, base=base, token=token, previous=previous
+                )
             if detail is not None:
                 store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
-        else:
-            store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
-    reloaded = _reload_mcp(box, store, backend) if detail is None else None
+    reloaded = _reload_mcp(now, store, backend) if detail is None else None
     return {
         **mcp_grants_of(box.id, store=store),
         "written": detail is None,
-        "pending": pending,
+        "pending": waits_for is not None,
+        "waits_for": waits_for,
         "detail": detail,
         "reloaded": reloaded,
     }
@@ -2287,7 +2407,7 @@ def rewrite_mcp_config(
     `None` when it wasn't written now: an agent that isn't running keeps its
     pending mark and is written when it next wakes (`wake_box`). True when
     written (and the agent asked to reload), False when the write failed, which
-    leaves it pending. For a catalogue change and for a wake.
+    leaves it pending. For a catalogue change, a wake, and the end of creation.
 
     `just_started` when the wake started the machine: Hermes may still be booting,
     so the reload waits for it to listen instead of recording a failure.
@@ -4086,7 +4206,9 @@ def wake_box(
     # MCP config held back while it slept (FLOTTA-125: `set_mcp_grants`), written
     # now it is up, before whoever addressed it reaches it. Best effort: the
     # grants are in force at the gateway either way, and a failure stays pending.
-    if store.mcp_config_pending(box_id):
+    # Not for an agent whose creation is still waiting out its first boot:
+    # `create_box` writes that one, once the boot has stopped editing the file.
+    if box_id not in _BOOTING and store.mcp_config_pending(box_id):
         try:
             rewrite_mcp_config(
                 box_id,

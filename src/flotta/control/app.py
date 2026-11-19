@@ -5639,7 +5639,9 @@ def create_app(
     def put_mcp_grants(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
         """Replace an agent's grants: in force at the gateway at once, then written to it.
 
-        `written: false` says the agent's config is behind (`provision.set_mcp_grants`).
+        `written: false` says the agent's config is behind (`provision.set_mcp_grants`),
+        and `pending: true` that it will be written without another save: `waits_for`
+        is `created` for an agent still being created, `woken` for one that is down.
         """
         from flotta.mcp import parse_grants
         from flotta.provision import ProvisionError, set_mcp_grants

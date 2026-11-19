@@ -174,3 +174,46 @@ def test_it_imports_nothing_of_flottas():
     """It runs on the box's Python, from source sent over exec."""
     source = Path(mcp_reload.__file__).read_text()
     assert "from flotta" not in source and "import flotta" not in source
+
+
+# -- only waiting for Hermes (FLOTTA-252) ----------------------------------------------
+
+
+class _Closed:
+    def close(self):
+        pass
+
+
+def test_waiting_answers_as_soon_as_hermes_takes_a_connection():
+    clock, asked = _Clock(), []
+
+    def connect(address, timeout=None):
+        asked.append(address)
+        if len(asked) < 4:
+            raise ConnectionRefusedError
+        return _Closed()
+
+    env = {"FLOTTA_SERVE_PORT": "9200"}
+    assert mcp_reload.listening(env, wait_s=120, sleep=clock.sleep, clock=clock, connect=connect)
+    assert asked == [("::1", 9200)] * 4 and clock.slept == [1.0, 1.0, 1.0]
+
+
+def test_waiting_gives_up_when_hermes_never_listens():
+    clock = _Clock()
+
+    def connect(address, timeout=None):
+        raise ConnectionRefusedError
+
+    assert not mcp_reload.listening({}, wait_s=5, sleep=clock.sleep, clock=clock, connect=connect)
+    assert len(clock.slept) == 5
+
+
+def test_only_waiting_reloads_nothing(monkeypatch, capsys):
+    """Asked before a new agent's first config is written: there is nothing to reload yet."""
+    monkeypatch.setattr(mcp_reload, "_environment", lambda: {})
+    monkeypatch.setattr(mcp_reload, "listening", lambda env, wait_s: True)
+    monkeypatch.setattr(mcp_reload, "reload", lambda *a, **k: pytest.fail("it reloaded"))
+    assert mcp_reload.main([mcp_reload.ONLY_WAIT_FLAG]) == 0
+    monkeypatch.setattr(mcp_reload, "listening", lambda env, wait_s: False)
+    assert mcp_reload.main([mcp_reload.ONLY_WAIT_FLAG]) == 1
+    assert "not listening" in capsys.readouterr().err
