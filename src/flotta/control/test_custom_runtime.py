@@ -602,3 +602,14 @@ def test_nothing_execs_into_a_custom_agent_unguarded():
     """The ratchet: any public verb that runs a script on the box, directly or
     through a helper, refuses a custom agent first: every exec rewrites Hermes."""
     assert _reaches_exec_unguarded() == []
+
+
+def test_the_timeline_says_what_it_ran_before_when_the_machine_cannot(fleet, machine, own):  # noqa: F811
+    """A local custom agent's "image" is a directory, and its substrate has no
+    image to report: the row's is the way back (FLOTTA-254)."""
+    machine.images.pop(own.endpoint, None)
+    with FleetStore(fleet) as store:
+        provision.set_custom_image(own.id, "ghcr.io/agency-x/support-agent:2.0", store=store)
+        (moved,) = [e for e in store.get_events("box", own.id) if e.type == "reimaged"]
+    assert moved.payload["from"] == IMAGE
+    assert moved.payload["to"] == "ghcr.io/agency-x/support-agent:2.0"

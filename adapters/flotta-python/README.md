@@ -40,6 +40,9 @@ on the machine, only the gateway.
 
 ## The contract it serves
 
+All of it, with what an agent is given and what it is not, is in
+[docs/CONTRACT.md](../../docs/CONTRACT.md).
+
 On `[::]:9119`. Every request must carry `Authorization: Bearer $FLOTTA_BOX_SECRET`,
 and anything else is refused, because other machines on the private network can
 reach the port.

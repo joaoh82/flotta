@@ -2501,7 +2501,9 @@ def set_custom_image(
         previous = _require_box(store, box.id).image
         store.set_box_image(box.id, new)
         try:
-            return upgrade_box(box.id, store=store, image=new, backend=backend, reason="image")
+            return upgrade_box(
+                box.id, store=store, image=new, backend=backend, reason="image", previous=previous
+            )
         except Exception:
             # Back only if the machine is not on the new image after all: a
             # timeout can follow a move the substrate did make.
@@ -2530,8 +2532,13 @@ def upgrade_box(
     image: str | None = None,
     backend: Backend | None = None,
     reason: str = "requested",
+    previous: str | None = None,
 ) -> dict[str, Any]:
     """Move a live agent onto a new image, keeping everything it remembers.
+
+    `previous` is what it ran before when the substrate cannot say (a local
+    custom agent, whose "image" is a directory): the timeline's `from` is the
+    way back, so it is never left empty when the row knew it (FLOTTA-254).
 
     The gap this closes: `HERMES_REF` pins what a box image is built from, and
     `just hermes-bump` moves it — but a machine runs the image it was created
@@ -2589,7 +2596,7 @@ def upgrade_box(
 
     impl = _resolve_backend(box, backend)
     target = box.endpoint or box_id
-    before = _peek_image(impl, target)
+    before = _peek_image(impl, target) or previous
     if before and _same_image(before, target_image):
         return {
             "box_id": box_id,
