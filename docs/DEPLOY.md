@@ -1173,13 +1173,16 @@ the gateway at once (`pending: true` in the answer), and its config is written b
 waits for Hermes to finish booting (up to 120 s), so it isn't recorded as a failure.
 **Nor is a grant lost for an agent that can't be written yet** (FLOTTA-252): `waits_for`
 in the answer says what a pending config waits for. `created` is an agent still being
-created, which has no machine; its config is written when creation ends, without another
-save. `woken` is one that is asleep, paused by a budget or in a suspended org, written at
-its next wake. Only an agent that is gone answers `written: false` with nothing pending.
-A config written while a machine boots is sent a second time once Hermes listens, because
-the image's boot steps edit the same file with no lock: the writer answers that nothing
-changed, or puts the entries back and the agent reloads again (`mcp_config_rewritten`
-with `after boot` in its reason). **A catalogue change
+created; its config is written when creation ends, without another save. `woken` is one
+that is asleep, paused by a budget or in a suspended org, written at its next wake. What
+still answers `written: false` with nothing pending is an agent that is gone, and a write
+to a running agent that failed, which waits for the next save. **A new agent's config is
+not written until Hermes listens**, up to 120 s after its machine starts: the image's boot
+steps (approvals, skills, the model, the screen) edit the same `config.yaml` with no lock,
+and on a first boot every one of them saves, so a write meanwhile can be put back without
+its servers. Creation waits for them, writes, and asks Hermes to reload
+(`mcp_config_rewritten` with the reason `created`); a save or a conversation in that time
+waits with it. If Hermes never listens the config stays pending for a wake. **A catalogue change
 reaches every agent granted the server:** its config is written again (the entry gone, or
 new tools) and it is reloaded, its grant kept and shown as going away. **A connection is
 only ever used for the address it was made for**: an entry whose URL changes leaves its

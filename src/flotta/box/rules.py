@@ -18,14 +18,6 @@ half-written one would be a broken agent for as long as it took. A rename
 replaces it in one step. The staged file is this run's own, and runs on one
 box take a lock on the file next to it, so two saves at once land one after
 the other rather than one renaming the other's half-written file.
-
-**Left alone when it already says so.** A run whose changes are all in the file
-writes nothing and answers `UNCHANGED`. That is how the control plane learns
-whether a config it wrote while the machine booted is still there once boot is
-over (`provision.rewrite_mcp_config`): the boot steps that also edit this file
-(`flotta.box.inference` and its neighbours) come with the image and take no
-lock, so one that read the file before a write and saved after it would have
-put the older copy back.
 """
 
 from __future__ import annotations
@@ -38,9 +30,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
-
-#: How `apply`'s answer starts when the file already held every change.
-UNCHANGED = "config unchanged"
 
 
 def merge(config: dict[str, Any] | None, changes: list[list[Any]]) -> dict[str, Any]:
@@ -78,8 +67,6 @@ def apply(home: Path, changes: list[list[Any]]) -> str:
         if loaded is not None and not isinstance(loaded, dict):
             raise ValueError(f"{path} is not a mapping")
         merged = merge(loaded, changes)
-        if path.exists() and merged == (loaded or {}):
-            return f"{UNCHANGED} at {path}"
         fd, staged = tempfile.mkstemp(dir=home, prefix=".config.yaml.", suffix=".flotta")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as out:

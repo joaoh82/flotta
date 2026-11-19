@@ -203,36 +203,29 @@ def test_an_oauth_server_takes_no_key():
 
 
 class _Machine:
-    """A machine with one config file: it remembers what it holds, as the writer does."""
-
-    def __init__(self, reload_code=0, fail_reload=False, boot_loses_config=False):
+    def __init__(self, reload_code=0, fail_reload=False, hermes_starts=True):
         self.commands: list[str] = []
         self.reload_code, self.fail_reload = reload_code, fail_reload
-        #: The config command its file holds, and every one that changed the file.
-        self.held: str | None = None
-        self.written: list[str] = []
-        #: A boot step that read the file before a write and saved after it
-        #: (`provision.rewrite_mcp_config`): over by the time Hermes listens.
-        self.boot_loses_config = boot_loses_config
+        #: Whether a wait for Hermes hears it, and what happens meanwhile (FLOTTA-252).
+        self.hermes_starts = hermes_starts
+        self.while_booting = lambda: None
 
     def exec(self, endpoint, command):
         from flotta.backend import ExecResult
-        from flotta.box.mcp_reload import WAIT_FLAG
-        from flotta.box.rules import UNCHANGED
+        from flotta.box.mcp_reload import ONLY_WAIT_FLAG
         from flotta.provision import MCP_RELOAD_MARK
 
         self.commands.append(command)
+        if command.endswith(ONLY_WAIT_FLAG):
+            self.while_booting()
+            if self.hermes_starts:
+                return ExecResult(0, "Hermes is listening", "")
+            return ExecResult(1, "", "Hermes was not listening after 120s")
         if MCP_RELOAD_MARK in command:
             if self.fail_reload:
                 raise RuntimeError("machine went away")
-            if self.boot_loses_config and command.endswith(WAIT_FLAG):
-                self.held, self.boot_loses_config = None, False
             return ExecResult(self.reload_code, "", "refused" if self.reload_code else "")
-        if command == self.held:
-            return ExecResult(0, f"[flotta-box] {UNCHANGED} at /data/hermes/config.yaml", "")
-        self.held = command
-        self.written.append(command)
-        return ExecResult(0, "[flotta-box] config written to /data/hermes/config.yaml", "")
+        return ExecResult(0, "config written", "")
 
     # Enough of a substrate for `wake_box`: asleep until started.
     asleep = False
@@ -247,7 +240,9 @@ class _Machine:
     def configs(self):
         from flotta.provision import MCP_RELOAD_MARK
 
-        return [c for c in self.commands if c != "start" and MCP_RELOAD_MARK not in c]
+        return [
+            c for c in self.commands if c not in ("start", "create") and MCP_RELOAD_MARK not in c
+        ]
 
 
 @pytest.fixture
@@ -401,14 +396,15 @@ def test_a_stopped_agent_isnt_woken_by_a_catalogue_change_and_gets_it_at_wake(gr
 
     wake_box("b-one", store=granted, backend=machine)
     assert machine.commands[0] == "start"
-    assert len(machine.written) == 1
+    assert len(machine.configs()) == 1
     assert not granted.mcp_config_pending("b-one")
 
 
 def _reloads(machine):
+    from flotta.box.mcp_reload import ONLY_WAIT_FLAG
     from flotta.provision import MCP_RELOAD_MARK
 
-    return [c for c in machine.commands if MCP_RELOAD_MARK in c]
+    return [c for c in machine.commands if MCP_RELOAD_MARK in c and not c.endswith(ONLY_WAIT_FLAG)]
 
 
 def test_a_wake_that_starts_the_machine_waits_for_hermes_to_reload(granted):
@@ -453,7 +449,7 @@ def test_a_grant_saved_for_a_stopped_agent_is_in_force_and_written_at_wake(grant
     assert [g.server for g in granted.box_mcp_grants("b-one")] == ["notes"]
 
     wake_box("b-one", store=granted, backend=machine)
-    assert len(machine.written) == 1
+    assert len(machine.configs()) == 1
     assert not granted.mcp_config_pending("b-one")
 
 
@@ -484,87 +480,188 @@ class _Creating(_Machine):
         pass
 
 
-def _config_commands(machine):
-    from flotta.provision import MCP_RELOAD_MARK
+def _waits(machine):
+    from flotta.box.mcp_reload import ONLY_WAIT_FLAG
 
-    return [c for c in machine.commands if c.startswith("printf") and MCP_RELOAD_MARK not in c]
+    return [c for c in machine.commands if c.endswith(ONLY_WAIT_FLAG)]
+
+
+def _create(store, machine):
+    from flotta.provision import create_box
+
+    return create_box("one", store=store, backend=machine, box=store.get_box("b-one"))
+
+
+NOTES = (Grant("notes", None, True),)
 
 
 def test_tools_given_while_an_agent_is_being_created_wait_for_its_machine(granted):
     """Recorded and never written, by anything, until saved a second time: that was the bug."""
-    from flotta.provision import create_box, set_mcp_grants
+    import flotta.provision as provision
+    from flotta.provision import set_mcp_grants
 
     machine = _Creating()
-    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    answer = set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
     assert (answer["written"], answer["pending"], answer["waits_for"]) == (False, True, "created")
     assert "still being created" in answer["detail"]
     assert machine.commands == []
     assert granted.mcp_config_pending("b-one")
     assert not _events(granted, "mcp_grants_write_failed")
 
-    create_box("one", store=granted, backend=machine, box=granted.get_box("b-one"))
+    _create(granted, machine)
     assert granted.get_box("b-one").status == "running"
-    assert len(machine.written) == 1
+    assert len(machine.configs()) == 1
     assert not granted.mcp_config_pending("b-one")
     assert [e.payload["reason"] for e in _events(granted, "mcp_config_rewritten")] == ["created"]
+    assert not provision._BOOTING
 
 
-def test_the_config_of_an_agent_just_created_is_written_before_hermes_is_asked_to_reload(granted):
-    """Its machine has only just started, so the reload waits for Hermes, as a wake's does."""
+def test_a_new_agents_config_is_not_written_until_hermes_listens(granted):
+    """Its first boot edits the same file with no lock, and Hermes starts after it. By
+    then Hermes has read the file, so it is asked to reload, and has nothing to wait for."""
     from flotta.box.mcp_reload import WAIT_FLAG
-    from flotta.provision import create_box, set_mcp_grants
+    from flotta.provision import set_mcp_grants
 
     machine = _Creating()
-    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
-    create_box("one", store=granted, backend=machine, box=granted.get_box("b-one"))
-    (reload,) = _reloads(machine)
-    assert reload.endswith(WAIT_FLAG)
-    assert machine.commands.index(machine.written[0]) < machine.commands.index(reload)
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
+    _create(granted, machine)
+    (wait,), (config,), (reload,) = _waits(machine), machine.configs(), _reloads(machine)
+    order = [machine.commands.index(c) for c in (wait, config, reload)]
+    assert order == sorted(order), "the config was written before the boot was known to be over"
+    assert not reload.endswith(WAIT_FLAG)
+    assert _events(granted, "mcp_reloaded")
 
 
 def test_an_agent_created_with_no_tools_chosen_is_sent_nothing(granted):
-    from flotta.provision import create_box
+    import flotta.provision as provision
 
     machine = _Creating()
-    create_box("one", store=granted, backend=machine, box=granted.get_box("b-one"))
-    assert _config_commands(machine) == [] and _reloads(machine) == []
+    _create(granted, machine)
+    assert machine.commands == ["create", "start"]
+    assert not provision._BOOTING
+
+
+def test_a_new_agent_whose_hermes_never_listens_keeps_its_tools_for_a_wake(granted):
+    """Nothing is written into a boot that isn't known to be over; the mark stays."""
+    import flotta.provision as provision
+    from flotta.provision import set_mcp_grants, wake_box
+
+    machine = _Creating(hermes_starts=False)
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
+    made = _create(granted, machine)
+    assert made["status"] == "running"
+    assert machine.configs() == [] and _reloads(machine) == []
+    assert granted.mcp_config_pending("b-one")
+    (failed,) = _events(granted, "mcp_grants_write_failed")
+    assert "Hermes did not start" in failed.payload["detail"]
+    assert not provision._BOOTING
+
+    wake_box("b-one", store=granted, backend=machine)
+    assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
+
+
+def test_a_substrate_with_no_shell_has_no_boot_to_wait_out(granted):
+    """`just local`'s stand-in: nothing edits its config but the writer, so it is written."""
+    from flotta.backend import NotSupported
+    from flotta.box.mcp_reload import ONLY_WAIT_FLAG
+    from flotta.provision import MCP_RELOAD_MARK, set_mcp_grants
+
+    class _NoShell(_Creating):
+        def exec(self, endpoint, command):
+            if MCP_RELOAD_MARK in command:
+                self.commands.append(command)
+                raise NotSupported("a local stand-in has no shell")
+            return super().exec(endpoint, command)
+
+    machine = _NoShell()
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
+    _create(granted, machine)
+    assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
+    assert machine.commands[2].endswith(ONLY_WAIT_FLAG)
+    assert not _events(granted, "mcp_grants_write_failed")
+
+
+def test_a_save_while_a_new_agent_boots_waits_too_and_is_in_what_is_written(granted):
+    """The row says running, and its boot is still editing the file: not written now."""
+    import base64
+
+    from flotta.provision import set_mcp_grants
+
+    machine = _Creating()
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
+    seen = {}
+
+    def a_second_save():
+        assert granted.get_box("b-one").status == "running"
+        seen["answer"] = set_mcp_grants(
+            "b-one", (Grant("notes", ("search",), False),), store=granted, backend=machine
+        )
+        seen["sent"] = list(machine.configs())
+
+    machine.while_booting = a_second_save
+    _create(granted, machine)
+    answer = seen["answer"]
+    assert (answer["written"], answer["pending"], answer["waits_for"]) == (False, True, "created")
+    assert seen["sent"] == [], "a config was written into a boot that was not over"
+    (config,) = machine.configs()
+    changes = json.loads(base64.b64decode(config.rsplit(" ", 1)[1]))
+    (entry,) = [value for _, key, value in changes if key == "flotta-notes"]
+    assert entry["tools"] == {"include": ["search"]} and "trust" not in entry
+
+
+def test_a_conversation_opened_while_a_new_agent_boots_writes_nothing(granted):
+    """The door wakes an agent for every conversation, and a wake writes a pending config."""
+    from flotta.provision import set_mcp_grants, wake_box
+
+    machine = _Creating()
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
+    seen = {}
+
+    def someone_opens_it():
+        woke = wake_box("b-one", store=granted, backend=machine)
+        seen["status"], seen["sent"] = woke["status"], list(machine.configs())
+
+    machine.while_booting = someone_opens_it
+    _create(granted, machine)
+    assert seen == {"status": "running", "sent": []}
+    assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
 
 
 def test_a_creation_that_fails_to_write_the_config_still_made_the_agent(granted, monkeypatch):
     """Best effort: the grants are in force at the gateway, and the mark stays for a wake."""
     import flotta.provision as provision
-    from flotta.provision import create_box, set_mcp_grants
+    from flotta.provision import set_mcp_grants
 
     machine = _Creating()
-    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
 
     def broken(*args, **kwargs):
         raise RuntimeError("nothing answered")
 
     monkeypatch.setattr(provision, "rewrite_mcp_config", broken)
-    made = create_box("one", store=granted, backend=machine, box=granted.get_box("b-one"))
-    assert made["status"] == "running"
+    assert _create(granted, machine)["status"] == "running"
     assert granted.mcp_config_pending("b-one")
+    assert not provision._BOOTING
 
 
 def test_a_creation_that_cant_even_look_for_waiting_tools_still_made_the_agent(
     granted, monkeypatch
 ):
-    from flotta.provision import create_box
+    import flotta.provision as provision
 
     def broken(box_id):
         raise RuntimeError("the store went away")
 
     monkeypatch.setattr(granted, "mcp_config_pending", broken)
-    made = create_box("one", store=granted, backend=_Creating(), box=granted.get_box("b-one"))
-    assert made["status"] == "running"
+    assert _create(granted, _Creating())["status"] == "running"
+    assert not provision._BOOTING
 
 
 def test_creation_looks_for_waiting_tools_only_once_a_save_in_flight_has_left_its_mark(
     granted, tmp_path
 ):
-    """A save that saw no machine holds the lock until it has marked the agent, and
-    creation reads the mark under the same lock: it can't look in between."""
+    """A save that saw an agent still being created holds the lock until it has marked
+    it, and creation reads the mark under the same lock: it can't look in between."""
     import threading
 
     import flotta.provision as provision
@@ -586,7 +683,33 @@ def test_creation_looks_for_waiting_tools_only_once_a_save_in_flight_has_left_it
         granted.mark_mcp_config_pending("b-one")
     worker.join(10)
     assert looked.is_set()
-    assert len(machine.written) == 1 and not granted.mcp_config_pending("b-one")
+    assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
+
+
+def test_an_agent_with_nothing_waiting_stops_being_new_under_the_lock_a_save_holds(granted):
+    """Or a save could see it still booting after creation had looked and gone: marked
+    as waiting for a creation that will not come back for it."""
+    import flotta.provision as provision
+
+    granted.update_box_status("b-one", "running", endpoint="fake://m")
+    provision._BOOTING.add("b-one")
+    real, seen = provision._rules_lock("b-one"), []
+
+    class _Watching:
+        def __enter__(self):
+            real.acquire()
+
+        def __exit__(self, *exc):
+            seen.append("b-one" in provision._BOOTING)
+            real.release()
+
+    try:
+        provision._RULES_LOCKS["b-one"] = _Watching()
+        provision._write_mcp_config_that_waited("b-one", store=granted, backend=_Machine())
+    finally:
+        provision._RULES_LOCKS["b-one"] = real
+        provision._BOOTING.discard("b-one")
+    assert seen == [False], "it was still new when the lock was let go"
 
 
 def test_a_save_that_finds_the_machine_up_by_the_time_it_holds_the_lock_writes_to_it(
@@ -606,10 +729,10 @@ def test_a_save_that_finds_the_machine_up_by_the_time_it_holds_the_lock_writes_t
 
     monkeypatch.setattr(provision, "_rules_lock", created_first)
     machine = _Machine()
-    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    answer = set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
     assert (answer["written"], answer["pending"], answer["waits_for"]) == (True, False, None)
     assert answer["reloaded"] is True
-    assert len(machine.written) == 1 and not granted.mcp_config_pending("b-one")
+    assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
 
 
 def test_tools_given_to_a_paused_agent_are_written_when_it_next_wakes(granted):
@@ -620,7 +743,7 @@ def test_tools_given_to_a_paused_agent_are_written_when_it_next_wakes(granted):
     granted.update_box_status("b-one", "paused")
     machine = _Machine()
     machine.asleep = True
-    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    answer = set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
     assert (answer["written"], answer["pending"], answer["waits_for"]) == (False, True, "woken")
     assert "paused" in answer["detail"]
     assert machine.commands == []
@@ -628,7 +751,7 @@ def test_tools_given_to_a_paused_agent_are_written_when_it_next_wakes(granted):
 
     granted.update_box_status("b-one", "stopped")  # the budget lets go
     wake_box("b-one", store=granted, backend=machine)
-    assert len(machine.written) == 1 and not granted.mcp_config_pending("b-one")
+    assert len(machine.configs()) == 1 and not granted.mcp_config_pending("b-one")
 
 
 def test_tools_given_while_the_org_is_suspended_wait_without_touching_the_machine(granted):
@@ -640,7 +763,7 @@ def test_tools_given_while_the_org_is_suspended_wait_without_touching_the_machin
     granted.update_box_status("b-two", "running", endpoint="fake://m2")
     granted.suspend_org("agency-x")
     machine = _Machine()
-    answer = set_mcp_grants("b-two", (Grant("notes", None, True),), store=granted, backend=machine)
+    answer = set_mcp_grants("b-two", NOTES, store=granted, backend=machine)
     assert (answer["written"], answer["pending"], answer["waits_for"]) == (False, True, "woken")
     assert "suspended" in answer["detail"]
     assert machine.commands == [] and granted.mcp_config_pending("b-two")
@@ -651,85 +774,24 @@ def test_tools_given_to_an_agent_that_is_gone_wait_for_nothing(granted):
 
     granted.update_box_status("b-one", "torn_down")
     machine = _Machine()
-    answer = set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    answer = set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
     assert (answer["written"], answer["pending"], answer["waits_for"]) == (False, False, None)
     assert "torn_down" in answer["detail"]
     assert not granted.mcp_config_pending("b-one")
     assert _events(granted, "mcp_grants_write_failed")
 
 
-# -- a config written while the machine boots is looked at again (FLOTTA-252) ----------
-
-
-def test_a_config_that_boot_put_back_is_written_again_once_hermes_is_up(granted):
-    """The image's boot steps edit the same file with no lock; a first boot runs them all."""
-    from flotta.box.mcp_reload import WAIT_FLAG
-    from flotta.provision import create_box, set_mcp_grants
-
-    machine = _Creating(boot_loses_config=True)
-    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
-    create_box("one", store=granted, backend=machine, box=granted.get_box("b-one"))
-    assert len(machine.written) == 2 and machine.held == machine.written[0]
-    first, second = _reloads(machine)
-    assert first.endswith(WAIT_FLAG) and not second.endswith(WAIT_FLAG)
-    assert machine.commands[-1] == second, "the agent was not asked to read what was put back"
-    assert [e.payload["reason"] for e in _events(granted, "mcp_config_rewritten")] == [
-        "created",
-        "created, after boot",
-    ]
-
-
-def test_a_config_that_survived_boot_is_looked_at_and_left(granted):
+def test_a_wake_still_writes_once_and_reloads_once(granted):
+    """Nothing about a wake changed: one config, one reload that waits for Hermes."""
     from flotta.provision import set_mcp_grants, wake_box
 
     granted.update_box_status("b-one", "running", endpoint="fake://m")
     granted.update_box_status("b-one", "stopped")
     machine = _Machine()
     machine.asleep = True
-    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
+    set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
     wake_box("b-one", store=granted, backend=machine)
-    sent = _config_commands(machine)
-    assert len(sent) == 2 and sent[0] == sent[1], "the second look must ask for the same thing"
-    assert len(machine.written) == 1 and len(_reloads(machine)) == 1
-    assert len(_events(granted, "mcp_config_rewritten")) == 1
-
-
-def test_a_machine_that_was_already_up_is_not_looked_at_twice(granted):
-    """Nothing is booting, so nothing can have put the file back."""
-    from flotta.provision import rewrite_mcp_config
-
-    machine = _Machine()
-    _grant_notes(granted, machine)
-    assert rewrite_mcp_config("b-one", store=granted, backend=machine, reason="catalogue")
-    assert len(_config_commands(machine)) == 1
-
-
-def test_a_reload_that_never_heard_hermes_is_not_followed_by_a_second_look(granted):
-    """Boot isn't known to be over, so a second write could be put back like the first."""
-    from flotta.provision import set_mcp_grants, wake_box
-
-    granted.update_box_status("b-one", "running", endpoint="fake://m")
-    granted.update_box_status("b-one", "stopped")
-    machine = _Machine(reload_code=1)
-    machine.asleep = True
-    set_mcp_grants("b-one", (Grant("notes", None, True),), store=granted, backend=machine)
-    wake_box("b-one", store=granted, backend=machine)
-    assert len(_config_commands(machine)) == 1
-
-
-def test_the_writer_leaves_a_file_that_already_says_so(tmp_path):
-    from flotta.box.rules import UNCHANGED
-
-    changes = [["mcp_servers", "flotta-notes", {"url": "https://gw.example.test/mcp/notes"}]]
-    assert UNCHANGED not in box_rules.apply(tmp_path, changes)
-    before = (tmp_path / "config.yaml").stat()
-    assert box_rules.apply(tmp_path, changes).startswith(UNCHANGED)
-    after = (tmp_path / "config.yaml").stat()
-    assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
-    # And one that lost the entry is written again, which is what the answer is for.
-    (tmp_path / "config.yaml").write_text("model:\n  default: m\n", encoding="utf-8")
-    assert UNCHANGED not in box_rules.apply(tmp_path, changes)
-    assert "flotta-notes" in (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert (len(machine.configs()), len(_reloads(machine)), _waits(machine)) == (1, 1, [])
 
 
 class _MovingMachine(_Machine):
