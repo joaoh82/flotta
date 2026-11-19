@@ -1185,3 +1185,83 @@ def test_provider_routing_stays_because_it_is_the_same_model(path, upstream):
         )
     assert response.status_code == 200
     assert json.loads(upstream.requests[0].content)["provider"] == {"order": ["somewhere"]}
+
+
+# -- the fake upstream's tool calls (M17.3) --------------------------------------
+
+_REFUND = {
+    "type": "function",
+    "function": {
+        "name": "refund",
+        "parameters": {
+            "type": "object",
+            "properties": {"order": {"type": "string"}, "times": {"type": "integer"}},
+            "required": ["order", "times"],
+        },
+    },
+}
+
+
+def _fake_says(body):
+    from flotta.gateway.fake import FakeUpstream
+
+    async def ask():
+        async with httpx.AsyncClient(transport=FakeUpstream()) as http:
+            return await http.post("http://fake-upstream.invalid/v1/chat/completions", json=body)
+
+    return asyncio.run(ask())
+
+
+def test_the_fake_model_calls_a_tool_the_message_names():
+    response = _fake_says(
+        {
+            "model": "fake/model",
+            "tools": [_REFUND],
+            "messages": [{"role": "user", "content": "Refund order 42"}],
+        }
+    )
+    choice = response.json()["choices"][0]
+    (call,) = choice["message"]["tool_calls"]
+    assert choice["finish_reason"] == "tool_calls"
+    assert call["function"]["name"] == "refund"
+    assert json.loads(call["function"]["arguments"]) == {"order": "42", "times": 42}
+
+
+def test_the_fake_model_streams_a_tool_call():
+    response = _fake_says(
+        {
+            "model": "fake/model",
+            "stream": True,
+            "tools": [_REFUND],
+            "messages": [{"role": "user", "content": "please refund 7"}],
+        }
+    )
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    (call,) = events[0]["choices"][0]["delta"]["tool_calls"]
+    assert (call["index"], call["function"]["name"]) == (0, "refund")
+    assert events[1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_after_a_tool_the_fake_model_says_what_it_returned():
+    response = _fake_says(
+        {
+            "model": "fake/model",
+            "tools": [_REFUND],
+            "messages": [
+                {"role": "user", "content": "refund 42"},
+                {"role": "tool", "tool_call_id": "c1", "content": "Refunded €59."},
+            ],
+        }
+    )
+    assert response.json()["choices"][0]["message"]["content"] == "Done: Refunded €59."
+
+
+def test_without_tools_the_fake_model_says_what_it_always_said():
+    response = _fake_says(
+        {"model": "fake/model", "messages": [{"role": "user", "content": "refund"}]}
+    )
+    assert response.json()["choices"][0]["message"]["content"] == "Hello from the fake upstream"

@@ -1,0 +1,60 @@
+# The LangGraph example agent, published to GHCR (M17.3).
+#
+# Bring-your-own-agent needs a public image to try it with, and the live check
+# on staging creates an agent from this one. It is the example under
+# examples/langgraph-support, built with the adapters beside it, so a change
+# to either republishes it. `latest` and the commit's sha are both pushed.
+#
+# The package is public on GHCR: Flotta pulls only public images (M17), so a
+# private one could not be used. GitHub makes a new package private, so the
+# first publish needs its visibility set to public once, by hand, in the
+# package's settings.
+
+name: Example image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "adapters/**"
+      - "examples/langgraph-support/**"
+      - ".github/workflows/example-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: example-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/flotta-example-support
+
+jobs:
+  publish:
+    name: build and push the example image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # The plain docker CLI the runner has, rather than a pinned action for
+      # each step: three commands, nothing to keep current.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        run: |
+          docker build \
+            -f examples/langgraph-support/Dockerfile \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
+
+      - name: Push
+        run: |
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"

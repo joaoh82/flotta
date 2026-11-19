@@ -279,6 +279,42 @@ def test_the_fleets_own_registries_are_not_public(image):
         validate_image_ref(image)
 
 
+def _local_agent(root):
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\n")
+    (root / "agent.py").write_text("")
+    return root
+
+
+def test_a_local_image_runs_only_on_a_local_fleet(tmp_path, monkeypatch):
+    """`local:<dir>` (M17.3) names a path on this machine: on Fly no machine
+    could boot from it."""
+    code = _local_agent(tmp_path / "agent")
+    with pytest.raises(InvalidImageError, match="local fleet"):
+        validate_image_ref(f"local:{code}")
+    monkeypatch.setenv("FLOTTA_BACKEND", "fly")
+    with pytest.raises(InvalidImageError, match="local fleet"):
+        validate_image_ref(f"local:{code}")
+
+
+def test_a_local_image_is_kept_as_an_absolute_directory(tmp_path, monkeypatch):
+    code = _local_agent(tmp_path / "agent")
+    monkeypatch.setenv("FLOTTA_BACKEND", "local")
+    monkeypatch.chdir(tmp_path)
+    assert validate_image_ref("local:agent") == f"local:{code}"
+
+
+@pytest.mark.parametrize("missing", ["agent.py", "pyproject.toml"])
+def test_a_local_image_is_a_directory_with_an_agent(tmp_path, monkeypatch, missing):
+    code = _local_agent(tmp_path / "agent")
+    (code / missing).unlink()
+    monkeypatch.setenv("FLOTTA_BACKEND", "local")
+    with pytest.raises(InvalidImageError, match="not a local agent"):
+        validate_image_ref(f"local:{code}")
+    with pytest.raises(InvalidImageError, match="directory"):
+        validate_image_ref("local:")
+
+
 def test_creating_a_hermes_agent_is_exactly_as_before(fleet, machine):  # noqa: F811
     with _api(fleet, background=False) as api:
         response = api.post("/api/boxes", json={"name": "own", "client": "acme"}, headers=OWNER)

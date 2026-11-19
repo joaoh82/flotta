@@ -13,7 +13,13 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DOCKERFILES = ["Dockerfile", "fly/Dockerfile", "fly/door/Dockerfile", "fly/gateway/Dockerfile"]
+DOCKERFILES = [
+    "Dockerfile",
+    "fly/Dockerfile",
+    "fly/door/Dockerfile",
+    "fly/gateway/Dockerfile",
+    "examples/langgraph-support/Dockerfile",
+]
 
 
 def _ignored() -> list[str]:

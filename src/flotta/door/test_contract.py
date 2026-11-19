@@ -503,11 +503,12 @@ def test_a_hermes_agent_is_spliced_through_as_before(agent):
 # -- the run loop's own client, through a door on a real port ------------------
 
 
-def test_the_run_loops_client_carries_a_turn_end_to_end(agent):
-    """`flotta.client` is what `runner.through_door` speaks: unchanged, it works."""
-    import aiohttp
-
+def test_the_run_loops_client_carries_a_turn_end_to_end(agent, monkeypatch):
+    """`runner.door_socket` is what the run loop opens, login and ticket first
+    (M17.3: the handshake was refused for a custom agent, so every scheduled
+    run of one failed): unchanged, it works, and only the socket wakes it."""
     from flotta import client as chat
+    from flotta import runner
 
     agent.script = [
         {"type": "tool.start", "id": "t1", "name": "lookup", "args": {"q": "x"}},
@@ -515,22 +516,29 @@ def test_the_run_loops_client_carries_a_turn_end_to_end(agent):
         {"type": "done", "reply": "the answer"},
     ]
     port = _free_port()
-    server, thread = _serve(_door(Plane(agent.port)), port)
+    plane = Plane(agent.port)
+    server, thread = _serve(_door(plane), port)
     heard = Steps()
+    made = chat.new_session
+
+    def addressed(**kwargs):
+        # The door reads the agent's name from Host; this one is on 127.0.0.1.
+        session = made(**kwargs)
+        session._default_headers["Host"] = HOST
+        return session
+
+    monkeypatch.setattr(chat, "new_session", addressed)
+    monkeypatch.setattr(runner, "door_base", lambda name: f"http://127.0.0.1:{port}")
+
+    class Box:
+        name = "own"
 
     async def converse():
-        async with aiohttp.ClientSession() as session:
-            ws = await session.ws_connect(
-                f"http://127.0.0.1:{port}/api/ws",
-                headers={"Host": HOST, "Authorization": f"Bearer {_token()}"},
+        async with runner.door_socket(Box(), _token()) as ws:
+            created = await chat.create_session(ws)
+            return await chat.send_turn(
+                ws, created["session_id"], "what is x?", timeout_s=10, hear=heard.hear
             )
-            await chat.await_ready(ws)
-            made = await chat.create_session(ws)
-            turn = await chat.send_turn(
-                ws, made["session_id"], "what is x?", timeout_s=10, hear=heard.hear
-            )
-            await ws.close()
-            return turn
 
     try:
         turn = asyncio.run(converse())
@@ -539,6 +547,25 @@ def test_the_run_loops_client_carries_a_turn_end_to_end(agent):
         thread.join(timeout=5)
     assert turn.response == "the answer"
     assert [s["name"] for s in heard.steps] == ["lookup"]
+    assert len(plane.woken) == 1  # by the socket, not the handshake
+
+
+def test_the_handshake_is_answered_without_waking_the_agent(agent):
+    from fastapi.testclient import TestClient
+
+    plane = Plane(agent.port)
+    headers = {"host": HOST, "authorization": f"Bearer {_token()}"}
+    with TestClient(_door(plane)) as client:
+        login = client.post("/auth/password-login", json={"provider": "basic"}, headers=headers)
+        ticket = client.post("/api/auth/ws-ticket", headers=headers)
+        other = client.post("/api/sessions", headers=headers)
+        anonymous = client.post("/auth/password-login", headers={"host": HOST})
+    assert login.status_code == 200
+    assert ticket.status_code == 200 and ticket.json()["ticket"]
+    # Anything else over HTTP is still refused, and nothing woke it.
+    assert other.status_code == 404
+    assert anonymous.status_code == 401
+    assert plane.woken == []
 
 
 class RecordingPlane(Plane):
