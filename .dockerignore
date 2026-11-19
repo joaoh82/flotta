@@ -20,6 +20,8 @@
 
 # --- local state that is never part of a build -----------------------------
 .venv/
+# The adapters' and the example's own environments (M17.3).
+**/.venv/
 __pycache__/
 *.pyc
 .pytest_cache/

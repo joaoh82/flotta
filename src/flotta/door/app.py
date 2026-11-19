@@ -1519,7 +1519,9 @@ def create_door(
 
     app = FastAPI(title="Flotta front door")
 
-    async def _target(token: Token, request_host: str | None, *, wants: str = "socket") -> Target:
+    async def _target(
+        token: Token, request_host: str | None, *, wants: str = "socket"
+    ) -> Target | None:
         """Resolve, check whose it is, wake, wait. In that order, and only that.
 
         The subject check sits between resolve and wake: after resolve because
@@ -1553,6 +1555,12 @@ def create_door(
             # agents. A box you may not address is a box that is not there.
             _log.info("refused %r for %r: %s", name, token.subject, refusal)
             raise BoxUnavailable(f"no box named {name!r}", status=404)
+        if address.runtime == "custom" and wants == "handshake":
+            # Hermes's login and ticket, which every client does before its
+            # socket (`flotta.client`, the run loop): a custom agent has neither,
+            # and the door's socket needs neither (M17.3). Answered here, so no
+            # machine starts for them; the socket is where it wakes.
+            return None
         if address.runtime == "custom" and wants != "socket":
             # Before the wake: a custom agent has only its conversation socket
             # here (M17.2), no web interface and no screen, and asking for one
@@ -1602,9 +1610,18 @@ def create_door(
     async def proxy(path: str, request: Request) -> Response:
         try:
             token = authorize(header=request.headers.get("authorization"), key=key)
-            target = await _target(token, request.headers.get("host"), wants="http")
+            handshake = request.method == "POST" and f"/{path}" in (LOGIN_PATH, HERMES_TICKET_PATH)
+            target = await _target(
+                token, request.headers.get("host"), wants="handshake" if handshake else "http"
+            )
         except BoxUnavailable as exc:
             return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+        if target is None:
+            # A custom agent's handshake: nothing to log into, and the ticket is
+            # never read, because the door's own socket carries the conversation.
+            if f"/{path}" == LOGIN_PATH:
+                return JSONResponse({"ok": True})
+            return JSONResponse({"ticket": "box-contract"})
 
         # Hop-by-hop headers describe *this* connection and must not be
         # forwarded; `host` must be rewritten or the box sees the public name.
@@ -1701,6 +1718,7 @@ def create_door(
             target = await _target(
                 token, websocket.headers.get("host"), wants="screen" if screen else "socket"
             )
+            assert target is not None  # only a handshake is answered without one
             upstream_ticket = None
             own = _own(target)
             custom = target.runtime == "custom"

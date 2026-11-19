@@ -393,6 +393,12 @@ org-custom-images ORG STATE:
 create-own NAME IMAGE *ARGS:
     uv run flotta create {{NAME}} --own-image {{IMAGE}} {{ARGS}}
 
+# Under `just local`, with the org's custom images on first
+# (`just org-custom-images <org> on`). Its dependencies install on first start.
+# M17.3 — a custom agent from a directory on this machine, e.g. the LangGraph example
+create-local NAME DIR="examples/langgraph-support" *ARGS:
+    uv run flotta create {{NAME}} --own-image local:{{DIR}} {{ARGS}}
+
 # M12.4 — sign-ups waiting for an answer, and the answer
 org-pending:
     uv run flotta org list --pending
@@ -537,6 +543,16 @@ fmt:
 # lint + tests — run before committing
 check: lint test
 
+# Their own projects with their own lockfiles, so not part of `check`; CI runs both.
+# M17.3 — the adapters' tests, and the example agent importing cleanly
+check-adapters:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run --project adapters/flotta-python --frozen pytest -q adapters/flotta-python
+    uv run --project adapters/flotta-langgraph --frozen pytest -q adapters/flotta-langgraph
+    cd examples/langgraph-support
+    OPENAI_API_KEY=unused uv run --frozen python -c 'import agent; print("example: the graph builds")'
+
 # Compares the Hermes your workers run, the latest upstream release, and the
 # Hermes running locally as orchestrator. There is no longer an "installable
 # ceiling": the image clones and installs editable, so any tag is reachable.
@@ -623,9 +639,12 @@ serve port="8080":
 # all set aside, and the local fleet keeps its own key and box password in
 # $FLOTTA_LOCAL_DIR (~/.flotta/local), so nothing minted here works anywhere
 # else. Sign-in links print here. Agents are at http://<agent>.localhost:<door>.
-# Ctrl-C stops the control plane, the door and every agent.
-# M12.6: the whole fleet on this machine — control plane on :8080, door on :8081
-local control="8080" door="8081":
+# Model calls go to a gateway with a fake upstream (M17.3): metered, priced as
+# `fake/model`, and $0. It calls a tool when a message names one, so a custom
+# agent's tools and approvals can be tried here: see `just create-local`.
+# Ctrl-C stops the control plane, the door, the gateway and every agent.
+# M12.6: the whole fleet on this machine — control plane on :8080, door on :8081, gateway on :8083
+local control="8080" door="8081" gateway="8083":
     #!/usr/bin/env bash
     set -euo pipefail
     DIR="${FLOTTA_LOCAL_DIR:-$HOME/.flotta/local}"
@@ -639,13 +658,16 @@ local control="8080" door="8081":
     # A browser reaches this door as `ws://<agent>.localhost:<port>`, not TLS on 443.
     export FLOTTA_DOOR_URL="ws://localhost:{{door}}"
     export FLOTTA_CONTROL_URL="http://127.0.0.1:{{control}}"
-    CP= DOOR=
-    trap 'kill $CP $DOOR 2>/dev/null; pkill -f "[f]lotta.backends.standin .*--home $FLOTTA_LOCAL_HOME/" || true' EXIT
+    # The fake upstream's one model, whatever .env names: the gateway refuses any other.
+    export FLOTTA_GATEWAY_URL="http://127.0.0.1:{{gateway}}" FLOTTA_MODEL=fake/model
+    CP= DOOR= GW=
+    trap 'kill $CP $DOOR $GW 2>/dev/null; pkill -f "[f]lotta.backends.standin .*--home $FLOTTA_LOCAL_HOME/" || true; pkill -f "$FLOTTA_LOCAL_HOME/[^ ]*/venv/bin/python .*--flotta-box" || true' EXIT
+    uv run --extra control flotta gateway --fake-upstream --port {{gateway}} & GW=$!
     uv run --extra control flotta serve --port {{control}} & CP=$!
     until curl -sf "127.0.0.1:{{control}}/health" >/dev/null; do sleep 0.5; done
     export FLOTTA_CONTROL_TOKEN="$(uv run flotta token mint door --scope fleet:route --days 30 2>/dev/null)"
     FLOTTA_DOOR_LOCAL=1 uv run --extra door flotta door --host 127.0.0.1 --port {{door}} & DOOR=$!
-    echo "local fleet: control plane http://127.0.0.1:{{control}}, agents at http://<agent>.localhost:{{door}}, state in $DIR"
+    echo "local fleet: control plane http://127.0.0.1:{{control}}, agents at http://<agent>.localhost:{{door}}, gateway http://127.0.0.1:{{gateway}}, state in $DIR"
     wait
 
 # Through the control plane at $FLOTTA_CONTROL_URL, which delivers it: under
