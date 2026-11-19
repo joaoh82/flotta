@@ -64,11 +64,13 @@ from .auth import DEFAULT_CLIENT, DEFAULT_ORG
 from .migrations import MigrationError
 from .store import (
     Box,
+    CustomImagesOffError,
     DuplicateBoxError,
     Event,
     FleetStore,
     InvalidBoxMetaError,
     InvalidBoxNameError,
+    InvalidImageError,
     InvalidTenantError,
     LegacyStoreError,
     LimitReachedError,
@@ -1362,6 +1364,12 @@ def create(
         "--screen",
         help="Give it a screen: a desktop and browser a person can watch. Makes it 4096 MB",
     ),
+    own_image: str | None = typer.Option(
+        None,
+        "--own-image",
+        help="Run the agency's own public image, which speaks the box contract, instead of "
+        "Hermes (M17). The org needs custom images turned on",
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -1402,9 +1410,13 @@ def create(
                 "region": region,
                 "model": model,
                 "screen": screen or None,
+                "runtime": "custom" if own_image else None,
+                "image": own_image,
             },
         )
         return
+    if own_image and image:
+        raise typer.BadParameter("--own-image is the agent's image; leave --image out")
 
     provision = _provision()
 
@@ -1449,10 +1461,14 @@ def create(
                 instructions=instructions,
                 model=model,
                 screen=screen,
+                runtime="custom" if own_image else "hermes",
+                image=own_image,
             )
         except (
             InvalidBoxNameError,
             InvalidBoxMetaError,
+            InvalidImageError,
+            CustomImagesOffError,
             InvalidTenantError,
             UnknownEntityError,
             DuplicateBoxError,
@@ -1465,6 +1481,10 @@ def create(
             # `DuplicateBoxError` reached here uncaught before this — a name
             # already taken printed a traceback, which reads as a crash rather
             # than the one-word fix it is.
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        except provision.CustomRuntimeRefused as exc:
+            # Asking a custom agent for a screen, say: a refusal, like the rest.
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
         except (provision.ProvisionError, ValueError) as exc:
@@ -3065,6 +3085,44 @@ def org_reopen(
             except (UnknownEntityError, InvalidTransitionError) as exc:
                 raise _fail(exc) from exc
     emit(view, f"{org_id}: reopened, suspended until resumed", as_json=as_json)
+
+
+@org_app.command("custom-images")
+def org_custom_images(
+    org_id: str = typer.Argument(..., help="The org"),
+    state: str = typer.Argument(..., help="on or off"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Let an org create agents from its own images, or stop (M17). The operator's.
+
+    Off destroys nothing: agents it has keep their images, and the next is refused.
+    """
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import UnknownEntityError
+
+    if state not in ("on", "off"):
+        raise typer.BadParameter("on or off")
+    on = state == "on"
+    if control_url():
+        try:
+            view = control_request(
+                "PUT",
+                f"/api/orgs/{org_id}/custom-images",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"on": on},
+            )["org"]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                view = asdict(fleet.set_org_custom_images(org_id, on))
+            except UnknownEntityError as exc:
+                raise _fail(exc) from exc
+    emit(view, f"{org_id}: custom images {state}", as_json=as_json)
 
 
 @org_app.command("decline")

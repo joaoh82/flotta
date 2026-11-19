@@ -119,6 +119,7 @@ def no_substrate(monkeypatch):
         "set_instructions",
         "set_rules",
         "set_mcp_grants",
+        "set_custom_image",
         "create_box",
     ):
         monkeypatch.setattr(provision, verb, reached)
@@ -152,6 +153,7 @@ BOX_ROUTES = [
     ("POST", "/api/boxes/{b}/repos", SCOPE_FLEET_WRITE, {"repo": "acme/secrets"}),
     ("DELETE", "/api/boxes/{b}/repos/acme/secrets", SCOPE_FLEET_WRITE, None),
     ("PUT", "/api/boxes/{b}/model", SCOPE_FLEET_WRITE, {"model": None}),
+    ("PUT", "/api/boxes/{b}/image", SCOPE_FLEET_WRITE, {"image": "ghcr.io/x/y:1"}),
     ("PUT", "/api/boxes/{b}/size", SCOPE_FLEET_WRITE, {"memory_mb": 4096}),
     ("PUT", "/api/boxes/{b}/screen", SCOPE_FLEET_WRITE, {"screen": True}),
     ("PUT", "/api/boxes/{b}/client-approvals", SCOPE_FLEET_WRITE, {"allowed": True}),

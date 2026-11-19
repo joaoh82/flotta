@@ -1296,6 +1296,21 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE orgs ADD COLUMN closed_by TEXT",
         ),
     ),
+    Migration(
+        42,
+        "custom runtimes: an agent from the agency's own image",
+        # M17.1. `boxes.runtime` is `hermes` on every agent that exists, which
+        # is what each of them is; `custom` runs the agency's own public image,
+        # named in `boxes.image`, and speaks the box contract (M17.2) instead of
+        # Hermes's protocol. A Hermes agent's image stays NULL: it is the
+        # fleet's, which upgrades move. `orgs.custom_images` is the operator's
+        # switch, off for every org until they turn it on.
+        (
+            "ALTER TABLE boxes ADD COLUMN runtime TEXT NOT NULL DEFAULT 'hermes'",
+            "ALTER TABLE boxes ADD COLUMN image TEXT",
+            "ALTER TABLE orgs ADD COLUMN custom_images INTEGER NOT NULL DEFAULT 0",
+        ),
+    ),
 )
 
 

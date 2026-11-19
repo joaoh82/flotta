@@ -384,6 +384,15 @@ org-close ORG *ARGS:
 org-reopen ORG:
     uv run flotta org reopen {{ORG}}
 
+# M17 — let an org run agents from its own images, or stop: `just org-custom-images <org> on`
+org-custom-images ORG STATE:
+    uv run flotta org custom-images {{ORG}} {{STATE}}
+
+# M17 — an agent from the agency's own public image, which speaks the box contract:
+# `just create-own <name> ghcr.io/org/agent:1.0 --org <org> --client <client>`
+create-own NAME IMAGE *ARGS:
+    uv run flotta create {{NAME}} --own-image {{IMAGE}} {{ARGS}}
+
 # M12.4 — sign-ups waiting for an answer, and the answer
 org-pending:
     uv run flotta org list --pending
