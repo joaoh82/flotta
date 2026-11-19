@@ -9061,6 +9061,8 @@ def create_app(
                     "status": box.status,
                     "org": box.org,
                     "client": box.client,
+                    # Whether the door speaks Hermes or the box contract (M17.2).
+                    "runtime": box.runtime,
                 }
             }
         finally:

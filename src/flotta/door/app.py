@@ -696,6 +696,9 @@ class Address:
     client: str = DEFAULT_CLIENT
     #: What the fleet says it is doing. `None` from a control plane that doesn't say.
     status: str | None = None
+    #: What runs in it (M17): `hermes`, or `custom`, which speaks the box
+    #: contract (`flotta.door.contract`). Absent is Hermes, as before M17.
+    runtime: str = "hermes"
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,6 +713,7 @@ class Target:
     #: boxes in one app that would silently connect you to someone else's agent.
     host: str
     port: int = DEFAULT_BOX_PORT
+    runtime: str = "hermes"
 
 
 def host_to_box_name(host: str | None, *, domain: str | None = None) -> str:
@@ -901,7 +905,14 @@ class ControlPlane:
         # Where it is, whatever it is: whether this door may go there is the
         # door's own decision (`create_door`), made before anything is proxied.
         host, port = upstream(endpoint, local=True)
-        return Target(box_id=box_id, name=name, endpoint=endpoint, host=host, port=port)
+        return Target(
+            box_id=box_id,
+            name=name,
+            endpoint=endpoint,
+            host=host,
+            port=port,
+            runtime=(body.get("box") or {}).get("runtime") or "hermes",
+        )
 
     async def resolve(self, name: str) -> Address:
         """Which box `name` is, and whose. Never wakes it.
@@ -922,6 +933,7 @@ class ControlPlane:
             org=box.get("org") or DEFAULT_ORG,
             client=box.get("client") or DEFAULT_CLIENT,
             status=box.get("status"),
+            runtime=box.get("runtime") or "hermes",
         )
 
     async def client_conversations(self, box_id: str) -> list[dict[str, Any]]:
@@ -1199,6 +1211,8 @@ async def wait_until_ready(
     *,
     timeout_s: float = DEFAULT_READY_TIMEOUT_S,
     sleep: Any = None,
+    contract_secret: str | None = None,
+    custom: bool = False,
 ) -> None:
     """Block until `hermes serve` answers, or give up with a useful message.
 
@@ -1221,6 +1235,16 @@ async def wait_until_ready(
     async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
         while loop.time() < deadline:
             try:
+                if custom:
+                    # A custom agent says so itself (M17.2): `GET /healthz`,
+                    # 200 with its Bearer. Anything else is not ready yet.
+                    from flotta.door.contract import contract_ready
+
+                    if await contract_ready(client, base_url, contract_secret):
+                        return
+                    last = "/healthz not 200"
+                    await naps(0.5)
+                    continue
                 response = await client.get(base_url + "/")
                 if response.status_code < 500:
                     return
@@ -1228,8 +1252,9 @@ async def wait_until_ready(
             except Exception as exc:
                 last = type(exc).__name__
             await naps(0.5)
+    what = "the agent's /healthz" if custom else "hermes serve"
     raise BoxUnavailable(
-        f"the box is up but hermes serve did not answer within {timeout_s:.0f}s (last: {last})",
+        f"the box is up but {what} did not answer within {timeout_s:.0f}s (last: {last})",
         status=504,
     )
 
@@ -1494,7 +1519,7 @@ def create_door(
 
     app = FastAPI(title="Flotta front door")
 
-    async def _target(token: Token, request_host: str | None) -> Target:
+    async def _target(token: Token, request_host: str | None, *, wants: str = "socket") -> Target:
         """Resolve, check whose it is, wake, wait. In that order, and only that.
 
         The subject check sits between resolve and wake: after resolve because
@@ -1528,6 +1553,12 @@ def create_door(
             # agents. A box you may not address is a box that is not there.
             _log.info("refused %r for %r: %s", name, token.subject, refusal)
             raise BoxUnavailable(f"no box named {name!r}", status=404)
+        if address.runtime == "custom" and wants != "socket":
+            # Before the wake: a custom agent has only its conversation socket
+            # here (M17.2), no web interface and no screen, and asking for one
+            # must not start a machine.
+            what = "a screen" if wants == "screen" else "a web interface through the door"
+            raise BoxUnavailable(f"{name!r} runs its own image, which has no {what}", status=404)
         # By id: the name can be released and reused between resolve and here,
         # and waking by name would start the replacement on this token's
         # account — the cost the check above exists to refuse.
@@ -1539,8 +1570,12 @@ def create_door(
         # Before the first byte goes to it: a deployed door routes no
         # `local://` box (`upstream`), so this refuses one here.
         upstream(target.endpoint, local=local_boxes)
+        own = _own(target)
         await wait_until_ready(
-            f"http://{authority(target.host, target.port)}", timeout_s=ready_timeout_s
+            f"http://{authority(target.host, target.port)}",
+            timeout_s=ready_timeout_s,
+            custom=target.runtime == "custom",
+            contract_secret=own[1] if own else None,
         )
         return target
 
@@ -1567,7 +1602,7 @@ def create_door(
     async def proxy(path: str, request: Request) -> Response:
         try:
             token = authorize(header=request.headers.get("authorization"), key=key)
-            target = await _target(token, request.headers.get("host"))
+            target = await _target(token, request.headers.get("host"), wants="http")
         except BoxUnavailable as exc:
             return JSONResponse({"detail": str(exc)}, status_code=exc.status)
 
@@ -1663,10 +1698,13 @@ def create_door(
                 raise BoxUnavailable(
                     f"the screen opens with Hermes's {DISPLAY_TICKET_PARAM}", status=400
                 )
-            target = await _target(token, websocket.headers.get("host"))
+            target = await _target(
+                token, websocket.headers.get("host"), wants="screen" if screen else "socket"
+            )
             upstream_ticket = None
             own = _own(target)
-            if ticketed and own and not screen:
+            custom = target.runtime == "custom"
+            if ticketed and own and not screen and not custom:
                 upstream_ticket = await hermes_ticket(
                     f"http://{authority(target.host, target.port)}", own
                 )
@@ -1800,15 +1838,29 @@ def create_door(
 
         async def converse() -> None:
             """The relay, and whatever outlives the person's socket (FLOTTA-204)."""
-            try:
-                async with websockets.connect(
+            if custom:
+                # The box contract behind a Hermes-shaped socket (M17.2): the
+                # relay below, the gate and the recorder are the same for both.
+                from flotta.door.contract import ContractSocket
+
+                connection: Any = ContractSocket(
+                    f"http://{authority(target.host, target.port)}",
+                    secret=own[1] if own else None,
+                    run_id=token.subject.removeprefix("run:")
+                    if token.subject.startswith("run:")
+                    else None,
+                )
+            else:
+                connection = websockets.connect(
                     upstream_url,
                     additional_headers=headers,
                     proxy=None,
                     max_size=BOX_FRAME_LIMIT,
                     ping_interval=BOX_PING_INTERVAL_S,
                     ping_timeout=BOX_PING_TIMEOUT_S,
-                ) as upstream:
+                )
+            try:
+                async with connection as upstream:
                     liveness.connected(upstream.send)
 
                     # Set once the person's socket has gone while the agent's is
