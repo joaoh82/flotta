@@ -23,6 +23,13 @@ as "not this agent" rather than as a running one.
 What a stand-in cannot do, it says: there is no shell to `exec` in, no image
 to `reimage`, and no memory snapshot, so `suspend` is `NotSupported` and
 `pause` stops it instead.
+
+**A custom agent runs itself** (M17.3). An agent created with the image
+`local:<dir>` is that directory's own `agent.py`, the agency's code under the
+box contract, rather than a stand-in: its dependencies are installed into the
+box's directory by `uv sync`, and it is told where to listen
+(`$FLOTTA_HOST`/`$FLOTTA_PORT`) and where its volume is (`$FLOTTA_DATA`). It is
+up when `GET /healthz` answers 200 to its own secret, as the door asks.
 """
 
 from __future__ import annotations
@@ -60,6 +67,13 @@ _KEPT_SECRETS = (standin.USERNAME_ENV, standin.PASSWORD_ENV, standin.MODEL_ENV)
 #: What a stand-in inherits from whoever started it: enough to run Python.
 _INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
 START_TIMEOUT_S = 15.0
+#: A custom agent's first start installs its dependencies, LangGraph and all.
+INSTALL_TIMEOUT_S = 600.0
+#: What a custom agent is: where its code is. Beside its endpoint.
+RUNTIME_FILE = "runtime.json"
+#: The marker on a custom agent's command line, so a stop can tell it is this
+#: agent's process before signalling it, as `--name` does for a stand-in.
+CUSTOM_MARK = "--flotta-box"
 #: Asking the port ignores `$http_proxy`: a proxy would carry a loopback
 #: question off the machine and answer it for whatever is listening there.
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -112,10 +126,13 @@ def _is_standin(pid: int, name: str) -> bool:
         ).stdout.split()
     except (OSError, subprocess.TimeoutExpired):
         return False
-    if "flotta.backends.standin" not in listed or "--name" not in listed:
-        return False
-    at = listed.index("--name") + 1
-    return at < len(listed) and listed[at] == name
+    for module, flag in (("flotta.backends.standin", "--name"), (None, CUSTOM_MARK)):
+        if (module is not None and module not in listed) or flag not in listed:
+            continue
+        at = listed.index(flag) + 1
+        if at < len(listed) and listed[at] == name:
+            return True
+    return False
 
 
 def _alive(pid: int, child: subprocess.Popen | None) -> bool:
@@ -201,12 +218,19 @@ class LocalBackend:
 
     # -- asking the port --------------------------------------------------------
 
+    def _custom(self, target: str) -> Path | None:
+        """A custom agent's code, if this box is one."""
+        path = self._read(target, RUNTIME_FILE).get("path")
+        return Path(path) if isinstance(path, str) and path else None
+
     def _probe(self, target: str) -> dict | None:
         """What answers on this box's port, if it is this box's stand-in."""
         found = self.existing_endpoint(self._name(target))
         if not found:
             return None
         host, port, name = parse_endpoint(found)
+        if self._custom(name) is not None:
+            return self._probe_custom(name, host, port)
         try:
             with _DIRECT.open(f"http://{host}:{port}/", timeout=2.0) as response:
                 body = json.loads(response.read())
@@ -218,6 +242,24 @@ class LocalBackend:
             return None
         return body
 
+    def _probe_custom(self, name: str, host: str, port: int) -> dict | None:
+        """A custom agent is up when it answers its own secret, and it is this
+        agent when the process recorded for it is still it."""
+        from flotta.provision import BOX_SECRET_ENV
+
+        secret = self._read(name, "secrets.json").get(BOX_SECRET_ENV, "")
+        request = urllib.request.Request(
+            f"http://{host}:{port}/healthz", headers={"Authorization": f"Bearer {secret}"}
+        )
+        try:
+            with _DIRECT.open(request, timeout=2.0) as response:
+                if response.status != 200:
+                    return None
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        pid = self._recorded_pid(name)
+        return None if pid is None else {"box": name, "pid": pid}
+
     # -- the protocol -----------------------------------------------------------
 
     def create(self, spec: BoxSpec) -> BoxHandle:
@@ -227,8 +269,17 @@ class LocalBackend:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "hermes").mkdir(exist_ok=True)
         endpoint = found or f"{SCHEME}://127.0.0.1:{_free_port()}/{name}"
+        # A Hermes agent's image means nothing here (it is a stand-in); a custom
+        # agent's is the code it runs, and must be on this machine.
+        custom = _local_path(spec.image) if spec.env.get("FLOTTA_RUNTIME") == "custom" else None
+        if custom is not None:
+            self._write(name, RUNTIME_FILE, {"path": str(custom)})
+            (directory / "data").mkdir(exist_ok=True)
         self._write(name, "env.json", dict(spec.env))
-        self._write(name, "secrets.json", _kept(spec.secrets), private=True)
+        # A custom agent is the agency's own code and is given what it was
+        # given on Fly; a stand-in, only what it reads.
+        kept = dict(spec.secrets) if custom is not None else _kept(spec.secrets)
+        self._write(name, "secrets.json", kept, private=True)
         (directory / "endpoint").write_text(endpoint)
         return BoxHandle(id=name, endpoint=endpoint, adopted=found is not None)
 
@@ -241,19 +292,31 @@ class LocalBackend:
         env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
         env.update(self._read(name, "env.json"))
         env.update(self._read(name, "secrets.json"))
+        custom = self._custom(name)
+        if custom is not None:
+            command = self._install(name, custom, env)
+            env.update(
+                {
+                    "FLOTTA_HOST": host,
+                    "FLOTTA_PORT": str(port),
+                    "FLOTTA_DATA": str(directory / "data"),
+                }
+            )
+        else:
+            command = [
+                self.python,
+                "-m",
+                "flotta.backends.standin",
+                "--name",
+                name,
+                "--home",
+                str(directory),
+                "--port",
+                str(port),
+            ]
         with open(directory / "agent.log", "ab") as log:
             child = subprocess.Popen(
-                [
-                    self.python,
-                    "-m",
-                    "flotta.backends.standin",
-                    "--name",
-                    name,
-                    "--home",
-                    str(directory),
-                    "--port",
-                    str(port),
-                ],
+                command,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
@@ -275,6 +338,36 @@ class LocalBackend:
                 )
             time.sleep(0.1)
         raise BackendError(f"the local agent {name!r} did not answer on {host}:{port}")
+
+    def _install(self, name: str, code: Path, env: dict[str, str]) -> list[str]:
+        """A custom agent's dependencies, into the box's own directory, and the
+        command that runs it. The agent's directory is left as it was found."""
+        uv = shutil.which("uv")
+        if uv is None:
+            raise BackendError(
+                "a local custom agent needs uv on the PATH: https://docs.astral.sh/uv/"
+            )
+        if not (code / "agent.py").is_file():
+            raise BackendError(f"{code} has no agent.py")
+        venv = self._dir(name) / "venv"
+        with open(self._dir(name) / "agent.log", "ab") as log:
+            try:
+                installed = subprocess.run(
+                    [uv, "sync", "--project", str(code), "--no-dev", "--quiet"],
+                    env={**env, "UV_PROJECT_ENVIRONMENT": str(venv)},
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=INSTALL_TIMEOUT_S,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise BackendError(f"installing {name!r}'s dependencies took too long") from exc
+        if installed.returncode != 0:
+            raise BackendError(
+                f"installing {name!r}'s dependencies failed; see {self._dir(name) / 'agent.log'}"
+            )
+        return [str(venv / "bin" / "python"), str(code / "agent.py"), CUSTOM_MARK, name]
 
     def suspend(self, box_id: str) -> None:
         raise NotSupported("a local stand-in has no memory snapshot; it is stopped instead")
@@ -358,7 +451,17 @@ class LocalBackend:
             self.start(name)
 
     def reimage(self, box_id: str, image: str) -> None:
-        raise NotSupported("a local stand-in has no image to replace")
+        """A custom agent onto other code: `local:<dir>`, restarted if it was up."""
+        name = self._name(box_id)
+        if self._custom(name) is None:
+            raise NotSupported("a local stand-in has no image to replace")
+        custom = _local_path(image)
+        running = self._probe(name) is not None
+        if running:
+            self.stop(name)
+        self._write(name, RUNTIME_FILE, {"path": str(custom)})
+        if running:
+            self.start(name)
 
     def check_resize(self, box_id: str, memory_mb: int) -> None:
         raise NotSupported(
@@ -457,12 +560,26 @@ class LocalBackend:
             machine_id=name,
             app=SCHEME,
             region=SCHEME,
-            volume_path=str(self._dir(name) / "hermes"),
+            volume_path=str(
+                self._dir(name) / ("data" if self._custom(name) is not None else "hermes")
+            ),
             control_url=(env.get("FLOTTA_CONTROL_URL") or None),
             env_box_id=(env.get("FLOTTA_BOX_ID") or None),
             git_author_name=(env.get("FLOTTA_GIT_AUTHOR_NAME") or None),
             git_author_email=(env.get("FLOTTA_GIT_AUTHOR_EMAIL") or None),
         )
+
+
+def _local_path(image: str | None) -> Path:
+    """`local:<dir>`'s directory. Any other image is refused: nothing on this
+    machine can boot a container."""
+    from flotta.store import LOCAL_IMAGE_PREFIX
+
+    if not image:
+        raise BackendError("a custom agent on a local fleet needs local:<dir> as its image")
+    if not image.startswith(LOCAL_IMAGE_PREFIX):
+        raise BackendError(f"a local fleet runs an agent's own code as local:<dir>, not {image!r}")
+    return Path(image[len(LOCAL_IMAGE_PREFIX) :]).expanduser().resolve()
 
 
 def _kept(secrets: dict[str, str]) -> dict[str, str]:

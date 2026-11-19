@@ -102,6 +102,29 @@ jobs:
       - name: just check (ruff check src + pytest)
         run: just check
 
+  # The adapters and the example are their own projects (MIT, M17.3), with
+  # their own lockfiles: LangGraph is no dependency of Flotta's, so they are
+  # tested in their own environments rather than in the suite above.
+  adapters:
+    name: adapters (flotta-agent + flotta-langgraph + example)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv (and Python 3.11)
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install just
+        uses: extractions/setup-just@v4
+
+      - run: just check-adapters
+
   dashboard:
     name: dashboard (tsc + eslint)
     runs-on: ubuntu-latest

@@ -541,6 +541,8 @@ def validate_image_ref(image: object) -> str:
     if not isinstance(image, str) or not image.strip():
         raise InvalidImageError("name the image, like ghcr.io/your-org/your-agent:1.0")
     ref = image.strip()
+    if ref.startswith(LOCAL_IMAGE_PREFIX):
+        return _local_image(ref)
     if len(ref) > IMAGE_REF_MAX:
         raise InvalidImageError(f"an image reference is at most {IMAGE_REF_MAX} characters")
     if "://" in ref:
@@ -563,6 +565,41 @@ def validate_image_ref(image: object) -> str:
             f"{host} is not a public registry; push the image to ghcr.io or Docker Hub"
         )
     return ref
+
+
+#: An agent run from a directory on this machine, not an image (M17.3): only on
+#: a local fleet (`just local`), where every agent is a process here anyway.
+LOCAL_IMAGE_PREFIX = "local:"
+#: What a local agent's directory holds: a uv project, and the script it runs.
+LOCAL_IMAGE_ENTRY = "agent.py"
+
+
+def _local_image(ref: str) -> str:
+    """`local:<dir>`, with the directory made absolute, or `InvalidImageError`.
+
+    Refused on any fleet but a local one: on Fly it would name a path on the
+    control plane's disk, which no machine can boot from.
+    """
+    from flotta.backend import DEFAULT_BACKEND_ENV
+
+    if (os.environ.get(DEFAULT_BACKEND_ENV) or "").strip().lower() != "local":
+        raise InvalidImageError(
+            "a local: image runs only on a local fleet (`just local`); "
+            "push the image to ghcr.io or Docker Hub"
+        )
+    given = ref[len(LOCAL_IMAGE_PREFIX) :].strip()
+    if not given:
+        raise InvalidImageError("name the agent's directory, like local:examples/langgraph-support")
+    directory = Path(given).expanduser().resolve()
+    if (
+        not (directory / LOCAL_IMAGE_ENTRY).is_file()
+        or not (directory / "pyproject.toml").is_file()
+    ):
+        raise InvalidImageError(
+            f"{directory} is not a local agent: "
+            f"it needs a pyproject.toml and an {LOCAL_IMAGE_ENTRY}"
+        )
+    return f"{LOCAL_IMAGE_PREFIX}{directory}"
 
 
 #: Registries an agency's image may not come from (M17.1): pulled with the

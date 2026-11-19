@@ -1,0 +1,14 @@
+[project]
+name = "flotta-example-support"
+version = "0.1.0"
+description = "A LangGraph support agent, run on Flotta."
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["flotta-langgraph[openai]>=0.1.0"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+flotta-langgraph = { path = "../../adapters/flotta-langgraph", editable = true }
+flotta-agent = { path = "../../adapters/flotta-python", editable = true }
