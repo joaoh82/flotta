@@ -116,7 +116,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from flotta import budgets
+from flotta import architect, budgets
 from flotta.auth import (
     SCOPE_MCP_CALL,
     SCOPE_MODEL_CALL,
@@ -125,6 +125,7 @@ from flotta.auth import (
     resolve_signing_key,
     subject_box,
     verify,
+    verify_architect_ticket,
 )
 from flotta.gateway.mcp import add_mcp_routes
 from flotta.inference import InvalidModel, is_openrouter, validate_model
@@ -565,6 +566,17 @@ def create_gateway(
 
     ledger = _Ledger(write_row, backoff_s=write_backoff_s, retry_s=write_retry_s)
 
+    def architect_row(**row: Any) -> None:
+        store = store_factory()
+        try:
+            store.record_architect_usage(**row)
+        finally:
+            store.close()
+
+    #: The Architect's calls, written as an agent's are: on threads a dropped
+    #: request cannot take with it, and tried again when the store is away.
+    architect_ledger = _Ledger(architect_row, backoff_s=write_backoff_s, retry_s=write_retry_s)
+
     def refresh_prices() -> None:
         assert price_source is not None
         prices = list(price_source())
@@ -624,6 +636,8 @@ def create_gateway(
             await mcp_proxy.close()
             await ledger.drain()
             ledger.close()
+            await architect_ledger.drain()
+            architect_ledger.close()
 
     app = FastAPI(title="Flotta model gateway", lifespan=lifespan)
 
@@ -797,6 +811,92 @@ def create_gateway(
         body = _scrubbed(reply.content, key.key) if reply.status_code >= 400 else reply.content
         return Response(body, reply.status_code, _response_headers(reply))
 
+    async def send_metered(
+        request: Request, *, payload: dict[str, Any], raw: bytes, key: str, write: Any
+    ) -> Response:
+        """Send one chat completion upstream with `key` and relay the answer,
+        streamed or whole, calling `write(status, usage=, chars=)` exactly once
+        with what it used: the caller's own ledger, an agent's or the
+        Architect's. `chars` is `None` when no tokens were spent at all."""
+        streaming = isinstance(payload, dict) and payload.get("stream") is True
+        options = payload.get("stream_options")
+        asked = isinstance(options, dict) and options.get("include_usage") is True
+        content = raw
+        if streaming and not asked:
+            given = options if isinstance(options, dict) else {}
+            payload["stream_options"] = {**given, "include_usage": True}
+            content = json.dumps(payload).encode()
+
+        client: httpx.AsyncClient = request.app.state.upstream
+        outgoing = client.build_request(
+            "POST",
+            f"{base_url}/chat/completions",
+            headers=upstream_headers(request, key),
+            content=content,
+        )
+        try:
+            reply = await client.send(outgoing, stream=True)
+        except httpx.HTTPError as exc:
+            _log.warning("the model provider could not be reached: %s", exc)
+            if isinstance(exc, _NEVER_SENT):
+                write(502)
+            else:
+                write(502, chars=0)
+            return _error(502, "the model provider could not be reached")
+
+        if reply.headers.get("content-type", "").startswith("text/event-stream") and (
+            reply.status_code < 400
+        ):
+            events = _Events(strip_usage=streaming and not asked)
+            written = False
+
+            def end(*, usage: Any, chars: int) -> None:
+                nonlocal written
+                if not written:
+                    written = True
+                    write(reply.status_code, usage=usage, chars=chars)
+
+            def finish() -> None:
+                end(usage=events.usage, chars=events.chars)
+                closing = asyncio.ensure_future(reply.aclose())
+                _closing.add(closing)
+                closing.add_done_callback(_closing.discard)
+
+            return _MeteredStream(
+                _relay(reply, events, end),
+                finish,
+                status_code=reply.status_code,
+                headers=_response_headers(reply),
+            )
+
+        try:
+            body = await reply.aread()
+        except httpx.HTTPError as exc:
+            _log.warning("the upstream's reply ended early: %s", exc)
+            # It may have worked, and nothing says what it used.
+            write(502, chars=0 if reply.status_code < 400 else None)
+            return _error(502, "the model provider's reply ended early")
+        finally:
+            await reply.aclose()
+
+        if reply.status_code >= 400:
+            write(reply.status_code)
+            return Response(_scrubbed(body, key), reply.status_code, _response_headers(reply))
+
+        try:
+            answer = json.loads(body)
+        except ValueError:
+            answer = {}
+        answer = answer if isinstance(answer, dict) else {}
+        choices = answer.get("choices")
+        seen = (
+            sum(_text_length(c.get("message")) for c in choices if isinstance(c, dict))
+            if isinstance(choices, list)
+            else 0
+        )
+        write(reply.status_code, usage=answer.get("usage"), chars=seen)
+        return Response(body, reply.status_code, _response_headers(reply))
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         started = time.monotonic()
@@ -898,83 +998,103 @@ def create_gateway(
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
 
-        streaming = isinstance(payload, dict) and payload.get("stream") is True
-        options = payload.get("stream_options")
-        asked = isinstance(options, dict) and options.get("include_usage") is True
-        content = raw
-        if streaming and not asked:
-            given = options if isinstance(options, dict) else {}
-            payload["stream_options"] = {**given, "include_usage": True}
-            content = json.dumps(payload).encode()
+        return await send_metered(request, payload=payload, raw=raw, key=key.key, write=write)
 
-        client: httpx.AsyncClient = request.app.state.upstream
-        outgoing = client.build_request(
-            "POST",
-            f"{base_url}/chat/completions",
-            headers=upstream_headers(request, key.key),
-            content=content,
-        )
+    # -- the Architect's own calls (FLOTTA-250, `flotta.architect`) ----------------
+
+    def architect_verdict(org_id: str) -> architect.Admitted | architect.Refusal:
+        store = store_factory()
         try:
-            reply = await client.send(outgoing, stream=True)
-        except httpx.HTTPError as exc:
-            _log.warning("the model provider could not be reached: %s", exc)
-            if isinstance(exc, _NEVER_SENT):
-                write(502)
+            return architect.admit(
+                store,
+                org_id,
+                now=datetime.now(UTC),
+                cost_is_reported=provider == "openrouter",
+                env=environment,
+            )
+        finally:
+            store.close()
+
+    @app.post("/v1/architect/chat/completions")
+    async def architect_completions(request: Request) -> Response:
+        """One model call for the Architect, on the fleet's own key.
+
+        The caller is the web app's server, with a ticket the control plane
+        made for a signed-in person of an agency (`POST /api/architect/ticket`).
+        The model is the operator's, never the caller's; the org's monthly
+        allowance is checked before anything is sent, and what the call cost is
+        written to `architect_usage` when it ends.
+        """
+        started = time.monotonic()
+        if not signing_key:
+            return _error(503, "the gateway has no signing key, so it cannot check a ticket")
+        scheme, _, presented = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not presented.strip():
+            return _error(401, "the Architect's route takes its ticket as a bearer token")
+        try:
+            ticket = verify_architect_ticket(presented.strip(), key=signing_key)
+        except AuthError as exc:
+            return _error(401, str(exc))
+
+        asked = await request.body()
+        try:
+            payload = json.loads(asked, object_pairs_hook=_no_repeats)
+            architect.shaped(payload, "unchosen")
+        except architect.BadCall as exc:
+            return _error(400, str(exc))
+        except (ValueError, TypeError):
+            return _error(400, "expected a JSON body, with no repeated keys")
+        refused = _refused_field(payload)
+        if refused is not None:
+            return _error(400, f"the Architect's route adds nothing to a call: no {refused!r}")
+
+        try:
+            verdict = await asyncio.to_thread(architect_verdict, ticket.org)
+        except Exception:
+            _log.exception("the Architect's allowance could not be checked")
+            verdict = architect.unchecked()
+        if isinstance(verdict, architect.Refusal):
+            return JSONResponse(verdict.body(), status_code=verdict.status)
+
+        fleet_key = (environment.get(FLEET_KEY_ENV) or "").strip()
+        if not fleet_key or not base_url:
+            return _error(503, "the gateway has no upstream configured")
+        sent = architect.shaped(payload, verdict.model)
+        raw = json.dumps(sent).encode()
+        call = uuid.uuid4().hex
+
+        def write(status: int, *, usage: Any = None, chars: int | None = None) -> None:
+            reported = _reported(usage)
+            if reported is not None:
+                tokens = reported
+            elif chars is None:
+                tokens = (0, 0, 0)
             else:
-                write(502, chars=0)
-            return _error(502, "the model provider could not be reached")
-
-        if reply.headers.get("content-type", "").startswith("text/event-stream") and (
-            reply.status_code < 400
-        ):
-            events = _Events(strip_usage=streaming and not asked)
-            written = False
-
-            def end(*, usage: Any, chars: int) -> None:
-                nonlocal written
-                if not written:
-                    written = True
-                    write(reply.status_code, usage=usage, chars=chars)
-
-            def finish() -> None:
-                end(usage=events.usage, chars=events.chars)
-                closing = asyncio.ensure_future(reply.aclose())
-                _closing.add(closing)
-                closing.add_done_callback(_closing.discard)
-
-            return _MeteredStream(
-                _relay(reply, events, end),
-                finish,
-                status_code=reply.status_code,
-                headers=_response_headers(reply),
+                tokens = (_estimated_tokens(len(raw)), _estimated_tokens(chars), 0)
+            _log.info(
+                "architect call for %s: %s, %d in, %d out, %d ms",
+                ticket.org,
+                status,
+                tokens[0],
+                tokens[1],
+                int((time.monotonic() - started) * 1000),
+            )
+            architect_ledger.write(
+                org=ticket.org,
+                user_id=ticket.user_id,
+                model=verdict.model,
+                upstream=provider,
+                tokens_in=tokens[0],
+                tokens_out=tokens[1],
+                tokens_cached=tokens[2],
+                idempotency_key=call,
+                eur_per_usd=verdict.eur_per_usd,
+                status=status,
+                estimated=reported is None and chars is not None,
+                reported_cost_nano=_reported_cost(usage) if provider == "openrouter" else None,
+                now=datetime.now(UTC),
             )
 
-        try:
-            body = await reply.aread()
-        except httpx.HTTPError as exc:
-            _log.warning("the upstream's reply ended early: %s", exc)
-            # It may have worked, and nothing says what it used.
-            write(502, chars=0 if reply.status_code < 400 else None)
-            return _error(502, "the model provider's reply ended early")
-        finally:
-            await reply.aclose()
-
-        if reply.status_code >= 400:
-            write(reply.status_code)
-            return Response(_scrubbed(body, key.key), reply.status_code, _response_headers(reply))
-
-        try:
-            answer = json.loads(body)
-        except ValueError:
-            answer = {}
-        answer = answer if isinstance(answer, dict) else {}
-        choices = answer.get("choices")
-        seen = (
-            sum(_text_length(c.get("message")) for c in choices if isinstance(c, dict))
-            if isinstance(choices, list)
-            else 0
-        )
-        write(reply.status_code, usage=answer.get("usage"), chars=seen)
-        return Response(body, reply.status_code, _response_headers(reply))
+        return await send_metered(request, payload=sent, raw=raw, key=fleet_key, write=write)
 
     return app

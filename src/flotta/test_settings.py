@@ -79,6 +79,11 @@ def test_every_catalogued_setting_actually_changes_something():
         # billing gives a paying self-serve org its ceiling
         # (`POST /api/orgs/{id}/spend-ceiling/default`, FLOTTA-241).
         "FLOTTA_SPEND_CEILING_EUR",
+        # Read by `flotta.architect`, through `layered`, on the gateway before
+        # each of the Architect's model calls and on the control plane where an
+        # agency is told how much of its allowance is left (FLOTTA-250).
+        "FLOTTA_ARCHITECT_MODEL",
+        "FLOTTA_ARCHITECT_MONTHLY_EUR",
         # Read by `provision.resolve_closed_retention_days`, through `layered`,
         # in every loop sweep (`purge_closed_orgs`) and in `/api/orgs`'s
         # `purge_after` (FLOTTA-224): how long a closed org's rows are kept.

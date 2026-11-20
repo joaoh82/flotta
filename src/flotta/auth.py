@@ -277,6 +277,15 @@ SCREEN_PROTOCOL = "flotta.screen.v1"
 #: The subprotocol that carries a ticket: this, then the ticket.
 TICKET_PROTOCOL_PREFIX = "flotta.ticket."
 
+#: An Architect ticket's lifetime (FLOTTA-250): one question may take several
+#: model calls, and the web app's server asks for a ticket per question.
+ARCHITECT_TICKET_TTL_S = 300
+#: Greppable, and distinct from a token and from a chat ticket.
+ARCHITECT_TICKET_PREFIX = "flotta_architect_"
+#: Signed into every Architect ticket and nothing else, so it verifies as
+#: neither a token nor a chat ticket, and neither verifies as one.
+_ARCHITECT_DOMAIN = "flotta-architect-ticket:"
+
 #: A default that is short because revocation is coarse. Long-lived tokens are
 #: an explicit `--expires` away.
 DEFAULT_TTL_S = 30 * 24 * 3600
@@ -879,6 +888,81 @@ def verify_ticket(
         full_access=claims.get("access") == "full",
         answers_approvals=claims.get("approvals") == "answer",
         screen=_screen_claim(claims.get("screen")),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectTicket:
+    """Who may make the Architect's model calls, and for which org, for minutes."""
+
+    user_id: str
+    org: str
+    issued_at: int
+    expires_at: int
+
+
+def mint_architect_ticket(
+    *,
+    user_id: str,
+    org: str,
+    ttl_s: int = ARCHITECT_TICKET_TTL_S,
+    key: str | None = None,
+    env: dict[str, str] | None = None,
+    now: int | None = None,
+) -> str:
+    """A ticket for the Architect's model calls (FLOTTA-250): one person, one org, minutes.
+
+    The control plane makes one for a signed-in person of an agency; the model
+    gateway takes it at the Architect's route and nowhere else. It is not a
+    token: it carries no scope, names no box, and no route of the fleet API
+    admits it. What it buys is bounded by the org's monthly allowance, which
+    the gateway checks before every call.
+    """
+    signing_key = _require_key(key, env)
+    if not 0 < ttl_s <= TICKET_MAX_TTL_S:
+        raise AuthError(f"a ticket lasts minutes: 1 to {TICKET_MAX_TTL_S} seconds")
+    for claim, value in (("person", user_id), ("org", org)):
+        if not value or not value.strip():
+            raise AuthError(f"an Architect ticket names its {claim}")
+    issued = int(time.time()) if now is None else now
+    payload = _encode(
+        {
+            "v": 1,
+            "sub": user_subject(user_id.strip()),
+            "org": org.strip(),
+            "iat": issued,
+            "exp": issued + ttl_s,
+        }
+    )
+    return f"{ARCHITECT_TICKET_PREFIX}{payload}.{_sign(_ARCHITECT_DOMAIN + payload, signing_key)}"
+
+
+def verify_architect_ticket(
+    ticket: str,
+    *,
+    key: str | None = None,
+    env: dict[str, str] | None = None,
+    now: int | None = None,
+) -> ArchitectTicket:
+    """An Architect ticket's person and org, or `AuthError`. Refuses every token
+    and every chat ticket."""
+    signing_key = _require_key(key, env)
+    if not ticket or not ticket.startswith(ARCHITECT_TICKET_PREFIX):
+        raise AuthError("not an Architect ticket")
+    claims = _open(
+        ticket[len(ARCHITECT_TICKET_PREFIX) :], signing_key, now=now, domain=_ARCHITECT_DOMAIN
+    )
+    subject, org, issued = claims.get("sub"), claims.get("org"), claims.get("iat")
+    if not isinstance(subject, str) or not subject.startswith(USER_SUBJECT_PREFIX):
+        raise AuthError("malformed ticket: it names no person")
+    user_id = subject[len(USER_SUBJECT_PREFIX) :]
+    if not user_id.strip() or not isinstance(org, str) or not org.strip():
+        raise AuthError("malformed ticket: it names no person or no org")
+    return ArchitectTicket(
+        user_id=user_id,
+        org=org,
+        issued_at=issued if isinstance(issued, int) else 0,
+        expires_at=claims["exp"],
     )
 
 

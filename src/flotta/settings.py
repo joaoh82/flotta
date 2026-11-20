@@ -94,6 +94,10 @@ STARTING_CAP_EUR_DEFAULT = "50"
 #: says otherwise (FLOTTA-241), in euros. Also what a value that is not more
 #: than zero falls back to: the default is never "no ceiling".
 SPEND_CEILING_EUR_DEFAULT = "500"
+#: Euros of the Architect's model calls an agency may use in a calendar month
+#: (FLOTTA-250). The fleet pays for them, so this is what one agency's
+#: Architect can cost its operator at most, give or take a call in flight.
+ARCHITECT_MONTHLY_EUR_DEFAULT = "10"
 
 #: Every setting the fleet exposes. Adding one here is what makes it settable —
 #: there is deliberately no way to write a key that is not in this list.
@@ -225,6 +229,30 @@ SETTINGS: tuple[Setting, ...] = (
         ),
         kind="money",
         default=SPEND_CEILING_EUR_DEFAULT,
+    ),
+    Setting(
+        key="FLOTTA_ARCHITECT_MODEL",
+        label="The Architect's model",
+        help=(
+            "The model the Architect answers with: the assistant an agency's "
+            "people ask about their account. It needs one that calls tools well. "
+            "Empty uses the model for new agents. The fleet pays for these calls, "
+            "not the agency."
+        ),
+        kind="text",
+        default="",
+    ),
+    Setting(
+        key="FLOTTA_ARCHITECT_MONTHLY_EUR",
+        label="The Architect's monthly allowance",
+        help=(
+            "Euros of the Architect's model calls each agency may use in a "
+            "calendar month, on the fleet's own model key. An agency that has "
+            "used it is told so and the Architect answers again next month. It "
+            "is not billed to the agency and counts against none of its budgets."
+        ),
+        kind="money",
+        default=ARCHITECT_MONTHLY_EUR_DEFAULT,
     ),
     Setting(
         key="FLOTTA_CLOSED_RETENTION_DAYS",
@@ -360,7 +388,7 @@ def validate(key: str, value: str) -> str:
             raise ValueError(f"{setting.label} cannot be negative, got {text!r}")
         if key == "FLOTTA_EUR_PER_USD" and number == 0:
             raise ValueError(f"{setting.label} must be greater than zero, got {text!r}")
-    elif key == "FLOTTA_MODEL":
+    elif key in ("FLOTTA_MODEL", "FLOTTA_ARCHITECT_MODEL"):
         from flotta.inference import InvalidModel, validate_model
 
         try:
@@ -495,6 +523,18 @@ def describe(store: Any, env: Mapping[str, str] | None = None) -> list[dict[str,
             }
         )
     return out
+
+
+def architect_monthly_eur_nano(store: Any, env: Mapping[str, str] | None = None) -> int:
+    """What each org's Architect may cost in a calendar month, in euro nanos
+    (FLOTTA-250). Never zero and never missing, like the spend ceiling: an
+    allowance of nothing is said by not offering the Architect, not by a zero
+    here that reads as "unlimited" to the next person."""
+    return _positive_eur_nano(
+        layered(store, env).get("FLOTTA_ARCHITECT_MONTHLY_EUR"),
+        "FLOTTA_ARCHITECT_MONTHLY_EUR",
+        ARCHITECT_MONTHLY_EUR_DEFAULT,
+    )
 
 
 def spend_ceiling_eur_nano(store: Any, env: Mapping[str, str] | None = None) -> int:

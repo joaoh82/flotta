@@ -950,6 +950,7 @@ PURGED_BY: dict[str, str] = {
         for table in (
             "alert_deliveries",
             "api_keys",
+            "architect_usage",
             "boxes",
             "budget_events",
             "budgets",
@@ -2591,6 +2592,7 @@ class FleetStore:
             for table in ("run_approvals", "requests", "handoffs", "pull_requests", "mcp_calls"):
                 gone(table, "org_id = ?", o)
             gone("usage", "org_id = ?", o)
+            gone("architect_usage", "org_id = ?", o)
             gone("api_keys", "org_id = ?", o)
             gone("triggers", "org_id = ?", o)
             gone("budgets", "org_id = ?", o)
@@ -4929,6 +4931,121 @@ class FleetStore:
         ).fetchone()
         # Postgres sums a BIGINT into a NUMERIC, which arrives as a Decimal.
         return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
+
+    # -- the Architect's own model calls (FLOTTA-250) ---------------------------
+
+    def record_architect_usage(
+        self,
+        *,
+        org: str,
+        user_id: str,
+        model: str,
+        upstream: str,
+        tokens_in: int,
+        tokens_out: int,
+        idempotency_key: str,
+        eur_per_usd: Decimal | None,
+        tokens_cached: int = 0,
+        status: int | None = None,
+        estimated: bool = False,
+        reported_cost_nano: int | None = None,
+        now: datetime | None = None,
+    ) -> int | None:
+        """One of the Architect's model calls, for `org`, asked for by `user_id`.
+
+        Priced as an agent's call is (`record_usage`): the upstream's own
+        figure when it reports one, else the catalogue's price, else nothing,
+        which is unknown and never free. Returns its cost in euro nanos, or
+        `None` for a call nobody could price.
+
+        Its own table, on purpose: `usage` is what an agency's budgets and
+        invoice add up, and this is the fleet's to pay. Written once however
+        often it is tried, by `idempotency_key`.
+        """
+        if self.get_org(org) is None:
+            raise UnknownEntityError(f"no org {org!r}")
+        moment = now or datetime.now(UTC)
+        price = self.price_of(model, at=moment)
+        currency = None if price is None else price.currency
+        upstream_cost: int | None
+        cost_eur: int | None
+        if reported_cost_nano:
+            currency = "USD"
+            upstream_cost = reported_cost_nano
+            cost_eur = to_eur_nano(reported_cost_nano, currency, eur_per_usd)
+        elif tokens_in == 0 and tokens_out == 0:
+            upstream_cost, cost_eur = 0, 0
+        elif price is None:
+            upstream_cost, cost_eur = None, None
+        else:
+            upstream_cost = cost_nano(
+                price, tokens_in=tokens_in, tokens_out=tokens_out, tokens_cached=tokens_cached
+            )
+            cost_eur = to_eur_nano(upstream_cost, price.currency, eur_per_usd)
+        rate = (
+            str(eur_per_usd)
+            if upstream_cost and cost_eur is not None and currency == "USD"
+            else None
+        )
+        self._conn.execute(
+            "INSERT INTO architect_usage (id, org_id, user_id, model, upstream, tokens_in, "
+            "tokens_out, tokens_cached, currency, upstream_cost_nano, eur_per_usd, cost_eur_nano, "
+            "status, estimated, cost_reported, at, idempotency_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (idempotency_key) DO NOTHING",
+            (
+                f"au-{uuid.uuid4().hex}",
+                org,
+                user_id,
+                model,
+                upstream,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                currency,
+                upstream_cost,
+                rate,
+                cost_eur,
+                status,
+                1 if estimated else 0,
+                1 if reported_cost_nano else 0,
+                _instant(moment),
+                idempotency_key,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT cost_eur_nano FROM architect_usage WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return None if row["cost_eur_nano"] is None else int(row["cost_eur_nano"])
+
+    def architect_spend(self, org: str, *, since: datetime) -> Spend:
+        """What `org`'s Architect has cost since `since`. `unpriced` counts the
+        calls with no euro cost, which the sum is short by."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced "
+            "FROM architect_usage WHERE org_id = ? AND at >= ?",
+            (org, _instant(since)),
+        ).fetchone()
+        return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
+
+    def architect_spend_by_org(self, *, since: datetime) -> dict[str, tuple[Spend, int]]:
+        """Every org whose Architect made a call since `since`: `{org: (spend, calls)}`.
+        For the operator, who pays for them."""
+        rows = self._conn.execute(
+            "SELECT org_id, COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls "
+            "FROM architect_usage WHERE at >= ? GROUP BY org_id ORDER BY org_id",
+            (_instant(since),),
+        ).fetchall()
+        return {
+            r["org_id"]: (
+                Spend(eur_nano=int(r["eur_nano"]), unpriced=int(r["unpriced"])),
+                int(r["calls"]),
+            )
+            for r in rows
+        }
 
     def usage_summary(
         self,
