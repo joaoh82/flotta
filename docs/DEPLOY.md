@@ -298,6 +298,27 @@ That round trip is the entire thesis of the project in one command.
 
 ---
 
+## The fleet API as MCP tools
+
+`POST /mcp` on the control plane offers the fleet API to an assistant acting for
+a signed-in person (FLOTTA-250, `control/fleet_mcp.py`). `just mcp-tools` lists
+the tools and the route each one calls.
+
+- **A tool is a route, called as the caller.** The request's own `Authorization`
+  (a session, or a token) is passed to the route, in-process. A tool can do what
+  that person's click could, and every tenancy and role check is the route's.
+  Whose account it reads is the caller's agency, never an argument.
+- **Read tools only, so far.** Never a tool: destroying an agent, minting a
+  token or a key, a secret, billing, anything the operator alone may do.
+- **Streamable HTTP, plain JSON, no stream.** `initialize`, `ping`,
+  `tools/list` and `tools/call`; a `GET` is a 405. A request naming an origin
+  other than the web app's is a 403.
+- **A read-only session cannot use it** (the operator viewing an agency):
+  every non-GET is refused for one, and this is a POST.
+
+What a tool answers is data. Agents and clients write much of it, so whatever
+reads it must report it and never follow instructions in it.
+
 ## Creating an agent is asynchronous
 
 `POST /api/boxes` answers **202** with the box id and `status: provisioning`,

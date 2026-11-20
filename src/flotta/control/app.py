@@ -9701,6 +9701,62 @@ def create_app(
         finally:
             store.close()
 
+    # -- the fleet API as MCP tools (FLOTTA-250) --------------------------------
+    #
+    # What an assistant acting for a signed-in person may ask of an agency's
+    # account (`control/fleet_mcp.py`). Each tool is one of the routes above,
+    # called in-process with the caller's own `Authorization`, so it can do
+    # what that person's click could and nothing else. Nothing here reads the
+    # store: the routes do. A `GET` is a 405, which is how an MCP server says
+    # it opens no stream.
+
+    @app.post("/mcp")
+    async def fleet_mcp(
+        request: Request,
+        token: Token | None = needs_anyone,
+        authorization: str | None = Header(default=None),
+        origin: str | None = Header(default=None),
+    ) -> Any:
+        """One JSON-RPC message in, one JSON object out: the fleet API's tools.
+
+        A browser has no business here, so a request that names an origin other
+        than the web app's is refused, as the MCP transport requires against
+        DNS rebinding. The web app's own server sends none.
+        """
+        import httpx
+        from fastapi.responses import JSONResponse, Response
+
+        from flotta.control import fleet_mcp as tools
+
+        if origin is not None and origin.rstrip("/") != (link_base or "").rstrip("/"):
+            return JSONResponse(
+                tools.rpc_error(None, -32600, "not from an origin this server knows"),
+                status_code=403,
+            )
+        try:
+            message = await request.json()
+        except ValueError:
+            return JSONResponse(tools.rpc_error(None, -32700, "not JSON"), status_code=400)
+
+        async def call_route(method: str, path: str, query: dict[str, str]) -> tuple[int, Any]:
+            # As the caller, and only as the caller: the one header that says who they are.
+            headers = {"authorization": authorization} if authorization else {}
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://control") as inner:
+                answer = await inner.request(method, path, params=query, headers=headers)
+            try:
+                return answer.status_code, answer.json()
+            except ValueError:
+                return answer.status_code, None
+
+        # Whose account a tool reads is the caller's own agency, from their
+        # credential and never from an argument: no tool takes an org.
+        org = (token.org if token is not None else None) or DEFAULT_ORG
+        status, body = await tools.handle(message, call_route=call_route, org=org)
+        if body is None:
+            return Response(status_code=status)
+        return JSONResponse(body, status_code=status)
+
     return app
 
 
