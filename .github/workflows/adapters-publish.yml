@@ -1,0 +1,70 @@
+# The MIT adapters, published to PyPI (M17 follow-up).
+#
+# An agency's own agent installs `flotta-langgraph` (or `flotta-agent`) from
+# PyPI, so its Dockerfile is its own few lines rather than a build from this
+# repository. Released by pushing a tag naming the package and the version its
+# pyproject.toml says: `flotta-agent-v0.1.0`, then `flotta-langgraph-v0.1.0`
+# (it depends on the first, so the first goes first).
+#
+# Trusted publishing: PyPI accepts this workflow's OIDC identity, so no PyPI
+# token exists anywhere. Each project needs a (pending) publisher on pypi.org
+# naming this repository, this workflow file and the `pypi` environment, set
+# up once by the account's owner.
+
+name: Publish adapters
+
+on:
+  push:
+    tags:
+      - "flotta-agent-v*"
+      - "flotta-langgraph-v*"
+
+concurrency:
+  group: adapters-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: test, build and publish the package the tag names
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Which package, and does its version match the tag
+        id: which
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            flotta-agent-v*) dir=adapters/flotta-python ;;
+            flotta-langgraph-v*) dir=adapters/flotta-langgraph ;;
+            *) echo "::error::$tag names no adapter"; exit 1 ;;
+          esac
+          version="${tag##*-v}"
+          declared=$(python3 -c "import tomllib; print(tomllib.load(open('$dir/pyproject.toml','rb'))['project']['version'])")
+          [ "$version" = "$declared" ] || { echo "::error::tag says $version, $dir/pyproject.toml says $declared"; exit 1; }
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv (and Python 3.11)
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+
+      # Its own tests first: a release is never something CI has not passed.
+      - name: Test
+        working-directory: ${{ steps.which.outputs.dir }}
+        run: uv run --frozen pytest -q
+
+      - name: Build
+        working-directory: ${{ steps.which.outputs.dir }}
+        run: uv build -o "$GITHUB_WORKSPACE/dist"
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

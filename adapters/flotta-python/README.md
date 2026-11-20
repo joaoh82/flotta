@@ -8,6 +8,10 @@ keeps its memory on a volume. Its model calls are metered and budgeted, and
 schedules and webhooks can run it. Approvals reach a person in the web app or
 by email.
 
+```sh
+pip install flotta-agent            # add [openai] for ctx.openai()
+```
+
 ```python
 from flotta_agent import agent
 

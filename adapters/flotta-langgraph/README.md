@@ -4,6 +4,10 @@ Run a [LangGraph](https://langchain-ai.github.io/langgraph/) agent on
 [Flotta](https://github.com/joaoh82/flotta) with one call: `serve(graph)`. MIT
 licensed, built on [flotta-agent](../flotta-python).
 
+```sh
+pip install "flotta-langgraph[openai]"
+```
+
 ```python
 from flotta_langgraph import chat_model, serve
 
