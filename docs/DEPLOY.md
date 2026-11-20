@@ -339,6 +339,28 @@ them only if they landed. A custom agent takes none.
 short slug, kept on the box and answered with it. The control plane does not
 know what a template sets; that is the caller's.
 
+**What the operator changed in a template is kept here too** (FLOTTA-269), so a
+front end's templates can be changed with no release of the front end. The
+templates stay the front end's; the control plane keeps, per template name,
+only the parts the operator changed:
+
+| Route | Who | What |
+| --- | --- | --- |
+| `GET /api/agent-templates` | whoever makes agents (`fleet:write` or `org:admin`) | `{"templates": [{"id", "changes", "updated_at"}]}`, one per changed template |
+| `PUT /api/agent-templates/{id}` | the operator | `{"changes": {...}}` replaces what was kept; `{}` clears it |
+| `DELETE /api/agent-templates/{id}` | the operator | the template is the front end's again |
+| `GET /api/agent-templates/public` | anyone, no token | whether each is offered and what it sets up, with none of the operator's words |
+
+`changes` may hold any of `offered`, `name`, `description`, `instructions`,
+`screen`, `repositories`, `pull_requests`, `starts_alone`, `tools`, `schedule`
+and `rules`. A part left out is the front end's own, and `null` for
+`pull_requests`, `starts_alone`, `schedule` or `rules` says the operator took
+it away. Each part is held to the limit of the route that later applies it
+(instructions to what `POST /api/boxes` takes, rules to an agent's rules, a
+schedule to a trigger's, a tool to one in the library), so a saved template
+can make an agent. A template's name and what it is called are not changed
+here. Agents already made are not touched.
+
 It used to hold the request open for the whole thing — an app, a volume, a
 machine and a boot — and the host's proxy (Railway's, then) gave up first:
 
