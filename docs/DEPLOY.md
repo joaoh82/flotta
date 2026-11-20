@@ -1288,6 +1288,47 @@ agent needs the image from this change before it files anything.
 
 ---
 
+## Step 12 — The Architect's model calls (FLOTTA-250)
+
+The Architect is an assistant for an agency's own people, in a front end: it
+answers about the account by calling the fleet API's tools (`POST /mcp`, above).
+Its loop runs in the front end's server. What it needs from the control plane is
+a model to think with: `POST /api/architect/completions`, an OpenAI chat
+completion, streamed or whole, called with the signed-in person's session.
+
+**The fleet pays for these calls, and they need a key of their own.** The model
+gateway holds the fleet's provider key and meters agents, but only agents'
+machines can reach it. So the control plane makes the Architect's calls itself:
+
+```bash
+FLOTTA_ARCHITECT_API_KEY=sk-or-...   # on the control plane; calls go to $FLOTTA_MODEL_BASE_URL
+```
+
+Make it a separate key at the provider and give it a monthly limit there. That
+limit is the fleet's whole Architect bill at most, whatever this code believes.
+Unset, the route answers 503 and nothing else changes.
+
+Two fleet settings, in HQ or with `PUT /api/settings`:
+
+| Setting | What | Default |
+| --- | --- | --- |
+| `FLOTTA_ARCHITECT_MODEL` | the model that answers; it must call tools well | the model for new agents |
+| `FLOTTA_ARCHITECT_MONTHLY_EUR` | what each agency may use in a calendar month (UTC) | 10 |
+
+- **The caller does not choose the model**, and an answer is at most 4,096 tokens.
+- **The allowance is checked before every call and fails closed.** Used up is a
+  402 with `code: architect_allowance_used` and where the month stands. So is
+  anything that would leave a call uncounted: no exchange rate, no price for the
+  model on an endpoint that reports no cost, a call this month nobody could
+  price, or a store that cannot be read. Calls already in flight are not
+  counted, so an agency can overshoot by what those cost.
+- **It is not in `usage`.** Each call is a row of `architect_usage` (org, person,
+  tokens, cost), so no client's budget and no agency's invoice ever includes it.
+- **Who may call:** a signed-in owner or builder of an active agency. Not a
+  client's people, not a token, and not while viewing an agency as its owner.
+- `GET /api/architect/allowance` tells an agency where its month stands, and
+  `GET /api/architect/spend` tells the operator what every agency's has cost.
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would
