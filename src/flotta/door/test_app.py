@@ -364,7 +364,7 @@ def _door_for(
         async def report_screen_lease(self, box_id, *, holder, since, by=None):
             self.leases.append((box_id, holder, since, by))
 
-        async def wake(self, name, *, box_id=None):
+        async def wake(self, name, *, box_id=None, timeout_s=None):
             self.woken.append(name)
             started = box_id or name_now_holds or _resolved_id
             self.woken_ids.append(started)

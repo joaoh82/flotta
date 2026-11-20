@@ -63,14 +63,16 @@ def standin(tmp_path):
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, "127.0.0.1", 0)
     loop.run_until_complete(site.start())
-    port = site._server.sockets[0].getsockname()[1]
+    port = runner.addresses[0][1]
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
     try:
         yield port
     finally:
+        asyncio.run_coroutine_threadsafe(runner.cleanup(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
+        loop.close()
 
 
 @pytest.fixture
@@ -105,8 +107,8 @@ def fleet(tmp_path, monkeypatch, standin):
         store.update_box_status(box.id, "running", endpoint="fly://flotta-support/m1")
 
     class InProcess(ControlPlane):
-        async def wake(self, name, *, box_id=None):
-            target = await super().wake(name, box_id=box_id)
+        async def wake(self, name, *, box_id=None, timeout_s=None):
+            target = await super().wake(name, box_id=box_id, timeout_s=timeout_s)
             return dataclasses.replace(target, host="127.0.0.1", port=standin)
 
     def door(*, timeout_s, wake_timeout_s, **kwargs):
@@ -143,20 +145,32 @@ def test_a_wake_slower_than_a_quick_question_still_connects(fleet):
         assert "gateway.ready" in socket.receive_text()
 
 
-def test_a_wake_that_outlasts_its_own_wait_says_the_agent_is_still_starting(fleet):
-    fleet["state"]["wake_s"] = 0.6
-    door = fleet["door"](timeout_s=5.0, wake_timeout_s=0.2)
-
+def _refused(fleet, door):
     with (
         TestClient(door) as front,
         fleet["connect"](front) as socket,
         pytest.raises(WebSocketDisconnect) as closed,
     ):
         socket.receive_text()
+    return closed.value
 
-    assert closed.value.code == 4504
-    assert "still starting" in closed.value.reason
-    assert "cannot reach the control plane" not in closed.value.reason
+
+def test_a_wake_that_outlasts_its_own_wait_says_to_try_again(fleet):
+    fleet["state"]["wake_s"] = 0.6
+    closed = _refused(fleet, fleet["door"](timeout_s=5.0, wake_timeout_s=0.2))
+
+    assert closed.code == 4504
+    assert closed.reason.startswith("try again in a moment: waking 'support")
+    assert "cannot reach the control plane" not in closed.reason
+
+
+def test_a_wake_gets_only_what_the_doors_budget_has_left(fleet):
+    """A door with a short budget must not wait out a long wake, then refuse the boot."""
+    fleet["state"]["wake_s"] = 0.6
+    closed = _refused(fleet, fleet["door"](timeout_s=5.0, wake_timeout_s=5.0, ready_timeout_s=0.3))
+
+    assert closed.code == 4504
+    assert "waking" in closed.reason
 
 
 def test_the_wake_and_the_boot_share_one_budget(fleet, monkeypatch):
@@ -177,13 +191,11 @@ def test_the_wake_and_the_boot_share_one_budget(fleet, monkeypatch):
     assert asked[0] <= 10.0 - 0.5
 
 
-def test_the_slowest_wake_still_leaves_time_to_boot():
-    assert door_app.MIN_READY_AFTER_WAKE_S > 0
-    assert WAKE_TIMEOUT_S + door_app.MIN_READY_AFTER_WAKE_S <= door_app.DEFAULT_READY_TIMEOUT_S
+def test_the_door_outwaits_a_machine_start_inside_its_own_budget():
     # `FlyBackend` waits this long for a machine to start; the door must outwait it.
     from flotta.backends.fly_backend import DEFAULT_WAIT_TIMEOUT_S
 
-    assert WAKE_TIMEOUT_S > DEFAULT_WAIT_TIMEOUT_S
+    assert DEFAULT_WAIT_TIMEOUT_S < WAKE_TIMEOUT_S <= door_app.DEFAULT_READY_TIMEOUT_S
 
 
 def _plane(handler):
@@ -226,5 +238,4 @@ def test_a_slow_answer_to_anything_but_a_wake_is_not_called_a_boot():
         asyncio.run(_plane(handler).resolve("eng-a"))
 
     assert raised.value.status == 504
-    assert "did not answer" in str(raised.value)
-    assert "still starting" not in str(raised.value)
+    assert str(raised.value) == "the control plane did not answer the resolve of 'eng-a' within 30s"
