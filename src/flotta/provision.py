@@ -101,6 +101,7 @@ from flotta.store import (
     reaches_fleet_github,
     validate_box_meta,
     validate_box_name,
+    validate_template,
     validate_tenant_id,
 )
 
@@ -1077,6 +1078,7 @@ def reserve_box(
     screen: bool = False,
     runtime: str = "hermes",
     image: str | None = None,
+    template: str | None = None,
 ) -> Box:
     """Write the row, and nothing else. Returns immediately.
 
@@ -1108,6 +1110,7 @@ def reserve_box(
     # refuses without spending the name — the same reason the name itself is
     # checked at the top of `store.create_box`.
     validate_box_meta(display_name, description, instructions)
+    template = validate_template(template)
     if model is not None:
         model = allowed_model(model, store)
     # What runs in it is written with the row, and the org's switch checked
@@ -1115,6 +1118,9 @@ def reserve_box(
     # no name is spent. Callers ran `check_custom_request` first, which is the
     # early answer for what only Hermes has.
     box = store.create_box(name, org=org, client=client, runtime=runtime, image=image)
+    if template is not None:
+        store.set_box_template(box.id, template)
+        box = store.get_box(box.id) or box
     store.add_event("box", box.id, "provisioning", {"name": box.name, "backend": backend.scheme})
     if display_name or description or instructions:
         store.set_box_meta(
@@ -1282,8 +1288,15 @@ def create_box(
     screen: bool = False,
     runtime: str = "hermes",
     image: str | None = None,
+    template: str | None = None,
+    rules: Rules | None = None,
+    by: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
+
+    `rules` are the agent's rules from its first conversation (FLOTTA-251),
+    written before the row says `running`: see `_write_rules_at_creation`.
+    `template` is the name of what it was made from, kept and nothing more.
 
     `runtime="custom"` with an `image` runs the agency's own image (M17.1): no
     Hermes, its model calls through the gateway only, and the door's secret
@@ -1384,6 +1397,11 @@ def create_box(
     # API answers immediately and provisions afterwards, without the row being
     # created twice or the name being taken between the two halves.
     if box is None:
+        if rules is not None and not rules.empty and runtime == "custom":
+            # Before the name is spent: its own image decides what it may do.
+            raise CustomRuntimeRefused(
+                f"{short} runs its own image; tool rules are for Hermes agents only"
+            )
         box = reserve_box(
             short,
             store=store,
@@ -1397,6 +1415,7 @@ def create_box(
             screen=screen,
             runtime=runtime,
             image=image,
+            template=template,
         )
 
     # Identity travels with the machine rather than arriving afterwards. The
@@ -1691,6 +1710,11 @@ def create_box(
         impl, handle.endpoint, assume="stopped" if started_error else "started"
     )
     if observed == "started":
+        # Its rules first, while the row still says `provisioning`: nothing can
+        # address an agent in that state, so nobody talks to it without them.
+        rules_written = _write_rules_at_creation(
+            box, handle.endpoint, rules, store=store, backend=impl, by=by
+        )
         # Booting from before the row says `running`, so nothing that sees it
         # running writes its config while its first boot may be editing it.
         _BOOTING.add(box.id)
@@ -1707,12 +1731,21 @@ def create_box(
             "endpoint": handle.endpoint,
             "machine_id": handle.id,
             "status": "running",
+            # Only said when rules were asked for: true when they are on the machine.
+            **({} if rules_written is None else {"rules_written": rules_written}),
         }
 
     # The machine exists but is not up. `stopped` is the true statement, and it
     # is recoverable — `flotta start` retries — where `torn_down` would discard
     # a machine that is sitting there costing disk.
     detail = started_error or f"machine is {observed!r} after create"
+    if rules is not None and not rules.empty:
+        store.add_event(
+            "box",
+            box.id,
+            "rules_write_failed",
+            {"detail": f"its machine did not start, so its rules were not written: {detail}"[:500]},
+        )
     store.update_box_status(box.id, "stopped", endpoint=handle.endpoint)
     store.add_event(
         "box",
@@ -1726,6 +1759,77 @@ def create_box(
         box_id=box.id,
         endpoint=handle.endpoint,
     )
+
+
+def _write_rules_at_creation(
+    box: Box,
+    endpoint: str,
+    rules: Rules | None,
+    *,
+    store: FleetStore,
+    backend: Backend,
+    by: str | None,
+) -> bool | None:
+    """An agent's rules, on its machine before anyone can reach it (FLOTTA-251).
+
+    `None` when none were asked for; otherwise whether they were written.
+
+    **Before the row says `running`.** `set_rules` needs a machine, so rules
+    could not be part of creating an agent: a save straight after `POST
+    /api/boxes` met a box with no endpoint and was refused. They are not held
+    back and written at the next wake, as MCP grants are, because a rule held
+    back is a rule not followed. So creation writes them itself, while the row
+    is still `provisioning`: no conversation, run or wake reaches an agent in
+    that state.
+
+    **After Hermes listens**, for the reason `_write_mcp_config_that_waited`
+    gives: its first boot is editing the same file until then. So an agent
+    made with rules is `provisioning` until Hermes is up, about as long as it
+    takes to be reachable anyway.
+
+    **A failure makes an agent with no rules, and says so.** Nothing is
+    recorded as its rules unless the write landed, so its Rules page shows none
+    and its timeline has `rules_write_failed`. It is still made: an agent
+    without the template's rules is one a person can give them to, and tearing
+    it down would spend a provision to say the same thing.
+    """
+    if rules is None or rules.empty:
+        return None
+    import json
+
+    try:
+        up, why = _wait_for_hermes_at(backend, endpoint)
+        if up is False:
+            detail: str | None = f"Hermes did not start: {why}"
+        else:
+            with _rules_lock(box.id):
+                result = backend.exec(endpoint, _config_command(config_changes(rules).to_json()))
+                if result.exit_code != 0:
+                    detail = (result.stderr or result.stdout or "").strip() or "no output"
+                else:
+                    detail = None
+                    store.set_box_rules(box.id, json.dumps(rules.to_json()))
+    except Exception as exc:  # noqa: BLE001 - never fail a creation over its rules
+        detail = str(exc) or type(exc).__name__
+    if detail is not None:
+        store.add_event("box", box.id, "rules_write_failed", {"detail": detail[:500], "by": by})
+        return False
+    store.add_event(
+        "box",
+        box.id,
+        RULES_CHANGED,
+        {
+            "always": len(rules.always),
+            "never": len(rules.never),
+            "careful": len(rules.careful),
+            "denied_commands": len(rules.denied_commands),
+            "disabled_tools": list(rules.disabled_tools),
+            "private_conversations": rules.private_conversations,
+            "by": by,
+            "reason": "created",
+        },
+    )
+    return True
 
 
 def _write_mcp_config_that_waited(box_id: str, *, store: FleetStore, backend: Backend) -> None:
@@ -2176,10 +2280,13 @@ def _wait_for_hermes(box: Box, backend: Backend | None) -> tuple[bool | None, st
     has no boot steps to wait out. Up to `mcp_reload.WAIT_S` on the box.
     """
     assert box.endpoint is not None
+    return _wait_for_hermes_at(_resolve_backend(box, backend), box.endpoint)
+
+
+def _wait_for_hermes_at(impl: Backend, endpoint: str) -> tuple[bool | None, str | None]:
+    """`_wait_for_hermes`, for a machine whose row has no endpoint yet."""
     try:
-        result = _resolve_backend(box, backend).exec(
-            box.endpoint, _mcp_reload_command(only_wait=True)
-        )
+        result = impl.exec(endpoint, _mcp_reload_command(only_wait=True))
     except NotSupported:
         return None, None
     except Exception as exc:  # noqa: BLE001 - best effort; the config stays pending

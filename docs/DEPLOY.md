@@ -304,6 +304,20 @@ That round trip is the entire thesis of the project in one command.
 then provisions on a background thread. Poll `GET /api/boxes/{id}` until it
 reaches `running`.
 
+**It may carry the agent's rules** (FLOTTA-251): `rules`, in the shape
+`PUT /api/boxes/{id}/rules` takes, refused with `422` before anything is made
+if they cannot be kept. The `202` then says `"rules": "writing"`, which an
+older Flotta that ignored the field does not. They are written on the machine
+once Hermes listens and before the row says `running`, so nobody reaches the
+agent without them; an agent made with rules is therefore `provisioning` a
+little longer. A write that fails makes an agent with no rules and a
+`rules_write_failed` event on its timeline: `GET /api/boxes/{id}/rules` has
+them only if they landed. A custom agent takes none.
+
+**And the name of the template it was made from** (FLOTTA-249): `template`, a
+short slug, kept on the box and answered with it. The control plane does not
+know what a template sets; that is the caller's.
+
 It used to hold the request open for the whole thing — an app, a volume, a
 machine and a boot — and the host's proxy (Railway's, then) gave up first:
 

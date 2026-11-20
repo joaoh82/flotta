@@ -4344,10 +4344,37 @@ def create_app(
         # typo here is an agent that answers every turn with "model not found".
         model = _checked_model(body.get("model"))
 
+        # What it was made from, and the rules it starts with (FLOTTA-249,
+        # FLOTTA-251). Both refused here, before a name or a provision is spent.
+        from flotta.rules import RulesError, parse_rules
+        from flotta.store import validate_template
+
+        try:
+            template = validate_template(body.get("template"))
+        except InvalidBoxMetaError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rules = None
+        if body.get("rules") is not None:
+            try:
+                rules = parse_rules(body["rules"])
+            except RulesError as exc:
+                raise HTTPException(status_code=422, detail=f"rules: {exc}") from exc
+            if rules.empty:
+                rules = None
+            elif runtime == "custom":
+                raise HTTPException(
+                    status_code=422,
+                    detail="rules are for Hermes agents only: its own image decides what it may do",
+                )
+        by = token.subject if token is not None else "operator"
+
         if background:
             return _create_in_background(
                 name,
                 token=token,
+                template=template,
+                rules=rules,
+                by=by,
                 org=org,
                 client=client,
                 label=label,
@@ -4381,6 +4408,9 @@ def create_app(
                     screen=screen,
                     runtime=runtime,
                     image=image,
+                    template=template,
+                    rules=rules,
+                    by=by,
                 )
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
@@ -4438,6 +4468,9 @@ def create_app(
         screen: bool = False,
         runtime: str = "hermes",
         image: str | None = None,
+        template: str | None = None,
+        rules: Any = None,
+        by: str | None = None,
     ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
@@ -4487,6 +4520,7 @@ def create_app(
                     screen=screen,
                     runtime=runtime,
                     image=image,
+                    template=template,
                 )
             except DuplicateBoxError as exc:
                 # A *live* box holds the name — a destroyed one no longer does,
@@ -4503,6 +4537,13 @@ def create_app(
             # for a poll, so it has to carry the display name or the agent
             # shows up under its address for five seconds.
             payload = {"box": _with_meta(store, box), "box_id": box.id, "status": box.status}
+            if rules is not None:
+                # Said so a caller can tell a Flotta that took its rules from an
+                # older one that ignored the field. They are written while the
+                # agent is being created, and are its rules only once it is up:
+                # `GET /api/boxes/{id}/rules` then has them, or its timeline
+                # has `rules_write_failed`.
+                payload["rules"] = "writing"
         finally:
             store.close()
 
@@ -4516,6 +4557,8 @@ def create_app(
                     volume_gb=volume_gb,
                     region=region,
                     memory_mb=memory_mb,
+                    rules=rules,
+                    by=by,
                 )
             except Exception as exc:  # noqa: BLE001
                 # `create_box` already records the failure against the row;

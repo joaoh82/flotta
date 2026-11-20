@@ -703,6 +703,9 @@ class Box:
     #: A custom agent's image, as the agency named it. `None` for Hermes, whose
     #: image is the fleet's and moves with its upgrades.
     image: str | None = None
+    #: The template it was made from, as whoever made it named it (FLOTTA-249).
+    #: A label and nothing more: nothing here knows what a template sets.
+    template: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1641,6 +1644,25 @@ INSTRUCTIONS_CHANGED = "instructions_changed"
 
 class InvalidBoxMetaError(ValueError):
     """A display name, description or instructions that cannot be stored."""
+
+
+_TEMPLATE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+
+
+def validate_template(raw: Any) -> str | None:
+    """The name of the template an agent was made from, or `None` for none.
+
+    A short slug, because it is shown and filtered on. The templates
+    themselves are the caller's (the web app's): the control plane keeps the
+    name it is given and does not know what a template sets.
+    """
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str) or not _TEMPLATE_ID.fullmatch(raw):
+        raise InvalidBoxMetaError(
+            "template is a short name in lower case letters, digits and hyphens"
+        )
+    return raw
 
 
 def validate_box_meta(
@@ -4105,6 +4127,13 @@ class FleetStore:
         org = self.get_org(org_id)
         assert org is not None
         return org
+
+    def set_box_template(self, box_id: str, template: str | None) -> None:
+        """Which template this agent was made from (FLOTTA-249). Said once, when it is made."""
+        self._get_box_or_raise(box_id)
+        self._conn.execute(
+            "UPDATE boxes SET template = ? WHERE id = ?", (validate_template(template), box_id)
+        )
 
     def set_box_screen(self, box_id: str, screen: bool) -> None:
         """Whether this agent has a screen (FLOTTA-208). Only the switch: the
@@ -8233,6 +8262,8 @@ def _box_from_row(row: db.Row) -> Box:
         # Before 42, every agent is Hermes on the fleet's image.
         runtime=row.get("runtime") or "hermes",
         image=row.get("image"),
+        # Before 43, no agent says what it was made from.
+        template=row.get("template"),
     )
 
 
