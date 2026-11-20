@@ -1958,6 +1958,88 @@ def test_the_gateway_refuses_what_it_cannot_do_safely(tmp_path, monkeypatch, arg
 
 
 @pytest.mark.parametrize(
+    ("args", "env", "said"),
+    [
+        (
+            ["--fake-upstream", "--host", "0.0.0.0"],
+            {"FLOTTA_CONTROL_ALLOW_INSECURE_BIND": "1"},
+            "bind 127.0.0.1",
+        ),
+        (["--fake-upstream"], {"FLOTTA_DATABASE_URL": "postgresql://real/fleet"}, "made-up spend"),
+    ],
+)
+def test_the_control_plane_refuses_a_stand_in_model_where_it_is_not_safe(
+    tmp_path, monkeypatch, args, env, said
+):
+    """FLOTTA-250: the Architect's stand-in answers anyone and writes made-up spend."""
+    from typer.testing import CliRunner
+
+    from flotta import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_BACKEND", "local")
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "k")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: pytest.fail("it must not start"))
+
+    result = CliRunner().invoke(cli.app, ["serve", *args])
+
+    assert result.exit_code == 2, result.output
+    assert said in result.output
+
+
+def test_a_local_control_plane_answers_the_architect_from_a_stand_in(tmp_path, monkeypatch):
+    """`just local` starts it this way, so the Architect can be tried for nothing:
+    a signed-in person's question gets an answer, and what it cost is written."""
+    from fastapi.testclient import TestClient
+    from typer.testing import CliRunner
+
+    from flotta import cli
+    from flotta.architect import KEY_ENV
+    from flotta.gateway.fake import FAKE_MODEL
+    from flotta.store import FleetStore
+
+    db = tmp_path / "fleet.db"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FLOTTA_BACKEND", "local")
+    monkeypatch.setenv("FLOTTA_STORE", str(db))
+    monkeypatch.setenv("FLOTTA_SIGNING_KEY", "a-signing-key-for-this-test")
+    # Set here so they are put back afterwards: the command writes them itself.
+    for name in (KEY_ENV, "FLOTTA_MODEL_BASE_URL", "FLOTTA_ARCHITECT_MODEL", "FLOTTA_EUR_PER_USD"):
+        monkeypatch.setenv(name, "")
+    monkeypatch.delenv("FLOTTA_EUR_PER_USD")
+    started: list = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: started.append(app))
+
+    result = CliRunner().invoke(cli.app, ["serve", "--fake-upstream"])
+
+    assert result.exit_code == 0, result.output
+    with FleetStore(db) as store:
+        store.create_org("demo", "Demo")
+        user = store.create_user("ana@example.com")
+        store.add_membership(user.id, "demo", "owner")
+        session = store.create_session(user.id, "demo")
+    ask = {
+        "messages": [{"role": "user", "content": "list clients"}],
+        "tools": [{"type": "function", "function": {"name": "list_clients", "parameters": {}}}],
+    }
+    with TestClient(started[0]) as api:
+        answer = api.post(
+            "/api/architect/completions", json=ask, headers={"Authorization": f"Session {session}"}
+        )
+
+    assert answer.status_code == 200, answer.text
+    # The stand-in calls a tool the message names, as a model would.
+    called = answer.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+    assert called == "list_clients"
+    with FleetStore(db) as store:
+        row = store._conn.execute("SELECT model, cost_eur_nano FROM architect_usage").fetchone()
+    assert row["model"] == FAKE_MODEL
+    assert row["cost_eur_nano"] is not None and row["cost_eur_nano"] > 0
+
+
+@pytest.mark.parametrize(
     ("base_url", "has_prices"),
     [("https://openrouter.ai/api/v1", True), ("https://other.example/v1", False)],
 )
