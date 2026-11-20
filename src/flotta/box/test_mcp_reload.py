@@ -211,9 +211,12 @@ def test_waiting_gives_up_when_hermes_never_listens():
 def test_only_waiting_reloads_nothing(monkeypatch, capsys):
     """Asked before a new agent's first config is written: there is nothing to reload yet."""
     monkeypatch.setattr(mcp_reload, "_environment", lambda: {})
-    monkeypatch.setattr(mcp_reload, "listening", lambda env, wait_s: True)
+    waited = []
+    monkeypatch.setattr(mcp_reload, "listening", lambda env, wait_s: waited.append(wait_s) or True)
     monkeypatch.setattr(mcp_reload, "reload", lambda *a, **k: pytest.fail("it reloaded"))
     assert mcp_reload.main([mcp_reload.ONLY_WAIT_FLAG]) == 0
+    # One short ask: Fly ends a command after about 30 seconds, so the caller asks again.
+    assert waited == [mcp_reload.ONLY_WAIT_S] and mcp_reload.ONLY_WAIT_S < 30 < mcp_reload.WAIT_S
     monkeypatch.setattr(mcp_reload, "listening", lambda env, wait_s: False)
     assert mcp_reload.main([mcp_reload.ONLY_WAIT_FLAG]) == 1
     assert "not listening" in capsys.readouterr().err

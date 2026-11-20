@@ -2283,17 +2283,42 @@ def _wait_for_hermes(box: Box, backend: Backend | None) -> tuple[bool | None, st
     return _wait_for_hermes_at(_resolve_backend(box, backend), box.endpoint)
 
 
+#: How long creation waits for a new agent's Hermes to listen, in all. A first
+#: boot on Fly took under a minute on staging; this is for a slow one.
+HERMES_BOOT_S = 240.0
+
+
 def _wait_for_hermes_at(impl: Backend, endpoint: str) -> tuple[bool | None, str | None]:
-    """`_wait_for_hermes`, for a machine whose row has no endpoint yet."""
-    try:
-        result = impl.exec(endpoint, _mcp_reload_command(only_wait=True))
-    except NotSupported:
-        return None, None
-    except Exception as exc:  # noqa: BLE001 - best effort; the config stays pending
-        return False, str(exc) or type(exc).__name__
-    if result.exit_code != 0:
-        return False, (result.stderr or result.stdout or "").strip() or "no output"
-    return True, None
+    """`_wait_for_hermes`, for a machine whose row has no endpoint yet.
+
+    **Asked in short steps, until `HERMES_BOOT_S` has passed.** Fly ends a
+    command on a machine after about 30 seconds, so one long wait was cut off
+    on every real first boot, and the agent was made without its rules (seen
+    on staging, 2026-11-20: `deadline_exceeded`). Each ask waits
+    `mcp_reload.ONLY_WAIT_S` on the machine. An ask that fails outright, as one
+    does while the machine is still coming up, is asked again like one that
+    answered "not yet".
+    """
+    deadline = time.monotonic() + HERMES_BOOT_S
+    while True:
+        try:
+            result = impl.exec(endpoint, _mcp_reload_command(only_wait=True))
+        except NotSupported:
+            return None, None
+        except Exception as exc:  # noqa: BLE001 - asked again until the time is up
+            why = str(exc) or type(exc).__name__
+        else:
+            if result.exit_code == 0:
+                return True, None
+            why = (result.stderr or result.stdout or "").strip() or "no output"
+        if time.monotonic() >= deadline:
+            return False, why
+        time.sleep(HERMES_ASK_EVERY_S)
+
+
+#: The pause between two asks. An ask that answered "not yet" has already
+#: waited on the machine; this is for one that failed at once.
+HERMES_ASK_EVERY_S = 2.0
 
 
 def _reload_mcp(
