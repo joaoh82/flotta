@@ -1,0 +1,83 @@
+# The MIT adapters, published to PyPI (M17 follow-up).
+#
+# An agency's own agent installs `flotta-langgraph` (or `flotta-agent`) from
+# PyPI, so its Dockerfile is its own few lines rather than a build from this
+# repository. Released by pushing a tag naming the package and the version its
+# pyproject.toml says: `flotta-agent-v0.1.0`, then `flotta-langgraph-v0.1.0`
+# (it depends on the first, so the first goes first).
+#
+# Trusted publishing: PyPI accepts this workflow's OIDC identity, so no PyPI
+# token exists anywhere. Each project needs a (pending) publisher on pypi.org
+# naming this repository, this workflow file and the `pypi` environment, set
+# up once by the account's owner.
+
+name: Publish adapters
+
+on:
+  push:
+    tags:
+      - "flotta-agent-v*"
+      - "flotta-langgraph-v*"
+
+concurrency:
+  group: adapters-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: test, build and publish the package the tag names
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Which package, and does its version match the tag
+        id: which
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            flotta-agent-v*) dir=adapters/flotta-python ;;
+            flotta-langgraph-v*) dir=adapters/flotta-langgraph ;;
+            *) echo "::error::$tag names no adapter"; exit 1 ;;
+          esac
+          version="${tag##*-v}"
+          declared=$(python3 -c "import tomllib; print(tomllib.load(open('$dir/pyproject.toml','rb'))['project']['version'])")
+          [ "$version" = "$declared" ] || { echo "::error::tag says $version, $dir/pyproject.toml says $declared"; exit 1; }
+          # Only what main has: a release is merged, reviewed code.
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$tag is not on main; merge first, then tag"; exit 1; }
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv (and Python 3.11)
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+
+      # Built without the repository's path sources, as PyPI's users will build it.
+      - name: Build
+        working-directory: ${{ steps.which.outputs.dir }}
+        run: uv build --no-sources -o "$GITHUB_WORKSPACE/dist"
+
+      # Its tests against the wheel just built, installed with its dependencies
+      # from PyPI: flotta-langgraph is tested against the flotta-agent its users
+      # get, never against unreleased source next to it in this repository.
+      - name: Test the built wheel
+        working-directory: ${{ steps.which.outputs.dir }}
+        run: |
+          set -euo pipefail
+          uv venv "$RUNNER_TEMP/release"
+          VIRTUAL_ENV="$RUNNER_TEMP/release" uv pip install "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)[openai]" pytest httpx langchain-openai
+          "$RUNNER_TEMP/release/bin/python" -m pytest -q -p no:cacheprovider tests
+
+      # Pinned to a commit: this step holds the PyPI publishing identity.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

@@ -11,6 +11,17 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+keywords = ["agents", "flotta", "agent"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Framework :: AsyncIO",
+]
+
+[project.urls]
+Homepage = "https://flotta.dev"
+Repository = "https://github.com/joaoh82/flotta"
+Documentation = "https://github.com/joaoh82/flotta/blob/main/docs/CONTRACT.md"
+
 [project.optional-dependencies]
 openai = ["openai>=1.40"]
 
