@@ -109,6 +109,8 @@ OPERATOR_ROUTES = frozenset(
         # What every agency's new agents start with (FLOTTA-269).
         "put_agent_template",
         "delete_agent_template",
+        # What every agency's Architect has cost the fleet (FLOTTA-250).
+        "architect_spend",
     }
 )
 

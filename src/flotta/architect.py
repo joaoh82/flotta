@@ -5,6 +5,14 @@ answers questions about the account by calling the fleet API's tools (`POST
 /mcp`). Its loop runs in the web app's server. What it needs from here is one
 thing, a model to think with, and this module is the rules for that.
 
+**The control plane makes the call, with a key of its own.** The model gateway
+holds the fleet's provider key and is the meter for agents, but it is reachable
+only from agents' machines, and a web app's server is not one. So
+`POST /api/architect/completions` calls the provider itself with
+`$FLOTTA_ARCHITECT_API_KEY`: a key for this and nothing else, which the
+operator can cap at the provider as a second limit beside the allowance. It is
+sent and metered by the gateway's own code (`gateway.app.send_metered`).
+
 **The fleet pays, up to an allowance.** Each org may use
 `FLOTTA_ARCHITECT_MONTHLY_EUR` of these calls in a calendar month (UTC). They
 are recorded in `architect_usage`, never in `usage`: an agency's budgets and its
@@ -20,8 +28,6 @@ those cost.
 **The caller does not choose the model.** It is the operator's setting, or the
 fleet's model for new agents when that is empty.
 
-Shared by the gateway, which makes the calls, and the control plane, which
-tells an agency where its allowance stands.
 """
 
 from __future__ import annotations
@@ -41,7 +47,11 @@ from flotta.settings import architect_monthly_eur_nano, layered
 #: made to cost what the allowance is meant to bound across a month.
 MAX_OUTPUT = 4096
 
-#: What a call may carry. Anything else is refused: the gateway calls one model
+#: The provider key the Architect's calls are made with. The environment's, and
+#: never a setting: a setting can be read back over HTTP.
+KEY_ENV = "FLOTTA_ARCHITECT_API_KEY"
+
+#: What a call may carry. Anything else is refused: the route calls one model
 #: with the messages and tools it is given, and adds nothing to them.
 FIELDS = frozenset(
     {
@@ -152,14 +162,12 @@ class Refusal:
     standing: Standing | None = None
 
     def body(self) -> dict[str, Any]:
-        error: dict[str, Any] = {
-            "message": self.message,
-            "type": "flotta_architect",
-            "code": self.code,
-        }
+        """As the control plane answers a refusal: `detail` in words, `code`
+        for a front end to tell them apart, and where the allowance stands."""
+        body: dict[str, Any] = {"detail": self.message, "code": self.code}
         if self.standing is not None:
-            error["allowance"] = self.standing.as_dict()
-        return {"error": error}
+            body["allowance"] = self.standing.as_dict()
+        return body
 
 
 def unchecked() -> Refusal:

@@ -736,6 +736,10 @@ def create_app(
     #: Judges a request before its agent starts (FLOTTA-173): `judge.judge`'s
     #: signature. Injected for the reason `reachable` is; `None` asks Jev.
     judge_request: Any = None,
+    #: Reaches the model provider for the Architect's calls (FLOTTA-250).
+    #: Injected for the reason `reachable` is: an `httpx.AsyncBaseTransport`;
+    #: `None` is the network. Nothing is sent without `$FLOTTA_ARCHITECT_API_KEY`.
+    architect_transport: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -1343,6 +1347,11 @@ def create_app(
         try:
             yield
         finally:
+            if "client" in architect_state:
+                # The Architect's calls (FLOTTA-250): what is still being written, then the client.
+                await architect_state["client"].aclose()
+                await architect_state["ledger"].drain()
+                architect_state["ledger"].close()
             if runs is not None:
                 runs.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -9824,55 +9833,147 @@ def create_app(
         assert token is not None
         return subject[len(USER_SUBJECT_PREFIX) :], token.org or DEFAULT_ORG
 
-    @app.post("/api/architect/ticket", status_code=201)
-    def architect_ticket(token: Token | None = needs_write) -> Any:
-        """A ticket for the Architect's model calls, for the web app's server.
+    architect_state: dict[str, Any] = {}
 
-        Good for minutes, at the gateway's Architect route and nowhere else
-        (`flotta.auth.mint_architect_ticket`): one question may take several
-        calls, so a front end asks for one per question. `url` is where the
-        calls go and `model` what answers them, which is the operator's choice.
-        `allowance` is where the agency's month stands; the gateway checks it
-        again before every call, so a ticket is given even when it is used up
-        and the front end says so without spending a call to find out.
-
-        For the agency's people who can change things: an owner or a builder.
-        Not a client's people, and not while viewing an agency as its owner.
-        """
-        from flotta import architect
-        from flotta.auth import ARCHITECT_TICKET_TTL_S, mint_architect_ticket
-        from flotta.provision import gateway_url
-
-        user_id, org_id = _architect_person(token)
-        gateway = gateway_url()
-        if key is None or gateway is None:
-            raise HTTPException(
-                status_code=503,
-                detail="this fleet has no model gateway, so it has no Architect",
-            )
+    def _architect_row(**row: Any) -> None:
         store = store_factory()
         try:
-            org = store.get_org(org_id)
-            if org is None or org.status != "active":
-                raise HTTPException(
-                    status_code=403,
-                    detail="the Architect is for an agency that is active: this one isn't",
-                )
-            model = architect.model_for(store)
-            where = architect.standing(store, org_id, now=datetime.now(UTC))
+            store.record_architect_usage(**row)
         finally:
             store.close()
-        if model is None:
+
+    @app.post("/api/architect/completions")
+    async def architect_completions(request: Request, token: Token | None = needs_write) -> Any:
+        """One model call for the Architect: an OpenAI chat completion, streamed
+        or whole, with the conversation's `messages` and the `tools` it may call.
+
+        For the web app's server, acting for a signed-in person of an agency who
+        can change things: an owner or a builder. Not a client's people, and not
+        while viewing an agency as its owner.
+
+        - **The model is the operator's** (`FLOTTA_ARCHITECT_MODEL`, else the
+          model for new agents), whatever the body names, and an answer is at
+          most `architect.MAX_OUTPUT` tokens.
+        - **The fleet pays, on an allowance.** The call is made with
+          `$FLOTTA_ARCHITECT_API_KEY`, and the org's month is checked before
+          anything is sent: used up is a 402 with `code` and `allowance`, and so
+          is anything that would leave the call uncounted.
+        - **What it cost is written to `architect_usage`**, never to `usage`,
+          which is what the agency's budgets and invoice add up.
+        """
+        import json as jsonlib
+        import os
+        import uuid
+
+        import httpx
+        from fastapi.responses import JSONResponse
+
+        from flotta import architect
+        from flotta.gateway import app as gateway
+        from flotta.inference import is_openrouter
+
+        user_id, org_id = _architect_person(token)
+        provider_key = (os.environ.get(architect.KEY_ENV) or "").strip()
+        base_url = (os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip().rstrip("/")
+        if not provider_key or not base_url:
             raise HTTPException(
-                status_code=503, detail="the fleet's operator has chosen no model for the Architect"
+                status_code=503,
+                detail="the fleet's operator has not set the Architect up: it has no model key",
             )
-        return {
-            "ticket": mint_architect_ticket(user_id=user_id, org=org_id, key=key),
-            "ttl_s": ARCHITECT_TICKET_TTL_S,
-            "url": f"{gateway}/architect/chat/completions",
-            "model": model,
-            "allowance": where.as_dict(),
-        }
+        started = time.monotonic()
+        try:
+            payload = jsonlib.loads(await request.body(), object_pairs_hook=gateway._no_repeats)
+            architect.shaped(payload, "unchosen")
+        except architect.BadCall as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="expected a JSON body, with no repeated keys"
+            ) from exc
+        refused = gateway._refused_field(payload)
+        if refused is not None:
+            raise HTTPException(
+                status_code=400, detail=f"the Architect's route adds nothing to a call: {refused!r}"
+            )
+        reported = is_openrouter(base_url)
+
+        def verdict_of() -> Any:
+            store = store_factory()
+            try:
+                return architect.admit(
+                    store, org_id, now=datetime.now(UTC), cost_is_reported=reported
+                )
+            finally:
+                store.close()
+
+        try:
+            verdict = await asyncio.to_thread(verdict_of)
+        except Exception:
+            _log.exception("the Architect's allowance could not be checked")
+            verdict = architect.unchecked()
+        if isinstance(verdict, architect.Refusal):
+            return JSONResponse(verdict.body(), status_code=verdict.status)
+
+        sent = architect.shaped(payload, verdict.model)
+        raw = jsonlib.dumps(sent).encode()
+        call = uuid.uuid4().hex
+        if "client" not in architect_state:
+            architect_state["client"] = httpx.AsyncClient(
+                transport=architect_transport, timeout=gateway._TIMEOUT, trust_env=False
+            )
+            architect_state["ledger"] = gateway._Ledger(_architect_row)
+
+        def write(status: int, *, usage: Any = None, chars: int | None = None) -> None:
+            counted = gateway._reported(usage)
+            if counted is not None:
+                tokens = counted
+            elif chars is None:
+                tokens = (0, 0, 0)
+            else:
+                tokens = (
+                    gateway._estimated_tokens(len(raw)),
+                    gateway._estimated_tokens(chars),
+                    0,
+                )
+            _log.info(
+                "architect call for %s: %s, %d in, %d out, %d ms",
+                org_id,
+                status,
+                tokens[0],
+                tokens[1],
+                int((time.monotonic() - started) * 1000),
+            )
+            architect_state["ledger"].write(
+                org=org_id,
+                user_id=user_id,
+                model=verdict.model,
+                upstream="openrouter" if reported else "custom",
+                tokens_in=tokens[0],
+                tokens_out=tokens[1],
+                tokens_cached=tokens[2],
+                idempotency_key=call,
+                eur_per_usd=verdict.eur_per_usd,
+                status=status,
+                estimated=counted is None and chars is not None,
+                # Only OpenRouter's: nothing says what another endpoint's field means.
+                reported_cost_nano=gateway._reported_cost(usage) if reported else None,
+                now=datetime.now(UTC),
+            )
+
+        return await gateway.send_metered(
+            architect_state["client"],
+            url=f"{base_url}/chat/completions",
+            headers={
+                "authorization": f"Bearer {provider_key}",
+                "content-type": "application/json",
+                # Usage is read out of the body, so it has to arrive readable.
+                "accept-encoding": "identity",
+            },
+            payload=sent,
+            raw=raw,
+            key=provider_key,
+            write=write,
+        )
 
     @app.get("/api/architect/allowance")
     def architect_allowance(token: Token | None = needs_read) -> Any:
