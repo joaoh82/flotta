@@ -216,6 +216,31 @@ def test_a_tool_answers_what_the_route_answers_for_that_person(fleet):  # noqa: 
     assert names(mine) == [X] and names(theirs) == [Y]
 
 
+def test_what_the_agencys_agents_are_doing_now_is_one_tool_away(fleet):  # noqa: F811
+    """FLOTTA-250's two missing reads, as tools: the agency's runs in one list,
+    and the work under way, for every agent or the one named."""
+    from flotta.store import FleetStore
+
+    with FleetStore(fleet) as store:
+        mine = store.get_box_by_name(X)
+        run = store.create_run(mine.id, "Chase the unpaid invoices", trigger_kind="api")
+        store.start_run(run.id)
+        theirs = store.create_run(store.get_box_by_name(Y).id, "Theirs", trigger_kind="api")
+        store.start_run(theirs.id)
+    with _api(fleet) as api:
+        runs = _data(_call(api, "list_runs", {"status": "pending,running"}))
+        working = _data(_call(api, "list_working"))
+        one = _data(_call(api, "list_working", {"agent": X}))
+        another = _refused(_call(api, "list_working", {"agent": Y}))
+        direct = api.get("/api/working", headers=OWNER).json()
+    assert [r["id"] for r in runs["runs"]] == [run.id]
+    assert working == direct == one
+    assert [(w["box"], w["about"]) for w in working["working"]] == [
+        (X, "Chase the unpaid invoices")
+    ]
+    assert "no box" in another.lower() or "not found" in another.lower(), another
+
+
 def test_another_agencys_agent_is_not_there(fleet):  # noqa: F811
     with _api(fleet) as api:
         said = _refused(_call(api, "get_agent", {"agent": Y}))

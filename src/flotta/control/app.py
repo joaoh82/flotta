@@ -7315,6 +7315,96 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/runs")
+    def list_org_runs(
+        limit: int = 50,
+        since: str | None = None,
+        status: str | None = None,
+        token: Token | None = needs_read,
+    ) -> Any:
+        """The caller's agency's runs, across its clients and agents, newest
+        first, each with what it cost (FLOTTA-250); `?since=` and `?status=` as
+        an agent's and a client's lists take them, so `?status=pending,running`
+        is the work under way and waiting. For someone confined to a client,
+        that client's runs and no other's."""
+        org = (token.org if token else None) or DEFAULT_ORG
+        client = token.client if token is not None else None
+        viewer = _run_reader(token, portal=True)
+        after = _runs_since(since)
+        statuses = _runs_status(status)
+        store = store_factory()
+        try:
+            runs = store.list_runs(
+                org=org,
+                client=client,
+                since=after,
+                statuses=statuses,
+                limit=min(limit, 200),
+                exclude_kinds=VIEWER_HIDDEN_KINDS if viewer else (),
+            )
+            costs = store.run_costs(runs)
+            shown = viewer and client is not None and store.client_spend_shown(org, client)
+            return {
+                "runs": [_run_view(r, costs[r.id], viewer=viewer, spend_shown=shown) for r in runs]
+            }
+        finally:
+            store.close()
+
+    def _run_about(store: Any, run: Any) -> str:
+        """A run in a line: its request's title, else the first line it was given."""
+        about = ""
+        if run.trigger_kind == "request" and run.trigger_id:
+            request = store.box_request(run.box_id, run.trigger_id)
+            about = request.title if request is not None else ""
+        if not about:
+            lines = (line.strip() for line in run.prompt.splitlines())
+            about = next((line for line in lines if line), "")
+        return about[:160]
+
+    @app.get("/api/working")
+    def list_working(box: str | None = None, token: Token | None = needs_read) -> Any:
+        """What each of the caller's agents is doing now (FLOTTA-250): one entry
+        per agent with a run under way, `?box=` for one agent. An agent not
+        listed is doing nothing: asleep, or awake and idle.
+
+        A conversation's turn is said to be one and no more: what was said in
+        it is on the agent's machine and is not this route's to repeat. A
+        client's viewer (D29) is told of no conversation, and never what the
+        agency asked for, as in the runs they read."""
+        org = (token.org if token else None) or DEFAULT_ORG
+        client = token.client if token is not None else None
+        viewer = _run_reader(token, portal=True)
+        store = store_factory()
+        try:
+            one = _scoped_box(store, token, box) if box is not None else None
+            names = {b.id: b.name for b in _scoped_boxes(store, token)}
+            runs = store.list_runs(
+                org=org,
+                client=client,
+                box=one.id if one is not None else None,
+                statuses=("running",),
+                limit=500,
+                exclude_kinds=VIEWER_HIDDEN_KINDS if viewer else (),
+            )
+            return {
+                "working": [
+                    {
+                        "box_id": run.box_id,
+                        "box": names.get(run.box_id),
+                        "client": run.client,
+                        "run_id": run.id,
+                        "trigger_kind": run.trigger_kind,
+                        "about": None
+                        if viewer
+                        else ("" if run.trigger_kind == "chat" else _run_about(store, run)),
+                        "started_at": run.started_at,
+                    }
+                    for run in runs
+                ]
+            }
+        finally:
+            store.close()
+
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str, token: Token | None = needs_run_read) -> Any:
         """One run: what started it, what it was given, its steps, its reply and its cost."""
@@ -9251,18 +9341,11 @@ def create_app(
             run = store.live_run(box.id)
             if run is None or run.trigger_kind == "chat":
                 return {"working": None}
-            about = ""
-            if run.trigger_kind == "request" and run.trigger_id:
-                request = store.box_request(box.id, run.trigger_id)
-                about = request.title if request is not None else ""
-            if not about:
-                lines = (line.strip() for line in run.prompt.splitlines())
-                about = next((line for line in lines if line), "")
             return {
                 "working": {
                     "run_id": run.id,
                     "trigger_kind": run.trigger_kind,
-                    "about": about[:160],
+                    "about": _run_about(store, run),
                 }
             }
         finally:

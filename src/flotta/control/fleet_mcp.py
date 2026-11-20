@@ -213,6 +213,36 @@ TOOLS: tuple[Tool, ...] = (
         query={"limit": "limit", "since": "since", "status": "status"},
     ),
     Tool(
+        "list_runs",
+        "The agency's runs",
+        "The pieces of work every agent in the agency was given, across its clients, newest "
+        "first: which agent and client, what started each, its status, and what it cost. Use "
+        "status pending,running for the work under way and waiting, or failed,budget_blocked "
+        "for what went wrong. Agents are named by id here; list_agents has their names.",
+        "/api/runs",
+        args={
+            "limit": _LIMIT,
+            "since": {"type": "string", "description": f"Only runs since then. {_DAY}"},
+            "status": {
+                "type": "string",
+                "description": "Only runs with one of these statuses, separated by commas: "
+                "pending, running, done, failed, cancelled, budget_blocked.",
+            },
+        },
+        query={"limit": "limit", "since": "since", "status": "status"},
+    ),
+    Tool(
+        "list_working",
+        "What agents are doing now",
+        "The agents with a piece of work under way at this moment, each with a line on what it "
+        "is about and when it started. An agent that is not listed is doing nothing: asleep, or "
+        "awake and idle. A conversation is listed as one, with nothing of what was said. Name "
+        "an agent to ask about that one alone.",
+        "/api/working",
+        args={"agent": _AGENT},
+        query={"agent": "box"},
+    ),
+    Tool(
         "get_run",
         "One run",
         "One piece of work: its prompt, status, reply, cost and what it used.",
