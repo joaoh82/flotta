@@ -193,7 +193,7 @@ def test_a_credential_made_for_one_job_does_not_get_in(fleet):  # noqa: F811
     from flotta.auth import SCOPE_ORG_GOVERN, mint
     from flotta.control.test_size_api import KEY
 
-    token = mint(scopes={SCOPE_ORG_GOVERN}, key=KEY, subject="billing", org="agency-x")
+    token = mint(scopes={SCOPE_ORG_GOVERN}, key=KEY, subject="billing")
     headers = {"Authorization": f"Bearer {token}"}
     with _api(fleet) as api:
         for method in ("initialize", "tools/list"):
