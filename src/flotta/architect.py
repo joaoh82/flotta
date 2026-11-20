@@ -73,6 +73,71 @@ class BadCall(ValueError):
     """A body the Architect's route will not send on, with why."""
 
 
+# -- a person's chats ---------------------------------------------------------------
+#
+# The control plane keeps each person's conversations with the Architect, so
+# they are there on another machine and the front end needs no database of its
+# own. It keeps what it is given and reads none of it: a message's `content` is
+# JSON the front end wrote, whatever it needs to show the turn again and carry
+# the conversation on. A chat is its person's alone.
+
+#: Characters a chat's title may be.
+TITLE_MAX = 120
+#: Characters one message may be, as JSON. A tool's answer is the long case,
+#: and `control.fleet_mcp` already cuts one off before this.
+MESSAGE_MAX = 200_000
+#: Messages added in one request: a turn is a question, some tool calls and an answer.
+MESSAGES_AT_ONCE = 100
+#: Messages one chat holds. Past this it is a new chat: a model is sent the
+#: whole conversation each time, and one this long costs more than it is worth.
+MESSAGES_PER_CHAT = 500
+#: Chats one person keeps in one org.
+CHATS_PER_PERSON = 500
+#: Who a message is from, as a chat completion names them.
+ROLES = ("user", "assistant", "tool")
+
+
+class BadChat(ValueError):
+    """A title or messages that will not be kept, with why."""
+
+
+def chat_title(raw: Any) -> str:
+    """A chat's title, tidied to one line. Empty is a chat not named yet."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise BadChat("a chat's title is text")
+    title = " ".join(raw.split())
+    if len(title) > TITLE_MAX:
+        raise BadChat(f"a chat's title is at most {TITLE_MAX} characters")
+    return title
+
+
+def chat_messages(raw: Any) -> list[tuple[str, str]]:
+    """Messages to add to a chat, as `(role, content as JSON)`, or `BadChat`.
+
+    Each is `{"role": ..., "content": <any JSON>}`. What `content` holds is the
+    front end's business; only its size is this module's.
+    """
+    import json
+
+    if not isinstance(raw, list) or not raw:
+        raise BadChat('expected {"messages": [{"role": ..., "content": ...}, ...]}')
+    if len(raw) > MESSAGES_AT_ONCE:
+        raise BadChat(f"at most {MESSAGES_AT_ONCE} messages are added at once")
+    out: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"role", "content"}:
+            raise BadChat('each message is {"role": ..., "content": ...}')
+        if item["role"] not in ROLES:
+            raise BadChat(f"a message's role is one of: {', '.join(ROLES)}")
+        content = json.dumps(item["content"], ensure_ascii=False, separators=(",", ":"))
+        if len(content) > MESSAGE_MAX:
+            raise BadChat(f"a message is at most {MESSAGE_MAX} characters")
+        out.append((item["role"], content))
+    return out
+
+
 def model_for(store: Any, env: Mapping[str, str] | None = None) -> str | None:
     """The model the Architect answers with, or `None` when the fleet has none."""
     settings = layered(store, env)

@@ -10028,6 +10028,151 @@ def create_app(
             ],
         }
 
+    # A person's chats with the Architect (FLOTTA-250): theirs alone. Nobody else
+    # in the agency reads one, the operator included, and a session viewing an
+    # agency keeps none: it holds no `fleet:write`, which every one of these asks.
+
+    def _architect_chat_view(chat: Any, messages: Any = None) -> dict[str, Any]:
+        import json as jsonlib
+
+        view: dict[str, Any] = {
+            "id": chat.id,
+            "title": chat.title,
+            "created_at": chat.created_at,
+            "updated_at": chat.updated_at,
+        }
+        if messages is not None:
+            view["messages"] = [
+                {
+                    "id": m.id,
+                    "seq": m.seq,
+                    "role": m.role,
+                    "content": jsonlib.loads(m.content),
+                    "created_at": m.created_at,
+                }
+                for m in messages
+            ]
+        return view
+
+    @app.get("/api/architect/chats")
+    def list_architect_chats(
+        q: str | None = None, limit: int = 50, token: Token | None = needs_write
+    ) -> Any:
+        """The caller's own chats with the Architect in this agency, the one last
+        added to first; `?q=` those whose title holds it. Never their messages."""
+        user_id, org_id = _architect_person(token)
+        store = store_factory()
+        try:
+            chats = store.architect_chats(
+                org_id, user_id, q=(q or "").strip() or None, limit=min(max(limit, 1), 200)
+            )
+        finally:
+            store.close()
+        return {"chats": [_architect_chat_view(c) for c in chats]}
+
+    @app.post("/api/architect/chats", status_code=201)
+    def create_architect_chat(body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """Start a chat: `{"title"?: "..."}`. Empty until messages are added."""
+        from flotta import architect
+        from flotta.store import ArchitectChatFullError
+
+        user_id, org_id = _architect_person(token)
+        if not isinstance(body, dict) or set(body) - {"title"}:
+            raise HTTPException(status_code=422, detail='expected {"title"?: "..."}')
+        try:
+            title = architect.chat_title(body.get("title"))
+        except architect.BadChat as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            chat = store.create_architect_chat(
+                org_id, user_id, title, limit=architect.CHATS_PER_PERSON
+            )
+        except ArchitectChatFullError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return _architect_chat_view(chat, [])
+
+    @app.get("/api/architect/chats/{chat_id}")
+    def get_architect_chat(chat_id: str, token: Token | None = needs_write) -> Any:
+        """One of the caller's chats, with everything said in it, in order."""
+        user_id, org_id = _architect_person(token)
+        store = store_factory()
+        try:
+            chat = store.architect_chat(org_id, user_id, chat_id)
+            if chat is None:
+                raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}")
+            return _architect_chat_view(chat, store.architect_messages(chat.id))
+        finally:
+            store.close()
+
+    @app.patch("/api/architect/chats/{chat_id}")
+    def rename_architect_chat(
+        chat_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Name one of the caller's chats: `{"title": "..."}`."""
+        from flotta import architect
+
+        user_id, org_id = _architect_person(token)
+        if not isinstance(body, dict) or set(body) != {"title"}:
+            raise HTTPException(status_code=422, detail='expected {"title": "..."}')
+        try:
+            title = architect.chat_title(body["title"])
+        except architect.BadChat as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            if not store.rename_architect_chat(org_id, user_id, chat_id, title):
+                raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}")
+            chat = store.architect_chat(org_id, user_id, chat_id)
+        finally:
+            store.close()
+        return _architect_chat_view(chat)
+
+    @app.post("/api/architect/chats/{chat_id}/messages", status_code=201)
+    def add_architect_messages(
+        chat_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Add a turn to one of the caller's chats: `{"messages": [{"role",
+        "content"}, ...]}`, all or none. `content` is any JSON and is kept as
+        given: the control plane does not read what was said."""
+        from flotta import architect
+        from flotta.store import ArchitectChatFullError
+
+        user_id, org_id = _architect_person(token)
+        if not isinstance(body, dict) or set(body) != {"messages"}:
+            raise HTTPException(status_code=422, detail='expected {"messages": [...]}')
+        try:
+            messages = architect.chat_messages(body["messages"])
+        except architect.BadChat as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            added = store.append_architect_messages(
+                org_id, user_id, chat_id, messages, limit=architect.MESSAGES_PER_CHAT
+            )
+            chat = store.architect_chat(org_id, user_id, chat_id)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}") from exc
+        except ArchitectChatFullError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return _architect_chat_view(chat, added)
+
+    @app.delete("/api/architect/chats/{chat_id}")
+    def delete_architect_chat(chat_id: str, token: Token | None = needs_write) -> Any:
+        """Delete one of the caller's chats, and everything said in it."""
+        user_id, org_id = _architect_person(token)
+        store = store_factory()
+        try:
+            if not store.delete_architect_chat(org_id, user_id, chat_id):
+                raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}")
+        finally:
+            store.close()
+        return {"deleted": chat_id}
+
     @app.post("/api/boxes/{box_id}/ticket")
     def chat_ticket(box_id: str, token: Token | None = needs_chat) -> Any:
         """A chat ticket for this one agent, for a browser to open it with (M12.5).

@@ -1372,6 +1372,42 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX architect_usage_org_at ON architect_usage (org_id, at)",
         ),
     ),
+    Migration(
+        46,
+        "architect chats: each person's conversations with the Architect",
+        # FLOTTA-250. A chat is one person's, in one org: nobody else in the
+        # agency reads it, the operator included. The control plane keeps what
+        # the front end gives it and does not read it: `content` is that
+        # message as JSON, whatever a front end needs to show the turn again
+        # and to carry the conversation on. `org_id` is on the messages too, so
+        # a closed org's are deleted by org like everything else of it. A chat
+        # goes with its person's membership of the org, and with the org.
+        (
+            """
+            CREATE TABLE architect_chats (
+                id          TEXT PRIMARY KEY,
+                org_id      TEXT NOT NULL REFERENCES orgs(id),
+                user_id     TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX architect_chats_owner ON architect_chats (org_id, user_id, updated_at)",
+            """
+            CREATE TABLE architect_messages (
+                id          TEXT PRIMARY KEY,
+                chat_id     TEXT NOT NULL REFERENCES architect_chats(id),
+                org_id      TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE (chat_id, seq)
+            )
+            """,
+        ),
+    ),
 )
 
 
