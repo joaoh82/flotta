@@ -1311,6 +1311,14 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE orgs ADD COLUMN custom_images INTEGER NOT NULL DEFAULT 0",
         ),
     ),
+    Migration(
+        43,
+        "templates: which template an agent was made from",
+        # FLOTTA-249. A name the caller gives when it makes the agent, kept so
+        # the agent can say what kind it is. NULL on every agent that exists,
+        # and on any made with no template: nothing here knows the templates.
+        ("ALTER TABLE boxes ADD COLUMN template TEXT",),
+    ),
 )
 
 
