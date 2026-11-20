@@ -2504,7 +2504,9 @@ def set_custom_image(
         previous = _require_box(store, box.id).image
         store.set_box_image(box.id, new)
         try:
-            return upgrade_box(box.id, store=store, image=new, backend=backend, reason="image")
+            return upgrade_box(
+                box.id, store=store, image=new, backend=backend, reason="image", previous=previous
+            )
         except Exception:
             # Back only if the machine is not on the new image after all: a
             # timeout can follow a move the substrate did make.
@@ -2533,8 +2535,13 @@ def upgrade_box(
     image: str | None = None,
     backend: Backend | None = None,
     reason: str = "requested",
+    previous: str | None = None,
 ) -> dict[str, Any]:
     """Move a live agent onto a new image, keeping everything it remembers.
+
+    `previous` is what it ran before when the substrate cannot say (a local
+    custom agent, whose "image" is a directory): the timeline's `from` is the
+    way back, so it is never left empty when the row knew it (FLOTTA-254).
 
     The gap this closes: `HERMES_REF` pins what a box image is built from, and
     `just hermes-bump` moves it — but a machine runs the image it was created
@@ -2592,8 +2599,12 @@ def upgrade_box(
 
     impl = _resolve_backend(box, backend)
     target = box.endpoint or box_id
-    before = _peek_image(impl, target)
-    if before and _same_image(before, target_image):
+    # Only the substrate's answer says it is already there: the row's says what
+    # it was last recorded on, which an edited local directory, or a move that
+    # landed after the row was rolled back, makes untrue.
+    peeked = _peek_image(impl, target)
+    before = peeked or previous
+    if peeked and _same_image(peeked, target_image):
         return {
             "box_id": box_id,
             "image": target_image,
@@ -2619,10 +2630,14 @@ def upgrade_box(
         # back. Without it an operator who wants to undo this has to go and ask
         # the substrate what the box used to run, which is exactly what they
         # cannot do while it is broken.
-        failure = (
-            f"could not upgrade box {box_id}: {exc}. It still runs "
-            f"{before or '(unknown)'}; nothing was changed."
+        ran = (
+            f"It still runs {peeked}"
+            if peeked
+            else f"It was last recorded on {before}"
+            if before
+            else "What it runs is not known"
         )
+        failure = f"could not upgrade box {box_id}: {exc}. {ran}; nothing was changed."
         # Recorded, not only raised. A caller that is still holding the
         # exception can read it; a caller that is not — the app, which asked
         # for this in the background and went back to polling — has nowhere
