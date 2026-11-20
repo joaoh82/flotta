@@ -111,8 +111,8 @@ def fleet(tmp_path, monkeypatch, stub_box):  # noqa: F811 - the fixture above
             resolved.append(name)
             return await super().resolve(name)
 
-        async def wake(self, name, *, box_id=None):
-            target = await super().wake(name, box_id=box_id)
+        async def wake(self, name, *, box_id=None, timeout_s=None):
+            target = await super().wake(name, box_id=box_id, timeout_s=timeout_s)
             return dataclasses.replace(target, host="127.0.0.1", port=port)
 
     plane = InProcess(

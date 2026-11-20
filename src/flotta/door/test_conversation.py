@@ -108,8 +108,8 @@ def fleet(tmp_path, monkeypatch, standin):
     class InProcess(ControlPlane):
         """The real client; the box it hands back is the stand-in."""
 
-        async def wake(self, name, *, box_id=None):
-            target = await super().wake(name, box_id=box_id)
+        async def wake(self, name, *, box_id=None, timeout_s=None):
+            target = await super().wake(name, box_id=box_id, timeout_s=timeout_s)
             return dataclasses.replace(target, host="127.0.0.1", port=standin)
 
     plane = InProcess(

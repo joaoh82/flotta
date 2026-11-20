@@ -165,7 +165,7 @@ class Plane:
     async def resolve(self, name):
         return Address(box_id=BOX, name=name, runtime=self.runtime)
 
-    async def wake(self, name, *, box_id=None):
+    async def wake(self, name, *, box_id=None, timeout_s=None):
         self.woken.append(name)
         return Target(
             box_id=BOX, name=name, endpoint="fly://app/m1", host="127.0.0.1", port=self.port,

@@ -220,6 +220,15 @@ DEFAULT_BOX_PORT = 9119
 #: once was refused agents that were booting normally. The web app's own wait
 #: (`READY_TIMEOUT_MS` in flotta-cloud) has to stay above this one.
 DEFAULT_READY_TIMEOUT_S = 240.0
+#: The longest the door waits for the control plane to wake a box (FLOTTA-133).
+#: `/wake` answers only once the machine has started, which can mean Fly's
+#: settle and start waits and, with an MCP config pending, a reload that waits
+#: for Hermes itself: so a wake can contain the boot. A fully stopped machine
+#: took 43 s on 2026-11-05, and the 30 s the door gave every fleet-API call
+#: reported it as the control plane being down while the agent came up anyway.
+#: The door's whole budget, because a wake that uses it has nothing left to wait
+#: for; `create_door` gives a wake only what its budget has left.
+WAKE_TIMEOUT_S = DEFAULT_READY_TIMEOUT_S
 #: How often to tell the control plane a live conversation is still live.
 #: Comfortably under the default 30-minute idle threshold: this only has to
 #: beat the sweep, and a chattier heartbeat would write more events for no gain.
@@ -854,6 +863,8 @@ class ControlPlane:
     base_url: str
     token: str | None = None
     timeout_s: float = 30.0
+    #: A wake's own, longer timeout: it waits for a machine to start.
+    wake_timeout_s: float = WAKE_TIMEOUT_S
     #: How requests travel: the network when `None`. A test hands it an
     #: `httpx.ASGITransport` around a real control plane, so the door and the
     #: fleet API run in one process with nothing but the machines faked.
@@ -881,7 +892,9 @@ class ControlPlane:
         with contextlib.suppress(Exception):
             await self.wake(box, box_id=box)
 
-    async def wake(self, name: str, *, box_id: str | None = None) -> Target:
+    async def wake(
+        self, name: str, *, box_id: str | None = None, timeout_s: float | None = None
+    ) -> Target:
         """Resolve `name` and ensure it is running. Returns where to proxy.
 
         `box_id`, when the caller has one, is what gets woken; `name` is then
@@ -895,7 +908,12 @@ class ControlPlane:
         drain between the read and the connect.
         """
         response = await self._call(
-            "POST", f"/api/boxes/{box_id or name}/wake", name=name, verb="wake"
+            "POST",
+            f"/api/boxes/{box_id or name}/wake",
+            name=name,
+            verb="wake",
+            # Its own limit, or what the caller's budget has left if that is less.
+            timeout_s=min(self.wake_timeout_s, timeout_s or self.wake_timeout_s),
         )
         body = response.json()
         endpoint = (body.get("box") or {}).get("endpoint")
@@ -1085,21 +1103,54 @@ class ControlPlane:
         response.raise_for_status()
         return response
 
-    async def _call(self, method: str, path: str, *, name: str, verb: str, json: Any = None) -> Any:
+    async def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        name: str,
+        verb: str,
+        json: Any = None,
+        timeout_s: float | None = None,
+    ) -> Any:
         """One request to the fleet API, with the door's errors mapped once."""
         import httpx
 
         url = f"{self.base_url.rstrip('/')}{path}"
+        timeout = self.timeout_s if timeout_s is None else timeout_s
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_s, transport=self.transport
-            ) as client:
+            async with httpx.AsyncClient(timeout=timeout, transport=self.transport) as client:
                 response = await client.request(method, url, headers=self._headers(), json=json)
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise BoxUnavailable(
+                f"cannot reach the control plane at {self.base_url}: "
+                f"no connection within {timeout:.0f}s",
+                status=503,
+            ) from exc
+        except httpx.ReadTimeout as exc:
+            # Connected and asked, then no answer in time (FLOTTA-133). That is
+            # not the control plane being down: saying "cannot reach" sent an
+            # operator to the wrong service while the agent came up anyway. For
+            # a wake it is usually the machine starting, but a stuck control
+            # plane looks the same from here, so neither is blamed. Short, with
+            # what to do first: a close reason is cut at 120 characters.
+            if verb == "wake":
+                raise BoxUnavailable(
+                    f"try again in a moment: waking {name!r} took over {timeout:.0f}s",
+                    status=504,
+                ) from exc
+            raise BoxUnavailable(
+                f"the control plane did not answer the {verb} of {name!r} within {timeout:.0f}s",
+                status=504,
+            ) from exc
         except Exception as exc:
             # The control plane being unreachable is the door's own outage, not
-            # the box's. Say which one is down.
+            # the box's. Say which one is down, and what went wrong: some httpx
+            # errors have no message, which left "...: " with nothing after it.
             raise BoxUnavailable(
-                f"cannot reach the control plane at {self.base_url}: {exc}", status=503
+                f"cannot reach the control plane at {self.base_url}: "
+                f"{str(exc) or type(exc).__name__}",
+                status=503,
             ) from exc
 
         if response.status_code == 404:
@@ -1120,6 +1171,15 @@ class ControlPlane:
         if response.status_code >= 400:
             raise BoxUnavailable(f"could not {verb} {name!r}: {response.text[:200]}", status=502)
         return response
+
+
+def _left(budget_s: float, began: float, clock: asyncio.AbstractEventLoop) -> float:
+    """What a budget started at `began` has left, never less than a moment.
+
+    The moment is so a step whose budget ran out still asks once, and fails with
+    its own message rather than none.
+    """
+    return max(budget_s - (clock.time() - began), min(budget_s, 1.0))
 
 
 def _detail(response: httpx.Response) -> str:
@@ -1541,6 +1601,11 @@ def create_door(
         if refusal is not None:
             _log.info("refused %r for %r before resolving: %s", name, token.subject, refusal)
             raise BoxUnavailable(f"no box named {name!r}", status=404)
+        # One budget for the resolve, the wake and the boot together, so the door
+        # gives up before the web app does (`READY_TIMEOUT_MS`, 300 s, which
+        # also covers the Hermes ticket after this), however the time splits.
+        clock = asyncio.get_running_loop()
+        began = clock.time()
         address = await plane.resolve(name)
         refusal = admits(
             token,
@@ -1570,7 +1635,9 @@ def create_door(
         # By id: the name can be released and reused between resolve and here,
         # and waking by name would start the replacement on this token's
         # account — the cost the check above exists to refuse.
-        target = await plane.wake(name, box_id=address.box_id)
+        target = await plane.wake(
+            name, box_id=address.box_id, timeout_s=_left(ready_timeout_s, began, clock)
+        )
         if target.box_id != address.box_id:
             # Should be unreachable now; kept because proxying to a box other
             # than the one checked is the failure, however it comes about.
@@ -1581,7 +1648,7 @@ def create_door(
         own = _own(target)
         await wait_until_ready(
             f"http://{authority(target.host, target.port)}",
-            timeout_s=ready_timeout_s,
+            timeout_s=_left(ready_timeout_s, began, clock),
             custom=target.runtime == "custom",
             contract_secret=own[1] if own else None,
         )
