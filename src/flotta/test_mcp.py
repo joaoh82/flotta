@@ -543,12 +543,13 @@ def test_an_agent_created_with_no_tools_chosen_is_sent_nothing(granted):
     assert not provision._BOOTING
 
 
-def test_a_new_agent_whose_hermes_never_listens_keeps_its_tools_for_a_wake(granted):
+def test_a_new_agent_whose_hermes_never_listens_keeps_its_tools_for_a_wake(granted, monkeypatch):
     """Nothing is written into a boot that isn't known to be over; the mark stays."""
     import flotta.provision as provision
     from flotta.provision import set_mcp_grants, wake_box
 
     machine = _Creating(hermes_starts=False)
+    monkeypatch.setattr(provision, "HERMES_BOOT_S", 0)
     set_mcp_grants("b-one", NOTES, store=granted, backend=machine)
     made = _create(granted, machine)
     assert made["status"] == "running"

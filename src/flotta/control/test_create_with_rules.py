@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from flotta.backend import BoxHandle, ExecResult, NotSupported
+from flotta.backend import BackendError, BoxHandle, ExecResult, NotSupported
 from flotta.box.mcp_reload import ONLY_WAIT_FLAG
 from flotta.control.test_size_api import MEMBER, OWNER, _api, _finish
 from flotta.control.test_size_api import fleet as fleet  # noqa: F401 - the fixture
@@ -35,6 +35,9 @@ class Machine:
         #: The row's status when each command arrived: the point of the order.
         self.status_at: list[str] = []
         self.hermes_starts: bool | None = True
+        #: What the first asks for Hermes meet, before `hermes_starts` decides:
+        #: "cut off" is Fly ending the command, "not yet" the script's own answer.
+        self.boot: list[str] = []
         self.write_code = 0
         self.fleet = None
 
@@ -56,6 +59,10 @@ class Machine:
         with FleetStore(self.fleet) as store:
             self.status_at.append(store.get_box_by_name(SEER).status)
         if command.endswith(ONLY_WAIT_FLAG):
+            if self.boot:
+                if self.boot.pop(0) == "cut off":
+                    raise BackendError("machine exec failed: deadline_exceeded")
+                return ExecResult(1, "", "Hermes was not listening after 15s")
             if self.hermes_starts is None:
                 raise NotSupported("no shell here")
             if self.hermes_starts:
@@ -172,7 +179,45 @@ def test_rules_whose_write_fails_make_an_agent_with_none_and_say_so(fleet, machi
     assert not _events(fleet, RULES_CHANGED)
 
 
-def test_rules_are_not_written_into_a_boot_that_is_not_known_to_be_over(fleet, machine):  # noqa: F811
+def test_hermes_is_asked_for_in_short_steps_until_it_listens(fleet, machine, monkeypatch):  # noqa: F811
+    """Fly ends a command on a machine after about 30 seconds, and a first boot takes
+    longer: one long wait was cut off on staging and the agent was made without its
+    rules. So each ask is short, and one that fails or says "not yet" is asked again."""
+    import flotta.provision as provision
+    from flotta.box.mcp_reload import ONLY_WAIT_S
+
+    assert ONLY_WAIT_S <= 20, "one ask has to end well inside Fly's 30 seconds"
+    monkeypatch.setattr(provision, "HERMES_ASK_EVERY_S", 0)
+    machine.boot = ["cut off", "not yet", "not yet"]
+    with _api(fleet, background=False) as api:
+        response = _create(api, rules=RULES)
+    assert response.json()["rules_written"] is True
+    asks = [c for c in machine.commands if c.endswith(ONLY_WAIT_FLAG)]
+    assert len(asks) == 4 and len(machine.written()) == 1
+    assert machine.status_at == ["provisioning"] * 5, (
+        "it was reachable before its rules were written"
+    )
+    assert not _events(fleet, "rules_write_failed")
+
+
+def test_asking_for_hermes_ends(fleet, machine, monkeypatch):  # noqa: F811
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "HERMES_ASK_EVERY_S", 0.01)
+    monkeypatch.setattr(provision, "HERMES_BOOT_S", 0.2)
+    machine.boot = ["not yet"] * 10_000
+    with _api(fleet, background=False) as api:
+        response = _create(api, rules=RULES)
+    assert response.json()["rules_written"] is False
+    assert 2 <= len(machine.commands) < 200 and machine.written() == []
+
+
+def test_rules_are_not_written_into_a_boot_that_is_not_known_to_be_over(
+    fleet, machine, monkeypatch
+):  # noqa: F811
+    import flotta.provision as provision
+
+    monkeypatch.setattr(provision, "HERMES_BOOT_S", 0)
     machine.hermes_starts = False
     with _api(fleet, background=False) as api:
         response = _create(api, rules=RULES)

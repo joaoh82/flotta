@@ -25,7 +25,10 @@ simply come too early (seen live on `eng-r`, 2026-11-07). A reload costs the nex
 prompt cache, which is the price of not showing a tool that is gone.
 
 **Or only wait** (`--only-wait`, FLOTTA-252): answer whether Hermes is listening,
-waiting up to `WAIT_S` for it, and reload nothing. `provision.create_box` asks this
+waiting up to `ONLY_WAIT_S` for it, and reload nothing. A short wait, asked again
+and again by the caller, because Fly ends a command on a machine after about 30
+seconds whatever it is doing: one long wait was cut off on every real first
+boot, which takes longer than that (seen on staging, 2026-11-20). `provision.create_box` asks this
 before it writes a new agent's first MCP config. Hermes listening means
 `box_entrypoint.sh` has finished: its steps that also edit `config.yaml`
 (approvals, skills, the model, the screen) each read the file and save it, and on
@@ -62,6 +65,10 @@ WAIT_FLAG = "--wait"
 
 #: The flag that asks only whether Hermes is listening, waiting for it: no reload.
 ONLY_WAIT_FLAG = "--only-wait"
+
+#: How long one `--only-wait` waits. Well under the 30 seconds or so after which
+#: Fly ends a command on a machine: the caller asks again until Hermes is up.
+ONLY_WAIT_S = 15.0
 
 
 def _environment() -> dict[str, str]:
@@ -164,10 +171,10 @@ def reload(
 
 def main(argv: list[str]) -> int:
     if ONLY_WAIT_FLAG in argv:
-        if listening(_environment(), wait_s=WAIT_S):
+        if listening(_environment(), wait_s=ONLY_WAIT_S):
             print("Hermes is listening")
             return 0
-        print(f"Hermes was not listening after {WAIT_S:.0f}s", file=sys.stderr)
+        print(f"Hermes was not listening after {ONLY_WAIT_S:.0f}s", file=sys.stderr)
         return 1
     try:
         result = reload(_environment(), wait_s=WAIT_S if WAIT_FLAG in argv else 0.0)
