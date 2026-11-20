@@ -551,6 +551,27 @@ def _box_dict(
     return out
 
 
+def _model_of(store: Any, box_id: str) -> str | None:
+    """The model an agent is to be on, as its single-box read says (`model`).
+
+    The front door holds a client to it (FLOTTA-128), so the two must agree:
+    the web app asks the door to move a conversation onto the read's model,
+    or onto a change under way, which a reconnect during the restart reads
+    before the change has recorded its result (FLOTTA-101).
+    """
+    from flotta.provision import fleet_model, model_changes, model_given_by_default
+
+    change = model_changes(store, [box_id]).get(box_id)
+    if change and change.get("state") == "pending" and change.get("model"):
+        return str(change["model"])
+    return (
+        store.model_for_box(box_id)
+        or store.models_given([box_id]).get(box_id)
+        or model_given_by_default()
+        or fleet_model(store)
+    )
+
+
 def _with_meta(store: Any, box: Any) -> dict[str, Any]:
     from flotta.provision import (
         box_sizes,
@@ -9213,6 +9234,8 @@ def create_app(
                     "client": box.client,
                     # Whether the door speaks Hermes or the box contract (M17.2).
                     "runtime": box.runtime,
+                    # The one model a client's conversation may move onto (FLOTTA-128).
+                    "model": _model_of(store, box.id),
                 }
             }
         finally:

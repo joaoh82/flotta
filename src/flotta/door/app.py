@@ -961,6 +961,17 @@ class ControlPlane:
         )
         return list(response.json().get("conversations") or [])
 
+    async def model_of(self, box_id: str) -> str | None:
+        """The model the control plane has for this box now (FLOTTA-128).
+
+        Read fresh, never from the socket's resolve: a model change restarts
+        the agent, but a client may ask to move a conversation the moment it
+        reconnects, and the answer must be the agency's latest word.
+        """
+        response = await self._call("GET", f"/api/boxes/{box_id}/address", name=box_id, verb="read")
+        model = (response.json().get("box") or {}).get("model")
+        return model if isinstance(model, str) and model else None
+
     async def working(self, box_id: str) -> dict[str, Any] | None:
         """The run this box is doing now, if not a conversation's (FLOTTA-197)."""
         response = await self._call("GET", f"/api/boxes/{box_id}/working", name=box_id, verb="read")
