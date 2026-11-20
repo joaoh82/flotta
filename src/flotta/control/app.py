@@ -9803,6 +9803,130 @@ def create_app(
         finally:
             store.close()
 
+    # -- the Architect (FLOTTA-250, `flotta.architect`) ---------------------------
+    #
+    # An assistant for an agency's own people, in a front end: it answers about
+    # the account with the fleet API's tools (`POST /mcp`). Its model calls are
+    # made at the gateway, on the fleet's key and an allowance per org. These
+    # routes hand a signed-in person the ticket for that, and say what it cost.
+
+    def _architect_person(token: Token | None) -> tuple[str, str]:
+        """`(user id, org)` of the signed-in person asking, or 403.
+
+        A person, because the allowance is an agency's people's and its spend
+        names who asked: a token an owner minted for a script is neither.
+        """
+        subject = token.subject if token is not None else ""
+        if not subject.startswith(USER_SUBJECT_PREFIX):
+            raise HTTPException(
+                status_code=403, detail="the Architect is for a signed-in person of an agency"
+            )
+        assert token is not None
+        return subject[len(USER_SUBJECT_PREFIX) :], token.org or DEFAULT_ORG
+
+    @app.post("/api/architect/ticket", status_code=201)
+    def architect_ticket(token: Token | None = needs_write) -> Any:
+        """A ticket for the Architect's model calls, for the web app's server.
+
+        Good for minutes, at the gateway's Architect route and nowhere else
+        (`flotta.auth.mint_architect_ticket`): one question may take several
+        calls, so a front end asks for one per question. `url` is where the
+        calls go and `model` what answers them, which is the operator's choice.
+        `allowance` is where the agency's month stands; the gateway checks it
+        again before every call, so a ticket is given even when it is used up
+        and the front end says so without spending a call to find out.
+
+        For the agency's people who can change things: an owner or a builder.
+        Not a client's people, and not while viewing an agency as its owner.
+        """
+        from flotta import architect
+        from flotta.auth import ARCHITECT_TICKET_TTL_S, mint_architect_ticket
+        from flotta.provision import gateway_url
+
+        user_id, org_id = _architect_person(token)
+        gateway = gateway_url()
+        if key is None or gateway is None:
+            raise HTTPException(
+                status_code=503,
+                detail="this fleet has no model gateway, so it has no Architect",
+            )
+        store = store_factory()
+        try:
+            org = store.get_org(org_id)
+            if org is None or org.status != "active":
+                raise HTTPException(
+                    status_code=403,
+                    detail="the Architect is for an agency that is active: this one isn't",
+                )
+            model = architect.model_for(store)
+            where = architect.standing(store, org_id, now=datetime.now(UTC))
+        finally:
+            store.close()
+        if model is None:
+            raise HTTPException(
+                status_code=503, detail="the fleet's operator has chosen no model for the Architect"
+            )
+        return {
+            "ticket": mint_architect_ticket(user_id=user_id, org=org_id, key=key),
+            "ttl_s": ARCHITECT_TICKET_TTL_S,
+            "url": f"{gateway}/architect/chat/completions",
+            "model": model,
+            "allowance": where.as_dict(),
+        }
+
+    @app.get("/api/architect/allowance")
+    def architect_allowance(token: Token | None = needs_read) -> Any:
+        """Where the caller's agency's Architect allowance stands this month:
+        what it may use, what it has, and when the month turns. For the
+        agency's own people; a client's people are not told what it costs."""
+        if token is not None and not (
+            token.allows(SCOPE_FLEET_WRITE) or token.allows(SCOPE_ORG_ADMIN)
+        ):
+            raise HTTPException(
+                status_code=403, detail="the Architect's allowance is the agency's to see"
+            )
+        from flotta import architect
+
+        org_id = (token.org if token else None) or DEFAULT_ORG
+        store = store_factory()
+        try:
+            return architect.standing(store, org_id, now=datetime.now(UTC)).as_dict()
+        finally:
+            store.close()
+
+    @app.get("/api/architect/spend")
+    def architect_spend(token: Token | None = needs_read) -> Any:
+        """What every agency's Architect has cost this month, for whoever pays
+        for it: one entry per org that made a call, and the allowance each has."""
+        _require_operator(token, "read what the Architect costs across the fleet")
+        from flotta import architect
+        from flotta.budgets import period_start
+        from flotta.settings import architect_monthly_eur_nano
+
+        now = datetime.now(UTC)
+        since = period_start("month", now)
+        store = store_factory()
+        try:
+            by_org = store.architect_spend_by_org(since=since)
+            allowance = architect_monthly_eur_nano(store)
+            model = architect.model_for(store)
+        finally:
+            store.close()
+        return {
+            "since": since.isoformat(),
+            "allowance_eur_nano": allowance,
+            "model": model,
+            "orgs": [
+                {
+                    "org": org_id,
+                    "spent_eur_nano": spend.eur_nano,
+                    "unpriced": spend.unpriced,
+                    "calls": calls,
+                }
+                for org_id, (spend, calls) in by_org.items()
+            ],
+        }
+
     @app.post("/api/boxes/{box_id}/ticket")
     def chat_ticket(box_id: str, token: Token | None = needs_chat) -> Any:
         """A chat ticket for this one agent, for a browser to open it with (M12.5).
