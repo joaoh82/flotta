@@ -2,7 +2,7 @@
 
 Run a [LangGraph](https://langchain-ai.github.io/langgraph/) agent on
 [Flotta](https://github.com/joaoh82/flotta) with one call: `serve(graph)`. MIT
-licensed, built on [flotta-agent](../flotta-python).
+licensed, built on [flotta-agent](https://github.com/joaoh82/flotta/tree/main/adapters/flotta-python).
 
 ```sh
 pip install "flotta-langgraph[openai]"
@@ -43,4 +43,4 @@ serve(builder)                           # compiled here, checkpointed on /data
 The input is `{"messages": [{"role": "user", "content": message}]}`. For a
 different state shape, pass `to_input=`.
 
-See [the example](../../examples/langgraph-support) for a complete agent.
+See [the example](https://github.com/joaoh82/flotta/tree/main/examples/langgraph-support) for a complete agent.

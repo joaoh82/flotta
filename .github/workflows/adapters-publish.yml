@@ -37,6 +37,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Which package, and does its version match the tag
         id: which
@@ -51,6 +53,9 @@ jobs:
           version="${tag##*-v}"
           declared=$(python3 -c "import tomllib; print(tomllib.load(open('$dir/pyproject.toml','rb'))['project']['version'])")
           [ "$version" = "$declared" ] || { echo "::error::tag says $version, $dir/pyproject.toml says $declared"; exit 1; }
+          # Only what main has: a release is merged, reviewed code.
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$tag is not on main; merge first, then tag"; exit 1; }
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       - name: Install uv (and Python 3.11)
@@ -58,13 +63,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Its own tests first: a release is never something CI has not passed.
-      - name: Test
-        working-directory: ${{ steps.which.outputs.dir }}
-        run: uv run --frozen pytest -q
-
+      # Built without the repository's path sources, as PyPI's users will build it.
       - name: Build
         working-directory: ${{ steps.which.outputs.dir }}
-        run: uv build -o "$GITHUB_WORKSPACE/dist"
+        run: uv build --no-sources -o "$GITHUB_WORKSPACE/dist"
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # Its tests against the wheel just built, installed with its dependencies
+      # from PyPI: flotta-langgraph is tested against the flotta-agent its users
+      # get, never against unreleased source next to it in this repository.
+      - name: Test the built wheel
+        working-directory: ${{ steps.which.outputs.dir }}
+        run: |
+          set -euo pipefail
+          uv venv "$RUNNER_TEMP/release"
+          VIRTUAL_ENV="$RUNNER_TEMP/release" uv pip install "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)[openai]" pytest httpx langchain-openai
+          "$RUNNER_TEMP/release/bin/python" -m pytest -q -p no:cacheprovider tests
+
+      # Pinned to a commit: this step holds the PyPI publishing identity.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
