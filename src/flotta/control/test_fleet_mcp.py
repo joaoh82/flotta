@@ -186,6 +186,23 @@ def test_nobody_gets_in_without_a_credential(fleet):  # noqa: F811
     assert answer.status_code == 401
 
 
+def test_a_credential_made_for_one_job_does_not_get_in(fleet):  # noqa: F811
+    """Billing's token holds `org:govern` and reaches its own routes and no other.
+    This is not one of them. An agent's API key is held the same way by the sweep
+    in `test_api_keys.py`, since only the store can make one."""
+    from flotta.auth import SCOPE_ORG_GOVERN, mint
+    from flotta.control.test_size_api import KEY
+
+    token = mint(scopes={SCOPE_ORG_GOVERN}, key=KEY, subject="billing", org="agency-x")
+    headers = {"Authorization": f"Bearer {token}"}
+    with _api(fleet) as api:
+        for method in ("initialize", "tools/list"):
+            answer = _rpc(api, method, headers=headers)
+            assert answer.status_code == 403, (method, answer.text)
+        # Not even a malformed message is read.
+        assert api.post("/mcp", json=[], headers=headers).status_code == 403
+
+
 # -- a tool is the caller's own request ---------------------------------------------------
 
 

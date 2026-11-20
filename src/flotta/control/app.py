@@ -9818,7 +9818,7 @@ def create_app(
     @app.post("/mcp")
     async def fleet_mcp(
         request: Request,
-        token: Token | None = needs_anyone,
+        token: Token | None = needs_read,
         authorization: str | None = Header(default=None),
         origin: str | None = Header(default=None),
     ) -> Any:
@@ -9827,6 +9827,11 @@ def create_app(
         A browser has no business here, so a request that names an origin other
         than the web app's is refused, as the MCP transport requires against
         DNS rebinding. The web app's own server sends none.
+
+        For whoever may read the fleet. Every tool is a route called as the
+        caller, which would refuse what they may not see; but a credential made
+        for one job (an agent's API key, billing's `org:govern`) reaches no
+        route but its own, and this is not one of them.
         """
         import httpx
         from fastapi.responses import JSONResponse, Response
