@@ -58,16 +58,17 @@ POST /run/{run_id}/approval       {"id", "choice": "once" | "deny"}
 
 ## What it does not get
 
-None of these are offered for a custom agent. The control plane refuses each with 409 `custom_runtime`, and the web app hides them:
+The control plane refuses each of these with 409 `custom_runtime`, and the web app hides them:
 
-- instructions (`SOUL.md`) and skills;
+- instructions (`SOUL.md`);
 - the model switch;
 - tool rules;
-- MCP grants;
+- MCP grants and the gateway switch;
 - the screen;
 - handoffs;
-- repositories and the GitHub identity;
-- the Hermes version, fleet updates and upgrades. `POST /api/hermes/update` skips custom agents rather than re-imaging them onto Hermes.
+- the Hermes upgrade. `POST /api/hermes/update` skips custom agents rather than re-imaging them onto Hermes.
+
+**Repositories and the GitHub identity are hidden, not refused.** The web app shows neither for a custom agent, and its image has no credential helper to use a grant. The API still records a repository grant for one, which does nothing. Hermes's skills simply don't exist on a custom image.
 
 On the conversation socket, the screen (`display.*`), attachments and everything else Hermes-specific are refused by name. A conversation offers no Attach.
 

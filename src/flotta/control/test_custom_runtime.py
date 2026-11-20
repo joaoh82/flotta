@@ -605,11 +605,29 @@ def test_nothing_execs_into_a_custom_agent_unguarded():
 
 
 def test_the_timeline_says_what_it_ran_before_when_the_machine_cannot(fleet, machine, own):  # noqa: F811
-    """A local custom agent's "image" is a directory, and its substrate has no
-    image to report: the row's is the way back (FLOTTA-254)."""
+    """A substrate with no image to report (the local backend never has one, its
+    "image" being a directory): the row's is the way back (FLOTTA-254)."""
     machine.images.pop(own.endpoint, None)
     with FleetStore(fleet) as store:
         provision.set_custom_image(own.id, "ghcr.io/agency-x/support-agent:2.0", store=store)
         (moved,) = [e for e in store.get_events("box", own.id) if e.type == "reimaged"]
     assert moved.payload["from"] == IMAGE
     assert moved.payload["to"] == "ghcr.io/agency-x/support-agent:2.0"
+
+
+def test_the_same_image_again_still_restarts_it_when_the_machine_cannot_say(fleet, machine, own):  # noqa: F811
+    """Only the substrate may say it is already there: a local agent whose
+    directory was edited is moved onto the same `local:` again to restart it."""
+    machine.images.pop(own.endpoint, None)
+    moved = []
+    real = machine.reimage
+
+    def counting(endpoint, image):
+        moved.append(image)
+        return real(endpoint, image)
+
+    machine.reimage = counting
+    with FleetStore(fleet) as store:
+        result = provision.set_custom_image(own.id, IMAGE, store=store)
+    assert moved == [IMAGE]
+    assert result["already_current"] is False

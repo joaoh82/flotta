@@ -2596,8 +2596,12 @@ def upgrade_box(
 
     impl = _resolve_backend(box, backend)
     target = box.endpoint or box_id
-    before = _peek_image(impl, target) or previous
-    if before and _same_image(before, target_image):
+    # Only the substrate's answer says it is already there: the row's says what
+    # it was last recorded on, which an edited local directory, or a move that
+    # landed after the row was rolled back, makes untrue.
+    peeked = _peek_image(impl, target)
+    before = peeked or previous
+    if peeked and _same_image(peeked, target_image):
         return {
             "box_id": box_id,
             "image": target_image,
@@ -2623,10 +2627,14 @@ def upgrade_box(
         # back. Without it an operator who wants to undo this has to go and ask
         # the substrate what the box used to run, which is exactly what they
         # cannot do while it is broken.
-        failure = (
-            f"could not upgrade box {box_id}: {exc}. It still runs "
-            f"{before or '(unknown)'}; nothing was changed."
+        ran = (
+            f"It still runs {peeked}"
+            if peeked
+            else f"It was last recorded on {before}"
+            if before
+            else "What it runs is not known"
         )
+        failure = f"could not upgrade box {box_id}: {exc}. {ran}; nothing was changed."
         # Recorded, not only raised. A caller that is still holding the
         # exception can read it; a caller that is not — the app, which asked
         # for this in the background and went back to polling — has nowhere

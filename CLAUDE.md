@@ -980,8 +980,9 @@ conventions, and the sharp edges below.
   (`mcp.connection_context`), and each call's row says which served it (`account`).
 - **A custom agent is not Hermes, and every Hermes-only path must say so (M17,
   `docs/CONTRACT.md`).** `boxes.runtime = 'custom'` runs the agency's own image,
-  which serves the box contract on 9119. `provision.hermes_only(box, what)` is the
-  first statement of every Hermes-only verb (instructions, rules, MCP, the gateway
+  which serves the box contract on 9119. `provision.hermes_only(store, box_id, what)` is the
+  first statement of every Hermes-only verb (`refuse_custom(box, what)` where a
+  route already holds the box) (instructions, rules, MCP, the gateway
   switch, the model, the screen), and the routes refuse before answering 202. A new
   Hermes-only feature that forgets it re-images or misconfigures a customer's code.
   The door translates in one place, `door/contract.py`, so the relay, the run loop
