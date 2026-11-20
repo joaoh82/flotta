@@ -980,6 +980,7 @@ PURGED_BY: dict[str, str] = {
     **{
         table: "global"
         for table in (
+            "agent_templates",
             "builds",
             "eur_rates",
             "mcp_server_secrets",
@@ -3990,6 +3991,47 @@ class FleetStore:
                     self.set_setting(key, value)
                 else:
                     self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+    # -- agent templates (FLOTTA-269) ----------------------------------------
+
+    def agent_templates(self) -> dict[str, tuple[dict[str, Any], str]]:
+        """Every template the operator changed: `{id: (changes, updated_at)}`.
+
+        Read whole, like the settings: there are a dozen templates, and a front
+        end shows them together. What a change may hold is `flotta.agent_templates`'s
+        to say; the store keeps what it is given.
+        """
+        rows = self._conn.execute(
+            "SELECT id, changes, updated_at FROM agent_templates ORDER BY id"
+        ).fetchall()
+        return {r["id"]: (json.loads(r["changes"]), r["updated_at"]) for r in rows}
+
+    def set_agent_template(self, template_id: str, changes: dict[str, Any]) -> str:
+        """Keep the operator's changes to one template, replacing any before.
+
+        Returns when. Nothing to keep is refused: that is `clear_agent_template`,
+        and a row holding no change would say "changed" about a template that
+        is exactly the front end's.
+        """
+        name = validate_template(template_id)
+        if name is None:
+            raise InvalidBoxMetaError("a template has a name")
+        if not changes:
+            raise ValueError("no changes to keep: clear the template instead")
+        now = _utcnow()
+        self._conn.execute(
+            "INSERT INTO agent_templates (id, changes, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET changes = EXCLUDED.changes, "
+            "updated_at = EXCLUDED.updated_at",
+            (name, json.dumps(changes, sort_keys=True), now),
+        )
+        return now
+
+    def clear_agent_template(self, template_id: str) -> bool:
+        """Forget the operator's changes to one template. Returns whether there were any."""
+        had = template_id in self.agent_templates()
+        self._conn.execute("DELETE FROM agent_templates WHERE id = ?", (template_id,))
+        return had
 
     def clear_setting(self, key: str) -> bool:
         """Forget an override, so the environment decides again. Returns whether

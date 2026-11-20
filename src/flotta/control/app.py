@@ -4976,6 +4976,111 @@ def create_app(
         finally:
             store.close()
 
+    # -- agent templates (FLOTTA-269) ------------------------------------------
+
+    @app.get("/api/agent-templates")
+    def list_agent_templates(token: Token | None = needs_read) -> Any:
+        """What the operator changed in the templates agents are made from.
+
+        The templates are the front end's; this is only the parts of each that
+        this fleet's operator changed (`flotta.agent_templates`), one entry per
+        changed template. A template not here is as the front end ships it.
+
+        For whoever makes agents, or runs an org: they are given what the
+        operator set. Not for a client's own people, who make none, and whose
+        read of the fleet is of their own agents and not of how an agency's
+        are written.
+        """
+        if token is not None and not (
+            token.allows(SCOPE_FLEET_WRITE) or token.allows(SCOPE_ORG_ADMIN)
+        ):
+            raise HTTPException(
+                status_code=403, detail="only people who make agents may read the templates"
+            )
+        store = store_factory()
+        try:
+            kept = store.agent_templates()
+        finally:
+            store.close()
+        return {
+            "templates": [
+                {"id": template_id, "changes": changes, "updated_at": at}
+                for template_id, (changes, at) in kept.items()
+            ]
+        }
+
+    @app.get("/api/agent-templates/public")
+    def public_agent_templates() -> Any:
+        """The same changes, as someone not signed in may know them.
+
+        For a page that lists the templates before sign-up: whether each is
+        offered and what its agent is set up with, so the page cannot offer one
+        the operator withdrew. Never the operator's words (`public_view`).
+        """
+        from flotta.agent_templates import public_view
+
+        store = store_factory()
+        try:
+            kept = store.agent_templates()
+        finally:
+            store.close()
+        shown = {template_id: public_view(changes) for template_id, (changes, _) in kept.items()}
+        return {
+            "templates": [
+                {"id": template_id, "changes": changes}
+                for template_id, changes in shown.items()
+                if changes
+            ]
+        }
+
+    @app.put("/api/agent-templates/{template_id}")
+    def put_agent_template(
+        template_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Keep the operator's changes to one template: `{"changes": {...}}`.
+
+        The changes given replace the ones kept: a part left out goes back to
+        what the front end ships. Each part is checked against the limit of the
+        route that later applies it, so a saved template can make an agent.
+        Nothing left to keep clears the template, which is `DELETE`.
+
+        Agents already made are not touched: a template is where an agent
+        starts, and its instructions and rules are its own from then on.
+        """
+        _require_operator(token, "change an agent template")
+        from flotta.agent_templates import AgentTemplateError, parse_changes
+        from flotta.store import InvalidBoxMetaError, validate_template
+
+        if not isinstance(body, dict) or set(body) != {"changes"}:
+            raise HTTPException(status_code=422, detail='expected {"changes": {...}}')
+        try:
+            name = validate_template(template_id)
+            changes = parse_changes(body["changes"])
+        except (AgentTemplateError, InvalidBoxMetaError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if name is None:
+            raise HTTPException(status_code=422, detail="a template has a name")
+        store = store_factory()
+        try:
+            if not changes:
+                store.clear_agent_template(name)
+                return {"id": name, "changes": {}, "updated_at": None}
+            at = store.set_agent_template(name, changes)
+        finally:
+            store.close()
+        return {"id": name, "changes": changes, "updated_at": at}
+
+    @app.delete("/api/agent-templates/{template_id}")
+    def delete_agent_template(template_id: str, token: Token | None = needs_write) -> Any:
+        """Forget the operator's changes to one template: it is the front end's again."""
+        _require_operator(token, "change an agent template")
+        store = store_factory()
+        try:
+            cleared = store.clear_agent_template(template_id)
+        finally:
+            store.close()
+        return {"id": template_id, "cleared": cleared}
+
     @app.put("/api/mcp/servers/{server}/client-secret")
     def set_mcp_client_secret(
         server: str, body: dict[str, Any], token: Token | None = needs_write

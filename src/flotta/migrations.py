@@ -1319,6 +1319,23 @@ MIGRATIONS: tuple[Migration, ...] = (
         # and on any made with no template: nothing here knows the templates.
         ("ALTER TABLE boxes ADD COLUMN template TEXT",),
     ),
+    Migration(
+        44,
+        "agent templates: what the operator changed in each",
+        # FLOTTA-269. One row per template the operator changed, keyed by the
+        # name agents record in `boxes.template`. `changes` is JSON holding only
+        # the parts that were changed (`flotta.agent_templates`), so a template
+        # with no row is whatever the front end ships. The fleet's own: no org's.
+        (
+            """
+            CREATE TABLE agent_templates (
+                id          TEXT PRIMARY KEY,
+                changes     TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 
