@@ -353,3 +353,28 @@ def test_only_the_operator_lists_everyone(api, fleet, path):
     answer = api.get(path, headers=owner)
     assert answer.status_code == 403
     assert "operator" in answer.json()["detail"]
+
+
+def test_a_read_only_session_reads_the_agent_templates_and_changes_none(api, fleet):
+    """FLOTTA-269. Viewing an agency shows its New agent sheet, which is made from
+    the operator's templates: the session holds `org:admin` and no write."""
+    user_id, viewing = _viewing(api, fleet)
+    with FleetStore(fleet) as store:
+        operator = {"Authorization": f"Session {store.create_session(user_id, 'default')}"}
+    saved = api.put(
+        "/api/agent-templates/qa-tester", json={"changes": {"screen": False}}, headers=operator
+    )
+    assert saved.status_code == 200, saved.text
+
+    read = api.get("/api/agent-templates", headers=viewing)
+    assert read.status_code == 200, read.text
+    assert [(t["id"], t["changes"]) for t in read.json()["templates"]] == [
+        ("qa-tester", {"screen": False})
+    ]
+    changing = api.put(
+        "/api/agent-templates/qa-tester", json={"changes": {"offered": False}}, headers=viewing
+    )
+    assert changing.status_code == 403, changing.text
+    assert api.delete("/api/agent-templates/qa-tester", headers=viewing).status_code == 403
+    with FleetStore(fleet) as store:
+        assert store.agent_templates()["qa-tester"][0] == {"screen": False}
