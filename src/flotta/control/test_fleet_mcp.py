@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 from flotta.control import fleet_mcp
-from flotta.control.fleet_mcp import NEVER, TOOLS, BadCall, Tool, request_for, tool_answer
+from flotta.control.fleet_mcp import (
+    NEVER,
+    TOOLS,
+    WRITES,
+    BadCall,
+    Tool,
+    request_for,
+    tool_answer,
+)
 from flotta.control.test_size_api import MEMBER, OTHER_OWNER, OWNER, X, Y, _api, _as
 from flotta.control.test_size_api import fleet as fleet  # noqa: F401 - the fixture
 
@@ -79,11 +87,26 @@ def test_the_tools_module_reads_no_store_and_imports_nothing_of_flottas():
     assert not re.search(r"store_factory|FleetStore|\.get_box|_conn\b|sqlite|psycopg", code)
 
 
-def test_every_tool_changes_nothing_for_now():
-    """Changing something waits for a person's approval, which is a later slice."""
-    assert {tool.method for tool in TOOLS} == {"GET"}
+def test_only_the_tools_named_as_writes_change_anything():
+    """A tool that changes the account is a decision a reviewer must see: it is
+    declared, and named in `WRITES`. Every other is a `GET` and says it only reads."""
+    changing = {tool.name for tool in TOOLS if tool.method != "GET"}
+    assert changing == WRITES == {"create_client", "set_budget", "add_schedule", "sleep_agent"}
     for tool in TOOLS:
-        assert tool.listed()["annotations"]["readOnlyHint"] is True
+        assert tool.listed()["annotations"]["readOnlyHint"] is (tool.name not in WRITES)
+        assert (tool.body or tool.fixed) == {} or tool.name in WRITES, "a read sends no body"
+        if tool.name in WRITES:
+            # Said in the words a person and a model both read before it is called.
+            assert "Changes the account." in tool.description, tool.name
+
+
+def test_the_ratchet_catches_a_tool_that_changes_something_unannounced(monkeypatch):
+    """Verified by breaking it: a write that is not in `WRITES` fails the test above."""
+    stray = Tool("pause_everything", "Pause", "x" * 40, "/api/boxes/{agent}/sleep", method="POST")
+    monkeypatch.setattr(fleet_mcp, "TOOLS", (*TOOLS, stray))
+    monkeypatch.setitem(globals(), "TOOLS", fleet_mcp.TOOLS)
+    with pytest.raises(AssertionError):
+        test_only_the_tools_named_as_writes_change_anything()
 
 
 @pytest.mark.parametrize("tool", TOOLS, ids=lambda t: t.name)
@@ -92,7 +115,11 @@ def test_a_tool_says_what_it_is_and_takes_only_what_its_route_does(tool):
     placeholders = set(re.findall(r"\{(\w+)\}", tool.path)) - {"org"}
     assert placeholders <= set(tool.required), "a path needs an argument the tool does not ask for"
     assert set(tool.required) <= set(tool.args) and set(tool.query) <= set(tool.args)
-    assert set(tool.args) == placeholders | set(tool.query), "an argument that goes nowhere"
+    assert set(tool.body) <= set(tool.args)
+    assert set(tool.args) == placeholders | set(tool.query) | set(tool.body), (
+        "an argument that goes nowhere"
+    )
+    assert not set(tool.fixed) & set(tool.body.values()), "a fixed field an argument could set"
     assert "org" not in tool.args, "whose account it reads is the caller's, never an argument"
     assert not any(pattern.search(tool.path) for pattern in NEVER), (
         "it reaches what is never a tool"
@@ -299,8 +326,9 @@ def test_spend_is_asked_for_the_way_the_route_takes_it():
             "from": "2026-11-01",
             "to": "2026-11-20",
         },
+        None,
     )
-    assert request_for(spend, {}, org="agency-x") == ("/api/orgs/agency-x/usage", {})
+    assert request_for(spend, {}, org="agency-x") == ("/api/orgs/agency-x/usage", {}, None)
 
 
 def test_spend_through_a_tool_is_the_figure_the_route_gives(fleet):  # noqa: F811
@@ -352,14 +380,153 @@ def test_only_the_callers_way_out_is_used():
     """`handle` reaches a route through what it is given, and through nothing else."""
     asked = []
 
-    async def call_route(method, path, query):
-        asked.append((method, path, query))
+    async def call_route(method, path, query, body):
+        asked.append((method, path, query, body))
         return 200, {"clients": []}
 
     message = {"jsonrpc": "2.0", "id": 7, "method": "tools/call"}
     message["params"] = {"name": "list_clients", "arguments": {}}
     status, body = asyncio.run(fleet_mcp.handle(message, call_route=call_route, org="agency-x"))
     assert status == 200 and body["id"] == 7 and body["result"]["isError"] is False
-    assert asked == [("GET", "/api/orgs/agency-x/clients", {})]
+    assert asked == [("GET", "/api/orgs/agency-x/clients", {}, None)]
     with pytest.raises(BadCall):
         request_for(TOOLS[1], {}, org=None)
+
+
+# -- the tools that change the account ---------------------------------------------------
+
+
+def _tool(name):
+    return next(tool for tool in TOOLS if tool.name == name)
+
+
+def test_a_change_is_sent_as_the_routes_own_body():
+    assert request_for(
+        _tool("set_budget"),
+        {"period": "month", "limit_eur": "50", "action": "pause", "client": "acme", "agent": "b-1"},
+        org="agency-x",
+    ) == (
+        "/api/orgs/agency-x/budgets",
+        {},
+        {"period": "month", "limit_eur": "50", "action": "pause", "client": "acme", "box": "b-1"},
+    )
+    # What was left out is left out: the route's own default stands.
+    assert request_for(
+        _tool("set_budget"), {"period": "day", "limit_eur": "5", "action": "notify"}, org="a"
+    )[2] == {"period": "day", "limit_eur": "5", "action": "notify"}
+    assert request_for(_tool("sleep_agent"), {"agent": "b-1"}, org="a") == (
+        "/api/boxes/b-1/sleep",
+        {},
+        None,
+    )
+
+
+def test_a_schedule_is_only_ever_a_schedule():
+    """A webhook's answer is a secret. The tool that adds a schedule cannot be
+    made to add one: `kind` is fixed, and is no argument."""
+    asked = {"agent": "b-1", "cron": "0 9 * * 1", "tz": "Europe/Lisbon", "prompt": "Report."}
+    assert request_for(_tool("add_schedule"), asked, org="a") == (
+        "/api/boxes/b-1/triggers",
+        {},
+        {"cron": "0 9 * * 1", "tz": "Europe/Lisbon", "prompt": "Report.", "kind": "schedule"},
+    )
+    with pytest.raises(BadCall, match="takes no kind"):
+        request_for(_tool("add_schedule"), {**asked, "kind": "webhook"}, org="a")
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "says"),
+    [
+        ("create_client", {"id": "acme"}, "needs name"),
+        ("create_client", {"id": 7, "name": "Acme"}, "id is string"),
+        ("create_client", {"id": "acme", "name": "Acme", "org": "agency-y"}, "takes no org"),
+        ("set_budget", {"period": "year", "limit_eur": "5", "action": "pause"}, "period is one of"),
+        ("set_budget", {"period": "day", "limit_eur": "5", "action": "kill"}, "action is one of"),
+        ("set_budget", {"period": "day", "limit_eur": 5, "action": "pause"}, "limit_eur is string"),
+        ("set_budget", {"period": "day", "limit_eur": "5", "action": True}, "action is string"),
+        ("sleep_agent", {"agent": "b-1", "force": True}, "takes no force"),
+        ("add_schedule", {"agent": "b-1", "cron": "0 9 * * 1", "tz": "UTC"}, "needs prompt"),
+    ],
+)
+def test_a_change_that_is_not_what_the_tool_takes_is_refused_before_any_route(
+    fleet,  # noqa: F811
+    name,
+    arguments,
+    says,
+):
+    with _api(fleet) as api:
+        answer = _rpc(api, "tools/call", {"name": name, "arguments": arguments}).json()
+        clients = api.get("/api/orgs/agency-x/clients", headers=OWNER).json()["clients"]
+    assert answer["error"]["code"] == -32602 and says in answer["error"]["message"], answer
+    assert [c["id"] for c in clients] == ["acme"]
+
+
+def test_an_owner_changes_the_account_through_a_tool_as_through_the_route(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        made = _data(_call(api, "create_client", {"id": "globex", "name": "Globex"}))
+        budget = _data(
+            _call(
+                api,
+                "set_budget",
+                {"period": "month", "limit_eur": "50", "action": "pause", "client": "globex"},
+            )
+        )
+        schedule = _data(
+            _call(
+                api,
+                "add_schedule",
+                {"agent": X, "cron": "0 9 * * 1", "tz": "Europe/Lisbon", "prompt": "Report."},
+            )
+        )
+        clients = api.get("/api/orgs/agency-x/clients", headers=OWNER).json()["clients"]
+        budgets = api.get("/api/orgs/agency-x/budgets", headers=OWNER).json()["budgets"]
+    assert made["client"]["id"] == "globex"
+    assert sorted(c["id"] for c in clients) == ["acme", "globex"]
+    assert (budget["client"], budget["period"], budget["action"]) == ("globex", "month", "pause")
+    assert [(b["client"], b["limit_eur"]) for b in budgets] == [("globex", "50")]
+    assert (schedule["kind"], schedule["cron"], schedule["tz"]) == (
+        "schedule",
+        "0 9 * * 1",
+        "Europe/Lisbon",
+    )
+    assert "secret" not in schedule
+
+
+def test_a_change_is_refused_to_whoever_the_route_refuses(fleet):  # noqa: F811
+    """No rule is copied here: a builder adds no client, and nobody changes another agency."""
+    with _api(fleet) as api:
+        member = _refused(
+            _call(api, "create_client", {"id": "globex", "name": "Globex"}, headers=MEMBER)
+        )
+        elsewhere = _refused(_call(api, "sleep_agent", {"agent": Y}))
+        theirs = _refused(
+            _call(
+                api,
+                "add_schedule",
+                {"agent": Y, "cron": "0 9 * * 1", "tz": "UTC", "prompt": "Report."},
+            )
+        )
+        clients = api.get("/api/orgs/agency-x/clients", headers=OWNER).json()["clients"]
+        other = api.get("/api/orgs/agency-y/clients", headers=OTHER_OWNER).json()["clients"]
+    assert member and elsewhere and theirs
+    assert "no box" in elsewhere.lower() or "not found" in elsewhere.lower(), elsewhere
+    assert [c["id"] for c in clients] == ["acme"] and [c["id"] for c in other] == ["acme"]
+
+
+def test_what_a_route_refuses_in_a_change_is_said_by_the_tool(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        twice = _refused(_call(api, "create_client", {"id": "acme", "name": "Acme again"}))
+        bad_id = _refused(_call(api, "create_client", {"id": "Not A Slug", "name": "X"}))
+        often = _refused(
+            _call(
+                api,
+                "add_schedule",
+                {"agent": X, "cron": "* * * * *", "tz": "UTC", "prompt": "Too often."},
+            )
+        )
+        amount = _refused(
+            _call(api, "set_budget", {"period": "day", "limit_eur": "lots", "action": "pause"})
+        )
+    assert "acme" in twice and bad_id
+    assert "minute" in often
+    assert "not an amount in euros" in amount

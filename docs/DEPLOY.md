@@ -308,8 +308,14 @@ the tools and the route each one calls.
   (a session, or a token) is passed to the route, in-process. A tool can do what
   that person's click could, and every tenancy and role check is the route's.
   Whose account it reads is the caller's agency, never an argument.
-- **Read tools only, so far.** Never a tool: destroying an agent, minting a
-  token or a key, a secret, billing, anything the operator alone may do.
+- **Most tools read. Four change the account** and say so (`readOnlyHint` is
+  false): add a client, set a budget, add a schedule, put an agent to sleep.
+  Each is the route's own request, so the route's rules hold: a builder adds
+  no client, and nobody changes another agency. A front end shows the person
+  exactly what one will do and waits for their yes before calling it; the
+  Architect does. Never a tool: destroying an agent, minting a token or a key,
+  a secret, a webhook (its answer is a secret), billing, anything the operator
+  alone may do.
 - **Streamable HTTP, plain JSON, no stream.** `initialize`, `ping`,
   `tools/list` and `tools/call`; a `GET` is a 405. A request naming an origin
   other than the web app's is a 403.
