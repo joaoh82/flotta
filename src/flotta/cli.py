@@ -2327,6 +2327,11 @@ def serve(
     interval_s: float = typer.Option(
         60.0, "--reconcile-interval-s", help="Seconds between reconcile sweeps"
     ),
+    fake_upstream: bool = typer.Option(
+        False,
+        "--fake-upstream",
+        help="Answer the Architect's model calls from a stand-in, for $0. Loopback only.",
+    ),
 ) -> None:
     """Run the control plane: the fleet API and the reconcile loop.
 
@@ -2380,14 +2385,54 @@ def serve(
     # one answer to "which proxies are trusted" (`control.app.caller_address`).
     from flotta.provision import warm_release_cache
 
+    architect_transport = _fake_architect(host) if fake_upstream else None
     uvicorn.run(
-        create_app(interval_s=interval_s, warm_release_cache=warm_release_cache),
+        create_app(
+            interval_s=interval_s,
+            warm_release_cache=warm_release_cache,
+            architect_transport=architect_transport,
+        ),
         host=host,
         port=port,
         log_level="info",
         proxy_headers=False,
         log_config=log_config(),
     )
+
+
+def _fake_architect(host: str) -> Any:
+    """The stand-in model for the Architect's calls on a local fleet (FLOTTA-250).
+
+    The same stand-in the local gateway answers agents with: it calls a tool
+    the message names and says what the tool answered, which is enough to try
+    the Architect for nothing. It sets this process up as a fleet whose
+    operator has given the Architect a key, with the stand-in's model and its
+    price, and returns the transport that answers in place of the network.
+    Loopback only, and never over a real database: it writes made-up spend.
+    """
+    from flotta.architect import KEY_ENV
+    from flotta.db import DATABASE_URL_ENV
+    from flotta.gateway.fake import FAKE_MODEL, FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
+
+    def refuse(message: str) -> typer.Exit:
+        typer.secho(message, fg=typer.colors.RED, err=True)
+        return typer.Exit(code=2)
+
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise refuse(f"--fake-upstream answers anyone; bind 127.0.0.1, not {host!r}.")
+    if os.environ.get(DATABASE_URL_ENV):
+        raise refuse(
+            f"--fake-upstream would write made-up spend into ${DATABASE_URL_ENV}. "
+            "Unset it, so this uses a local store."
+        )
+    os.environ[KEY_ENV] = "fake"
+    os.environ["FLOTTA_MODEL_BASE_URL"] = FAKE_UPSTREAM_URL
+    os.environ["FLOTTA_ARCHITECT_MODEL"] = FAKE_MODEL
+    # A made-up price needs a rate to become euros; one is as good as another here.
+    os.environ.setdefault("FLOTTA_EUR_PER_USD", "1")
+    with FleetStore(store_target(None)) as fleet:
+        fleet.refresh_prices([FAKE_PRICE])
+    return FakeUpstream(chunk_delay_s=0.05)
 
 
 @app.command()

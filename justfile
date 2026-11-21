@@ -663,7 +663,8 @@ local control="8080" door="8081" gateway="8083":
     CP= DOOR= GW=
     trap 'kill $CP $DOOR $GW 2>/dev/null; pkill -f "[f]lotta.backends.standin .*--home $FLOTTA_LOCAL_HOME/" || true; pkill -f "$FLOTTA_LOCAL_HOME/[^ ]*/venv/bin/python .*--flotta-box" || true' EXIT
     uv run --extra control flotta gateway --fake-upstream --port {{gateway}} & GW=$!
-    uv run --extra control flotta serve --port {{control}} & CP=$!
+    # The Architect answers from the same stand-in model agents do (FLOTTA-250).
+    uv run --extra control flotta serve --port {{control}} --fake-upstream & CP=$!
     until curl -sf "127.0.0.1:{{control}}/health" >/dev/null; do sleep 0.5; done
     export FLOTTA_CONTROL_TOKEN="$(uv run flotta token mint door --scope fleet:route --days 30 2>/dev/null)"
     FLOTTA_DOOR_LOCAL=1 uv run --extra door flotta door --host 127.0.0.1 --port {{door}} & DOOR=$!
