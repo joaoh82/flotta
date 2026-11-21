@@ -613,3 +613,62 @@ def test_a_long_record_is_readable_through_the_tool_itself(fleet, monkeypatch): 
     assert 0 < len(kept) < len(whole["entries"])
     assert kept == whole["entries"][-len(kept) :]
     assert result["structuredContent"]["left_out"] == len(whole["entries"]) - len(kept)
+
+
+@pytest.mark.parametrize(
+    ("params", "room"),
+    [
+        ({}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": 30_000}}, 30_000),
+        # Never more than this server gives anyone, and never so little that nothing fits.
+        ({"_meta": {"flotta.dev/maxChars": 10_000_000}}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": 5}}, 2_000),
+        ({"_meta": {"flotta.dev/maxChars": -1}}, 2_000),
+        # Anything that is not a whole number says nothing.
+        ({"_meta": {"flotta.dev/maxChars": "30000"}}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": True}}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": 30_000.5}}, 60_000),
+        ({"_meta": {"maxChars": 30_000}}, 60_000),
+        ({"_meta": "flotta.dev/maxChars"}, 60_000),
+        (None, 60_000),
+    ],
+)
+def test_a_caller_says_how_long_an_answer_it_can_read(params, room):
+    assert fleet_mcp.answer_room(params) == room
+
+
+def test_an_answer_is_cut_to_what_the_caller_can_read_with_the_note_first():
+    audit = _tool("get_client_audit")
+    whole = tool_answer(200, _audit(740), audit)
+    half = tool_answer(200, _audit(740), audit, 30_000)
+    text = half["content"][0]["text"]
+
+    assert half["isError"] is False and len(text) <= 30_000
+    assert len(half["structuredContent"]["entries"]) < len(whole["structuredContent"]["entries"])
+    assert half["structuredContent"]["entries"][-1]["n"] == 739
+    # A reader that stops early has read that the rest was left out.
+    assert text.startswith('{"note":"Only the latest '), text[:60]
+    assert list(half["structuredContent"])[:2] == ["note", "left_out"]
+    # And a tool with nowhere to cut is refused at the caller's length, not this server's.
+    clients = {"clients": [{"id": f"c{i}", "name": "x" * 40} for i in range(700)]}
+    assert tool_answer(200, clients, _tool("list_clients"))["isError"] is False
+    assert tool_answer(200, clients, _tool("list_clients"), 30_000)["isError"] is True
+
+
+def test_the_callers_length_reaches_the_answer_through_the_server(fleet):  # noqa: F811
+    from flotta.store import FleetStore
+
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name(X)
+        for n in range(40):
+            store.add_event("box", box.id, "model_set", {"model": f"some/model-{n}", "by": "ana"})
+    call = {"name": "get_client_audit", "arguments": {"client": "acme"}}
+    with _api(fleet) as api:
+        whole = _rpc(api, "tools/call", call).json()["result"]
+        short = _rpc(api, "tools/call", {**call, "_meta": {"flotta.dev/maxChars": 2_000}}).json()[
+            "result"
+        ]
+    assert "left_out" not in whole["structuredContent"]
+    assert short["isError"] is False and len(short["content"][0]["text"]) <= 2_000
+    assert short["structuredContent"]["left_out"] > 0
+    assert short["structuredContent"]["entries"][-1] == whole["structuredContent"]["entries"][-1]

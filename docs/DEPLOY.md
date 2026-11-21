@@ -308,6 +308,12 @@ the tools and the route each one calls.
   (a session, or a token) is passed to the route, in-process. A tool can do what
   that person's click could, and every tenancy and role check is the route's.
   Whose account it reads is the caller's agency, never an argument.
+- **An answer is at most 60,000 characters.** A caller that can read less says
+  so in the call (`params._meta["flotta.dev/maxChars"]`), and the answer is
+  fitted to that here, where it is known which end matters. A client's record
+  too long to read keeps its latest entries, whole, with a note first saying
+  how many were left out. Any other answer that is too long is refused with
+  what to ask for instead.
 - **Most tools read. Four change the account** and say so (`readOnlyHint` is
   false): add a client, set a budget, add a schedule, put an agent to sleep.
   Each is the route's own request, so the route's rules hold: a builder adds
