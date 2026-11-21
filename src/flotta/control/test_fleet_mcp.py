@@ -530,3 +530,86 @@ def test_what_a_route_refuses_in_a_change_is_said_by_the_tool(fleet):  # noqa: F
     assert "acme" in twice and bad_id
     assert "minute" in often
     assert "not an amount in euros" in amount
+
+
+# -- an answer too long to read whole -----------------------------------------------------
+
+
+def _audit(n, size=200):
+    entries = [
+        {"at": f"2026-11-{1 + i // 100:02d}", "n": i, "summary": "x" * size} for i in range(n)
+    ]
+    return {"org": "agency-x", "client": "acme", "entries": entries, "truncated": False}
+
+
+def test_a_record_too_long_to_read_keeps_its_latest_entries_and_says_what_it_left_out():
+    audit = _tool("get_client_audit")
+    answer = tool_answer(200, _audit(740), audit)
+    body = answer["structuredContent"]
+    kept = [entry["n"] for entry in body["entries"]]
+
+    assert answer["isError"] is False
+    assert len(answer["content"][0]["text"]) <= fleet_mcp.MAX_ANSWER_CHARS
+    # The latest, in the order they were, with none cut in the middle.
+    assert kept == list(range(740 - len(kept), 740)) and 100 < len(kept) < 740
+    assert body["left_out"] == 740 - len(kept)
+    assert f"Only the latest {len(kept)} of 740 entries are here" in body["note"]
+    assert "narrower window" in body["note"]
+    assert (body["org"], body["client"], body["truncated"]) == ("agency-x", "acme", False)
+    # As much as fits: one more entry would not have.
+    assert len(answer["content"][0]["text"]) > fleet_mcp.MAX_ANSWER_CHARS - 1000
+
+
+def test_a_record_that_fits_is_given_whole_and_says_nothing_of_leaving_out():
+    answer = tool_answer(200, _audit(20), _tool("get_client_audit"))
+    assert len(answer["structuredContent"]["entries"]) == 20
+    assert (
+        "left_out" not in answer["structuredContent"] and "note" not in answer["structuredContent"]
+    )
+
+
+def test_only_a_tool_that_says_where_is_cut_and_only_when_something_fits(monkeypatch):
+    # A tool with nowhere to cut is refused as before, with what to ask for.
+    refused = tool_answer(200, _audit(740), _tool("list_clients"))
+    assert refused["isError"] is True and "too long to read whole" in refused["content"][0]["text"]
+    assert tool_answer(200, _audit(740))["isError"] is True
+    audit = _tool("get_client_audit")
+    # Not the shape it cuts: refused, not guessed at.
+    assert tool_answer(200, {"entries": "x" * 70_000}, audit)["isError"] is True
+    assert tool_answer(200, ["x" * 70_000], audit)["isError"] is True
+    # One entry that alone is too long leaves nothing to keep.
+    assert tool_answer(200, _audit(1, size=70_000), audit)["isError"] is True
+    # And a refusal by the route is still the route's words.
+    assert tool_answer(404, {"detail": "no client 'acme'"}, audit)["content"][0]["text"] == (
+        "no client 'acme'"
+    )
+
+
+def test_the_first_end_is_kept_for_a_list_that_starts_with_what_matters():
+    newest_first = Tool("x", "X", "y" * 30, "/api/x", trim=("runs", "first"))
+    body = {"runs": [{"n": i, "said": "x" * 500} for i in range(400)]}
+    answer = tool_answer(200, body, newest_first)["structuredContent"]
+    assert [run["n"] for run in answer["runs"]] == list(range(len(answer["runs"])))
+    assert f"Only the first {len(answer['runs'])} of 400 runs are here" in answer["note"]
+
+
+def test_a_long_record_is_readable_through_the_tool_itself(fleet, monkeypatch):  # noqa: F811
+    """Found on staging: a test client's last 30 days were 162,000 characters,
+    and the tool answered only that it was too long."""
+    from flotta.store import FleetStore
+
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name(X)
+        for n in range(12):
+            store.add_event("box", box.id, "model_set", {"model": f"some/model-{n}", "by": "ana"})
+    monkeypatch.setattr(fleet_mcp, "MAX_ANSWER_CHARS", 1500)
+    with _api(fleet) as api:
+        whole = api.get("/api/clients/acme/audit", headers=OWNER).json()
+        answer = _call(api, "get_client_audit", {"client": "acme"})
+    result = answer["result"]
+    assert len(whole["entries"]) > 2, "the fixture has a record worth cutting"
+    assert result["isError"] is False, result
+    kept = result["structuredContent"]["entries"]
+    assert 0 < len(kept) < len(whole["entries"])
+    assert kept == whole["entries"][-len(kept) :]
+    assert result["structuredContent"]["left_out"] == len(whole["entries"]) - len(kept)

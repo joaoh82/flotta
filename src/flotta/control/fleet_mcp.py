@@ -84,6 +84,10 @@ class Tool:
     method: str = "GET"
     body: dict[str, str] = field(default_factory=dict)
     fixed: dict[str, Any] = field(default_factory=dict)
+    #: The list in its answer that is cut when the whole answer is too long to
+    #: read, and the end of it that is kept: `("entries", "last")` for a record
+    #: kept oldest first, whose latest entries are the ones asked about.
+    trim: tuple[str, str] | None = None
 
     @property
     def read_only(self) -> bool:
@@ -322,7 +326,9 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "get_client_audit",
         "A client's record",
-        "The record of what was done for one client: who changed what, and when.",
+        "The record of what was done for one client: who changed what, and when. The last "
+        "30 days if no window is named. For a busy client only the latest entries fit, and "
+        "the answer says how many were left out: name a window of a few days to read those.",
         "/api/clients/{client}/audit",
         args={
             "client": _CLIENT,
@@ -331,6 +337,7 @@ TOOLS: tuple[Tool, ...] = (
         },
         required=("client",),
         query={"from": "from", "to": "to"},
+        trim=("entries", "last"),
     ),
     # -- what changes something. Each waits for a person's yes in the front end. ------
     Tool(
@@ -525,10 +532,50 @@ def rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def tool_answer(status: int, body: Any) -> dict[str, Any]:
-    """A route's answer as a tool's: the JSON it gave, or why it refused."""
+def _fitted(body: Any, trim: tuple[str, str]) -> dict[str, Any] | None:
+    """`body` with its long list cut to what can be read, and a note saying so,
+    or `None` when even that cannot be done. The end named is kept whole item
+    by whole item: nothing is cut in the middle of an entry."""
+    name, end = trim
+    if not isinstance(body, dict) or not isinstance(body.get(name), list):
+        return None
+    items = body[name]
+    dumps = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))  # noqa: E731
+    # Room for everything else in the answer, and for the note about what is missing.
+    room = MAX_ANSWER_CHARS - len(dumps({**body, name: []})) - 400
+    kept: list[Any] = []
+    for item in reversed(items) if end == "last" else items:
+        room -= len(dumps(item)) + 1
+        if room < 0:
+            break
+        kept.append(item)
+    if not kept:
+        return None
+    if end == "last":
+        kept.reverse()
+    left_out = len(items) - len(kept)
+    which = "latest" if end == "last" else "first"
+    return {
+        **body,
+        name: kept,
+        "left_out": left_out,
+        "note": f"Only the {which} {len(kept)} of {len(items)} {name} are here: all of them "
+        f"were too long to read. The other {left_out} were left out. Ask for a narrower "
+        "window to read those.",
+    }
+
+
+def tool_answer(status: int, body: Any, tool: Tool | None = None) -> dict[str, Any]:
+    """A route's answer as a tool's: the JSON it gave, or why it refused. One
+    too long to read whole is cut to what fits when the tool says where
+    (`Tool.trim`), and is refused with what to ask for when it does not."""
     if 200 <= status < 300:
         text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        if len(text) > MAX_ANSWER_CHARS and tool is not None and tool.trim is not None:
+            fitted = _fitted(body, tool.trim)
+            if fitted is not None:
+                body = fitted
+                text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         if len(text) > MAX_ANSWER_CHARS:
             return {
                 "content": [
@@ -599,7 +646,7 @@ async def handle(
         except BadCall as exc:
             return 200, rpc_error(request_id, -32602, str(exc))
         status, body = await call_route(tool.method, path, query, sent)
-        return 200, rpc_result(request_id, tool_answer(status, body))
+        return 200, rpc_result(request_id, tool_answer(status, body, tool))
     return 200, rpc_error(request_id, -32601, f"no method {method!r}")
 
 
