@@ -676,6 +676,13 @@ local control="8080" door="8081" gateway="8083":
 run box prompt:
     uv run flotta run {{box}} {{quote(prompt)}} --wait
 
+# Offline and free: it prints the list, and calls nothing. They are served at
+# POST /mcp on the control plane, each as a call to the route beside it, made
+# with the caller's own credential.
+# FLOTTA-250: the fleet API's own MCP tools, and the route each one calls
+mcp-tools:
+    uv run python -m flotta.control.fleet_mcp
+
 # M14.2: an agent's runs, newest first
 runs box:
     uv run flotta runs {{box}}
