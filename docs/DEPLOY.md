@@ -314,6 +314,12 @@ the tools and the route each one calls.
   too long to read keeps its latest entries, whole, with a note first saying
   how many were left out. Any other answer that is too long is refused with
   what to ask for instead.
+- **A day that ends a window is counted whole.** A route reads a bare day as
+  its midnight, so `to=2026-11-21` stops before the 21st begins. A tool that
+  takes the end of a window (spend, a client's record) sends the day after
+  instead, or nothing when the day named is today or later, so the window ends
+  now. A moment (`2026-11-21T12:00:00Z`) goes as given. The routes themselves
+  are unchanged.
 - **Most tools read. Four change the account** and say so (`readOnlyHint` is
   false): add a client, set a budget, add a schedule, put an agent to sleep.
   Each is the route's own request, so the route's rules hold: a builder adds

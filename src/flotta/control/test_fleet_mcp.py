@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -317,28 +318,70 @@ def test_spend_is_asked_for_the_way_the_route_takes_it():
         "from": "2026-11-01",
         "to": "2026-11-20",
     }
-    assert request_for(spend, asked, org="agency-x") == (
+    # The 20th is the last day asked for, so the route is told to stop as the 21st begins.
+    assert request_for(spend, asked, org="agency-x", today=date(2026, 11, 25)) == (
         "/api/orgs/agency-x/usage",
         {
             "client": "acme",
             "box": "b-1",
             "group": "day,client",
             "from": "2026-11-01",
-            "to": "2026-11-20",
+            "to": "2026-11-21",
         },
         None,
     )
     assert request_for(spend, {}, org="agency-x") == ("/api/orgs/agency-x/usage", {}, None)
 
 
+# Found on staging, 21 Nov 2026, with a real model: asked what was spent this
+# month it named a window "to 2026-11-21", the route read that as the midnight
+# the 21st began, and the answer said "1 to 21 November" with a figure that
+# held nothing of the 21st.
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [
+        ("2026-11-20", "2026-11-21"),  # a day that has ended: all of it
+        ("2026-10-31", "2026-11-01"),  # across a month
+        ("2026-11-21", None),  # today: the window ends now, as the route ends it itself
+        ("2026-11-25", None),  # a day to come: nothing runs past now
+        ("2026-11-21T12:00:00Z", "2026-11-21T12:00:00Z"),  # a moment is a moment
+        ("2026-11-21T00:00:00+00:00", "2026-11-21T00:00:00+00:00"),
+        ("soon", "soon"),  # no date: the route says so in its own words
+        ("2026-13-45", "2026-13-45"),
+    ],
+)
+def test_a_day_that_ends_a_window_is_counted_whole(given, sent):
+    for name in ("get_spend", "get_client_audit"):
+        asked = {"client": "acme", "from": "2026-11-01", "to": given}
+        _, query, _ = request_for(_tool(name), asked, org="a", today=date(2026, 11, 21))
+        # Where it starts is a day's midnight, which is what a first day means.
+        assert query["from"] == "2026-11-01"
+        assert query.get("to") == sent, name
+
+
+def test_every_tool_that_takes_the_end_of_a_window_counts_its_last_day():
+    ends = {"to", "until", "before", "end"}
+    for tool in TOOLS:
+        assert ends & set(tool.args) <= set(tool.through), tool.name
+        assert set(tool.through) <= set(tool.query), tool.name
+
+
 def test_spend_through_a_tool_is_the_figure_the_route_gives(fleet):  # noqa: F811
     with _api(fleet) as api:
         window = {"from": "2026-11-01", "to": "2026-11-20"}
         through = _data(_call(api, "get_spend", {"group_by": ["client"], **window}))
+        # The tool's last day is counted whole: the route's window stops as the next begins.
         direct = api.get(
-            "/api/orgs/agency-x/usage", params={"group": "client", **window}, headers=OWNER
+            "/api/orgs/agency-x/usage",
+            params={"group": "client", "from": "2026-11-01", "to": "2026-11-21"},
+            headers=OWNER,
         )
+        today = datetime.now(UTC).date()
+        so_far = {"from": (today - timedelta(days=3)).isoformat(), "to": today.isoformat()}
+        now = _data(_call(api, "get_spend", so_far))
     assert through == direct.json() and through["org"] == "agency-x"
+    # Named as the last day, today is in the window: it ends now, not at the midnight before.
+    assert now["to"] > f"{today.isoformat()}T00:00:00+00:00"
 
 
 @pytest.mark.parametrize(

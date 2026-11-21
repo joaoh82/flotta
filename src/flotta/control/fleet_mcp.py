@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -59,6 +60,10 @@ _STRING = {"type": "string"}
 _AGENT = {"type": "string", "description": "The agent's id (b-…) or its address, from list_agents."}
 _CLIENT = {"type": "string", "description": "The client's id, from list_clients."}
 _DAY = "A day (2026-11-01) or a moment (2026-11-01T00:00:00Z)."
+_LAST_DAY = (
+    "A day (2026-11-21), which is counted whole, or a moment (2026-11-21T12:00:00Z). "
+    "Leave it out for a window that runs up to now."
+)
 _LIMIT = {"type": "integer", "minimum": 1, "maximum": 200, "description": "How many, newest first."}
 
 
@@ -84,6 +89,10 @@ class Tool:
     method: str = "GET"
     body: dict[str, str] = field(default_factory=dict)
     fixed: dict[str, Any] = field(default_factory=dict)
+    #: The arguments that end a window. A route reads a bare day as its midnight,
+    #: so `to=2026-11-21` stops before the 21st begins; someone who names a last
+    #: day means all of it. See `_through`.
+    through: tuple[str, ...] = ()
     #: The list in its answer that is cut when the whole answer is too long to
     #: read, and the end of it that is kept: `("entries", "last")` for a record
     #: kept oldest first, whose latest entries are the ones asked about.
@@ -163,9 +172,10 @@ TOOLS: tuple[Tool, ...] = (
                 "description": "Break the total down by any of these. `box` is the agent.",
             },
             "from": {"type": "string", "description": f"Start of the window. {_DAY}"},
-            "to": {"type": "string", "description": f"End of the window. {_DAY}"},
+            "to": {"type": "string", "description": f"End of the window. {_LAST_DAY}"},
         },
         query={"client": "client", "agent": "box", "group_by": "group", "from": "from", "to": "to"},
+        through=("to",),
     ),
     Tool(
         "list_budgets",
@@ -333,10 +343,11 @@ TOOLS: tuple[Tool, ...] = (
         args={
             "client": _CLIENT,
             "from": {"type": "string", "description": f"Start of the window. {_DAY}"},
-            "to": {"type": "string", "description": f"End of the window. {_DAY}"},
+            "to": {"type": "string", "description": f"End of the window. {_LAST_DAY}"},
         },
         required=("client",),
         query={"from": "from", "to": "to"},
+        through=("to",),
         trim=("entries", "last"),
     ),
     # -- what changes something. Each waits for a person's yes in the front end. ------
@@ -476,11 +487,37 @@ def _body_value(tool: Tool, name: str, value: Any) -> Any:
     return value
 
 
+_BARE_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _through(value: str, today: date) -> str | None:
+    """What a route is sent for a window that ends with `value`, or `None` to send
+    nothing and let the route end it now.
+
+    A route reads a bare day as its midnight, the moment the day begins, so a
+    window "to 2026-11-21" holds nothing of the 21st. Asked for a month up to
+    today, a model names today, and the figure it is given leaves today out
+    while its answer says "1 to 21 November" (found on staging, 21 Nov 2026).
+    So a bare day here means the whole of it: the route is sent the day after,
+    or nothing at all when that day has not ended, since a window cannot run
+    past now. A moment, and anything that is no date, goes as given: the route
+    has its own words for what it cannot read.
+    """
+    if not _BARE_DAY.fullmatch(value):
+        return value
+    try:
+        last = date.fromisoformat(value)
+    except ValueError:
+        return value
+    return None if last >= today else (last + timedelta(days=1)).isoformat()
+
+
 def request_for(
-    tool: Tool, arguments: dict[str, Any], *, org: str | None
+    tool: Tool, arguments: dict[str, Any], *, org: str | None, today: date | None = None
 ) -> tuple[str, dict[str, str], dict[str, Any] | None]:
-    """The path, query and JSON body of the route `tool` calls with `arguments`. Pure.
-    The body is `None` for a tool that sends none.
+    """The path, query and JSON body of the route `tool` calls with `arguments`.
+    The body is `None` for a tool that sends none. Pure, given `today`: the day
+    it is in UTC, which decides whether a window's last day has ended.
 
     Refuses an argument the tool does not take, a missing one it needs, and a
     path that needs the caller's agency when there is none.
@@ -510,6 +547,11 @@ def request_for(
             value = ",".join(str(item) for item in value)
         elif isinstance(value, bool) or not isinstance(value, (str, int)):
             raise BadCall(f"{name} is text or a whole number")
+        if name in tool.through and isinstance(value, str):
+            ends = _through(value.strip(), today or datetime.now(UTC).date())
+            if ends is None:
+                continue
+            value = ends
         query[param] = str(value)
     if not tool.body and not tool.fixed:
         return path, query, None
