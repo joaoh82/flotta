@@ -950,6 +950,8 @@ PURGED_BY: dict[str, str] = {
         for table in (
             "alert_deliveries",
             "api_keys",
+            "architect_chats",
+            "architect_messages",
             "architect_usage",
             "boxes",
             "budget_events",
@@ -1577,6 +1579,40 @@ class Budget:
     #: The org's spend ceiling (FLOTTA-241), made from its row by
     #: `ceiling_budget` and never stored here: period `billing`.
     ceiling: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectChat:
+    """One person's conversation with the Architect, in one org (FLOTTA-250)."""
+
+    id: str
+    org: str
+    user_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectMessage:
+    """One message of a chat. `content` is JSON the front end wrote, kept as text."""
+
+    id: str
+    chat_id: str
+    seq: int
+    role: str
+    content: str
+    created_at: str
+
+
+def _architect_chat(row: Any) -> ArchitectChat:
+    return ArchitectChat(
+        row["id"], row["org_id"], row["user_id"], row["title"], row["created_at"], row["updated_at"]
+    )
+
+
+class ArchitectChatFullError(RuntimeError):
+    """A person has as many chats, or a chat as many messages, as are kept."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2593,6 +2629,8 @@ class FleetStore:
                 gone(table, "org_id = ?", o)
             gone("usage", "org_id = ?", o)
             gone("architect_usage", "org_id = ?", o)
+            gone("architect_messages", "org_id = ?", o)
+            gone("architect_chats", "org_id = ?", o)
             gone("api_keys", "org_id = ?", o)
             gone("triggers", "org_id = ?", o)
             gone("budgets", "org_id = ?", o)
@@ -3032,6 +3070,16 @@ class FleetStore:
             )
             self._conn.execute(
                 "DELETE FROM sessions WHERE user_id = ? AND org_id = ?", (user_id, org_id)
+            )
+            # Their conversations with the Architect in this org (FLOTTA-250):
+            # theirs alone, about an account they no longer have.
+            self._conn.execute(
+                "DELETE FROM architect_messages WHERE chat_id IN "
+                "(SELECT id FROM architect_chats WHERE user_id = ? AND org_id = ?)",
+                (user_id, org_id),
+            )
+            self._conn.execute(
+                "DELETE FROM architect_chats WHERE user_id = ? AND org_id = ?", (user_id, org_id)
             )
             user = self.get_user(user_id)
             if user is not None:
@@ -5046,6 +5094,141 @@ class FleetStore:
             )
             for r in rows
         }
+
+    # -- a person's conversations with the Architect (FLOTTA-250) ---------------
+
+    def create_architect_chat(
+        self, org: str, user_id: str, title: str = "", *, limit: int | None = None
+    ) -> ArchitectChat:
+        """A new, empty chat of `user_id`'s in `org`. With `limit`, refused once
+        they have that many: the count and the insert share one guarded
+        transaction, so two at once cannot both be the last."""
+        if self.get_org(org) is None:
+            raise UnknownEntityError(f"no org {org!r}")
+        now = _utcnow()
+        chat = ArchitectChat(f"ac-{uuid.uuid4().hex}", org, user_id, title, now, now)
+        with self._conn.transaction(guard="architect_chats"):
+            if limit is not None:
+                held = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM architect_chats WHERE org_id = ? AND user_id = ?",
+                    (org, user_id),
+                ).fetchone()["n"]
+                if int(held) >= limit:
+                    raise ArchitectChatFullError(
+                        f"you have {limit} chats with the Architect, which is the most kept: "
+                        "delete one to start another"
+                    )
+            self._conn.execute(
+                "INSERT INTO architect_chats (id, org_id, user_id, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat.id, org, user_id, title, now, now),
+            )
+        return chat
+
+    def architect_chats(
+        self, org: str, user_id: str, *, q: str | None = None, limit: int = 50
+    ) -> list[ArchitectChat]:
+        """`user_id`'s chats in `org`, the one last added to first. `q` keeps
+        those whose title holds it, whatever its letter case."""
+        where = ["org_id = ?", "user_id = ?"]
+        params: list[Any] = [org, user_id]
+        if q:
+            # LIKE's own wildcards are escaped: a search for "50%" is for those characters.
+            wanted = q.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            where.append("LOWER(title) LIKE ? ESCAPE '!'")
+            params.append(f"%{wanted}%")
+        params.append(max(0, limit))
+        rows = self._conn.execute(
+            "SELECT id, org_id, user_id, title, created_at, updated_at FROM architect_chats "
+            f"WHERE {' AND '.join(where)} ORDER BY updated_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [_architect_chat(r) for r in rows]
+
+    def architect_chat(self, org: str, user_id: str, chat_id: str) -> ArchitectChat | None:
+        """One chat, if it is `user_id`'s in `org`. Anyone else's is not there."""
+        row = self._conn.execute(
+            "SELECT id, org_id, user_id, title, created_at, updated_at FROM architect_chats "
+            "WHERE id = ? AND org_id = ? AND user_id = ?",
+            (chat_id, org, user_id),
+        ).fetchone()
+        return _architect_chat(row) if row else None
+
+    def architect_messages(self, chat_id: str) -> list[ArchitectMessage]:
+        """A chat's messages, in the order they were added."""
+        rows = self._conn.execute(
+            "SELECT id, chat_id, seq, role, content, created_at FROM architect_messages "
+            "WHERE chat_id = ? ORDER BY seq",
+            (chat_id,),
+        ).fetchall()
+        return [
+            ArchitectMessage(
+                r["id"], r["chat_id"], int(r["seq"]), r["role"], r["content"], r["created_at"]
+            )
+            for r in rows
+        ]
+
+    def append_architect_messages(
+        self,
+        org: str,
+        user_id: str,
+        chat_id: str,
+        messages: Sequence[tuple[str, str]],
+        *,
+        limit: int | None = None,
+    ) -> list[ArchitectMessage]:
+        """Add `(role, content as JSON)` messages to the end of a chat, all or none.
+
+        The chat must be `user_id`'s in `org`. With `limit`, refused if the chat
+        would then hold more than that many. Numbering and the count are read
+        and written under one guard, so two turns added at once do not take the
+        same place.
+        """
+        with self._conn.transaction(guard="architect_messages"):
+            if self.architect_chat(org, user_id, chat_id) is None:
+                raise UnknownEntityError(f"no chat {chat_id!r}")
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(seq), 0) AS last FROM architect_messages "
+                "WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if limit is not None and int(row["n"]) + len(messages) > limit:
+                raise ArchitectChatFullError(
+                    f"a chat with the Architect holds at most {limit} messages: start a new one"
+                )
+            now = _utcnow()
+            added: list[ArchitectMessage] = []
+            for offset, (role, content) in enumerate(messages, start=1):
+                message = ArchitectMessage(
+                    f"am-{uuid.uuid4().hex}", chat_id, int(row["last"]) + offset, role, content, now
+                )
+                self._conn.execute(
+                    "INSERT INTO architect_messages (id, chat_id, org_id, seq, role, content, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (message.id, chat_id, org, message.seq, role, content, now),
+                )
+                added.append(message)
+            if added:
+                self._conn.execute(
+                    "UPDATE architect_chats SET updated_at = ? WHERE id = ?", (now, chat_id)
+                )
+        return added
+
+    def rename_architect_chat(self, org: str, user_id: str, chat_id: str, title: str) -> bool:
+        """Give a chat of `user_id`'s a title. Whether there was such a chat."""
+        if self.architect_chat(org, user_id, chat_id) is None:
+            return False
+        self._conn.execute("UPDATE architect_chats SET title = ? WHERE id = ?", (title, chat_id))
+        return True
+
+    def delete_architect_chat(self, org: str, user_id: str, chat_id: str) -> bool:
+        """Delete a chat of `user_id`'s, and everything said in it. Whether there was one."""
+        with self._conn.transaction(guard="architect_messages"):
+            if self.architect_chat(org, user_id, chat_id) is None:
+                return False
+            self._conn.execute("DELETE FROM architect_messages WHERE chat_id = ?", (chat_id,))
+            self._conn.execute("DELETE FROM architect_chats WHERE id = ?", (chat_id,))
+        return True
 
     def usage_summary(
         self,

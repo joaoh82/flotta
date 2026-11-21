@@ -1329,6 +1329,16 @@ Two fleet settings, in HQ or with `PUT /api/settings`:
 - `GET /api/architect/allowance` tells an agency where its month stands, and
   `GET /api/architect/spend` tells the operator what every agency's has cost.
 
+**Each person's chats are kept here too**, so a front end needs no database of
+its own: `GET` and `POST /api/architect/chats`, `GET`, `PATCH` and `DELETE
+/api/architect/chats/{id}`, and `POST /api/architect/chats/{id}/messages` to add
+a turn. A message is `{"role": "user" | "assistant" | "tool", "content": <any
+JSON>}`, kept as given and never read. A chat is its person's alone: no
+colleague, owner or operator reads it, and a session viewing an agency keeps and
+reads none. It is deleted when its person is removed from the agency, and when
+the agency is closed and purged. A chat holds at most 500 messages and a person
+at most 500 chats.
+
 ## What is not automated yet
 
 Everything above should be a recipe. In rough order of how much each would
