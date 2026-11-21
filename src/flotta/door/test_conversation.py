@@ -27,6 +27,7 @@ from flotta.door.app import BoxUnavailable, ControlPlane, create_door
 from flotta.door.conversation import (
     METHOD_REFUSED,
     SESSION_NOT_FOUND,
+    UNAVAILABLE,
     WAITING_EVENT,
     ConversationGate,
     latest_of_the_agency,
@@ -366,7 +367,6 @@ def test_a_client_cannot_act_on_a_session_it_was_not_given(fleet):
         "shell.exec",
         "cli.exec",
         "slash.exec",
-        "config.set",
         "model.save_key",
         "session.list",
         "session.delete",
@@ -380,6 +380,138 @@ def test_a_client_cannot_act_on_a_session_it_was_not_given(fleet):
 def test_what_a_conversation_does_not_use_is_refused_through_the_door(fleet, method):
     with Talk(fleet, "ana") as ana:
         assert ana.rpc(method, session_id="x")["error"]["code"] == METHOD_REFUSED
+
+
+# -- moving a conversation onto the agent's model (FLOTTA-128) ------------------
+
+
+def _agent_model(fleet, model):
+    with FleetStore(fleet["path"]) as store:
+        store.set_box_model(fleet["box"], model)
+
+
+def _move(talk, live, value, **extra):
+    return talk.rpc(
+        "config.set",
+        session_id=live,
+        key="model",
+        value=value,
+        confirm_expensive_model=True,
+        **extra,
+    )
+
+
+def test_a_client_moves_its_conversation_onto_the_agents_model(fleet):
+    """The ticket's done-when: the next visit after a change is on the new model."""
+    _agent_model(fleet, "agency/pick")
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        assert _move(ana, live, "agency/pick")["result"]["value"] == "agency/pick"
+
+
+def test_a_client_asking_for_any_other_model_is_refused(fleet):
+    _agent_model(fleet, "agency/pick")
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        for value in ("pricey/model", "", None, ["agency/pick"], "AGENCY/PICK"):
+            refused = _move(ana, live, value)
+            assert refused["error"]["code"] == METHOD_REFUSED, value
+
+
+def test_the_model_is_read_when_asked_not_when_the_socket_opened(fleet):
+    """The agency changes it while a client's socket is open: the old one is
+    no longer open to the client, and the new one is."""
+    _agent_model(fleet, "first/model")
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        assert _move(ana, live, "first/model")["result"]["value"] == "first/model"
+        _agent_model(fleet, "second/model")
+        assert _move(ana, live, "first/model")["error"]["code"] == METHOD_REFUSED
+        assert _move(ana, live, "second/model")["result"]["value"] == "second/model"
+
+
+@pytest.mark.parametrize("key", ["yolo", "provider", "approvals.mode", None])
+def test_no_other_setting_is_open_to_a_client(fleet, key):
+    _agent_model(fleet, "agency/pick")
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        refused = ana.rpc("config.set", session_id=live, key=key, value="agency/pick")
+        assert refused["error"]["code"] == METHOD_REFUSED
+
+
+def test_a_client_cannot_move_a_session_it_was_not_given(fleet):
+    """Without a session Hermes would set the agent's own config for good."""
+    _agent_model(fleet, "agency/pick")
+    with Talk(fleet, "owner") as owner:
+        _, theirs = owner.say("private")
+        with Talk(fleet, "ana") as ana:
+            assert _move(ana, theirs, "agency/pick")["error"]["code"] == SESSION_NOT_FOUND
+            refused = ana.rpc("config.set", key="model", value="agency/pick")
+            assert refused["error"]["code"] == SESSION_NOT_FOUND
+
+
+def _web_apps_model(read):
+    """flotta-cloud's `conversationFacts`: a pending change's model, else `model`."""
+    change = read.get("model_change") or {}
+    return change["model"] if change.get("state") == "pending" else read["model"]
+
+
+def test_the_door_and_the_web_app_read_the_same_model(fleet):
+    """The web app asks to move onto what it reads, so the door's word must
+    be that one, whichever source it comes from, a change under way included."""
+    from flotta.provision import MODEL_CHANGE_STARTED
+
+    headers = _bearer(fleet["tokens"]["owner"])
+    path = f"/api/boxes/{fleet['box']}"
+    plane = ControlPlane(
+        base_url="http://control",
+        token=mint(subject="door", scopes={SCOPE_FLEET_ROUTE}, key=KEY),
+        transport=httpx.ASGITransport(app=fleet["api"].app),
+    )
+    for own in (None, "agency/pick", "pending"):
+        if own == "pending":
+            with FleetStore(fleet["path"]) as store:
+                store.add_event("box", fleet["box"], MODEL_CHANGE_STARTED, {"model": "new/model"})
+        else:
+            _agent_model(fleet, own)
+        read = fleet["api"].get(path, headers=headers).json()
+        read = read.get("box", read)
+        assert _run(plane.model_of(fleet["box"])) == _web_apps_model(read), own
+    assert _web_apps_model(read) == "new/model"
+
+
+@pytest.mark.parametrize("person", ["owner", "ana"])
+def test_only_the_door_reads_the_conversation_model(fleet, person):
+    """A person's token learns nothing of how the agency runs the agent here."""
+    path = f"/api/boxes/{fleet['box']}/conversation-model"
+    assert fleet["api"].get(path, headers=_bearer(fleet["tokens"][person])).status_code == 403
+    address = fleet["api"].get(
+        f"/api/boxes/{fleet['box']}/address", headers=_bearer(fleet["tokens"]["ana"])
+    )
+    assert address.is_success and "model" not in address.json()["box"]
+
+
+def test_a_change_under_way_is_the_model_to_move_onto(fleet):
+    """The web app moves a reconnect during the restart onto the change's model."""
+    from flotta.provision import MODEL_CHANGE_STARTED
+
+    _agent_model(fleet, "old/model")
+    with FleetStore(fleet["path"]) as store:
+        store.add_event(
+            "box", fleet["box"], MODEL_CHANGE_STARTED, {"model": "new/model", "source": "agent"}
+        )
+    with Talk(fleet, "ana") as ana:
+        live = ana.rpc("session.create")["result"]["session_id"]
+        assert _move(ana, live, "old/model")["error"]["code"] == METHOD_REFUSED
+        assert _move(ana, live, "new/model")["result"]["value"] == "new/model"
+
+
+def test_the_agency_still_sets_what_it_likes(fleet):
+    """A full-access ticket is forwarded unread, as before."""
+    _agent_model(fleet, "agency/pick")
+    with Talk(fleet, "owner") as owner:
+        live = owner.rpc("session.create")["result"]["session_id"]
+        assert "result" in _move(owner, live, "another/model")
 
 
 def test_a_ticket_is_narrow_unless_its_holder_can_change_the_agent(fleet):
@@ -455,6 +587,65 @@ class Plane:
         if self.broken:
             raise BoxUnavailable("down", status=503)
         self.recorded.append(session_id)
+
+
+class ModelPlane(Plane):
+    def __init__(self, model="agency/pick", *, down=False):
+        super().__init__()
+        self.model, self.down, self.asked = model, down, 0
+
+    async def model_of(self, box_id):
+        self.asked += 1
+        if self.down:
+            raise BoxUnavailable("down", status=503)
+        return self.model
+
+
+def _with_live(gate, live="live-1"):
+    gate._live.add(live)
+    return gate
+
+
+def test_a_move_is_rebuilt_from_what_it_may_carry():
+    gate = _with_live(_gate(ModelPlane()))
+    frame = _frame(
+        "config.set",
+        session_id="live-1",
+        key="model",
+        value="agency/pick",
+        confirm_expensive_model="yes please",
+        profile="other",
+    )
+    forwarded = json.loads(_run(gate.from_client(frame)).to_box)["params"]
+    assert forwarded == {"session_id": "live-1", "key": "model", "value": "agency/pick"}
+
+
+def test_a_move_the_door_cannot_check_never_reaches_the_box():
+    gate = _with_live(_gate(ModelPlane(down=True)))
+    step = _run(
+        gate.from_client(
+            _frame("config.set", session_id="live-1", key="model", value="agency/pick")
+        )
+    )
+    assert step.to_box is None
+    assert json.loads(step.to_client)["error"]["code"] == UNAVAILABLE
+
+
+def test_an_agent_with_no_model_on_record_is_moved_nowhere():
+    gate = _with_live(_gate(ModelPlane(model=None)))
+    step = _run(gate.from_client(_frame("config.set", session_id="live-1", key="model", value="x")))
+    assert step.to_box is None
+
+
+def test_a_move_on_a_session_not_held_does_not_ask_the_control_plane():
+    plane = ModelPlane()
+    step = _run(
+        _gate(plane).from_client(
+            _frame("config.set", session_id="nope", key="model", value="agency/pick")
+        )
+    )
+    assert json.loads(step.to_client)["error"]["code"] == SESSION_NOT_FOUND
+    assert plane.asked == 0
 
 
 def _gate(plane=None, *, conversation_only=True):

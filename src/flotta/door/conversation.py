@@ -82,6 +82,16 @@ span every conversation, so a client asking it in words can still reach them.
 That is for guardrails (FLOTTA-124), and it is why this says what a *ticket* can
 open rather than what a client can learn.
 
+**A client may move its conversation onto the agent's model, and only that
+(FLOTTA-128).** Hermes's `session.resume` restores the model the session was
+using, so after the agency changes an agent's model the web app moves a
+resumed conversation with `config.set` (FLOTTA-101). Open to anyone, that would
+let a client's person pick any model and spend the agency's money. So a ticket
+may call it with `key: "model"`, on a session this socket holds, and with the
+value the control plane has for the agent at that moment, read fresh. Any other
+key or model is refused. A client can then only ever ask for what the agency
+already chose.
+
 ## The agent's screen (FLOTTA-210)
 
 A ticket's screen grant (`Token.screen`, FLOTTA-209) adds Hermes's `display.*`
@@ -181,9 +191,23 @@ def screen_methods(grant: str | None) -> dict[str, frozenset[str]]:
 APPROVAL_RESPOND = "approval.respond"
 _APPROVAL_RESPOND_PARAMS = frozenset({"session_id", "choice", "request_id"})
 
+#: Moving a conversation onto the agent's model (FLOTTA-128). Open to a client
+#: for one key and one value: the model the control plane has for the agent.
+#: See the module.
+CONFIG_SET = "config.set"
+_CONFIG_SET_PARAMS = frozenset({"session_id", "key", "value", "confirm_expensive_model"})
+MODEL_KEY = "model"
+
 #: The ones that act on a session, and so must name a live id of this socket's.
 _ON_A_SESSION = frozenset(
-    {"prompt.submit", "image.attach_bytes", "file.attach", "image.detach", APPROVAL_RESPOND}
+    {
+        "prompt.submit",
+        "image.attach_bytes",
+        "file.attach",
+        "image.detach",
+        APPROVAL_RESPOND,
+        CONFIG_SET,
+    }
 )
 
 #: What the box may ask a client and be told. It may decline anything else it was
@@ -217,6 +241,8 @@ class Conversations(Protocol):
     async def record_client_conversation(self, box_id: str, session_id: str) -> None: ...
 
     async def working(self, box_id: str) -> dict[str, Any] | None: ...
+
+    async def model_of(self, box_id: str) -> str | None: ...
 
 
 def _error(rid: Any, code: int, message: str) -> str:
@@ -526,6 +552,10 @@ class ConversationGate:
         if method in _ON_A_SESSION and params.get("session_id") not in self._live:
             self._note(f"{method} on a session this socket wasn't given")
             return Step(to_client=_error(rid, SESSION_NOT_FOUND, "session not found"))
+        if method == CONFIG_SET:
+            refused = await self._refused_setting(rid, params)
+            if refused is not None:
+                return refused
         if method == "session.create":
             self._creating.add(rid)
         elif method == "session.resume":
@@ -565,9 +595,37 @@ class ConversationGate:
             return {"choice": choice} if choice in CLIENT_APPROVAL_CHOICES else None
         return result if asked in ANSWERED_BY_A_CLIENT else None
 
+    async def _refused_setting(self, rid: Any, params: dict[str, Any]) -> Step | None:
+        """`config.set`'s refusal, or None: the agent's own model, and nothing else.
+
+        `confirm_expensive_model` is passed on because the operator offering
+        the model already confirmed it, and only as a boolean: Hermes reads it
+        as one, and anything else is not this page's request.
+        """
+        if params.get("key") != MODEL_KEY:
+            self._note("a setting a client can't change")
+            return Step(to_client=_error(rid, METHOD_REFUSED, "that is not open to this ticket"))
+        if not isinstance(params.get("confirm_expensive_model", False), bool):
+            params.pop("confirm_expensive_model")
+        try:
+            wanted = await self._plane.model_of(self._box_id)
+        except Exception as exc:
+            return Step(to_client=_error(rid, UNAVAILABLE, f"could not ask for its model: {exc}"))
+        value = params.get("value")
+        if wanted is None or not isinstance(value, str) or value != wanted:
+            self._note("a model the agency didn't choose")
+            return Step(
+                to_client=_error(
+                    rid, METHOD_REFUSED, "only the agent's own model is open to this ticket"
+                )
+            )
+        return None
+
     def _allowed_params(self, method: Any) -> frozenset[str] | None:
         if not isinstance(method, str):
             return None
+        if method == CONFIG_SET:
+            return _CONFIG_SET_PARAMS
         if method == APPROVAL_RESPOND and self.answers_approvals:
             return _APPROVAL_RESPOND_PARAMS
         if method in self._screen_methods:
