@@ -107,6 +107,17 @@ Each item names where it lives in this repository.
   whether a merge has been deployed to production. (`src/flotta/pulls.py`)
 - **A screen, if you want one.** An agent can have a desktop and browser that a person can watch
   and take over, for a sign-in or a payment step. (`src/flotta/handoffs.py`, `fly/screen_tools.py`)
+- **The fleet API as tools for an assistant.** `POST /mcp` on the control plane offers the fleet
+  API as MCP tools to an assistant acting for a signed-in person: clients, agents, spend,
+  budgets, runs, requests, pull requests, tools, the team and a client's record. A tool is a
+  route called as that person, so it reads what their own click could and no more. Four tools
+  change the account (add a client, set a budget, add a schedule, put an agent to sleep) and say
+  so, so a front end can show the person what one will do and wait for their yes. Destroying an
+  agent, minting a token and reading a secret are never tools. The control plane also gives such
+  an assistant a model to think with, on a key of its own, with a monthly allowance per agency
+  that is kept out of every client's budget and invoice, and it keeps each person's chats.
+  `just mcp-tools` lists the tools. (`src/flotta/control/fleet_mcp.py`,
+  `/api/architect/*`, `docs/DEPLOY.md`)
 - **A CLI, a fleet API and a fleet view.** `flotta` (every command takes `--json`), the control
   plane's HTTP API, and `dashboard/`, a small Next.js view of the fleet.
 
@@ -117,6 +128,7 @@ This repository is the runtime. Self-hosted, it gives you:
 - the control plane and fleet API, the front door, the model gateway and the agent image;
 - tenancy, accounts, sign-in by link, budgets, metering, runs, triggers, triage, approvals,
   MCP servers and rules, all over HTTP;
+- the fleet API as MCP tools, with a model route and kept chats, for an assistant of your own;
 - the `flotta` CLI and the `dashboard/` fleet view.
 
 It does not include the screens people click through. The managed platform at
@@ -125,12 +137,20 @@ It does not include the screens people click through. The managed platform at
 - the web app for agencies and their clients: conversations, the requests and approvals pages,
   agent settings, budgets, usage and a CSV export for invoicing;
 - a portal where a client sees its own requests and what was done;
+- the Architect, an assistant on every page of the agency's web app. It answers questions about
+  the account by reading it as the person asking, with the figures it found as cards that link
+  to their page, and it makes a change only after that person approves it;
 - sign-up, plans and billing;
 - running and upgrading the infrastructure for you.
 
 ![The managed web app's clients page, with illustrative data: each client's agents, whether they are awake, model spend against the monthly budget, and the last run](docs/images/managed-clients.png)
 
 *The managed web app's clients page, from flotta.dev. The data is illustrative.*
+
+![The Architect in the managed web app, open on the Budgets page: its answer to which budgets are closest to their limit, as a table, with cards for the figures it found](docs/images/managed-architect.png)
+
+*The Architect, answering from the account through this runtime's tools. Taken on Flotta's test
+environment, with a made-up agency.*
 
 The web app talks to this runtime only through its HTTP API, so anything it does, you can do
 with the API. When the hosted product needs something new from the runtime, it is added here
