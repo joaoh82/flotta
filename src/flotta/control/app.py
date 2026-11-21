@@ -10301,12 +10301,14 @@ def create_app(
         except ValueError:
             return JSONResponse(tools.rpc_error(None, -32700, "not JSON"), status_code=400)
 
-        async def call_route(method: str, path: str, query: dict[str, str]) -> tuple[int, Any]:
+        async def call_route(
+            method: str, path: str, query: dict[str, str], body: dict[str, Any] | None
+        ) -> tuple[int, Any]:
             # As the caller, and only as the caller: the one header that says who they are.
             headers = {"authorization": authorization} if authorization else {}
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://control") as inner:
-                answer = await inner.request(method, path, params=query, headers=headers)
+                answer = await inner.request(method, path, params=query, headers=headers, json=body)
             try:
                 return answer.status_code, answer.json()
             except ValueError:
