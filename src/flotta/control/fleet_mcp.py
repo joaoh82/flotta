@@ -84,6 +84,10 @@ class Tool:
     method: str = "GET"
     body: dict[str, str] = field(default_factory=dict)
     fixed: dict[str, Any] = field(default_factory=dict)
+    #: The list in its answer that is cut when the whole answer is too long to
+    #: read, and the end of it that is kept: `("entries", "last")` for a record
+    #: kept oldest first, whose latest entries are the ones asked about.
+    trim: tuple[str, str] | None = None
 
     @property
     def read_only(self) -> bool:
@@ -322,7 +326,9 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "get_client_audit",
         "A client's record",
-        "The record of what was done for one client: who changed what, and when.",
+        "The record of what was done for one client: who changed what, and when. The last "
+        "30 days if no window is named. For a busy client only the latest entries fit, and "
+        "the answer says how many were left out: name a window of a few days to read those.",
         "/api/clients/{client}/audit",
         args={
             "client": _CLIENT,
@@ -331,6 +337,7 @@ TOOLS: tuple[Tool, ...] = (
         },
         required=("client",),
         query={"from": "from", "to": "to"},
+        trim=("entries", "last"),
     ),
     # -- what changes something. Each waits for a person's yes in the front end. ------
     Tool(
@@ -525,11 +532,78 @@ def rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def tool_answer(status: int, body: Any) -> dict[str, Any]:
-    """A route's answer as a tool's: the JSON it gave, or why it refused."""
+#: The least a caller may ask an answer be cut to. Below it nothing useful fits.
+MIN_ANSWER_CHARS = 2_000
+
+#: Where a caller says how long an answer it can read (`params._meta`).
+ROOM_META = "flotta.dev/maxChars"
+
+
+def answer_room(params: Any) -> int:
+    """How long this call's answer may be: what the caller says it can read
+    (`_meta["flotta.dev/maxChars"]`), never more than `MAX_ANSWER_CHARS`.
+
+    A caller that reads less than that and says nothing would cut the answer
+    itself, from the end, and lose the latest of a record and the note saying
+    the rest was left out. Saying so lets the cut be made here, where it is
+    known which end matters."""
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    asked = meta.get(ROOM_META) if isinstance(meta, dict) else None
+    if isinstance(asked, bool) or not isinstance(asked, int):
+        return MAX_ANSWER_CHARS
+    return max(MIN_ANSWER_CHARS, min(asked, MAX_ANSWER_CHARS))
+
+
+def _fitted(body: Any, trim: tuple[str, str], room: int) -> dict[str, Any] | None:
+    """`body` with its long list cut to what can be read in `room` characters,
+    and a note saying so, or `None` when even that cannot be done. The end
+    named is kept whole item by whole item: nothing is cut in the middle of an
+    entry. The note comes first, so a reader that stops early has read it."""
+    name, end = trim
+    if not isinstance(body, dict) or not isinstance(body.get(name), list):
+        return None
+    items = body[name]
+    dumps = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))  # noqa: E731
+    # Room for everything else in the answer, and for the note about what is missing.
+    room = room - len(dumps({**body, name: []})) - 400
+    kept: list[Any] = []
+    for item in reversed(items) if end == "last" else items:
+        room -= len(dumps(item)) + 1
+        if room < 0:
+            break
+        kept.append(item)
+    if not kept:
+        return None
+    if end == "last":
+        kept.reverse()
+    left_out = len(items) - len(kept)
+    which = "latest" if end == "last" else "first"
+    return {
+        "note": f"Only the {which} {len(kept)} of {len(items)} {name} are here: all of them "
+        f"were too long to read. The other {left_out} were left out. Ask for a narrower "
+        "window to read those.",
+        "left_out": left_out,
+        **body,
+        name: kept,
+    }
+
+
+def tool_answer(
+    status: int, body: Any, tool: Tool | None = None, room: int | None = None
+) -> dict[str, Any]:
+    """A route's answer as a tool's: the JSON it gave, or why it refused. One
+    too long to read whole (longer than `room`, or `MAX_ANSWER_CHARS`) is cut
+    to what fits when the tool says where (`Tool.trim`), and is refused with
+    what to ask for when it does not."""
     if 200 <= status < 300:
+        limit = MAX_ANSWER_CHARS if room is None else room
         text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-        if len(text) > MAX_ANSWER_CHARS:
+        if len(text) > limit and tool is not None and tool.trim is not None:
+            fitted = _fitted(body, tool.trim, limit)
+            if fitted is not None:
+                body = fitted
+                text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        if len(text) > limit:
             return {
                 "content": [
                     {
@@ -599,7 +673,7 @@ async def handle(
         except BadCall as exc:
             return 200, rpc_error(request_id, -32602, str(exc))
         status, body = await call_route(tool.method, path, query, sent)
-        return 200, rpc_result(request_id, tool_answer(status, body))
+        return 200, rpc_result(request_id, tool_answer(status, body, tool, answer_room(params)))
     return 200, rpc_error(request_id, -32601, f"no method {method!r}")
 
 
