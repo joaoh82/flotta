@@ -1327,7 +1327,8 @@ Two fleet settings, in HQ or with `PUT /api/settings`:
 - **Who may call:** a signed-in owner or builder of an active agency. Not a
   client's people, not a token, and not while viewing an agency as its owner.
 - `GET /api/architect/allowance` tells an agency where its month stands, and
-  `GET /api/architect/spend` tells the operator what every agency's has cost.
+  `GET /api/architect/spend` tells the operator what every agency's has cost,
+  and whether it can answer at all (`ready`, and `has_key`: never the key).
 
 **Each person's chats are kept here too**, so a front end needs no database of
 its own: `GET` and `POST /api/architect/chats`, `GET`, `PATCH` and `DELETE

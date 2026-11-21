@@ -9998,7 +9998,12 @@ def create_app(
     @app.get("/api/architect/spend")
     def architect_spend(token: Token | None = needs_read) -> Any:
         """What every agency's Architect has cost this month, for whoever pays
-        for it: one entry per org that made a call, and the allowance each has."""
+        for it: one entry per org that made a call, and the allowance each has.
+
+        And whether it can answer at all (`ready`): it needs a model key of its
+        own (`has_key`, never the key), somewhere to send calls, and a model.
+        Without them it has cost nothing because it has answered nobody, and a
+        page that showed only the nothing would be hiding why."""
         _require_operator(token, "read what the Architect costs across the fleet")
         from flotta import architect
         from flotta.budgets import period_start
@@ -10013,10 +10018,14 @@ def create_app(
             model = architect.model_for(store)
         finally:
             store.close()
+        has_key = bool((os.environ.get(architect.KEY_ENV) or "").strip())
+        has_url = bool((os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip())
         return {
             "since": since.isoformat(),
             "allowance_eur_nano": allowance,
             "model": model,
+            "has_key": has_key,
+            "ready": has_key and has_url and model is not None,
             "orgs": [
                 {
                     "org": org_id,
