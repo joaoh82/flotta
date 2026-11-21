@@ -1336,6 +1336,42 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        45,
+        "architect usage: what the Architect's model calls cost, by org and person",
+        # FLOTTA-250. The Architect is an assistant for an agency's people, and
+        # the fleet pays for its model calls up to a monthly allowance per org.
+        # Its calls are no agent's, so they cannot go in `usage` (a row there
+        # needs a box), and must not: a client's budget and an agency's invoice
+        # are sums over `usage`, and this is neither's. `user_id` is kept as
+        # text with no reference, so what an org spent outlives the person who
+        # asked. A NULL `cost_eur_nano` is a call nobody could price, which the
+        # allowance check treats as unknown, never as free.
+        (
+            """
+            CREATE TABLE architect_usage (
+                id                  TEXT PRIMARY KEY,
+                org_id              TEXT NOT NULL REFERENCES orgs(id),
+                user_id             TEXT NOT NULL,
+                model               TEXT NOT NULL,
+                upstream            TEXT NOT NULL,
+                tokens_in           INTEGER NOT NULL,
+                tokens_out          INTEGER NOT NULL,
+                tokens_cached       INTEGER NOT NULL DEFAULT 0,
+                currency            TEXT,
+                upstream_cost_nano  BIGINT,
+                eur_per_usd         TEXT,
+                cost_eur_nano       BIGINT,
+                status              INTEGER,
+                estimated           INTEGER NOT NULL DEFAULT 0,
+                cost_reported       INTEGER NOT NULL DEFAULT 0,
+                at                  TEXT NOT NULL,
+                idempotency_key     TEXT NOT NULL UNIQUE
+            )
+            """,
+            "CREATE INDEX architect_usage_org_at ON architect_usage (org_id, at)",
+        ),
+    ),
 )
 
 

@@ -82,6 +82,10 @@ projects:
               # request waits for a person.
               - key: TYPESAFE_API_KEY
                 sync: false
+              # Optional: the Architect's own model calls (step 12). A provider
+              # key for this and nothing else. Unset, the Architect answers 503.
+              - key: FLOTTA_ARCHITECT_API_KEY
+                sync: false
               # Optional: agencies connect their own GitHub (step 7d).
               - key: FLOTTA_GITHUB_APP_SLUG
                 sync: false
