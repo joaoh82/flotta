@@ -552,12 +552,14 @@ def _box_dict(
 
 
 def _model_of(store: Any, box_id: str) -> str | None:
-    """The model an agent is to be on, as its single-box read says (`model`).
+    """The model an agent is to be on: a change under way's, else its own.
 
-    The front door holds a client to it (FLOTTA-128), so the two must agree:
-    the web app asks the door to move a conversation onto the read's model,
-    or onto a change under way, which a reconnect during the restart reads
-    before the change has recorded its result (FLOTTA-101).
+    The front door holds a client to it (FLOTTA-128), so it must be what the
+    web app asks for: the single-box read's `model_change.model` while that is
+    `pending`, else its `model` (flotta-cloud `conversationFacts`). A reconnect
+    during the restart reads it before the change has recorded its result
+    (FLOTTA-101). A change that then fails leaves a client on the model the
+    agency asked for, which the operator's list already allows.
     """
     from flotta.provision import fleet_model, model_changes, model_given_by_default
 
@@ -9234,10 +9236,23 @@ def create_app(
                     "client": box.client,
                     # Whether the door speaks Hermes or the box contract (M17.2).
                     "runtime": box.runtime,
-                    # The one model a client's conversation may move onto (FLOTTA-128).
-                    "model": _model_of(store, box.id),
                 }
             }
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/conversation-model")
+    def conversation_model(box_id: str, token: Token | None = needs_fleet_route) -> Any:
+        """The one model a client's conversation may move onto (FLOTTA-128).
+
+        The front door's alone, asked only when a client asks to move: not on
+        `/address`, which every request resolves through and a person's
+        `box:chat` token reads, since the model is how the agency runs it.
+        """
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            return {"box_id": box.id, "model": _model_of(store, box.id)}
         finally:
             store.close()
 

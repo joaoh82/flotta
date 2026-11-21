@@ -450,9 +450,17 @@ def test_a_client_cannot_move_a_session_it_was_not_given(fleet):
             assert refused["error"]["code"] == SESSION_NOT_FOUND
 
 
+def _web_apps_model(read):
+    """flotta-cloud's `conversationFacts`: a pending change's model, else `model`."""
+    change = read.get("model_change") or {}
+    return change["model"] if change.get("state") == "pending" else read["model"]
+
+
 def test_the_door_and_the_web_app_read_the_same_model(fleet):
-    """The web app asks to move onto the single-box read's `model`, so the
-    door's word must be that one, whichever source it comes from."""
+    """The web app asks to move onto what it reads, so the door's word must
+    be that one, whichever source it comes from, a change under way included."""
+    from flotta.provision import MODEL_CHANGE_STARTED
+
     headers = _bearer(fleet["tokens"]["owner"])
     path = f"/api/boxes/{fleet['box']}"
     plane = ControlPlane(
@@ -460,11 +468,27 @@ def test_the_door_and_the_web_app_read_the_same_model(fleet):
         token=mint(subject="door", scopes={SCOPE_FLEET_ROUTE}, key=KEY),
         transport=httpx.ASGITransport(app=fleet["api"].app),
     )
-    for own in (None, "agency/pick"):
-        _agent_model(fleet, own)
+    for own in (None, "agency/pick", "pending"):
+        if own == "pending":
+            with FleetStore(fleet["path"]) as store:
+                store.add_event("box", fleet["box"], MODEL_CHANGE_STARTED, {"model": "new/model"})
+        else:
+            _agent_model(fleet, own)
         read = fleet["api"].get(path, headers=headers).json()
         read = read.get("box", read)
-        assert _run(plane.model_of(fleet["box"])) == read["model"]
+        assert _run(plane.model_of(fleet["box"])) == _web_apps_model(read), own
+    assert _web_apps_model(read) == "new/model"
+
+
+@pytest.mark.parametrize("person", ["owner", "ana"])
+def test_only_the_door_reads_the_conversation_model(fleet, person):
+    """A person's token learns nothing of how the agency runs the agent here."""
+    path = f"/api/boxes/{fleet['box']}/conversation-model"
+    assert fleet["api"].get(path, headers=_bearer(fleet["tokens"][person])).status_code == 403
+    address = fleet["api"].get(
+        f"/api/boxes/{fleet['box']}/address", headers=_bearer(fleet["tokens"]["ana"])
+    )
+    assert address.is_success and "model" not in address.json()["box"]
 
 
 def test_a_change_under_way_is_the_model_to_move_onto(fleet):

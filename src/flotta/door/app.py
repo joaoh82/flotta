@@ -968,8 +968,10 @@ class ControlPlane:
         the agent, but a client may ask to move a conversation the moment it
         reconnects, and the answer must be the agency's latest word.
         """
-        response = await self._call("GET", f"/api/boxes/{box_id}/address", name=box_id, verb="read")
-        model = (response.json().get("box") or {}).get("model")
+        response = await self._call(
+            "GET", f"/api/boxes/{box_id}/conversation-model", name=box_id, verb="read"
+        )
+        model = response.json().get("model")
         return model if isinstance(model, str) and model else None
 
     async def working(self, box_id: str) -> dict[str, Any] | None:
