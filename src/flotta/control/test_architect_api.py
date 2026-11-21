@@ -480,11 +480,50 @@ def test_the_operator_reads_what_every_agencys_architect_cost_this_month(fleet, 
     assert answer.status_code == 200, answer.text
     body = answer.json()
     assert (body["allowance_eur_nano"], body["model"]) == (10 * NANO, FAKE_MODEL)
+    assert (body["has_key"], body["ready"]) == (True, True)
     assert body["orgs"] == [
         {"org": "agency-x", "spent_eur_nano": 3_500_000_000, "unpriced": 0, "calls": 2},
         {"org": "agency-y", "spent_eur_nano": 9_000_000_000, "unpriced": 0, "calls": 1},
     ]
     assert refused.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("unset", "has_key"),
+    [
+        ((architect.KEY_ENV,), False),
+        (("FLOTTA_MODEL_BASE_URL",), True),
+        (("FLOTTA_MODEL",), True),
+    ],
+)
+def test_the_operator_is_told_when_the_architect_cannot_answer_and_never_its_key(
+    fleet, upstream, monkeypatch, unset, has_key
+):
+    """It has cost nothing because it has answered nobody: the route says which."""
+    for name in unset:
+        monkeypatch.delenv(name)
+    operator = {
+        "Authorization": "Bearer "
+        + mint(subject="josh", scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE}, key=KEY)
+    }
+
+    with _api(fleet, upstream) as api:
+        answer = api.get("/api/architect/spend", headers=operator)
+
+    body = answer.json()
+    assert (body["has_key"], body["ready"]) == (has_key, False), body
+    assert ARCHITECT_KEY not in answer.text
+
+
+def test_a_key_of_only_spaces_is_no_key(fleet, upstream, monkeypatch):
+    monkeypatch.setenv(architect.KEY_ENV, "   ")
+    operator = {
+        "Authorization": "Bearer "
+        + mint(subject="josh", scopes={SCOPE_FLEET_READ, SCOPE_FLEET_WRITE}, key=KEY)
+    }
+    with _api(fleet, upstream) as api:
+        body = api.get("/api/architect/spend", headers=operator).json()
+    assert (body["has_key"], body["ready"]) == (False, False)
 
 
 def test_a_closed_orgs_calls_go_when_it_is_purged(fleet):
