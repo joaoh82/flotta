@@ -265,10 +265,9 @@ def test_the_door_refuses_a_key():
 
     secret = "flotta_key_" + "a" * 43
 
-    for kwargs in ({"header": f"Bearer {secret}"}, {"header": None, "query_token": secret}):
-        with pytest.raises(BoxUnavailable) as refused:
-            authorize(key=KEY, allow_query=True, **kwargs)
-        assert refused.value.status == 401
+    with pytest.raises(BoxUnavailable) as refused:
+        authorize(header=f"Bearer {secret}", key=KEY)
+    assert refused.value.status == 401
 
 
 def test_a_key_cannot_make_or_revoke_a_key(api):

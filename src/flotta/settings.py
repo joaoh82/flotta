@@ -1,6 +1,7 @@
 """Fleet settings a person can change, and where they win over the environment.
 
-**Flotta is used through the desktop app.** How long an agent stays awake, how
+**Flotta is used through an app, not a terminal** (the desktop app then, the
+web app since D17). How long an agent stays awake, how
 often the loop sweeps, what a container-second costs — all of it was a process
 environment variable, which means it could only be changed by whoever deploys
 the control plane, with a restart. That is the wrong owner and the wrong place

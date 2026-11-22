@@ -45,14 +45,16 @@ deliberate:
   to route around it with a socat forwarder, and the workaround was the wrong
   answer — it would have removed a layer rather than passed one.
 
-## WebSocket auth: a header, or the query string for the desktop app
+## WebSocket auth: a header, never the query string
 
 A WS upgrade takes `Authorization` like any request, which is what `flotta chat`
-and a colleague's question send. The desktop app couldn't set headers, so the
-door also accepts `?access_token=` for WS upgrades, never for plain HTTP. That
-has a real cost: query strings land in logs and proxy access records in a way
-headers do not, so the door's own log hides every query value
-(`flotta.server_logs`, FLOTTA-118). The path can go with the app (FLOTTA-80).
+and a colleague's question send, and a browser comes with a ticket (below). The
+desktop app couldn't set headers, so the door used to accept `?access_token=` on
+a WS upgrade too, and query strings land in logs and proxy access records in a
+way headers do not. The path left with the app (FLOTTA-80). A token in the query
+is now ignored: still stripped before proxying, so the box never receives it,
+and still hidden in the door's own log (`flotta.server_logs`, FLOTTA-118), for
+any old client that sends one.
 
 ## A browser comes with a ticket (M12.5)
 
@@ -757,25 +759,15 @@ def host_to_box_name(host: str | None, *, domain: str | None = None) -> str:
     return label
 
 
-def authorize(
-    *,
-    header: str | None,
-    query_token: str | None = None,
-    key: str | None = None,
-    allow_query: bool = False,
-) -> Token:
+def authorize(*, header: str | None, key: str | None = None) -> Token:
     """Validate the caller's Flotta token and require `box:chat`.
 
-    `allow_query` is passed only by the WebSocket path. A browser cannot set
-    headers on a WS handshake, so the token has to travel in the URL there —
-    and a query string is logged in places a header is not, which is why plain
-    HTTP never gets the same allowance.
+    From the `Authorization` header only, on HTTP and WebSocket alike: a token
+    in a URL is logged in places a header is not (FLOTTA-80, FLOTTA-118).
     """
     raw: str | None = None
     if header and header.lower().startswith("bearer "):
         raw = header.split(" ", 1)[1].strip()
-    elif allow_query and query_token:
-        raw = query_token.strip()
 
     if not raw:
         raise BoxUnavailable("missing bearer token", status=401)
@@ -1784,12 +1776,7 @@ def create_door(
                     key=key,
                 )
             else:
-                token = authorize(
-                    header=websocket.headers.get("authorization"),
-                    query_token=websocket.query_params.get("access_token"),
-                    key=key,
-                    allow_query=True,
-                )
+                token = authorize(header=websocket.headers.get("authorization"), key=key)
             if screen and not display_ticket:
                 # Hermes would refuse it, and only after the box was woken for it.
                 raise BoxUnavailable(
@@ -1920,8 +1907,9 @@ def create_door(
 
         heartbeat = asyncio.create_task(keep_awake())
 
-        # Rebuilt from the filtered pairs rather than passed through: the raw
-        # query carries `access_token`, and the box must not receive it.
+        # Rebuilt from the filtered pairs rather than passed through: an old
+        # client's query may still carry `access_token`, and the box must not
+        # receive it.
         from urllib.parse import urlencode
 
         pairs = strip_door_params(websocket.query_params)
@@ -2127,9 +2115,10 @@ _HOP_BY_HOP = frozenset(
 
 
 #: Query parameters the door consumes and must not pass upstream.
-#: `access_token` is the WS handshake's only way to carry a Flotta token — a
-#: browser cannot set headers there — which makes it a *credential in the URL*,
-#: and forwarding it hands the box a token for the fleet it lives in.
+#: `access_token` was the desktop app's way to carry a Flotta token on a WS
+#: handshake (gone with FLOTTA-80). The door no longer reads it, but an old
+#: client may still send one, and forwarding it would hand the box a token for
+#: the fleet it lives in.
 _DOOR_QUERY_PARAMS = frozenset({"access_token"})
 
 

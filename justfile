@@ -426,7 +426,7 @@ user-add EMAIL ROLE ORG="default" CLIENT="":
 # spend their time — client-side timings plus each model call's latency, cache
 # and upstream from Hermes's own log — as a Markdown report (FLOTTA-61).
 # Fresh conversations each round, so it does not disturb one in progress, but
-# the web app will open on the measurement's conversation afterwards.
+# the agent's latest conversation will be the measurement's afterwards.
 latency box="eng-g" rounds="3":
     #!/usr/bin/env bash
     set -euo pipefail

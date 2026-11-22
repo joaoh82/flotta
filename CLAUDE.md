@@ -550,8 +550,10 @@ conventions, and the sharp edges below.
   processing..."`), not the agent — never show it. A terminal command that
   fails has `error: null` and a non-zero `exit_code`, so reading only `error`
   calls it a success. **`message.complete`'s text is only the final segment**:
-  whatever the agent said before a tool is *not* repeated, so the app turns
-  that narration into its own line (`Step::Said`) when the tool starts.
+  whatever the agent said before a tool is *not* repeated, so the desktop
+  app turned that narration into its own line (`Step::Said`) when the tool
+  started, and the web app's conversation (flotta-cloud
+  `src/conversation/hermes.ts`) has to do the same.
   The desktop app's `a_turn_shows_its_steps_as_they_happen` (`just app-live`)
   re-checked both on a Hermes bump until the app was removed (FLOTTA-80); now
   check them by hand in a live web-app conversation (FLOTTA-61).
@@ -564,23 +566,27 @@ conventions, and the sharp edges below.
   `{"jsonrpc":"2.0","id":"srq-…","result":{"choice":"once"}}`. A request that
   times out or is interrupted is withdrawn with a `request.cancel`
   `{id, method, reason}` event. The same mechanism carries clarify, sudo and
-  secret prompts. Rolled onto it, the app ignored the frame: no card, and
-  every approval denied by the 60s timeout, with the live test reporting "the
-  model never reached the gate" while each turn took 65s (FLOTTA-64). The app
-  now reads both forms and answers each on its own path (`answer_for`). **A
+  secret prompts. Rolled onto it, the desktop app ignored the frame: no card,
+  and every approval denied by the 60s timeout, with the live test reporting
+  "the model never reached the gate" while each turn took 65s (FLOTTA-64). It
+  then read both forms and answered each on its own path (`answer_for`), as the
+  web app's conversation and the door's gate (`door/conversation.py`) do. **A
   Hermes bump is a protocol change until a live conversation says otherwise** —
   hold one with an agent in the web app before calling it done. The live test
   that did this, `just app-live`, left with the desktop app (FLOTTA-80).
-- **Approvals are granted by pattern, not by command — so the app never offers
+- **Approvals are granted by pattern, not by command — so nothing offers
   `always`.** Hermes records `session` and `always` against the command's
   `pattern_key` (e.g. `delete in root path`), not the command itself. Measured
   on `eng-g`: answering `session` for `rm -rf /tmp/…-a` let `rm -rf /tmp/…-b`
   run with **no approval asked**. `always` does the same **permanently**,
   writing the pattern to `command_allowlist` in `$HERMES_HOME/config.yaml` on
   the volume — surviving restarts, re-images and updates, invisible in the app.
-  A button beside one command must not grant a category forever, so
-  `APPROVAL_CHOICES` in `agent.rs` omits `always`: `read_approval` drops it from
-  the card and `valid_choice` refuses to send it. The card names the pattern
+  A button beside one command must not grant a category forever, so the web
+  app's `APPROVAL_CHOICES` (flotta-cloud `src/conversation/hermes.ts`) omits
+  `always`: `validChoice` drops it from the card, and `approvalAnswers` offers
+  only once and deny. For a client's ticket the door enforces it too, rebuilding
+  every answer from `CLIENT_APPROVAL_CHOICES` (`flotta.approval_choices`). The
+  desktop app did the same in `agent.rs` until it was removed (FLOTTA-80). The card names the pattern
   that "Allow for this conversation" would cover (FLOTTA-62). `session` is not
   persisted — `config.yaml` is unchanged after one.
 - **To trigger an approval on purpose, ask for a routine command, not a scary
