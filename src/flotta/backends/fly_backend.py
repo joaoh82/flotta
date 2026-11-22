@@ -752,8 +752,17 @@ class FlyBackend:
         Here that reading would free a name whose machine is still billing.
         """
         app = self.config.app_for(box_name)
+        if not self._app_listed(app):
+            # No app, nothing of it: a shared app is gone once a destroy took
+            # it, or before the first create ever made it.
+            return False
         if app == self.config.app:
             return bool(self._machines(app, strict=True))
+        return True
+
+    def _app_listed(self, app: str) -> bool:
+        """Whether Fly lists `app`. Strict, unlike `_app_exists`: a `flyctl`
+        that could not answer raises `BackendError` instead of saying no."""
         result = self._flyctl("apps", "list", "--json", app=None, check=False)
         if result.returncode != 0:
             why = _reason(result.stderr) or f"flyctl exited {result.returncode}"
@@ -778,12 +787,13 @@ class FlyBackend:
         agent: that refuses, and someone removes the machine by hand.
         """
         app = self.config.app_for(box_name)
+        if not self.leftover(box_name):
+            return
         if app == self.config.app:
             raise BackendError(
                 f"{app} is the fleet's shared app; remove this agent's machine from it by hand"
             )
-        if self.leftover(box_name):
-            self._flyctl("apps", "destroy", app, "-y", app=None)
+        self._flyctl("apps", "destroy", app, "-y", app=None)
 
     def current_image(self, app: str) -> str | None:
         """The image this app last released, if any.

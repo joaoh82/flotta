@@ -4514,7 +4514,9 @@ def test_kill_frees_a_held_name_once_its_machine_is_gone(store):
             "UPDATE boxes SET endpoint = ? WHERE id = ?", ("fake://app/m1", held.id)
         )
     out = teardown_box(held.id, store=store, backend=impl)
-    assert "destroy" in impl.calls
+    # By name, never a raw destroy of the endpoint: on a shared-app fleet that
+    # destroy is `apps destroy <shared>`, every live agent with it.
+    assert "remove_leftover" in impl.calls and "destroy" not in impl.calls
     assert out["name_released"] == f"eng-f@{held.id}"
     assert store.create_box("eng-f").id != held.id
 
@@ -4533,12 +4535,12 @@ def test_kill_keeps_the_name_when_destroying_again_fails(store):
     from flotta.provision import teardown_box
 
     class Stuck(FakeBackend):
-        def destroy(self, box_id):
+        def remove_leftover(self, name):
             raise BackendError("fly is down")
 
     box = store.create_box("eng-c")
     store.update_box_status(box.id, "torn_down", endpoint="fake://app/m1")
-    out = teardown_box(box.id, store=store, backend=Stuck())
+    out = teardown_box(box.id, store=store, backend=Stuck(left=True))
     assert out["name_released"] is None and "fly is down" in out["name_held"]
 
 
@@ -4556,6 +4558,22 @@ def test_a_teardown_whose_destroy_failed_keeps_the_name(store):
     out = teardown_box(box.id, store=store, backend=Stuck())
     assert out["name_released"] is None and "fly is down" in out["name_held"]
     assert store.get_box(box.id).status == "torn_down"
+
+
+def test_a_teardown_whose_destroy_returned_quietly_still_asks(store):
+    """Fly's `destroy` reads a `flyctl` that could not list apps as "already
+    gone" and returns, so a destroy that did not raise proves nothing."""
+    from flotta.provision import teardown_box
+
+    class Quiet(FakeBackend):
+        def destroy(self, box_id):
+            self.calls.append("destroy")  # and the app is still there
+
+    box = store.create_box("eng-a")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    out = teardown_box(box.id, store=store, backend=Quiet(left=True))
+    assert out["name_released"] is None and "still there" in out["name_held"]
+    assert store.get_box(box.id).name == "eng-a"
 
 
 def test_a_stranded_provision_frees_its_name_once_destroyed(store):

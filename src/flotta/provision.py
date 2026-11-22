@@ -4737,17 +4737,21 @@ def teardown_box(
         #
         # But only once nothing of it remains (FLOTTA-30): this is the recovery
         # for a failed provision, whose machine may have survived it. So it
-        # tries the destroy again, then asks. A provision that failed before
-        # the row learned an endpoint, the usual case, is removed by name.
+        # removes what is left, by name, then asks. By name even when the row
+        # has an endpoint: `remove_leftover` refuses a fleet's shared app, and
+        # a raw `destroy` of an old row's `fly://<shared>/m` would take the
+        # shared app with every live agent in it. Only a backend that cannot
+        # remove by name falls back to destroying the endpoint.
         impl = _backend_or_none(box, backend)
         retried: dict[str, Any] = {}
         if impl is not None and not box.name.endswith(f"@{box.id}"):
             remove = getattr(impl, "remove_leftover", None)
             try:
-                if box.endpoint:
+                if remove is not None:
+                    if _name_is_free(impl, box, {}) is False:
+                        remove(box.name)
+                elif box.endpoint:
                     impl.destroy(box.endpoint)
-                elif remove is not None and _name_is_free(impl, box, {}) is False:
-                    remove(box.name)
             except Exception as exc:  # noqa: BLE001 - recorded; the name stays held
                 retried["destroy_error"] = f"{type(exc).__name__}: {exc}"
         free = not retried and (
@@ -4777,6 +4781,7 @@ def teardown_box(
     # the tests) drive destruction without a backend.
     cancelled = False
     cancel_error: str | None = None
+    impl: Backend | None = None
     if canceller is not None:
         if box.endpoint is not None:
             try:
@@ -4786,7 +4791,8 @@ def teardown_box(
                 cancel_error = f"{type(exc).__name__}: {exc}"
     elif box.endpoint:
         try:
-            _resolve_backend(box, backend).destroy(box.endpoint)
+            impl = _resolve_backend(box, backend)
+            impl.destroy(box.endpoint)
             cancelled = True
         except (BackendError, ProvisionError) as exc:
             # Best effort, same as a Modal cancel: a machine that is already
@@ -4835,7 +4841,16 @@ def teardown_box(
     # Unless destroying it failed (FLOTTA-30): a fresh `eng-a` would adopt the
     # machine left behind, and its volume with the old agent's memory. A box
     # that never had a machine has nothing to leave.
+    #
+    # And a destroy that returned is not proof: Fly's reads a `flyctl` that
+    # could not list apps as "already gone" and returns quietly. So a backend
+    # that can say whether anything remains is asked before the name goes.
+    held_why = f"its machine could not be destroyed: {cancel_error}"
     held = cancel_error is not None and box.endpoint is not None
+    if not held and cancelled and impl is not None and hasattr(impl, "leftover"):
+        asked: dict[str, Any] = {}
+        if not _name_is_free(impl, box, asked):
+            held, held_why = True, asked["name_held"]
     released = None if held else store.release_name(box_id)
 
     return {
@@ -4846,7 +4861,7 @@ def teardown_box(
         "cancel_error": cancel_error,
         "failed_tasks": failed_tasks,
         "name_released": released,
-        **({"name_held": f"its machine could not be destroyed: {cancel_error}"} if held else {}),
+        **({"name_held": held_why} if held else {}),
     }
 
 
