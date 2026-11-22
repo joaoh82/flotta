@@ -551,3 +551,12 @@ def test_two_uploads_with_one_name_stay_two(backend):
     assert "First" in kept and "Second" in kept
     assert detached == {"detached": True, "count": 1}
     assert "@image:" in kept and "image-2.png" not in kept
+
+
+def test_leftover_is_whether_the_box_is_still_here(backend):
+    """FLOTTA-30: a destroyed box leaves nothing, so its name may be reused."""
+    assert backend.leftover("eng-f") is False
+    made = backend.create(BoxSpec(name="eng-f", secrets=LOGIN))
+    assert backend.leftover("eng-f") is True
+    backend.destroy(made.endpoint)
+    assert backend.leftover("eng-f") is False

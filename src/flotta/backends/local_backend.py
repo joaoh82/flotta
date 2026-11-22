@@ -429,6 +429,11 @@ class LocalBackend:
             return None
         return pid if _is_standin(pid, name) else None
 
+    def leftover(self, name: str) -> bool:
+        """Whether anything of this box is still here (FLOTTA-30): its directory,
+        which `create` would reuse and `destroy` removes."""
+        return self._dir(self._name(name)).exists()
+
     def destroy(self, box_id: str) -> None:
         try:
             name = self._name(box_id)

@@ -1397,3 +1397,58 @@ def test_a_shared_machine_may_be_checked_for_every_size_on_the_list():
     for size in MEMORY_SIZES_MB:
         backend.check_resize("fly://joaoh82-flotta-eng-a/m-1", size)
     assert not any("update" in c for c in issued), "checking is read-only"
+
+
+# -- FLOTTA-30: whether anything of a box is left, never a guess -------------
+
+
+def _flyctl_answers(code, out, seen=None):
+    import subprocess
+
+    def run(cmd, *, timeout, check, stdin=None):
+        if seen is not None:
+            seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, code, out, "" if code == 0 else "not logged in")
+
+    return run
+
+
+def _per_agent_apps():
+    return replace(_offline_config(), app="flotta-fleet", app_prefix="flotta")
+
+
+@pytest.mark.parametrize(
+    ("apps", "left"),
+    [([{"Name": "flotta-eng-f"}], True), ([{"Name": "flotta-eng-f-2"}], False), ([], False)],
+    ids=["its-app", "a-lookalike", "none"],
+)
+def test_leftover_is_whether_the_agents_app_exists(apps, left):
+    """Its app at all: a volume without a machine still holds the memory."""
+    import json as _json
+
+    backend = FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(0, _json.dumps(apps)))
+    assert backend.leftover("eng-f") is left
+
+
+@pytest.mark.parametrize(("code", "out"), [(1, ""), (0, "not json"), (0, "{}")])
+def test_leftover_raises_when_fly_cannot_be_asked(code, out):
+    """A failed `flyctl` is not "nothing there": that reading frees a name
+    whose machine is still billing."""
+    backend = FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(code, out))
+    with pytest.raises(BackendError):
+        backend.leftover("eng-f")
+
+
+def test_leftover_in_a_shared_app_is_its_machines():
+    """Without a prefix the fleet's one app always exists, so it can't be the answer."""
+    import json as _json
+
+    config = replace(_offline_config(), app="flotta-fleet", app_prefix=None)
+    seen: list = []
+    empty = FlyBackend(config=config, runner=_flyctl_answers(0, "[]", seen))
+    assert empty.leftover("eng-f") is False
+    assert any("machines" in part for part in seen[0])
+    one = FlyBackend(config=config, runner=_flyctl_answers(0, _json.dumps([{"id": "m1"}])))
+    assert one.leftover("eng-f") is True
+    with pytest.raises(BackendError):
+        FlyBackend(config=config, runner=_flyctl_answers(1, "")).leftover("eng-f")

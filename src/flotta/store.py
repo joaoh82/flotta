@@ -2101,6 +2101,17 @@ class FleetStore:
             # they would rename and hit the same wall.
             if self.get_box(bid) is not None:
                 raise DuplicateBoxError(f"a box with id {bid!r} already exists") from exc
+            holder = self.get_box_by_name(label)
+            if holder is not None and holder.status in BOX_TERMINAL:
+                # Not in the fleet list, so "already exists" names something
+                # nobody can see (FLOTTA-30). It is a torn-down agent whose name
+                # was kept because its machine may still be there.
+                raise DuplicateBoxError(
+                    f"the name {label!r} is still held by agent {holder.id}, which is torn "
+                    "down but may have left its machine behind (its provision failed, or "
+                    f"destroying it did). `flotta kill {holder.id}` removes what is left and "
+                    "frees the name; until then, use another name."
+                ) from exc
             raise DuplicateBoxError(f"a box named {label!r} already exists") from exc
         return self._get_box_or_raise(bid)
 

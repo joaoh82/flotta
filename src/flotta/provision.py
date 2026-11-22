@@ -1003,6 +1003,47 @@ def reconcile_boxes(
     return changed
 
 
+def _name_is_free(impl: Backend | None, box: Box, detail: dict[str, Any]) -> bool:
+    """Whether nothing of `box` remains, so its name may go to a new agent (FLOTTA-30).
+
+    `create` adopts whatever it finds under a name (`FlyBackend.create` takes
+    `machines[0]`), and the `BoxOccupied` guard only looks at live rows, so a
+    name freed while a machine or volume survives hands the next agent the old
+    one's machine and memory. So the name is freed only on a definite "nothing
+    remains". Anything else keeps it held, and `detail["name_held"]` says why:
+    that name is then the only handle on something that may still be billing,
+    and `flotta kill` on the row tries again.
+    """
+    ask = getattr(impl, "leftover", None) if impl is not None else None
+    if ask is None:
+        detail["name_held"] = "nothing could say whether its machine is gone"
+        return False
+    try:
+        remains = ask(box.name)
+    except Exception as exc:  # noqa: BLE001 - not knowing is an answer: keep it held
+        detail["name_held"] = (
+            f"could not tell whether its machine is gone: {type(exc).__name__}: {exc}"
+        )
+        return False
+    if remains:
+        detail["name_held"] = "its machine or volume is still there"
+        return False
+    return True
+
+
+def _backend_or_none(box: Box, backend: Backend | None = None) -> Backend | None:
+    """The backend for `box`, or the default substrate's when it has no endpoint;
+    None when neither can be had."""
+    try:
+        return _resolve_backend(box, backend)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return _backend_for(f"{default_scheme()}://")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _close_stranded_provision(
     store: FleetStore, box: Box, resolve: Callable[[str], Backend]
 ) -> dict[str, Any]:
@@ -1030,10 +1071,23 @@ def _close_stranded_provision(
             detail["destroyed"] = False
             detail["error"] = f"{type(exc).__name__}: {exc}"
 
+    # Its name, only once nothing of it remains (FLOTTA-30). A machine it could
+    # not destroy keeps the name held: that name is what finds it again.
+    if detail.get("destroyed") is False:
+        detail["name_held"] = "its machine could not be destroyed"
+        free = False
+    else:
+        try:
+            impl = resolve(endpoint or f"{default_scheme()}://")
+        except Exception:  # noqa: BLE001
+            impl = None
+        free = _name_is_free(impl, box, detail)
     store.add_event(
         "box", box.id, "torn_down", {"reason": "provisioning never completed", **detail}
     )
     store.update_box_status(box.id, "torn_down", endpoint=endpoint)
+    if free:
+        detail["name_released"] = store.release_name(box.id)
     return detail
 
 
@@ -1577,8 +1631,21 @@ def create_box(
         # `Exception`, not `BaseException`: a Ctrl-C should not be recorded as
         # a teardown.
         detail = f"create failed: {type(exc).__name__}: {exc}"
-        store.add_event("box", box.id, "torn_down", {"reason": detail})
+        closed: dict[str, Any] = {"reason": detail}
+        # The name goes back only if the failure left nothing behind (FLOTTA-30),
+        # so the person can try again with it; otherwise it stays held, and
+        # saying so beats a later 409 about an agent nobody can see.
+        free = _name_is_free(impl, box, closed)
+        store.add_event("box", box.id, "torn_down", closed)
         store.update_box_status(box.id, "torn_down")
+        if free:
+            store.release_name(box.id)
+            detail += f". The name {name!r} is free to use again."
+        else:
+            detail += (
+                f". The name {name!r} stays held ({closed['name_held']}); "
+                f"`flotta kill {box.id}` frees it once nothing of it remains."
+            )
         raise ProvisionError(detail) from exc
 
     # The size the machine has, on the timeline, so the box payload can say it
@@ -4667,11 +4734,30 @@ def teardown_box(
         #
         # Releasing here means the rule applies to rows that predate it, which
         # is the difference between a fix and a fix for new boxes only.
+        #
+        # But only once nothing of it remains (FLOTTA-30): this is the recovery
+        # for a failed provision, whose machine may have survived it. So it
+        # tries the destroy again, then asks.
+        impl = _backend_or_none(box, backend)
+        retried: dict[str, Any] = {}
+        if box.endpoint and impl is not None and not box.name.endswith(f"@{box.id}"):
+            try:
+                impl.destroy(box.endpoint)
+            except Exception as exc:  # noqa: BLE001 - recorded; the name stays held
+                retried["destroy_error"] = f"{type(exc).__name__}: {exc}"
+        free = not retried and (
+            box.name.endswith(f"@{box.id}") or _name_is_free(impl, box, retried)
+        )
         return {
             "box_id": box_id,
             "status": "torn_down",
             "already_torn_down": True,
-            "name_released": store.release_name(box_id),
+            "name_released": store.release_name(box_id) if free else None,
+            **(
+                {"name_held": retried.get("name_held") or retried["destroy_error"]}
+                if not free
+                else {}
+            ),
         }
 
     # Its schedules stop first (FLOTTA-148), before the task scan below and
@@ -4740,7 +4826,12 @@ def teardown_box(
     # The agent is gone; its *address* should not be held hostage by the row
     # that records it. Renaming frees `eng-a` for a fresh agent while leaving
     # the history intact — events are keyed by id, not by name.
-    released = store.release_name(box_id)
+    #
+    # Unless destroying it failed (FLOTTA-30): a fresh `eng-a` would adopt the
+    # machine left behind, and its volume with the old agent's memory. A box
+    # that never had a machine has nothing to leave.
+    held = cancel_error is not None and box.endpoint is not None
+    released = None if held else store.release_name(box_id)
 
     return {
         "box_id": box_id,
@@ -4750,6 +4841,7 @@ def teardown_box(
         "cancel_error": cancel_error,
         "failed_tasks": failed_tasks,
         "name_released": released,
+        **({"name_held": f"its machine could not be destroyed: {cancel_error}"} if held else {}),
     }
 
 
