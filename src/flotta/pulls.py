@@ -23,6 +23,10 @@ its comments. There is no webhook (the App's is off, and turning it on would
 send every PR on a repository, not just the agents'). Closed PRs are never read
 again.
 
+Merged or closed by anyone but its agent, the agent is told, in the
+conversation it opened the PR in (`flotta.notices`, FLOTTA-273). A merge from
+Flotta's own button is told by its route, since the sweep never sees it change.
+
 ## Deployed (FLOTTA-174)
 
 A client wants to know when the work they asked for is live, and merged is not
@@ -632,7 +636,13 @@ def check(store: Any, pr: Any, *, token_for: TokenFor, fetch: Fetch, now: dateti
             else "pull_request_reopened",
             {"repo": pr.repo, "number": pr.number, "by": fresh.get("merged_by")},
         )
+    settled = fresh["state"] != pr.state and fresh["state"] in ("merged", "closed")
     pr = store.update_pull_request(pr.id, **changes)
+    if settled and not _settled_by_agent(store, pr, own):
+        # Someone else merged or closed it: tell the agent (FLOTTA-273).
+        from flotta import notices
+
+        notices.pull_request_settled(store, pr)
     if pr.state == "merged":
         return deployed(store, pr, fetch=fetch, token=token, checked=checked)
     if pr.state != "open":
@@ -641,6 +651,19 @@ def check(store: Any, pr: Any, *, token_for: TokenFor, fetch: Fetch, now: dateti
     if feedback:
         pr = follow_up(store, pr, feedback, now=now)
     return pr
+
+
+def _settled_by_agent(store: Any, pr: Any, own: Callable[[str, str], bool]) -> bool:
+    """Whether the PR's own agent merged or closed it, and so needs no telling.
+
+    A merge names who made it (`own` decides, as for feedback). A close names
+    nobody, so a close while the agent was working counts as the agent's.
+    """
+    if pr.state == "merged":
+        return bool(pr.merged_by and pr.merged_at and own(pr.merged_by, pr.merged_at))
+    if pr.closed_at:
+        return bool(store.was_working(pr.box_id, datetime.fromisoformat(pr.closed_at)))
+    return False
 
 
 def deployed(store: Any, pr: Any, *, fetch: Fetch, token: str, checked: str) -> Any:
