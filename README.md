@@ -270,8 +270,7 @@ Any OpenAI-compatible model endpoint works, set with `FLOTTA_MODEL`, `FLOTTA_MOD
 - **Tokens minted from the signing key cannot be revoked one by one.** They last until they
   expire, unless the key is rotated, which ends every token at once. Sign-in sessions can be
   ended individually.
-- **`app/` is a retired desktop app** and will be removed. `dashboard/` still says "worker" in
-  places.
+- **`dashboard/` still says "worker"** in places.
 
 ## Development
 

@@ -422,75 +422,11 @@ client-list ORG:
 user-add EMAIL ROLE ORG="default" CLIENT="":
     uv run flotta user add "{{EMAIL}}" --role {{ROLE}} --org {{ORG}} {{ if CLIENT == "" { "" } else { "--client " + CLIENT } }}
 
-# `tauri dev` runs the Vite server and the Rust shell together, so this is the
-# only command needed — running `npm run dev` alone gives a page in a browser,
-# which is precisely the thing this app is not.
-# M8 — the Flotta app: a window listing your agents (needs a control plane)
-app:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # The token, without the manual mint.
-    #
-    # A debug build reads $FLOTTA_TOKEN before the keychain (`token_from_env`
-    # in fleet.rs) because an unsigned binary's keychain ACL is tied to that
-    # exact binary — every `cargo` rebuild is denied the item its predecessor
-    # wrote. So running the app in development has always meant a token in the
-    # environment, and every smoke test in this repo opened with the same mint
-    # line pasted by hand.
-    #
-    # These are the four scopes the window actually uses: list agents and read
-    # their timelines (fleet:read), create one (fleet:write), destroy one
-    # (box:destroy), and talk to one through the door (box:chat).
-    #
-    # Nothing is required: with no signing key here the app falls through to
-    # the keychain, which is what a release build does in any case.
-    #
-    # Minted even when .env has a FLOTTA_TOKEN: that one is for `flotta chat`
-    # (box:chat only, which `just cli-setup` writes), and handing it to the
-    # window lists no agents — it cannot read the fleet.
-    if [ -n "${FLOTTA_SIGNING_KEY:-}" ]; then
-      export FLOTTA_TOKEN="$(uv run flotta token mint app \
-          --scope fleet:read --scope fleet:write \
-          --scope box:chat --scope box:destroy --days 1)"
-      echo "minted a 1-day app token: fleet:read fleet:write box:chat box:destroy"
-    fi
-    cd app
-    # `npm ci` like the dashboard recipes: install rewrites the lockfile for
-    # the local platform, and a dev command should not be able to change what
-    # CI installs.
-    [ -d node_modules ] || npm ci
-    npm run tauri dev
-
-# One real conversation with a real box, through the app's own client — the
-# same code path the window uses, without the window. Costs a machine wake and
-# a model call, so it is opt-in and never runs in CI.
-#
-# Override the target with FLOTTA_BOX; defaults to eng-a.
-# M8.2 — prove the agent protocol against a live box (REAL infra + a model call)
-app-live:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    : "${FLOTTA_SIGNING_KEY:?set FLOTTA_SIGNING_KEY in .env}"
-    # **fleet:read as well as box:chat.** `attach` asks the control plane when
-    # this agent's instructions last changed, and that read needs fleet:read.
-    # With a chat-only token it fails, falls back to "never changed", and the
-    # staleness branch can never fire — so the live test sails past the one
-    # path it is here to prove while reporting success. Measured: the
-    # instruction test failed on exactly that and passed once the scope was
-    # added.
-    export FLOTTA_TOKEN="${FLOTTA_TOKEN:-$(uv run flotta token mint app-live --scope box:chat --scope fleet:read --days 1)}"
-    # Separate, and deliberately not folded into the one above: rewriting an
-    # agent's persona is not something a conversation token should be able to
-    # do, so the test swaps it in for that one call.
-    export FLOTTA_WRITE_TOKEN="${FLOTTA_WRITE_TOKEN:-$(uv run flotta token mint app-live-write --scope fleet:write --days 1)}"
-    cd app/src-tauri
-    cargo test -- --ignored --nocapture
-
 # COSTS MONEY: a wake and a few dozen model calls. Where an agent's turns
 # spend their time — client-side timings plus each model call's latency, cache
 # and upstream from Hermes's own log — as a Markdown report (FLOTTA-61).
 # Fresh conversations each round, so it does not disturb one in progress, but
-# the app will open on the measurement's conversation afterwards.
+# the web app will open on the measurement's conversation afterwards.
 latency box="eng-g" rounds="3":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -499,24 +435,6 @@ latency box="eng-g" rounds="3":
     export FLOTTA_TOKEN="${FLOTTA_TOKEN:-$(uv run flotta token mint latency --scope box:chat --days 1)}"
     export FLOTTA_READ_TOKEN="${FLOTTA_READ_TOKEN:-$(uv run flotta token mint latency-read --scope fleet:read --days 1)}"
     uv run python scripts/latency_probe.py "{{box}}" "{{rounds}}"
-
-# Type-check and lint the app — both halves. `just check` covers neither.
-check-app:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd app
-    [ -d node_modules ] || npm ci
-    npx tsc --noEmit
-    # The typechecker is not the test suite. Four of the five findings in
-    # FLOTTA-29's review were in `.tsx` and every one of them typechecked.
-    npm test
-    cd src-tauri
-    cargo fmt --check
-    # -D warnings: the Rust half holds the keychain and every outbound
-    # request, so a warning there is worth failing on rather than scrolling
-    # past.
-    cargo clippy --all-targets -- -D warnings
-    cargo test
 
 # list available recipes
 default:
@@ -767,9 +685,8 @@ check-dashboard:
 
 # What GitHub Actions checks, in one command — so "will CI go green?" is
 # answerable before pushing. ci.yml runs check and check-dashboard on every
-# commit; app.yml runs check-app only when app/ (or this file) changes, plus
-# weekly. Here all three run in sequence. No Fly, no cost.
-ci: check check-dashboard check-app
+# commit, and here both run in sequence. No Fly, no cost.
+ci: check check-dashboard
 
 # M4 CLI — there is deliberately no `just flotta` recipe. just's variadic
 # arguments are re-split by the shell, so `just flotta spawn "a b c"` breaks on

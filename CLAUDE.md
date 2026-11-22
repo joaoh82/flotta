@@ -552,8 +552,9 @@ conventions, and the sharp edges below.
   calls it a success. **`message.complete`'s text is only the final segment**:
   whatever the agent said before a tool is *not* repeated, so the app turns
   that narration into its own line (`Step::Said`) when the tool starts.
-  `a_turn_shows_its_steps_as_they_happen` (`just app-live`) re-checks both on
-  the next Hermes bump (FLOTTA-61).
+  The desktop app's `a_turn_shows_its_steps_as_they_happen` (`just app-live`)
+  re-checked both on a Hermes bump until the app was removed (FLOTTA-80); now
+  check them by hand in a live web-app conversation (FLOTTA-61).
 - **Hermes v2026.9.14 asks for approvals instead of announcing them.** The
   question used to be an `approval.request` *event* answered by the
   `approval.respond` RPC. From v2026.9.14 it is a **server→client JSON-RPC
@@ -567,8 +568,9 @@ conventions, and the sharp edges below.
   every approval denied by the 60s timeout, with the live test reporting "the
   model never reached the gate" while each turn took 65s (FLOTTA-64). The app
   now reads both forms and answers each on its own path (`answer_for`). **A
-  Hermes bump is a protocol change until the live tests say otherwise** —
-  run `just app-live` against one agent before calling it done.
+  Hermes bump is a protocol change until a live conversation says otherwise** —
+  hold one with an agent in the web app before calling it done. The live test
+  that did this, `just app-live`, left with the desktop app (FLOTTA-80).
 - **Approvals are granted by pattern, not by command — so the app never offers
   `always`.** Hermes records `session` and `always` against the command's
   `pattern_key` (e.g. `delete in root path`), not the command itself. Measured
@@ -587,8 +589,8 @@ conventions, and the sharp edges below.
   exactly that. `rm -rf /tmp/flotta-approval-probe` reads as ordinary cleanup
   to the model and is still flagged ("delete in root path"), escalating on
   three runs out of three. The path does not exist, so a wrong answer removes
-  nothing. `FLOTTA_BOX=eng-g just app-live` runs this through the app's own
-  turn loop.
+  nothing. It ran through the desktop app's turn loop as
+  `FLOTTA_BOX=eng-g just app-live` until that app was removed (FLOTTA-80).
 - **A provider failure arrives as a normal `message.complete`** whose text is
   an error string, with `status != "complete"`. Returning it as the reply would
   print "No inference provider configured" as though the agent had said it.
@@ -1059,7 +1061,7 @@ Common commands live in the **`justfile`** (`just` alone lists them). Python too
 ```bash
 just check                  # lint + tests — run before committing
 just check-dashboard        # tsc + eslint (the Python `check` does not cover the dashboard)
-just ci                     # check + check-dashboard + check-app — what GitHub Actions checks (app only when app/ changes)
+just ci                     # check + check-dashboard — what GitHub Actions checks
 just test-one <keyword>     # a single test (uv run pytest -k <keyword>)
 just test-postgres          # the store suite against a real Postgres (throwaway container)
 just fmt                    # ruff format + --fix
