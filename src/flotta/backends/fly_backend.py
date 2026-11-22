@@ -768,6 +768,23 @@ class FlyBackend:
             raise BackendError("flyctl apps list did not return a list")
         return any(isinstance(a, dict) and a.get("Name") == app for a in apps)
 
+    def remove_leftover(self, box_name: str) -> None:
+        """Destroy whatever is left of this box on Fly, by name (FLOTTA-30).
+
+        For a provision that failed before its row learned an endpoint, which
+        is the usual case: `destroy` needs one, and there is none to give it.
+        With one app per agent the app is the box, so it goes, volume and all.
+        A shared app is the whole fleet's and is never destroyed for one
+        agent: that refuses, and someone removes the machine by hand.
+        """
+        app = self.config.app_for(box_name)
+        if app == self.config.app:
+            raise BackendError(
+                f"{app} is the fleet's shared app; remove this agent's machine from it by hand"
+            )
+        if self.leftover(box_name):
+            self._flyctl("apps", "destroy", app, "-y", app=None)
+
     def current_image(self, app: str) -> str | None:
         """The image this app last released, if any.
 

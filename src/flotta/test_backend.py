@@ -1452,3 +1452,31 @@ def test_leftover_in_a_shared_app_is_its_machines():
     assert one.leftover("eng-f") is True
     with pytest.raises(BackendError):
         FlyBackend(config=config, runner=_flyctl_answers(1, "")).leftover("eng-f")
+
+
+def test_remove_leftover_destroys_the_agents_own_app():
+    import json as _json
+
+    seen: list = []
+    apps = _json.dumps([{"Name": "flotta-eng-f"}])
+    FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(0, apps, seen)).remove_leftover(
+        "eng-f"
+    )
+    assert any(cmd[1:4] == ["apps", "destroy", "flotta-eng-f"] for cmd in seen)
+
+
+def test_remove_leftover_never_destroys_the_fleets_shared_app():
+    config = replace(_offline_config(), app="flotta-fleet", app_prefix=None)
+    seen: list = []
+    with pytest.raises(BackendError, match="shared app"):
+        FlyBackend(config=config, runner=_flyctl_answers(0, "[]", seen)).remove_leftover("eng-f")
+    assert not any("destroy" in cmd for cmd in seen)
+
+
+def test_remove_leftover_does_nothing_when_fly_cannot_say():
+    seen: list = []
+    with pytest.raises(BackendError):
+        FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(1, "", seen)).remove_leftover(
+            "eng-f"
+        )
+    assert not any("destroy" in cmd for cmd in seen)

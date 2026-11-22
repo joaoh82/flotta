@@ -4737,12 +4737,17 @@ def teardown_box(
         #
         # But only once nothing of it remains (FLOTTA-30): this is the recovery
         # for a failed provision, whose machine may have survived it. So it
-        # tries the destroy again, then asks.
+        # tries the destroy again, then asks. A provision that failed before
+        # the row learned an endpoint, the usual case, is removed by name.
         impl = _backend_or_none(box, backend)
         retried: dict[str, Any] = {}
-        if box.endpoint and impl is not None and not box.name.endswith(f"@{box.id}"):
+        if impl is not None and not box.name.endswith(f"@{box.id}"):
+            remove = getattr(impl, "remove_leftover", None)
             try:
-                impl.destroy(box.endpoint)
+                if box.endpoint:
+                    impl.destroy(box.endpoint)
+                elif remove is not None and _name_is_free(impl, box, {}) is False:
+                    remove(box.name)
             except Exception as exc:  # noqa: BLE001 - recorded; the name stays held
                 retried["destroy_error"] = f"{type(exc).__name__}: {exc}"
         free = not retried and (

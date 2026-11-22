@@ -208,6 +208,12 @@ class FakeBackend:
             raise BackendError("the substrate could not be asked")
         return self.left
 
+    def remove_leftover(self, name):
+        self.calls.append("remove_leftover")
+        if self.left == "unknown":
+            raise BackendError("the substrate could not be asked")
+        self.left = False
+
     def state(self, box_id):
         return self.machine_state
 
@@ -4519,7 +4525,7 @@ def test_kill_keeps_the_name_while_the_substrate_cannot_say(store):
     box = store.create_box("eng-c")
     store.update_box_status(box.id, "torn_down")
     out = teardown_box(box.id, store=store, backend=FakeBackend(left="unknown"))
-    assert out["name_released"] is None and "could not tell" in out["name_held"]
+    assert out["name_released"] is None and "could not" in out["name_held"]
     assert store.get_box(box.id).name == "eng-c"
 
 
@@ -4579,3 +4585,40 @@ def test_a_stranded_provision_it_could_not_destroy_keeps_its_name(store):
     assert changed[0]["destroyed"] is False
     assert "name_released" not in changed[0]
     assert store.get_box(box.id).name == "eng-x"
+
+
+def test_kill_removes_by_name_what_a_failed_create_left(store):
+    """The usual failed create never learned an endpoint, so there is nothing
+    for `destroy` to address: kill removes it by name, then frees the name."""
+    from flotta.provision import teardown_box
+
+    impl = _Failing(left=True)
+    with pytest.raises(ProvisionError):
+        create_box("eng-f", store=store, backend=impl)
+    held = store.get_box_by_name("eng-f")
+    assert held.endpoint is None
+    out = teardown_box(held.id, store=store, backend=impl)
+    assert "remove_leftover" in impl.calls
+    assert out["name_released"] == f"eng-f@{held.id}"
+
+
+def test_the_recovery_works_on_a_real_local_fleet(store, tmp_path):
+    """End to end on the local backend, as found running it: a bad image is
+    refused after the agent's directory exists, so the name is held; the 409
+    names `flotta kill`; the kill frees it; the name is taken again."""
+    from flotta.backend import BoxSpec
+    from flotta.backends.local_backend import LocalBackend
+    from flotta.provision import teardown_box
+    from flotta.store import DuplicateBoxError
+
+    local = LocalBackend(tmp_path / "boxes")
+    spec = BoxSpec(name="eng-g", image="ghcr.io/x/y:1", env={"FLOTTA_RUNTIME": "custom"})
+    with pytest.raises(ProvisionError, match="stays held"):
+        create_box("eng-g", store=store, backend=local, spec=spec)
+    held = store.get_box_by_name("eng-g")
+    with pytest.raises(DuplicateBoxError, match=f"flotta kill {held.id}"):
+        store.create_box("eng-g")
+    out = teardown_box(held.id, store=store, backend=local)
+    assert out["name_released"] == f"eng-g@{held.id}"
+    assert local.leftover("eng-g") is False
+    assert store.create_box("eng-g").id != held.id
