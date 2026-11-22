@@ -260,9 +260,9 @@ CREATE TABLE IF NOT EXISTS box_peer_blocks (
 );
 
 -- Fleet configuration a person set, as opposed to what the process was
--- started with. Flotta is used through the desktop app, so the app has to be
--- able to change how the fleet behaves — and an environment variable on
--- somebody else's Railway service is not reachable from a window on a laptop.
+-- started with. Flotta is used through an app (the desktop app then, the web
+-- app since D17), so the app has to be able to change how the fleet behaves —
+-- and an environment variable on the deployer's service is not reachable from it.
 --
 -- A new TABLE, for the same load-bearing reason as `box_repos` above: it
 -- appears on an existing fleet by itself, where a new column would not.

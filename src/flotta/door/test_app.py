@@ -185,24 +185,6 @@ def test_a_token_signed_by_another_key_is_401():
     assert exc.value.status == 401
 
 
-def test_a_query_token_is_refused_on_plain_http():
-    """A query string is logged where a header is not.
-
-    HTTP always has an `Authorization` header available, so there is no excuse
-    to accept the leakier channel. Only the WS handshake — where a browser
-    cannot set headers — gets the allowance.
-    """
-    raw = mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY)
-    with pytest.raises(BoxUnavailable) as exc:
-        authorize(header=None, query_token=raw, key=KEY, allow_query=False)
-    assert exc.value.status == 401
-
-
-def test_a_query_token_is_accepted_for_the_websocket():
-    raw = mint(subject="app", scopes={SCOPE_BOX_CHAT}, key=KEY)
-    assert authorize(header=None, query_token=raw, key=KEY, allow_query=True).subject == "app"
-
-
 # -- the box's own credentials ----------------------------------------------
 
 
@@ -699,7 +681,7 @@ def test_the_websocket_path_applies_the_same_subject_check(stub_box):
     with (
         TestClient(app) as client,
         client.websocket_connect(
-            f"/api/ws?access_token={raw}", headers={"Host": "eng-a.flotta.dev"}
+            "/api/ws", headers={"Host": "eng-a.flotta.dev", "Authorization": f"Bearer {raw}"}
         ) as ws,
         pytest.raises(WebSocketDisconnect) as closed,
     ):

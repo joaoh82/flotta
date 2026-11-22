@@ -543,7 +543,8 @@ async def open_agent_socket(session, base_url: str, ticket: str, *, token: str |
 
     Through the door the Flotta token goes in `Authorization`, as on every
     other request. It used to travel as `?access_token=`, the way the desktop
-    app had to send it, and the door's log kept every one (FLOTTA-118). A
+    app had to send it, and the door's log kept every one (FLOTTA-118); the
+    door no longer reads it there (FLOTTA-80). A
     browser doesn't need that path either: it comes with a ticket in
     `Sec-WebSocket-Protocol`.
     """

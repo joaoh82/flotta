@@ -40,7 +40,7 @@ PROMPTS = (
 )
 
 #: Events that put something on the screen. Not `thinking.delta` (Hermes's
-#: spinner) and not session bookkeeping — see `agent.rs`'s `read_step`.
+#: spinner) and not session bookkeeping: CLAUDE.md's Hermes protocol notes.
 VISIBLE = {"reasoning.delta", "message.delta", "tool.generating", "tool.start", "approval.request"}
 
 

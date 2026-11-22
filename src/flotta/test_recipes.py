@@ -80,8 +80,8 @@ def test_every_scope_a_recipe_mints_is_a_real_scope(scope):
     `flotta token mint` does not validate what it is handed, so the failure
     surfaces as a 403 from the control plane — which reads as "my token is
     wrong" rather than "the recipe asked for a scope that does not exist".
-    `just app` mints four of the five, so this is now four chances to misspell
-    one in a file nothing else checks.
+    Every recipe that mints is a chance to misspell one in a file nothing else
+    checks.
     """
     from flotta.auth import SCOPES
 

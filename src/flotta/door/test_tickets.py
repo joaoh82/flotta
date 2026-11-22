@@ -243,8 +243,21 @@ def test_a_refusal_still_answers_the_public_protocol():
 def test_a_fleet_read_token_is_still_not_a_ticket_or_a_conversation():
     app, _ = _door()
     token = mint(subject="dash", scopes={SCOPE_FLEET_READ}, key=KEY)
-    code, _ = _refused(app, protocols=None, path=f"/api/ws?access_token={token}")
+    code, _ = _refused(
+        app, protocols=None, path="/api/ws", headers={"Authorization": f"Bearer {token}"}
+    )
     assert code == 4403
+
+
+def test_a_token_in_the_query_opens_nothing():
+    """FLOTTA-80: the desktop app's `?access_token=` path is gone. A URL is
+    logged where a header is not, so a good `box:chat` token there is refused
+    as if absent, before the box is even resolved."""
+    app, plane = _door()
+    token = mint(subject="old-client", scopes={SCOPE_BOX_CHAT}, key=KEY)
+    code, _ = _refused(app, protocols=None, path=f"/api/ws?access_token={token}")
+    assert code == 4401
+    assert plane.resolved == []
 
 
 # -- end to end, against a stand-in for `hermes serve` ------------------------
