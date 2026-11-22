@@ -219,3 +219,15 @@ def test_the_policy_is_read_by_the_agent_and_changed_by_the_agency(api, fleet):
             ).status_code
             == 422
         )
+
+
+def test_a_merge_from_flotta_tells_the_agent_who_merged_it(api, fleet, github):
+    """The sweep never sees this one change, so the route says it (FLOTTA-273)."""
+    pr = _report(api, fleet).json()["pull_request"]
+    api.post(f"/api/pull-requests/{pr['id']}/merge", headers=_as(SCOPE_FLEET_WRITE))
+    with FleetStore(fleet) as store:
+        box = store.get_box(pr["box_id"])
+        found = [r for r in store.list_runs(org=box.org, box=box.id) if r.trigger_kind == "notice"]
+        merged_by = store.get_pull_request(pr["id"]).merged_by_person
+    assert len(found) == 1
+    assert f"was merged by {merged_by}." in found[0].prompt

@@ -22,7 +22,7 @@ from typing import Any
 #: `review` new feedback on a pull request the agent opened (FLOTTA-172);
 #: `request` work a client asked for, once the agency approved it (FLOTTA-173).
 TRIGGER_KINDS: frozenset[str] = frozenset(
-    {"api", "chat", "peer", "request", "review", "schedule", "webhook"}
+    {"api", "chat", "notice", "peer", "request", "review", "schedule", "webhook"}
 )
 
 #: Steps kept per run, half from the start and half from the end: how it began

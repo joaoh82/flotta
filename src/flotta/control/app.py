@@ -680,7 +680,7 @@ VIEWER_USAGE_GROUPS = frozenset({"day", "box"})
 
 #: The runs a client's viewer never sees (D29): conversations, which are the
 #: people's who had them. A viewer has none of its own.
-VIEWER_HIDDEN_KINDS = ("chat",)
+VIEWER_HIDDEN_KINDS = ("chat", "notice")
 
 #: What a client's viewer never reads of a run (D29): the agency's words to the
 #: agent, what a trigger fed it, and the agency's note on settling a failure.
@@ -7388,6 +7388,9 @@ def create_app(
         if run.trigger_kind == "request" and run.trigger_id:
             request = store.box_request(run.box_id, run.trigger_id)
             about = request.title if request is not None else ""
+        if run.trigger_kind == "notice" and isinstance(run.input, dict):
+            notice = run.input.get("notice")
+            about = str(notice.get("headline") or "") if isinstance(notice, dict) else ""
         if not about:
             lines = (line.strip() for line in run.prompt.splitlines())
             about = next((line for line in lines if line), "")
@@ -8712,6 +8715,11 @@ def create_app(
                 "pull_request_merged",
                 {"repo": pr.repo, "number": pr.number, "by": who, "method": method, "in": "flotta"},
             )
+            # The agency merged it here, so the sweep never sees it change: tell
+            # the agent now (FLOTTA-273).
+            from flotta import notices
+
+            notices.pull_request_settled(store, pr, by=who)
             return {"pull_request": pulls.view(store, pr)}
         finally:
             store.close()
@@ -8896,7 +8904,8 @@ def create_app(
         """The agency's answer to a waiting request: `{"approve": true|false, "note": "…"}`.
 
         Approved, the work becomes a run on the agent, with the note; declined,
-        the note is kept for the agent to pass on when the person asks.
+        the note is kept. Either way the agent is told at once, in the
+        conversation it was asked in (`flotta.notices`, FLOTTA-273).
         """
         from flotta import work_requests
 
@@ -8915,6 +8924,11 @@ def create_app(
                 decided = store.decide_request(found.id, approve=approve, by=who, note=note)
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # Told in the conversation it was asked in (FLOTTA-273), before its
+            # work is queued, so the notice is not left waiting behind the work.
+            from flotta import notices
+
+            notices.request_decided(store, decided)
             if approve:
                 try:
                     run = store.create_run(

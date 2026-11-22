@@ -150,7 +150,8 @@ def message(run: Run) -> str:
         from flotta import work_requests
 
         return work_requests.message(run.prompt, run.input)
-    if run.input is None:
+    if run.input is None or run.trigger_kind == "notice":
+        # A notice's input says what it is about for the record; the prompt says it all.
         return run.prompt
     return f"{run.prompt}\n\nInput:\n```json\n{json.dumps(run.input, indent=2)}\n```"
 
@@ -228,6 +229,11 @@ class Talk:
         resumed, so it is sent the run again with the "carry on" after it.
         """
         if self.continuing is None:
+            if run.trigger_kind == "notice":
+                # Said in the conversation it is news for (FLOTTA-273).
+                from flotta import notices
+
+                return message(run), notices.session_of(run)
             return message(run), None
         if self.session:
             return self.continuing, self.session
