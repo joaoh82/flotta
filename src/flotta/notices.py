@@ -11,7 +11,8 @@ FLOTTA-203's `⟦flotta: requests⟧` news reaches the agent with the person's
 
 ## The path
 
-When one is answered, the control plane makes a `notice` run on the agent,
+When one is answered, or an approved request's work ends (FLOTTA-275), the
+control plane makes a `notice` run on the agent,
 **in the conversation the thing came from**: the stored session of the turn it
 was filed in (`conversation_of`), so the agent's answer is where the person
 already talks to it. Hermes attaches a second client to a conversation that is
@@ -44,6 +45,24 @@ NEWS_CLOSE = "⟦/flotta⟧"
 #: Characters of a title or a note said in a notice.
 MAX_SAID = 300
 
+#: Characters of a work run's own summary said in a notice.
+MAX_SUMMARY = 2_000
+
+#: How a request's work ended, by status, in the notice's headline and its line
+#: for the agent. Held (`budget_blocked`) is not said: its agent cannot take a
+#: notice either, and the agency is already asked about it.
+_WORK_ENDED: dict[str, tuple[str, str]] = {
+    "done": ("is done", ""),
+    "failed": (
+        "failed",
+        "The agency can run it again. Do not redo it here.",
+    ),
+    "cancelled": (
+        "was stopped before it finished",
+        "Do not redo it here unless the person and the agency ask.",
+    ),
+}
+
 #: What the agent is told about the block, after the headline.
 _IN_CONVERSATION = (
     "From Flotta, not written by the person: news about something you filed in this "
@@ -61,6 +80,12 @@ def inert(text: str, limit: int = MAX_SAID) -> str:
     """Text that cannot open or close a block, on one line, clipped."""
     flat = " ".join(str(text).replace("⟦", "[").replace("⟧", "]").split())
     return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def inert_block(text: str, limit: int) -> str:
+    """Text kept as written, lines and all, that cannot open or close a block."""
+    kept = str(text).replace("⟦", "[").replace("⟧", "]").strip()
+    return kept if len(kept) <= limit else kept[: limit - 1].rstrip() + "…"
 
 
 def text(headline: str, *, more: str = "", in_conversation: bool) -> str:
@@ -189,4 +214,45 @@ def request_decided(store: Any, request: Any) -> Any:
         )
     except Exception as exc:  # noqa: BLE001 - the decision stands whatever the notice did
         _log.warning("request %s: no notice: %s", request.id, exc)
+        return None
+
+
+def request_work_ended(store: Any, run: Any) -> Any:
+    """An approved request's work run ended: say how, where it was asked. The
+    notice run, or None.
+
+    Only the request's current work (a replaced attempt says nothing), and not
+    a run ended by tearing its agent down: there is no agent to tell.
+    """
+    if run.trigger_kind != "request" or not run.trigger_id:
+        return None
+    ending = _WORK_ENDED.get(run.status)
+    if ending is None or run.error_class == "torn_down":
+        return None
+    request = store.get_request(run.trigger_id)
+    if request is None or request.work_run_id != run.id:
+        return None
+    said, then = ending
+    headline = f'The work on your request "{inert(request.title)}" {said}.'
+    output = (run.output or "").strip()
+    if run.status == "done":
+        more = (
+            "What its run said it did, in its own words:\n" + inert_block(output, MAX_SUMMARY)
+            if output
+            else "Its run said nothing about what it did."
+        )
+    else:
+        why = inert(output.splitlines()[0], MAX_SAID) if output else ""
+        more = (f"Its run ended: {why}. " if why else "") + then
+    try:
+        return send(
+            store,
+            request.box_id,
+            headline=headline,
+            more=more,
+            about={"kind": "request_work", "id": request.id, "status": run.status, "run": run.id},
+            filed_in=request.run_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - the run's ending stands whatever the notice did
+        _log.warning("request %s: no notice of its work: %s", request.id, exc)
         return None

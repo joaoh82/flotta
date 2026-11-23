@@ -14,7 +14,9 @@
    and the agency's note; declined, it is recorded with the note. Either way
    the agent is told at once, in the conversation it was asked in
    (`flotta.notices`, FLOTTA-273), and can still read how each of its requests
-   was answered (`flotta-request list`).
+   was answered (`flotta-request list`). When an approved request's work ends,
+   done, failed or stopped, that conversation is told too, with the work's own
+   summary when it is done (FLOTTA-275).
 
 ## What it is not
 
