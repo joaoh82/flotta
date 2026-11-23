@@ -273,6 +273,9 @@ def _latest(row: dict[str, Any] | None) -> dict[str, Any]:
 #: The title a run's own session is made with (`control.app._deliver_run`):
 #: what a schedule, a request or an API run opened, never a person's.
 RUN_TITLE = re.compile(r"Run t-[0-9a-f]+")
+#: And a colleague's message, which the relay delivers in a session of its own
+#: (`control.app`, "<box> asked"): an agent's words, not a person's.
+RELAY_TITLE = re.compile(r"[a-z0-9-]+ asked")
 
 
 def latest_of_the_agency(
@@ -293,8 +296,9 @@ def latest_of_the_agency(
     person's words. So a session made with a run's title is never picked, and
     of the rest: the newest of `mine` (the conversations the control plane has
     this ticket's subject speaking in), else of `people` (anyone's), else the
-    newest left, which is a conversation from before turns were recorded. None
-    when only runs have used the agent: the page then starts a conversation.
+    newest left that no colleague's message opened either, which is a
+    conversation from before turns were recorded. None when only runs and
+    colleagues have used the agent: the page then starts a conversation.
     """
     left = [
         row
@@ -313,7 +317,8 @@ def latest_of_the_agency(
                 return row
         return None
 
-    return pick(mine) or pick(people) or (left[0] if left else None)
+    unclaimed = (row for row in left if not RELAY_TITLE.fullmatch(str(row.get("title") or "")))
+    return pick(mine) or pick(people) or next(unclaimed, None)
 
 
 #: A message's method, and the block the door puts above one while a run works
@@ -527,9 +532,15 @@ class ConversationGate:
             return Step(to_box=frame)
         try:
             rows = await self._plane.client_conversations(self._box_id)
-            had = await self._plane.chat_conversations(self._box_id, self._subject)
         except Exception as exc:
             return Step(to_client=_error(rid, UNAVAILABLE, f"could not ask whose it is: {exc}"))
+        try:
+            had = await self._plane.chat_conversations(self._box_id, self._subject)
+        except Exception as exc:  # noqa: BLE001 - which is a person's is a preference
+            # Not knowing whose a conversation is still leaves out the client's
+            # and the runs': a page that cannot open one is worse.
+            _log.warning("%s's conversations could not be read: %s", self._box_id, exc)
+            had = None
         people: set[str] = set()
         mine: set[str] = set()
         for row in had or []:

@@ -1069,6 +1069,23 @@ def test_a_control_plane_without_the_route_still_skips_runs():
     assert _agency_latest(Plane(chats=None), rows) == "ours"
 
 
+def test_a_colleagues_message_is_not_a_persons_conversation_either():
+    rows = [
+        {"id": "relayed", "source": "tui", "title": "eng-b asked"},
+        {"id": "from-october", "source": "tui", "title": "Fix the build"},
+    ]
+    assert _agency_latest(Plane(), rows) == "from-october"
+
+
+def test_not_knowing_whose_a_conversation_is_still_opens_one():
+    class Half(Plane):
+        async def chat_conversations(self, box_id, by):
+            raise BoxUnavailable("slow", status=504)
+
+    rows = [{"id": "the-run", "source": "tui", "title": "Run t-0123456789ab"}, {"id": "ours"}]
+    assert _agency_latest(Half(), rows) == "ours"
+
+
 def test_a_conversation_compressed_since_its_turn_is_still_found():
     rows = [{"id": "the-run", "source": "tui"}, {"id": "tip", "_lineage_root_id": "root"}]
     assert _agency_latest(Plane(chats=[("root", "user:ana")]), rows) == "tip"

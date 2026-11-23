@@ -4594,7 +4594,7 @@ class FleetStore:
         """
         rows = self._conn.execute(
             "SELECT input_json FROM tasks WHERE box_id = ? AND trigger_kind = 'chat' "
-            "ORDER BY created_at DESC, id LIMIT ?",
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
             (box_id, limit),
         )
         order: list[str] = []
