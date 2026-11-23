@@ -19,6 +19,7 @@ passed while the instructions were still readable.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 
@@ -47,7 +48,17 @@ def _failing_flyctl(cmd, **kwargs):
     when a host is full: the error quotes the whole command back."""
     if cmd[1:3] == ["machine", "run"]:
         return subprocess.CompletedProcess(cmd, 1, "", "Error: insufficient memory available")
+    if cmd[1:3] == ["apps", "list"] and _failing_flyctl.app_made:
+        # The app was made before `machine run` failed, so it is still there,
+        # and the name stays held for it (FLOTTA-30).
+        return subprocess.CompletedProcess(cmd, 0, json.dumps([{"Name": APP}]), "")
+    if cmd[1:3] == ["apps", "create"]:
+        _failing_flyctl.app_made = True
     return subprocess.CompletedProcess(cmd, 0, "[]" if "--json" in cmd else "", "")
+
+
+_failing_flyctl.app_made = False
+APP = "flotta-intake--acme--agency-x"
 
 
 def _failed_provision(store, monkeypatch):
@@ -59,6 +70,7 @@ def _failed_provision(store, monkeypatch):
 
     monkeypatch.setattr(fly_backend.shutil, "which", lambda name: "/usr/bin/flyctl")
     monkeypatch.setattr(fly_backend.subprocess, "run", _failing_flyctl)
+    monkeypatch.setattr(_failing_flyctl, "app_made", False)
     config = FlyConfig(
         org="personal",
         app="flotta-box",
@@ -157,6 +169,7 @@ def test_the_failure_is_recorded_as_it_was_found(fleet):
     with FleetStore(fleet) as store:
         failed = store.get_box_by_name(FAILED)
         assert failed is not None and failed.status == "torn_down"
+        assert "name_held" in store.get_events("box", failed.id)[-1].payload, "its app is left"
         assert PLAN in store.meta_for_box(failed.id).instructions
         support = store.get_box_by_name(X)
         assert any(OLD_PLAN in repr(e.payload) for e in store.get_box_timeline(support.id))

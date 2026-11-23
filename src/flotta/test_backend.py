@@ -1397,3 +1397,138 @@ def test_a_shared_machine_may_be_checked_for_every_size_on_the_list():
     for size in MEMORY_SIZES_MB:
         backend.check_resize("fly://joaoh82-flotta-eng-a/m-1", size)
     assert not any("update" in c for c in issued), "checking is read-only"
+
+
+# -- FLOTTA-30: whether anything of a box is left, never a guess -------------
+
+
+def _flyctl_answers(code, out, seen=None):
+    import subprocess
+
+    def run(cmd, *, timeout, check, stdin=None):
+        if seen is not None:
+            seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, code, out, "" if code == 0 else "not logged in")
+
+    return run
+
+
+def _per_agent_apps():
+    return replace(_offline_config(), app="flotta-fleet", app_prefix="flotta")
+
+
+@pytest.mark.parametrize(
+    ("apps", "left"),
+    [([{"Name": "flotta-eng-f"}], True), ([{"Name": "flotta-eng-f-2"}], False), ([], False)],
+    ids=["its-app", "a-lookalike", "none"],
+)
+def test_leftover_is_whether_the_agents_app_exists(apps, left):
+    """Its app at all: a volume without a machine still holds the memory."""
+    import json as _json
+
+    backend = FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(0, _json.dumps(apps)))
+    assert backend.leftover("eng-f") is left
+
+
+@pytest.mark.parametrize(("code", "out"), [(1, ""), (0, "not json"), (0, "{}")])
+def test_leftover_raises_when_fly_cannot_be_asked(code, out):
+    """A failed `flyctl` is not "nothing there": that reading frees a name
+    whose machine is still billing."""
+    backend = FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(code, out))
+    with pytest.raises(BackendError):
+        backend.leftover("eng-f")
+
+
+def _flyctl_by_verb(answers, seen=None):
+    """A runner answering by flyctl verb (`apps`, `machines`): `(code, out)`."""
+    import subprocess
+
+    def run(cmd, *, timeout, check, stdin=None):
+        if seen is not None:
+            seen.append(cmd)
+        code, out = answers[cmd[1]]
+        return subprocess.CompletedProcess(cmd, code, out, "" if code == 0 else "not logged in")
+
+    return run
+
+
+_SHARED_LISTED = (0, '[{"Name": "flotta-fleet"}]')
+
+
+def _shared_app():
+    return replace(_offline_config(), app="flotta-fleet", app_prefix=None)
+
+
+def test_leftover_in_a_shared_app_is_its_machines():
+    """Without a prefix the fleet shares one app, so its machines are the answer."""
+    seen: list = []
+    empty = FlyBackend(
+        config=_shared_app(),
+        runner=_flyctl_by_verb({"apps": _SHARED_LISTED, "machines": (0, "[]")}, seen),
+    )
+    assert empty.leftover("eng-f") is False
+    assert any("machines" in cmd for cmd in seen)
+    one = FlyBackend(
+        config=_shared_app(),
+        runner=_flyctl_by_verb({"apps": _SHARED_LISTED, "machines": (0, '[{"id": "m1"}]')}),
+    )
+    assert one.leftover("eng-f") is True
+    with pytest.raises(BackendError):
+        FlyBackend(
+            config=_shared_app(),
+            runner=_flyctl_by_verb({"apps": _SHARED_LISTED, "machines": (1, "")}),
+        ).leftover("eng-f")
+
+
+def test_leftover_in_a_shared_app_that_is_gone_is_nothing():
+    """A destroy takes the whole shared app, and a failed first create never
+    made one; asking for its machines then fails, which once held the name
+    for good, with no `flotta kill` that could free it."""
+    seen: list = []
+    gone = FlyBackend(
+        config=_shared_app(), runner=_flyctl_by_verb({"apps": (0, "[]"), "machines": (1, "")}, seen)
+    )
+    assert gone.leftover("eng-f") is False
+    gone.remove_leftover("eng-f")
+    assert not any("destroy" in cmd for cmd in seen)
+    with pytest.raises(BackendError):
+        FlyBackend(
+            config=_shared_app(), runner=_flyctl_by_verb({"apps": (1, ""), "machines": (0, "[]")})
+        ).leftover("eng-f")
+
+
+def test_remove_leftover_destroys_the_agents_own_app():
+    import json as _json
+
+    seen: list = []
+    apps = _json.dumps([{"Name": "flotta-eng-f"}])
+    FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(0, apps, seen)).remove_leftover(
+        "eng-f"
+    )
+    assert any(cmd[1:4] == ["apps", "destroy", "flotta-eng-f"] for cmd in seen)
+
+
+def test_remove_leftover_never_destroys_the_fleets_shared_app():
+    seen: list = []
+    answers = {"apps": _SHARED_LISTED, "machines": (0, '[{"id": "m1"}]')}
+    with pytest.raises(BackendError, match="shared app"):
+        FlyBackend(config=_shared_app(), runner=_flyctl_by_verb(answers, seen)).remove_leftover(
+            "eng-f"
+        )
+    assert not any("destroy" in cmd for cmd in seen)
+
+
+def test_remove_leftover_in_an_empty_shared_app_has_nothing_to_do():
+    seen: list = []
+    answers = {"apps": _SHARED_LISTED, "machines": (0, "[]")}
+    FlyBackend(config=_shared_app(), runner=_flyctl_by_verb(answers, seen)).remove_leftover("eng-f")
+    assert not any("destroy" in cmd for cmd in seen)
+
+
+def test_remove_leftover_does_nothing_when_fly_cannot_say():
+    seen: list = []
+    with pytest.raises(BackendError):
+        FlyBackend(config=_per_agent_apps(), runner=_flyctl_answers(1, "", seen)).remove_leftover(
+            "eng-f"
+        )
+    assert not any("destroy" in cmd for cmd in seen)
