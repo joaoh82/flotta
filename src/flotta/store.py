@@ -6474,7 +6474,14 @@ class FleetStore:
             # conversation's turn ends as the agent hands over: its handoff is
             # for whoever reads the conversation, and stays.
             self.expire_handoffs(run_id, now=now)
-        return self._get_run_or_raise(run_id)
+        ended = self._get_run_or_raise(run_id)
+        if ended.trigger_kind == "request":
+            # Its request was asked in a conversation: say how the work went
+            # there (FLOTTA-275). Here, because every way a run ends comes here.
+            from flotta import notices
+
+            notices.request_work_ended(self, ended)
+        return ended
 
     def open_chat_run(
         self,
