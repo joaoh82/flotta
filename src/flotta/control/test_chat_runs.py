@@ -160,3 +160,53 @@ def test_a_time_that_is_not_this_turns_is_refused(api):
         (now + timedelta(minutes=5)).isoformat(),
     ):
         assert _open(api, started_at=bad).status_code == 422, bad
+
+
+# -- FLOTTA-276: the conversations people have had, for the door's latest ------
+
+
+def _conversations(api, box=X, headers=DOOR, by="user:u-1"):
+    return api.get(f"/api/boxes/{box}/chat-conversations", params={"by": by}, headers=headers)
+
+
+def _turn(api, stored, by, **body):
+    opened = _open(api, by=by, stored_session_id=stored, **body).json()
+    assert _end(api, opened["id"]).status_code == 200
+
+
+def test_the_people_s_conversations_are_listed_newest_first_and_whose(api):
+    _turn(api, "s-old", "user:u-1")
+    _turn(api, "s-ben", "user:u-2")
+    _turn(api, "s-mixed", "user:u-1")
+    _turn(api, "s-mixed", "user:u-2")  # Ben spoke last; it is still Ana's too
+    _turn(api, "s-tip", "user:u-1", conversation_root="s-root")
+    _turn(api, None, "user:u-1")  # a turn whose stored id the door didn't hear names none
+
+    answer = _conversations(api)
+
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["conversations"] == [
+        {"id": "s-tip", "root": "s-root", "mine": True},
+        {"id": "s-mixed", "mine": True},
+        {"id": "s-ben", "mine": False},
+        {"id": "s-old", "mine": True},
+    ]
+    nobody = _conversations(api, by="")
+    assert not any(c["mine"] for c in nobody.json()["conversations"])
+
+
+def test_a_runs_session_is_not_a_conversation(api, fleet):
+    """A schedule's, a request's or an API run's session has no person's turn."""
+    _turn(api, "s-ana", "user:u-1")
+    run = api.post(f"/api/boxes/{X}/runs", json={"prompt": "Summarise."}, headers=AGENCY_X)
+    assert run.status_code in (200, 201, 202), run.text
+
+    assert [c["id"] for c in _conversations(api).json()["conversations"]] == ["s-ana"]
+
+
+def test_only_the_door_reads_the_conversations_and_only_of_its_tenant(api):
+    _turn(api, "s-ana", "user:u-1")
+    assert _conversations(api, headers=AGENCY_X).status_code == 403
+    tenant_route = _bearer(SCOPE_FLEET_ROUTE, org="agency-y")
+    assert _conversations(api, headers=tenant_route).status_code == 404
+    assert _conversations(api, box=Y).json()["conversations"] == []

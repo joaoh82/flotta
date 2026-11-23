@@ -4578,6 +4578,49 @@ class FleetStore:
         )
         return [McpCall(**dict(r)) for r in rows]
 
+    def chat_conversations(
+        self, box_id: str, *, limit: int = 5_000
+    ) -> list[tuple[str, str | None, frozenset[str]]]:
+        """This box's people's conversations, newest first (FLOTTA-276): each as
+        (stored session id, the id it began under if the door heard it, who spoke).
+
+        Read off its `chat` runs: the door records each person's turn with the
+        conversation it was in and whose ticket said it. Only the stored id,
+        which is the one a conversation is listed and resumed by; a turn whose
+        stored id the door did not hear names none. A run's own session never
+        has a `chat` run, which is the point: what a schedule, a request or a
+        notice opened is not anybody's conversation. The newest `limit` turns
+        are read, which on the busiest agent so far is weeks of them.
+        """
+        rows = self._conn.execute(
+            "SELECT input_json FROM tasks WHERE box_id = ? AND trigger_kind = 'chat' "
+            "ORDER BY created_at DESC, id LIMIT ?",
+            (box_id, limit),
+        )
+        order: list[str] = []
+        roots: dict[str, str | None] = {}
+        spoke: dict[str, set[str]] = {}
+        for row in rows:
+            try:
+                given = json.loads(row["input_json"]) if row["input_json"] else None
+            except ValueError:
+                continue
+            if not isinstance(given, dict):
+                continue
+            stored = given.get("stored_session_id")
+            if not isinstance(stored, str) or not stored:
+                continue
+            if stored not in spoke:
+                order.append(stored)
+                spoke[stored] = set()
+            root = given.get("conversation_root")
+            if roots.get(stored) is None and isinstance(root, str) and root:
+                roots[stored] = root
+            by = given.get("by")
+            if isinstance(by, str) and by:
+                spoke[stored].add(by)
+        return [(sid, roots.get(sid), frozenset(spoke[sid])) for sid in order]
+
     def client_conversations(self, box_id: str) -> list[tuple[str, str]]:
         """This box's client conversations as (session id, when), newest first."""
         rows = self._conn.execute(

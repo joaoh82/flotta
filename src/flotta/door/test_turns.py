@@ -73,7 +73,16 @@ class Plane:
         self.polls = 0
 
     async def open_chat_run(
-        self, box_id, *, prompt, session_id, by, client, started_at, stored_session_id=None
+        self,
+        box_id,
+        *,
+        prompt,
+        session_id,
+        by,
+        client,
+        started_at,
+        stored_session_id=None,
+        conversation_root=None,
     ):
         if self.hang:
             await self.released.wait()
@@ -81,6 +90,7 @@ class Plane:
             {"box": box_id, "prompt": prompt, "session": session_id, "by": by, "client": client}
         )
         self.stored = stored_session_id
+        self.root = conversation_root
         self.started_at = started_at
         if self.busy:
             return None
@@ -297,6 +307,32 @@ def test_a_resumed_conversation_is_recorded_by_its_stored_id():
     plane = asyncio.run(go())
     (opened,) = plane.opened
     assert opened["session"] == "live-2" and plane.stored == "s-old"
+
+
+def test_a_compressed_conversations_turn_says_what_it_began_as():
+    """FLOTTA-276: Hermes lists it under its newest id and the one it began
+    under, so a turn naming only the id it was resumed by is lost after the
+    next compression."""
+
+    async def go():
+        plane = Plane()
+        gate, recorder = _gate(plane, subject="user:u-9", client=False)
+        recorder.heard_root("tip", "root")
+        resume = {"session_id": "tip"}
+        await gate.from_client(
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "session.resume", "params": resume})
+        )
+        await gate.from_box(
+            json.dumps({"jsonrpc": "2.0", "id": 4, "result": {"session_id": "live-2"}})
+        )
+        await gate.from_client(_submit("Again?", session="live-2"))
+        for frame in _turn(session="live-2", tool=False):
+            await gate.from_box(frame)
+        await _settle(recorder)
+        return plane
+
+    plane = asyncio.run(go())
+    assert plane.stored == "tip" and plane.root == "root"
 
 
 def test_each_turn_is_its_own_run():

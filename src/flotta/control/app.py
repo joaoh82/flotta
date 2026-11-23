@@ -9390,6 +9390,35 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/boxes/{box_id}/chat-conversations")
+    def chat_conversations(
+        box_id: str, by: str | None = None, token: Token | None = needs_fleet_route
+    ) -> Any:
+        """The conversations people have had with this agent, newest first (FLOTTA-276).
+
+        The front door's alone: what it answers the agency's `session.most_recent`
+        with, so a page opens the person's own conversation and never the session
+        a run made. `mine` is whether `by` (the door's ticket subject) spoke in it
+        at all, and `root` the id it began under when the door heard it, which
+        is what Hermes lists a conversation compressed since under. Who else
+        spoke is not said: the door needs only which.
+        """
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            return {
+                "conversations": [
+                    {
+                        "id": session_id,
+                        **({"root": root} if root else {}),
+                        "mine": bool(by) and by in who,
+                    }
+                    for session_id, root, who in store.chat_conversations(box.id)
+                ]
+            }
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}/working")
     def box_working(box_id: str, token: Token | None = needs_fleet_route) -> Any:
         """The run this agent is doing now, if it isn't a conversation's turn
@@ -9556,9 +9585,11 @@ def create_app(
     def open_chat_run(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{prompt, session_id, by, client, started_at, stored_session_id?}`: a turn
-        began; `stored_session_id` is the conversation it is listed and opened
-        by, when the door heard which (FLOTTA-173). 409 while the agent
+        """`{prompt, session_id, by, client, started_at, stored_session_id?,
+        conversation_root?}`: a turn began; `stored_session_id` is the
+        conversation it is listed and opened by, when the door heard which
+        (FLOTTA-173), and `conversation_root` the id that conversation began
+        under, when it was compressed and the door heard that (FLOTTA-276). 409 while the agent
         is doing another run, and the turn is then not recorded: its model
         calls belong to that run (`FleetStore._run_for_call`)."""
         session_id, by = body.get("session_id"), body.get("by")
@@ -9567,11 +9598,12 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail=f"{name} is a name of 1 to 200 characters"
                 )
-        stored = body.get("stored_session_id")
-        if stored is not None and (not isinstance(stored, str) or not 0 < len(stored) <= 200):
-            raise HTTPException(
-                status_code=422, detail="stored_session_id is a name of 1 to 200 characters"
-            )
+        stored, root = body.get("stored_session_id"), body.get("conversation_root")
+        for name, value in (("stored_session_id", stored), ("conversation_root", root)):
+            if value is not None and (not isinstance(value, str) or not 0 < len(value) <= 200):
+                raise HTTPException(
+                    status_code=422, detail=f"{name} is a name of 1 to 200 characters"
+                )
         prompt = body.get("prompt")
         prompt = prompt if isinstance(prompt, str) and prompt.strip() else CHAT_NO_PROMPT
         started_at = _door_time(body.get("started_at"), "started_at")
@@ -9587,6 +9619,7 @@ def create_app(
                         "by": by,
                         "client": bool(body.get("client")),
                         **({"stored_session_id": stored} if stored else {}),
+                        **({"conversation_root": root} if stored and root else {}),
                     },
                     started_at=started_at,
                 )
