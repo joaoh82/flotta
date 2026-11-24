@@ -953,6 +953,27 @@ class ControlPlane:
         )
         return list(response.json().get("conversations") or [])
 
+    async def chat_conversations(self, box_id: str, by: str | None) -> list[dict[str, Any]] | None:
+        """The conversations people have had with this box, newest first (FLOTTA-276).
+
+        `None` from a control plane without the route, which is older than
+        this door: the door is deployed on its own, so either may go first.
+        """
+        from urllib.parse import quote
+
+        try:
+            response = await self._call(
+                "GET",
+                f"/api/boxes/{box_id}/chat-conversations?by={quote(by or '', safe='')}",
+                name=box_id,
+                verb="read",
+            )
+        except BoxUnavailable as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return list(response.json().get("conversations") or [])
+
     async def model_of(self, box_id: str) -> str | None:
         """The model the control plane has for this box now (FLOTTA-128).
 
@@ -1013,6 +1034,7 @@ class ControlPlane:
         client: bool,
         started_at: str,
         stored_session_id: str | None = None,
+        conversation_root: str | None = None,
     ) -> str | None:
         """A turn began on `box_id`: its `chat` run's id, or None while the agent
         is doing another run (M14.6, `flotta.door.turns`)."""
@@ -1028,6 +1050,8 @@ class ControlPlane:
         }
         if stored_session_id:
             body["stored_session_id"] = stored_session_id
+        if stored_session_id and conversation_root:
+            body["conversation_root"] = conversation_root
         async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
             response = await http.post(url, headers=self._headers(), json=body)
         if response.status_code == 409:

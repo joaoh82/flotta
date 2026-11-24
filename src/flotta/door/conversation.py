@@ -20,7 +20,8 @@ this list is never shown to a client:
   session some other socket has open. Live ids are per socket on purpose.
 - The agency asking for its latest gets the newest session *not* on the list, so
   its next message doesn't land in the client's conversation. It is not confined:
-  it holds the whole agent anyway.
+  it holds the whole agent anyway. And only a session a person has talked in,
+  its own first (FLOTTA-276): a run's session is nobody's conversation.
 
 **An approval isn't a client's to see or answer (FLOTTA-124).** Hermes takes the
 answer from whoever is connected, and "always" writes to the agent's `config.yaml`
@@ -240,6 +241,10 @@ class Conversations(Protocol):
 
     async def record_client_conversation(self, box_id: str, session_id: str) -> None: ...
 
+    async def chat_conversations(
+        self, box_id: str, by: str | None
+    ) -> list[dict[str, Any]] | None: ...
+
     async def working(self, box_id: str) -> dict[str, Any] | None: ...
 
     async def model_of(self, box_id: str) -> str | None: ...
@@ -265,20 +270,55 @@ def _latest(row: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def latest_of_the_agency(rows: list[Any], client_sessions: set[str]) -> dict[str, Any] | None:
+#: The title a run's own session is made with (`control.app._deliver_run`):
+#: what a schedule, a request or an API run opened, never a person's.
+RUN_TITLE = re.compile(r"Run t-[0-9a-f]+")
+#: And a colleague's message, which the relay delivers in a session of its own
+#: (`control.app`, "<box> asked"): an agent's words, not a person's.
+RELAY_TITLE = re.compile(r"[a-z0-9-]+ asked")
+
+
+def latest_of_the_agency(
+    rows: list[Any],
+    client_sessions: set[str],
+    mine: set[str] | None = None,
+    people: set[str] | None = None,
+) -> dict[str, Any] | None:
     """The newest of `session.list`'s rows that isn't a client's.
 
     A compressed conversation lists under its newest id, with the id it began
     under as `_lineage_root_id`, and that one is what the list holds. `unknown`
     is what Hermes's own pick skips: a placeholder, not a conversation.
+
+    **And a person's, not a run's (FLOTTA-276).** Every run that isn't a chat
+    opens a session of its own on the agent, so after a run Hermes's newest is
+    the run's, and a page that opened it showed the run's prompt as the
+    person's words. So a session made with a run's title is never picked, and
+    of the rest: the newest of `mine` (the conversations the control plane has
+    this ticket's subject speaking in), else of `people` (anyone's), else the
+    newest left that no colleague's message opened either, which is a
+    conversation from before turns were recorded. None when only runs and
+    colleagues have used the agent: the page then starts a conversation.
     """
-    for row in rows:
-        if not isinstance(row, dict) or row.get("source") == "unknown":
-            continue
-        if {row.get("id"), row.get("_lineage_root_id")} & client_sessions:
-            continue
-        return row
-    return None
+    left = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("source") != "unknown"
+        and not ({row.get("id"), row.get("_lineage_root_id")} & client_sessions)
+        and not RUN_TITLE.fullmatch(str(row.get("title") or ""))
+    ]
+
+    def pick(wanted: set[str] | None) -> dict[str, Any] | None:
+        if not wanted:
+            return None
+        for row in left:
+            if {row.get("id"), row.get("_lineage_root_id")} & wanted:
+                return row
+        return None
+
+    unclaimed = (row for row in left if not RELAY_TITLE.fullmatch(str(row.get("title") or "")))
+    return pick(mine) or pick(people) or next(unclaimed, None)
 
 
 #: A message's method, and the block the door puts above one while a run works
@@ -368,7 +408,7 @@ class ConversationGate:
         self._creating: set[Any] = set()
         self._resuming: set[Any] = set()
         #: The door's `session.list` -> the client's id, and what to leave out.
-        self._listing: dict[str, tuple[Any, set[str]]] = {}
+        self._listing: dict[str, tuple[Any, set[str], set[str], set[str]]] = {}
         self._asked = 0
         #: What the box has asked this socket and not been answered: id -> method.
         self._open: dict[str, str] = {}
@@ -485,16 +525,32 @@ class ConversationGate:
         return Step(to_box=json.dumps(rebuilt))
 
     async def _agency_latest(self, rid: Any, frame: str) -> Step:
+        """The agency's latest: listed and picked here, never Hermes's own answer,
+        which after any run is the session that run made (FLOTTA-276). A run's,
+        a relay's or a box's own socket is no person, and gets Hermes's."""
+        if self._subject_of_run():
+            return Step(to_box=frame)
         try:
             rows = await self._plane.client_conversations(self._box_id)
         except Exception as exc:
             return Step(to_client=_error(rid, UNAVAILABLE, f"could not ask whose it is: {exc}"))
-        if not rows:
-            # No client has talked to this agent, so Hermes's own answer is right.
-            return Step(to_box=frame)
+        try:
+            had = await self._plane.chat_conversations(self._box_id, self._subject)
+        except Exception as exc:  # noqa: BLE001 - which is a person's is a preference
+            # Not knowing whose a conversation is still leaves out the client's
+            # and the runs': a page that cannot open one is worse.
+            _log.warning("%s's conversations could not be read: %s", self._box_id, exc)
+            had = None
+        people: set[str] = set()
+        mine: set[str] = set()
+        for row in had or []:
+            ids = {str(row[k]) for k in ("id", "root") if row.get(k)}
+            people |= ids
+            if row.get("mine"):
+                mine |= ids
         self._asked += 1
         door_id = f"{LIST_ID_PREFIX}{self._asked}"
-        self._listing[door_id] = (rid, {str(row.get("id")) for row in rows})
+        self._listing[door_id] = (rid, {str(row.get("id")) for row in rows}, mine, people)
         question = {
             "jsonrpc": "2.0",
             "id": door_id,
@@ -758,12 +814,18 @@ class ConversationGate:
         return json.dumps({**parsed, "result": cleaned})
 
     def _answer_latest(self, door_id: str, parsed: dict[str, Any]) -> str:
-        rid, client_sessions = self._listing.pop(door_id)
+        rid, client_sessions, mine, people = self._listing.pop(door_id)
         result = parsed.get("result")
         rows = result.get("sessions") if isinstance(result, dict) else None
         if not isinstance(rows, list):
             return _error(rid, UNAVAILABLE, "the agent did not list its sessions")
-        return _result(rid, _latest(latest_of_the_agency(rows, client_sessions)))
+        picked = latest_of_the_agency(rows, client_sessions, mine, people)
+        root = picked.get("_lineage_root_id") if picked else None
+        if picked and self._turns is not None and isinstance(root, str) and root:
+            # Its turns from now on say which conversation it began as, which is
+            # how Hermes lists it after the next compression too.
+            self._turns.heard_root(str(picked.get("id")), root)
+        return _result(rid, _latest(picked))
 
     async def _created(self, rid: Any, parsed: dict[str, Any], frame: str) -> str:
         """Goes on the list before the client hears of it, or the client doesn't.

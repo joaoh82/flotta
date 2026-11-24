@@ -157,6 +157,7 @@ class Recorder(Protocol):
         client: bool,
         started_at: str,
         stored_session_id: str | None = None,
+        conversation_root: str | None = None,
     ) -> str | None: ...
 
     async def finish_chat_run(
@@ -237,6 +238,9 @@ class TurnRecorder:
         #: Each live session's stored id, the one a conversation is listed and
         #: opened by: Hermes answers a turn under one and keeps it under the other.
         self._stored: dict[str, str] = {}
+        #: A stored id -> the id its conversation began under, when the door
+        #: told this socket it was compressed (FLOTTA-276).
+        self._roots: dict[str, str] = {}
         #: Resumes asked and not yet answered: the request's id, and the stored id.
         self._resuming: dict[str, str] = {}
         self._queue: asyncio.Queue[Any] = asyncio.Queue(QUEUE_LIMIT)
@@ -383,6 +387,11 @@ class TurnRecorder:
         rid = parsed.get("id")
         if parsed.get("method") == "approval" and isinstance(rid, str) and rid:
             self._ask(session, turn, rid, params)
+
+    def heard_root(self, stored: str, root: str) -> None:
+        """`stored` is a conversation compressed since it began as `root`."""
+        if stored != root and (stored in self._roots or len(self._roots) < MAX_RESUMING):
+            self._roots[stored] = root
 
     def _hear_session(self, frame: str) -> None:
         """A session made or resumed: which stored conversation its live id is."""
@@ -537,6 +546,7 @@ class TurnRecorder:
                 client=self._client,
                 started_at=turn.started_at.isoformat(),
                 stored_session_id=self._stored.get(session),
+                conversation_root=self._roots.get(self._stored.get(session) or ""),
             )
         turn.run_id.set_result(run_id)
 

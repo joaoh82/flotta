@@ -574,14 +574,28 @@ def test_the_list_keeps_one_row_per_session_newest_first(fleet):
 
 
 class Plane:
-    def __init__(self, rows=(), *, broken=False):
+    def __init__(self, rows=(), *, broken=False, chats=()):
         self.rows, self.broken = [{"id": row, "started_at": 1.0} for row in rows], broken
         self.recorded = []
+        #: (stored id, whose) newest first: the people's conversations (FLOTTA-276).
+        self.chats = None if chats is None else list(chats)
+        self.chats_asked: list[str] = []
 
     async def client_conversations(self, box_id):
         if self.broken:
             raise BoxUnavailable("down", status=503)
         return self.rows
+
+    async def chat_conversations(self, box_id, by):
+        if self.broken:
+            raise BoxUnavailable("down", status=503)
+        self.chats_asked.append(by)
+        if self.chats is None:  # a control plane older than the route
+            return None
+        return [
+            {"id": chat[0], "mine": chat[1] == by, **({"root": chat[2]} if len(chat) > 2 else {})}
+            for chat in self.chats
+        ]
 
     async def record_client_conversation(self, box_id, session_id):
         if self.broken:
@@ -965,26 +979,159 @@ def test_a_session_with_no_stored_id_is_not_handed_over():
     assert "error" in _run(go())
 
 
-def test_the_agencys_socket_is_left_alone_until_a_client_has_talked():
+def test_the_agencys_socket_is_left_alone_but_for_its_latest():
     gate = _gate(conversation_only=False)
     frame = _frame("shell.exec")
     assert _run(gate.from_client(frame)).to_box == frame
-    frame = _frame("session.most_recent")
-    assert _run(gate.from_client(frame)).to_box == frame
+    asked = json.loads(_run(gate.from_client(_frame("session.most_recent"))).to_box)
+    assert asked["method"] == "session.list"
 
 
-def test_the_agency_cannot_be_told_a_clients_session_is_its_latest():
+def test_a_runs_own_socket_gets_hermess_latest():
+    """No person is on it: a run, a relay or a box's own token."""
+    for subject in ("run:t-1", "relay", "box:eng-a"):
+        gate = ConversationGate(
+            box_id="b-1", subject=subject, plane=Plane(), conversation_only=False
+        )
+        frame = _frame("session.most_recent")
+        assert _run(gate.from_client(frame)).to_box == frame
+
+
+def _agency_latest(plane, rows):
     async def go():
-        gate = _gate(Plane(["hers"]), conversation_only=False)
+        gate = _gate(plane, conversation_only=False)
         asked = json.loads((await gate.from_client(_frame("session.most_recent", rid=9))).to_box)
         assert asked["method"] == "session.list"
-        rows = [{"id": "hers", "source": "tui"}, {"id": "ours", "source": "tui", "started_at": 2}]
         return json.loads(
             await gate.from_box(json.dumps({"id": asked["id"], "result": {"sessions": rows}}))
         )
 
     answer = _run(go())
-    assert answer["id"] == 9 and answer["result"]["session_id"] == "ours"
+    assert answer["id"] == 9
+    return answer["result"]["session_id"]
+
+
+def test_the_agency_cannot_be_told_a_clients_session_is_its_latest():
+    rows = [{"id": "hers", "source": "tui"}, {"id": "ours", "source": "tui", "started_at": 2}]
+    chats = [("hers", "user:ana"), ("ours", "user:ana")]
+    assert _agency_latest(Plane(["hers"], chats=chats), rows) == "ours"
+
+
+def test_a_runs_session_is_nobodys_conversation():
+    """FLOTTA-276: after a run, Hermes's newest is the run's own session, and
+    the page showed its prompt as the person's words."""
+    rows = [
+        {"id": "the-run", "source": "tui", "started_at": 3},
+        {"id": "ours", "source": "tui", "started_at": 2},
+    ]
+    plane = Plane(chats=[("ours", "user:ana")])
+    assert _agency_latest(plane, rows) == "ours"
+    assert plane.chats_asked == ["user:ana"]
+
+
+def test_the_persons_own_conversation_before_a_colleagues():
+    rows = [
+        {"id": "the-run", "source": "tui"},
+        {"id": "bens", "source": "tui"},
+        {"id": "anas", "source": "tui"},
+    ]
+    chats = [("bens", "user:ben"), ("anas", "user:ana")]
+    assert _agency_latest(Plane(chats=chats), rows) == "anas"
+    # Ana never spoke here: the newest anybody did.
+    assert _agency_latest(Plane(chats=[("bens", "user:ben")]), rows) == "bens"
+
+
+def test_an_agent_only_runs_have_used_starts_a_conversation():
+    """None, which the web app answers with `session.create`."""
+    rows = [
+        {"id": "schedule-run", "source": "tui", "title": "Run t-0123456789ab"},
+        {"id": "request-run", "source": "tui", "title": "Run t-ba9876543210"},
+    ]
+    assert _agency_latest(Plane(), rows) is None
+
+
+def test_a_conversation_from_before_turns_were_recorded_is_still_opened():
+    """Nothing recorded names it, and it is no run's: the newest such is the
+    conversation, rather than a new one that hides it."""
+    rows = [
+        {"id": "the-run", "source": "tui", "title": "Run t-0123456789ab"},
+        {"id": "from-october", "source": "tui", "title": "Fix the build"},
+    ]
+    assert _agency_latest(Plane(), rows) == "from-october"
+
+
+def test_a_control_plane_without_the_route_still_skips_runs():
+    """The door and the control plane deploy apart; an older one answers 404."""
+    rows = [
+        {"id": "the-run", "source": "tui", "title": "Run t-0123456789ab"},
+        {"id": "ours", "source": "tui"},
+    ]
+    assert _agency_latest(Plane(chats=None), rows) == "ours"
+
+
+def test_a_colleagues_message_is_not_a_persons_conversation_either():
+    rows = [
+        {"id": "relayed", "source": "tui", "title": "eng-b asked"},
+        {"id": "from-october", "source": "tui", "title": "Fix the build"},
+    ]
+    assert _agency_latest(Plane(), rows) == "from-october"
+
+
+def test_not_knowing_whose_a_conversation_is_still_opens_one():
+    class Half(Plane):
+        async def chat_conversations(self, box_id, by):
+            raise BoxUnavailable("slow", status=504)
+
+    rows = [{"id": "the-run", "source": "tui", "title": "Run t-0123456789ab"}, {"id": "ours"}]
+    assert _agency_latest(Half(), rows) == "ours"
+
+
+def test_a_conversation_compressed_since_its_turn_is_still_found():
+    rows = [{"id": "the-run", "source": "tui"}, {"id": "tip", "_lineage_root_id": "root"}]
+    assert _agency_latest(Plane(chats=[("root", "user:ana")]), rows) == "tip"
+    # Compressed twice: the turn named the middle id, and said what it began as.
+    rows = [{"id": "the-run", "source": "tui"}, {"id": "tip2", "_lineage_root_id": "root"}]
+    assert _agency_latest(Plane(chats=[("tip", "user:ana", "root")]), rows) == "tip2"
+
+
+def test_the_door_tells_the_turns_what_a_picked_conversation_began_as():
+    class Turns:
+        def __init__(self):
+            self.roots = []
+
+        def heard_root(self, stored, root):
+            self.roots.append((stored, root))
+
+        def heard_client(self, frame):
+            pass
+
+        def heard_box(self, frame):
+            pass
+
+    async def go(turns):
+        gate = ConversationGate(
+            box_id="b-1",
+            subject="user:ana",
+            plane=Plane(chats=[("root", "user:ana")]),
+            conversation_only=False,
+            turns=turns,
+        )
+        asked = json.loads((await gate.from_client(_frame("session.most_recent", rid=9))).to_box)
+        rows = [{"id": "tip", "_lineage_root_id": "root", "source": "tui"}]
+        await gate.from_box(json.dumps({"id": asked["id"], "result": {"sessions": rows}}))
+
+    turns = Turns()
+    _run(go(turns))
+    assert turns.roots == [("tip", "root")]
+
+
+def test_the_agencys_latest_is_refused_when_nobody_can_say_whose():
+    async def go():
+        gate = _gate(Plane(broken=True), conversation_only=False)
+        return await gate.from_client(_frame("session.most_recent"))
+
+    step = _run(go())
+    assert step.to_box is None and "error" in json.loads(step.to_client)
 
 
 def test_a_compressed_conversation_is_still_the_clients():
