@@ -3189,7 +3189,9 @@ class FleetStore:
         page passed; a founding one also takes a place and the Studio limits.
         """
         email = normalize_email(email)
-        with self._conn.transaction(guard=("users", "orgs")):
+        # `orgs` before `users`: `close_org` locks them in that order, and the
+        # other way round deadlocks a sign-up against a close on Postgres.
+        with self._conn.transaction(guard=("orgs", "users")):
             created = self._sign_up_body(email, org_id, org_name, attribution)
         self._emit_signup(created)
         return created
@@ -3209,7 +3211,10 @@ class FleetStore:
             return None
         moment = now or datetime.now(UTC)
         created: tuple[User, Org, Membership] | None = None
-        with self._conn.transaction(guard=("users", "login_links", "orgs")):
+        # `orgs`, then `users`, then `login_links`. `close_org` locks orgs
+        # before users, and an invite locks users before login_links; any
+        # other order deadlocks one of those against this redeem.
+        with self._conn.transaction(guard=("orgs", "users", "login_links")):
             row = self._live_link_row(secret, moment)
             if row is None or row["purpose"] != "sign_up":
                 return None
