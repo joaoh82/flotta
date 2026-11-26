@@ -20,6 +20,8 @@
 
 # --- local state that is never part of a build -----------------------------
 .venv/
+# The adapters' and the example's own environments (M17.3).
+**/.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -36,8 +38,9 @@ vendor/
 dashboard/
 skills/
 assets/
-# The retired desktop app (D17): no image builds from it, and its Rust build
-# output and node_modules made every `just door-deploy` upload 7.3 GB.
+# The desktop app is gone (D17, FLOTTA-80), but a checkout that had it keeps
+# its untracked Rust build output and node_modules, which made every
+# `just door-deploy` upload 7.3 GB.
 app/
 # At any depth: a bare `node_modules/` only matches the one at the root.
 **/node_modules/

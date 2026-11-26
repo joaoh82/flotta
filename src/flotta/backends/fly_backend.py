@@ -735,6 +735,66 @@ class FlyBackend:
             return None
         return endpoint_for(app, machines[0]["id"])
 
+    def leftover(self, box_name: str) -> bool:
+        """Whether anything of this box is still on Fly (FLOTTA-30). Never guesses.
+
+        The question that decides whether a name may be given to a new agent:
+        `create` adopts whatever it finds under the name, so a machine or a
+        volume left behind would become the next agent's, memory included.
+
+        With one app per agent the app is the box, and its existing at all is
+        the answer: a volume without a machine still bills and still holds the
+        agent's memory. Without a prefix the fleet shares one app, which always
+        exists, so its machines are the answer there.
+
+        **Raises `BackendError` when Fly can't be asked**, unlike `_app_exists`
+        and the lenient listing, which read a failed `flyctl` as "nothing here".
+        Here that reading would free a name whose machine is still billing.
+        """
+        app = self.config.app_for(box_name)
+        if not self._app_listed(app):
+            # No app, nothing of it: a shared app is gone once a destroy took
+            # it, or before the first create ever made it.
+            return False
+        if app == self.config.app:
+            return bool(self._machines(app, strict=True))
+        return True
+
+    def _app_listed(self, app: str) -> bool:
+        """Whether Fly lists `app`. Strict, unlike `_app_exists`: a `flyctl`
+        that could not answer raises `BackendError` instead of saying no."""
+        result = self._flyctl("apps", "list", "--json", app=None, check=False)
+        if result.returncode != 0:
+            why = _reason(result.stderr) or f"flyctl exited {result.returncode}"
+            raise BackendError(f"could not list Fly apps: {why}")
+        try:
+            apps = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise BackendError(
+                f"flyctl apps list did not return JSON: {(result.stdout or '')[:120]!r}"
+            ) from exc
+        if not isinstance(apps, list):
+            raise BackendError("flyctl apps list did not return a list")
+        return any(isinstance(a, dict) and a.get("Name") == app for a in apps)
+
+    def remove_leftover(self, box_name: str) -> None:
+        """Destroy whatever is left of this box on Fly, by name (FLOTTA-30).
+
+        For a provision that failed before its row learned an endpoint, which
+        is the usual case: `destroy` needs one, and there is none to give it.
+        With one app per agent the app is the box, so it goes, volume and all.
+        A shared app is the whole fleet's and is never destroyed for one
+        agent: that refuses, and someone removes the machine by hand.
+        """
+        app = self.config.app_for(box_name)
+        if not self.leftover(box_name):
+            return
+        if app == self.config.app:
+            raise BackendError(
+                f"{app} is the fleet's shared app; remove this agent's machine from it by hand"
+            )
+        self._flyctl("apps", "destroy", app, "-y", app=None)
+
     def current_image(self, app: str) -> str | None:
         """The image this app last released, if any.
 

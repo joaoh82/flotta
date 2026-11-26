@@ -550,10 +550,13 @@ conventions, and the sharp edges below.
   processing..."`), not the agent — never show it. A terminal command that
   fails has `error: null` and a non-zero `exit_code`, so reading only `error`
   calls it a success. **`message.complete`'s text is only the final segment**:
-  whatever the agent said before a tool is *not* repeated, so the app turns
-  that narration into its own line (`Step::Said`) when the tool starts.
-  `a_turn_shows_its_steps_as_they_happen` (`just app-live`) re-checks both on
-  the next Hermes bump (FLOTTA-61).
+  whatever the agent said before a tool is *not* repeated, so the desktop
+  app turned that narration into its own line (`Step::Said`) when the tool
+  started, and the web app's conversation (flotta-cloud
+  `src/conversation/hermes.ts`) has to do the same.
+  The desktop app's `a_turn_shows_its_steps_as_they_happen` (`just app-live`)
+  re-checked both on a Hermes bump until the app was removed (FLOTTA-80); now
+  check them by hand in a live web-app conversation (FLOTTA-61).
 - **Hermes v2026.9.14 asks for approvals instead of announcing them.** The
   question used to be an `approval.request` *event* answered by the
   `approval.respond` RPC. From v2026.9.14 it is a **server→client JSON-RPC
@@ -563,22 +566,27 @@ conventions, and the sharp edges below.
   `{"jsonrpc":"2.0","id":"srq-…","result":{"choice":"once"}}`. A request that
   times out or is interrupted is withdrawn with a `request.cancel`
   `{id, method, reason}` event. The same mechanism carries clarify, sudo and
-  secret prompts. Rolled onto it, the app ignored the frame: no card, and
-  every approval denied by the 60s timeout, with the live test reporting "the
-  model never reached the gate" while each turn took 65s (FLOTTA-64). The app
-  now reads both forms and answers each on its own path (`answer_for`). **A
-  Hermes bump is a protocol change until the live tests say otherwise** —
-  run `just app-live` against one agent before calling it done.
-- **Approvals are granted by pattern, not by command — so the app never offers
+  secret prompts. Rolled onto it, the desktop app ignored the frame: no card,
+  and every approval denied by the 60s timeout, with the live test reporting
+  "the model never reached the gate" while each turn took 65s (FLOTTA-64). It
+  then read both forms and answered each on its own path (`answer_for`), as the
+  web app's conversation and the door's gate (`door/conversation.py`) do. **A
+  Hermes bump is a protocol change until a live conversation says otherwise** —
+  hold one with an agent in the web app before calling it done. The live test
+  that did this, `just app-live`, left with the desktop app (FLOTTA-80).
+- **Approvals are granted by pattern, not by command — so nothing offers
   `always`.** Hermes records `session` and `always` against the command's
   `pattern_key` (e.g. `delete in root path`), not the command itself. Measured
   on `eng-g`: answering `session` for `rm -rf /tmp/…-a` let `rm -rf /tmp/…-b`
   run with **no approval asked**. `always` does the same **permanently**,
   writing the pattern to `command_allowlist` in `$HERMES_HOME/config.yaml` on
   the volume — surviving restarts, re-images and updates, invisible in the app.
-  A button beside one command must not grant a category forever, so
-  `APPROVAL_CHOICES` in `agent.rs` omits `always`: `read_approval` drops it from
-  the card and `valid_choice` refuses to send it. The card names the pattern
+  A button beside one command must not grant a category forever, so the web
+  app's `APPROVAL_CHOICES` (flotta-cloud `src/conversation/hermes.ts`) omits
+  `always`: `validChoice` drops it from the card, and `approvalAnswers` offers
+  only once and deny. For a client's ticket the door enforces it too, rebuilding
+  every answer from `CLIENT_APPROVAL_CHOICES` (`flotta.approval_choices`). The
+  desktop app did the same in `agent.rs` until it was removed (FLOTTA-80). The card names the pattern
   that "Allow for this conversation" would cover (FLOTTA-62). `session` is not
   persisted — `config.yaml` is unchanged after one.
 - **To trigger an approval on purpose, ask for a routine command, not a scary
@@ -587,8 +595,8 @@ conventions, and the sharp edges below.
   exactly that. `rm -rf /tmp/flotta-approval-probe` reads as ordinary cleanup
   to the model and is still flagged ("delete in root path"), escalating on
   three runs out of three. The path does not exist, so a wrong answer removes
-  nothing. `FLOTTA_BOX=eng-g just app-live` runs this through the app's own
-  turn loop.
+  nothing. It ran through the desktop app's turn loop as
+  `FLOTTA_BOX=eng-g just app-live` until that app was removed (FLOTTA-80).
 - **A provider failure arrives as a normal `message.complete`** whose text is
   an error string, with `status != "complete"`. Returning it as the reply would
   print "No inference provider configured" as though the agent had said it.
@@ -978,6 +986,18 @@ conventions, and the sharp edges below.
   not passed over for the agency's**: the client's work would quietly move to an account
   nobody chose for it. A client's credential is sealed to that client as well
   (`mcp.connection_context`), and each call's row says which served it (`account`).
+- **A custom agent is not Hermes, and every Hermes-only path must say so (M17,
+  `docs/CONTRACT.md`).** `boxes.runtime = 'custom'` runs the agency's own image,
+  which serves the box contract on 9119. `provision.hermes_only(store, box_id, what)` is the
+  first statement of every Hermes-only verb (`refuse_custom(box, what)` where a
+  route already holds the box) (instructions, rules, MCP, the gateway
+  switch, the model, the screen), and the routes refuse before answering 202. A new
+  Hermes-only feature that forgets it re-images or misconfigures a customer's code.
+  The door translates in one place, `door/contract.py`, so the relay, the run loop
+  and the recorder see Hermes frames either way. **A test that opens the socket
+  directly is not a test of the run loop**: #260's did, and missed that
+  `runner.door_socket` logs in over HTTP first, which the door refused for every
+  custom agent (#261). Drive `door_socket` itself.
 
 ## Source of truth
 
@@ -1014,7 +1034,9 @@ One durable store is the single source of truth for fleet state; everything else
 - **A suspended org runs nothing and creates nothing** (FLOTTA-184): how a final failed payment ends. `FleetStore.suspend_org`/`resume_org` (`active ↔ suspended` only, never the default org, under the orgs guard; a repeat is `changed: false` and emails nobody, because billing's webhooks are redelivered). `POST /api/orgs/{id}/suspend|resume` for the operator or `org:govern`. What holds it: `provision._refuse_held` (every path that starts a machine, `start_box` included), the wake route's 402 before it records activity (the door closes 4402; the web app reads `org_status` on `/api/me`), `runner._blocked` (`budget_blocked` with `error_class="suspended"`), `budgets.check_budgets` (the gateway's 402), and `provision.sleep_suspended_orgs` (after the suspend, and every loop sweep). Clients, people and invites are refused in the store; `OrgNotActiveError` is a 403 from one handler. Sign-in and reads still work. `control/test_suspended.py` sends every route at a suspended org's sleeping agent and fails if its machine starts. Events go on its agents' timelines (`org_suspended`/`org_resumed`): `events` has no org kind.
 - **Billing never approves an org without a starting cap** (FLOTTA-185). `POST /api/orgs/{id}/approve` takes the operator or `org:govern`; for `org:govern` it always passes `starting_cap_eur_nano` (`settings.starting_cap_eur_nano`, from `FLOTTA_STARTING_CAP_EUR`, never zero) and `decide_org` writes the cap in the approval's transaction. The cap is its **own row** (`_starting_cap_id`, `budgets.starting_cap = 1`): the org-wide monthly budget, `pause`, under an id no scope and period addresses, so an owner's `PUT`/`DELETE` never reach it and `budgets_covering` applies it beside the org's own. `DELETE /api/orgs/{id}/starting-cap` (operator or billing) lifts it, idempotently, with `starting_cap_set`/`starting_cap_lifted` in `budget_events`. `control/test_starting_cap.py` sends every route with `org:govern` at a pending org and fails if it comes out active without its cap.
 - **An org's spend ceiling** (FLOTTA-241) bounds what it may owe in model spend on the fleet's keys between invoices. Three columns on `orgs` (migration 40): `spend_ceiling_eur_nano` (NULL is none), `spend_ceiling_set_at` (NULL is never decided) and `billing_period_from`. `store.ceiling_budget(org)` makes it an org-wide `pause` budget with id `ceiling:<org>`, period `billing` and `soft_pct` 0.8, **never stored in `budgets`**; `budgets.covering` adds it beside `budgets_covering`, and `enforce_budgets` adds `orgs_with_ceiling()`, so the gateway, the sweep, the 80% event and the unpause guard all treat it as a budget. It sums `key_scope = 'fleet'` only, over `budgets.billing_window` (from `billing_period_from` a month at a time, else the calendar month). Routes: `GET/PUT /api/orgs/{id}/spend-ceiling` (read by the org's agency people, set by the operator or `org:govern`), `POST …/spend-ceiling/default` (billing, from `FLOTTA_SPEND_CEILING_EUR`, only while undecided) and `PUT …/billing-period`. CLI `flotta org ceiling <org> [--eur N | --none]`. `test_spend_ceiling.py` and `control/test_spend_ceiling_api.py`.
+- **Closing an org, and deleting it later** (FLOTTA-224). `closed` is an org status, with `closed_at`/`closed_by` (migration 41; `closed_by` is `operator` or `owner`, never a person). `FleetStore.close_org` (never the default org, under the `orgs` and `users` guards, so a sign-in can't slip in) ends the org's sessions, deletes its links and disables its triggers in one transaction; `provision.close_org_agents` then tears down every agent (after the route answers, and again each sweep for any the substrate refused). A closed org is `Org.held`, as a suspended one is, so everything that refuses a suspended org refuses it, and `create_session` and the sign-in paths refuse it outright. `POST /api/orgs/{id}/close` with `{"confirm": "<id>"}` is the operator's or the org's owner's (`org:admin` **and** `fleet:write` in that org, so not the operator viewing as owner), never `org:govern`; `POST …/reopen` is the operator's and brings it back `suspended` by the operator, agents gone. `provision.purge_closed_orgs` runs last in every loop sweep: expired sessions and links go, and a closed org past `FLOTTA_CLOSED_RETENTION_DAYS` (a fleet setting, 30) with every box torn down has **every row deleted** by `FleetStore.purge_org`, people with no other org included; it logs counts, never names. **Every table must be in `store.PURGED_BY`**: `control/test_close_org.py::test_every_table_is_known_to_the_purge` fails for a new table until you decide how a closed org's rows in it are deleted, and add that to `purge_org`. `/api/orgs` shows `purge_after`. CLI `flotta org close <org> --confirm <org>` and `flotta org reopen <org>`.
 - **`src/flotta/auth.py`** — scoped, expiring signed-JSON tokens (M5a). Scopes are listed in `SCOPES` and pinned by `test_auth.py::test_the_known_scopes_are_exactly_these`, which says why each exists. `org:govern` (FLOTTA-183) is the hosted product's billing: an org's limits, its suspension (FLOTTA-184) and its approval with a starting cap (FLOTTA-185), nothing else, held alone, and `_is_operator` is False for it although it looks like the operator's token (`control/test_govern.py` sweeps every route with one). Revocation is a **key rotation**, so mint short ones. Subjects beginning `box:` are confined to their own box — that check is what makes it safe to put a token on a machine whose agent has root.
+- **`src/flotta/door/contract.py`** — the box contract behind a Hermes-shaped socket (M17): `ContractSocket` stands in for `websockets.connect` for a custom agent, answering `session.*` and `prompt.submit` and turning `/run`'s NDJSON into Hermes events. **`adapters/`** (MIT, their own projects and lockfiles, `just check-adapters`) serve the contract: `flotta-python` and `flotta-langgraph`. **`examples/langgraph-support`** is published to GHCR on merge.
 - **`src/flotta/door/conversation.py`** — what a chat ticket may say once the socket is open (FLOTTA-123, FLOTTA-126). A ticket opens a conversation unless it says `"access": "full"`, which the control plane adds only for a caller holding `fleet:write`: named methods with named parameters, and live ids this socket was given. The control plane lists a box's client conversations; anything not listed is the agency's. **The method list is what flotta-cloud's conversation page sends, so a new method on that page needs adding here**, or it is refused. It doesn't stop an agent telling a client what it knows: its memory and session search span every conversation. Not Hermes's `source`, which also sets the agent's platform and so its tools.
 - **`src/flotta/door/`** — the front door (M5b). It **cannot** be a reverse proxy: a request normally arrives while the box is asleep, so it must resolve → wake → wait-for-ready → proxy, including the WS upgrade. A separate Fly app, because reaching a box needs 6PN and pinning the control plane to Fly would tie the self-host recipe to one provider.
 - **`src/flotta/github_app.py`** — an agency's own GitHub, as a GitHub App (FLOTTA-22): a 1-hour token per repository, so GitHub enforces what a box reaches. An installation id proves nothing, so `claim` needs GitHub to confirm the person owns the account, and a state naming who started it. `store.github_installation_for` picks by the repository's owner, among the client's and the org's; connecting an account again replaces that org's older row for it, since GitHub keeps one installation per account. `$FLOTTA_GITHUB_TOKEN` stays the operator's own, for the default org only, and **a grant records which it may spend** (`box_repos.source`), so disconnecting an account ends the grants made on it rather than moving them to that token.
@@ -1045,7 +1067,7 @@ Common commands live in the **`justfile`** (`just` alone lists them). Python too
 ```bash
 just check                  # lint + tests — run before committing
 just check-dashboard        # tsc + eslint (the Python `check` does not cover the dashboard)
-just ci                     # check + check-dashboard + check-app — what GitHub Actions checks (app only when app/ changes)
+just ci                     # check + check-dashboard — what GitHub Actions checks
 just test-one <keyword>     # a single test (uv run pytest -k <keyword>)
 just test-postgres          # the store suite against a real Postgres (throwaway container)
 just fmt                    # ruff format + --fix

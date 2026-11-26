@@ -109,8 +109,8 @@ def calls_between(lines: list[str], start: float, end: float) -> list[ModelCall]
     """The calls logged inside a measurement window, in order.
 
     A window, not a session id: the id in the log is the database's, and the
-    socket only ever learns the live one — the two-ids trap `agent.rs`
-    documents. A box that is being measured is not being used for anything
+    socket only ever learns the live one — Hermes's two session ids, which
+    CLAUDE.md describes. A box that is being measured is not being used for anything
     else, which is what makes a time window honest.
     """
     calls = [c for c in (parse_call(line) for line in lines) if c is not None]

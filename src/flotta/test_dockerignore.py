@@ -13,7 +13,13 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DOCKERFILES = ["Dockerfile", "fly/Dockerfile", "fly/door/Dockerfile", "fly/gateway/Dockerfile"]
+DOCKERFILES = [
+    "Dockerfile",
+    "fly/Dockerfile",
+    "fly/door/Dockerfile",
+    "fly/gateway/Dockerfile",
+    "examples/langgraph-support/Dockerfile",
+]
 
 
 def _ignored() -> list[str]:
@@ -67,6 +73,8 @@ def test_secrets_stay_out_of_every_build_context():
 
 
 def test_the_retired_desktop_app_and_its_build_output_stay_out():
+    """The app is gone (FLOTTA-80); its untracked build output on a developer's
+    disk is not."""
     patterns = _ignored()
     assert _excluded("app/src-tauri/target/debug/flotta", patterns)
     assert _excluded("app/node_modules/react/index.js", patterns)

@@ -260,9 +260,9 @@ CREATE TABLE IF NOT EXISTS box_peer_blocks (
 );
 
 -- Fleet configuration a person set, as opposed to what the process was
--- started with. Flotta is used through the desktop app, so the app has to be
--- able to change how the fleet behaves — and an environment variable on
--- somebody else's Railway service is not reachable from a window on a laptop.
+-- started with. Flotta is used through an app (the desktop app then, the web
+-- app since D17), so the app has to be able to change how the fleet behaves —
+-- and an environment variable on the deployer's service is not reachable from it.
 --
 -- A new TABLE, for the same load-bearing reason as `box_repos` above: it
 -- appears on an existing fleet by itself, where a new column would not.
@@ -471,8 +471,13 @@ class OrgNotActiveError(StoreError):
 SUSPENDED_HINT = "an owner can settle its payment in billing to resume it"
 
 
+CLOSED_HINT = "its account was closed"
+
+
 def suspended_refusal(org: Org, doing: str) -> str:
-    """Why a suspended org may not do `doing`, in words a person can act on."""
+    """Why a suspended or closed org may not do `doing`, in words a person can act on."""
+    if org.status == "closed":
+        return f"org {org.id!r} is closed, so it cannot {doing}; {CLOSED_HINT}"
     return f"org {org.id!r} is suspended, so it cannot {doing}; {SUSPENDED_HINT}"
 
 
@@ -507,6 +512,117 @@ class InvalidBudgetError(StoreError):
 
 class LastOwnerError(StoreError):
     """Raised when removing an org's last owner would leave nobody to run it."""
+
+
+class CustomImagesOffError(StoreError):
+    """Raised when an org whose operator has not turned custom images on asks for one."""
+
+
+class InvalidImageError(StoreError):
+    """Raised when an image reference is not one Fly can pull without credentials."""
+
+
+#: What may run in an agent (M17): Hermes on the fleet's image, or the agency's own.
+RUNTIMES = ("hermes", "custom")
+#: The longest image reference taken, which is far past any real one.
+IMAGE_REF_MAX = 255
+# `[registry[:port]/]path[:tag][@sha256:digest]`, lower case as registries
+# require, with no scheme and no `user:password@`: only a public image is
+# taken in M17, and a credential in a reference would be logged everywhere
+# the reference is.
+_IMAGE_REF = re.compile(
+    r"^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?/)?"
+    r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@sha256:[a-f0-9]{64})?$"
+)
+
+
+def validate_image_ref(image: object) -> str:
+    """A custom agent's image reference, cleaned, or `InvalidImageError`.
+
+    In the store, where every caller meets it, for the reason a box name is:
+    a reference Fly cannot pull is an agent that never boots, and one carrying
+    a credential is a secret in every event and log line that names it.
+    """
+    if not isinstance(image, str) or not image.strip():
+        raise InvalidImageError("name the image, like ghcr.io/your-org/your-agent:1.0")
+    ref = image.strip()
+    if ref.startswith(LOCAL_IMAGE_PREFIX):
+        return _local_image(ref)
+    if len(ref) > IMAGE_REF_MAX:
+        raise InvalidImageError(f"an image reference is at most {IMAGE_REF_MAX} characters")
+    if "://" in ref:
+        raise InvalidImageError(
+            "an image reference has no scheme: ghcr.io/org/agent:tag, not https://"
+        )
+    if "@" in ref.split("/", 1)[0] or ref.count("@") > 1 or ("@" in ref and "@sha256:" not in ref):
+        raise InvalidImageError(
+            "an image reference carries no credentials; only public images can be used for now"
+        )
+    if not _IMAGE_REF.match(ref):
+        raise InvalidImageError(
+            f"{ref!r} is not an image reference; it looks like ghcr.io/your-org/your-agent:1.0"
+        )
+    host = ref.split("/", 1)[0] if "/" in ref else ""
+    if _private_registry(host.split(":", 1)[0]):
+        # Fly pulls its own registry with the fleet's credentials, so an image
+        # there is not public: it is the fleet's Hermes, or another app's.
+        raise InvalidImageError(
+            f"{host} is not a public registry; push the image to ghcr.io or Docker Hub"
+        )
+    return ref
+
+
+#: An agent run from a directory on this machine, not an image (M17.3): only on
+#: a local fleet (`just local`), where every agent is a process here anyway.
+LOCAL_IMAGE_PREFIX = "local:"
+#: What a local agent's directory holds: a uv project, and the script it runs.
+LOCAL_IMAGE_ENTRY = "agent.py"
+
+
+def _local_image(ref: str) -> str:
+    """`local:<dir>`, with the directory made absolute, or `InvalidImageError`.
+
+    Refused on any fleet but a local one: on Fly it would name a path on the
+    control plane's disk, which no machine can boot from.
+    """
+    from flotta.backend import DEFAULT_BACKEND_ENV
+
+    if (os.environ.get(DEFAULT_BACKEND_ENV) or "").strip().lower() != "local":
+        raise InvalidImageError(
+            "a local: image runs only on a local fleet (`just local`); "
+            "push the image to ghcr.io or Docker Hub"
+        )
+    given = ref[len(LOCAL_IMAGE_PREFIX) :].strip()
+    if not given:
+        raise InvalidImageError("name the agent's directory, like local:examples/langgraph-support")
+    directory = Path(given).expanduser().resolve()
+    if (
+        not (directory / LOCAL_IMAGE_ENTRY).is_file()
+        or not (directory / "pyproject.toml").is_file()
+    ):
+        raise InvalidImageError(
+            f"{directory} is not a local agent: "
+            f"it needs a pyproject.toml and an {LOCAL_IMAGE_ENTRY}"
+        )
+    return f"{LOCAL_IMAGE_PREFIX}{directory}"
+
+
+#: Registries an agency's image may not come from (M17.1): pulled with the
+#: fleet's own credentials, or on the fleet's own network.
+_PRIVATE_REGISTRIES = ("registry.fly.io", "localhost")
+_PRIVATE_SUFFIXES = (".fly.io", ".fly.dev", ".internal", ".flycast", ".localhost")
+
+
+def _private_registry(host: str) -> bool:
+    host = host.lower()
+    if host in _PRIVATE_REGISTRIES or host.endswith(_PRIVATE_SUFFIXES):
+        return True
+    # An address rather than a name: nobody publishes a public image at one,
+    # and it is the shape of reaching the fleet's own network.
+    return bool(re.fullmatch(r"[0-9.]+|\[[0-9a-f:]+\]", host))
 
 
 class InvalidBoxNameError(StoreError):
@@ -589,6 +705,15 @@ class Box:
     #: Whether this agent has a screen a person can watch and take over
     #: (FLOTTA-208/209). Off unless chosen: no screen means no ticket grants one.
     screen: bool = False
+    #: What runs in it (M17): `hermes`, the fleet's own image, or `custom`, the
+    #: agency's own image speaking the box contract. One of `RUNTIMES`.
+    runtime: str = "hermes"
+    #: A custom agent's image, as the agency named it. `None` for Hermes, whose
+    #: image is the fleet's and moves with its upgrades.
+    image: str | None = None
+    #: The template it was made from, as whoever made it named it (FLOTTA-249).
+    #: A label and nothing more: nothing here knows what a template sets.
+    template: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +753,14 @@ class Org:
     #: When its current billing period began, as billing last said (FLOTTA-241):
     #: the ceiling's window. `None` is the calendar month.
     billing_period_from: str | None = None
+    #: When it was closed and by whom (FLOTTA-224), while `status` is `closed`:
+    #: `closed_by` is one of `CLOSED_BY`. Its rows are deleted
+    #: `FLOTTA_CLOSED_RETENTION_DAYS` after `closed_at`. See `FleetStore.close_org`.
+    closed_at: str | None = None
+    closed_by: str | None = None
+    #: Whether its people may create agents from their own image (M17.1): the
+    #: operator's switch, off unless they turn it on.
+    custom_images: bool = False
     #: The plan the sign-up asked for (`founding`, `studio`, `agency`), and the
     #: campaign the website passed with it. `None` is a sign-up that named none.
     #: Founding Studio sets the Studio limits here; the other two wait for
@@ -646,6 +779,11 @@ class Org:
     #: and when the owner was told it was ending. Both `None` until then.
     price_until: str | None = None
     price_notice_at: str | None = None
+
+    @property
+    def held(self) -> bool:
+        """Whether nothing of it may run or be created: suspended, or closed."""
+        return self.status in ("suspended", "closed")
 
     def limit(self, kind: str) -> int | None:
         """The limit on `kind` (one of `LIMIT_KINDS`), or `None` for none."""
@@ -807,8 +945,90 @@ LINK_PURPOSES = frozenset({"sign_in", "invite", "sign_up"})
 #: An org's lifecycle (M12.4). `pending` is a sign-up waiting to be approved.
 #: On a self-hosted fleet the operator approves it. The managed product's
 #: billing does, once the agency starts a plan. `active` and `declined` are
-#: final. An org made by the operator starts `active`.
-ORG_STATUSES = ("pending", "active", "declined", "suspended")
+#: final. `closed` is an org that was shut (FLOTTA-224); the operator can
+#: reopen it as `suspended`. An org made by the operator starts `active`.
+ORG_STATUSES = ("pending", "active", "declined", "suspended", "closed")
+
+#: Who closed an org (FLOTTA-224): the operator, or the org's own owner.
+CLOSED_BY = ("operator", "owner")
+
+#: The tables whose rows belong to an org only through one of its boxes, which
+#: `purge_org` deletes by box (FLOTTA-224).
+PURGED_BY_BOX = (
+    "box_mcp_config_pending",
+    "box_mcp_grants",
+    "box_meta",
+    "box_models",
+    "box_peer_blocks",
+    "box_pr_policy",
+    "box_repos",
+    "box_request_policy",
+    "box_rules",
+    "client_approvers",
+    "client_conversations",
+    "client_screen_control",
+    "machine_meter_marks",
+)
+
+#: Every table, and how `purge_org` reaches its rows (FLOTTA-224): `org` by the
+#: org's id, `box` through its boxes, `entity` through its boxes, tasks and
+#: workspaces, `user` for people left in no org, and `global` for the fleet's
+#: own (no org's data). A test fails for a table not listed here, so a new
+#: table is purged on purpose, never by accident.
+PURGED_BY: dict[str, str] = {
+    **{table: "box" for table in PURGED_BY_BOX},
+    "events": "entity",
+    "trigger_fires": "trigger",
+    "tasks": "org",
+    "workspaces": "box",
+    **{
+        table: "org"
+        for table in (
+            "alert_deliveries",
+            "api_keys",
+            "architect_chats",
+            "architect_messages",
+            "architect_usage",
+            "boxes",
+            "budget_events",
+            "budgets",
+            "client_report_settings",
+            "client_reports",
+            "client_spend_shown",
+            "clients",
+            "github_installations",
+            "handoffs",
+            "login_links",
+            "mcp_calls",
+            "mcp_connections",
+            "mcp_oauth_flows",
+            "memberships",
+            "org_alerts",
+            "org_branding",
+            "orgs",
+            "pull_requests",
+            "report_notices",
+            "requests",
+            "run_approvals",
+            "sessions",
+            "triggers",
+            "usage",
+        )
+    },
+    "users": "user",
+    **{
+        table: "global"
+        for table in (
+            "agent_templates",
+            "builds",
+            "eur_rates",
+            "mcp_server_secrets",
+            "model_prices",
+            "schema_migrations",
+            "settings",
+        )
+    },
+}
 
 #: Which level's key paid for a model call (D19).
 KEY_SCOPES = frozenset({"fleet", "org", "client"})
@@ -1403,6 +1623,40 @@ class Budget:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchitectChat:
+    """One person's conversation with the Architect, in one org (FLOTTA-250)."""
+
+    id: str
+    org: str
+    user_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectMessage:
+    """One message of a chat. `content` is JSON the front end wrote, kept as text."""
+
+    id: str
+    chat_id: str
+    seq: int
+    role: str
+    content: str
+    created_at: str
+
+
+def _architect_chat(row: Any) -> ArchitectChat:
+    return ArchitectChat(
+        row["id"], row["org_id"], row["user_id"], row["title"], row["created_at"], row["updated_at"]
+    )
+
+
+class ArchitectChatFullError(RuntimeError):
+    """A person has as many chats, or a chat as many messages, as are kept."""
+
+
+@dataclass(frozen=True, slots=True)
 class Spend:
     """A sum over the ledger. `unpriced` counts rows with no euro cost, which
     `eur_nano` is short by: a budget check has to treat that as unknown."""
@@ -1469,6 +1723,25 @@ INSTRUCTIONS_CHANGED = "instructions_changed"
 
 class InvalidBoxMetaError(ValueError):
     """A display name, description or instructions that cannot be stored."""
+
+
+_TEMPLATE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+
+
+def validate_template(raw: Any) -> str | None:
+    """The name of the template an agent was made from, or `None` for none.
+
+    A short slug, because it is shown and filtered on. The templates
+    themselves are the caller's (the web app's): the control plane keeps the
+    name it is given and does not know what a template sets.
+    """
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str) or not _TEMPLATE_ID.fullmatch(raw):
+        raise InvalidBoxMetaError(
+            "template is a short name in lower case letters, digits and hyphens"
+        )
+    return raw
 
 
 def validate_box_meta(
@@ -1787,8 +2060,16 @@ class FleetStore:
         org: str = DEFAULT_ORG,
         client: str = DEFAULT_CLIENT,
         box_id: str | None = None,
+        runtime: str = "hermes",
+        image: str | None = None,
     ) -> Box:
         """Insert a new box in status ``provisioning`` and return it.
+
+        **What runs in it is written with it** (M17.1): `runtime="custom"`
+        needs an `image` and an org whose operator turned custom images on,
+        checked before the insert and under the same guard, so a refusal
+        leaves no row holding the name and no box is ever re-labelled after
+        it exists.
 
         **Capped by the org's agents limit** (FLOTTA-183): the count and the
         insert share `boxes`' guard, so two creates cannot both take the last
@@ -1814,12 +2095,20 @@ class FleetStore:
         tenancy is written in the same statement as the name — there is no
         moment at which a box exists without an owner.
 
-        No transaction around the client check: clients are never deleted, and
-        the insert cannot make one disappear.
+        No transaction around the client check: a client is deleted only with
+        its org, by `purge_org`, long after the org closed, and a closed org
+        creates nothing (FLOTTA-224); the insert cannot make one disappear.
         """
         org = validate_tenant_id(org, kind="org")
         client = validate_tenant_id(client, kind="client")
         label = box_label(name, org=org, client=client)
+        if runtime not in RUNTIMES:
+            raise InvalidBoxMetaError(f"runtime is one of {', '.join(RUNTIMES)}, not {runtime!r}")
+        if runtime == "hermes":
+            if image is not None:
+                raise InvalidImageError("a Hermes agent runs the fleet's image; name none")
+        else:
+            image = validate_image_ref(image)
         if self.get_client(org, client) is None:
             raise UnknownEntityError(f"org {org!r} has no client {client!r}")
         bid = box_id or f"b-{uuid.uuid4().hex[:12]}"
@@ -1834,10 +2123,18 @@ class FleetStore:
                 # agents is held the same way, for the same reason.
                 self.require_active_org(org)
                 self._check_room(org, "agents")
+                if runtime == "custom":
+                    self.require_custom_images(org)
+                # A Hermes row names no runtime: the column's default is
+                # Hermes, and a store part-way through its migrations, before
+                # 42, has no such column (the migration tests write one). One
+                # statement either way, which the pending-org ratchet counts.
+                extra = "" if runtime == "hermes" else ", runtime, image"
+                values = () if runtime == "hermes" else (runtime, image)
                 self._conn.execute(
-                    "INSERT INTO boxes (id, name, status, created_at, org_id, client_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (bid, label, "provisioning", _utcnow(), org, client),
+                    f"INSERT INTO boxes (id, name, status, created_at, org_id, client_id{extra}) "
+                    f"VALUES ({', '.join('?' for _ in range(6 + len(values)))})",
+                    (bid, label, "provisioning", _utcnow(), org, client, *values),
                 )
         except db.UniqueViolation as exc:
             # Two different collisions land here. Reporting a duplicate *id* as
@@ -1845,6 +2142,17 @@ class FleetStore:
             # they would rename and hit the same wall.
             if self.get_box(bid) is not None:
                 raise DuplicateBoxError(f"a box with id {bid!r} already exists") from exc
+            holder = self.get_box_by_name(label)
+            if holder is not None and holder.status in BOX_TERMINAL:
+                # Not in the fleet list, so "already exists" names something
+                # nobody can see (FLOTTA-30). It is a torn-down agent whose name
+                # was kept because its machine may still be there.
+                raise DuplicateBoxError(
+                    f"the name {label!r} is still held by agent {holder.id}, which is torn "
+                    "down but may have left its machine behind (its provision failed, or "
+                    f"destroying it did). `flotta kill {holder.id}` removes what is left and "
+                    "frees the name; until then, use another name."
+                ) from exc
             raise DuplicateBoxError(f"a box named {label!r} already exists") from exc
         return self._get_box_or_raise(bid)
 
@@ -1980,6 +2288,8 @@ class FleetStore:
                     if org.status == "pending"
                     else f"it cannot create agents; {SUSPENDED_HINT}"
                     if org.status == "suspended"
+                    else f"it cannot create agents; {CLOSED_HINT}"
+                    if org.status == "closed"
                     else "it cannot create agents"
                 )
             )
@@ -1990,7 +2300,7 @@ class FleetStore:
     def org_counts(self, org_id: str) -> dict[str, int]:
         """What `org_id` holds of each of `LIMIT_KINDS`, as its limits count it.
 
-        Clients are every client it has (clients are never deleted), seats its
+        Clients are every client it has (deleted only with the org), seats its
         owners and members, agents its boxes that are not torn down.
         """
         clients = self._conn.execute(
@@ -2264,6 +2574,221 @@ class FleetStore:
         """
         return self._set_suspended(org_id, False, by=by, as_billing=as_billing)
 
+    # -- closing an org (FLOTTA-224) -----------------------------------------
+
+    def close_org(self, org_id: str, *, by: str) -> tuple[Org, bool]:
+        """Close an org: `(org, changed)`. Its data is deleted later, by `purge_org`.
+
+        In one transaction: the status becomes `closed`, every session of the
+        org ends, its sign-in and invite links are deleted, and its triggers stop
+        firing. Destroying its agents' machines is the caller's next step
+        (`provision.close_org_agents`), outside the transaction, because it
+        reaches the substrate; the purge sweep retries any that failed.
+
+        `by` is one of `CLOSED_BY`. Closing a closed org changes nothing and
+        answers `changed=False`. The default org is the operator's own fleet
+        and is never closed.
+        """
+        if by not in CLOSED_BY:
+            raise ValueError(f"an org is closed by one of {CLOSED_BY}, not {by!r}")
+        # `users` too: `create_session` checks the org under it, so a sign-in
+        # either lands before this and its session is deleted here, or after
+        # and is refused.
+        with self._conn.transaction(guard=("orgs", "users")):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.id == DEFAULT_ORG:
+                raise InvalidTransitionError(
+                    "the default org is the operator's own fleet; it is never closed"
+                )
+            if org.status == "closed":
+                return org, False
+            self._conn.execute(
+                "UPDATE orgs SET status = 'closed', closed_at = ?, closed_by = ? WHERE id = ?",
+                (_utcnow(), by, org_id),
+            )
+            self._conn.execute("DELETE FROM sessions WHERE org_id = ?", (org_id,))
+            self._conn.execute("DELETE FROM login_links WHERE org_id = ?", (org_id,))
+            self._conn.execute("UPDATE triggers SET enabled = 0 WHERE org_id = ?", (org_id,))
+            for box in self.list_boxes_in(org_id):
+                if box.status not in BOX_TERMINAL:
+                    self.add_event("box", box.id, "org_closed", {"by": by})
+        closed = self.get_org(org_id)
+        assert closed is not None
+        return closed, True
+
+    def reopen_org(self, org_id: str) -> Org:
+        """Undo a close before the purge: the org is suspended by the operator.
+
+        Its agents are gone, destroyed when it closed; its people, clients and
+        records are back. An owner signs in and chooses a plan, or the operator
+        resumes it. Anything but a closed org is `InvalidTransitionError`.
+        """
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.status != "closed":
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is {org.status}; only a closed org can be reopened"
+                )
+            self._conn.execute(
+                "UPDATE orgs SET status = 'suspended', suspended_at = ?, suspend_reason = ?, "
+                "suspended_by = ?, closed_at = NULL, closed_by = NULL WHERE id = ?",
+                (_utcnow(), "reopened after it was closed", OPERATOR, org_id),
+            )
+        reopened = self.get_org(org_id)
+        assert reopened is not None
+        return reopened
+
+    def orgs_to_purge(self, *, days: float, now: datetime | None = None) -> list[Org]:
+        """The closed orgs whose `closed_at` is at least `days` ago."""
+        moment = now or datetime.now(UTC)
+        due = moment - timedelta(days=days)
+        return [
+            org
+            for org in self.list_orgs(status="closed")
+            if org.id != DEFAULT_ORG
+            and org.closed_at is not None
+            and datetime.fromisoformat(org.closed_at) <= due
+        ]
+
+    def purge_org(self, org_id: str) -> dict[str, int]:
+        """Delete every row of a closed org, and the people who belong to nothing else.
+
+        What closing promised: nothing of it is kept. Its invoices are Stripe's,
+        not ours. Refuses an org that isn't closed, the default org, and one
+        with an agent that isn't torn down, since a row is the only handle on a
+        machine that may still be billing. Returns how many rows went from
+        each table, which is what the caller logs: counts, never names.
+
+        Every table is in `PURGED_BY` (a test fails for one that isn't), and
+        foreign keys don't cascade, so children go before their parents.
+        """
+        counts: dict[str, int] = {}
+
+        def gone(table: str, where: str, args: tuple[Any, ...]) -> None:
+            # Counted first: `execute` returns rows, not a row count, on both engines.
+            n = self._conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE {where}", args
+            ).fetchone()["n"]
+            if n:
+                self._conn.execute(f"DELETE FROM {table} WHERE {where}", args)
+                counts[table] = counts.get(table, 0) + int(n)
+
+        with self._conn.transaction(guard="orgs"):
+            org = self.get_org(org_id)
+            if org is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            if org.id == DEFAULT_ORG:
+                raise InvalidTransitionError("the default org is never purged")
+            if org.status != "closed":
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is {org.status}; only a closed org is purged"
+                )
+            live = [b.id for b in self.list_boxes_in(org_id) if b.status != "torn_down"]
+            if live:
+                raise InvalidTransitionError(
+                    f"org {org_id!r} still has {len(live)} agent(s) not torn down; "
+                    "they are destroyed before anything of it is deleted"
+                )
+            boxes = "SELECT id FROM boxes WHERE org_id = ?"
+            tasks = f"SELECT id FROM tasks WHERE org_id = ? OR box_id IN ({boxes})"
+            workspaces = f"SELECT id FROM workspaces WHERE box_id IN ({boxes})"
+            o: tuple[Any, ...] = (org_id,)
+            for table in PURGED_BY_BOX:
+                if table == "box_peer_blocks":
+                    gone(table, f"box_id IN ({boxes}) OR peer_id IN ({boxes})", o + o)
+                else:
+                    gone(table, f"box_id IN ({boxes})", o)
+            gone("events", f"entity_kind = 'box' AND entity_id IN ({boxes})", o)
+            gone("events", f"entity_kind = 'task' AND entity_id IN ({tasks})", o + o)
+            gone("events", f"entity_kind = 'workspace' AND entity_id IN ({workspaces})", o)
+            gone("alert_deliveries", "org_id = ?", o)
+            gone("budget_events", "org_id = ?", o)
+            gone("trigger_fires", "trigger_id IN (SELECT id FROM triggers WHERE org_id = ?)", o)
+            for table in ("run_approvals", "requests", "handoffs", "pull_requests", "mcp_calls"):
+                gone(table, "org_id = ?", o)
+            gone("usage", "org_id = ?", o)
+            gone("architect_usage", "org_id = ?", o)
+            gone("architect_messages", "org_id = ?", o)
+            gone("architect_chats", "org_id = ?", o)
+            gone("api_keys", "org_id = ?", o)
+            gone("triggers", "org_id = ?", o)
+            gone("budgets", "org_id = ?", o)
+            gone("tasks", f"org_id = ? OR box_id IN ({boxes})", o + o)
+            gone("workspaces", f"box_id IN ({boxes})", o)
+            for table in (
+                "mcp_oauth_flows",
+                "mcp_connections",
+                "client_spend_shown",
+                "client_report_settings",
+                "client_reports",
+                "report_notices",
+                "org_alerts",
+                "org_branding",
+                "login_links",
+                "sessions",
+            ):
+                gone(table, "org_id = ?", o)
+            gone("github_installations", "org = ?", o)
+            members = [
+                r["user_id"]
+                for r in self._conn.execute(
+                    "SELECT user_id FROM memberships WHERE org_id = ?", o
+                ).fetchall()
+            ]
+            gone("memberships", "org_id = ?", o)
+            gone("boxes", "org_id = ?", o)
+            gone("clients", "org_id = ?", o)
+            for user_id in members:
+                left = self._conn.execute(
+                    "SELECT 1 FROM memberships WHERE user_id = ?", (user_id,)
+                ).fetchone()
+                if left is None:
+                    row = self._conn.execute(
+                        "SELECT email FROM users WHERE id = ?", (user_id,)
+                    ).fetchone()
+                    gone("sessions", "user_id = ?", (user_id,))
+                    # Their sign-in links only: an invite from another org, or a
+                    # sign-up for a new one, is that org's or their own next step,
+                    # not this org's to delete (the review of #258).
+                    if row is not None:
+                        gone(
+                            "login_links",
+                            "email = ? AND purpose = 'sign_in'",
+                            (row["email"],),
+                        )
+                    gone("users", "id = ?", (user_id,))
+            gone("orgs", "id = ?", o)
+        return {table: n for table, n in counts.items() if n}
+
+    def purge_expired_access(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Delete expired sessions and sign-in and sign-up links: `{table: count}`.
+
+        Nothing reads them once they expire (`session` and `redeem` refuse
+        them), so keeping them only keeps who signed in, and when. **Not
+        invites**: an org's people list its expired ones to send again
+        (`open_invites`, the resend route), and they go with the org.
+        """
+        moment = now or datetime.now(UTC)
+        counts: dict[str, int] = {}
+        for table, key, where in (
+            ("sessions", "id_hash", ""),
+            ("login_links", "token_hash", " WHERE purpose IN ('sign_in', 'sign_up')"),
+        ):
+            rows = self._conn.execute(f"SELECT {key}, expires_at FROM {table}{where}").fetchall()
+            expired = [r[key] for r in rows if datetime.fromisoformat(r["expires_at"]) <= moment]
+            # Guarded like every other write here: two sweeps (two control
+            # planes during a deploy) deleting the same rows serialise.
+            with self._conn.transaction(guard=table):
+                for value in expired:
+                    self._conn.execute(f"DELETE FROM {table} WHERE {key} = ?", (value,))
+            if expired:
+                counts[table] = len(expired)
+        return counts
+
     def _set_suspended(
         self,
         org_id: str,
@@ -2281,6 +2806,12 @@ class FleetStore:
             if org.id == DEFAULT_ORG:
                 raise InvalidTransitionError(
                     "the default org is the operator's own fleet; it is never suspended"
+                )
+            if org.status == "closed":
+                # FLOTTA-224: neither billing nor the operator suspends or resumes
+                # a closed org; the operator reopens it.
+                raise InvalidTransitionError(
+                    f"org {org_id!r} is closed; it is neither suspended nor resumed"
                 )
             if org.status == wanted:
                 # The operator holding an org billing already suspended makes the
@@ -2336,21 +2867,21 @@ class FleetStore:
         return changed, True
 
     def _refuse_suspended(self, org_id: str, doing: str) -> None:
-        """`OrgNotActiveError` if `org_id` is suspended. For the creates that a
-        pending org may still do (clients, invites, seats), which a suspended
+        """`OrgNotActiveError` if `org_id` is suspended or closed. For the creates
+        that a pending org may still do (clients, invites, seats), which a held
         one may not."""
         org = self.get_org(org_id)
-        if org is not None and org.status == "suspended":
+        if org is not None and org.held:
             raise OrgNotActiveError(suspended_refusal(org, doing))
 
     def create_client(self, org_id: str, client_id: str, name: str) -> Client:
         """Insert a client of `org_id`. Its id is unique within the org only.
 
         Under the clients guard, for the org's limit on clients (FLOTTA-183):
-        two adds racing for the last one cannot both see it free. Orgs are
-        never deleted, so the org cannot disappear between the read and the
-        insert, and the foreign key refuses the insert on both engines if it
-        somehow did.
+        two adds racing for the last one cannot both see it free. An org is
+        deleted only by `purge_org`, after it closed, and a closed org adds no
+        client (FLOTTA-224), so it cannot disappear between the read and the
+        insert; the foreign key refuses the insert on both engines if it did.
         """
         client_id = validate_tenant_id(client_id, kind="client")
         name = _tenant_name(name, kind="client")
@@ -2623,6 +3154,16 @@ class FleetStore:
             self._conn.execute(
                 "DELETE FROM sessions WHERE user_id = ? AND org_id = ?", (user_id, org_id)
             )
+            # Their conversations with the Architect in this org (FLOTTA-250):
+            # theirs alone, about an account they no longer have.
+            self._conn.execute(
+                "DELETE FROM architect_messages WHERE chat_id IN "
+                "(SELECT id FROM architect_chats WHERE user_id = ? AND org_id = ?)",
+                (user_id, org_id),
+            )
+            self._conn.execute(
+                "DELETE FROM architect_chats WHERE user_id = ? AND org_id = ?", (user_id, org_id)
+            )
             user = self.get_user(user_id)
             if user is not None:
                 self._conn.execute(
@@ -2886,6 +3427,11 @@ class FleetStore:
         ).fetchone()
         if kept is None:
             raise InvalidAccountError("this invite was withdrawn")
+        # Closing deletes an org's invites under this same guard, so this holds
+        # already; said here too, where every join meets it (FLOTTA-224).
+        org = self.get_org(link.org)
+        if org is not None and org.status == "closed":
+            raise InvalidAccountError(f"org {link.org!r} is closed")
         user = self.get_user_by_email(link.email)
         if user is not None and user.disabled_at is not None:
             raise InvalidAccountError(f"the account for {link.email} is disabled")
@@ -3075,7 +3621,7 @@ class FleetStore:
                 raise UnknownEntityError(f"no org with id {org_id!r}")
             if org.status == "declined":
                 raise OrgNotActiveError(f"org {org_id!r} was declined; it cannot invite anyone")
-            if org.status == "suspended":
+            if org.held:
                 raise OrgNotActiveError(suspended_refusal(org, "invite anyone"))
             if client_id is not None and self.get_client(org_id, client_id) is None:
                 raise UnknownEntityError(f"org {org_id!r} has no client {client_id!r}")
@@ -3200,6 +3746,11 @@ class FleetStore:
                 raise InvalidAccountError(f"user {user_id!r} is disabled")
             if self.membership(user_id, org_id) is None:
                 raise UnknownEntityError(f"user {user_id!r} is not a member of org {org_id!r}")
+            # Closed (FLOTTA-224): nobody signs in to it again. Under the same
+            # guard `close_org` takes, so a session can't slip in as it closes.
+            org = self.get_org(org_id)
+            if org is not None and org.status == "closed":
+                raise InvalidAccountError(f"org {org_id!r} is closed")
             self._conn.execute(
                 "INSERT INTO sessions (id_hash, user_id, org_id, created_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -3769,6 +4320,47 @@ class FleetStore:
                 else:
                     self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
+    # -- agent templates (FLOTTA-269) ----------------------------------------
+
+    def agent_templates(self) -> dict[str, tuple[dict[str, Any], str]]:
+        """Every template the operator changed: `{id: (changes, updated_at)}`.
+
+        Read whole, like the settings: there are a dozen templates, and a front
+        end shows them together. What a change may hold is `flotta.agent_templates`'s
+        to say; the store keeps what it is given.
+        """
+        rows = self._conn.execute(
+            "SELECT id, changes, updated_at FROM agent_templates ORDER BY id"
+        ).fetchall()
+        return {r["id"]: (json.loads(r["changes"]), r["updated_at"]) for r in rows}
+
+    def set_agent_template(self, template_id: str, changes: dict[str, Any]) -> str:
+        """Keep the operator's changes to one template, replacing any before.
+
+        Returns when. Nothing to keep is refused: that is `clear_agent_template`,
+        and a row holding no change would say "changed" about a template that
+        is exactly the front end's.
+        """
+        name = validate_template(template_id)
+        if name is None:
+            raise InvalidBoxMetaError("a template has a name")
+        if not changes:
+            raise ValueError("no changes to keep: clear the template instead")
+        now = _utcnow()
+        self._conn.execute(
+            "INSERT INTO agent_templates (id, changes, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET changes = EXCLUDED.changes, "
+            "updated_at = EXCLUDED.updated_at",
+            (name, json.dumps(changes, sort_keys=True), now),
+        )
+        return now
+
+    def clear_agent_template(self, template_id: str) -> bool:
+        """Forget the operator's changes to one template. Returns whether there were any."""
+        had = template_id in self.agent_templates()
+        self._conn.execute("DELETE FROM agent_templates WHERE id = ?", (template_id,))
+        return had
+
     def clear_setting(self, key: str) -> bool:
         """Forget an override, so the environment decides again. Returns whether
         there was one — the difference between "reset to the default" and "there
@@ -3864,6 +4456,54 @@ class FleetStore:
             tuple(box_ids),
         ).fetchall()
         return {str(r["box_id"]) for r in rows}
+
+    def require_custom_images(self, org_id: str) -> None:
+        """Refuse unless `org_id`'s operator turned custom images on (M17.1).
+
+        The one place the refusal is worded, for every caller that meets it.
+        """
+        org = self.get_org(org_id)
+        if org is None or not org.custom_images:
+            raise CustomImagesOffError(
+                f"{org_id} cannot run its own images yet; the operator turns that on"
+            )
+
+    def set_box_image(self, box_id: str, image: str) -> Box:
+        """A custom agent's new image, once its machine runs it (M17.1).
+
+        Only a custom agent's: a Hermes agent's image is the fleet's, and is
+        never written here.
+        """
+        box = self._get_box_or_raise(box_id)
+        if box.runtime != "custom":
+            raise InvalidImageError(f"{box.name} runs Hermes on the fleet's image")
+        self._conn.execute(
+            "UPDATE boxes SET image = ? WHERE id = ?", (validate_image_ref(image), box_id)
+        )
+        return self._get_box_or_raise(box_id)
+
+    def set_org_custom_images(self, org_id: str, on: bool) -> Org:
+        """Whether `org_id`'s people may create agents from their own image (M17.1).
+
+        Turning it off creates nothing and destroys nothing: agents it already
+        has keep running their images, and the next one is refused.
+        """
+        with self._conn.transaction(guard="orgs"):
+            if self.get_org(org_id) is None:
+                raise UnknownEntityError(f"no org with id {org_id!r}")
+            self._conn.execute(
+                "UPDATE orgs SET custom_images = ? WHERE id = ?", (int(bool(on)), org_id)
+            )
+        org = self.get_org(org_id)
+        assert org is not None
+        return org
+
+    def set_box_template(self, box_id: str, template: str | None) -> None:
+        """Which template this agent was made from (FLOTTA-249). Said once, when it is made."""
+        self._get_box_or_raise(box_id)
+        self._conn.execute(
+            "UPDATE boxes SET template = ? WHERE id = ?", (validate_template(template), box_id)
+        )
 
     def set_box_screen(self, box_id: str, screen: bool) -> None:
         """Whether this agent has a screen (FLOTTA-208). Only the switch: the
@@ -4204,6 +4844,49 @@ class FleetStore:
             (box_id, limit),
         )
         return [McpCall(**dict(r)) for r in rows]
+
+    def chat_conversations(
+        self, box_id: str, *, limit: int = 5_000
+    ) -> list[tuple[str, str | None, frozenset[str]]]:
+        """This box's people's conversations, newest first (FLOTTA-276): each as
+        (stored session id, the id it began under if the door heard it, who spoke).
+
+        Read off its `chat` runs: the door records each person's turn with the
+        conversation it was in and whose ticket said it. Only the stored id,
+        which is the one a conversation is listed and resumed by; a turn whose
+        stored id the door did not hear names none. A run's own session never
+        has a `chat` run, which is the point: what a schedule, a request or a
+        notice opened is not anybody's conversation. The newest `limit` turns
+        are read, which on the busiest agent so far is weeks of them.
+        """
+        rows = self._conn.execute(
+            "SELECT input_json FROM tasks WHERE box_id = ? AND trigger_kind = 'chat' "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (box_id, limit),
+        )
+        order: list[str] = []
+        roots: dict[str, str | None] = {}
+        spoke: dict[str, set[str]] = {}
+        for row in rows:
+            try:
+                given = json.loads(row["input_json"]) if row["input_json"] else None
+            except ValueError:
+                continue
+            if not isinstance(given, dict):
+                continue
+            stored = given.get("stored_session_id")
+            if not isinstance(stored, str) or not stored:
+                continue
+            if stored not in spoke:
+                order.append(stored)
+                spoke[stored] = set()
+            root = given.get("conversation_root")
+            if roots.get(stored) is None and isinstance(root, str) and root:
+                roots[stored] = root
+            by = given.get("by")
+            if isinstance(by, str) and by:
+                spoke[stored].add(by)
+        return [(sid, roots.get(sid), frozenset(spoke[sid])) for sid in order]
 
     def client_conversations(self, box_id: str) -> list[tuple[str, str]]:
         """This box's client conversations as (session id, when), newest first."""
@@ -4634,6 +5317,256 @@ class FleetStore:
         # Postgres sums a BIGINT into a NUMERIC, which arrives as a Decimal.
         return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
 
+    # -- the Architect's own model calls (FLOTTA-250) ---------------------------
+
+    def record_architect_usage(
+        self,
+        *,
+        org: str,
+        user_id: str,
+        model: str,
+        upstream: str,
+        tokens_in: int,
+        tokens_out: int,
+        idempotency_key: str,
+        eur_per_usd: Decimal | None,
+        tokens_cached: int = 0,
+        status: int | None = None,
+        estimated: bool = False,
+        reported_cost_nano: int | None = None,
+        now: datetime | None = None,
+    ) -> int | None:
+        """One of the Architect's model calls, for `org`, asked for by `user_id`.
+
+        Priced as an agent's call is (`record_usage`): the upstream's own
+        figure when it reports one, else the catalogue's price, else nothing,
+        which is unknown and never free. Returns its cost in euro nanos, or
+        `None` for a call nobody could price.
+
+        Its own table, on purpose: `usage` is what an agency's budgets and
+        invoice add up, and this is the fleet's to pay. Written once however
+        often it is tried, by `idempotency_key`.
+        """
+        if self.get_org(org) is None:
+            raise UnknownEntityError(f"no org {org!r}")
+        moment = now or datetime.now(UTC)
+        price = self.price_of(model, at=moment)
+        currency = None if price is None else price.currency
+        upstream_cost: int | None
+        cost_eur: int | None
+        if reported_cost_nano:
+            currency = "USD"
+            upstream_cost = reported_cost_nano
+            cost_eur = to_eur_nano(reported_cost_nano, currency, eur_per_usd)
+        elif tokens_in == 0 and tokens_out == 0:
+            upstream_cost, cost_eur = 0, 0
+        elif price is None:
+            upstream_cost, cost_eur = None, None
+        else:
+            upstream_cost = cost_nano(
+                price, tokens_in=tokens_in, tokens_out=tokens_out, tokens_cached=tokens_cached
+            )
+            cost_eur = to_eur_nano(upstream_cost, price.currency, eur_per_usd)
+        rate = (
+            str(eur_per_usd)
+            if upstream_cost and cost_eur is not None and currency == "USD"
+            else None
+        )
+        self._conn.execute(
+            "INSERT INTO architect_usage (id, org_id, user_id, model, upstream, tokens_in, "
+            "tokens_out, tokens_cached, currency, upstream_cost_nano, eur_per_usd, cost_eur_nano, "
+            "status, estimated, cost_reported, at, idempotency_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (idempotency_key) DO NOTHING",
+            (
+                f"au-{uuid.uuid4().hex}",
+                org,
+                user_id,
+                model,
+                upstream,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                currency,
+                upstream_cost,
+                rate,
+                cost_eur,
+                status,
+                1 if estimated else 0,
+                1 if reported_cost_nano else 0,
+                _instant(moment),
+                idempotency_key,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT cost_eur_nano FROM architect_usage WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return None if row["cost_eur_nano"] is None else int(row["cost_eur_nano"])
+
+    def architect_spend(self, org: str, *, since: datetime) -> Spend:
+        """What `org`'s Architect has cost since `since`. `unpriced` counts the
+        calls with no euro cost, which the sum is short by."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced "
+            "FROM architect_usage WHERE org_id = ? AND at >= ?",
+            (org, _instant(since)),
+        ).fetchone()
+        return Spend(eur_nano=int(row["eur_nano"]), unpriced=int(row["unpriced"]))
+
+    def architect_spend_by_org(self, *, since: datetime) -> dict[str, tuple[Spend, int]]:
+        """Every org whose Architect made a call since `since`: `{org: (spend, calls)}`.
+        For the operator, who pays for them."""
+        rows = self._conn.execute(
+            "SELECT org_id, COALESCE(SUM(cost_eur_nano), 0) AS eur_nano, "
+            "COUNT(*) - COUNT(cost_eur_nano) AS unpriced, COUNT(*) AS calls "
+            "FROM architect_usage WHERE at >= ? GROUP BY org_id ORDER BY org_id",
+            (_instant(since),),
+        ).fetchall()
+        return {
+            r["org_id"]: (
+                Spend(eur_nano=int(r["eur_nano"]), unpriced=int(r["unpriced"])),
+                int(r["calls"]),
+            )
+            for r in rows
+        }
+
+    # -- a person's conversations with the Architect (FLOTTA-250) ---------------
+
+    def create_architect_chat(
+        self, org: str, user_id: str, title: str = "", *, limit: int | None = None
+    ) -> ArchitectChat:
+        """A new, empty chat of `user_id`'s in `org`. With `limit`, refused once
+        they have that many: the count and the insert share one guarded
+        transaction, so two at once cannot both be the last."""
+        if self.get_org(org) is None:
+            raise UnknownEntityError(f"no org {org!r}")
+        now = _utcnow()
+        chat = ArchitectChat(f"ac-{uuid.uuid4().hex}", org, user_id, title, now, now)
+        with self._conn.transaction(guard="architect_chats"):
+            if limit is not None:
+                held = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM architect_chats WHERE org_id = ? AND user_id = ?",
+                    (org, user_id),
+                ).fetchone()["n"]
+                if int(held) >= limit:
+                    raise ArchitectChatFullError(
+                        f"you have {limit} chats with the Architect, which is the most kept: "
+                        "delete one to start another"
+                    )
+            self._conn.execute(
+                "INSERT INTO architect_chats (id, org_id, user_id, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat.id, org, user_id, title, now, now),
+            )
+        return chat
+
+    def architect_chats(
+        self, org: str, user_id: str, *, q: str | None = None, limit: int = 50
+    ) -> list[ArchitectChat]:
+        """`user_id`'s chats in `org`, the one last added to first. `q` keeps
+        those whose title holds it, whatever its letter case."""
+        where = ["org_id = ?", "user_id = ?"]
+        params: list[Any] = [org, user_id]
+        if q:
+            # LIKE's own wildcards are escaped: a search for "50%" is for those characters.
+            wanted = q.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            where.append("LOWER(title) LIKE ? ESCAPE '!'")
+            params.append(f"%{wanted}%")
+        params.append(max(0, limit))
+        rows = self._conn.execute(
+            "SELECT id, org_id, user_id, title, created_at, updated_at FROM architect_chats "
+            f"WHERE {' AND '.join(where)} ORDER BY updated_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [_architect_chat(r) for r in rows]
+
+    def architect_chat(self, org: str, user_id: str, chat_id: str) -> ArchitectChat | None:
+        """One chat, if it is `user_id`'s in `org`. Anyone else's is not there."""
+        row = self._conn.execute(
+            "SELECT id, org_id, user_id, title, created_at, updated_at FROM architect_chats "
+            "WHERE id = ? AND org_id = ? AND user_id = ?",
+            (chat_id, org, user_id),
+        ).fetchone()
+        return _architect_chat(row) if row else None
+
+    def architect_messages(self, chat_id: str) -> list[ArchitectMessage]:
+        """A chat's messages, in the order they were added."""
+        rows = self._conn.execute(
+            "SELECT id, chat_id, seq, role, content, created_at FROM architect_messages "
+            "WHERE chat_id = ? ORDER BY seq",
+            (chat_id,),
+        ).fetchall()
+        return [
+            ArchitectMessage(
+                r["id"], r["chat_id"], int(r["seq"]), r["role"], r["content"], r["created_at"]
+            )
+            for r in rows
+        ]
+
+    def append_architect_messages(
+        self,
+        org: str,
+        user_id: str,
+        chat_id: str,
+        messages: Sequence[tuple[str, str]],
+        *,
+        limit: int | None = None,
+    ) -> list[ArchitectMessage]:
+        """Add `(role, content as JSON)` messages to the end of a chat, all or none.
+
+        The chat must be `user_id`'s in `org`. With `limit`, refused if the chat
+        would then hold more than that many. Numbering and the count are read
+        and written under one guard, so two turns added at once do not take the
+        same place.
+        """
+        with self._conn.transaction(guard="architect_messages"):
+            if self.architect_chat(org, user_id, chat_id) is None:
+                raise UnknownEntityError(f"no chat {chat_id!r}")
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(seq), 0) AS last FROM architect_messages "
+                "WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if limit is not None and int(row["n"]) + len(messages) > limit:
+                raise ArchitectChatFullError(
+                    f"a chat with the Architect holds at most {limit} messages: start a new one"
+                )
+            now = _utcnow()
+            added: list[ArchitectMessage] = []
+            for offset, (role, content) in enumerate(messages, start=1):
+                message = ArchitectMessage(
+                    f"am-{uuid.uuid4().hex}", chat_id, int(row["last"]) + offset, role, content, now
+                )
+                self._conn.execute(
+                    "INSERT INTO architect_messages (id, chat_id, org_id, seq, role, content, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (message.id, chat_id, org, message.seq, role, content, now),
+                )
+                added.append(message)
+            if added:
+                self._conn.execute(
+                    "UPDATE architect_chats SET updated_at = ? WHERE id = ?", (now, chat_id)
+                )
+        return added
+
+    def rename_architect_chat(self, org: str, user_id: str, chat_id: str, title: str) -> bool:
+        """Give a chat of `user_id`'s a title. Whether there was such a chat."""
+        if self.architect_chat(org, user_id, chat_id) is None:
+            return False
+        self._conn.execute("UPDATE architect_chats SET title = ? WHERE id = ?", (title, chat_id))
+        return True
+
+    def delete_architect_chat(self, org: str, user_id: str, chat_id: str) -> bool:
+        """Delete a chat of `user_id`'s, and everything said in it. Whether there was one."""
+        with self._conn.transaction(guard="architect_messages"):
+            if self.architect_chat(org, user_id, chat_id) is None:
+                return False
+            self._conn.execute("DELETE FROM architect_messages WHERE chat_id = ?", (chat_id,))
+            self._conn.execute("DELETE FROM architect_chats WHERE id = ?", (chat_id,))
+        return True
+
     def usage_summary(
         self,
         org: str,
@@ -4731,7 +5664,7 @@ class FleetStore:
             updated_at=row["updated_at"],
             # `get`: a store part-way through its migrations, before 31, has none.
             starting_cap=bool(row.get("starting_cap") or 0),
-            # Before 41, no founding trial.
+            # Before 47, no founding trial.
             trial_cap=bool(row.get("trial_cap") or 0),
         )
 
@@ -5874,7 +6807,14 @@ class FleetStore:
             # conversation's turn ends as the agent hands over: its handoff is
             # for whoever reads the conversation, and stays.
             self.expire_handoffs(run_id, now=now)
-        return self._get_run_or_raise(run_id)
+        ended = self._get_run_or_raise(run_id)
+        if ended.trigger_kind == "request":
+            # Its request was asked in a conversation: say how the work went
+            # there (FLOTTA-275). Here, because every way a run ends comes here.
+            from flotta import notices
+
+            notices.request_work_ended(self, ended)
+        return ended
 
     def open_chat_run(
         self,
@@ -8012,6 +8952,11 @@ def _box_from_row(row: db.Row) -> Box:
         # `get`: a store read part-way through its migrations, before 34, has
         # no screens yet, which is no screen.
         screen=bool(row.get("screen") or 0),
+        # Before 42, every agent is Hermes on the fleet's image.
+        runtime=row.get("runtime") or "hermes",
+        image=row.get("image"),
+        # Before 43, no agent says what it was made from.
+        template=row.get("template"),
     )
 
 
@@ -8033,8 +8978,12 @@ def _org_from_row(row: db.Row) -> Org:
         spend_ceiling_eur_nano=_maybe_int(row.get("spend_ceiling_eur_nano")),
         spend_ceiling_set_at=row.get("spend_ceiling_set_at"),
         billing_period_from=row.get("billing_period_from"),
-        # `get`: a store read part-way through its migrations, before 41, has
-        # no plan yet, which is no plan.
+        # `get`: a store read part-way through its migrations. Before 41 it has
+        # not been closed, before 42 custom images are off, and before 47 it
+        # has no plan, which is no plan.
+        closed_at=row.get("closed_at"),
+        closed_by=row.get("closed_by"),
+        custom_images=bool(row.get("custom_images") or 0),
         plan=row.get("plan"),
         plan_interval=row.get("plan_interval"),
         utm_source=row.get("utm_source"),

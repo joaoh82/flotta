@@ -527,6 +527,103 @@ def _response_headers(response: httpx.Response) -> dict[str, str]:
     return {k: v for k, v in response.headers.items() if k.lower() not in _DROPPED}
 
 
+async def send_metered(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    raw: bytes,
+    key: str,
+    write: Any,
+) -> Response:
+    """Send one chat completion to `url` and relay the answer, streamed or
+    whole, calling `write(status, usage=, chars=)` exactly once with what it
+    used. `chars` is `None` when no tokens were spent at all.
+
+    Whose ledger `write` is, is the caller's business: an agent's call here in
+    the gateway, or the Architect's on the control plane (FLOTTA-250). `key` is
+    the provider key in `headers`, named so an error body can be scrubbed of it.
+    """
+    streaming = isinstance(payload, dict) and payload.get("stream") is True
+    options = payload.get("stream_options")
+    asked = isinstance(options, dict) and options.get("include_usage") is True
+    content = raw
+    if streaming and not asked:
+        given = options if isinstance(options, dict) else {}
+        payload["stream_options"] = {**given, "include_usage": True}
+        content = json.dumps(payload).encode()
+
+    outgoing = client.build_request(
+        "POST",
+        url,
+        headers=headers,
+        content=content,
+    )
+    try:
+        reply = await client.send(outgoing, stream=True)
+    except httpx.HTTPError as exc:
+        _log.warning("the model provider could not be reached: %s", exc)
+        if isinstance(exc, _NEVER_SENT):
+            write(502)
+        else:
+            write(502, chars=0)
+        return _error(502, "the model provider could not be reached")
+
+    if reply.headers.get("content-type", "").startswith("text/event-stream") and (
+        reply.status_code < 400
+    ):
+        events = _Events(strip_usage=streaming and not asked)
+        written = False
+
+        def end(*, usage: Any, chars: int) -> None:
+            nonlocal written
+            if not written:
+                written = True
+                write(reply.status_code, usage=usage, chars=chars)
+
+        def finish() -> None:
+            end(usage=events.usage, chars=events.chars)
+            closing = asyncio.ensure_future(reply.aclose())
+            _closing.add(closing)
+            closing.add_done_callback(_closing.discard)
+
+        return _MeteredStream(
+            _relay(reply, events, end),
+            finish,
+            status_code=reply.status_code,
+            headers=_response_headers(reply),
+        )
+
+    try:
+        body = await reply.aread()
+    except httpx.HTTPError as exc:
+        _log.warning("the upstream's reply ended early: %s", exc)
+        # It may have worked, and nothing says what it used.
+        write(502, chars=0 if reply.status_code < 400 else None)
+        return _error(502, "the model provider's reply ended early")
+    finally:
+        await reply.aclose()
+
+    if reply.status_code >= 400:
+        write(reply.status_code)
+        return Response(_scrubbed(body, key), reply.status_code, _response_headers(reply))
+
+    try:
+        answer = json.loads(body)
+    except ValueError:
+        answer = {}
+    answer = answer if isinstance(answer, dict) else {}
+    choices = answer.get("choices")
+    seen = (
+        sum(_text_length(c.get("message")) for c in choices if isinstance(c, dict))
+        if isinstance(choices, list)
+        else 0
+    )
+    write(reply.status_code, usage=answer.get("usage"), chars=seen)
+    return Response(body, reply.status_code, _response_headers(reply))
+
+
 def create_gateway(
     *,
     store_factory: Callable[[], FleetStore] = FleetStore,
@@ -898,83 +995,14 @@ def create_gateway(
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
 
-        streaming = isinstance(payload, dict) and payload.get("stream") is True
-        options = payload.get("stream_options")
-        asked = isinstance(options, dict) and options.get("include_usage") is True
-        content = raw
-        if streaming and not asked:
-            given = options if isinstance(options, dict) else {}
-            payload["stream_options"] = {**given, "include_usage": True}
-            content = json.dumps(payload).encode()
-
-        client: httpx.AsyncClient = request.app.state.upstream
-        outgoing = client.build_request(
-            "POST",
-            f"{base_url}/chat/completions",
+        return await send_metered(
+            request.app.state.upstream,
+            url=f"{base_url}/chat/completions",
             headers=upstream_headers(request, key.key),
-            content=content,
+            payload=payload,
+            raw=raw,
+            key=key.key,
+            write=write,
         )
-        try:
-            reply = await client.send(outgoing, stream=True)
-        except httpx.HTTPError as exc:
-            _log.warning("the model provider could not be reached: %s", exc)
-            if isinstance(exc, _NEVER_SENT):
-                write(502)
-            else:
-                write(502, chars=0)
-            return _error(502, "the model provider could not be reached")
-
-        if reply.headers.get("content-type", "").startswith("text/event-stream") and (
-            reply.status_code < 400
-        ):
-            events = _Events(strip_usage=streaming and not asked)
-            written = False
-
-            def end(*, usage: Any, chars: int) -> None:
-                nonlocal written
-                if not written:
-                    written = True
-                    write(reply.status_code, usage=usage, chars=chars)
-
-            def finish() -> None:
-                end(usage=events.usage, chars=events.chars)
-                closing = asyncio.ensure_future(reply.aclose())
-                _closing.add(closing)
-                closing.add_done_callback(_closing.discard)
-
-            return _MeteredStream(
-                _relay(reply, events, end),
-                finish,
-                status_code=reply.status_code,
-                headers=_response_headers(reply),
-            )
-
-        try:
-            body = await reply.aread()
-        except httpx.HTTPError as exc:
-            _log.warning("the upstream's reply ended early: %s", exc)
-            # It may have worked, and nothing says what it used.
-            write(502, chars=0 if reply.status_code < 400 else None)
-            return _error(502, "the model provider's reply ended early")
-        finally:
-            await reply.aclose()
-
-        if reply.status_code >= 400:
-            write(reply.status_code)
-            return Response(_scrubbed(body, key.key), reply.status_code, _response_headers(reply))
-
-        try:
-            answer = json.loads(body)
-        except ValueError:
-            answer = {}
-        answer = answer if isinstance(answer, dict) else {}
-        choices = answer.get("choices")
-        seen = (
-            sum(_text_length(c.get("message")) for c in choices if isinstance(c, dict))
-            if isinstance(choices, list)
-            else 0
-        )
-        write(reply.status_code, usage=answer.get("usage"), chars=seen)
-        return Response(body, reply.status_code, _response_headers(reply))
 
     return app

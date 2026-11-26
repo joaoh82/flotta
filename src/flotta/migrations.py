@@ -1286,6 +1286,130 @@ MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(
         41,
+        "closing an org: when it was closed and by whom",
+        # FLOTTA-224. A closed org's agents are destroyed at once and its rows
+        # deleted `FLOTTA_CLOSED_RETENTION_DAYS` after `closed_at`, by the
+        # purge sweep. `closed_by` is a kind (`operator` or `owner`), never a
+        # person. The status is `orgs.status`, which has no CHECK to widen.
+        (
+            "ALTER TABLE orgs ADD COLUMN closed_at TEXT",
+            "ALTER TABLE orgs ADD COLUMN closed_by TEXT",
+        ),
+    ),
+    Migration(
+        42,
+        "custom runtimes: an agent from the agency's own image",
+        # M17.1. `boxes.runtime` is `hermes` on every agent that exists, which
+        # is what each of them is; `custom` runs the agency's own public image,
+        # named in `boxes.image`, and speaks the box contract (M17.2) instead of
+        # Hermes's protocol. A Hermes agent's image stays NULL: it is the
+        # fleet's, which upgrades move. `orgs.custom_images` is the operator's
+        # switch, off for every org until they turn it on.
+        (
+            "ALTER TABLE boxes ADD COLUMN runtime TEXT NOT NULL DEFAULT 'hermes'",
+            "ALTER TABLE boxes ADD COLUMN image TEXT",
+            "ALTER TABLE orgs ADD COLUMN custom_images INTEGER NOT NULL DEFAULT 0",
+        ),
+    ),
+    Migration(
+        43,
+        "templates: which template an agent was made from",
+        # FLOTTA-249. A name the caller gives when it makes the agent, kept so
+        # the agent can say what kind it is. NULL on every agent that exists,
+        # and on any made with no template: nothing here knows the templates.
+        ("ALTER TABLE boxes ADD COLUMN template TEXT",),
+    ),
+    Migration(
+        44,
+        "agent templates: what the operator changed in each",
+        # FLOTTA-269. One row per template the operator changed, keyed by the
+        # name agents record in `boxes.template`. `changes` is JSON holding only
+        # the parts that were changed (`flotta.agent_templates`), so a template
+        # with no row is whatever the front end ships. The fleet's own: no org's.
+        (
+            """
+            CREATE TABLE agent_templates (
+                id          TEXT PRIMARY KEY,
+                changes     TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
+    Migration(
+        45,
+        "architect usage: what the Architect's model calls cost, by org and person",
+        # FLOTTA-250. The Architect is an assistant for an agency's people, and
+        # the fleet pays for its model calls up to a monthly allowance per org.
+        # Its calls are no agent's, so they cannot go in `usage` (a row there
+        # needs a box), and must not: a client's budget and an agency's invoice
+        # are sums over `usage`, and this is neither's. `user_id` is kept as
+        # text with no reference, so what an org spent outlives the person who
+        # asked. A NULL `cost_eur_nano` is a call nobody could price, which the
+        # allowance check treats as unknown, never as free.
+        (
+            """
+            CREATE TABLE architect_usage (
+                id                  TEXT PRIMARY KEY,
+                org_id              TEXT NOT NULL REFERENCES orgs(id),
+                user_id             TEXT NOT NULL,
+                model               TEXT NOT NULL,
+                upstream            TEXT NOT NULL,
+                tokens_in           INTEGER NOT NULL,
+                tokens_out          INTEGER NOT NULL,
+                tokens_cached       INTEGER NOT NULL DEFAULT 0,
+                currency            TEXT,
+                upstream_cost_nano  BIGINT,
+                eur_per_usd         TEXT,
+                cost_eur_nano       BIGINT,
+                status              INTEGER,
+                estimated           INTEGER NOT NULL DEFAULT 0,
+                cost_reported       INTEGER NOT NULL DEFAULT 0,
+                at                  TEXT NOT NULL,
+                idempotency_key     TEXT NOT NULL UNIQUE
+            )
+            """,
+            "CREATE INDEX architect_usage_org_at ON architect_usage (org_id, at)",
+        ),
+    ),
+    Migration(
+        46,
+        "architect chats: each person's conversations with the Architect",
+        # FLOTTA-250. A chat is one person's, in one org: nobody else in the
+        # agency reads it, the operator included. The control plane keeps what
+        # the front end gives it and does not read it: `content` is that
+        # message as JSON, whatever a front end needs to show the turn again
+        # and to carry the conversation on. `org_id` is on the messages too, so
+        # a closed org's are deleted by org like everything else of it. A chat
+        # goes with its person's membership of the org, and with the org.
+        (
+            """
+            CREATE TABLE architect_chats (
+                id          TEXT PRIMARY KEY,
+                org_id      TEXT NOT NULL REFERENCES orgs(id),
+                user_id     TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX architect_chats_owner ON architect_chats (org_id, user_id, updated_at)",
+            """
+            CREATE TABLE architect_messages (
+                id          TEXT PRIMARY KEY,
+                chat_id     TEXT NOT NULL REFERENCES architect_chats(id),
+                org_id      TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE (chat_id, seq)
+            )
+            """,
+        ),
+    ),
+    Migration(
+        47,
         "founding studio: plan, attribution, trial window and unbilled usage",
         # A founding org is one of five. The count is `plan = 'founding'`, so
         # the plan is a column and not an event. The sign-up link carries the
@@ -1296,7 +1420,8 @@ MIGRATIONS: tuple[Migration, ...] = (
         # trial budget is an ordinary month row with `trial_cap`, because the
         # period check only allows day and month and an old image has to be
         # able to read the row. `price_until` is 12 months from the first paid
-        # invoice, which is when the note goes out.
+        # invoice, which is when the note goes out. Numbered after 46: 41 was
+        # already closing an org on main.
         (
             "ALTER TABLE login_links ADD COLUMN plan TEXT",
             "ALTER TABLE login_links ADD COLUMN plan_interval TEXT",

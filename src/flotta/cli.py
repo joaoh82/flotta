@@ -64,11 +64,13 @@ from .auth import DEFAULT_CLIENT, DEFAULT_ORG
 from .migrations import MigrationError
 from .store import (
     Box,
+    CustomImagesOffError,
     DuplicateBoxError,
     Event,
     FleetStore,
     InvalidBoxMetaError,
     InvalidBoxNameError,
+    InvalidImageError,
     InvalidTenantError,
     LegacyStoreError,
     LimitReachedError,
@@ -1362,6 +1364,12 @@ def create(
         "--screen",
         help="Give it a screen: a desktop and browser a person can watch. Makes it 4096 MB",
     ),
+    own_image: str | None = typer.Option(
+        None,
+        "--own-image",
+        help="Run the agency's own public image, which speaks the box contract, instead of "
+        "Hermes (M17). The org needs custom images turned on",
+    ),
     store: str | None = StoreOpt,
     as_json: bool = JsonOpt,
 ) -> None:
@@ -1402,9 +1410,13 @@ def create(
                 "region": region,
                 "model": model,
                 "screen": screen or None,
+                "runtime": "custom" if own_image else None,
+                "image": own_image,
             },
         )
         return
+    if own_image and image:
+        raise typer.BadParameter("--own-image is the agent's image; leave --image out")
 
     provision = _provision()
 
@@ -1449,10 +1461,14 @@ def create(
                 instructions=instructions,
                 model=model,
                 screen=screen,
+                runtime="custom" if own_image else "hermes",
+                image=own_image,
             )
         except (
             InvalidBoxNameError,
             InvalidBoxMetaError,
+            InvalidImageError,
+            CustomImagesOffError,
             InvalidTenantError,
             UnknownEntityError,
             DuplicateBoxError,
@@ -1465,6 +1481,10 @@ def create(
             # `DuplicateBoxError` reached here uncaught before this — a name
             # already taken printed a traceback, which reads as a crash rather
             # than the one-word fix it is.
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        except provision.CustomRuntimeRefused as exc:
+            # Asking a custom agent for a screen, say: a refusal, like the rest.
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
         except (provision.ProvisionError, ValueError) as exc:
@@ -2307,6 +2327,11 @@ def serve(
     interval_s: float = typer.Option(
         60.0, "--reconcile-interval-s", help="Seconds between reconcile sweeps"
     ),
+    fake_upstream: bool = typer.Option(
+        False,
+        "--fake-upstream",
+        help="Answer the Architect's model calls from a stand-in, for $0. Loopback only.",
+    ),
 ) -> None:
     """Run the control plane: the fleet API and the reconcile loop.
 
@@ -2360,14 +2385,54 @@ def serve(
     # one answer to "which proxies are trusted" (`control.app.caller_address`).
     from flotta.provision import warm_release_cache
 
+    architect_transport = _fake_architect(host) if fake_upstream else None
     uvicorn.run(
-        create_app(interval_s=interval_s, warm_release_cache=warm_release_cache),
+        create_app(
+            interval_s=interval_s,
+            warm_release_cache=warm_release_cache,
+            architect_transport=architect_transport,
+        ),
         host=host,
         port=port,
         log_level="info",
         proxy_headers=False,
         log_config=log_config(),
     )
+
+
+def _fake_architect(host: str) -> Any:
+    """The stand-in model for the Architect's calls on a local fleet (FLOTTA-250).
+
+    The same stand-in the local gateway answers agents with: it calls a tool
+    the message names and says what the tool answered, which is enough to try
+    the Architect for nothing. It sets this process up as a fleet whose
+    operator has given the Architect a key, with the stand-in's model and its
+    price, and returns the transport that answers in place of the network.
+    Loopback only, and never over a real database: it writes made-up spend.
+    """
+    from flotta.architect import KEY_ENV
+    from flotta.db import DATABASE_URL_ENV
+    from flotta.gateway.fake import FAKE_MODEL, FAKE_PRICE, FAKE_UPSTREAM_URL, FakeUpstream
+
+    def refuse(message: str) -> typer.Exit:
+        typer.secho(message, fg=typer.colors.RED, err=True)
+        return typer.Exit(code=2)
+
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise refuse(f"--fake-upstream answers anyone; bind 127.0.0.1, not {host!r}.")
+    if os.environ.get(DATABASE_URL_ENV):
+        raise refuse(
+            f"--fake-upstream would write made-up spend into ${DATABASE_URL_ENV}. "
+            "Unset it, so this uses a local store."
+        )
+    os.environ[KEY_ENV] = "fake"
+    os.environ["FLOTTA_MODEL_BASE_URL"] = FAKE_UPSTREAM_URL
+    os.environ["FLOTTA_ARCHITECT_MODEL"] = FAKE_MODEL
+    # A made-up price needs a rate to become euros; one is as good as another here.
+    os.environ.setdefault("FLOTTA_EUR_PER_USD", "1")
+    with FleetStore(store_target(None)) as fleet:
+        fleet.refresh_prices([FAKE_PRICE])
+    return FakeUpstream(chunk_delay_s=0.05)
 
 
 @app.command()
@@ -2988,6 +3053,121 @@ def org_ceiling(
         else f"{org_id}: no spend ceiling; EUR {view['spent_eur']} this billing period"
     )
     emit(view, line, as_json=as_json)
+
+
+@org_app.command("close")
+def org_close(
+    org_id: str = typer.Argument(..., help="The org to close"),
+    confirm: str = typer.Option(
+        ..., "--confirm", help="The org's id again: closing destroys its agents at once"
+    ),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Close an org (FLOTTA-224): its people signed out, its agents destroyed.
+
+    Everything else of it is deleted FLOTTA_CLOSED_RETENTION_DAYS later (30 by
+    default) by the control plane's sweep; until then `flotta org reopen` undoes
+    it. On the hosted product, cancel its subscription first, or close it from HQ.
+    """
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_FLEET_WRITE, SCOPE_ORG_ADMIN
+    from flotta.store import InvalidTransitionError, UnknownEntityError
+
+    if confirm != org_id:
+        raise _fail(ValueError(f"--confirm must be the org's id, {org_id!r}"))
+    if control_url():
+        try:
+            answer = control_request(
+                "POST",
+                f"/api/orgs/{org_id}/close",
+                scopes=(SCOPE_ORG_ADMIN, SCOPE_FLEET_WRITE),
+                body={"confirm": confirm},
+            )
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+        view = answer["org"]
+    else:
+        from flotta.provision import close_org_agents, purge_after
+
+        with _open_store(store) as fleet:
+            try:
+                org, _changed = fleet.close_org(org_id, by="operator")
+            except (UnknownEntityError, InvalidTransitionError) as exc:
+                raise _fail(exc) from exc
+            close_org_agents(fleet, org_id=org_id)
+            view = {**asdict(org), "purge_after": purge_after(fleet, org)}
+    emit(
+        view, f"{org_id}: closed; its data is deleted after {view['purge_after']}", as_json=as_json
+    )
+
+
+@org_app.command("reopen")
+def org_reopen(
+    org_id: str = typer.Argument(..., help="A closed org whose data isn't deleted yet"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Undo a close before the purge (FLOTTA-224): the org comes back suspended,
+    with its agents gone. Resume it, or let its owner choose a plan."""
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import InvalidTransitionError, UnknownEntityError
+
+    if control_url():
+        try:
+            view = control_request("POST", f"/api/orgs/{org_id}/reopen", scopes=(SCOPE_ORG_ADMIN,))[
+                "org"
+            ]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                view = asdict(fleet.reopen_org(org_id))
+            except (UnknownEntityError, InvalidTransitionError) as exc:
+                raise _fail(exc) from exc
+    emit(view, f"{org_id}: reopened, suspended until resumed", as_json=as_json)
+
+
+@org_app.command("custom-images")
+def org_custom_images(
+    org_id: str = typer.Argument(..., help="The org"),
+    state: str = typer.Argument(..., help="on or off"),
+    store: str | None = StoreOpt,
+    as_json: bool = JsonOpt,
+) -> None:
+    """Let an org create agents from its own images, or stop (M17). The operator's.
+
+    Off destroys nothing: agents it has keep their images, and the next is refused.
+    """
+    from dataclasses import asdict
+
+    from flotta.auth import SCOPE_ORG_ADMIN
+    from flotta.store import UnknownEntityError
+
+    if state not in ("on", "off"):
+        raise typer.BadParameter("on or off")
+    on = state == "on"
+    if control_url():
+        try:
+            view = control_request(
+                "PUT",
+                f"/api/orgs/{org_id}/custom-images",
+                scopes=(SCOPE_ORG_ADMIN,),
+                body={"on": on},
+            )["org"]
+        except ControlPlaneError as exc:
+            raise _fail(exc) from exc
+    else:
+        with _open_store(store) as fleet:
+            try:
+                view = asdict(fleet.set_org_custom_images(org_id, on))
+            except UnknownEntityError as exc:
+                raise _fail(exc) from exc
+    emit(view, f"{org_id}: custom images {state}", as_json=as_json)
 
 
 @org_app.command("decline")

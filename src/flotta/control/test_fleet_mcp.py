@@ -1,0 +1,717 @@
+"""The fleet API as MCP tools (FLOTTA-250): each tool is a route, called as the caller."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from flotta.control import fleet_mcp
+from flotta.control.fleet_mcp import (
+    NEVER,
+    TOOLS,
+    WRITES,
+    BadCall,
+    Tool,
+    request_for,
+    tool_answer,
+)
+from flotta.control.test_size_api import MEMBER, OTHER_OWNER, OWNER, X, Y, _api, _as
+from flotta.control.test_size_api import fleet as fleet  # noqa: F401 - the fixture
+
+VIEWER = _as("client_viewer", "agency-x", "acme")
+
+
+def _rpc(api, method, params=None, *, headers=OWNER, request_id=1):
+    body = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        body["params"] = params
+    return api.post("/mcp", json=body, headers=headers)
+
+
+def _call(api, name, arguments=None, *, headers=OWNER):
+    answer = _rpc(api, "tools/call", {"name": name, "arguments": arguments or {}}, headers=headers)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _data(called):
+    """What a tool answered, as the route gave it."""
+    result = called["result"]
+    assert result["isError"] is False, result
+    return json.loads(result["content"][0]["text"])
+
+
+def _refused(called) -> str:
+    result = called["result"]
+    assert result["isError"] is True, result
+    return result["content"][0]["text"]
+
+
+# -- the ratchet: a tool is a route, and nothing else ------------------------------------
+
+
+def _shape(path: str) -> str:
+    return re.sub(r"\{\w+\}", "{}", path)
+
+
+def test_every_tool_is_a_route_of_this_control_plane(fleet):  # noqa: F811
+    """A tool that named no route would answer 404 to every question it was asked."""
+    with _api(fleet) as api:
+        routes = {
+            (method, _shape(route.path))
+            for route in api.app.routes
+            for method in getattr(route, "methods", None) or ()
+        }
+    for tool in TOOLS:
+        assert (tool.method, _shape(tool.path)) in routes, f"{tool.name}: no route {tool.path}"
+
+
+def test_the_ratchet_catches_a_tool_with_no_route(fleet, monkeypatch):  # noqa: F811
+    """Verified by breaking it: the test above fails for a tool that names no route."""
+    stray = Tool("list_unicorns", "Unicorns", "None exist.", "/api/orgs/{org}/unicorns")
+    monkeypatch.setattr(fleet_mcp, "TOOLS", (*TOOLS, stray))
+    monkeypatch.setitem(globals(), "TOOLS", fleet_mcp.TOOLS)
+    with pytest.raises(AssertionError, match="list_unicorns: no route"):
+        test_every_tool_is_a_route_of_this_control_plane(fleet)
+
+
+def test_the_tools_module_reads_no_store_and_imports_nothing_of_flottas():
+    """It has no second copy of the rules because it has no way to answer by itself."""
+    source = Path(fleet_mcp.__file__).read_text(encoding="utf-8")
+    code = source.split('"""', 2)[2]
+    assert not re.search(r"^\s*(from|import) flotta", code, re.M)
+    assert not re.search(r"store_factory|FleetStore|\.get_box|_conn\b|sqlite|psycopg", code)
+
+
+def test_only_the_tools_named_as_writes_change_anything():
+    """A tool that changes the account is a decision a reviewer must see: it is
+    declared, and named in `WRITES`. Every other is a `GET` and says it only reads."""
+    changing = {tool.name for tool in TOOLS if tool.method != "GET"}
+    assert changing == WRITES == {"create_client", "set_budget", "add_schedule", "sleep_agent"}
+    for tool in TOOLS:
+        assert tool.listed()["annotations"]["readOnlyHint"] is (tool.name not in WRITES)
+        assert (tool.body or tool.fixed) == {} or tool.name in WRITES, "a read sends no body"
+        if tool.name in WRITES:
+            # Said in the words a person and a model both read before it is called.
+            assert "Changes the account." in tool.description, tool.name
+
+
+def test_the_ratchet_catches_a_tool_that_changes_something_unannounced(monkeypatch):
+    """Verified by breaking it: a write that is not in `WRITES` fails the test above."""
+    stray = Tool("pause_everything", "Pause", "x" * 40, "/api/boxes/{agent}/sleep", method="POST")
+    monkeypatch.setattr(fleet_mcp, "TOOLS", (*TOOLS, stray))
+    monkeypatch.setitem(globals(), "TOOLS", fleet_mcp.TOOLS)
+    with pytest.raises(AssertionError):
+        test_only_the_tools_named_as_writes_change_anything()
+
+
+@pytest.mark.parametrize("tool", TOOLS, ids=lambda t: t.name)
+def test_a_tool_says_what_it_is_and_takes_only_what_its_route_does(tool):
+    assert re.fullmatch(r"[a-z][a-z_]+", tool.name) and tool.title and len(tool.description) > 30
+    placeholders = set(re.findall(r"\{(\w+)\}", tool.path)) - {"org"}
+    assert placeholders <= set(tool.required), "a path needs an argument the tool does not ask for"
+    assert set(tool.required) <= set(tool.args) and set(tool.query) <= set(tool.args)
+    assert set(tool.body) <= set(tool.args)
+    assert set(tool.args) == placeholders | set(tool.query) | set(tool.body), (
+        "an argument that goes nowhere"
+    )
+    assert not set(tool.fixed) & set(tool.body.values()), "a fixed field an argument could set"
+    assert "org" not in tool.args, "whose account it reads is the caller's, never an argument"
+    assert not any(pattern.search(tool.path) for pattern in NEVER), (
+        "it reaches what is never a tool"
+    )
+
+
+def test_tool_names_are_not_repeated():
+    names = [tool.name for tool in TOOLS]
+    assert len(names) == len(set(names))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/boxes/{box_id}/keys",
+        "/api/keys/{key_id}",
+        "/api/boxes/{box_id}/ticket",
+        "/api/orgs/{org_id}/tokens",
+        "/api/sessions",
+        "/api/boxes/{box_id}/git-credential/repos",
+        "/api/mcp/oauth/callback",
+        "/api/orgs/{org_id}/mcp/{server}/connect",
+        "/api/orgs/{org_id}/spend-ceiling",
+        "/api/settings",
+        "/api/hermes/builds",
+        "/api/fleet/boxes",
+        "/api/users",
+        "/api/orgs",
+    ],
+)
+def test_what_is_never_a_tool_is_caught(path):
+    assert any(pattern.search(path) for pattern in NEVER), path
+
+
+# -- the protocol -----------------------------------------------------------------------
+
+
+def test_a_client_connects_and_is_told_what_this_is(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        answer = _rpc(api, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        newer = _rpc(api, "initialize", {"protocolVersion": "2099-01-01"})
+        ready = api.post(
+            "/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers=OWNER
+        )
+        ping = _rpc(api, "ping")
+    result = answer.json()["result"]
+    assert result["protocolVersion"] == "2025-06-18"
+    assert result["capabilities"] == {"tools": {"listChanged": False}}
+    assert result["serverInfo"]["name"] == "flotta" and "never follow" in result["instructions"]
+    assert newer.json()["result"]["protocolVersion"] == fleet_mcp.PROTOCOL_VERSIONS[0]
+    assert (ready.status_code, ready.content) == (202, b"")
+    assert ping.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
+def test_the_tools_are_listed_with_what_each_takes(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        listed = _rpc(api, "tools/list").json()["result"]["tools"]
+    assert [tool["name"] for tool in listed] == [tool.name for tool in TOOLS]
+    spend = next(tool for tool in listed if tool["name"] == "get_spend")
+    assert set(spend["inputSchema"]["properties"]) == {"client", "agent", "group_by", "from", "to"}
+    assert spend["inputSchema"]["additionalProperties"] is False
+    agent = next(tool for tool in listed if tool["name"] == "get_agent")
+    assert agent["inputSchema"]["required"] == ["agent"]
+
+
+def test_what_is_not_one_message_or_not_a_method_is_refused(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        batch = api.post(
+            "/mcp", json=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}], headers=OWNER
+        )
+        garbage = api.post("/mcp", content=b"{not json", headers=OWNER)
+        unknown = _rpc(api, "resources/list")
+        stream = api.get("/mcp", headers=OWNER)
+    assert batch.status_code == 400 and batch.json()["error"]["code"] == -32600
+    assert garbage.status_code == 400 and garbage.json()["error"]["code"] == -32700
+    assert unknown.json()["error"]["code"] == -32601
+    assert stream.status_code == 405, "it opens no stream, and says so the way MCP expects"
+
+
+def test_a_browser_on_another_origin_is_refused(fleet):  # noqa: F811
+    """The transport's guard against DNS rebinding. The web app's own server sends no origin."""
+    with _api(fleet) as api:
+        foreign = _rpc(api, "ping", headers={**OWNER, "origin": "https://evil.example"})
+        none = _rpc(api, "ping")
+    assert foreign.status_code == 403 and none.status_code == 200
+
+
+def test_nobody_gets_in_without_a_credential(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        answer = _rpc(api, "tools/list", headers={})
+    assert answer.status_code == 401
+
+
+def test_a_credential_made_for_one_job_does_not_get_in(fleet):  # noqa: F811
+    """Billing's token holds `org:govern` and reaches its own routes and no other.
+    This is not one of them. An agent's API key is held the same way by the sweep
+    in `test_api_keys.py`, since only the store can make one."""
+    from flotta.auth import SCOPE_ORG_GOVERN, mint
+    from flotta.control.test_size_api import KEY
+
+    token = mint(scopes={SCOPE_ORG_GOVERN}, key=KEY, subject="billing")
+    headers = {"Authorization": f"Bearer {token}"}
+    with _api(fleet) as api:
+        for method in ("initialize", "tools/list"):
+            answer = _rpc(api, method, headers=headers)
+            assert answer.status_code == 403, (method, answer.text)
+        # Not even a malformed message is read.
+        assert api.post("/mcp", json=[], headers=headers).status_code == 403
+
+
+# -- a tool is the caller's own request ---------------------------------------------------
+
+
+def test_a_tool_answers_what_the_route_answers_for_that_person(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        mine = _data(_call(api, "list_agents"))
+        theirs = _data(_call(api, "list_agents", headers=OTHER_OWNER))
+        direct = api.get("/api/boxes", headers=OWNER).json()
+    assert mine == direct
+    names = lambda listed: [box["name"] for box in listed["boxes"]]  # noqa: E731
+    assert names(mine) == [X] and names(theirs) == [Y]
+
+
+def test_what_the_agencys_agents_are_doing_now_is_one_tool_away(fleet):  # noqa: F811
+    """FLOTTA-250's two missing reads, as tools: the agency's runs in one list,
+    and the work under way, for every agent or the one named."""
+    from flotta.store import FleetStore
+
+    with FleetStore(fleet) as store:
+        mine = store.get_box_by_name(X)
+        run = store.create_run(mine.id, "Chase the unpaid invoices", trigger_kind="api")
+        store.start_run(run.id)
+        theirs = store.create_run(store.get_box_by_name(Y).id, "Theirs", trigger_kind="api")
+        store.start_run(theirs.id)
+    with _api(fleet) as api:
+        runs = _data(_call(api, "list_runs", {"status": "pending,running"}))
+        working = _data(_call(api, "list_working"))
+        one = _data(_call(api, "list_working", {"agent": X}))
+        another = _refused(_call(api, "list_working", {"agent": Y}))
+        direct = api.get("/api/working", headers=OWNER).json()
+    assert [r["id"] for r in runs["runs"]] == [run.id]
+    assert working == direct == one
+    assert [(w["box"], w["about"]) for w in working["working"]] == [
+        (X, "Chase the unpaid invoices")
+    ]
+    assert "no box" in another.lower() or "not found" in another.lower(), another
+
+
+def test_another_agencys_agent_is_not_there(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        said = _refused(_call(api, "get_agent", {"agent": Y}))
+        own = _data(_call(api, "get_agent", {"agent": X}))
+    assert "no box" in said.lower() or "not found" in said.lower(), said
+    assert own["box"]["name"] == X
+
+
+def test_whose_account_is_the_callers_and_never_an_argument(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        mine = _data(_call(api, "list_clients"))
+        asked = _rpc(api, "tools/call", {"name": "list_clients", "arguments": {"org": "agency-y"}})
+    assert [client["id"] for client in mine["clients"]] == ["acme"]
+    assert (
+        asked.json()["error"]["code"] == -32602
+        and "takes no org" in asked.json()["error"]["message"]
+    )
+
+
+def test_a_role_that_may_not_read_something_is_told_so_by_the_route(fleet):  # noqa: F811
+    """No rule is copied here: a member is refused the team by the route that owns it."""
+    with _api(fleet) as api:
+        team = _data(_call(api, "list_team"))
+        refused = _refused(_call(api, "list_team", headers=MEMBER))
+        viewer = _refused(_call(api, "get_spend", headers=VIEWER))
+    assert "members" in team
+    assert refused and viewer
+
+
+def test_an_argument_is_one_path_segment_whatever_it_holds(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        said = _refused(_call(api, "get_agent", {"agent": "x/../../orgs"}))
+        dots = _refused(_call(api, "get_agent", {"agent": ".."}))
+    assert "orgs" not in json.dumps(said).replace("x/../../orgs", "") or "no box" in said.lower()
+    assert dots
+    assert request_for(TOOLS[3], {"agent": "x/../../orgs"}, org="a")[0] == (
+        "/api/boxes/x%2F..%2F..%2Forgs"
+    )
+
+
+def test_spend_is_asked_for_the_way_the_route_takes_it():
+    spend = next(tool for tool in TOOLS if tool.name == "get_spend")
+    asked = {
+        "agent": "b-1",
+        "client": "acme",
+        "group_by": ["day", "client"],
+        "from": "2026-11-01",
+        "to": "2026-11-20",
+    }
+    # The 20th is the last day asked for, so the route is told to stop as the 21st begins.
+    assert request_for(spend, asked, org="agency-x", today=date(2026, 11, 25)) == (
+        "/api/orgs/agency-x/usage",
+        {
+            "client": "acme",
+            "box": "b-1",
+            "group": "day,client",
+            "from": "2026-11-01",
+            "to": "2026-11-21",
+        },
+        None,
+    )
+    assert request_for(spend, {}, org="agency-x") == ("/api/orgs/agency-x/usage", {}, None)
+
+
+# Found on staging, 21 Nov 2026, with a real model: asked what was spent this
+# month it named a window "to 2026-11-21", the route read that as the midnight
+# the 21st began, and the answer said "1 to 21 November" with a figure that
+# held nothing of the 21st.
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [
+        ("2026-11-20", "2026-11-21"),  # a day that has ended: all of it
+        ("2026-10-31", "2026-11-01"),  # across a month
+        ("2026-11-21", None),  # today: the window ends now, as the route ends it itself
+        ("2026-11-25", None),  # a day to come: nothing runs past now
+        ("2026-11-21T12:00:00Z", "2026-11-21T12:00:00Z"),  # a moment is a moment
+        ("2026-11-21T00:00:00+00:00", "2026-11-21T00:00:00+00:00"),
+        ("soon", "soon"),  # no date: the route says so in its own words
+        ("2026-13-45", "2026-13-45"),
+    ],
+)
+def test_a_day_that_ends_a_window_is_counted_whole(given, sent):
+    for name in ("get_spend", "get_client_audit"):
+        asked = {"client": "acme", "from": "2026-11-01", "to": given}
+        _, query, _ = request_for(_tool(name), asked, org="a", today=date(2026, 11, 21))
+        # Where it starts is a day's midnight, which is what a first day means.
+        assert query["from"] == "2026-11-01"
+        assert query.get("to") == sent, name
+
+
+def test_every_tool_that_takes_the_end_of_a_window_counts_its_last_day():
+    ends = {"to", "until", "before", "end"}
+    for tool in TOOLS:
+        assert ends & set(tool.args) <= set(tool.through), tool.name
+        assert set(tool.through) <= set(tool.query), tool.name
+
+
+def test_spend_through_a_tool_is_the_figure_the_route_gives(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        window = {"from": "2026-11-01", "to": "2026-11-20"}
+        through = _data(_call(api, "get_spend", {"group_by": ["client"], **window}))
+        # The tool's last day is counted whole: the route's window stops as the next begins.
+        direct = api.get(
+            "/api/orgs/agency-x/usage",
+            params={"group": "client", "from": "2026-11-01", "to": "2026-11-21"},
+            headers=OWNER,
+        )
+        today = datetime.now(UTC).date()
+        so_far = {"from": (today - timedelta(days=3)).isoformat(), "to": today.isoformat()}
+        now = _data(_call(api, "get_spend", so_far))
+    assert through == direct.json() and through["org"] == "agency-x"
+    # Named as the last day, today is in the window: it ends now, not at the midnight before.
+    assert now["to"] > f"{today.isoformat()}T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "says"),
+    [
+        ("get_agent", {}, "needs agent"),
+        ("get_agent", {"agent": ""}, "needs agent"),
+        ("get_agent", {"agent": X, "verbose": True}, "takes no verbose"),
+        ("list_agent_runs", {"agent": X, "limit": {"a": 1}}, "limit is text or a whole number"),
+        ("destroy_agent", {"agent": X}, "no tool named"),
+    ],
+)
+def test_a_call_that_cannot_be_made_is_refused_before_any_route_is_asked(
+    fleet,  # noqa: F811
+    name,
+    arguments,
+    says,
+):
+    with _api(fleet) as api:
+        answer = _rpc(api, "tools/call", {"name": name, "arguments": arguments}).json()
+    assert answer["error"]["code"] == -32602 and says in answer["error"]["message"]
+
+
+def test_an_answer_too_long_to_read_is_said_to_be(monkeypatch):
+    monkeypatch.setattr(fleet_mcp, "MAX_ANSWER_CHARS", 50)
+    long = tool_answer(200, {"runs": ["x" * 100]})
+    short = tool_answer(200, {"runs": []})
+    assert long["isError"] is True and "Ask for less" in long["content"][0]["text"]
+    assert short == {
+        "content": [{"type": "text", "text": '{"runs":[]}'}],
+        "isError": False,
+        "structuredContent": {"runs": []},
+    }
+    assert tool_answer(404, {"detail": "no box 'x'"})["content"][0]["text"] == "no box 'x'"
+    assert tool_answer(502, None)["content"][0]["text"] == "Flotta answered 502"
+
+
+def test_only_the_callers_way_out_is_used():
+    """`handle` reaches a route through what it is given, and through nothing else."""
+    asked = []
+
+    async def call_route(method, path, query, body):
+        asked.append((method, path, query, body))
+        return 200, {"clients": []}
+
+    message = {"jsonrpc": "2.0", "id": 7, "method": "tools/call"}
+    message["params"] = {"name": "list_clients", "arguments": {}}
+    status, body = asyncio.run(fleet_mcp.handle(message, call_route=call_route, org="agency-x"))
+    assert status == 200 and body["id"] == 7 and body["result"]["isError"] is False
+    assert asked == [("GET", "/api/orgs/agency-x/clients", {}, None)]
+    with pytest.raises(BadCall):
+        request_for(TOOLS[1], {}, org=None)
+
+
+# -- the tools that change the account ---------------------------------------------------
+
+
+def _tool(name):
+    return next(tool for tool in TOOLS if tool.name == name)
+
+
+def test_a_change_is_sent_as_the_routes_own_body():
+    assert request_for(
+        _tool("set_budget"),
+        {"period": "month", "limit_eur": "50", "action": "pause", "client": "acme", "agent": "b-1"},
+        org="agency-x",
+    ) == (
+        "/api/orgs/agency-x/budgets",
+        {},
+        {"period": "month", "limit_eur": "50", "action": "pause", "client": "acme", "box": "b-1"},
+    )
+    # What was left out is left out: the route's own default stands.
+    assert request_for(
+        _tool("set_budget"), {"period": "day", "limit_eur": "5", "action": "notify"}, org="a"
+    )[2] == {"period": "day", "limit_eur": "5", "action": "notify"}
+    assert request_for(_tool("sleep_agent"), {"agent": "b-1"}, org="a") == (
+        "/api/boxes/b-1/sleep",
+        {},
+        None,
+    )
+
+
+def test_a_schedule_is_only_ever_a_schedule():
+    """A webhook's answer is a secret. The tool that adds a schedule cannot be
+    made to add one: `kind` is fixed, and is no argument."""
+    asked = {"agent": "b-1", "cron": "0 9 * * 1", "tz": "Europe/Lisbon", "prompt": "Report."}
+    assert request_for(_tool("add_schedule"), asked, org="a") == (
+        "/api/boxes/b-1/triggers",
+        {},
+        {"cron": "0 9 * * 1", "tz": "Europe/Lisbon", "prompt": "Report.", "kind": "schedule"},
+    )
+    with pytest.raises(BadCall, match="takes no kind"):
+        request_for(_tool("add_schedule"), {**asked, "kind": "webhook"}, org="a")
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "says"),
+    [
+        ("create_client", {"id": "acme"}, "needs name"),
+        ("create_client", {"id": 7, "name": "Acme"}, "id is string"),
+        ("create_client", {"id": "acme", "name": "Acme", "org": "agency-y"}, "takes no org"),
+        ("set_budget", {"period": "year", "limit_eur": "5", "action": "pause"}, "period is one of"),
+        ("set_budget", {"period": "day", "limit_eur": "5", "action": "kill"}, "action is one of"),
+        ("set_budget", {"period": "day", "limit_eur": 5, "action": "pause"}, "limit_eur is string"),
+        ("set_budget", {"period": "day", "limit_eur": "5", "action": True}, "action is string"),
+        ("sleep_agent", {"agent": "b-1", "force": True}, "takes no force"),
+        ("add_schedule", {"agent": "b-1", "cron": "0 9 * * 1", "tz": "UTC"}, "needs prompt"),
+    ],
+)
+def test_a_change_that_is_not_what_the_tool_takes_is_refused_before_any_route(
+    fleet,  # noqa: F811
+    name,
+    arguments,
+    says,
+):
+    with _api(fleet) as api:
+        answer = _rpc(api, "tools/call", {"name": name, "arguments": arguments}).json()
+        clients = api.get("/api/orgs/agency-x/clients", headers=OWNER).json()["clients"]
+    assert answer["error"]["code"] == -32602 and says in answer["error"]["message"], answer
+    assert [c["id"] for c in clients] == ["acme"]
+
+
+def test_an_owner_changes_the_account_through_a_tool_as_through_the_route(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        made = _data(_call(api, "create_client", {"id": "globex", "name": "Globex"}))
+        budget = _data(
+            _call(
+                api,
+                "set_budget",
+                {"period": "month", "limit_eur": "50", "action": "pause", "client": "globex"},
+            )
+        )
+        schedule = _data(
+            _call(
+                api,
+                "add_schedule",
+                {"agent": X, "cron": "0 9 * * 1", "tz": "Europe/Lisbon", "prompt": "Report."},
+            )
+        )
+        clients = api.get("/api/orgs/agency-x/clients", headers=OWNER).json()["clients"]
+        budgets = api.get("/api/orgs/agency-x/budgets", headers=OWNER).json()["budgets"]
+    assert made["client"]["id"] == "globex"
+    assert sorted(c["id"] for c in clients) == ["acme", "globex"]
+    assert (budget["client"], budget["period"], budget["action"]) == ("globex", "month", "pause")
+    assert [(b["client"], b["limit_eur"]) for b in budgets] == [("globex", "50")]
+    assert (schedule["kind"], schedule["cron"], schedule["tz"]) == (
+        "schedule",
+        "0 9 * * 1",
+        "Europe/Lisbon",
+    )
+    assert "secret" not in schedule
+
+
+def test_a_change_is_refused_to_whoever_the_route_refuses(fleet):  # noqa: F811
+    """No rule is copied here: a builder adds no client, and nobody changes another agency."""
+    with _api(fleet) as api:
+        member = _refused(
+            _call(api, "create_client", {"id": "globex", "name": "Globex"}, headers=MEMBER)
+        )
+        elsewhere = _refused(_call(api, "sleep_agent", {"agent": Y}))
+        theirs = _refused(
+            _call(
+                api,
+                "add_schedule",
+                {"agent": Y, "cron": "0 9 * * 1", "tz": "UTC", "prompt": "Report."},
+            )
+        )
+        clients = api.get("/api/orgs/agency-x/clients", headers=OWNER).json()["clients"]
+        other = api.get("/api/orgs/agency-y/clients", headers=OTHER_OWNER).json()["clients"]
+    assert member and elsewhere and theirs
+    assert "no box" in elsewhere.lower() or "not found" in elsewhere.lower(), elsewhere
+    assert [c["id"] for c in clients] == ["acme"] and [c["id"] for c in other] == ["acme"]
+
+
+def test_what_a_route_refuses_in_a_change_is_said_by_the_tool(fleet):  # noqa: F811
+    with _api(fleet) as api:
+        twice = _refused(_call(api, "create_client", {"id": "acme", "name": "Acme again"}))
+        bad_id = _refused(_call(api, "create_client", {"id": "Not A Slug", "name": "X"}))
+        often = _refused(
+            _call(
+                api,
+                "add_schedule",
+                {"agent": X, "cron": "* * * * *", "tz": "UTC", "prompt": "Too often."},
+            )
+        )
+        amount = _refused(
+            _call(api, "set_budget", {"period": "day", "limit_eur": "lots", "action": "pause"})
+        )
+    assert "acme" in twice and bad_id
+    assert "minute" in often
+    assert "not an amount in euros" in amount
+
+
+# -- an answer too long to read whole -----------------------------------------------------
+
+
+def _audit(n, size=200):
+    entries = [
+        {"at": f"2026-11-{1 + i // 100:02d}", "n": i, "summary": "x" * size} for i in range(n)
+    ]
+    return {"org": "agency-x", "client": "acme", "entries": entries, "truncated": False}
+
+
+def test_a_record_too_long_to_read_keeps_its_latest_entries_and_says_what_it_left_out():
+    audit = _tool("get_client_audit")
+    answer = tool_answer(200, _audit(740), audit)
+    body = answer["structuredContent"]
+    kept = [entry["n"] for entry in body["entries"]]
+
+    assert answer["isError"] is False
+    assert len(answer["content"][0]["text"]) <= fleet_mcp.MAX_ANSWER_CHARS
+    # The latest, in the order they were, with none cut in the middle.
+    assert kept == list(range(740 - len(kept), 740)) and 100 < len(kept) < 740
+    assert body["left_out"] == 740 - len(kept)
+    assert f"Only the latest {len(kept)} of 740 entries are here" in body["note"]
+    assert "narrower window" in body["note"]
+    assert (body["org"], body["client"], body["truncated"]) == ("agency-x", "acme", False)
+    # As much as fits: one more entry would not have.
+    assert len(answer["content"][0]["text"]) > fleet_mcp.MAX_ANSWER_CHARS - 1000
+
+
+def test_a_record_that_fits_is_given_whole_and_says_nothing_of_leaving_out():
+    answer = tool_answer(200, _audit(20), _tool("get_client_audit"))
+    assert len(answer["structuredContent"]["entries"]) == 20
+    assert (
+        "left_out" not in answer["structuredContent"] and "note" not in answer["structuredContent"]
+    )
+
+
+def test_only_a_tool_that_says_where_is_cut_and_only_when_something_fits(monkeypatch):
+    # A tool with nowhere to cut is refused as before, with what to ask for.
+    refused = tool_answer(200, _audit(740), _tool("list_clients"))
+    assert refused["isError"] is True and "too long to read whole" in refused["content"][0]["text"]
+    assert tool_answer(200, _audit(740))["isError"] is True
+    audit = _tool("get_client_audit")
+    # Not the shape it cuts: refused, not guessed at.
+    assert tool_answer(200, {"entries": "x" * 70_000}, audit)["isError"] is True
+    assert tool_answer(200, ["x" * 70_000], audit)["isError"] is True
+    # One entry that alone is too long leaves nothing to keep.
+    assert tool_answer(200, _audit(1, size=70_000), audit)["isError"] is True
+    # And a refusal by the route is still the route's words.
+    assert tool_answer(404, {"detail": "no client 'acme'"}, audit)["content"][0]["text"] == (
+        "no client 'acme'"
+    )
+
+
+def test_the_first_end_is_kept_for_a_list_that_starts_with_what_matters():
+    newest_first = Tool("x", "X", "y" * 30, "/api/x", trim=("runs", "first"))
+    body = {"runs": [{"n": i, "said": "x" * 500} for i in range(400)]}
+    answer = tool_answer(200, body, newest_first)["structuredContent"]
+    assert [run["n"] for run in answer["runs"]] == list(range(len(answer["runs"])))
+    assert f"Only the first {len(answer['runs'])} of 400 runs are here" in answer["note"]
+
+
+def test_a_long_record_is_readable_through_the_tool_itself(fleet, monkeypatch):  # noqa: F811
+    """Found on staging: a test client's last 30 days were 162,000 characters,
+    and the tool answered only that it was too long."""
+    from flotta.store import FleetStore
+
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name(X)
+        for n in range(12):
+            store.add_event("box", box.id, "model_set", {"model": f"some/model-{n}", "by": "ana"})
+    monkeypatch.setattr(fleet_mcp, "MAX_ANSWER_CHARS", 1500)
+    with _api(fleet) as api:
+        whole = api.get("/api/clients/acme/audit", headers=OWNER).json()
+        answer = _call(api, "get_client_audit", {"client": "acme"})
+    result = answer["result"]
+    assert len(whole["entries"]) > 2, "the fixture has a record worth cutting"
+    assert result["isError"] is False, result
+    kept = result["structuredContent"]["entries"]
+    assert 0 < len(kept) < len(whole["entries"])
+    assert kept == whole["entries"][-len(kept) :]
+    assert result["structuredContent"]["left_out"] == len(whole["entries"]) - len(kept)
+
+
+@pytest.mark.parametrize(
+    ("params", "room"),
+    [
+        ({}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": 30_000}}, 30_000),
+        # Never more than this server gives anyone, and never so little that nothing fits.
+        ({"_meta": {"flotta.dev/maxChars": 10_000_000}}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": 5}}, 2_000),
+        ({"_meta": {"flotta.dev/maxChars": -1}}, 2_000),
+        # Anything that is not a whole number says nothing.
+        ({"_meta": {"flotta.dev/maxChars": "30000"}}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": True}}, 60_000),
+        ({"_meta": {"flotta.dev/maxChars": 30_000.5}}, 60_000),
+        ({"_meta": {"maxChars": 30_000}}, 60_000),
+        ({"_meta": "flotta.dev/maxChars"}, 60_000),
+        (None, 60_000),
+    ],
+)
+def test_a_caller_says_how_long_an_answer_it_can_read(params, room):
+    assert fleet_mcp.answer_room(params) == room
+
+
+def test_an_answer_is_cut_to_what_the_caller_can_read_with_the_note_first():
+    audit = _tool("get_client_audit")
+    whole = tool_answer(200, _audit(740), audit)
+    half = tool_answer(200, _audit(740), audit, 30_000)
+    text = half["content"][0]["text"]
+
+    assert half["isError"] is False and len(text) <= 30_000
+    assert len(half["structuredContent"]["entries"]) < len(whole["structuredContent"]["entries"])
+    assert half["structuredContent"]["entries"][-1]["n"] == 739
+    # A reader that stops early has read that the rest was left out.
+    assert text.startswith('{"note":"Only the latest '), text[:60]
+    assert list(half["structuredContent"])[:2] == ["note", "left_out"]
+    # And a tool with nowhere to cut is refused at the caller's length, not this server's.
+    clients = {"clients": [{"id": f"c{i}", "name": "x" * 40} for i in range(700)]}
+    assert tool_answer(200, clients, _tool("list_clients"))["isError"] is False
+    assert tool_answer(200, clients, _tool("list_clients"), 30_000)["isError"] is True
+
+
+def test_the_callers_length_reaches_the_answer_through_the_server(fleet):  # noqa: F811
+    from flotta.store import FleetStore
+
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name(X)
+        for n in range(40):
+            store.add_event("box", box.id, "model_set", {"model": f"some/model-{n}", "by": "ana"})
+    call = {"name": "get_client_audit", "arguments": {"client": "acme"}}
+    with _api(fleet) as api:
+        whole = _rpc(api, "tools/call", call).json()["result"]
+        short = _rpc(api, "tools/call", {**call, "_meta": {"flotta.dev/maxChars": 2_000}}).json()[
+            "result"
+        ]
+    assert "left_out" not in whole["structuredContent"]
+    assert short["isError"] is False and len(short["content"][0]["text"]) <= 2_000
+    assert short["structuredContent"]["left_out"] > 0
+    assert short["structuredContent"]["entries"][-1] == whole["structuredContent"]["entries"][-1]

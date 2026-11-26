@@ -64,7 +64,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from flotta import budgets as budget_rules
@@ -86,11 +86,13 @@ from flotta.github import GITHUB_TOKEN_ENV
 from flotta.rules import Rules, config_changes, rules_from_json
 from flotta.runs import RUN_DEADLINE_S
 from flotta.store import (
+    CLOSED_HINT,
     INSTRUCTIONS_CHANGED,
     SUSPENDED_HINT,
     Box,
     FleetStore,
     InvalidTransitionError,
+    Org,
     Task,
     UnknownEntityError,
     box_label,
@@ -99,6 +101,7 @@ from flotta.store import (
     reaches_fleet_github,
     validate_box_meta,
     validate_box_name,
+    validate_template,
     validate_tenant_id,
 )
 
@@ -478,6 +481,7 @@ def fleet_secrets(
     box_id: str,
     org: str | None = None,
     client: str | None = None,
+    runtime: str = "hermes",
 ) -> tuple[dict[str, str], list[str]]:
     """What every box in this fleet needs to boot, and what is missing.
 
@@ -503,6 +507,8 @@ def fleet_secrets(
     because nothing else needs to know it.
     """
     source = os.environ if env is None else env
+    if runtime == "custom":
+        return custom_secrets(source, box_id=box_id, org=org, client=client)
     secrets: dict[str, str] = {}
     missing: list[str] = []
 
@@ -549,6 +555,74 @@ def fleet_secrets(
         missing.append("FLOTTA_MODEL / FLOTTA_MODEL_BASE_URL / FLOTTA_API_KEY")
 
     return secrets, missing
+
+
+#: The per-agent secret a custom agent checks on every request (M17): the
+#: door sends it as a Bearer, because anything on Fly's private network can
+#: reach the agent's port. Derived like a Hermes agent's password, so the door
+#: works it out and it opens one agent.
+BOX_SECRET_ENV = "FLOTTA_BOX_SECRET"
+#: What a custom agent is told it is, so an adapter can tell.
+RUNTIME_ENV = "FLOTTA_RUNTIME"
+
+
+def custom_secrets(
+    source: Mapping[str, str],
+    *,
+    box_id: str,
+    org: str | None = None,
+    client: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """What a custom agent needs (M17.1), and what is missing.
+
+    **Its model calls go through the gateway or nowhere.** A Hermes agent off
+    the gateway is given the fleet's provider key, which is Flotta's own image
+    holding it; a custom image is the agency's code, and the fleet's key in it
+    would be the agency's to read. So off the gateway a custom agent is given
+    no key at all and the gap is reported.
+
+    The model values come under the names an OpenAI SDK reads as well as
+    Flotta's, so a LangGraph agent's `ChatOpenAI()` works with no
+    configuration. No Hermes dashboard login: there is no Hermes to log into.
+    """
+    secrets: dict[str, str] = {}
+    missing: list[str] = []
+    password = (source.get("FLOTTA_BOX_PASSWORD") or "").strip()
+    if password:
+        secrets[BOX_SECRET_ENV] = box_password(password, box_id)
+    else:
+        missing.append("FLOTTA_BOX_PASSWORD (the door's secret for this agent is derived from it)")
+    model = (source.get("FLOTTA_MODEL") or "").strip()
+    if not gateway_url(source):
+        missing.append("FLOTTA_GATEWAY_URL (a custom agent calls models only through the gateway)")
+    elif not model:
+        missing.append("FLOTTA_MODEL")
+    else:
+        from flotta.auth import AuthError
+
+        try:
+            given = gateway_secrets(box_id, model, env=source, org=org, client=client)
+        except AuthError:
+            missing.append("FLOTTA_SIGNING_KEY (the gateway needs a token for this agent)")
+        else:
+            given.pop("OPENROUTER_API_KEY", None)
+            given.pop("FLOTTA_GATEWAY_UPSTREAM", None)
+            secrets.update(given)
+            secrets.update(openai_aliases(given))
+    return secrets, missing
+
+
+def openai_aliases(model_secrets: Mapping[str, str]) -> dict[str, str]:
+    """The gateway's values under the names OpenAI's SDKs read (M17.1)."""
+    out: dict[str, str] = {}
+    for flotta_name, openai_name in (
+        ("FLOTTA_MODEL_BASE_URL", "OPENAI_BASE_URL"),
+        ("FLOTTA_API_KEY", "OPENAI_API_KEY"),
+        ("FLOTTA_MODEL", "OPENAI_MODEL"),
+    ):
+        if model_secrets.get(flotta_name):
+            out[openai_name] = model_secrets[flotta_name]
+    return out
 
 
 def build_identity(
@@ -929,6 +1003,47 @@ def reconcile_boxes(
     return changed
 
 
+def _name_is_free(impl: Backend | None, box: Box, detail: dict[str, Any]) -> bool:
+    """Whether nothing of `box` remains, so its name may go to a new agent (FLOTTA-30).
+
+    `create` adopts whatever it finds under a name (`FlyBackend.create` takes
+    `machines[0]`), and the `BoxOccupied` guard only looks at live rows, so a
+    name freed while a machine or volume survives hands the next agent the old
+    one's machine and memory. So the name is freed only on a definite "nothing
+    remains". Anything else keeps it held, and `detail["name_held"]` says why:
+    that name is then the only handle on something that may still be billing,
+    and `flotta kill` on the row tries again.
+    """
+    ask = getattr(impl, "leftover", None) if impl is not None else None
+    if ask is None:
+        detail["name_held"] = "nothing could say whether its machine is gone"
+        return False
+    try:
+        remains = ask(box.name)
+    except Exception as exc:  # noqa: BLE001 - not knowing is an answer: keep it held
+        detail["name_held"] = (
+            f"could not tell whether its machine is gone: {type(exc).__name__}: {exc}"
+        )
+        return False
+    if remains:
+        detail["name_held"] = "its machine or volume is still there"
+        return False
+    return True
+
+
+def _backend_or_none(box: Box, backend: Backend | None = None) -> Backend | None:
+    """The backend for `box`, or the default substrate's when it has no endpoint;
+    None when neither can be had."""
+    try:
+        return _resolve_backend(box, backend)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return _backend_for(f"{default_scheme()}://")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _close_stranded_provision(
     store: FleetStore, box: Box, resolve: Callable[[str], Backend]
 ) -> dict[str, Any]:
@@ -956,10 +1071,23 @@ def _close_stranded_provision(
             detail["destroyed"] = False
             detail["error"] = f"{type(exc).__name__}: {exc}"
 
+    # Its name, only once nothing of it remains (FLOTTA-30). A machine it could
+    # not destroy keeps the name held: that name is what finds it again.
+    if detail.get("destroyed") is False:
+        detail["name_held"] = "its machine could not be destroyed"
+        free = False
+    else:
+        try:
+            impl = resolve(endpoint or f"{default_scheme()}://")
+        except Exception:  # noqa: BLE001
+            impl = None
+        free = _name_is_free(impl, box, detail)
     store.add_event(
         "box", box.id, "torn_down", {"reason": "provisioning never completed", **detail}
     )
     store.update_box_status(box.id, "torn_down", endpoint=endpoint)
+    if free:
+        detail["name_released"] = store.release_name(box.id)
     return detail
 
 
@@ -1002,6 +1130,9 @@ def reserve_box(
     instructions: str | None = None,
     model: str | None = None,
     screen: bool = False,
+    runtime: str = "hermes",
+    image: str | None = None,
+    template: str | None = None,
 ) -> Box:
     """Write the row, and nothing else. Returns immediately.
 
@@ -1033,9 +1164,17 @@ def reserve_box(
     # refuses without spending the name — the same reason the name itself is
     # checked at the top of `store.create_box`.
     validate_box_meta(display_name, description, instructions)
+    template = validate_template(template)
     if model is not None:
         model = allowed_model(model, store)
-    box = store.create_box(name, org=org, client=client)
+    # What runs in it is written with the row, and the org's switch checked
+    # under the same guard (`store.create_box`): a refusal leaves no row, so
+    # no name is spent. Callers ran `check_custom_request` first, which is the
+    # early answer for what only Hermes has.
+    box = store.create_box(name, org=org, client=client, runtime=runtime, image=image)
+    if template is not None:
+        store.set_box_template(box.id, template)
+        box = store.get_box(box.id) or box
     store.add_event("box", box.id, "provisioning", {"name": box.name, "backend": backend.scheme})
     if display_name or description or instructions:
         store.set_box_meta(
@@ -1055,6 +1194,77 @@ def reserve_box(
         store.set_box_screen(box.id, True)
         box = store.get_box(box.id)
     return box
+
+
+class CustomRuntimeRefused(ProvisionError):
+    """A custom agent asked for something only a Hermes agent has (M17.1)."""
+
+
+def refuse_custom(box: Box, what: str) -> None:
+    """Refuse `what` for a custom agent: the one wording, for every caller."""
+    if box.runtime == "custom":
+        raise CustomRuntimeRefused(
+            f"{box.name} runs its own image; {what} is for Hermes agents only"
+        )
+
+
+def hermes_only(store: FleetStore, box_id: str, what: str) -> None:
+    """Refuse `what` for a custom agent: it works by rewriting Hermes on the box.
+
+    At the top of every provision verb that does (rules, MCP, model, screen,
+    instructions, the gateway move), held there by a ratchet that reads this
+    file, so a route added later cannot reach one for a custom agent. The
+    gateway move is in the list for a sharper reason than Hermes: off the
+    gateway, an agent is given the fleet's provider key, and a custom image is
+    the agency's code.
+    """
+    box = store.get_box(box_id) or store.get_box_by_name(box_id)
+    if box is not None:
+        refuse_custom(box, what)
+
+
+def check_custom_request(
+    runtime: str,
+    image: str | None,
+    *,
+    store: FleetStore,
+    org: str,
+    screen: bool = False,
+    instructions: str | None = None,
+    model: str | None = None,
+) -> str | None:
+    """Refuse a custom agent before its name is spent. Returns the cleaned image.
+
+    The early answer, for the API and the CLI alike; the store refuses the
+    row's runtime too (`store.create_box`), which is the guarantee. A custom
+    agent has no screen, no `SOUL.md` and no model of Flotta's choosing: its
+    image decides all three, so asking for them is asking for nothing.
+    """
+    from flotta.store import (
+        RUNTIMES,
+        InvalidBoxMetaError,
+        InvalidImageError,
+        validate_image_ref,
+    )
+
+    if runtime not in RUNTIMES:
+        raise InvalidBoxMetaError(f"runtime is one of {', '.join(RUNTIMES)}, not {runtime!r}")
+    if runtime == "hermes":
+        if image:
+            raise InvalidImageError(
+                "a Hermes agent runs the fleet's image; say runtime custom to run your own"
+            )
+        return None
+    cleaned = validate_image_ref(image)
+    for asked, what in ((screen, "a screen"), (instructions, "instructions"), (model, "a model")):
+        if asked:
+            raise CustomRuntimeRefused(
+                f"an agent from your own image has no {what.removeprefix('a ')} of Flotta's; "
+                "its image decides that"
+            )
+    if store.get_org(org) is not None:
+        store.require_custom_images(org)
+    return cleaned
 
 
 def resolve_box_resources(
@@ -1130,8 +1340,21 @@ def create_box(
     instructions: str | None = None,
     model: str | None = None,
     screen: bool = False,
+    runtime: str = "hermes",
+    image: str | None = None,
+    template: str | None = None,
+    rules: Rules | None = None,
+    by: str | None = None,
 ) -> dict[str, Any]:
     """Provision a **persistent** box and record it. Returns ``{box_id, endpoint}``.
+
+    `rules` are the agent's rules from its first conversation (FLOTTA-251),
+    written before the row says `running`: see `_write_rules_at_creation`.
+    `template` is the name of what it was made from, kept and nothing more.
+
+    `runtime="custom"` with an `image` runs the agency's own image (M17.1): no
+    Hermes, its model calls through the gateway only, and the door's secret
+    for it in `FLOTTA_BOX_SECRET`. A row reserved as one has both already.
 
     `screen` gives the agent a screen (FLOTTA-208): a 4096 MB machine unless a
     size is named, a named size below that refused, and `FLOTTA_SCREEN=1` in
@@ -1186,6 +1409,18 @@ def create_box(
     if screen:
         check_screen_size(memory_mb)
         check_screen_size(spec.memory_mb if spec else None)
+    if box is not None:
+        runtime, image = box.runtime, box.image
+    else:
+        image = check_custom_request(
+            runtime,
+            image,
+            store=store,
+            org=org,
+            screen=screen,
+            instructions=instructions,
+            model=model,
+        )
 
     # A pending org's agent is refused before a substrate is resolved, let alone
     # probed. The store refuses the row too (`FleetStore.create_box`), and that
@@ -1216,6 +1451,11 @@ def create_box(
     # API answers immediately and provisions afterwards, without the row being
     # created twice or the name being taken between the two halves.
     if box is None:
+        if rules is not None and not rules.empty and runtime == "custom":
+            # Before the name is spent: its own image decides what it may do.
+            raise CustomRuntimeRefused(
+                f"{short} runs its own image; tool rules are for Hermes agents only"
+            )
         box = reserve_box(
             short,
             store=store,
@@ -1227,6 +1467,9 @@ def create_box(
             instructions=instructions,
             model=model,
             screen=screen,
+            runtime=runtime,
+            image=image,
+            template=template,
         )
 
     # Identity travels with the machine rather than arriving afterwards. The
@@ -1239,6 +1482,11 @@ def create_box(
     # after it, and a tenant box's spec carrying its short name would put it
     # in another org's app.
     base = replace(spec, name=name) if spec else BoxSpec(name=name)
+    if runtime == "custom":
+        # Its own image, always: the fleet's is Hermes, and a custom agent on
+        # it would be a Hermes agent the rest of Flotta thinks speaks the box
+        # contract. Not a caller's spec either, for the same reason.
+        base = replace(base, image=image)
 
     # The image every agent is born on, resolved the same way an upgrade
     # resolves it — `$FLOTTA_FLY_IMAGE`, else the newest release on the build
@@ -1317,7 +1565,11 @@ def create_box(
     # values are recorded rather than raised: a box with no provider key still
     # boots and can be fixed, and refusing to create would strand the operator
     # with no agent and no obvious way to get one.
-    fleet, missing_fleet = fleet_secrets(source, box_id=box.id, org=box.org, client=box.client)
+    fleet, missing_fleet = fleet_secrets(
+        source, box_id=box.id, org=box.org, client=box.client, runtime=runtime
+    )
+    if runtime == "custom":
+        identity_env[RUNTIME_ENV] = "custom"
     # This agent's own model, if it has one — from the store for the reason
     # `meta` is. Only the model is overridden: the endpoint and key stay the
     # fleet's (see the `box_models` table).
@@ -1379,8 +1631,21 @@ def create_box(
         # `Exception`, not `BaseException`: a Ctrl-C should not be recorded as
         # a teardown.
         detail = f"create failed: {type(exc).__name__}: {exc}"
-        store.add_event("box", box.id, "torn_down", {"reason": detail})
+        closed: dict[str, Any] = {"reason": detail}
+        # The name goes back only if the failure left nothing behind (FLOTTA-30),
+        # so the person can try again with it; otherwise it stays held, and
+        # saying so beats a later 409 about an agent nobody can see.
+        free = _name_is_free(impl, box, closed)
+        store.add_event("box", box.id, "torn_down", closed)
         store.update_box_status(box.id, "torn_down")
+        if free:
+            store.release_name(box.id)
+            detail += f". The name {name!r} is free to use again."
+        else:
+            detail += (
+                f". The name {name!r} stays held ({closed['name_held']}); "
+                f"`flotta kill {box.id}` frees it once nothing of it remains."
+            )
         raise ProvisionError(detail) from exc
 
     # The size the machine has, on the timeline, so the box payload can say it
@@ -1444,6 +1709,13 @@ def create_box(
             # thing that is not broken.
             identity_error = f"apply_secrets failed: {exc}"
 
+    if handle.adopted and runtime == "custom":
+        # An adopted machine kept its own image, which on Fly is whatever the
+        # app last released: Hermes, or another agent's. Moved onto the
+        # agency's, or stopped and said so, never left running a different
+        # image than the row names.
+        _custom_onto_adopted(store, impl, box, handle.endpoint, image)
+
     if handle.adopted and screen:
         # An adopted machine kept its own environment and size, so a screen
         # reaches it the way turning one on later does: one `machine update`.
@@ -1505,22 +1777,43 @@ def create_box(
         impl, handle.endpoint, assume="stopped" if started_error else "started"
     )
     if observed == "started":
-        store.update_box_status(box.id, "running", endpoint=handle.endpoint)
-        store.add_event(
-            "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
+        # Its rules first, while the row still says `provisioning`: nothing can
+        # address an agent in that state, so nobody talks to it without them.
+        rules_written = _write_rules_at_creation(
+            box, handle.endpoint, rules, store=store, backend=impl, by=by
         )
+        # Booting from before the row says `running`, so nothing that sees it
+        # running writes its config while its first boot may be editing it.
+        _BOOTING.add(box.id)
+        try:
+            store.update_box_status(box.id, "running", endpoint=handle.endpoint)
+            store.add_event(
+                "box", box.id, "running", {"endpoint": handle.endpoint, "machine_id": handle.id}
+            )
+            _write_mcp_config_that_waited(box.id, store=store, backend=impl)
+        finally:
+            _BOOTING.discard(box.id)
         _note_agent_created(store, box)
         return {
             "box_id": box.id,
             "endpoint": handle.endpoint,
             "machine_id": handle.id,
             "status": "running",
+            # Only said when rules were asked for: true when they are on the machine.
+            **({} if rules_written is None else {"rules_written": rules_written}),
         }
 
     # The machine exists but is not up. `stopped` is the true statement, and it
     # is recoverable — `flotta start` retries — where `torn_down` would discard
     # a machine that is sitting there costing disk.
     detail = started_error or f"machine is {observed!r} after create"
+    if rules is not None and not rules.empty:
+        store.add_event(
+            "box",
+            box.id,
+            "rules_write_failed",
+            {"detail": f"its machine did not start, so its rules were not written: {detail}"[:500]},
+        )
     store.update_box_status(box.id, "stopped", endpoint=handle.endpoint)
     store.add_event(
         "box",
@@ -1545,6 +1838,153 @@ def _note_agent_created(store: FleetStore, box: Box) -> None:
         agent_created(store, box)
     except Exception:
         _log.exception("could not record agent_created for %s", box.id)
+
+
+def _write_rules_at_creation(
+    box: Box,
+    endpoint: str,
+    rules: Rules | None,
+    *,
+    store: FleetStore,
+    backend: Backend,
+    by: str | None,
+) -> bool | None:
+    """An agent's rules, on its machine before anyone can reach it (FLOTTA-251).
+
+    `None` when none were asked for; otherwise whether they were written.
+
+    **Before the row says `running`.** `set_rules` needs a machine, so rules
+    could not be part of creating an agent: a save straight after `POST
+    /api/boxes` met a box with no endpoint and was refused. They are not held
+    back and written at the next wake, as MCP grants are, because a rule held
+    back is a rule not followed. So creation writes them itself, while the row
+    is still `provisioning`: no conversation, run or wake reaches an agent in
+    that state.
+
+    **After Hermes listens**, for the reason `_write_mcp_config_that_waited`
+    gives: its first boot is editing the same file until then. So an agent
+    made with rules is `provisioning` until Hermes is up, about as long as it
+    takes to be reachable anyway.
+
+    **A failure makes an agent with no rules, and says so.** Nothing is
+    recorded as its rules unless the write landed, so its Rules page shows none
+    and its timeline has `rules_write_failed`. It is still made: an agent
+    without the template's rules is one a person can give them to, and tearing
+    it down would spend a provision to say the same thing.
+    """
+    if rules is None or rules.empty:
+        return None
+    import json
+
+    try:
+        up, why = _wait_for_hermes_at(backend, endpoint)
+        if up is False:
+            detail: str | None = f"Hermes did not start: {why}"
+        else:
+            with _rules_lock(box.id):
+                result = backend.exec(endpoint, _config_command(config_changes(rules).to_json()))
+                if result.exit_code != 0:
+                    detail = (result.stderr or result.stdout or "").strip() or "no output"
+                else:
+                    detail = None
+                    store.set_box_rules(box.id, json.dumps(rules.to_json()))
+    except Exception as exc:  # noqa: BLE001 - never fail a creation over its rules
+        detail = str(exc) or type(exc).__name__
+    if detail is not None:
+        store.add_event("box", box.id, "rules_write_failed", {"detail": detail[:500], "by": by})
+        return False
+    store.add_event(
+        "box",
+        box.id,
+        RULES_CHANGED,
+        {
+            "always": len(rules.always),
+            "never": len(rules.never),
+            "careful": len(rules.careful),
+            "denied_commands": len(rules.denied_commands),
+            "disabled_tools": list(rules.disabled_tools),
+            "private_conversations": rules.private_conversations,
+            "by": by,
+            "reason": "created",
+        },
+    )
+    return True
+
+
+def _write_mcp_config_that_waited(box_id: str, *, store: FleetStore, backend: Backend) -> None:
+    """Tools chosen for an agent while it was being created, written once it is up (FLOTTA-252).
+
+    `set_mcp_grants` marks an agent still being created as pending, and this is
+    what comes back for it. Called with the box in `_BOOTING`.
+
+    **The mark is read under the lock a save holds** from looking at the box to
+    leaving its mark, and a box with nothing waiting leaves `_BOOTING` under
+    that lock too. So a save either left its mark before this looked, or comes
+    after and finds an agent it may write to.
+
+    **Nothing is written until Hermes listens** (`_wait_for_hermes`). The image's
+    boot steps edit the same `config.yaml` (`box_entrypoint.sh`: approvals,
+    skills, the model, the screen), and on a first boot every one of them
+    saves. On an image from before FLOTTA-253 each was a read and a save with
+    no lock: a config written meanwhile could be put back without its servers
+    by a step that read the file first, or read while a step had it
+    half-written and saved over that step's own. Those steps now take the
+    writer's lock (`flotta.box.config_file`), but the control plane cannot tell
+    which image a machine booted, and Hermes has to be listening to be asked to
+    reload anyway. It is started after the steps, so its listening means they
+    are done, and it has read the file by then.
+
+    Best effort, like the same step in `wake_box`, which writes the config if
+    this does not: the grants are in force at the gateway either way, and a
+    failure leaves the mark.
+    """
+    try:
+        with _rules_lock(box_id):
+            waited = store.mcp_config_pending(box_id)
+            if not waited:
+                _BOOTING.discard(box_id)
+        if not waited:
+            return
+        box = store.get_box(box_id)
+        if box is None or not box.endpoint:
+            return
+        up, why = _wait_for_hermes(box, backend)
+        _BOOTING.discard(box_id)
+        if up is False:
+            store.add_event(
+                "box",
+                box_id,
+                "mcp_grants_write_failed",
+                {"detail": f"not written yet, because Hermes did not start: {why}"[:500]},
+            )
+            return
+        rewrite_mcp_config(box_id, store=store, backend=backend, reason="created")
+    except Exception as exc:  # noqa: BLE001 - never fail a creation over discovery
+        _log.warning("the pending MCP config of %s was not written: %s", box_id, exc)
+
+
+def _custom_onto_adopted(
+    store: FleetStore, impl: Backend, box: Box, endpoint: str, image: str | None
+) -> None:
+    """Put an adopted machine on the custom agent's image, or stop it (M17.1)."""
+    running = _peek_image(impl, endpoint)
+    if image and running and _same_image(running, image):
+        return
+    try:
+        impl.reimage(endpoint, image)
+    except Exception as exc:  # noqa: BLE001 - any failure means the wrong image is there
+        detail = f"the machine it adopted runs {running or 'an unknown image'}: {exc}"
+        store.add_event("box", box.id, "image_not_applied", {"to": image, "error": detail[:400]})
+        with contextlib.suppress(Exception):
+            impl.stop(endpoint)
+        store.update_box_status(box.id, "stopped", endpoint=endpoint)
+        raise BoxNotRunning(
+            f"box {box.id} adopted a machine that is not on {image}, and moving it failed: "
+            f"{detail}. It is stopped; change its image to retry.",
+            box_id=box.id,
+            endpoint=endpoint,
+        ) from exc
+    store.add_event("box", box.id, "reimaged", {"reason": "adopted", "from": running, "to": image})
 
 
 def _peek_endpoint(impl: Backend, box_name: str | None = None) -> str | None:
@@ -1716,6 +2156,7 @@ def set_instructions(
     one: Hermes seeds its own default when `SOUL.md` is absent, and an empty
     file would leave an agent with no identity at all.
     """
+    hermes_only(store, box_id, "Flotta's instructions")
     import base64
 
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
@@ -1840,6 +2281,7 @@ def set_rules(
     enforced, the next conversation for the rest. As with instructions, nothing
     restarts. Asleep is fine, since `exec` starts the machine; paused is not.
     """
+    hermes_only(store, box_id, "tool rules")
     import json
 
     box = _writable_box(box_id, store)
@@ -1884,11 +2326,12 @@ MCP_GRANTS_CHANGED = "mcp_grants_changed"
 MCP_RELOAD_MARK = "--flotta-mcp-reload"
 
 
-def _mcp_reload_command(*, wait: bool = False) -> str:
+def _mcp_reload_command(*, wait: bool = False, only_wait: bool = False) -> str:
     """Run `flotta.box.mcp_reload` on the box: the script travels with the command.
 
     `wait` when the machine was just started: the script then waits for Hermes
-    to listen rather than failing because it is still booting.
+    to listen rather than failing because it is still booting. `only_wait` to
+    wait for Hermes to listen and reload nothing (`_wait_for_hermes`).
     """
     import base64
     from pathlib import Path
@@ -1897,7 +2340,64 @@ def _mcp_reload_command(*, wait: bool = False) -> str:
 
     script = base64.b64encode(Path(mcp_reload.__file__).read_bytes()).decode("ascii")
     flag = f" {mcp_reload.WAIT_FLAG}" if wait else ""
+    if only_wait:
+        flag = f" {mcp_reload.ONLY_WAIT_FLAG}"
     return f"printf %s {script} | base64 -d | {BOX_PYTHON} - {MCP_RELOAD_MARK}{flag}"
+
+
+#: Agents whose first boot isn't known to be over: `create_box` has started the
+#: machine and is still to hear Hermes listen (FLOTTA-252). Nothing writes such
+#: an agent's MCP config, since its boot is editing the same file. Per process,
+#: as `_RULES_LOCKS` is.
+_BOOTING: set[str] = set()
+
+
+def _wait_for_hermes(box: Box, backend: Backend | None) -> tuple[bool | None, str | None]:
+    """Wait for a just-created agent's Hermes to listen: `(is it, why not)`.
+
+    `None` on a substrate with no shell, like `just local`'s stand-in, which
+    has no boot steps to wait out. Up to `mcp_reload.WAIT_S` on the box.
+    """
+    assert box.endpoint is not None
+    return _wait_for_hermes_at(_resolve_backend(box, backend), box.endpoint)
+
+
+#: How long creation waits for a new agent's Hermes to listen, in all. A first
+#: boot on Fly took under a minute on staging; this is for a slow one.
+HERMES_BOOT_S = 240.0
+
+
+def _wait_for_hermes_at(impl: Backend, endpoint: str) -> tuple[bool | None, str | None]:
+    """`_wait_for_hermes`, for a machine whose row has no endpoint yet.
+
+    **Asked in short steps, until `HERMES_BOOT_S` has passed.** Fly ends a
+    command on a machine after about 30 seconds, so one long wait was cut off
+    on every real first boot, and the agent was made without its rules (seen
+    on staging, 2026-11-20: `deadline_exceeded`). Each ask waits
+    `mcp_reload.ONLY_WAIT_S` on the machine. An ask that fails outright, as one
+    does while the machine is still coming up, is asked again like one that
+    answered "not yet".
+    """
+    deadline = time.monotonic() + HERMES_BOOT_S
+    while True:
+        try:
+            result = impl.exec(endpoint, _mcp_reload_command(only_wait=True))
+        except NotSupported:
+            return None, None
+        except Exception as exc:  # noqa: BLE001 - asked again until the time is up
+            why = str(exc) or type(exc).__name__
+        else:
+            if result.exit_code == 0:
+                return True, None
+            why = (result.stderr or result.stdout or "").strip() or "no output"
+        if time.monotonic() >= deadline:
+            return False, why
+        time.sleep(HERMES_ASK_EVERY_S)
+
+
+#: The pause between two asks. An ask that answered "not yet" has already
+#: waited on the machine; this is for one that failed at once.
+HERMES_ASK_EVERY_S = 2.0
 
 
 def _reload_mcp(
@@ -1994,6 +2494,28 @@ def _write_mcp_config(
     return None
 
 
+def _mcp_config_waits(box: Box, store: FleetStore) -> tuple[str, str] | None:
+    """Why `box`'s MCP config is written later rather than now, or `None` to write it now.
+
+    For a box that isn't terminal. `(waits_for, detail)`: `"created"` for an
+    agent with no machine yet, or one whose first boot `create_box` is still
+    waiting out (`_BOOTING`), which `create_box` writes once Hermes listens;
+    and `"woken"` for one that is asleep, paused or in a suspended org, which
+    `wake_box` writes when it is next addressed. None of them is touched now:
+    there is nothing to write to, its boot is editing the same file, or
+    writing would start a machine that is meant to be down.
+    """
+    if not box.endpoint or box.id in _BOOTING:
+        return "created", f"{box.name} is still being created: its config is written when it is up"
+    try:
+        _refuse_held(store, box)
+    except ProvisionError as exc:
+        return "woken", f"{exc} Its config is written when it next wakes."
+    if box.status != "running":
+        return "woken", f"{box.name} is asleep: its config is written when it next wakes"
+    return None
+
+
 def set_mcp_grants(
     box_id: str,
     grants: tuple[Any, ...],
@@ -2023,21 +2545,32 @@ def set_mcp_grants(
     once, waking it if need be: a rule held back would be a rule not followed,
     while a grant held back is still enforced.
 
+    **Nor is anything lost for an agent that can't be written yet** (FLOTTA-252).
+    One still being created has no machine, or a machine in its first boot,
+    and one that is paused or in a suspended org must not be started: each is
+    `pending` too, and `waits_for` says for what (`_mcp_config_waits`). These
+    were once recorded and never written, by anything, until somebody saved
+    the same grants a second time. What still answers `written: false` with
+    nothing pending is a box that is gone, and a write to a running agent that
+    failed: that one is not tried again until the grants are next saved.
+
+    **Decided under the lock, from the box as it is then.** `create_box` looks
+    for the pending mark under the same lock, so a save that saw an agent still
+    being created has left its mark by the time creation looks, and one that
+    comes after creation has finished finds the machine and writes to it.
+
     A running agent is then asked to reload (`reload.mcp`), so a server taken
     away leaves its open conversations too; see `_reload_mcp`.
     """
+    hermes_only(store, box_id, "MCP grants")
     import json
 
     box = store.get_box(box_id) or store.get_box_by_name(box_id)
     if box is None:
         raise ProvisionError(f"no box {box_id!r}")
     base, token = _mcp_token(box, store)
-    detail = None
-    try:
-        _writable_box(box.id, store)
-    except ProvisionError as exc:
-        detail = str(exc)
-    pending = False
+    detail: str | None = None
+    waits_for: str | None = None
     with _rules_lock(box.id):
         previous = [g.server for g in store.box_mcp_grants(box.id)]
         store.set_box_mcp_grants(
@@ -2051,23 +2584,25 @@ def set_mcp_grants(
             "box", box.id, MCP_GRANTS_CHANGED, {"servers": [g.to_json() for g in grants], "by": by}
         )
         now = store.get_box(box.id) or box
-        if detail is None and now.status != "running":
+        waits = None if is_terminal("box", now.status) else _mcp_config_waits(now, store)
+        if waits is not None:
             store.mark_mcp_config_pending(box.id)
-            pending = True
-            detail = f"{box.name} is asleep: its config is written when it next wakes"
-        elif detail is None:
-            detail = _write_mcp_config(
-                now, store, backend, base=base, token=token, previous=previous
-            )
+            waits_for, detail = waits
+        else:
+            if is_terminal("box", now.status):
+                detail = f"box {now.name} is {now.status}, so there is no volume to write to"
+            else:
+                detail = _write_mcp_config(
+                    now, store, backend, base=base, token=token, previous=previous
+                )
             if detail is not None:
                 store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
-        else:
-            store.add_event("box", box.id, "mcp_grants_write_failed", {"detail": detail[:500]})
-    reloaded = _reload_mcp(box, store, backend) if detail is None else None
+    reloaded = _reload_mcp(now, store, backend) if detail is None else None
     return {
         **mcp_grants_of(box.id, store=store),
         "written": detail is None,
-        "pending": pending,
+        "pending": waits_for is not None,
+        "waits_for": waits_for,
         "detail": detail,
         "reloaded": reloaded,
     }
@@ -2086,13 +2621,15 @@ def rewrite_mcp_config(
     `None` when it wasn't written now: an agent that isn't running keeps its
     pending mark and is written when it next wakes (`wake_box`). True when
     written (and the agent asked to reload), False when the write failed, which
-    leaves it pending. For a catalogue change and for a wake.
+    leaves it pending. For a catalogue change, a wake, and the end of creation.
 
     `just_started` when the wake started the machine: Hermes may still be booting,
     so the reload waits for it to listen instead of recording a failure.
     """
     box = store.get_box(box_id)
-    if box is None or is_terminal("box", box.status):
+    if box is None or is_terminal("box", box.status) or box.runtime == "custom":
+        # A custom agent has no Hermes config to write (M17.1), and is never
+        # granted MCP servers; nothing to do, now or on wake.
         return None
     try:
         base, token = _mcp_token(box, store)
@@ -2149,6 +2686,59 @@ def mcp_grants_of(box_id: str, *, store: FleetStore) -> dict[str, Any]:
     }
 
 
+def set_custom_image(
+    box_id: str,
+    image: str,
+    *,
+    store: FleetStore,
+    backend: Backend | None = None,
+) -> dict[str, Any]:
+    """Move a custom agent onto another image of the agency's, keeping its disk (M17.1).
+
+    The row first, then the machine, because `upgrade_box` refuses any image
+    the row does not name; if the machine cannot be moved the row goes back,
+    so it never names an image nothing runs. The timeline's `reimaged` event
+    says what it ran before, which is the history and the way back.
+    """
+    from flotta.store import validate_image_ref
+
+    box = _require_box(store, box_id)
+    if box.runtime != "custom":
+        raise CustomRuntimeRefused(
+            f"{box.name} runs Hermes on the fleet's image; its image moves with the fleet's"
+        )
+    store.require_custom_images(box.org)
+    new = validate_image_ref(image)
+    # One move at a time per agent: two overlapping would each roll the row
+    # back over the other's image.
+    with _image_lock(box.id):
+        previous = _require_box(store, box.id).image
+        store.set_box_image(box.id, new)
+        try:
+            return upgrade_box(
+                box.id, store=store, image=new, backend=backend, reason="image", previous=previous
+            )
+        except Exception:
+            # Back only if the machine is not on the new image after all: a
+            # timeout can follow a move the substrate did make.
+            impl = _resolve_backend(box, backend)
+            running = None
+            with contextlib.suppress(Exception):
+                running = _peek_image(impl, box.endpoint or box.id)
+            if previous and not (running and _same_image(running, new)):
+                store.set_box_image(box.id, previous)
+            raise
+
+
+_IMAGE_LOCKS: dict[str, threading.Lock] = {}
+_IMAGE_LOCKS_GUARD = threading.Lock()
+
+
+def _image_lock(box_id: str) -> threading.Lock:
+    with _IMAGE_LOCKS_GUARD:
+        return _IMAGE_LOCKS.setdefault(box_id, threading.Lock())
+
+
 def upgrade_box(
     box_id: str,
     *,
@@ -2156,8 +2746,13 @@ def upgrade_box(
     image: str | None = None,
     backend: Backend | None = None,
     reason: str = "requested",
+    previous: str | None = None,
 ) -> dict[str, Any]:
     """Move a live agent onto a new image, keeping everything it remembers.
+
+    `previous` is what it ran before when the substrate cannot say (a local
+    custom agent, whose "image" is a directory): the timeline's `from` is the
+    way back, so it is never left empty when the row knew it (FLOTTA-254).
 
     The gap this closes: `HERMES_REF` pins what a box image is built from, and
     `just hermes-bump` moves it — but a machine runs the image it was created
@@ -2191,7 +2786,21 @@ def upgrade_box(
             "thread building it; wait for it to settle."
         )
 
-    target_image = (image or "").strip() or _fleet_image()
+    if box.runtime == "custom":
+        # **Never onto the fleet's image** (M17.1). That is Hermes, and every
+        # path that re-images (an upgrade with no image named, the fleet's
+        # Hermes update) would otherwise turn the agency's own agent into one
+        # the rest of Flotta still treats as speaking the box contract. Its
+        # image changes only through `set_custom_image`, which writes the row
+        # first; here the target must be what the row says.
+        target_image = (image or "").strip() or (box.image or "")
+        if not box.image or not _same_image(target_image, box.image):
+            raise CustomRuntimeRefused(
+                f"{box.name} runs its own image ({box.image}); change it with "
+                "PUT /api/boxes/{id}/image, never by an upgrade"
+            )
+    else:
+        target_image = (image or "").strip() or _fleet_image()
     if not target_image:
         raise ProvisionError(
             "no image to upgrade to. Pass one explicitly or set $FLOTTA_FLY_IMAGE — "
@@ -2201,8 +2810,12 @@ def upgrade_box(
 
     impl = _resolve_backend(box, backend)
     target = box.endpoint or box_id
-    before = _peek_image(impl, target)
-    if before and _same_image(before, target_image):
+    # Only the substrate's answer says it is already there: the row's says what
+    # it was last recorded on, which an edited local directory, or a move that
+    # landed after the row was rolled back, makes untrue.
+    peeked = _peek_image(impl, target)
+    before = peeked or previous
+    if peeked and _same_image(peeked, target_image):
         return {
             "box_id": box_id,
             "image": target_image,
@@ -2228,10 +2841,14 @@ def upgrade_box(
         # back. Without it an operator who wants to undo this has to go and ask
         # the substrate what the box used to run, which is exactly what they
         # cannot do while it is broken.
-        failure = (
-            f"could not upgrade box {box_id}: {exc}. It still runs "
-            f"{before or '(unknown)'}; nothing was changed."
+        ran = (
+            f"It still runs {peeked}"
+            if peeked
+            else f"It was last recorded on {before}"
+            if before
+            else "What it runs is not known"
         )
+        failure = f"could not upgrade box {box_id}: {exc}. {ran}; nothing was changed."
         # Recorded, not only raised. A caller that is still holding the
         # exception can read it; a caller that is not — the app, which asked
         # for this in the background and went back to polling — has nowhere
@@ -2334,7 +2951,11 @@ def rotate_identity(
     rewritten = {"FLOTTA_BOX_TOKEN": token}
     fleet_password = (layered(store).get("FLOTTA_BOX_PASSWORD") or "").strip()
     if fleet_password:
-        rewritten["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = box_password(fleet_password, box.id)
+        # The door's secret for this agent, under the name its runtime reads.
+        secret_name = (
+            BOX_SECRET_ENV if box.runtime == "custom" else "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"
+        )
+        rewritten[secret_name] = box_password(fleet_password, box.id)
 
     impl = _resolve_backend(box, backend)
     try:
@@ -2357,7 +2978,9 @@ def rotate_identity(
         "scopes": sorted(claims.scopes),
         # Whether the box now holds its own password rather than the fleet's:
         # the timeline is how to tell which agents a FLOTTA-96 rollout reached.
-        "own_password": "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" in rewritten,
+        "own_password": bool(
+            {"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", BOX_SECRET_ENV} & set(rewritten)
+        ),
     }
     store.add_event(
         "box",
@@ -2636,6 +3259,7 @@ def join_gateway(
     rest. `leave_gateway` is the way back. Synchronous: the control plane runs it on
     a thread, as `set_model`.
     """
+    hermes_only(store, box_id, "moving it on or off the gateway")
     from flotta.auth import AuthError
     from flotta.settings import layered
 
@@ -2683,6 +3307,7 @@ def leave_gateway(
     Needs the control plane to still hold the key, so it has to outlive the last
     agent's move.
     """
+    hermes_only(store, box_id, "moving it on or off the gateway")
     from flotta.inference import provider_secrets
     from flotta.settings import layered
 
@@ -2906,6 +3531,7 @@ def set_model(
 
     Synchronous: the control plane runs it on a thread (FLOTTA-99).
     """
+    hermes_only(store, box_id, "choosing its model")
     box, wanted, effective = _model_plan(box_id, model, store)
     default = fleet_model(store)
 
@@ -3304,6 +3930,7 @@ def set_screen(
     **Substrate first, row second**, as `resize_box` is: the row says the agent
     has a screen only once its machine has been told.
     """
+    hermes_only(store, box_id, "a screen")
     box, resize_to, current = _screen_plan(box_id, screen, store, backend)
     impl = _resolve_backend(box, backend)
     env = {SCREEN_ENV_KEY: "1" if screen else "0"}
@@ -3725,13 +4352,15 @@ def _refuse_held(store: FleetStore, box: Box) -> None:
     if box.status == "paused":
         raise BoxPaused(f"{box.name} is paused by budget, so it was not woken.")
     org = store.get_org(box.org)
-    if org is not None and org.status == "suspended":
-        raise OrgSuspended(suspended_wake_message(box, org.id))
+    if org is not None and org.held:
+        raise OrgSuspended(suspended_wake_message(box, org))
 
 
-def suspended_wake_message(box: Box, org_id: str) -> str:
-    """What the door says when it closes a suspended org's conversation."""
-    return f"{box.name} was not woken: org {org_id!r} is suspended. {SUSPENDED_HINT.capitalize()}."
+def suspended_wake_message(box: Box, org: Org) -> str:
+    """What the door says when it closes a suspended or closed org's conversation."""
+    if org.status == "closed":
+        return f"{box.name} was not woken: org {org.id!r} is closed. {CLOSED_HINT.capitalize()}."
+    return f"{box.name} was not woken: org {org.id!r} is suspended. {SUSPENDED_HINT.capitalize()}."
 
 
 def wake_box(
@@ -3806,7 +4435,9 @@ def wake_box(
     # MCP config held back while it slept (FLOTTA-125: `set_mcp_grants`), written
     # now it is up, before whoever addressed it reaches it. Best effort: the
     # grants are in force at the gateway either way, and a failure stays pending.
-    if store.mcp_config_pending(box_id):
+    # Not for an agent whose creation is still waiting out its first boot:
+    # `create_box` writes that one, once the boot has stopped editing the file.
+    if box_id not in _BOOTING and store.mcp_config_pending(box_id):
         try:
             rewrite_mcp_config(
                 box_id,
@@ -4115,11 +4746,39 @@ def teardown_box(
         #
         # Releasing here means the rule applies to rows that predate it, which
         # is the difference between a fix and a fix for new boxes only.
+        #
+        # But only once nothing of it remains (FLOTTA-30): this is the recovery
+        # for a failed provision, whose machine may have survived it. So it
+        # removes what is left, by name, then asks. By name even when the row
+        # has an endpoint: `remove_leftover` refuses a fleet's shared app, and
+        # a raw `destroy` of an old row's `fly://<shared>/m` would take the
+        # shared app with every live agent in it. Only a backend that cannot
+        # remove by name falls back to destroying the endpoint.
+        impl = _backend_or_none(box, backend)
+        retried: dict[str, Any] = {}
+        if impl is not None and not box.name.endswith(f"@{box.id}"):
+            remove = getattr(impl, "remove_leftover", None)
+            try:
+                if remove is not None:
+                    if _name_is_free(impl, box, {}) is False:
+                        remove(box.name)
+                elif box.endpoint:
+                    impl.destroy(box.endpoint)
+            except Exception as exc:  # noqa: BLE001 - recorded; the name stays held
+                retried["destroy_error"] = f"{type(exc).__name__}: {exc}"
+        free = not retried and (
+            box.name.endswith(f"@{box.id}") or _name_is_free(impl, box, retried)
+        )
         return {
             "box_id": box_id,
             "status": "torn_down",
             "already_torn_down": True,
-            "name_released": store.release_name(box_id),
+            "name_released": store.release_name(box_id) if free else None,
+            **(
+                {"name_held": retried.get("name_held") or retried["destroy_error"]}
+                if not free
+                else {}
+            ),
         }
 
     # Its schedules stop first (FLOTTA-148), before the task scan below and
@@ -4134,6 +4793,7 @@ def teardown_box(
     # the tests) drive destruction without a backend.
     cancelled = False
     cancel_error: str | None = None
+    impl: Backend | None = None
     if canceller is not None:
         if box.endpoint is not None:
             try:
@@ -4143,7 +4803,8 @@ def teardown_box(
                 cancel_error = f"{type(exc).__name__}: {exc}"
     elif box.endpoint:
         try:
-            _resolve_backend(box, backend).destroy(box.endpoint)
+            impl = _resolve_backend(box, backend)
+            impl.destroy(box.endpoint)
             cancelled = True
         except (BackendError, ProvisionError) as exc:
             # Best effort, same as a Modal cancel: a machine that is already
@@ -4188,7 +4849,21 @@ def teardown_box(
     # The agent is gone; its *address* should not be held hostage by the row
     # that records it. Renaming frees `eng-a` for a fresh agent while leaving
     # the history intact — events are keyed by id, not by name.
-    released = store.release_name(box_id)
+    #
+    # Unless destroying it failed (FLOTTA-30): a fresh `eng-a` would adopt the
+    # machine left behind, and its volume with the old agent's memory. A box
+    # that never had a machine has nothing to leave.
+    #
+    # And a destroy that returned is not proof: Fly's reads a `flyctl` that
+    # could not list apps as "already gone" and returns quietly. So a backend
+    # that can say whether anything remains is asked before the name goes.
+    held_why = f"its machine could not be destroyed: {cancel_error}"
+    held = cancel_error is not None and box.endpoint is not None
+    if not held and cancelled and impl is not None and hasattr(impl, "leftover"):
+        asked: dict[str, Any] = {}
+        if not _name_is_free(impl, box, asked):
+            held, held_why = True, asked["name_held"]
+    released = None if held else store.release_name(box_id)
 
     return {
         "box_id": box_id,
@@ -4198,6 +4873,7 @@ def teardown_box(
         "cancel_error": cancel_error,
         "failed_tasks": failed_tasks,
         "name_released": released,
+        **({"name_held": held_why} if held else {}),
     }
 
 
@@ -4672,6 +5348,112 @@ def sleep_suspended_orgs(
             except (ProvisionError, BackendError) as exc:
                 _log.warning("could not put %s of suspended %s to sleep: %s", box.name, org.id, exc)
                 outcomes.append({"box_id": box.id, "error": str(exc)})
+    return outcomes
+
+
+def close_org_agents(
+    store: FleetStore,
+    *,
+    org_id: str | None = None,
+    backend: Backend | None = None,
+) -> list[dict[str, Any]]:
+    """Destroy every agent of a closed org, machine and volume (FLOTTA-224).
+
+    `org_id` for the org just closed (the close route runs it after
+    answering); without it, every closed org, from the reconcile loop, which is
+    how a teardown the substrate refused comes round again. Closing promised
+    the agents go at once: their memory is the agency's data too.
+    """
+    if org_id is not None:
+        org = store.get_org(org_id)
+        orgs = [org] if org is not None and org.status == "closed" else []
+    else:
+        orgs = store.list_orgs(status="closed")
+    outcomes: list[dict[str, Any]] = []
+    for org in orgs:
+        for box in store.list_boxes_in(org.id):
+            if box.status == "torn_down":
+                continue
+            if box.status == "provisioning":
+                # No machine to name yet. It either gets one, destroyed next
+                # sweep, or the stranded-provision sweep finds it by name and
+                # destroys it; the purge waits either way.
+                outcomes.append({"box_id": box.id, "waiting": "provisioning"})
+                continue
+            try:
+                # The machine first, and only then the row. `teardown_box` is
+                # best effort about the machine and closes the row whatever
+                # happens, which here would let the purge delete the only
+                # record of a machine still holding the agent's memory (the
+                # review of #258). `destroy` is idempotent: one already gone
+                # answers at once.
+                if box.endpoint:
+                    _resolve_backend(box, backend).destroy(box.endpoint)
+                teardown_box(box.id, store=store, reason="org_closed", backend=backend)
+                outcomes.append({"box_id": box.id, "destroyed": True})
+            except InvalidTransitionError:
+                # The close route's teardown and the loop's reached it together;
+                # the other one closed the row, after the same idempotent destroy.
+                outcomes.append({"box_id": box.id, "destroyed": True})
+            except (ProvisionError, BackendError) as exc:
+                _log.warning("could not destroy %s of closed %s: %s", box.name, org.id, exc)
+                outcomes.append({"box_id": box.id, "error": str(exc)})
+    return outcomes
+
+
+#: How long a closed org's rows are kept before `purge_closed_orgs` deletes them
+#: (FLOTTA-224), unless the fleet setting says otherwise.
+DEFAULT_CLOSED_RETENTION_DAYS = 30.0
+
+
+def resolve_closed_retention_days(env: Mapping[str, str] | None) -> float:
+    """`FLOTTA_CLOSED_RETENTION_DAYS`, or 30. Never negative: a typo deletes nothing early."""
+    raw = ((env or {}).get("FLOTTA_CLOSED_RETENTION_DAYS") or "").strip()
+    try:
+        days = float(raw) if raw else DEFAULT_CLOSED_RETENTION_DAYS
+    except ValueError:
+        return DEFAULT_CLOSED_RETENTION_DAYS
+    return days if math.isfinite(days) and days >= 0 else DEFAULT_CLOSED_RETENTION_DAYS
+
+
+def purge_after(store: FleetStore, org: Org) -> str | None:
+    """When a closed org's rows are deleted, as an ISO time; `None` if it isn't closed."""
+    if org.status != "closed" or org.closed_at is None:
+        return None
+    days = resolve_closed_retention_days(_settings_env(store))
+    return (datetime.fromisoformat(org.closed_at) + timedelta(days=days)).isoformat()
+
+
+def purge_closed_orgs(
+    store: FleetStore,
+    *,
+    backend: Backend | None = None,
+    now: datetime | None = None,
+    days: float | None = None,
+) -> list[dict[str, Any]]:
+    """The reconcile loop's deletions (FLOTTA-224).
+
+    Every sweep: expired sessions and sign-in links go, and a closed org's
+    agents are destroyed if an earlier attempt failed. A closed org past its
+    retention period then has every row deleted (`FleetStore.purge_org`), once
+    none of its agents is left; until then it waits for the next sweep. What is
+    logged is the org's id and row counts, never a name or an address.
+    """
+    retention = days if days is not None else resolve_closed_retention_days(_settings_env(store))
+    outcomes: list[dict[str, Any]] = []
+    expired = store.purge_expired_access(now=now)
+    if expired:
+        outcomes.append({"expired": expired})
+    outcomes.extend(close_org_agents(store, backend=backend))
+    for org in store.orgs_to_purge(days=retention, now=now):
+        try:
+            counts = store.purge_org(org.id)
+        except InvalidTransitionError as exc:
+            _log.warning("not purging closed %s yet: %s", org.id, exc)
+            outcomes.append({"org": org.id, "waiting": str(exc)})
+            continue
+        _log.info("purged closed org %s: %s", org.id, counts)
+        outcomes.append({"org": org.id, "purged": counts})
     return outcomes
 
 

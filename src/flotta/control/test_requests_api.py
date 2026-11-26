@@ -689,3 +689,46 @@ def test_in_one_turn_each_request_has_the_changes_made_after_it(api, fleet, jev)
         store.finish_run(turn.id, "done", output="ok")
     seen = api.get("/api/requests", headers=_as_client()).json()["requests"]
     assert {r["turn_status"] for r in seen} == {"done"}
+
+
+def _notices(fleet):
+    with FleetStore(fleet) as store:
+        box = store.get_box_by_name("eng-a")
+        return [r for r in store.list_runs(org=box.org, box=box.id) if r.trigger_kind == "notice"]
+
+
+@pytest.mark.parametrize("approve", [True, False])
+def test_the_decision_is_said_in_the_conversation_it_was_asked_in(api, fleet, jev, approve):
+    """FLOTTA-273: not left for the person's next message to carry."""
+    jev.verdict = _verdict((0, 0, 0.1, 0.8, 0.1))
+    with FleetStore(fleet) as store:
+        turn = store.open_chat_run(
+            _id(fleet),
+            "Can you rebuild it?",
+            input={"session_id": "live-9", "stored_session_id": "s-42", "by": "u", "client": True},
+            started_at=datetime.now(UTC),
+        )
+    filed = _file(api, fleet, title="Rebuild the dashboard").json()["request"]
+    with FleetStore(fleet) as store:
+        store.finish_chat_run(turn.id, turn.box_id, "done")
+    decided = api.post(
+        f"/api/requests/{filed['id']}/decision",
+        json={"approve": approve, "note": "Keep the old URLs"},
+        headers=_as(SCOPE_FLEET_WRITE),
+    ).json()["request"]
+
+    [notice] = _notices(fleet)
+    assert notice.input["session_id"] == "s-42"
+    said = "approved" if approve else "declined"
+    assert f'The agency {said} your request "Rebuild the dashboard".' in notice.prompt
+    assert "Keep the old URLs" in notice.prompt
+    if approve:
+        with FleetStore(fleet) as store:
+            [first] = store.queued_runs(limit=10, skip_boxes=[])
+            assert store.get_run(decided["work_run_id"]).status == "pending"
+        assert first.id == notice.id, "the notice goes first, not behind the work"
+
+
+def test_work_started_on_its_own_is_no_news(api, fleet, jev):
+    assert _file(api, fleet).json()["starts"] is True
+    assert _notices(fleet) == []

@@ -212,14 +212,20 @@ def apply(home: Path, env: dict[str, str] | None = None) -> str:
 
     Never raises: an agent that cannot tune its screen must still boot.
     """
+    from flotta.box import config_file
+
     try:
-        return _apply(home, env)
+        # Under the lock the control plane's writer takes (`config_file`).
+        with config_file.locked(home):
+            return _apply(home, env)
     except Exception as exc:  # noqa: BLE001 - the boot must go on
         return f"screen left alone: {type(exc).__name__}: {exc}"
 
 
 def _apply(home: Path, env: dict[str, str] | None) -> str:
     import yaml
+
+    from flotta.box import config_file
 
     on = wanted(env)
     path = home / "config.yaml"
@@ -248,7 +254,7 @@ def _apply(home: Path, env: dict[str, str] | None) -> str:
         if new_marker != marker:
             marker_path.write_text(json.dumps(new_marker, indent=2) + "\n", encoding="utf-8")
         if changed:
-            path.write_text(yaml.safe_dump(settled, sort_keys=False), encoding="utf-8")
+            config_file.save(path, settled)
     except OSError as exc:
         return f"screen {state}, left alone: could not write: {exc}"
     detail = "; ".join(notes) if notes else "already so"

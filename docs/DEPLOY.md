@@ -298,11 +298,94 @@ That round trip is the entire thesis of the project in one command.
 
 ---
 
+## The fleet API as MCP tools
+
+`POST /mcp` on the control plane offers the fleet API to an assistant acting for
+a signed-in person (FLOTTA-250, `control/fleet_mcp.py`). `just mcp-tools` lists
+the tools and the route each one calls.
+
+- **A tool is a route, called as the caller.** The request's own `Authorization`
+  (a session, or a token) is passed to the route, in-process. A tool can do what
+  that person's click could, and every tenancy and role check is the route's.
+  Whose account it reads is the caller's agency, never an argument.
+- **An answer is at most 60,000 characters.** A caller that can read less says
+  so in the call (`params._meta["flotta.dev/maxChars"]`), and the answer is
+  fitted to that here, where it is known which end matters. A client's record
+  too long to read keeps its latest entries, whole, with a note first saying
+  how many were left out. Any other answer that is too long is refused with
+  what to ask for instead.
+- **A day that ends a window is counted whole.** A route reads a bare day as
+  its midnight, so `to=2026-11-21` stops before the 21st begins. A tool that
+  takes the end of a window (spend, a client's record) sends the day after
+  instead, or nothing when the day named is today or later, so the window ends
+  now. A moment (`2026-11-21T12:00:00Z`) goes as given. The routes themselves
+  are unchanged.
+- **Most tools read. Four change the account** and say so (`readOnlyHint` is
+  false): add a client, set a budget, add a schedule, put an agent to sleep.
+  Each is the route's own request, so the route's rules hold: a builder adds
+  no client, and nobody changes another agency. A front end shows the person
+  exactly what one will do and waits for their yes before calling it; the
+  Architect does. Never a tool: destroying an agent, minting a token or a key,
+  a secret, a webhook (its answer is a secret), billing, anything the operator
+  alone may do.
+- **Streamable HTTP, plain JSON, no stream.** `initialize`, `ping`,
+  `tools/list` and `tools/call`; a `GET` is a 405. A request naming an origin
+  other than the web app's is a 403.
+- **A read-only session cannot use it** (the operator viewing an agency):
+  every non-GET is refused for one, and this is a POST.
+
+What a tool answers is data. Agents and clients write much of it, so whatever
+reads it must report it and never follow instructions in it.
+
+Two reads exist because an assistant needed them and no route gave a person
+either: `GET /api/runs`, the caller's agency's runs in one list across its
+clients (`?since=`, `?status=`, as an agent's list takes them), and
+`GET /api/working`, each agent with a run under way and a line on what it is
+about (`?box=` for one). A conversation's turn is listed as one, with nothing of
+what was said. Both keep someone confined to a client to that client, and a
+client's viewer to what they may read of a run.
+
 ## Creating an agent is asynchronous
 
 `POST /api/boxes` answers **202** with the box id and `status: provisioning`,
 then provisions on a background thread. Poll `GET /api/boxes/{id}` until it
 reaches `running`.
+
+**It may carry the agent's rules** (FLOTTA-251): `rules`, in the shape
+`PUT /api/boxes/{id}/rules` takes, refused with `422` before anything is made
+if they cannot be kept. The `202` then says `"rules": "writing"`, which an
+older Flotta that ignored the field does not. They are written on the machine
+once Hermes listens and before the row says `running`, so nobody reaches the
+agent without them; an agent made with rules is therefore `provisioning` a
+little longer. A write that fails makes an agent with no rules and a
+`rules_write_failed` event on its timeline: `GET /api/boxes/{id}/rules` has
+them only if they landed. A custom agent takes none.
+
+**And the name of the template it was made from** (FLOTTA-249): `template`, a
+short slug, kept on the box and answered with it. The control plane does not
+know what a template sets; that is the caller's.
+
+**What the operator changed in a template is kept here too** (FLOTTA-269), so a
+front end's templates can be changed with no release of the front end. The
+templates stay the front end's; the control plane keeps, per template name,
+only the parts the operator changed:
+
+| Route | Who | What |
+| --- | --- | --- |
+| `GET /api/agent-templates` | whoever makes agents (`fleet:write` or `org:admin`) | `{"templates": [{"id", "changes", "updated_at"}]}`, one per changed template |
+| `PUT /api/agent-templates/{id}` | the operator | `{"changes": {...}}` replaces what was kept; `{}` clears it |
+| `DELETE /api/agent-templates/{id}` | the operator | the template is the front end's again |
+| `GET /api/agent-templates/public` | anyone, no token | whether each is offered and what it sets up, with none of the operator's words |
+
+`changes` may hold any of `offered`, `name`, `description`, `instructions`,
+`screen`, `repositories`, `pull_requests`, `starts_alone`, `tools`, `schedule`
+and `rules`. A part left out is the front end's own, and `null` for
+`pull_requests`, `starts_alone`, `schedule` or `rules` says the operator took
+it away. Each part is held to the limit of the route that later applies it
+(instructions to what `POST /api/boxes` takes, rules to an agent's rules, a
+schedule to a trigger's, a tool to one in the library), so a saved template
+can make an agent. A template's name and what it is called are not changed
+here. Agents already made are not touched.
 
 It used to hold the request open for the whole thing — an app, a volume, a
 machine and a boot — and the host's proxy (Railway's, then) gave up first:
@@ -1170,7 +1253,23 @@ a removed one is refused anyway. A running agent is then asked to reload its MCP
 sleeping agent isn't woken for a grant or a catalogue change**: the grant is in force at
 the gateway at once (`pending: true` in the answer), and its config is written by
 `wake_box` when something next addresses it, before it is reached. That wake's reload
-waits for Hermes to finish booting (up to 120 s), so it isn't recorded as a failure. **A catalogue change
+waits for Hermes to finish booting (up to 120 s), so it isn't recorded as a failure.
+**Nor is a grant lost for an agent that can't be written yet** (FLOTTA-252): `waits_for`
+in the answer says what a pending config waits for. `created` is an agent still being
+created; its config is written when creation ends, without another save. `woken` is one
+that is asleep, paused by a budget or in a suspended org, written at its next wake. What
+still answers `written: false` with nothing pending is an agent that is gone, and a write
+to a running agent that failed, which waits for the next save. **A new agent's config is
+not written until Hermes listens**, up to 120 s after its machine starts: the image's boot
+steps (approvals, skills, the model, the screen) edit the same `config.yaml`, and on a
+first boot every one of them saves. Since FLOTTA-253 they take the lock the control
+plane's writer takes and save by rename (`flotta.box.config_file`), so the two take turns;
+on an image from before it they did neither, and a write meanwhile could be put back
+without its servers, or save over a boot step's own. An agent has the lock once it is on
+an image built since, which for one already running means `flotta upgrade`. Creation
+waits for the steps either way, writes, and asks Hermes to reload
+(`mcp_config_rewritten` with the reason `created`); a save or a conversation in that time
+waits with it. If Hermes never listens the config stays pending for a wake. **A catalogue change
 reaches every agent granted the server:** its config is written again (the entry gone, or
 new tools) and it is reloaded, its grant kept and shown as going away. **A connection is
 only ever used for the address it was made for**: an entry whose URL changes leaves its
@@ -1206,6 +1305,58 @@ Agents learn to file from the `flotta-requests` skill in the box image, so an
 agent needs the image from this change before it files anything.
 
 ---
+
+## Step 12 — The Architect's model calls (FLOTTA-250)
+
+The Architect is an assistant for an agency's own people, in a front end: it
+answers about the account by calling the fleet API's tools (`POST /mcp`, above).
+Its loop runs in the front end's server. What it needs from the control plane is
+a model to think with: `POST /api/architect/completions`, an OpenAI chat
+completion, streamed or whole, called with the signed-in person's session.
+
+**The fleet pays for these calls, and they need a key of their own.** The model
+gateway holds the fleet's provider key and meters agents, but only agents'
+machines can reach it. So the control plane makes the Architect's calls itself:
+
+```bash
+FLOTTA_ARCHITECT_API_KEY=sk-or-...   # on the control plane; calls go to $FLOTTA_MODEL_BASE_URL
+```
+
+Make it a separate key at the provider and give it a monthly limit there. That
+limit is the fleet's whole Architect bill at most, whatever this code believes.
+Unset, the route answers 503 and nothing else changes.
+
+Two fleet settings, in HQ or with `PUT /api/settings`:
+
+| Setting | What | Default |
+| --- | --- | --- |
+| `FLOTTA_ARCHITECT_MODEL` | the model that answers; it must call tools well | the model for new agents |
+| `FLOTTA_ARCHITECT_MONTHLY_EUR` | what each agency may use in a calendar month (UTC) | 10 |
+
+- **The caller does not choose the model**, and an answer is at most 4,096 tokens.
+- **The allowance is checked before every call and fails closed.** Used up is a
+  402 with `code: architect_allowance_used` and where the month stands. So is
+  anything that would leave a call uncounted: no exchange rate, no price for the
+  model on an endpoint that reports no cost, a call this month nobody could
+  price, or a store that cannot be read. Calls already in flight are not
+  counted, so an agency can overshoot by what those cost.
+- **It is not in `usage`.** Each call is a row of `architect_usage` (org, person,
+  tokens, cost), so no client's budget and no agency's invoice ever includes it.
+- **Who may call:** a signed-in owner or builder of an active agency. Not a
+  client's people, not a token, and not while viewing an agency as its owner.
+- `GET /api/architect/allowance` tells an agency where its month stands, and
+  `GET /api/architect/spend` tells the operator what every agency's has cost,
+  and whether it can answer at all (`ready`, and `has_key`: never the key).
+
+**Each person's chats are kept here too**, so a front end needs no database of
+its own: `GET` and `POST /api/architect/chats`, `GET`, `PATCH` and `DELETE
+/api/architect/chats/{id}`, and `POST /api/architect/chats/{id}/messages` to add
+a turn. A message is `{"role": "user" | "assistant" | "tool", "content": <any
+JSON>}`, kept as given and never read. A chat is its person's alone: no
+colleague, owner or operator reads it, and a session viewing an agency keeps and
+reads none. It is deleted when its person is removed from the agency, and when
+the agency is closed and purged. A chat holds at most 500 messages and a person
+at most 500 chats.
 
 ## What is not automated yet
 

@@ -131,8 +131,12 @@ class FakeBackend:
         reimage_fails=False,
         image=None,
         exec_result=None,
+        left=False,
     ):
         self.calls: list[str] = []
+        #: What `leftover` answers (FLOTTA-30): False, nothing of the box
+        #: remains; True, something does; "unknown", the substrate can't say.
+        self.left = left
         self.can_suspend = can_suspend
         self.can_reimage = can_reimage
         self.reimage_fails = reimage_fails
@@ -196,6 +200,19 @@ class FakeBackend:
     def destroy(self, box_id):
         self.calls.append("destroy")
         self.machine_state = "gone"
+        if self.left is True:
+            self.left = False
+
+    def leftover(self, name):
+        if self.left == "unknown":
+            raise BackendError("the substrate could not be asked")
+        return self.left
+
+    def remove_leftover(self, name):
+        self.calls.append("remove_leftover")
+        if self.left == "unknown":
+            raise BackendError("the substrate could not be asked")
+        self.left = False
 
     def state(self, box_id):
         return self.machine_state
@@ -4426,3 +4443,200 @@ def test_refreshing_a_scope_carries_on_past_a_box_the_substrate_refuses(store):
         assert [e.type for e in store.get_events("box", box.id) if "author" in e.type] == [
             "commit_author_refresh_failed"
         ]
+
+
+# -- FLOTTA-30: a failed provision's name, freed only when nothing remains ----
+
+
+class _Failing(FakeBackend):
+    def create(self, spec):
+        raise BackendError("fly quota exceeded")
+
+
+def test_a_create_that_left_nothing_frees_its_name(store):
+    """The person can try again with the name they wanted."""
+    with pytest.raises(ProvisionError, match="is free to use again"):
+        create_box("eng-f", store=store, backend=_Failing(left=False))
+    retry = store.create_box("eng-f")
+    assert retry.status == "provisioning"
+
+
+@pytest.mark.parametrize("left", [True, "unknown"], ids=["remains", "cannot-tell"])
+def test_a_create_that_may_have_left_a_machine_keeps_its_name(store, left):
+    """A freed name would hand the next agent the machine and its memory."""
+    with pytest.raises(ProvisionError, match=r"stays held .*flotta kill"):
+        create_box("eng-f", store=store, backend=_Failing(left=left))
+    box = store.get_box_by_name("eng-f")
+    assert box.status == "torn_down"
+    assert "name_held" in store.get_events("box", box.id)[-1].payload
+
+
+def test_a_backend_that_cannot_say_keeps_the_name(store):
+    """No `leftover` at all is not "nothing remains"."""
+
+    class Mute(_Failing):
+        leftover = None
+
+    with pytest.raises(ProvisionError, match="stays held"):
+        create_box("eng-f", store=store, backend=Mute())
+    assert store.get_box_by_name("eng-f").status == "torn_down"
+
+
+def test_the_refusal_names_the_holder_and_the_recovery(store):
+    """Not "already exists" about an agent the fleet list doesn't show."""
+    from flotta.store import DuplicateBoxError
+
+    with pytest.raises(ProvisionError):
+        create_box("eng-f", store=store, backend=_Failing(left=True))
+    held = store.get_box_by_name("eng-f")
+    with pytest.raises(DuplicateBoxError, match=rf"held by agent {held.id}.*flotta kill {held.id}"):
+        store.create_box("eng-f")
+
+
+def test_a_live_holder_is_still_plainly_a_duplicate(store):
+    from flotta.store import DuplicateBoxError
+
+    store.create_box("eng-f")
+    with pytest.raises(DuplicateBoxError, match="already exists"):
+        store.create_box("eng-f")
+
+
+def test_kill_frees_a_held_name_once_its_machine_is_gone(store):
+    """The recovery the refusal names: it destroys what is left, then frees it."""
+    from flotta.provision import teardown_box
+
+    impl = _Failing(left=True)
+    with pytest.raises(ProvisionError):
+        create_box("eng-f", store=store, backend=impl)
+    held = store.get_box_by_name("eng-f")
+    with store._conn.transaction(guard="boxes"):
+        store._conn.execute(
+            "UPDATE boxes SET endpoint = ? WHERE id = ?", ("fake://app/m1", held.id)
+        )
+    out = teardown_box(held.id, store=store, backend=impl)
+    # By name, never a raw destroy of the endpoint: on a shared-app fleet that
+    # destroy is `apps destroy <shared>`, every live agent with it.
+    assert "remove_leftover" in impl.calls and "destroy" not in impl.calls
+    assert out["name_released"] == f"eng-f@{held.id}"
+    assert store.create_box("eng-f").id != held.id
+
+
+def test_kill_keeps_the_name_while_the_substrate_cannot_say(store):
+    from flotta.provision import teardown_box
+
+    box = store.create_box("eng-c")
+    store.update_box_status(box.id, "torn_down")
+    out = teardown_box(box.id, store=store, backend=FakeBackend(left="unknown"))
+    assert out["name_released"] is None and "could not" in out["name_held"]
+    assert store.get_box(box.id).name == "eng-c"
+
+
+def test_kill_keeps_the_name_when_destroying_again_fails(store):
+    from flotta.provision import teardown_box
+
+    class Stuck(FakeBackend):
+        def remove_leftover(self, name):
+            raise BackendError("fly is down")
+
+    box = store.create_box("eng-c")
+    store.update_box_status(box.id, "torn_down", endpoint="fake://app/m1")
+    out = teardown_box(box.id, store=store, backend=Stuck(left=True))
+    assert out["name_released"] is None and "fly is down" in out["name_held"]
+
+
+def test_a_teardown_whose_destroy_failed_keeps_the_name(store):
+    """The same hole on the ordinary path: `eng-a` again would adopt the old
+    agent's machine and volume."""
+    from flotta.provision import teardown_box
+
+    class Stuck(FakeBackend):
+        def destroy(self, box_id):
+            raise BackendError("fly is down")
+
+    box = store.create_box("eng-a")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    out = teardown_box(box.id, store=store, backend=Stuck())
+    assert out["name_released"] is None and "fly is down" in out["name_held"]
+    assert store.get_box(box.id).status == "torn_down"
+
+
+def test_a_teardown_whose_destroy_returned_quietly_still_asks(store):
+    """Fly's `destroy` reads a `flyctl` that could not list apps as "already
+    gone" and returns, so a destroy that did not raise proves nothing."""
+    from flotta.provision import teardown_box
+
+    class Quiet(FakeBackend):
+        def destroy(self, box_id):
+            self.calls.append("destroy")  # and the app is still there
+
+    box = store.create_box("eng-a")
+    store.update_box_status(box.id, "running", endpoint="fake://app/m1")
+    out = teardown_box(box.id, store=store, backend=Quiet(left=True))
+    assert out["name_released"] is None and "still there" in out["name_held"]
+    assert store.get_box(box.id).name == "eng-a"
+
+
+def test_a_stranded_provision_frees_its_name_once_destroyed(store):
+    from flotta.provision import reconcile_boxes
+
+    box = _aged(store, "eng-x", "provisioning", minutes=30)
+    impl = FakeBackend(left=True)
+    impl.existing_endpoint = lambda name=None: "fake://app/m9"
+    changed = reconcile_boxes(store, backend_for=lambda _: impl)
+    assert changed[0]["destroyed"] is True
+    assert changed[0]["name_released"] == f"eng-x@{box.id}"
+
+
+def test_a_stranded_provision_it_could_not_destroy_keeps_its_name(store):
+    from flotta.provision import reconcile_boxes
+
+    class Stuck(FakeBackend):
+        def destroy(self, box_id):
+            raise BackendError("fly is down")
+
+    box = _aged(store, "eng-x", "provisioning", minutes=30)
+    # Even when the substrate then claims nothing is left: a destroy that
+    # failed is the stronger word.
+    impl = Stuck(left=False)
+    impl.existing_endpoint = lambda name=None: "fake://app/m9"
+    changed = reconcile_boxes(store, backend_for=lambda _: impl)
+    assert changed[0]["destroyed"] is False
+    assert "name_released" not in changed[0]
+    assert store.get_box(box.id).name == "eng-x"
+
+
+def test_kill_removes_by_name_what_a_failed_create_left(store):
+    """The usual failed create never learned an endpoint, so there is nothing
+    for `destroy` to address: kill removes it by name, then frees the name."""
+    from flotta.provision import teardown_box
+
+    impl = _Failing(left=True)
+    with pytest.raises(ProvisionError):
+        create_box("eng-f", store=store, backend=impl)
+    held = store.get_box_by_name("eng-f")
+    assert held.endpoint is None
+    out = teardown_box(held.id, store=store, backend=impl)
+    assert "remove_leftover" in impl.calls
+    assert out["name_released"] == f"eng-f@{held.id}"
+
+
+def test_the_recovery_works_on_a_real_local_fleet(store, tmp_path):
+    """End to end on the local backend, as found running it: a bad image is
+    refused after the agent's directory exists, so the name is held; the 409
+    names `flotta kill`; the kill frees it; the name is taken again."""
+    from flotta.backend import BoxSpec
+    from flotta.backends.local_backend import LocalBackend
+    from flotta.provision import teardown_box
+    from flotta.store import DuplicateBoxError
+
+    local = LocalBackend(tmp_path / "boxes")
+    spec = BoxSpec(name="eng-g", image="ghcr.io/x/y:1", env={"FLOTTA_RUNTIME": "custom"})
+    with pytest.raises(ProvisionError, match="stays held"):
+        create_box("eng-g", store=store, backend=local, spec=spec)
+    held = store.get_box_by_name("eng-g")
+    with pytest.raises(DuplicateBoxError, match=f"flotta kill {held.id}"):
+        store.create_box("eng-g")
+    out = teardown_box(held.id, store=store, backend=local)
+    assert out["name_released"] == f"eng-g@{held.id}"
+    assert local.leftover("eng-g") is False
+    assert store.create_box("eng-g").id != held.id

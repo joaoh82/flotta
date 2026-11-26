@@ -178,6 +178,7 @@ async def run_reconcile_loop(
     budget_enforcer: Callable[..., list[dict[str, Any]]] | None = None,
     suspension_enforcer: Callable[..., list[dict[str, Any]]] | None = None,
     machine_meter: Callable[..., list[dict[str, Any]]] | None = None,
+    purger: Callable[..., list[dict[str, Any]]] | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep,
     max_sweeps: int | None = None,
 ) -> None:
@@ -216,6 +217,10 @@ async def run_reconcile_loop(
         from flotta.metering import meter_machines
 
         machine_meter = meter_machines
+    if purger is None:
+        from flotta.provision import purge_closed_orgs
+
+        purger = purge_closed_orgs
 
     state.started_at = state._clock()
     _log.info("reconcile loop started, interval=%.0fs", state.interval_s)
@@ -300,6 +305,17 @@ async def run_reconcile_loop(
                         _log.info("told %d founding org(s) their price is ending", len(noted))
                 except Exception as exc:
                     _log.warning("founding price notices failed: %s: %s", type(exc).__name__, exc)
+
+                # Deletions (FLOTTA-224): expired sessions and links, a closed
+                # org's agents if their teardown failed, and a closed org's rows
+                # once its retention period is over. Last, and on its own: a
+                # failure here deletes nothing, and the next sweep tries again.
+                try:
+                    purged = purger(store)
+                    if purged:
+                        _log.info("purge sweep: %s", purged)
+                except Exception as exc:
+                    _log.warning("purge sweep failed: %s: %s", type(exc).__name__, exc)
                 return stranded, slept
             finally:
                 store.close()

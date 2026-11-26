@@ -11,9 +11,12 @@
    agent goes on in the same conversation; above it, or unjudged, it waits.
 3. A waiting request is on the agency's Requests page and on Home. Approved,
    it becomes a run on the agent (`trigger_kind="request"`) with the request
-   and the agency's note; declined, it is recorded with the note. The agent can
-   see how each of its requests was answered (`flotta-request list`), so the
-   next time the person asks, it can say.
+   and the agency's note; declined, it is recorded with the note. Either way
+   the agent is told at once, in the conversation it was asked in
+   (`flotta.notices`, FLOTTA-273), and can still read how each of its requests
+   was answered (`flotta-request list`). When an approved request's work ends,
+   done, failed or stopped, that conversation is told too, with the work's own
+   summary when it is done (FLOTTA-275).
 
 ## What it is not
 

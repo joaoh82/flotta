@@ -45,14 +45,16 @@ deliberate:
   to route around it with a socat forwarder, and the workaround was the wrong
   answer — it would have removed a layer rather than passed one.
 
-## WebSocket auth: a header, or the query string for the desktop app
+## WebSocket auth: a header, never the query string
 
 A WS upgrade takes `Authorization` like any request, which is what `flotta chat`
-and a colleague's question send. The desktop app couldn't set headers, so the
-door also accepts `?access_token=` for WS upgrades, never for plain HTTP. That
-has a real cost: query strings land in logs and proxy access records in a way
-headers do not, so the door's own log hides every query value
-(`flotta.server_logs`, FLOTTA-118). The path can go with the app (FLOTTA-80).
+and a colleague's question send, and a browser comes with a ticket (below). The
+desktop app couldn't set headers, so the door used to accept `?access_token=` on
+a WS upgrade too, and query strings land in logs and proxy access records in a
+way headers do not. The path left with the app (FLOTTA-80). A token in the query
+is now ignored: still stripped before proxying, so the box never receives it,
+and still hidden in the door's own log (`flotta.server_logs`, FLOTTA-118), for
+any old client that sends one.
 
 ## A browser comes with a ticket (M12.5)
 
@@ -220,6 +222,15 @@ DEFAULT_BOX_PORT = 9119
 #: once was refused agents that were booting normally. The web app's own wait
 #: (`READY_TIMEOUT_MS` in flotta-cloud) has to stay above this one.
 DEFAULT_READY_TIMEOUT_S = 240.0
+#: The longest the door waits for the control plane to wake a box (FLOTTA-133).
+#: `/wake` answers only once the machine has started, which can mean Fly's
+#: settle and start waits and, with an MCP config pending, a reload that waits
+#: for Hermes itself: so a wake can contain the boot. A fully stopped machine
+#: took 43 s on 2026-11-05, and the 30 s the door gave every fleet-API call
+#: reported it as the control plane being down while the agent came up anyway.
+#: The door's whole budget, because a wake that uses it has nothing left to wait
+#: for; `create_door` gives a wake only what its budget has left.
+WAKE_TIMEOUT_S = DEFAULT_READY_TIMEOUT_S
 #: How often to tell the control plane a live conversation is still live.
 #: Comfortably under the default 30-minute idle threshold: this only has to
 #: beat the sweep, and a chattier heartbeat would write more events for no gain.
@@ -696,6 +707,9 @@ class Address:
     client: str = DEFAULT_CLIENT
     #: What the fleet says it is doing. `None` from a control plane that doesn't say.
     status: str | None = None
+    #: What runs in it (M17): `hermes`, or `custom`, which speaks the box
+    #: contract (`flotta.door.contract`). Absent is Hermes, as before M17.
+    runtime: str = "hermes"
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,6 +724,7 @@ class Target:
     #: boxes in one app that would silently connect you to someone else's agent.
     host: str
     port: int = DEFAULT_BOX_PORT
+    runtime: str = "hermes"
 
 
 def host_to_box_name(host: str | None, *, domain: str | None = None) -> str:
@@ -744,25 +759,15 @@ def host_to_box_name(host: str | None, *, domain: str | None = None) -> str:
     return label
 
 
-def authorize(
-    *,
-    header: str | None,
-    query_token: str | None = None,
-    key: str | None = None,
-    allow_query: bool = False,
-) -> Token:
+def authorize(*, header: str | None, key: str | None = None) -> Token:
     """Validate the caller's Flotta token and require `box:chat`.
 
-    `allow_query` is passed only by the WebSocket path. A browser cannot set
-    headers on a WS handshake, so the token has to travel in the URL there —
-    and a query string is logged in places a header is not, which is why plain
-    HTTP never gets the same allowance.
+    From the `Authorization` header only, on HTTP and WebSocket alike: a token
+    in a URL is logged in places a header is not (FLOTTA-80, FLOTTA-118).
     """
     raw: str | None = None
     if header and header.lower().startswith("bearer "):
         raw = header.split(" ", 1)[1].strip()
-    elif allow_query and query_token:
-        raw = query_token.strip()
 
     if not raw:
         raise BoxUnavailable("missing bearer token", status=401)
@@ -850,6 +855,8 @@ class ControlPlane:
     base_url: str
     token: str | None = None
     timeout_s: float = 30.0
+    #: A wake's own, longer timeout: it waits for a machine to start.
+    wake_timeout_s: float = WAKE_TIMEOUT_S
     #: How requests travel: the network when `None`. A test hands it an
     #: `httpx.ASGITransport` around a real control plane, so the door and the
     #: fleet API run in one process with nothing but the machines faked.
@@ -877,7 +884,9 @@ class ControlPlane:
         with contextlib.suppress(Exception):
             await self.wake(box, box_id=box)
 
-    async def wake(self, name: str, *, box_id: str | None = None) -> Target:
+    async def wake(
+        self, name: str, *, box_id: str | None = None, timeout_s: float | None = None
+    ) -> Target:
         """Resolve `name` and ensure it is running. Returns where to proxy.
 
         `box_id`, when the caller has one, is what gets woken; `name` is then
@@ -891,7 +900,12 @@ class ControlPlane:
         drain between the read and the connect.
         """
         response = await self._call(
-            "POST", f"/api/boxes/{box_id or name}/wake", name=name, verb="wake"
+            "POST",
+            f"/api/boxes/{box_id or name}/wake",
+            name=name,
+            verb="wake",
+            # Its own limit, or what the caller's budget has left if that is less.
+            timeout_s=min(self.wake_timeout_s, timeout_s or self.wake_timeout_s),
         )
         body = response.json()
         endpoint = (body.get("box") or {}).get("endpoint")
@@ -901,7 +915,14 @@ class ControlPlane:
         # Where it is, whatever it is: whether this door may go there is the
         # door's own decision (`create_door`), made before anything is proxied.
         host, port = upstream(endpoint, local=True)
-        return Target(box_id=box_id, name=name, endpoint=endpoint, host=host, port=port)
+        return Target(
+            box_id=box_id,
+            name=name,
+            endpoint=endpoint,
+            host=host,
+            port=port,
+            runtime=(body.get("box") or {}).get("runtime") or "hermes",
+        )
 
     async def resolve(self, name: str) -> Address:
         """Which box `name` is, and whose. Never wakes it.
@@ -922,6 +943,7 @@ class ControlPlane:
             org=box.get("org") or DEFAULT_ORG,
             client=box.get("client") or DEFAULT_CLIENT,
             status=box.get("status"),
+            runtime=box.get("runtime") or "hermes",
         )
 
     async def client_conversations(self, box_id: str) -> list[dict[str, Any]]:
@@ -930,6 +952,40 @@ class ControlPlane:
             "GET", f"/api/boxes/{box_id}/client-conversations", name=box_id, verb="read"
         )
         return list(response.json().get("conversations") or [])
+
+    async def chat_conversations(self, box_id: str, by: str | None) -> list[dict[str, Any]] | None:
+        """The conversations people have had with this box, newest first (FLOTTA-276).
+
+        `None` from a control plane without the route, which is older than
+        this door: the door is deployed on its own, so either may go first.
+        """
+        from urllib.parse import quote
+
+        try:
+            response = await self._call(
+                "GET",
+                f"/api/boxes/{box_id}/chat-conversations?by={quote(by or '', safe='')}",
+                name=box_id,
+                verb="read",
+            )
+        except BoxUnavailable as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return list(response.json().get("conversations") or [])
+
+    async def model_of(self, box_id: str) -> str | None:
+        """The model the control plane has for this box now (FLOTTA-128).
+
+        Read fresh, never from the socket's resolve: a model change restarts
+        the agent, but a client may ask to move a conversation the moment it
+        reconnects, and the answer must be the agency's latest word.
+        """
+        response = await self._call(
+            "GET", f"/api/boxes/{box_id}/conversation-model", name=box_id, verb="read"
+        )
+        model = response.json().get("model")
+        return model if isinstance(model, str) and model else None
 
     async def working(self, box_id: str) -> dict[str, Any] | None:
         """The run this box is doing now, if not a conversation's (FLOTTA-197)."""
@@ -978,6 +1034,7 @@ class ControlPlane:
         client: bool,
         started_at: str,
         stored_session_id: str | None = None,
+        conversation_root: str | None = None,
     ) -> str | None:
         """A turn began on `box_id`: its `chat` run's id, or None while the agent
         is doing another run (M14.6, `flotta.door.turns`)."""
@@ -993,6 +1050,8 @@ class ControlPlane:
         }
         if stored_session_id:
             body["stored_session_id"] = stored_session_id
+        if stored_session_id and conversation_root:
+            body["conversation_root"] = conversation_root
         async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as http:
             response = await http.post(url, headers=self._headers(), json=body)
         if response.status_code == 409:
@@ -1073,21 +1132,54 @@ class ControlPlane:
         response.raise_for_status()
         return response
 
-    async def _call(self, method: str, path: str, *, name: str, verb: str, json: Any = None) -> Any:
+    async def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        name: str,
+        verb: str,
+        json: Any = None,
+        timeout_s: float | None = None,
+    ) -> Any:
         """One request to the fleet API, with the door's errors mapped once."""
         import httpx
 
         url = f"{self.base_url.rstrip('/')}{path}"
+        timeout = self.timeout_s if timeout_s is None else timeout_s
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_s, transport=self.transport
-            ) as client:
+            async with httpx.AsyncClient(timeout=timeout, transport=self.transport) as client:
                 response = await client.request(method, url, headers=self._headers(), json=json)
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise BoxUnavailable(
+                f"cannot reach the control plane at {self.base_url}: "
+                f"no connection within {timeout:.0f}s",
+                status=503,
+            ) from exc
+        except httpx.ReadTimeout as exc:
+            # Connected and asked, then no answer in time (FLOTTA-133). That is
+            # not the control plane being down: saying "cannot reach" sent an
+            # operator to the wrong service while the agent came up anyway. For
+            # a wake it is usually the machine starting, but a stuck control
+            # plane looks the same from here, so neither is blamed. Short, with
+            # what to do first: a close reason is cut at 120 characters.
+            if verb == "wake":
+                raise BoxUnavailable(
+                    f"try again in a moment: waking {name!r} took over {timeout:.0f}s",
+                    status=504,
+                ) from exc
+            raise BoxUnavailable(
+                f"the control plane did not answer the {verb} of {name!r} within {timeout:.0f}s",
+                status=504,
+            ) from exc
         except Exception as exc:
             # The control plane being unreachable is the door's own outage, not
-            # the box's. Say which one is down.
+            # the box's. Say which one is down, and what went wrong: some httpx
+            # errors have no message, which left "...: " with nothing after it.
             raise BoxUnavailable(
-                f"cannot reach the control plane at {self.base_url}: {exc}", status=503
+                f"cannot reach the control plane at {self.base_url}: "
+                f"{str(exc) or type(exc).__name__}",
+                status=503,
             ) from exc
 
         if response.status_code == 404:
@@ -1108,6 +1200,15 @@ class ControlPlane:
         if response.status_code >= 400:
             raise BoxUnavailable(f"could not {verb} {name!r}: {response.text[:200]}", status=502)
         return response
+
+
+def _left(budget_s: float, began: float, clock: asyncio.AbstractEventLoop) -> float:
+    """What a budget started at `began` has left, never less than a moment.
+
+    The moment is so a step whose budget ran out still asks once, and fails with
+    its own message rather than none.
+    """
+    return max(budget_s - (clock.time() - began), min(budget_s, 1.0))
 
 
 def _detail(response: httpx.Response) -> str:
@@ -1199,6 +1300,8 @@ async def wait_until_ready(
     *,
     timeout_s: float = DEFAULT_READY_TIMEOUT_S,
     sleep: Any = None,
+    contract_secret: str | None = None,
+    custom: bool = False,
 ) -> None:
     """Block until `hermes serve` answers, or give up with a useful message.
 
@@ -1221,6 +1324,16 @@ async def wait_until_ready(
     async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
         while loop.time() < deadline:
             try:
+                if custom:
+                    # A custom agent says so itself (M17.2): `GET /healthz`,
+                    # 200 with its Bearer. Anything else is not ready yet.
+                    from flotta.door.contract import contract_ready
+
+                    if await contract_ready(client, base_url, contract_secret):
+                        return
+                    last = "/healthz not 200"
+                    await naps(0.5)
+                    continue
                 response = await client.get(base_url + "/")
                 if response.status_code < 500:
                     return
@@ -1228,8 +1341,9 @@ async def wait_until_ready(
             except Exception as exc:
                 last = type(exc).__name__
             await naps(0.5)
+    what = "the agent's /healthz" if custom else "hermes serve"
     raise BoxUnavailable(
-        f"the box is up but hermes serve did not answer within {timeout_s:.0f}s (last: {last})",
+        f"the box is up but {what} did not answer within {timeout_s:.0f}s (last: {last})",
         status=504,
     )
 
@@ -1494,7 +1608,9 @@ def create_door(
 
     app = FastAPI(title="Flotta front door")
 
-    async def _target(token: Token, request_host: str | None) -> Target:
+    async def _target(
+        token: Token, request_host: str | None, *, wants: str = "socket"
+    ) -> Target | None:
         """Resolve, check whose it is, wake, wait. In that order, and only that.
 
         The subject check sits between resolve and wake: after resolve because
@@ -1514,6 +1630,11 @@ def create_door(
         if refusal is not None:
             _log.info("refused %r for %r before resolving: %s", name, token.subject, refusal)
             raise BoxUnavailable(f"no box named {name!r}", status=404)
+        # One budget for the resolve, the wake and the boot together, so the door
+        # gives up before the web app does (`READY_TIMEOUT_MS`, 300 s, which
+        # also covers the Hermes ticket after this), however the time splits.
+        clock = asyncio.get_running_loop()
+        began = clock.time()
         address = await plane.resolve(name)
         refusal = admits(
             token,
@@ -1528,10 +1649,24 @@ def create_door(
             # agents. A box you may not address is a box that is not there.
             _log.info("refused %r for %r: %s", name, token.subject, refusal)
             raise BoxUnavailable(f"no box named {name!r}", status=404)
+        if address.runtime == "custom" and wants == "handshake":
+            # Hermes's login and ticket, which every client does before its
+            # socket (`flotta.client`, the run loop): a custom agent has neither,
+            # and the door's socket needs neither (M17.3). Answered here, so no
+            # machine starts for them; the socket is where it wakes.
+            return None
+        if address.runtime == "custom" and wants != "socket":
+            # Before the wake: a custom agent has only its conversation socket
+            # here (M17.2), no web interface and no screen, and asking for one
+            # must not start a machine.
+            what = "a screen" if wants == "screen" else "a web interface through the door"
+            raise BoxUnavailable(f"{name!r} runs its own image, which has no {what}", status=404)
         # By id: the name can be released and reused between resolve and here,
         # and waking by name would start the replacement on this token's
         # account — the cost the check above exists to refuse.
-        target = await plane.wake(name, box_id=address.box_id)
+        target = await plane.wake(
+            name, box_id=address.box_id, timeout_s=_left(ready_timeout_s, began, clock)
+        )
         if target.box_id != address.box_id:
             # Should be unreachable now; kept because proxying to a box other
             # than the one checked is the failure, however it comes about.
@@ -1539,8 +1674,12 @@ def create_door(
         # Before the first byte goes to it: a deployed door routes no
         # `local://` box (`upstream`), so this refuses one here.
         upstream(target.endpoint, local=local_boxes)
+        own = _own(target)
         await wait_until_ready(
-            f"http://{authority(target.host, target.port)}", timeout_s=ready_timeout_s
+            f"http://{authority(target.host, target.port)}",
+            timeout_s=_left(ready_timeout_s, began, clock),
+            custom=target.runtime == "custom",
+            contract_secret=own[1] if own else None,
         )
         return target
 
@@ -1567,9 +1706,18 @@ def create_door(
     async def proxy(path: str, request: Request) -> Response:
         try:
             token = authorize(header=request.headers.get("authorization"), key=key)
-            target = await _target(token, request.headers.get("host"))
+            handshake = request.method == "POST" and f"/{path}" in (LOGIN_PATH, HERMES_TICKET_PATH)
+            target = await _target(
+                token, request.headers.get("host"), wants="handshake" if handshake else "http"
+            )
         except BoxUnavailable as exc:
             return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+        if target is None:
+            # A custom agent's handshake: nothing to log into, and the ticket is
+            # never read, because the door's own socket carries the conversation.
+            if f"/{path}" == LOGIN_PATH:
+                return JSONResponse({"ok": True})
+            return JSONResponse({"ticket": "box-contract"})
 
         # Hop-by-hop headers describe *this* connection and must not be
         # forwarded; `host` must be rewritten or the box sees the public name.
@@ -1652,21 +1800,20 @@ def create_door(
                     key=key,
                 )
             else:
-                token = authorize(
-                    header=websocket.headers.get("authorization"),
-                    query_token=websocket.query_params.get("access_token"),
-                    key=key,
-                    allow_query=True,
-                )
+                token = authorize(header=websocket.headers.get("authorization"), key=key)
             if screen and not display_ticket:
                 # Hermes would refuse it, and only after the box was woken for it.
                 raise BoxUnavailable(
                     f"the screen opens with Hermes's {DISPLAY_TICKET_PARAM}", status=400
                 )
-            target = await _target(token, websocket.headers.get("host"))
+            target = await _target(
+                token, websocket.headers.get("host"), wants="screen" if screen else "socket"
+            )
+            assert target is not None  # only a handshake is answered without one
             upstream_ticket = None
             own = _own(target)
-            if ticketed and own and not screen:
+            custom = target.runtime == "custom"
+            if ticketed and own and not screen and not custom:
                 upstream_ticket = await hermes_ticket(
                     f"http://{authority(target.host, target.port)}", own
                 )
@@ -1784,8 +1931,9 @@ def create_door(
 
         heartbeat = asyncio.create_task(keep_awake())
 
-        # Rebuilt from the filtered pairs rather than passed through: the raw
-        # query carries `access_token`, and the box must not receive it.
+        # Rebuilt from the filtered pairs rather than passed through: an old
+        # client's query may still carry `access_token`, and the box must not
+        # receive it.
         from urllib.parse import urlencode
 
         pairs = strip_door_params(websocket.query_params)
@@ -1800,15 +1948,29 @@ def create_door(
 
         async def converse() -> None:
             """The relay, and whatever outlives the person's socket (FLOTTA-204)."""
-            try:
-                async with websockets.connect(
+            if custom:
+                # The box contract behind a Hermes-shaped socket (M17.2): the
+                # relay below, the gate and the recorder are the same for both.
+                from flotta.door.contract import ContractSocket
+
+                connection: Any = ContractSocket(
+                    f"http://{authority(target.host, target.port)}",
+                    secret=own[1] if own else None,
+                    run_id=token.subject.removeprefix("run:")
+                    if token.subject.startswith("run:")
+                    else None,
+                )
+            else:
+                connection = websockets.connect(
                     upstream_url,
                     additional_headers=headers,
                     proxy=None,
                     max_size=BOX_FRAME_LIMIT,
                     ping_interval=BOX_PING_INTERVAL_S,
                     ping_timeout=BOX_PING_TIMEOUT_S,
-                ) as upstream:
+                )
+            try:
+                async with connection as upstream:
                     liveness.connected(upstream.send)
 
                     # Set once the person's socket has gone while the agent's is
@@ -1845,6 +2007,11 @@ def create_door(
                                 if turns is not None and turns.awaiting_answer():
                                     # Their turn waits on someone else's answer, which
                                     # only this socket can carry to the agent: keep it.
+                                    left.set()
+                                    return
+                                if custom and upstream.running():
+                                    # A custom agent's turn lasts as long as its
+                                    # request: closing would end it halfway (M17.2).
                                     left.set()
                                     return
                                 await upstream.close()
@@ -1886,7 +2053,7 @@ def create_door(
                     done, pending = await asyncio.wait(
                         [person, agent, heartbeat], return_when=asyncio.FIRST_COMPLETED
                     )
-                    if left.is_set() and turns is not None:
+                    if left.is_set():
                         # The person left mid-turn, with an approval of theirs still
                         # waiting (FLOTTA-204). Keep the agent's socket, the answer
                         # poll and the keep-awake beat until the turn ends, the agent
@@ -1896,7 +2063,9 @@ def create_door(
                         _log.info(
                             "%s's person left mid-turn awaiting an answer; holding", target.name
                         )
-                        over = asyncio.create_task(turns.asked_turns_over())
+                        over = asyncio.create_task(
+                            upstream.runs_over() if custom else turns.asked_turns_over()  # type: ignore[union-attr]
+                        )
                         done, pending = await asyncio.wait(
                             [agent, heartbeat, over],
                             timeout=HELD_AFTER_LEAVING_S,
@@ -1970,9 +2139,10 @@ _HOP_BY_HOP = frozenset(
 
 
 #: Query parameters the door consumes and must not pass upstream.
-#: `access_token` is the WS handshake's only way to carry a Flotta token — a
-#: browser cannot set headers there — which makes it a *credential in the URL*,
-#: and forwarding it hands the box a token for the fleet it lives in.
+#: `access_token` was the desktop app's way to carry a Flotta token on a WS
+#: handshake (gone with FLOTTA-80). The door no longer reads it, but an old
+#: client may still send one, and forwarding it would hand the box a token for
+#: the fleet it lives in.
 _DOOR_QUERY_PARAMS = frozenset({"access_token"})
 
 

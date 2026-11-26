@@ -113,8 +113,8 @@ held in the page's memory for one connection. The door takes it only in
 
 It is signed under its own name (`_TICKET_DOMAIN`), so **`verify` refuses
 every ticket and `verify_ticket` refuses every token.** A ticket therefore
-cannot call the fleet API or open the door's `Authorization` and
-`?access_token=` path, where no `Origin` is checked; and a long-lived token
+cannot call the fleet API or open the door's `Authorization` path, where no
+`Origin` is checked; and a long-lived token
 cannot be passed off as a ticket. A verifier built before tickets existed
 refuses them too, on the signature, rather than reading one as a token that
 reaches every box in its tenant.

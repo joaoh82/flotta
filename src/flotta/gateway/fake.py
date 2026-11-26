@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -93,20 +94,49 @@ class FakeUpstream(httpx.AsyncBaseTransport):
                 self.status, json={"error": {"message": "the fake upstream says no"}}
             )
         body = json.loads(request.content)
+        words, calls = _decide(body)
         if body.get("stream") is True:
             wants_usage = (body.get("stream_options") or {}).get("include_usage") is True
-            return self._stream(wants_usage and self.reports_usage, cookie)
+            return self._stream(wants_usage and self.reports_usage, cookie, words, calls)
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(words)}
+        if calls:
+            message = {"role": "assistant", "content": None, "tool_calls": calls}
         reply: dict[str, Any] = {
             "id": "fake-1",
             "object": "chat.completion",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(_WORDS)}}],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls" if calls else "stop",
+                }
+            ],
         }
         if self.reports_usage:
             reply["usage"] = self.usage
         return httpx.Response(200, json=reply, headers=cookie)
 
-    def _stream(self, with_usage: bool, headers: dict[str, str]) -> httpx.Response:
-        chunks = [_event({"choices": [{"index": 0, "delta": {"content": w}}]}) for w in _WORDS]
+    def _stream(
+        self,
+        with_usage: bool,
+        headers: dict[str, str],
+        words: tuple[str, ...] = _WORDS,
+        calls: list[dict[str, Any]] | None = None,
+    ) -> httpx.Response:
+        if calls:
+            deltas = [{**call, "index": i} for i, call in enumerate(calls)]
+            chunks = [
+                _event(
+                    {
+                        "choices": [
+                            {"index": 0, "delta": {"role": "assistant", "tool_calls": deltas}}
+                        ]
+                    }
+                ),
+                _event({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            ]
+        else:
+            chunks = [_event({"choices": [{"index": 0, "delta": {"content": w}}]}) for w in words]
         if with_usage:
             chunks.append(_event({"choices": [], "usage": self.usage}))
         chunks.append(b"data: [DONE]\n\n")
@@ -116,3 +146,66 @@ class FakeUpstream(httpx.AsyncBaseTransport):
             headers={"content-type": "text/event-stream", **headers},
             stream=_Stream(self, chunks, self.cut_after),
         )
+
+
+# -- tool calls, scripted (M17.3) -------------------------------------------------
+
+
+def _text_of(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+    return ""
+
+
+def _decide(body: dict[str, Any]) -> tuple[tuple[str, ...], list[dict[str, Any]]]:
+    """What the fake model says: a tool call when the person's message names one
+    of the tools it was offered, a line about the tool's result after one, else
+    the usual greeting. Enough for an agent's tools and approvals to be tried for
+    $0: "refund order 42" calls `refund` with `{"order": "42"}`-shaped arguments.
+    """
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    last = messages[-1] if messages and isinstance(messages[-1], dict) else {}
+    tools = [
+        t["function"]
+        for t in body.get("tools") or []
+        if isinstance(t, dict) and isinstance(t.get("function"), dict)
+    ]
+    if last.get("role") == "tool":
+        said = " ".join(_text_of(last.get("content")).split())[:200]
+        return ("Done", ": ", said or "the tool answered."), []
+    if last.get("role") != "user" or not tools:
+        return _WORDS, []
+    text = _text_of(last.get("content")).lower()
+    for tool in tools:
+        name = str(tool.get("name") or "")
+        if name and (name.lower() in text or name.lower().replace("_", " ") in text):
+            arguments = _arguments(tool.get("parameters") or {}, text)
+            return (), [
+                {
+                    "id": f"call_{len(messages)}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+            ]
+    return _WORDS, []
+
+
+def _arguments(schema: dict[str, Any], text: str) -> dict[str, Any]:
+    """Every required argument filled from the message: numbers from its first
+    number, anything else from that number too, or the message itself."""
+    number = re.search(r"\d+(?:\.\d+)?", text)
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    out: dict[str, Any] = {}
+    for name in schema.get("required") or list(properties):
+        kind = (properties.get(name) or {}).get("type")
+        if kind == "integer":
+            out[name] = int(float(number.group())) if number else 1
+        elif kind == "number":
+            out[name] = float(number.group()) if number else 1.0
+        elif kind == "boolean":
+            out[name] = True
+        else:
+            out[name] = number.group() if number else text
+    return out

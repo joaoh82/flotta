@@ -115,11 +115,13 @@ from flotta.store import (
     SEAT_ROLES,
     TASK_STATUSES,
     BoxBusyError,
+    CustomImagesOffError,
     DuplicateMembershipError,
     DuplicateTenantError,
     FleetStore,
     FoundingClosedError,
     InvalidAccountError,
+    InvalidImageError,
     InvalidTenantError,
     InvalidTransitionError,
     LastOwnerError,
@@ -550,6 +552,29 @@ def _box_dict(
     return out
 
 
+def _model_of(store: Any, box_id: str) -> str | None:
+    """The model an agent is to be on: a change under way's, else its own.
+
+    The front door holds a client to it (FLOTTA-128), so it must be what the
+    web app asks for: the single-box read's `model_change.model` while that is
+    `pending`, else its `model` (flotta-cloud `conversationFacts`). A reconnect
+    during the restart reads it before the change has recorded its result
+    (FLOTTA-101). A change that then fails leaves a client on the model the
+    agency asked for, which the operator's list already allows.
+    """
+    from flotta.provision import fleet_model, model_changes, model_given_by_default
+
+    change = model_changes(store, [box_id]).get(box_id)
+    if change and change.get("state") == "pending" and change.get("model"):
+        return str(change["model"])
+    return (
+        store.model_for_box(box_id)
+        or store.models_given([box_id]).get(box_id)
+        or model_given_by_default()
+        or fleet_model(store)
+    )
+
+
 def _with_meta(store: Any, box: Any) -> dict[str, Any]:
     from flotta.provision import (
         box_sizes,
@@ -656,7 +681,7 @@ VIEWER_USAGE_GROUPS = frozenset({"day", "box"})
 
 #: The runs a client's viewer never sees (D29): conversations, which are the
 #: people's who had them. A viewer has none of its own.
-VIEWER_HIDDEN_KINDS = ("chat",)
+VIEWER_HIDDEN_KINDS = ("chat", "notice")
 
 #: What a client's viewer never reads of a run (D29): the agency's words to the
 #: agent, what a trigger fed it, and the agency's note on settling a failure.
@@ -735,6 +760,10 @@ def create_app(
     #: Judges a request before its agent starts (FLOTTA-173): `judge.judge`'s
     #: signature. Injected for the reason `reachable` is; `None` asks Jev.
     judge_request: Any = None,
+    #: Reaches the model provider for the Architect's calls (FLOTTA-250).
+    #: Injected for the reason `reachable` is: an `httpx.AsyncBaseTransport`;
+    #: `None` is the network. Nothing is sent without `$FLOTTA_ARCHITECT_API_KEY`.
+    architect_transport: Any = None,
 ) -> Any:
     """Build the control-plane app.
 
@@ -868,6 +897,16 @@ def create_app(
                         headers={"WWW-Authenticate": "Bearer"},
                     ) from exc
 
+            # A closed org's people are signed out, and that includes tokens an
+            # owner minted (FLOTTA-224): a signature can't be revoked, so it is
+            # refused here. Billing's and the operator's carry no org claim.
+            if token.org is not None and token.org != DEFAULT_ORG and _org_closed(token.org):
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"org {token.org!r} is closed",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
             missing = [s for s in scopes if not token.allows(s)]
             if any_of and len(missing) < len(scopes):
                 missing = []
@@ -881,6 +920,22 @@ def create_app(
             return token
 
         return dependency
+
+    def _org_closed(org_id: str) -> bool:
+        """Whether `org_id` is closed (FLOTTA-224). A store that can't answer is
+        not a reason to refuse: the routes still check tenancy as before."""
+        try:
+            store = store_factory()
+        except Exception:  # noqa: BLE001 - a store that can't open refuses nothing
+            return False
+        try:
+            org = store.get_org(org_id)
+            return org is not None and org.status == "closed"
+        except Exception:  # noqa: BLE001 - a read that failed refuses nothing
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                store.close()
 
     def _session_token(secret: str, request: Request) -> Token:
         """The token a live session's membership would mint, or 401.
@@ -1316,6 +1371,11 @@ def create_app(
         try:
             yield
         finally:
+            if "client" in architect_state:
+                # The Architect's calls (FLOTTA-250): what is still being written, then the client.
+                await architect_state["client"].aclose()
+                await architect_state["ledger"].drain()
+                architect_state["ledger"].close()
             if runs is not None:
                 runs.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1360,6 +1420,37 @@ def create_app(
             status_code=402,
             content={"detail": str(exc), "limit": {"kind": exc.kind, "limit": exc.limit}},
         )
+
+    @app.exception_handler(CustomImagesOffError)
+    def _custom_images_off(_request: Request, exc: CustomImagesOffError) -> Any:
+        """403 wherever an org without the operator's switch asks for its own image (M17.1)."""
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=403, content={"detail": str(exc), "code": "custom_images_off"}
+        )
+
+    @app.exception_handler(InvalidImageError)
+    def _invalid_image(_request: Request, exc: InvalidImageError) -> Any:
+        """422 for an image reference that could not be pulled, or carries a credential."""
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    from flotta.provision import CustomRuntimeRefused
+    from flotta.provision import refuse_custom as _refuse_custom
+
+    @app.exception_handler(CustomRuntimeRefused)
+    def _custom_refused(_request: Request, exc: CustomRuntimeRefused) -> Any:
+        """409 wherever a custom agent is asked for what only Hermes has (M17.1).
+
+        One handler, because the refusal is raised in `provision` (`hermes_only`),
+        where every route meets it; a route that catches `ProvisionError` itself
+        answers 409 for it already.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=409, content={"detail": str(exc), "code": "custom_runtime"})
 
     @app.exception_handler(OrgNotActiveError)
     def _org_not_active(_request: Request, exc: OrgNotActiveError) -> Any:
@@ -1432,8 +1523,6 @@ def create_app(
 
         `?status=pending` is the operator's queue of sign-ups to decide.
         """
-        from dataclasses import asdict
-
         store = store_factory()
         try:
             if _is_operator(token):
@@ -1442,9 +1531,17 @@ def create_app(
                 assert token is not None
                 own = store.get_org(token.org or DEFAULT_ORG)
                 orgs = [own] if own is not None else []
-            return {"orgs": [asdict(o) for o in orgs]}
+            return {"orgs": [_org_view(store, o) for o in orgs]}
         finally:
             store.close()
+
+    def _org_view(store: Any, org: Any) -> dict[str, Any]:
+        """An org as the API shows it: its row, and when a closed one is deleted."""
+        from dataclasses import asdict
+
+        from flotta.provision import purge_after
+
+        return {**asdict(org), "purge_after": purge_after(store, org)}
 
     @app.post("/api/orgs", status_code=201)
     def create_org(body: dict[str, Any], token: Token | None = needs_admin) -> Any:
@@ -1928,6 +2025,115 @@ def create_app(
                 ],
             )
         return {"org": asdict(org), "changed": changed, "told": told}
+
+    @app.post("/api/orgs/{org_id}/close")
+    def close_org(
+        org_id: str,
+        tasks: BackgroundTasks,
+        body: dict[str, Any] | None = None,
+        token: Token | None = needs_admin,
+    ) -> Any:
+        """Close an org (FLOTTA-224): `{"confirm": "<org id>"}`.
+
+        Its people are signed out and can't sign in to it again, its links and
+        triggers stop, and its agents are destroyed, machine and volume, after
+        the response. Everything else is deleted `FLOTTA_CLOSED_RETENTION_DAYS`
+        later by the purge sweep; until then the operator can reopen it.
+
+        The operator's, or the org's own owner's: `org:admin` in that org with
+        `fleet:write`, which the operator viewing an agency as its owner doesn't
+        hold. Not billing's (`org:govern`), which cancels plans, not accounts.
+        The hosted product cancels the org's subscription before calling this.
+        """
+        if not _is_operator(token):
+            assert token is not None
+            if (
+                token.org != org_id
+                or token.client is not None
+                or not (token.allows(SCOPE_ORG_ADMIN) and token.allows(SCOPE_FLEET_WRITE))
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="only the org's owner, or the fleet's operator, may close it",
+                )
+        if str((body or {}).get("confirm") or "") != org_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f'to close it, confirm with the org\'s id: {{"confirm": "{org_id}"}}',
+            )
+        by = "operator" if _is_operator(token) else "owner"
+        store = store_factory()
+        try:
+            org, changed = store.close_org(org_id, by=by)
+            view = _org_view(store, org)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        if changed:
+            subject = token.subject if token is not None else "operator"
+            _log.info("%s closed by its %s (%s)", org_id, by, subject)
+            tasks.add_task(_destroy_closed, org_id)
+        return {"org": view, "changed": changed}
+
+    @app.put("/api/orgs/{org_id}/custom-images")
+    def put_custom_images(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_admin
+    ) -> Any:
+        """Let an agency run agents from its own images, or stop: `{"on": true}` (M17.1).
+
+        The operator's alone: the image is the agency's code, on the fleet's
+        substrate beside every other agency's agents. Off creates nothing and
+        destroys nothing; it refuses the next one.
+        """
+        _require_operator(token, "let an org run its own images")
+        on = (body or {}).get("on")
+        if not isinstance(on, bool):
+            raise HTTPException(status_code=422, detail="on is true or false")
+        store = store_factory()
+        try:
+            try:
+                org = store.set_org_custom_images(org_id, on)
+            except UnknownEntityError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            view = _org_view(store, org)
+        finally:
+            store.close()
+        _log.info("custom images for %s turned %s by the operator", org_id, "on" if on else "off")
+        return {"org": view}
+
+    @app.post("/api/orgs/{org_id}/reopen")
+    def reopen_org(org_id: str, token: Token | None = needs_admin) -> Any:
+        """Undo a close before its data is deleted: the org is suspended by the
+        operator, with its agents gone. The operator's alone."""
+        _require_operator(token, "reopen an org")
+        store = store_factory()
+        try:
+            org = store.reopen_org(org_id)
+            view = _org_view(store, org)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        _log.info("%s reopened by the operator", org_id)
+        return {"org": view}
+
+    def _destroy_closed(org_id: str) -> None:
+        """After a close's response: its agents destroyed now. The reconcile loop
+        does the same each sweep, for any the substrate refused."""
+        from flotta.provision import close_org_agents
+
+        store = store_factory()
+        try:
+            close_org_agents(store, org_id=org_id)
+        except Exception:  # noqa: BLE001 - the loop tries again next sweep
+            _log.exception("could not destroy %s's agents after closing it", org_id)
+        finally:
+            store.close()
 
     def _sleep_suspended(org_id: str) -> None:
         """After a suspend's response: its running agents to sleep now. The
@@ -3499,7 +3705,12 @@ def create_app(
             user = store.get_user_by_email(link.email)
             if user is None or user.disabled_at is not None:
                 raise refused
-            orgs = [m.org for m in store.memberships_for(user.id)]
+            # Not a closed org (FLOTTA-224): one closed is as if it were gone.
+            orgs = [
+                m.org
+                for m in store.memberships_for(user.id)
+                if (o := store.get_org(m.org)) is None or o.status != "closed"
+            ]
             if not orgs:
                 raise refused
             org = str(wanted) if wanted is not None else orgs[0]
@@ -3527,8 +3738,8 @@ def create_app(
         if user is not None and user.disabled_at is not None:
             raise refused
         org = store.get_org(link.org)
-        # Declined since it was sent: the decline is the later word.
-        if org is None or org.status == "declined":
+        # Declined or closed since it was sent: the later word wins.
+        if org is None or org.status in ("declined", "closed"):
             raise refused
         # An org whose seats filled since the invite was sent answers 402 here,
         # before the link is touched. This is only the early answer: the check
@@ -3990,6 +4201,17 @@ def create_app(
                 for box in inner.list_boxes():
                     if is_terminal("box", box.status) or box.status == "provisioning":
                         continue
+                    if box.runtime != "hermes":
+                        # The agency's own image (M17.1): there is no Hermes in
+                        # it to update, and the fleet's image would replace it.
+                        # Said on its timeline and the build's, as a held screen is.
+                        inner.add_event(
+                            "box",
+                            box.id,
+                            UPGRADE_SKIPPED_EVENT,
+                            {"build_id": build.id, "to": image, "reason": "own_image"},
+                        )
+                        continue
                     # A person on its screen (FLOTTA-211): passed by, not stopped
                     # at. Nothing is wrong with the image, and one sign-in must
                     # not hold back the fleet. Said on its timeline and the build's.
@@ -4149,6 +4371,13 @@ def create_app(
         name = str(body.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=422, detail="a box needs a name")
+        # What runs in it (M17.1): Hermes unless the agency names its own image.
+        runtime = str(body.get("runtime") or "hermes").strip()
+        image = body.get("image")
+        if image is not None and not isinstance(image, str):
+            raise HTTPException(
+                status_code=422, detail="image is a reference, like ghcr.io/org/agent:1.0"
+            )
 
         # Here as well as in the store, and deliberately: the store is the
         # guarantee — it is what makes this true for the CLI too — while this
@@ -4185,6 +4414,23 @@ def create_app(
             # The same early answer for an org at its limit on agents: the
             # store refuses the row as well, under its guard (FLOTTA-183).
             tenant_store.require_room(org, "agents")
+            # And for an image the org may not run, or a custom agent asked for
+            # what only Hermes has: before a name or a probe is spent.
+            from flotta.provision import check_custom_request
+            from flotta.store import InvalidBoxMetaError as _BadMeta
+
+            try:
+                image = check_custom_request(
+                    runtime,
+                    image,
+                    store=tenant_store,
+                    org=org,
+                    screen=bool(body.get("screen")),
+                    instructions=(str(body.get("instructions") or "").strip() or None),
+                    model=(str(body.get("model") or "").strip() or None),
+                )
+            except _BadMeta as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             tenant_store.close()
 
@@ -4240,10 +4486,37 @@ def create_app(
         # typo here is an agent that answers every turn with "model not found".
         model = _checked_model(body.get("model"))
 
+        # What it was made from, and the rules it starts with (FLOTTA-249,
+        # FLOTTA-251). Both refused here, before a name or a provision is spent.
+        from flotta.rules import RulesError, parse_rules
+        from flotta.store import validate_template
+
+        try:
+            template = validate_template(body.get("template"))
+        except InvalidBoxMetaError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rules = None
+        if body.get("rules") is not None:
+            try:
+                rules = parse_rules(body["rules"])
+            except RulesError as exc:
+                raise HTTPException(status_code=422, detail=f"rules: {exc}") from exc
+            if rules.empty:
+                rules = None
+            elif runtime == "custom":
+                raise HTTPException(
+                    status_code=422,
+                    detail="rules are for Hermes agents only: its own image decides what it may do",
+                )
+        by = token.subject if token is not None else "operator"
+
         if background:
             return _create_in_background(
                 name,
                 token=token,
+                template=template,
+                rules=rules,
+                by=by,
                 org=org,
                 client=client,
                 label=label,
@@ -4255,6 +4528,8 @@ def create_app(
                 instructions=instructions,
                 model=model,
                 screen=screen,
+                runtime=runtime,
+                image=image,
             )
 
         store = store_factory()
@@ -4273,6 +4548,11 @@ def create_app(
                     instructions=instructions,
                     model=model,
                     screen=screen,
+                    runtime=runtime,
+                    image=image,
+                    template=template,
+                    rules=rules,
+                    by=by,
                 )
             except DuplicateBoxError as exc:
                 # A name still held by an existing box. Since teardown releases
@@ -4328,6 +4608,11 @@ def create_app(
         instructions: str | None = None,
         model: str | None = None,
         screen: bool = False,
+        runtime: str = "hermes",
+        image: str | None = None,
+        template: str | None = None,
+        rules: Any = None,
+        by: str | None = None,
     ) -> Any:
         """Reserve the row, answer, and provision afterwards.
 
@@ -4375,13 +4660,16 @@ def create_app(
                     instructions=instructions,
                     model=model,
                     screen=screen,
+                    runtime=runtime,
+                    image=image,
+                    template=template,
                 )
             except DuplicateBoxError as exc:
                 # A *live* box holds the name — a destroyed one no longer does,
                 # because teardown releases it.
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except LimitReachedError:
-                raise  # 402, from its handler: not a conflict over the name
+            except (LimitReachedError, CustomImagesOffError):
+                raise  # 402 or 403, from their handlers: not a conflict over the name
             except Exception as exc:
                 raise HTTPException(
                     status_code=409,
@@ -4391,6 +4679,13 @@ def create_app(
             # for a poll, so it has to carry the display name or the agent
             # shows up under its address for five seconds.
             payload = {"box": _with_meta(store, box), "box_id": box.id, "status": box.status}
+            if rules is not None:
+                # Said so a caller can tell a Flotta that took its rules from an
+                # older one that ignored the field. They are written while the
+                # agent is being created, and are its rules only once it is up:
+                # `GET /api/boxes/{id}/rules` then has them, or its timeline
+                # has `rules_write_failed`.
+                payload["rules"] = "writing"
         finally:
             store.close()
 
@@ -4404,6 +4699,8 @@ def create_app(
                     volume_gb=volume_gb,
                     region=region,
                     memory_mb=memory_mb,
+                    rules=rules,
+                    by=by,
                 )
             except Exception as exc:  # noqa: BLE001
                 # `create_box` already records the failure against the row;
@@ -4820,6 +5117,111 @@ def create_app(
             }
         finally:
             store.close()
+
+    # -- agent templates (FLOTTA-269) ------------------------------------------
+
+    @app.get("/api/agent-templates")
+    def list_agent_templates(token: Token | None = needs_read) -> Any:
+        """What the operator changed in the templates agents are made from.
+
+        The templates are the front end's; this is only the parts of each that
+        this fleet's operator changed (`flotta.agent_templates`), one entry per
+        changed template. A template not here is as the front end ships it.
+
+        For whoever makes agents, or runs an org: they are given what the
+        operator set. Not for a client's own people, who make none, and whose
+        read of the fleet is of their own agents and not of how an agency's
+        are written.
+        """
+        if token is not None and not (
+            token.allows(SCOPE_FLEET_WRITE) or token.allows(SCOPE_ORG_ADMIN)
+        ):
+            raise HTTPException(
+                status_code=403, detail="only people who make agents may read the templates"
+            )
+        store = store_factory()
+        try:
+            kept = store.agent_templates()
+        finally:
+            store.close()
+        return {
+            "templates": [
+                {"id": template_id, "changes": changes, "updated_at": at}
+                for template_id, (changes, at) in kept.items()
+            ]
+        }
+
+    @app.get("/api/agent-templates/public")
+    def public_agent_templates() -> Any:
+        """The same changes, as someone not signed in may know them.
+
+        For a page that lists the templates before sign-up: whether each is
+        offered and what its agent is set up with, so the page cannot offer one
+        the operator withdrew. Never the operator's words (`public_view`).
+        """
+        from flotta.agent_templates import public_view
+
+        store = store_factory()
+        try:
+            kept = store.agent_templates()
+        finally:
+            store.close()
+        shown = {template_id: public_view(changes) for template_id, (changes, _) in kept.items()}
+        return {
+            "templates": [
+                {"id": template_id, "changes": changes}
+                for template_id, changes in shown.items()
+                if changes
+            ]
+        }
+
+    @app.put("/api/agent-templates/{template_id}")
+    def put_agent_template(
+        template_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Keep the operator's changes to one template: `{"changes": {...}}`.
+
+        The changes given replace the ones kept: a part left out goes back to
+        what the front end ships. Each part is checked against the limit of the
+        route that later applies it, so a saved template can make an agent.
+        Nothing left to keep clears the template, which is `DELETE`.
+
+        Agents already made are not touched: a template is where an agent
+        starts, and its instructions and rules are its own from then on.
+        """
+        _require_operator(token, "change an agent template")
+        from flotta.agent_templates import AgentTemplateError, parse_changes
+        from flotta.store import InvalidBoxMetaError, validate_template
+
+        if not isinstance(body, dict) or set(body) != {"changes"}:
+            raise HTTPException(status_code=422, detail='expected {"changes": {...}}')
+        try:
+            name = validate_template(template_id)
+            changes = parse_changes(body["changes"])
+        except (AgentTemplateError, InvalidBoxMetaError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if name is None:
+            raise HTTPException(status_code=422, detail="a template has a name")
+        store = store_factory()
+        try:
+            if not changes:
+                store.clear_agent_template(name)
+                return {"id": name, "changes": {}, "updated_at": None}
+            at = store.set_agent_template(name, changes)
+        finally:
+            store.close()
+        return {"id": name, "changes": changes, "updated_at": at}
+
+    @app.delete("/api/agent-templates/{template_id}")
+    def delete_agent_template(template_id: str, token: Token | None = needs_write) -> Any:
+        """Forget the operator's changes to one template: it is the front end's again."""
+        _require_operator(token, "change an agent template")
+        store = store_factory()
+        try:
+            cleared = store.clear_agent_template(template_id)
+        finally:
+            store.close()
+        return {"id": template_id, "cleared": cleared}
 
     @app.put("/api/mcp/servers/{server}/client-secret")
     def set_mcp_client_secret(
@@ -5527,7 +5929,9 @@ def create_app(
     def put_mcp_grants(box_id: str, body: dict[str, Any], token: Token | None = needs_write) -> Any:
         """Replace an agent's grants: in force at the gateway at once, then written to it.
 
-        `written: false` says the agent's config is behind (`provision.set_mcp_grants`).
+        `written: false` says the agent's config is behind (`provision.set_mcp_grants`),
+        and `pending: true` that it will be written without another save: `waits_for`
+        is `created` for an agent still being created, `woken` for one that is down.
         """
         from flotta.mcp import parse_grants
         from flotta.provision import ProvisionError, set_mcp_grants
@@ -6049,6 +6453,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "a screen")
             store.set_clients_control_screen(box.id, allowed)
             store.add_event(
                 "box",
@@ -6094,6 +6499,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "choosing its model")
             went_ahead = _refuse_screen_held(
                 store, box, token, force=force, verb="change the model of"
             )
@@ -6322,6 +6728,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "a screen")
             went_ahead = _refuse_screen_held(
                 store, box, token, force=force, verb="change the screen of"
             )
@@ -6490,6 +6897,7 @@ def create_app(
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
+            _refuse_custom(box, "moving it on or off the gateway")
             if not _is_operator(token):
                 raise HTTPException(
                     status_code=403, detail="only the fleet's operator may move an agent"
@@ -6618,6 +7026,37 @@ def create_app(
         finally:
             store.close()
 
+    @app.put("/api/boxes/{box_id}/image")
+    def set_image_endpoint(
+        box_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Move a custom agent onto another of the agency's images: `{"image": "..."}` (M17.1).
+
+        Its disk is kept; the timeline's `reimaged` says what it ran before,
+        which is the way back. A Hermes agent is 409: its image is the fleet's.
+        Synchronous, like an upgrade, and for the same reason it is a known
+        limit: a running agent restarts.
+        """
+        from flotta.provision import ProvisionError, UpgradeFailed, set_custom_image
+
+        image = (body or {}).get("image")
+        store = store_factory()
+        try:
+            box = _scoped_box(store, token, box_id)
+            try:
+                result = set_custom_image(
+                    box.id, image if isinstance(image, str) else "", store=store
+                )
+            except UpgradeFailed as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except CustomRuntimeRefused:
+                raise
+            except ProvisionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"box": _with_meta(store, _scoped_box(store, token, box.id)), **result}
+        finally:
+            store.close()
+
     @app.post("/api/boxes/{box_id}/upgrade")
     def upgrade_box_endpoint(
         box_id: str,
@@ -6675,6 +7114,7 @@ def create_app(
         store = store_factory()
         try:
             box = _operated_box(store, token, box_id)
+            _refuse_custom(box, "an upgrade onto the fleet's image (change its image instead)")
             went_ahead = _refuse_screen_held(store, box, token, force=force, verb="re-image")
             if background:
                 started = _upgrade_in_background(box, image)
@@ -7013,6 +7453,99 @@ def create_app(
             shown = viewer and store.client_spend_shown(org, client_id)
             return {
                 "runs": [_run_view(r, costs[r.id], viewer=viewer, spend_shown=shown) for r in runs]
+            }
+        finally:
+            store.close()
+
+    @app.get("/api/runs")
+    def list_org_runs(
+        limit: int = 50,
+        since: str | None = None,
+        status: str | None = None,
+        token: Token | None = needs_read,
+    ) -> Any:
+        """The caller's agency's runs, across its clients and agents, newest
+        first, each with what it cost (FLOTTA-250); `?since=` and `?status=` as
+        an agent's and a client's lists take them, so `?status=pending,running`
+        is the work under way and waiting. For someone confined to a client,
+        that client's runs and no other's."""
+        org = (token.org if token else None) or DEFAULT_ORG
+        client = token.client if token is not None else None
+        viewer = _run_reader(token, portal=True)
+        after = _runs_since(since)
+        statuses = _runs_status(status)
+        store = store_factory()
+        try:
+            runs = store.list_runs(
+                org=org,
+                client=client,
+                since=after,
+                statuses=statuses,
+                limit=min(limit, 200),
+                exclude_kinds=VIEWER_HIDDEN_KINDS if viewer else (),
+            )
+            costs = store.run_costs(runs)
+            shown = viewer and client is not None and store.client_spend_shown(org, client)
+            return {
+                "runs": [_run_view(r, costs[r.id], viewer=viewer, spend_shown=shown) for r in runs]
+            }
+        finally:
+            store.close()
+
+    def _run_about(store: Any, run: Any) -> str:
+        """A run in a line: its request's title, else the first line it was given."""
+        about = ""
+        if run.trigger_kind == "request" and run.trigger_id:
+            request = store.box_request(run.box_id, run.trigger_id)
+            about = request.title if request is not None else ""
+        if run.trigger_kind == "notice" and isinstance(run.input, dict):
+            notice = run.input.get("notice")
+            about = str(notice.get("headline") or "") if isinstance(notice, dict) else ""
+        if not about:
+            lines = (line.strip() for line in run.prompt.splitlines())
+            about = next((line for line in lines if line), "")
+        return about[:160]
+
+    @app.get("/api/working")
+    def list_working(box: str | None = None, token: Token | None = needs_read) -> Any:
+        """What each of the caller's agents is doing now (FLOTTA-250): one entry
+        per agent with a run under way, `?box=` for one agent. An agent not
+        listed is doing nothing: asleep, or awake and idle.
+
+        A conversation's turn is said to be one and no more: what was said in
+        it is on the agent's machine and is not this route's to repeat. A
+        client's viewer (D29) is told of no conversation, and never what the
+        agency asked for, as in the runs they read."""
+        org = (token.org if token else None) or DEFAULT_ORG
+        client = token.client if token is not None else None
+        viewer = _run_reader(token, portal=True)
+        store = store_factory()
+        try:
+            one = _scoped_box(store, token, box) if box is not None else None
+            names = {b.id: b.name for b in _scoped_boxes(store, token)}
+            runs = store.list_runs(
+                org=org,
+                client=client,
+                box=one.id if one is not None else None,
+                statuses=("running",),
+                limit=500,
+                exclude_kinds=VIEWER_HIDDEN_KINDS if viewer else (),
+            )
+            return {
+                "working": [
+                    {
+                        "box_id": run.box_id,
+                        "box": names.get(run.box_id),
+                        "client": run.client,
+                        "run_id": run.id,
+                        "trigger_kind": run.trigger_kind,
+                        "about": None
+                        if viewer
+                        else ("" if run.trigger_kind == "chat" else _run_about(store, run)),
+                        "started_at": run.started_at,
+                    }
+                    for run in runs
+                ]
             }
         finally:
             store.close()
@@ -8292,6 +8825,11 @@ def create_app(
                 "pull_request_merged",
                 {"repo": pr.repo, "number": pr.number, "by": who, "method": method, "in": "flotta"},
             )
+            # The agency merged it here, so the sweep never sees it change: tell
+            # the agent now (FLOTTA-273).
+            from flotta import notices
+
+            notices.pull_request_settled(store, pr, by=who)
             return {"pull_request": pulls.view(store, pr)}
         finally:
             store.close()
@@ -8488,7 +9026,8 @@ def create_app(
         """The agency's answer to a waiting request: `{"approve": true|false, "note": "…"}`.
 
         Approved, the work becomes a run on the agent, with the note; declined,
-        the note is kept for the agent to pass on when the person asks.
+        the note is kept. Either way the agent is told at once, in the
+        conversation it was asked in (`flotta.notices`, FLOTTA-273).
         """
         from flotta import work_requests
 
@@ -8507,6 +9046,11 @@ def create_app(
                 decided = store.decide_request(found.id, approve=approve, by=who, note=note)
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # Told in the conversation it was asked in (FLOTTA-273), before its
+            # work is queued, so the notice is not left waiting behind the work.
+            from flotta import notices
+
+            notices.request_decided(store, decided)
             if approve:
                 try:
                     run = store.create_run(
@@ -8581,6 +9125,7 @@ def create_app(
         store = store_factory()
         try:
             box = _scoped_box(store, token, box_id)
+            _refuse_custom(box, "a handoff on its screen")
             confine_to_box(token, box, "hand over the screen of")
             if not box.screen:
                 raise HTTPException(
@@ -8924,8 +9469,25 @@ def create_app(
                     "status": box.status,
                     "org": box.org,
                     "client": box.client,
+                    # Whether the door speaks Hermes or the box contract (M17.2).
+                    "runtime": box.runtime,
                 }
             }
+        finally:
+            store.close()
+
+    @app.get("/api/boxes/{box_id}/conversation-model")
+    def conversation_model(box_id: str, token: Token | None = needs_fleet_route) -> Any:
+        """The one model a client's conversation may move onto (FLOTTA-128).
+
+        The front door's alone, asked only when a client asks to move: not on
+        `/address`, which every request resolves through and a person's
+        `box:chat` token reads, since the model is how the agency runs it.
+        """
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            return {"box_id": box.id, "model": _model_of(store, box.id)}
         finally:
             store.close()
 
@@ -8950,6 +9512,35 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/boxes/{box_id}/chat-conversations")
+    def chat_conversations(
+        box_id: str, by: str | None = None, token: Token | None = needs_fleet_route
+    ) -> Any:
+        """The conversations people have had with this agent, newest first (FLOTTA-276).
+
+        The front door's alone: what it answers the agency's `session.most_recent`
+        with, so a page opens the person's own conversation and never the session
+        a run made. `mine` is whether `by` (the door's ticket subject) spoke in it
+        at all, and `root` the id it began under when the door heard it, which
+        is what Hermes lists a conversation compressed since under. Who else
+        spoke is not said: the door needs only which.
+        """
+        store = store_factory()
+        try:
+            box = _routable_box(store, token, box_id)
+            return {
+                "conversations": [
+                    {
+                        "id": session_id,
+                        **({"root": root} if root else {}),
+                        "mine": bool(by) and by in who,
+                    }
+                    for session_id, root, who in store.chat_conversations(box.id)
+                ]
+            }
+        finally:
+            store.close()
+
     @app.get("/api/boxes/{box_id}/working")
     def box_working(box_id: str, token: Token | None = needs_fleet_route) -> Any:
         """The run this agent is doing now, if it isn't a conversation's turn
@@ -8962,18 +9553,11 @@ def create_app(
             run = store.live_run(box.id)
             if run is None or run.trigger_kind == "chat":
                 return {"working": None}
-            about = ""
-            if run.trigger_kind == "request" and run.trigger_id:
-                request = store.box_request(box.id, run.trigger_id)
-                about = request.title if request is not None else ""
-            if not about:
-                lines = (line.strip() for line in run.prompt.splitlines())
-                about = next((line for line in lines if line), "")
             return {
                 "working": {
                     "run_id": run.id,
                     "trigger_kind": run.trigger_kind,
-                    "about": about[:160],
+                    "about": _run_about(store, run),
                 }
             }
         finally:
@@ -9123,9 +9707,11 @@ def create_app(
     def open_chat_run(
         box_id: str, body: dict[str, Any], token: Token | None = needs_fleet_route
     ) -> Any:
-        """`{prompt, session_id, by, client, started_at, stored_session_id?}`: a turn
-        began; `stored_session_id` is the conversation it is listed and opened
-        by, when the door heard which (FLOTTA-173). 409 while the agent
+        """`{prompt, session_id, by, client, started_at, stored_session_id?,
+        conversation_root?}`: a turn began; `stored_session_id` is the
+        conversation it is listed and opened by, when the door heard which
+        (FLOTTA-173), and `conversation_root` the id that conversation began
+        under, when it was compressed and the door heard that (FLOTTA-276). 409 while the agent
         is doing another run, and the turn is then not recorded: its model
         calls belong to that run (`FleetStore._run_for_call`)."""
         session_id, by = body.get("session_id"), body.get("by")
@@ -9134,11 +9720,12 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail=f"{name} is a name of 1 to 200 characters"
                 )
-        stored = body.get("stored_session_id")
-        if stored is not None and (not isinstance(stored, str) or not 0 < len(stored) <= 200):
-            raise HTTPException(
-                status_code=422, detail="stored_session_id is a name of 1 to 200 characters"
-            )
+        stored, root = body.get("stored_session_id"), body.get("conversation_root")
+        for name, value in (("stored_session_id", stored), ("conversation_root", root)):
+            if value is not None and (not isinstance(value, str) or not 0 < len(value) <= 200):
+                raise HTTPException(
+                    status_code=422, detail=f"{name} is a name of 1 to 200 characters"
+                )
         prompt = body.get("prompt")
         prompt = prompt if isinstance(prompt, str) and prompt.strip() else CHAT_NO_PROMPT
         started_at = _door_time(body.get("started_at"), "started_at")
@@ -9154,6 +9741,7 @@ def create_app(
                         "by": by,
                         "client": bool(body.get("client")),
                         **({"stored_session_id": stored} if stored else {}),
+                        **({"conversation_root": root} if stored and root else {}),
                     },
                     started_at=started_at,
                 )
@@ -9352,8 +9940,8 @@ def create_app(
             # closes with as 4402 and the control plane's words; the web app tells
             # them apart by the org's status on `/api/me`.
             owner = store.get_org(box.org)
-            if owner is not None and owner.status == "suspended":
-                raise HTTPException(status_code=402, detail=suspended_wake_message(box, owner.id))
+            if owner is not None and owner.held:
+                raise HTTPException(status_code=402, detail=suspended_wake_message(box, owner))
             if box.status == "paused":
                 raise HTTPException(
                     status_code=402, detail=paused_message(store, box, datetime.now(UTC))
@@ -9430,6 +10018,376 @@ def create_app(
             return {"box": _box_dict(_scoped_box(store, token, box.id)), **result}
         finally:
             store.close()
+
+    # -- the Architect (FLOTTA-250, `flotta.architect`) ---------------------------
+    #
+    # An assistant for an agency's own people, in a front end: it answers about
+    # the account with the fleet API's tools (`POST /mcp`). Its model calls are
+    # made at the gateway, on the fleet's key and an allowance per org. These
+    # routes hand a signed-in person the ticket for that, and say what it cost.
+
+    def _architect_person(token: Token | None) -> tuple[str, str]:
+        """`(user id, org)` of the signed-in person asking, or 403.
+
+        A person, because the allowance is an agency's people's and its spend
+        names who asked: a token an owner minted for a script is neither.
+        """
+        subject = token.subject if token is not None else ""
+        if not subject.startswith(USER_SUBJECT_PREFIX):
+            raise HTTPException(
+                status_code=403, detail="the Architect is for a signed-in person of an agency"
+            )
+        assert token is not None
+        return subject[len(USER_SUBJECT_PREFIX) :], token.org or DEFAULT_ORG
+
+    architect_state: dict[str, Any] = {}
+
+    def _architect_row(**row: Any) -> None:
+        store = store_factory()
+        try:
+            store.record_architect_usage(**row)
+        finally:
+            store.close()
+
+    @app.post("/api/architect/completions")
+    async def architect_completions(request: Request, token: Token | None = needs_write) -> Any:
+        """One model call for the Architect: an OpenAI chat completion, streamed
+        or whole, with the conversation's `messages` and the `tools` it may call.
+
+        For the web app's server, acting for a signed-in person of an agency who
+        can change things: an owner or a builder. Not a client's people, and not
+        while viewing an agency as its owner.
+
+        - **The model is the operator's** (`FLOTTA_ARCHITECT_MODEL`, else the
+          model for new agents), whatever the body names, and an answer is at
+          most `architect.MAX_OUTPUT` tokens.
+        - **The fleet pays, on an allowance.** The call is made with
+          `$FLOTTA_ARCHITECT_API_KEY`, and the org's month is checked before
+          anything is sent: used up is a 402 with `code` and `allowance`, and so
+          is anything that would leave the call uncounted.
+        - **What it cost is written to `architect_usage`**, never to `usage`,
+          which is what the agency's budgets and invoice add up.
+        """
+        import json as jsonlib
+        import os
+        import uuid
+
+        import httpx
+        from fastapi.responses import JSONResponse
+
+        from flotta import architect
+        from flotta.gateway import app as gateway
+        from flotta.inference import is_openrouter
+
+        user_id, org_id = _architect_person(token)
+        provider_key = (os.environ.get(architect.KEY_ENV) or "").strip()
+        base_url = (os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip().rstrip("/")
+        if not provider_key or not base_url:
+            raise HTTPException(
+                status_code=503,
+                detail="the fleet's operator has not set the Architect up: it has no model key",
+            )
+        started = time.monotonic()
+        try:
+            payload = jsonlib.loads(await request.body(), object_pairs_hook=gateway._no_repeats)
+            architect.shaped(payload, "unchosen")
+        except architect.BadCall as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="expected a JSON body, with no repeated keys"
+            ) from exc
+        refused = gateway._refused_field(payload)
+        if refused is not None:
+            raise HTTPException(
+                status_code=400, detail=f"the Architect's route adds nothing to a call: {refused!r}"
+            )
+        reported = is_openrouter(base_url)
+
+        def verdict_of() -> Any:
+            store = store_factory()
+            try:
+                return architect.admit(
+                    store, org_id, now=datetime.now(UTC), cost_is_reported=reported
+                )
+            finally:
+                store.close()
+
+        try:
+            verdict = await asyncio.to_thread(verdict_of)
+        except Exception:
+            _log.exception("the Architect's allowance could not be checked")
+            verdict = architect.unchecked()
+        if isinstance(verdict, architect.Refusal):
+            return JSONResponse(verdict.body(), status_code=verdict.status)
+
+        sent = architect.shaped(payload, verdict.model)
+        raw = jsonlib.dumps(sent).encode()
+        call = uuid.uuid4().hex
+        if "client" not in architect_state:
+            architect_state["client"] = httpx.AsyncClient(
+                transport=architect_transport, timeout=gateway._TIMEOUT, trust_env=False
+            )
+            architect_state["ledger"] = gateway._Ledger(_architect_row)
+
+        def write(status: int, *, usage: Any = None, chars: int | None = None) -> None:
+            counted = gateway._reported(usage)
+            if counted is not None:
+                tokens = counted
+            elif chars is None:
+                tokens = (0, 0, 0)
+            else:
+                tokens = (
+                    gateway._estimated_tokens(len(raw)),
+                    gateway._estimated_tokens(chars),
+                    0,
+                )
+            _log.info(
+                "architect call for %s: %s, %d in, %d out, %d ms",
+                org_id,
+                status,
+                tokens[0],
+                tokens[1],
+                int((time.monotonic() - started) * 1000),
+            )
+            architect_state["ledger"].write(
+                org=org_id,
+                user_id=user_id,
+                model=verdict.model,
+                upstream="openrouter" if reported else "custom",
+                tokens_in=tokens[0],
+                tokens_out=tokens[1],
+                tokens_cached=tokens[2],
+                idempotency_key=call,
+                eur_per_usd=verdict.eur_per_usd,
+                status=status,
+                estimated=counted is None and chars is not None,
+                # Only OpenRouter's: nothing says what another endpoint's field means.
+                reported_cost_nano=gateway._reported_cost(usage) if reported else None,
+                now=datetime.now(UTC),
+            )
+
+        return await gateway.send_metered(
+            architect_state["client"],
+            url=f"{base_url}/chat/completions",
+            headers={
+                "authorization": f"Bearer {provider_key}",
+                "content-type": "application/json",
+                # Usage is read out of the body, so it has to arrive readable.
+                "accept-encoding": "identity",
+            },
+            payload=sent,
+            raw=raw,
+            key=provider_key,
+            write=write,
+        )
+
+    @app.get("/api/architect/allowance")
+    def architect_allowance(token: Token | None = needs_read) -> Any:
+        """Where the caller's agency's Architect allowance stands this month:
+        what it may use, what it has, and when the month turns. For the
+        agency's own people; a client's people are not told what it costs."""
+        if token is not None and not (
+            token.allows(SCOPE_FLEET_WRITE) or token.allows(SCOPE_ORG_ADMIN)
+        ):
+            raise HTTPException(
+                status_code=403, detail="the Architect's allowance is the agency's to see"
+            )
+        from flotta import architect
+
+        org_id = (token.org if token else None) or DEFAULT_ORG
+        store = store_factory()
+        try:
+            return architect.standing(store, org_id, now=datetime.now(UTC)).as_dict()
+        finally:
+            store.close()
+
+    @app.get("/api/architect/spend")
+    def architect_spend(token: Token | None = needs_read) -> Any:
+        """What every agency's Architect has cost this month, for whoever pays
+        for it: one entry per org that made a call, and the allowance each has.
+
+        And whether it can answer at all (`ready`): it needs a model key of its
+        own (`has_key`, never the key), somewhere to send calls, and a model.
+        Without them it has cost nothing because it has answered nobody, and a
+        page that showed only the nothing would be hiding why."""
+        _require_operator(token, "read what the Architect costs across the fleet")
+        from flotta import architect
+        from flotta.budgets import period_start
+        from flotta.settings import architect_monthly_eur_nano
+
+        now = datetime.now(UTC)
+        since = period_start("month", now)
+        store = store_factory()
+        try:
+            by_org = store.architect_spend_by_org(since=since)
+            allowance = architect_monthly_eur_nano(store)
+            model = architect.model_for(store)
+        finally:
+            store.close()
+        has_key = bool((os.environ.get(architect.KEY_ENV) or "").strip())
+        has_url = bool((os.environ.get("FLOTTA_MODEL_BASE_URL") or "").strip())
+        return {
+            "since": since.isoformat(),
+            "allowance_eur_nano": allowance,
+            "model": model,
+            "has_key": has_key,
+            "ready": has_key and has_url and model is not None,
+            "orgs": [
+                {
+                    "org": org_id,
+                    "spent_eur_nano": spend.eur_nano,
+                    "unpriced": spend.unpriced,
+                    "calls": calls,
+                }
+                for org_id, (spend, calls) in by_org.items()
+            ],
+        }
+
+    # A person's chats with the Architect (FLOTTA-250): theirs alone. Nobody else
+    # in the agency reads one, the operator included, and a session viewing an
+    # agency keeps none: it holds no `fleet:write`, which every one of these asks.
+
+    def _architect_chat_view(chat: Any, messages: Any = None) -> dict[str, Any]:
+        import json as jsonlib
+
+        view: dict[str, Any] = {
+            "id": chat.id,
+            "title": chat.title,
+            "created_at": chat.created_at,
+            "updated_at": chat.updated_at,
+        }
+        if messages is not None:
+            view["messages"] = [
+                {
+                    "id": m.id,
+                    "seq": m.seq,
+                    "role": m.role,
+                    "content": jsonlib.loads(m.content),
+                    "created_at": m.created_at,
+                }
+                for m in messages
+            ]
+        return view
+
+    @app.get("/api/architect/chats")
+    def list_architect_chats(
+        q: str | None = None, limit: int = 50, token: Token | None = needs_write
+    ) -> Any:
+        """The caller's own chats with the Architect in this agency, the one last
+        added to first; `?q=` those whose title holds it. Never their messages."""
+        user_id, org_id = _architect_person(token)
+        store = store_factory()
+        try:
+            chats = store.architect_chats(
+                org_id, user_id, q=(q or "").strip() or None, limit=min(max(limit, 1), 200)
+            )
+        finally:
+            store.close()
+        return {"chats": [_architect_chat_view(c) for c in chats]}
+
+    @app.post("/api/architect/chats", status_code=201)
+    def create_architect_chat(body: dict[str, Any], token: Token | None = needs_write) -> Any:
+        """Start a chat: `{"title"?: "..."}`. Empty until messages are added."""
+        from flotta import architect
+        from flotta.store import ArchitectChatFullError
+
+        user_id, org_id = _architect_person(token)
+        if not isinstance(body, dict) or set(body) - {"title"}:
+            raise HTTPException(status_code=422, detail='expected {"title"?: "..."}')
+        try:
+            title = architect.chat_title(body.get("title"))
+        except architect.BadChat as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            chat = store.create_architect_chat(
+                org_id, user_id, title, limit=architect.CHATS_PER_PERSON
+            )
+        except ArchitectChatFullError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return _architect_chat_view(chat, [])
+
+    @app.get("/api/architect/chats/{chat_id}")
+    def get_architect_chat(chat_id: str, token: Token | None = needs_write) -> Any:
+        """One of the caller's chats, with everything said in it, in order."""
+        user_id, org_id = _architect_person(token)
+        store = store_factory()
+        try:
+            chat = store.architect_chat(org_id, user_id, chat_id)
+            if chat is None:
+                raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}")
+            return _architect_chat_view(chat, store.architect_messages(chat.id))
+        finally:
+            store.close()
+
+    @app.patch("/api/architect/chats/{chat_id}")
+    def rename_architect_chat(
+        chat_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Name one of the caller's chats: `{"title": "..."}`."""
+        from flotta import architect
+
+        user_id, org_id = _architect_person(token)
+        if not isinstance(body, dict) or set(body) != {"title"}:
+            raise HTTPException(status_code=422, detail='expected {"title": "..."}')
+        try:
+            title = architect.chat_title(body["title"])
+        except architect.BadChat as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            if not store.rename_architect_chat(org_id, user_id, chat_id, title):
+                raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}")
+            chat = store.architect_chat(org_id, user_id, chat_id)
+        finally:
+            store.close()
+        return _architect_chat_view(chat)
+
+    @app.post("/api/architect/chats/{chat_id}/messages", status_code=201)
+    def add_architect_messages(
+        chat_id: str, body: dict[str, Any], token: Token | None = needs_write
+    ) -> Any:
+        """Add a turn to one of the caller's chats: `{"messages": [{"role",
+        "content"}, ...]}`, all or none. `content` is any JSON and is kept as
+        given: the control plane does not read what was said."""
+        from flotta import architect
+        from flotta.store import ArchitectChatFullError
+
+        user_id, org_id = _architect_person(token)
+        if not isinstance(body, dict) or set(body) != {"messages"}:
+            raise HTTPException(status_code=422, detail='expected {"messages": [...]}')
+        try:
+            messages = architect.chat_messages(body["messages"])
+        except architect.BadChat as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            added = store.append_architect_messages(
+                org_id, user_id, chat_id, messages, limit=architect.MESSAGES_PER_CHAT
+            )
+            chat = store.architect_chat(org_id, user_id, chat_id)
+        except UnknownEntityError as exc:
+            raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}") from exc
+        except ArchitectChatFullError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            store.close()
+        return _architect_chat_view(chat, added)
+
+    @app.delete("/api/architect/chats/{chat_id}")
+    def delete_architect_chat(chat_id: str, token: Token | None = needs_write) -> Any:
+        """Delete one of the caller's chats, and everything said in it."""
+        user_id, org_id = _architect_person(token)
+        store = store_factory()
+        try:
+            if not store.delete_architect_chat(org_id, user_id, chat_id):
+                raise HTTPException(status_code=404, detail=f"no chat {chat_id!r}")
+        finally:
+            store.close()
+        return {"deleted": chat_id}
 
     @app.post("/api/boxes/{box_id}/ticket")
     def chat_ticket(box_id: str, token: Token | None = needs_chat) -> Any:
@@ -9516,6 +10474,69 @@ def create_app(
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
         finally:
             store.close()
+
+    # -- the fleet API as MCP tools (FLOTTA-250) --------------------------------
+    #
+    # What an assistant acting for a signed-in person may ask of an agency's
+    # account (`control/fleet_mcp.py`). Each tool is one of the routes above,
+    # called in-process with the caller's own `Authorization`, so it can do
+    # what that person's click could and nothing else. Nothing here reads the
+    # store: the routes do. A `GET` is a 405, which is how an MCP server says
+    # it opens no stream.
+
+    @app.post("/mcp")
+    async def fleet_mcp(
+        request: Request,
+        token: Token | None = needs_read,
+        authorization: str | None = Header(default=None),
+        origin: str | None = Header(default=None),
+    ) -> Any:
+        """One JSON-RPC message in, one JSON object out: the fleet API's tools.
+
+        A browser has no business here, so a request that names an origin other
+        than the web app's is refused, as the MCP transport requires against
+        DNS rebinding. The web app's own server sends none.
+
+        For whoever may read the fleet. Every tool is a route called as the
+        caller, which would refuse what they may not see; but a credential made
+        for one job (an agent's API key, billing's `org:govern`) reaches no
+        route but its own, and this is not one of them.
+        """
+        import httpx
+        from fastapi.responses import JSONResponse, Response
+
+        from flotta.control import fleet_mcp as tools
+
+        if origin is not None and origin.rstrip("/") != (link_base or "").rstrip("/"):
+            return JSONResponse(
+                tools.rpc_error(None, -32600, "not from an origin this server knows"),
+                status_code=403,
+            )
+        try:
+            message = await request.json()
+        except ValueError:
+            return JSONResponse(tools.rpc_error(None, -32700, "not JSON"), status_code=400)
+
+        async def call_route(
+            method: str, path: str, query: dict[str, str], body: dict[str, Any] | None
+        ) -> tuple[int, Any]:
+            # As the caller, and only as the caller: the one header that says who they are.
+            headers = {"authorization": authorization} if authorization else {}
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://control") as inner:
+                answer = await inner.request(method, path, params=query, headers=headers, json=body)
+            try:
+                return answer.status_code, answer.json()
+            except ValueError:
+                return answer.status_code, None
+
+        # Whose account a tool reads is the caller's own agency, from their
+        # credential and never from an argument: no tool takes an org.
+        org = (token.org if token is not None else None) or DEFAULT_ORG
+        status, body = await tools.handle(message, call_route=call_route, org=org)
+        if body is None:
+            return Response(status_code=status)
+        return JSONResponse(body, status_code=status)
 
     return app
 

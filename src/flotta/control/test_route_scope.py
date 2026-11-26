@@ -106,6 +106,11 @@ OPERATOR_ROUTES = frozenset(
         "list_fleet_boxes",
         # The connector library writes the fleet catalogue (FLOTTA-225).
         "add_mcp_from_library",
+        # What every agency's new agents start with (FLOTTA-269).
+        "put_agent_template",
+        "delete_agent_template",
+        # What every agency's Architect has cost the fleet (FLOTTA-250).
+        "architect_spend",
     }
 )
 
@@ -122,7 +127,17 @@ CONFIG_READS = frozenset({"list_models", "list_mcp_servers", "list_mcp_library"}
 #: A webhook (M14.4) is called by a client's system holding the trigger's
 #: secret, not a token; it reaches a trigger only through `_hooked_trigger`.
 OPEN_ROUTES = frozenset(
-    {"health", "request_link", "redeem_link", "sign_up", "mcp_oauth_callback", "receive_hook"}
+    {
+        "health",
+        "request_link",
+        "redeem_link",
+        "sign_up",
+        "mcp_oauth_callback",
+        "receive_hook",
+        # What a visitor may know of the operator's templates before signing up
+        # (FLOTTA-269): whether each is offered and what it sets up, never its words.
+        "public_agent_templates",
+    }
 )
 
 #: The routes not yet scoped. May only shrink — and is empty since M11.6b.
