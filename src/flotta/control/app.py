@@ -119,6 +119,7 @@ from flotta.store import (
     DuplicateMembershipError,
     DuplicateTenantError,
     FleetStore,
+    FoundingClosedError,
     InvalidAccountError,
     InvalidImageError,
     InvalidTenantError,
@@ -2966,8 +2967,17 @@ def create_app(
         store = store_factory()
         try:
             _org_or_404(store, org_id)
+            # Billing's invoice leaves out a founding trial's model use. The
+            # agency's own read still shows it.
             return report(
-                store, org_id, since=since, until=until, group=groups, client=client, box=box
+                store,
+                org_id,
+                since=since,
+                until=until,
+                group=groups,
+                client=client,
+                box=box,
+                billed_only=token is not None and is_governor(token),
             )
         finally:
             store.close()
@@ -3169,6 +3179,78 @@ def create_app(
             if minted:
                 answer["webhook_secret"] = webhook_secret(key, org_id, nonce)
             return answer
+        finally:
+            store.close()
+
+    @app.post("/api/orgs/{org_id}/funnel")
+    def record_funnel(
+        org_id: str, body: dict[str, Any], token: Token | None = needs_limits_write
+    ) -> Any:
+        """Billing records checkout and the first paid invoice for the funnel.
+
+        `{"event": "checkout_started"|"subscription_started", "plan", "interval"}`,
+        and `amount_eur` on the subscription. The owner's email is the distinct
+        id, so these join the sign-up. The operator or `org:govern`; an agency
+        cannot record its own. A founding subscription's first paid invoice
+        also starts the 12 months at EUR 149.
+        """
+        if not (_is_operator(token) or (token is not None and is_governor(token))):
+            raise HTTPException(
+                status_code=403,
+                detail="only the fleet's operator, or its billing, may record this",
+            )
+        from flotta.analytics import funnel
+        from flotta.founding import (
+            FOUNDING_PLAN,
+            INTERVALS,
+            PLAN_INTENTS,
+            AttributionError,
+            amount_value,
+            parse_amount_eur,
+        )
+
+        event = body.get("event")
+        plan, interval = body.get("plan"), body.get("interval")
+        if event not in ("checkout_started", "subscription_started"):
+            raise HTTPException(
+                status_code=422, detail="event is checkout_started or subscription_started"
+            )
+        if not isinstance(plan, str) or plan not in PLAN_INTENTS:
+            raise HTTPException(status_code=422, detail="plan is founding, studio or agency")
+        if not isinstance(interval, str) or interval not in INTERVALS:
+            raise HTTPException(status_code=422, detail="interval is month or year")
+        if plan == FOUNDING_PLAN and interval != "month":
+            raise HTTPException(status_code=422, detail="Founding Studio is monthly")
+        amount = None
+        if event == "subscription_started":
+            try:
+                amount = amount_value(parse_amount_eur(body.get("amount_eur")))
+            except AttributionError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = store_factory()
+        try:
+            org = _org_or_404(store, org_id)
+            email = store.owner_email(org.id)
+            if email is None:
+                raise HTTPException(
+                    status_code=409, detail="this org has no owner to attribute the event to"
+                )
+            if event == "subscription_started":
+                org, started = store.note_founding_paid(org.id)
+                # A founding invoice delivered twice must not count twice.
+                # Other plans have no price lock here; the caller posts once.
+                if org.plan == FOUNDING_PLAN and not started:
+                    return {"recorded": False, "event": event, "price_until": org.price_until}
+            funnel(
+                email,
+                event,
+                plan=plan,
+                interval=interval,
+                org_id=org.id,
+                amount_eur=amount,
+                visitor=org.visitor_id,
+            )
+            return {"recorded": True, "event": event, "price_until": org.price_until}
         finally:
             store.close()
 
@@ -3463,30 +3545,42 @@ def create_app(
     ) -> Any:
         """Email a link that creates an agency: `{"email", "org", "org_name"}`.
 
+        Optional, and not in the email: `plan` (`founding`, `studio`, `agency`),
+        `interval` (`month` or `year`), `utm_source`, `utm_medium`, `utm_campaign`
+        and `visitor` (the website's anonymous id). Founding Studio is monthly,
+        hidden, and limited to five agencies.
+
         The org is made when the link is redeemed, which proves the address,
         and made `pending`: it can sign in and invite its team, and creates no
-        agent until the operator approves it.
+        agent until it is approved. On a self-hosted fleet the operator
+        approves it. The managed product's billing does, once the agency
+        starts a plan.
 
         Like asking for a sign-in link, always `202` and the same limits, so
         it says nothing about who has an account; someone who already belongs
         to an org gets a sign-in link instead. What it does say is whether the
         org id is free, which is no secret: org ids are in agents' hostnames.
+        A full Founding Studio says so too, which is the plan and not the person.
         """
         try:
             email = normalize_email(str(body.get("email") or ""))
         except InvalidAccountError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        from flotta.founding import AttributionError, parse_attribution
         from flotta.store import _tenant_name, validate_tenant_id
 
         try:
             org_id = validate_tenant_id(str(body.get("org") or ""), kind="org")
             org_name = _tenant_name(str(body.get("org_name") or ""), kind="org")
-        except InvalidTenantError as exc:
+            attribution = parse_attribution(body)
+        except (InvalidTenantError, AttributionError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         store = store_factory()
         try:
             if store.get_org(org_id) is not None:
                 raise HTTPException(status_code=409, detail=f"an org {org_id!r} already exists")
+            if attribution.founding and not store.founding_available():
+                raise HTTPException(status_code=409, detail="Founding Studio is full")
         finally:
             store.close()
         caller = _link_caller(request, authorization)
@@ -3496,10 +3590,10 @@ def create_app(
                 detail="too many sign-in links asked for; wait, then ask again",
                 headers={"Retry-After": str(int(LINK_LIMIT_WINDOW_S))},
             )
-        tasks.add_task(_send_sign_up, email, org_id, org_name)
+        tasks.add_task(_send_sign_up, email, org_id, org_name, attribution)
         return {"sent": True}
 
-    def _send_sign_up(email: str, org_id: str, org_name: str) -> None:
+    def _send_sign_up(email: str, org_id: str, org_name: str, attribution: Any = None) -> None:
         """A sign-up link, or a sign-in link for someone who has an org already."""
         if deliver_link is None:
             return
@@ -3515,11 +3609,21 @@ def create_app(
             else:
                 try:
                     secret = store.create_login_link(
-                        email, purpose="sign_up", org_id=org_id, org_name=org_name
+                        email,
+                        purpose="sign_up",
+                        org_id=org_id,
+                        org_name=org_name,
+                        attribution=attribution,
                     )
                 except DuplicateTenantError:
                     return  # taken since the 202; the redeem would refuse it anyway
-                message = sign_up_message(email, sign_in_url(link_base, secret))
+                except FoundingClosedError:
+                    return  # filled since the 409; the redeem would refuse it anyway
+                message = sign_up_message(
+                    email,
+                    sign_in_url(link_base, secret),
+                    trial=attribution is not None and attribution.founding,
+                )
         finally:
             store.close()
         try:
@@ -3666,14 +3770,20 @@ def create_app(
                 status_code=409,
                 detail=f"an org {link.org!r} was created since this link was sent; sign up again",
             )
-        if store.redeem_login_link(offered) is None:
-            raise refused
         try:
-            user, _org, _membership = store.sign_up(link.email, link.org, link.org_name)
+            # The link is spent in the same transaction as the org. A full
+            # Founding Studio or an org id taken since the email leaves the
+            # link unused.
+            created = store.sign_up_from_link(offered)
+            if created is None:
+                raise refused
+            user, _org, _membership = created
             secret = store.create_session(user.id, link.org)
         except InvalidAccountError as exc:
             raise refused from exc
         except DuplicateTenantError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FoundingClosedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         session = store.session(secret)
         assert session is not None
@@ -8857,6 +8967,18 @@ def create_app(
                     "starts": decision.starts,
                 },
             )
+            from flotta.analytics import request_filed
+            from flotta.judge import COMPLEXITY_NAMES
+
+            try:
+                request_filed(
+                    store,
+                    box,
+                    size=COMPLEXITY_NAMES[verdict.complexity] if verdict is not None else None,
+                    auto_started=decision.starts,
+                )
+            except Exception:
+                _log.exception("could not record request_filed for %s", box.id)
             return {
                 "request": work_requests.view(store, filed),
                 "starts": decision.starts,

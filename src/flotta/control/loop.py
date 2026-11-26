@@ -295,6 +295,17 @@ async def run_reconcile_loop(
                 except Exception as exc:
                     _log.warning("suspension sweep failed: %s: %s", type(exc).__name__, exc)
 
+                # Founding Studio prices end 12 months after the first paid
+                # invoice. The owner is told once, from 14 days before.
+                try:
+                    from flotta.founding import send_price_notices
+
+                    noted = send_price_notices(store)
+                    if noted:
+                        _log.info("told %d founding org(s) their price is ending", len(noted))
+                except Exception as exc:
+                    _log.warning("founding price notices failed: %s: %s", type(exc).__name__, exc)
+
                 # Deletions (FLOTTA-224): expired sessions and links, a closed
                 # org's agents if their teardown failed, and a closed org's rows
                 # once its retention period is over. Last, and on its own: a

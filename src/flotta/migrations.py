@@ -1408,6 +1408,41 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        47,
+        "founding studio: plan, attribution, trial window and unbilled usage",
+        # A founding org is one of five. The count is `plan = 'founding'`, so
+        # the plan is a column and not an event. The sign-up link carries the
+        # plan and the campaign the website passed, because the redeem is a
+        # different request, often in another browser, and the email must not
+        # carry them. The trial window is when model use on Flotta's keys is
+        # capped and left off the invoice: those rows are `billed = 0`. The
+        # trial budget is an ordinary month row with `trial_cap`, because the
+        # period check only allows day and month and an old image has to be
+        # able to read the row. `price_until` is 12 months from the first paid
+        # invoice, which is when the note goes out. Numbered after 46: 41 was
+        # already closing an org on main.
+        (
+            "ALTER TABLE login_links ADD COLUMN plan TEXT",
+            "ALTER TABLE login_links ADD COLUMN plan_interval TEXT",
+            "ALTER TABLE login_links ADD COLUMN utm_source TEXT",
+            "ALTER TABLE login_links ADD COLUMN utm_medium TEXT",
+            "ALTER TABLE login_links ADD COLUMN utm_campaign TEXT",
+            "ALTER TABLE login_links ADD COLUMN visitor_id TEXT",
+            "ALTER TABLE orgs ADD COLUMN plan TEXT",
+            "ALTER TABLE orgs ADD COLUMN plan_interval TEXT",
+            "ALTER TABLE orgs ADD COLUMN utm_source TEXT",
+            "ALTER TABLE orgs ADD COLUMN utm_medium TEXT",
+            "ALTER TABLE orgs ADD COLUMN utm_campaign TEXT",
+            "ALTER TABLE orgs ADD COLUMN visitor_id TEXT",
+            "ALTER TABLE orgs ADD COLUMN trial_from TEXT",
+            "ALTER TABLE orgs ADD COLUMN trial_until TEXT",
+            "ALTER TABLE orgs ADD COLUMN price_until TEXT",
+            "ALTER TABLE orgs ADD COLUMN price_notice_at TEXT",
+            "ALTER TABLE budgets ADD COLUMN trial_cap INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage ADD COLUMN billed INTEGER NOT NULL DEFAULT 1",
+        ),
+    ),
 )
 
 
