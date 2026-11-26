@@ -7,8 +7,10 @@ Stripe Price, the Checkout session and the move onto the regular Studio price
 live in the hosted product. What lives here is the cap of five, the trial, and
 the note sent 14 days before the price ends.
 
-A founding place is taken when the org is created, and a later decline does
-not give it back. Five is the whole offer.
+A founding place is taken when the org is approved, which for a self-serve
+agency is when its EUR 0 trial invoice is paid. A pending sign-up and a
+declined one do not take a place. A later suspension or close keeps it:
+five approved founding orgs is the whole offer.
 """
 
 from __future__ import annotations
@@ -27,6 +29,11 @@ PLAN_INTENTS = frozenset({FOUNDING_PLAN, "studio", "agency"})
 INTERVALS = frozenset({"month", "year"})
 FOUNDING_INTERVAL = "month"
 FOUNDING_CAP = 5
+#: Statuses that hold one of the five places. Pending has not been approved
+#: and declined was refused, so neither holds one. Suspended and closed were
+#: approved — the trial invoice was paid, or the operator approved them — and
+#: keep the place. See `FleetStore._founding_count`.
+HELD_STATUSES = ("active", "suspended", "closed")
 FOUNDING_LIMITS = {"clients": 5, "seats": 1, "agents": 15}
 TRIAL_DAYS = 30
 TRIAL_LIMIT_EUR_NANO = 20 * 10**9

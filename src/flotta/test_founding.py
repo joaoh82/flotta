@@ -1,10 +1,10 @@
 """Founding Studio, and the sign-up funnel PostHog records.
 
-Five founding agencies, ever, and two redeems cannot both take the last place
-(the race itself is in `test_store_postgres.py`). A trial caps model use at
-EUR 20 and leaves it off the invoice. `signup_completed`, `agent_created` and
-`request_filed` carry the properties the funnel asks for, and a test address
-is marked `is_test`.
+Five approved founding agencies. Pending and declined orgs take no place, and
+two approvals cannot both take the last one (the race itself is in
+`test_store_postgres.py`). A trial caps model use at EUR 20 and leaves it off
+the invoice. `signup_completed`, `agent_created` and `request_filed` carry the
+properties the funnel asks for, and a test address is marked `is_test`.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flotta import analytics, budgets
-from flotta.auth import SCOPE_BOX_PEER, SCOPE_ORG_GOVERN, box_subject, mint
+from flotta.auth import SCOPE_BOX_PEER, SCOPE_FLEET_READ, SCOPE_ORG_GOVERN, box_subject, mint
 from flotta.control.test_sign_in import KEY, Outbox, _app
 from flotta.founding import (
     FOUNDING_CAP,
@@ -57,22 +57,51 @@ def _founding(store, email, org_id, **utm):
     )
 
 
-def test_five_founding_agencies_and_then_no_more(tmp_path, recorded):
+def test_the_cap_counts_approved_founding_orgs_only(tmp_path):
+    """Pending and declined founding orgs take no place. The sixth approval does.
+
+    A founding org that was approved and later suspended or closed keeps its
+    place: the offer is five approvals, and a decline only matters before one.
+    """
     with FleetStore(tmp_path / "fleet.db") as store:
-        for index in range(FOUNDING_CAP):
+        # More than five pending, and two of them declined: still room.
+        for index in range(FOUNDING_CAP + 3):
             _founding(store, f"owner{index}@example.com", f"org-{index}")
+        assert store.founding_available() is True
+        assert store._founding_count() == 0
+        for index in range(2):
+            assert store.decide_org(f"org-{index}", approve=False).status == "declined"
+        assert store._founding_count() == 0
+        approved = []
+        for index in range(2, 2 + FOUNDING_CAP):
+            org = store.decide_org(f"org-{index}", approve=True, now=T0)
+            approved.append(org.id)
+            assert org.status == "active"
+            assert org.trial_from is not None
         assert store.founding_available() is False
+        assert store._founding_count() == FOUNDING_CAP
+        store.suspend_org(approved[0])
+        store.close_org(approved[1], by="operator")
+        assert store._founding_count() == FOUNDING_CAP
+        # org-(CAP+2) is the one still pending past the five.
+        sixth = f"org-{FOUNDING_CAP + 2}"
+        with pytest.raises(FoundingClosedError, match="Founding Studio is full"):
+            store.decide_org(sixth, approve=True, now=T0)
+        refused = store.get_org(sixth)
+        assert refused.status == "pending"
+        assert refused.trial_from is None
+        assert store.budgets_for_org(sixth) == []
         secret = store.create_login_link(
-            "sixth@example.com",
+            "seventh@example.com",
             purpose="sign_up",
-            org_id="org-sixth",
-            org_name="Sixth",
+            org_id="org-seventh",
+            org_name="Seventh",
             attribution=Attribution(plan="founding", interval="month"),
         )
-        with pytest.raises(FoundingClosedError):
+        with pytest.raises(FoundingClosedError, match="Founding Studio is full"):
             store.sign_up_from_link(secret)
         assert store.login_link(secret) is not None, "a refused founding link stays usable"
-        assert store.get_org("org-sixth") is None
+        assert store.get_org("org-seventh") is None
         # A studio sign-up does not take a founding place, and still gets in.
         store.sign_up(
             "studio@example.com",
@@ -81,11 +110,11 @@ def test_five_founding_agencies_and_then_no_more(tmp_path, recorded):
             attribution=Attribution(plan="studio", interval="year"),
         )
         assert store.get_org("studio-six").plan == "studio"
+        store.decide_org("studio-six", approve=True, now=T0)
+        assert store.get_org("studio-six").status == "active"
         assert store._founding_count() == FOUNDING_CAP
-        first = store.get_org("org-0")
-        assert (first.max_clients, first.max_seats, first.max_agents) == (5, 1, 15)
-        assert first.status == "pending"
-        assert first.trial_from is None, "the trial starts when the org is approved"
+        held = store.get_org(approved[2])
+        assert (held.max_clients, held.max_seats, held.max_agents) == (5, 1, 15)
 
 
 def test_the_trial_caps_model_use_and_leaves_it_off_the_invoice(tmp_path):
@@ -336,12 +365,78 @@ def test_the_sign_up_route_keeps_the_campaign_and_stops_at_five(api, fleet, outb
             _founding(store, f"o{index}@example.com", f"org-{index}")
     year = api.post("/api/auth/sign-up", json={**body, "org": "other", "interval": "year"})
     assert year.status_code == 422, year.text
-    full = api.post(
+    # Five pending founding orgs do not fill the offer.
+    pending = api.post(
         "/api/auth/sign-up",
         json={**body, "email": "more@example.com", "org": "more", "org_name": "More"},
     )
+    assert pending.status_code == 202, pending.text
+    with FleetStore(fleet) as store:
+        store.decide_org("pat", approve=True, now=T0)
+        for index in range(FOUNDING_CAP - 1):
+            store.decide_org(f"org-{index}", approve=True, now=T0)
+    full = api.post(
+        "/api/auth/sign-up",
+        json={**body, "email": "later@example.com", "org": "later", "org_name": "Later"},
+    )
     assert full.status_code == 409, full.text
     assert full.json()["detail"] == "Founding Studio is full"
+
+
+def _read(subject, org):
+    token = mint(subject=subject, scopes={SCOPE_FLEET_READ}, key=KEY, org=org)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_the_sixth_approval_is_refused_and_the_place_is_visible(api, fleet, outbox):
+    """Approving the sixth founding org is the 409 the trial-invoice webhook sees.
+
+    `GET /api/orgs/{id}` carries `founding_available` so a checkout can be
+    refused before anyone pays. The refusal leaves the org pending: no trial,
+    no starting cap, and no mail.
+    """
+    with FleetStore(fleet) as store:
+        for index in range(FOUNDING_CAP - 1):
+            _founding(store, f"o{index}@example.com", f"org-{index}")
+            store.decide_org(f"org-{index}", approve=True, now=T0)
+        _founding(store, "sixth@example.com", "sixth")
+    # Four approved and a queue of pending: a checkout may still start.
+    room = api.get("/api/orgs/sixth", headers=_read("sixth", "sixth"))
+    assert room.status_code == 200, room.text
+    assert room.json()["founding_available"] is True
+    assert room.json()["status"] == "pending"
+    with FleetStore(fleet) as store:
+        _founding(store, "last@example.com", "org-last")
+        store.decide_org("org-last", approve=True, now=T0)
+    full = api.get("/api/orgs/sixth", headers=_read("sixth", "sixth"))
+    assert full.status_code == 200, full.text
+    assert full.json()["founding_available"] is False
+    assert full.json()["plan"] == "founding"
+    held = api.get("/api/orgs/org-0", headers=_read("o0", "org-0"))
+    assert held.json()["founding_available"] is False
+    assert held.json()["status"] == "active"
+    assert api.get("/api/orgs/sixth", headers=_read("o0", "org-0")).status_code == 404
+    assert api.get("/api/orgs/sixth", headers=_governor()).status_code == 403
+    refused = api.post("/api/orgs/sixth/approve", headers=_governor())
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == "Founding Studio is full"
+    assert outbox == []
+    with FleetStore(fleet) as store:
+        org = store.get_org("sixth")
+        assert org.status == "pending"
+        assert org.trial_from is None
+        assert store.starting_cap("sixth") is None
+        assert store.budgets_for_org("sixth") == []
+
+
+def test_founding_available_is_true_while_only_pending_orgs_exist(api, fleet):
+    with FleetStore(fleet) as store:
+        for index in range(FOUNDING_CAP + 2):
+            _founding(store, f"p{index}@example.com", f"pend-{index}")
+    answer = api.get("/api/orgs/pend-0", headers=_read("p0", "pend-0"))
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["founding_available"] is True
+    assert answer.json()["status"] == "pending"
 
 
 def test_billing_records_checkout_and_the_first_paid_invoice(api, fleet, recorded):

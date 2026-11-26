@@ -1535,6 +1535,27 @@ def create_app(
         finally:
             store.close()
 
+    @app.get("/api/orgs/{org_id}")
+    def get_org(org_id: str, token: Token | None = needs_read) -> Any:
+        """One org, as the list shows it, plus whether Founding Studio has a place.
+
+        `founding_available` is the fleet's, not this org's: true while fewer
+        than five founding orgs are approved (`active`, or later suspended or
+        closed). A pending or declined founding org does not take a place. The
+        hosted product reads it before opening a founding Checkout, and does
+        not when it is false. Another org is the 404 of no org.
+        """
+        if not _is_operator(token):
+            assert token is not None
+            if (token.org or DEFAULT_ORG) != org_id:
+                raise HTTPException(status_code=404, detail=f"no org {org_id!r}")
+        store = store_factory()
+        try:
+            org = _org_or_404(store, org_id)
+            return {**_org_view(store, org), "founding_available": store.founding_available()}
+        finally:
+            store.close()
+
     def _org_view(store: Any, org: Any) -> dict[str, Any]:
         """An org as the API shows it: its row, and when a closed one is deleted."""
         from dataclasses import asdict
@@ -1889,6 +1910,11 @@ def create_app(
         except UnknownEntityError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FoundingClosedError as exc:
+            # The sixth approved founding org. The raise is before the status
+            # write, so the org stays pending: no trial, no starting cap, and
+            # the mail below never runs.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             store.close()
@@ -3548,7 +3574,8 @@ def create_app(
         Optional, and not in the email: `plan` (`founding`, `studio`, `agency`),
         `interval` (`month` or `year`), `utm_source`, `utm_medium`, `utm_campaign`
         and `visitor` (the website's anonymous id). Founding Studio is monthly,
-        hidden, and limited to five agencies.
+        hidden, and limited to five approved agencies. A pending sign-up does
+        not take a place.
 
         The org is made when the link is redeemed, which proves the address,
         and made `pending`: it can sign in and invite its team, and creates no

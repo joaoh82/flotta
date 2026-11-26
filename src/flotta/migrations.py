@@ -1411,12 +1411,14 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         47,
         "founding studio: plan, attribution, trial window and unbilled usage",
-        # A founding org is one of five. The count is `plan = 'founding'`, so
-        # the plan is a column and not an event. The sign-up link carries the
-        # plan and the campaign the website passed, because the redeem is a
-        # different request, often in another browser, and the email must not
-        # carry them. The trial window is when model use on Flotta's keys is
-        # capped and left off the invoice: those rows are `billed = 0`. The
+        # A founding org is one of five. The plan is a column and not an event,
+        # which is what the count reads. Which of those rows hold a place is
+        # `FleetStore._founding_count`: approved ones, not pending or declined.
+        # The sign-up link carries the plan and the campaign the website
+        # passed, because the redeem is a different request, often in another
+        # browser, and the email must not carry them. The trial window is when
+        # model use on Flotta's keys is capped and left off the invoice: those
+        # rows are `billed = 0`. The
         # trial budget is an ordinary month row with `trial_cap`, because the
         # period check only allows day and month and an old image has to be
         # able to read the row. `price_until` is 12 months from the first paid

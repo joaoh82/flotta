@@ -505,9 +505,9 @@ def test_a_grants_source_keeps_the_operators_word_on_postgres(pg_store):
     assert not pg_store.may_spend_fleet_token(box.id, "same/other")
 
 
-def test_two_founding_sign_ups_cannot_both_take_the_last_place(pg_store):
-    """The fifth place is one row. Two redeems at once, one org, and the
-    refused link is still good."""
+def test_two_founding_approvals_cannot_both_take_the_last_place(pg_store):
+    """The fifth approved founding org is one row. Two approvals at once:
+    one org becomes active, and the other stays pending."""
     from flotta.founding import FOUNDING_CAP, Attribution
 
     for index in range(FOUNDING_CAP - 1):
@@ -517,24 +517,27 @@ def test_two_founding_sign_ups_cannot_both_take_the_last_place(pg_store):
             f"Org {index}",
             attribution=Attribution(plan="founding", interval="month"),
         )
-    secrets = [
-        pg_store.create_login_link(
+        pg_store.decide_org(f"org-{index}", approve=True)
+    for index in range(2):
+        pg_store.sign_up(
             f"last{index}@example.com",
-            purpose="sign_up",
-            org_id=f"last-{index}",
-            org_name=f"Last {index}",
+            f"last-{index}",
+            f"Last {index}",
             attribution=Attribution(plan="founding", interval="month"),
         )
-        for index in range(2)
-    ]
 
-    def redeem(fleet, index):
-        if fleet.sign_up_from_link(secrets[index]) is None:
-            raise LookupError("not redeemed")
+    def approve(fleet, index):
+        fleet.decide_org(f"last-{index}", approve=True)
 
-    outcomes = _race(pg_store, redeem)
+    outcomes = _race(pg_store, approve)
 
     assert sorted(outcomes) == ["FoundingClosedError", "created"], outcomes
     assert pg_store._founding_count() == FOUNDING_CAP
-    live = [secret for secret in secrets if pg_store.login_link(secret) is not None]
-    assert len(live) == 1, "the refused link was spent"
+    statuses = {pg_store.get_org(f"last-{index}").status for index in range(2)}
+    assert statuses == {"active", "pending"}
+    pending = next(
+        pg_store.get_org(f"last-{index}")
+        for index in range(2)
+        if pg_store.get_org(f"last-{index}").status == "pending"
+    )
+    assert pending.trial_from is None

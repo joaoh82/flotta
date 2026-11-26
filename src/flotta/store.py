@@ -433,10 +433,12 @@ class DuplicateTenantError(StoreError):
 
 
 class FoundingClosedError(StoreError):
-    """Raised when a Founding Studio sign-up would be the sixth.
+    """Raised when a founding sign-up or approval would be past the five.
 
-    Five founding orgs, ever. The link is not spent: the person can sign up
-    on another plan.
+    Five approved founding orgs. A pending or declined one does not hold a
+    place, so a sign-up can still be created, and a link is not spent when the
+    five are already approved: the person can sign up on another plan.
+    Approving a sixth leaves that org pending.
     """
 
 
@@ -2485,15 +2487,24 @@ class FleetStore:
         every model call is on the fleet's key, and a card that pays one month
         and is then disputed would otherwise spend it without bound.
 
-        Under the org table's guard, so an approve and a decline arriving
-        together cannot both succeed and leave the answer to whichever wrote
-        last.
+        Under the same locks a sign-up redeem takes, in that order (`orgs`,
+        then `users`, then `login_links`), so an approval cannot deadlock a
+        redeem or a close, and two approvals cannot both read four founding
+        orgs and both become the fifth.
 
         Approving a founding org opens its trial in the same transaction: 30
         days, and a pause at EUR 20 of model use. It does not open one twice.
+        It is also when the founding place is taken. Five approved founding
+        orgs is the cap; a sixth stays pending and raises `FoundingClosedError`.
+        Pending and declined orgs are not in that count.
         """
+        from flotta.founding import FOUNDING_CAP, FOUNDING_PLAN
+
         moment = now or datetime.now(UTC)
-        with self._conn.transaction(guard="orgs"):
+        # `orgs`, then `users`, then `login_links`, as `sign_up_from_link`.
+        # `close_org` locks the first two of those. Any other order deadlocks
+        # one of them against this decision on Postgres.
+        with self._conn.transaction(guard=("orgs", "users", "login_links")):
             org = self.get_org(org_id)
             if org is None:
                 raise UnknownEntityError(f"no org with id {org_id!r}")
@@ -2501,6 +2512,11 @@ class FleetStore:
                 raise InvalidTransitionError(
                     f"org {org_id!r} is {org.status}, not pending; there is nothing to decide"
                 )
+            # Before the update, so this org is still pending and not in the
+            # count, and a replay of one already approved stays "not pending"
+            # rather than "full".
+            if approve and org.plan == FOUNDING_PLAN and self._founding_count() >= FOUNDING_CAP:
+                raise FoundingClosedError("Founding Studio is full")
             self._conn.execute(
                 "UPDATE orgs SET status = ?, decline_reason = ? WHERE id = ?",
                 ("active" if approve else "declined", None if approve else reason, org_id),
@@ -3186,7 +3202,8 @@ class FleetStore:
         under the users and orgs guards: a taken org id, a disabled account or
         a Founding Studio that is already full leaves no account, org or
         membership behind. `attribution` is the plan and campaign the sign-up
-        page passed; a founding one also takes a place and the Studio limits.
+        page passed; a founding one records the plan and the Studio limits.
+        The founding place is taken when the org is approved, not here.
         """
         email = normalize_email(email)
         # `orgs` before `users`: `close_org` locks them in that order, and the
@@ -3202,10 +3219,10 @@ class FleetStore:
         """Redeem the sign-up `secret` opens and create its org, as one write.
 
         `None` as `redeem_login_link`: unknown, used, expired, or not a
-        sign-up. A founding place that is already taken, or an org id taken
-        since the link was sent, raises and leaves the link unused, so the
-        person can be sent another. The cap and the insert share the orgs
-        lock, so two redeems cannot both take the last place.
+        sign-up. Five founding orgs already approved, or an org id taken since
+        the link was sent, raises and leaves the link unused, so the person
+        can be sent another. The cap and the insert share the orgs lock, so
+        two redeems cannot both pass once the fifth approval has landed.
         """
         if not secret:
             return None
@@ -3252,11 +3269,12 @@ class FleetStore:
         return user, stored, membership
 
     def _apply_sign_up_plan(self, org_id: str, attribution: Any) -> None:
-        """Copy `attribution` onto the org, and claim a founding place if it is one.
+        """Copy `attribution` onto the org, and refuse a founding one past the five.
 
-        The count is of founding orgs already stored. This org is not one yet,
-        and the caller holds the orgs lock, so two sign-ups cannot both read
-        four and both become the fifth.
+        The count is of founding orgs already approved. This org is not one
+        yet, and the caller holds the orgs lock, so a sign-up cannot pass a
+        check that an approval has since filled. Pending and declined orgs
+        are not in the count: the place is taken in `decide_org`.
         """
         if attribution is None:
             return
@@ -3284,16 +3302,27 @@ class FleetStore:
         )
 
     def _founding_count(self) -> int:
+        """Approved founding orgs: the ones that hold a place.
+
+        Pending and declined do not. The caller that decides from this holds
+        the orgs lock (`decide_org`, and a sign-up's `_apply_sign_up_plan`).
+        """
+        from flotta.founding import FOUNDING_PLAN, HELD_STATUSES
+
+        held = ", ".join("?" for _ in HELD_STATUSES)
         row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM orgs WHERE plan = ?", ("founding",)
+            f"SELECT COUNT(*) AS n FROM orgs WHERE plan = ? AND status IN ({held})",
+            (FOUNDING_PLAN, *HELD_STATUSES),
         ).fetchone()
         return int(row["n"])
 
     def founding_available(self) -> bool:
-        """Whether another Founding Studio sign-up would still be one of five.
+        """Whether another founding org can still be approved, within the five.
 
-        The redeem checks again under the orgs lock. This is the early answer
-        the sign-up route gives, before it emails a link that cannot be used.
+        The redeem checks again under the orgs lock, and so does the approval.
+        This is the early answer the sign-up route gives, before it emails a
+        link that cannot be used, and the one `GET /api/orgs/{id}` shows a
+        checkout before it takes a card.
         """
         from flotta.founding import FOUNDING_CAP
 
