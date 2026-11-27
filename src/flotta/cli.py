@@ -68,6 +68,7 @@ from .store import (
     DuplicateBoxError,
     Event,
     FleetStore,
+    FoundingClosedError,
     InvalidBoxMetaError,
     InvalidBoxNameError,
     InvalidImageError,
@@ -2926,7 +2927,7 @@ def _decide_org(
                         org_id, approve=approve, reason=reason, starting_cap_eur_nano=cap, by="cli"
                     )
                 )
-            except (UnknownEntityError, InvalidTransitionError) as exc:
+            except (UnknownEntityError, InvalidTransitionError, FoundingClosedError) as exc:
                 raise _fail(exc) from exc
         told = 0
         note = "decided on the store directly, so nobody was emailed; tell its owners yourself"
